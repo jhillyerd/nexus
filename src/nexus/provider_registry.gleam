@@ -675,6 +675,52 @@ pub fn list_providers(
   actor.call(registry, 5000, List)
 }
 
+/// One provider as masked metadata (404-shaped lookup by id).
+pub fn get(
+  registry: Subject(Msg),
+  id: String,
+) -> Result(Provider, RegistryError) {
+  actor.call(registry, 5000, fn(reply) { Get(id, reply) })
+}
+
+/// Create a provider (enabled). The submitted plaintext key — if any —
+/// exists only inside this call; the reply is masked metadata.
+pub fn create(
+  registry: Subject(Msg),
+  params: provider.ProviderParams,
+) -> Result(Provider, RegistryError) {
+  actor.call(registry, 5000, fn(reply) { Create(params, reply) })
+}
+
+/// PATCH a provider: present fields replace, absent keep; a present
+/// non-blank `api_key` replaces the stored envelope.
+pub fn update(
+  registry: Subject(Msg),
+  id: String,
+  patch: provider.ProviderUpdate,
+) -> Result(Provider, RegistryError) {
+  actor.call(registry, 5000, fn(reply) { Update(id, patch, reply) })
+}
+
+/// Hard delete, guarded: 409-shaped `StillReferenced` while any session
+/// pins the provider.
+pub fn delete(
+  registry: Subject(Msg),
+  id: String,
+) -> Result(Nil, RegistryError) {
+  actor.call(registry, 5000, fn(reply) { Delete(id, reply) })
+}
+
+/// Toggle the reversible off-switch (Resolve/ListModels refuse disabled
+/// providers; reads keep showing them).
+pub fn set_enabled(
+  registry: Subject(Msg),
+  id: String,
+  enabled: Bool,
+) -> Result(Provider, RegistryError) {
+  actor.call(registry, 5000, fn(reply) { SetEnabled(id, enabled, reply) })
+}
+
 /// Live model list for one provider. The reply arrives from an unlinked
 /// fetch process, so the timeout must cover the fetch itself — it mirrors
 /// the endpoint's own first-response budget (server-global SSE policy).

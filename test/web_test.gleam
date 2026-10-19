@@ -10,6 +10,8 @@ import gleam/option.{None, Some}
 import gleam/string
 import gleeunit/should
 import nexus/page as nexus_page
+import nexus/provider
+import nexus/provider_registry
 import nexus/session
 import nexus/session_registry
 import nexus/web
@@ -185,6 +187,128 @@ pub fn request_body_decoders_test() {
   |> should.equal(Error(Nil))
 }
 
+pub fn provider_body_decoders_test() {
+  // Create: name + base_url required, api_key optional (keyless).
+  let assert Ok(full) =
+    web.parse_provider_create_json(
+      "{\"name\":\"Bifrost\",\"base_url\":\"https://gw.test/v1/\",\"api_key\":\"sk-1\"}",
+    )
+  should.equal(full.name, "Bifrost")
+  should.equal(full.api_key, Some("sk-1"))
+  let assert Ok(keyless) =
+    web.parse_provider_create_json(
+      "{\"name\":\"Ollama\",\"base_url\":\"http://127.0.0.1:11434/v1\"}",
+    )
+  should.equal(keyless.api_key, None)
+  // Explicit null api_key reads as keyless.
+  let assert Ok(nulled) =
+    web.parse_provider_create_json(
+      "{\"name\":\"x\",\"base_url\":\"https://x.test/v1\",\"api_key\":null}",
+    )
+  should.equal(nulled.api_key, None)
+  web.parse_provider_create_json("{\"name\":\"x\"}")
+  |> should.equal(Error(Nil))
+  web.parse_provider_create_json("{\"base_url\":\"https://x.test/v1\"}")
+  |> should.equal(Error(Nil))
+  web.parse_provider_create_json("not json")
+  |> should.equal(Error(Nil))
+
+  // Patch: present keys decode; absent and explicit-null keys keep.
+  let assert Ok(patch) =
+    web.parse_provider_patch_json(
+      "{\"name\":\"y\",\"base_url\":\"https://y.test/v1\",\"api_key\":\"sk-2\",\"enabled\":false}",
+    )
+  should.equal(patch.name, Some("y"))
+  should.equal(patch.base_url, Some("https://y.test/v1"))
+  should.equal(patch.api_key, Some("sk-2"))
+  should.equal(patch.enabled, Some(False))
+  let assert Ok(partial) = web.parse_provider_patch_json("{\"enabled\":true}")
+  should.equal(partial.name, None)
+  should.equal(partial.base_url, None)
+  should.equal(partial.api_key, None)
+  should.equal(partial.enabled, Some(True))
+  let assert Ok(nulled_patch) =
+    web.parse_provider_patch_json("{\"name\":null,\"api_key\":null}")
+  should.equal(nulled_patch.name, None)
+  should.equal(nulled_patch.api_key, None)
+  web.parse_provider_patch_json("{\"enabled\":\"yes\"}")
+  |> should.equal(Error(Nil))
+  web.parse_provider_patch_json("[]") |> should.equal(Error(Nil))
+}
+
+pub fn providers_json_test() {
+  let p =
+    provider.Provider(
+      id: "p1",
+      name: "Bifrost",
+      base_url: "https://gw.test/v1",
+      dialect: "openai",
+      enabled: True,
+      has_key: True,
+      created_at: 1_729_000_000,
+      updated_at: 1_729_003_600,
+    )
+  let data = json.to_string(web.providers_json([p]))
+  should.be_true(string.contains(data, "\"providers\":["))
+  should.be_true(string.contains(data, "\"id\":\"p1\""))
+  should.be_true(string.contains(data, "\"name\":\"Bifrost\""))
+  should.be_true(string.contains(data, "\"base_url\":\"https://gw.test/v1\""))
+  should.be_true(string.contains(data, "\"dialect\":\"openai\""))
+  should.be_true(string.contains(data, "\"enabled\":true"))
+  should.be_true(string.contains(data, "\"has_key\":true"))
+  should.be_true(string.contains(data, "\"created_at\":1729000000"))
+  should.be_true(string.contains(data, "\"updated_at\":1729003600"))
+  should.be_true(string.contains(
+    data,
+    "\"created_at_rfc3339\":\"2024-10-15T13:46:40Z\"",
+  ))
+  should.be_true(string.contains(
+    data,
+    "\"updated_at_rfc3339\":\"2024-10-15T14:46:40Z\"",
+  ))
+  // The masked record cannot carry key material — and the wire shape has
+  // no field for it either.
+  should.be_false(string.contains(data, "api_key"))
+  should.be_false(string.contains(data, "encrypted"))
+}
+
+/// The registry's closed error vocabulary maps onto the plan's §11
+/// statuses with `describe`'s fixed text.
+pub fn registry_error_fields_test() {
+  web.registry_error_fields(provider_registry.Unknown)
+  |> should.equal(#(404, "unknown provider"))
+  web.registry_error_fields(provider_registry.Disabled)
+  |> should.equal(#(400, "provider is disabled"))
+  web.registry_error_fields(provider_registry.InvalidName)
+  |> should.equal(#(400, "provider name must be non-empty after trimming"))
+  web.registry_error_fields(provider_registry.InvalidBaseUrl)
+  |> should.equal(#(
+    400,
+    "provider base URL should be the OpenAI-compatible base ending in /v1",
+  ))
+  web.registry_error_fields(provider_registry.DuplicateName)
+  |> should.equal(#(409, "provider name already exists"))
+  web.registry_error_fields(provider_registry.StillReferenced)
+  |> should.equal(#(
+    409,
+    "provider is still pinned by sessions; disable it instead",
+  ))
+  web.registry_error_fields(provider_registry.DecryptFailed)
+  |> should.equal(#(
+    500,
+    "decryption failed: wrong key, provider, or tampered data",
+  ))
+  web.registry_error_fields(provider_registry.KeyOperationFailed)
+  |> should.equal(#(500, "provider key operation failed"))
+  // Store/list failures surface their sanitized text with 502.
+  web.registry_error_fields(provider_registry.StoreFailed("store down"))
+  |> should.equal(#(502, "store down"))
+  web.registry_error_fields(provider_registry.ModelsFailed(
+    "model list failed: HTTP 503",
+  ))
+  |> should.equal(#(502, "model list failed: HTTP 503"))
+}
+
 pub fn protected_route_matrix_test() {
   [
     #(Get, []),
@@ -195,6 +319,13 @@ pub fn protected_route_matrix_test() {
     // M3 organization: metadata + deletion sit behind the same gate.
     #(Patch, ["sessions", "s-1"]),
     #(Delete, ["sessions", "s-1"]),
+    // P4: the whole provider management surface (§11 — all provider
+    // routes require NEXUS_UI_TOKEN when set).
+    #(Get, ["providers"]),
+    #(Post, ["providers"]),
+    #(Get, ["providers", "p-1", "models"]),
+    #(Patch, ["providers", "p-1"]),
+    #(Delete, ["providers", "p-1"]),
     // M3: the Lustre client runtime asset and the WebSocket transport sit
     // behind the same token gate as the page itself.
     #(Get, ["lustre", "runtime.mjs"]),

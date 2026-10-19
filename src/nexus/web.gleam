@@ -1,6 +1,7 @@
-//// The HTTP surface: a JSON scripting API (model listing, session CRUD,
-//// send, stop), the Lustre shell page with its WebSocket transport
-//// (`/ws`, `/lustre/runtime.mjs`), and a health check.
+//// The HTTP surface: a JSON scripting API (provider CRUD, provider-
+//// scoped model listing, session CRUD, send, stop), the Lustre shell
+//// page with its WebSocket transport (`/ws`, `/lustre/runtime.mjs`),
+//// and a health check.
 ////
 //// Mist remains sufficient: the WebSocket upgrade bypasses wisp, and the
 //// scripting surface is still small and explicit. The session actor is
@@ -56,6 +57,18 @@ pub fn handler(
         protected(cfg, req, fn() { patch_session_response(req, registry, id) })
       Delete, ["sessions", id] ->
         protected(cfg, req, fn() { delete_session_response(registry, id) })
+      Get, ["providers"] ->
+        protected(cfg, req, fn() { providers_response(providers) })
+      Post, ["providers"] ->
+        protected(cfg, req, fn() { create_provider_response(req, providers) })
+      Get, ["providers", id, "models"] ->
+        protected(cfg, req, fn() {
+          provider_models_response(cfg, providers, id)
+        })
+      Patch, ["providers", id] ->
+        protected(cfg, req, fn() { patch_provider_response(req, providers, id) })
+      Delete, ["providers", id] ->
+        protected(cfg, req, fn() { delete_provider_response(providers, id) })
       Post, ["sessions", id, "send"] ->
         protected(cfg, req, fn() {
           with_session(registry, id, send_response(req, registry, id, _))
@@ -124,8 +137,7 @@ fn with_session(
 
 // GET /models is gone (multi-provider §11): with N providers there is
 // no "default" endpoint to answer it — callers ask the provider-scoped
-// surface instead (P4's GET /providers/<id>/models; the registry's
-// ListModels message already exists).
+// `GET /providers/<id>/models` below.
 
 fn sessions_response(
   registry: process.Subject(session_registry.Msg),
@@ -308,6 +320,120 @@ fn read_create(req: Request(mist.Connection)) -> Result(CreateFields, Nil) {
   }
 }
 
+/// The POST /providers body (§11): `{"name":…, "base_url":…,
+/// "api_key":…?}` — name and base_url are required; a blank or absent
+/// api_key creates a KEYLESS provider (local endpoints).
+pub type ProviderCreateFields {
+  ProviderCreateFields(name: String, base_url: String, api_key: Option(String))
+}
+
+pub fn provider_create_fields_decoder() -> decode.Decoder(ProviderCreateFields) {
+  use name <- decode.field("name", decode.string)
+  use base_url <- decode.field("base_url", decode.string)
+  use api_key <- decode.optional_field(
+    "api_key",
+    None,
+    decode.optional(decode.string),
+  )
+  decode.success(ProviderCreateFields(name:, base_url:, api_key:))
+}
+
+pub fn parse_provider_create_json(
+  body: String,
+) -> Result(ProviderCreateFields, Nil) {
+  json.parse(body, using: provider_create_fields_decoder())
+  |> result.map_error(fn(_) { Nil })
+}
+
+fn read_provider_create(
+  req: Request(mist.Connection),
+) -> Result(ProviderCreateFields, Nil) {
+  case mist.read_body(req, max_body_limit: 1_000_000) {
+    Error(_) -> Error(Nil)
+    Ok(read) ->
+      case bit_array.to_string(read.body) {
+        Error(_) -> Error(Nil)
+        Ok(body) -> parse_provider_create_json(body)
+      }
+  }
+}
+
+/// The PATCH /providers/<id> body (§11): every field optional; an
+/// absent (or explicit null) field keeps the stored value. An api_key
+/// that is present AND non-blank replaces the stored key — blank means
+/// keep, and "going keyless" is deliberately a create-time choice.
+pub type ProviderPatchFields {
+  ProviderPatchFields(
+    name: Option(String),
+    base_url: Option(String),
+    api_key: Option(String),
+    enabled: Option(Bool),
+  )
+}
+
+pub fn provider_patch_fields_decoder() -> decode.Decoder(ProviderPatchFields) {
+  use name <- decode.optional_field(
+    "name",
+    None,
+    decode.optional(decode.string),
+  )
+  use base_url <- decode.optional_field(
+    "base_url",
+    None,
+    decode.optional(decode.string),
+  )
+  use api_key <- decode.optional_field(
+    "api_key",
+    None,
+    decode.optional(decode.string),
+  )
+  use enabled <- decode.optional_field(
+    "enabled",
+    None,
+    decode.optional(decode.bool),
+  )
+  decode.success(ProviderPatchFields(name:, base_url:, api_key:, enabled:))
+}
+
+pub fn parse_provider_patch_json(
+  body: String,
+) -> Result(ProviderPatchFields, Nil) {
+  json.parse(body, using: provider_patch_fields_decoder())
+  |> result.map_error(fn(_) { Nil })
+}
+
+fn read_provider_patch(
+  req: Request(mist.Connection),
+) -> Result(ProviderPatchFields, Nil) {
+  case mist.read_body(req, max_body_limit: 1_000_000) {
+    Error(_) -> Error(Nil)
+    Ok(read) ->
+      case bit_array.to_string(read.body) {
+        Error(_) -> Error(Nil)
+        Ok(body) -> parse_provider_patch_json(body)
+      }
+  }
+}
+
+/// A present-but-blank key is the same as an absent one: keep.
+fn blank_as_none(value: Option(String)) -> Option(String) {
+  case value {
+    Some(key) ->
+      case string.trim(key) {
+        "" -> None
+        _ -> Some(key)
+      }
+    None -> None
+  }
+}
+
+fn empty_provider_patch(patch: provider.ProviderUpdate) -> Bool {
+  option.is_none(patch.name)
+  && option.is_none(patch.base_url)
+  && option.is_none(patch.api_key)
+  && option.is_none(patch.enabled)
+}
+
 fn read_body_json(
   req: Request(mist.Connection),
   decoder: decode.Decoder(String),
@@ -366,6 +492,136 @@ fn send_response(
         }
       }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Provider routes (multi-provider §11, P4)
+// ---------------------------------------------------------------------------
+
+/// Masked metadata only — `has_key`, never key material.
+fn providers_response(
+  providers: process.Subject(provider_registry.Msg),
+) -> Response(mist.ResponseData) {
+  case provider_registry.list_providers(providers) {
+    Ok(all) -> json_response(200, providers_json(all))
+    Error(error) -> registry_error_response(error)
+  }
+}
+
+/// Validation, normalization, and encryption all live in the registry;
+/// the route only decodes and maps errors.
+fn create_provider_response(
+  req: Request(mist.Connection),
+  providers: process.Subject(provider_registry.Msg),
+) -> Response(mist.ResponseData) {
+  case read_provider_create(req) {
+    Error(_) -> json_response(400, err_json("unreadable body"))
+    Ok(fields) ->
+      case
+        provider_registry.create(
+          providers,
+          provider.ProviderParams(
+            name: fields.name,
+            base_url: fields.base_url,
+            api_key: fields.api_key,
+          ),
+        )
+      {
+        Ok(created) -> json_response(201, provider_json(created))
+        Error(error) -> registry_error_response(error)
+      }
+  }
+}
+
+fn patch_provider_response(
+  req: Request(mist.Connection),
+  providers: process.Subject(provider_registry.Msg),
+  id: String,
+) -> Response(mist.ResponseData) {
+  case read_provider_patch(req) {
+    Error(_) -> json_response(400, err_json("unreadable body"))
+    Ok(fields) -> {
+      // A present-but-blank api_key means "keep" (there is no
+      // remove-key patch), so normalize it away BEFORE the empty check:
+      // `{"api_key":"  "}` is an empty patch, not a silent 200.
+      let patch =
+        provider.ProviderUpdate(
+          name: fields.name,
+          base_url: fields.base_url,
+          api_key: blank_as_none(fields.api_key),
+          enabled: fields.enabled,
+        )
+      case empty_provider_patch(patch) {
+        True -> json_response(400, err_json("empty patch"))
+        False ->
+          case provider_registry.update(providers, id, patch) {
+            Ok(updated) -> json_response(200, provider_json(updated))
+            Error(error) -> registry_error_response(error)
+          }
+      }
+    }
+  }
+}
+
+fn delete_provider_response(
+  providers: process.Subject(provider_registry.Msg),
+  id: String,
+) -> Response(mist.ResponseData) {
+  case provider_registry.delete(providers, id) {
+    // The registry's StillReferenced (the 409 guard) lands in
+    // registry_error_response, as does Unknown (404).
+    Ok(Nil) ->
+      response.new(204)
+      |> response.set_body(mist.Bytes(bytes_tree.new()))
+    Error(error) -> registry_error_response(error)
+  }
+}
+
+fn provider_models_response(
+  cfg: Config,
+  providers: process.Subject(provider_registry.Msg),
+  id: String,
+) -> Response(mist.ResponseData) {
+  // Same budget as the session-create preflight: the live fetch mirrors
+  // the endpoint's first-response timeout, plus round-trip headroom.
+  case
+    provider_registry.list_models(
+      providers,
+      id,
+      cfg.sse_first_response_timeout_ms + 5000,
+    )
+  {
+    Ok(models) -> json_response(200, models_json(models))
+    Error(error) -> registry_error_response(error)
+  }
+}
+
+/// The registry's closed error vocabulary onto the plan's status codes
+/// (§11). Body text is always `describe`'s fixed string — never operator
+/// input beyond the id the caller already knows, never key material.
+pub fn registry_error_fields(
+  error: provider_registry.RegistryError,
+) -> #(Int, String) {
+  let status = case error {
+    provider_registry.Unknown -> 404
+    provider_registry.Disabled -> 400
+    provider_registry.InvalidName -> 400
+    provider_registry.InvalidBaseUrl -> 400
+    provider_registry.DuplicateName -> 409
+    provider_registry.StillReferenced -> 409
+    provider_registry.DecryptFailed -> 500
+    provider_registry.KeyOperationFailed -> 500
+    provider_registry.StoreFailed(_) -> 502
+    provider_registry.ModelsFailed(_) -> 502
+  }
+  #(status, provider_registry.describe(error))
+}
+
+fn registry_error_response(
+  error: provider_registry.RegistryError,
+) -> Response(mist.ResponseData) {
+  let #(status, message) = registry_error_fields(error)
+  json_response(status, err_json(message))
 }
 
 // ---------------------------------------------------------------------------
@@ -624,6 +880,29 @@ pub fn models_json(models: List(String)) -> Json {
   json.object([#("models", json.array(models, json.string))])
 }
 
+pub fn providers_json(all: List(provider.Provider)) -> Json {
+  json.object([#("providers", json.array(all, provider_json))])
+}
+
+/// Masked provider wire shape: `has_key` is the only key fact on the
+/// wire — structurally incapable of carrying key material (the masked
+/// record does not contain it).
+pub fn provider_json(p: provider.Provider) -> Json {
+  json.object([
+    #("id", json.string(p.id)),
+    #("name", json.string(p.name)),
+    #("base_url", json.string(p.base_url)),
+    #("dialect", json.string(p.dialect)),
+    #("enabled", json.bool(p.enabled)),
+    #("has_key", json.bool(p.has_key)),
+    // Same epoch + RFC3339 twin convention as session summaries.
+    #("created_at", json.int(p.created_at)),
+    #("created_at_rfc3339", json.string(timing.wall_to_rfc3339(p.created_at))),
+    #("updated_at", json.int(p.updated_at)),
+    #("updated_at_rfc3339", json.string(timing.wall_to_rfc3339(p.updated_at))),
+  ])
+}
+
 pub fn sessions_json(summaries: List(session.SessionSummary)) -> Json {
   json.object([#("sessions", json.array(summaries, session_summary_json))])
 }
@@ -671,14 +950,21 @@ pub fn requires_auth(method: Method, segments: List(String)) -> Bool {
   case method, segments {
     Get, []
     | Get, ["sessions"]
+    | Get, ["providers"]
+    | Get, ["providers", _, "models"]
     | Get, ["lustre", "runtime.mjs"]
     | Get, ["ws"]
     -> True
     Post, ["sessions"]
     | Post, ["sessions", _, "send"]
     | Post, ["sessions", _, "stop"]
+    | Post, ["providers"]
     -> True
-    Patch, ["sessions", _] | Delete, ["sessions", _] -> True
+    Patch, ["sessions", _]
+    | Delete, ["sessions", _]
+    | Patch, ["providers", _]
+    | Delete, ["providers", _]
+    -> True
     _, _ -> False
   }
 }
