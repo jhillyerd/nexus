@@ -17,6 +17,7 @@ fn test_config() -> Config {
     base_url: "http://127.0.0.1:9",
     api_key: "k",
     model_default: "smart",
+    encryption_key: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
     sse_first_response_timeout_ms: 1,
     stream_idle_timeout_ms: 1,
     http_bind: "127.0.0.1",

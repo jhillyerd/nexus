@@ -22,6 +22,7 @@ import gleam/otp/supervision
 import gleam/string
 import mist
 import nexus/config
+import nexus/provider_registry
 import nexus/session_registry
 import nexus/store/persist
 import nexus/ui_runtime
@@ -36,13 +37,15 @@ pub fn main() -> Nil {
     Error(message) -> {
       io.println("config error: " <> message)
       io.println(
-        "required: BIFROST_BASE_URL, BIFROST_API_KEY, NEXUS_MODEL_DEFAULT",
+        "required: BIFROST_BASE_URL, BIFROST_API_KEY, NEXUS_MODEL_DEFAULT, "
+        <> "NEXUS_ENCRYPTION_KEY",
       )
       halt(2)
     }
     Ok(cfg) -> {
       // Names are stable across restarts of the supervisor itself.
       let store_name = process.new_name("nexus_store")
+      let provider_registry_name = process.new_name("nexus_provider_registry")
       let factory_name = process.new_name("nexus_factory")
       let registry_name = process.new_name("nexus_registry")
       let component_name = process.new_name("nexus_chat_component")
@@ -55,7 +58,22 @@ pub fn main() -> Nil {
           supervision.supervisor(fn() { persist.supervised(cfg, store_name) }),
         )
         |> supervisor.add(
-          // Factory second: the registry resolves it by name at startup.
+          // Provider registry second (multi-provider plan §7): after the
+          // store (it loads and decrypt-validates every provider row at
+          // start — a bad envelope or key fails boot here), before the
+          // factory/session registry (sessions resolve endpoints through
+          // it once P3 pins providers into the turn runner).
+          supervision.supervisor(fn() {
+            provider_registry.start(
+              cfg,
+              persist.seam(process.named_subject(store_name)),
+              provider_registry_name,
+            )
+          }),
+        )
+        |> supervisor.add(
+          // Factory third: the session registry resolves it by name at
+          // startup.
           supervision.supervisor(fn() {
             factory_supervisor.start(session_registry.factory_builder(
               factory_name,

@@ -5,11 +5,16 @@ import gleam/string
 import gleeunit/should
 import nexus/config
 
+/// Valid base64 of exactly 32 bytes — the shared test fixture value
+/// (same convention as the other suites' `encryption_key` field).
+const key_b64 = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+
 fn set_all(pairs: List(#(String, String))) -> Nil {
   // Clear every variable we might read, then set the given ones.
   envoy.unset("BIFROST_BASE_URL")
   envoy.unset("BIFROST_API_KEY")
   envoy.unset("NEXUS_MODEL_DEFAULT")
+  envoy.unset("NEXUS_ENCRYPTION_KEY")
   envoy.unset("NEXUS_SSE_FIRST_RESPONSE_TIMEOUT_MS")
   envoy.unset("NEXUS_STREAM_IDLE_TIMEOUT_MS")
   envoy.unset("NEXUS_HTTP_BIND")
@@ -57,6 +62,7 @@ pub fn load_defaults_test() {
     #("BIFROST_BASE_URL", "https://bifrost.example/v1"),
     #("BIFROST_API_KEY", "sk-test"),
     #("NEXUS_MODEL_DEFAULT", "vllm-alias"),
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
   ])
   let assert Ok(cfg) = config.load()
   cfg.base_url |> should.equal("https://bifrost.example/v1")
@@ -74,6 +80,7 @@ pub fn load_overrides_and_trims_test() {
     #("BIFROST_BASE_URL", "  https://bifrost.example/v1/ "),
     #("BIFROST_API_KEY", "sk-test"),
     #("NEXUS_MODEL_DEFAULT", "m"),
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
     #("NEXUS_SSE_FIRST_RESPONSE_TIMEOUT_MS", "60000"),
     #("NEXUS_STREAM_IDLE_TIMEOUT_MS", "5000"),
     #("NEXUS_HTTP_BIND", "0.0.0.0"),
@@ -97,6 +104,7 @@ pub fn load_rejects_non_integer_test() {
     #("BIFROST_BASE_URL", "https://bifrost.example/v1"),
     #("BIFROST_API_KEY", "sk-test"),
     #("NEXUS_MODEL_DEFAULT", "m"),
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
     #("NEXUS_SSE_FIRST_RESPONSE_TIMEOUT_MS", "soon"),
   ])
   let assert Error(message) = config.load()
@@ -108,6 +116,39 @@ pub fn empty_string_counts_as_missing_test() {
     #("BIFROST_BASE_URL", ""),
     #("BIFROST_API_KEY", "sk-test"),
     #("NEXUS_MODEL_DEFAULT", "m"),
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+  ])
+  should.be_error(config.load())
+}
+
+pub fn load_requires_encryption_key_test() {
+  set_all([
+    #("BIFROST_BASE_URL", "https://bifrost.example/v1"),
+    #("BIFROST_API_KEY", "sk-test"),
+    #("NEXUS_MODEL_DEFAULT", "m"),
+  ])
+  let assert Error(message) = config.load()
+  should.be_true(string.contains(message, "NEXUS_ENCRYPTION_KEY"))
+}
+
+pub fn load_rejects_wrong_length_encryption_key_test() {
+  set_all([
+    #("BIFROST_BASE_URL", "https://bifrost.example/v1"),
+    #("BIFROST_API_KEY", "sk-test"),
+    #("NEXUS_MODEL_DEFAULT", "m"),
+    #("NEXUS_ENCRYPTION_KEY", "c2hvcnQ="),
+  ])
+  let assert Error(message) = config.load()
+  // Fixed crypto error text — never the submitted value.
+  should.be_true(string.contains(message, "32 bytes"))
+}
+
+pub fn load_rejects_non_base64_encryption_key_test() {
+  set_all([
+    #("BIFROST_BASE_URL", "https://bifrost.example/v1"),
+    #("BIFROST_API_KEY", "sk-test"),
+    #("NEXUS_MODEL_DEFAULT", "m"),
+    #("NEXUS_ENCRYPTION_KEY", "not!base64!!"),
   ])
   should.be_error(config.load())
 }

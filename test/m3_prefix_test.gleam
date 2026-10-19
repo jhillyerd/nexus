@@ -183,6 +183,8 @@ fn smoke_config() -> Config {
         "BIFROST_BASE_URL" -> Ok("https://bifrost.example/v1")
         "BIFROST_API_KEY" -> Ok("k")
         "NEXUS_MODEL_DEFAULT" -> Ok("smart")
+        "NEXUS_ENCRYPTION_KEY" ->
+          Ok("MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
         _ -> Error(Nil)
       }
     })

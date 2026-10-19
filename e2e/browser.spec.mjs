@@ -132,6 +132,8 @@ function startNexus({ port, bifrostPort, searxPort, maxToolIterations }) {
     ...process.env,
     BIFROST_BASE_URL: `http://127.0.0.1:${bifrostPort}/v1`,
     BIFROST_API_KEY: "none",
+    NEXUS_ENCRYPTION_KEY:
+      "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
     NEXUS_MODEL_DEFAULT: "smart",
     NEXUS_HTTP_BIND: "127.0.0.1",
     NEXUS_HTTP_PORT: String(port),

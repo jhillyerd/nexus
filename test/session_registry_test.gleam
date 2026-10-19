@@ -24,6 +24,7 @@ fn test_config() -> config.Config {
     base_url: "https://bifrost.example/v1",
     api_key: "sk-test",
     model_default: "default-alias",
+    encryption_key: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
     sse_first_response_timeout_ms: 1000,
     stream_idle_timeout_ms: 1000,
     http_bind: "127.0.0.1",

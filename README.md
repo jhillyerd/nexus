@@ -151,6 +151,7 @@ Bifrost/SearxNG, and the production cache check whose golden fixture is
 | `BIFROST_BASE_URL` | — | Bifrost base URL **including `/v1`** (required) |
 | `BIFROST_API_KEY` | — | bearer token (required) |
 | `NEXUS_MODEL_DEFAULT` | — | model alias used when a session is created without an explicit model (required) |
+| `NEXUS_ENCRYPTION_KEY` | — | master key for provider API keys at rest: base64 of exactly 32 random bytes (`openssl rand -base64 32`, required) |
 | `NEXUS_HTTP_BIND` | `127.0.0.1` | server bind (loopback per PRD) |
 | `NEXUS_HTTP_PORT` | `8080` | server port |
 | `NEXUS_UI_TOKEN` | unset | single-user bearer token; unset disables auth |

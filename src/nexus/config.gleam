@@ -9,6 +9,7 @@ import gleam/int
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
+import nexus/crypto
 
 pub type Config {
   Config(
@@ -17,6 +18,11 @@ pub type Config {
     api_key: String,
     /// Model alias used by the audit tool and the boot session.
     model_default: String,
+    /// Master key for provider API keys at rest: base64 of exactly 32
+    /// random bytes (`openssl rand -base64 32`), validated at load so
+    /// boot fails loudly on a missing/invalid key. Never logged or
+    /// echoed; the provider registry is its only consumer.
+    encryption_key: String,
     /// SSE first-response (status/headers) timeout in ms.
     sse_first_response_timeout_ms: Int,
     /// Our own receive timeout between SSE events mid-stream, in ms.
@@ -71,6 +77,7 @@ pub fn from_env(
   use base_url <- result.try(normalize_base_url(base_url))
   use api_key <- result.try(required(get, "BIFROST_API_KEY"))
   use model_default <- result.try(required(get, "NEXUS_MODEL_DEFAULT"))
+  use encryption_key <- result.try(required_encryption_key(get))
   use first_response_ms <- result.try(optional_int(
     get,
     "NEXUS_SSE_FIRST_RESPONSE_TIMEOUT_MS",
@@ -134,6 +141,7 @@ pub fn from_env(
     base_url: base_url,
     api_key: api_key,
     model_default: model_default,
+    encryption_key: encryption_key,
     sse_first_response_timeout_ms: first_response_ms,
     stream_idle_timeout_ms: idle_ms,
     http_bind: http_bind,
@@ -229,6 +237,19 @@ fn optional_bool(
         _ ->
           Error("environment variable " <> name <> " is not a boolean: " <> raw)
       }
+  }
+}
+
+fn required_encryption_key(
+  get: fn(String) -> Result(String, Nil),
+) -> Result(String, String) {
+  use raw <- result.try(required(get, "NEXUS_ENCRYPTION_KEY"))
+  // Validate the exact shape now (base64 of 32 bytes) — the provider
+  // registry decodes it again, but a mistyped key must fail boot here,
+  // before any actor starts.
+  case crypto.decode_key(raw) {
+    Ok(_) -> Ok(raw)
+    Error(error) -> Error("NEXUS_ENCRYPTION_KEY: " <> crypto.describe(error))
   }
 }
 

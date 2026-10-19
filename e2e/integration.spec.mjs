@@ -122,6 +122,8 @@ function startNexus({ port = PORT, systemPrompt = SYSTEM_PROMPT } = {}) {
     ...process.env,
     BIFROST_BASE_URL: BIFROST,
     BIFROST_API_KEY: BIFROST_KEY,
+    NEXUS_ENCRYPTION_KEY:
+      "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
     NEXUS_MODEL_DEFAULT: "smart",
     NEXUS_HTTP_BIND: "127.0.0.1",
     NEXUS_HTTP_PORT: String(port),
