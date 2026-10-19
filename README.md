@@ -58,9 +58,19 @@ like the system prompt for the session's lifetime (KV-cache contract).
 Changing provider or model means creating a new session.
 
 A fresh database has zero providers, and the server boots fine that way
-(zero sessions too — nothing auto-creates). Until the provider CRUD HTTP
-API and settings UI land (P4/P5 of the multi-provider plan), seed the
-first provider out-of-band:
+(zero sessions too — nothing auto-creates). Create the first provider
+through the HTTP API (the settings UI is P5):
+
+```sh
+curl -s http://127.0.0.1:8080/providers \
+  -H "authorization: Bearer $NEXUS_UI_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"name":"bifrost","base_url":"https://gateway.example/v1",
+       "api_key":"sk-…"}'
+# keyless provider? omit `api_key` entirely (local endpoints)
+```
+
+or seed it out-of-band while the server is not running:
 
 ```sh
 DATABASE_URL=postgres://nexus@127.0.0.1:5433/nexus \
@@ -73,11 +83,12 @@ gleam run -m nexus/dev_seed
 # (omit it entirely — or leave it blank — to keep/create a keyless row)
 ```
 
-The tool is idempotent by name (re-running reports "nothing to do"), and
-the key never appears in its output. Seed **before** booting the server
-or restart it afterwards — the provider registry loads the table once at
-start (a bad envelope fails boot loudly). The chat UI auto-targets the
-first enabled provider until the P5 picker lands.
+The seed tool is idempotent by name (re-running reports "nothing to
+do"), and the key never appears in its output. Seed **before** booting
+the server or restart it afterwards — the provider registry loads the
+table once at start (a bad envelope fails boot loudly). Either way, the
+chat UI auto-targets the first enabled provider until the P5 picker
+lands.
 
 ## The UI
 
@@ -144,6 +155,19 @@ All routes except `GET /healthz` require the configured token when
 - `GET /` — authenticated chat page (Lustre server-component shell)
 - `GET /ws` — the server component's WebSocket transport
 - `GET /lustre/runtime.mjs` — the Lustre client runtime asset
+- `GET /providers` — provider list as masked metadata (`has_key`, never
+  the key itself)
+- `POST /providers` `{"name","base_url","api_key"?}` — create; the base
+  URL must be OpenAI-compatible ending in `/v1` (normalized server-side);
+  a blank or absent key creates a keyless provider (201, masked row)
+- `GET /providers/<id>/models` — live alias list from that provider's own
+  `/v1/models` (unknown → `404`, disabled → `400`, upstream failure → `502`)
+- `PATCH /providers/<id>` `{"name"?,"base_url"?,"api_key"?,"enabled"?}` —
+  present keys replace, absent keys keep; a present non-blank `api_key`
+  replaces the stored key (blank means keep; there is no remove-key
+  patch), and `enabled:false` is the reversible off-switch
+- `DELETE /providers/<id>` — hard delete (204); `409` while any session
+  pins the provider — disable it instead
 - `GET /sessions` — summaries, pinned first then most recently active
   (default: active only)
 - `GET /sessions?archived=1` — archived summaries only
@@ -151,9 +175,8 @@ All routes except `GET /healthz` require the configured token when
   required: the provider is resolved by id or name (unknown/disabled →
   `400`), the alias validated against that provider's live model list,
   and the `(provider, model)` pair pinned for the session's lifetime.
-  (There is no longer a global `GET /models` — with N providers there is
-  no default endpoint to answer it; the provider-scoped route lands with
-  the provider CRUD API.)
+  (There is no global `GET /models` — with N providers there is no
+  default endpoint to answer it; use `GET /providers/<id>/models`.)
 - `PATCH /sessions/<id>` `{"title?","pinned?","tags?","archived?"}` — update
   metadata (present keys only; `title` implies a manual rename) → updated
   summary. Invariant: an archived session is never pinned — archiving
@@ -173,6 +196,16 @@ Playwright suites drive turns through `/send` and poll `/sessions`).
 Examples:
 
 ```sh
+# provider management (P4 surface)
+curl -H "Authorization: Bearer $NEXUS_UI_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"name":"bifrost","base_url":"https://gateway.example/v1",
+       "api_key":"sk-…"}' \
+  "$BASE/providers"
+
+curl -H "Authorization: Bearer $NEXUS_UI_TOKEN" "$BASE/providers/$PID/models"
+
+# session pinned to that provider + model
 curl -H "Authorization: Bearer $NEXUS_UI_TOKEN" \
   -H 'content-type: application/json' \
   -d "{\"provider\":\"$PROVIDER\",\"model\":\"$MODEL\"}" \

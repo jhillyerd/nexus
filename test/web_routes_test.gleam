@@ -478,9 +478,9 @@ pub fn models_route_removed_test() {
 }
 
 /// A provider may be NAMED after another provider's id — the id is the
-/// unambiguous key and must win: a request for "p1" pins the provider
-/// WITH ID p1, never the provider merely named "p1" (review finding on
-/// PR #12).
+// unambiguous key and must win: a request for "p1" pins the provider
+// WITH ID p1, never the provider merely named "p1" (review finding on
+// PR #12).
 pub fn create_session_provider_id_wins_over_name_test() {
   let #(_registry, _providers, port) =
     start_server_with(fn(providers) {
@@ -511,4 +511,312 @@ pub fn create_session_provider_id_wins_over_name_test() {
     )),
     #(400, "{\"error\":\"unknown model: gamma-only\"}"),
   )
+}
+
+// ---------------------------------------------------------------------------
+// P4: provider CRUD surface (multi-provider §11)
+// ---------------------------------------------------------------------------
+
+/// The first `"id":"…"` value in a single-object reply (create/patch
+/// responses are one provider object).
+fn first_id(body: String) -> String {
+  case string.split(body, "\"id\":\"") {
+    [_, rest, ..] ->
+      case string.split(rest, "\"") {
+        [id, ..] -> id
+        _ -> ""
+      }
+    _ -> ""
+  }
+}
+
+/// The full curl-able CRUD walk (plan §17 acceptance): create with a
+/// key, list, patch (rename / keep-key / replace-key / validation),
+/// delete — and the submitted key material NEVER appears in any
+/// response body along the way.
+pub fn providers_crud_test() {
+  let #(_registry, _providers, port) = start_server_with(fn(_) { Nil })
+  let secret = "sk-live-never-echo-me-0123456789"
+
+  // ---- auth gates the provider surface --------------------------------
+  let assert Ok(denied) = hackney.send(req(port, Get, "/providers", ""))
+  should.equal(denied.status, 401)
+  let assert Ok(denied_create) =
+    hackney.send(req(
+      port,
+      Post,
+      "/providers",
+      "{\"name\":\"x\",\"base_url\":\"https://x.test/v1\"}",
+    ))
+  should.equal(denied_create.status, 401)
+
+  // ---- create (with key): 201, masked, key never echoed ----------------
+  let #(status, body) =
+    send_authorized(req(
+      port,
+      Post,
+      "/providers",
+      "{\"name\":\"openai\",\"base_url\":\"https://api.openai.test/v1\",\"api_key\":\""
+        <> secret
+        <> "\"}",
+    ))
+  should.equal(status, 201)
+  let id = first_id(body)
+  should.be_true(string.starts_with(id, "p"))
+  should.be_true(string.contains(body, "\"name\":\"openai\""))
+  should.be_true(string.contains(
+    body,
+    "\"base_url\":\"https://api.openai.test/v1\"",
+  ))
+  should.be_true(string.contains(body, "\"dialect\":\"openai\""))
+  should.be_true(string.contains(body, "\"enabled\":true"))
+  should.be_true(string.contains(body, "\"has_key\":true"))
+  should.be_true(string.contains(body, "\"created_at_rfc3339\":\""))
+  should.be_true(string.contains(body, "\"updated_at_rfc3339\":\""))
+  should.be_false(string.contains(body, secret))
+
+  // ---- list: both providers, fixture keyless, still no key -------------
+  let #(status, listed) = send_authorized(req(port, Get, "/providers", ""))
+  should.equal(status, 200)
+  should.be_true(string.contains(listed, "\"providers\":["))
+  should.be_true(string.contains(listed, "\"name\":\"fixture\""))
+  should.be_true(string.contains(listed, "\"has_key\":false"))
+  should.be_true(string.contains(listed, "\"name\":\"openai\""))
+  should.be_false(string.contains(listed, secret))
+
+  // ---- patch: rename; blank api_key KEEPS the key -----------------------
+  let #(status, body) =
+    send_authorized(req(
+      port,
+      Patch,
+      "/providers/" <> id,
+      "{\"name\":\"openai-prod\",\"api_key\":\"   \"}",
+    ))
+  should.equal(status, 200)
+  should.be_true(string.contains(body, "\"name\":\"openai-prod\""))
+  should.be_true(string.contains(body, "\"has_key\":true"))
+  should.be_false(string.contains(body, secret))
+
+  // ---- patch: replace the key (has_key stays true, neither key echoes) --
+  let replacement = "sk-live-also-secret-9876543210"
+  let #(status, body) =
+    send_authorized(req(
+      port,
+      Patch,
+      "/providers/" <> id,
+      "{\"api_key\":\"" <> replacement <> "\"}",
+    ))
+  should.equal(status, 200)
+  should.be_true(string.contains(body, "\"has_key\":true"))
+  should.be_false(string.contains(body, secret))
+  should.be_false(string.contains(body, replacement))
+
+  // ---- patch: disable reads back enabled:false --------------------------
+  let #(status, body) =
+    send_authorized(req(port, Patch, "/providers/" <> id, "{\"enabled\":false}"))
+  should.equal(status, 200)
+  should.be_true(string.contains(body, "\"enabled\":false"))
+
+  // ---- validation -------------------------------------------------------
+  // Duplicate name -> 409 (unique).
+  should.equal(
+    send_authorized(req(
+      port,
+      Post,
+      "/providers",
+      "{\"name\":\"fixture\",\"base_url\":\"https://dup.test/v1\"}",
+    )),
+    #(409, "{\"error\":\"provider name already exists\"}"),
+  )
+  // Rename onto a taken name -> 409 too.
+  should.equal(
+    send_authorized(req(
+      port,
+      Patch,
+      "/providers/" <> id,
+      "{\"name\":\"fixture\"}",
+    )),
+    #(409, "{\"error\":\"provider name already exists\"}"),
+  )
+  // Base URL must end /v1 -> 400.
+  should.equal(
+    send_authorized(req(
+      port,
+      Post,
+      "/providers",
+      "{\"name\":\"bad\",\"base_url\":\"https://api.openai.test\"}",
+    )),
+    #(
+      400,
+      "{\"error\":\"provider base URL should be the OpenAI-compatible base ending in /v1\"}",
+    ),
+  )
+  // Blank name -> 400.
+  should.equal(
+    send_authorized(req(
+      port,
+      Post,
+      "/providers",
+      "{\"name\":\"   \",\"base_url\":\"https://api.openai.test/v1\"}",
+    )),
+    #(400, "{\"error\":\"provider name must be non-empty after trimming\"}"),
+  )
+  // Missing required field -> 400.
+  should.equal(
+    send_authorized(req(
+      port,
+      Post,
+      "/providers",
+      "{\"base_url\":\"https://api.openai.test/v1\"}",
+    )),
+    #(400, "{\"error\":\"unreadable body\"}"),
+  )
+  // Unknown id -> 404; empty patch -> 400; blank-only key patch is an
+  // empty patch (keep means no-op), not a silent 200.
+  should.equal(
+    send_authorized(req(port, Patch, "/providers/nope", "{\"name\":\"x\"}")),
+    #(404, "{\"error\":\"unknown provider\"}"),
+  )
+  should.equal(send_authorized(req(port, Patch, "/providers/" <> id, "{}")), #(
+    400,
+    "{\"error\":\"empty patch\"}",
+  ))
+  should.equal(
+    send_authorized(req(port, Patch, "/providers/" <> id, "{\"api_key\":\" \"}")),
+    #(400, "{\"error\":\"empty patch\"}"),
+  )
+  should.equal(
+    send_authorized(req(port, Patch, "/providers/" <> id, "not json")),
+    #(400, "{\"error\":\"unreadable body\"}"),
+  )
+  should.equal(send_authorized(req(port, Delete, "/providers/nope", "")), #(
+    404,
+    "{\"error\":\"unknown provider\"}",
+  ))
+
+  // ---- delete: unreferenced -> 204, then gone ---------------------------
+  should.equal(
+    send_authorized(req(port, Delete, "/providers/" <> id, ""))
+      |> fn(pair) { #(pair.0, "") },
+    #(204, ""),
+  )
+  let #(_status, after) = send_authorized(req(port, Get, "/providers", ""))
+  should.be_false(string.contains(after, "\"name\":\"openai-prod\""))
+  should.equal(send_authorized(req(port, Delete, "/providers/" <> id, "")), #(
+    404,
+    "{\"error\":\"unknown provider\"}",
+  ))
+}
+
+/// The 409 delete guard (plan §11/§17): a provider pinned by any session
+/// cannot be hard-deleted — disabling is the reversible path, and even
+/// disabled the sessions still pin the row. Unpin (delete the session)
+/// and the delete goes through.
+pub fn provider_delete_guard_test() {
+  let #(_registry, _providers, port) = start_server_with(fn(_) { Nil })
+  let assert #(201, created) =
+    send_authorized(req(
+      port,
+      Post,
+      "/providers",
+      "{\"name\":\"gamma\",\"base_url\":\"https://gamma.test/v1\"}",
+    ))
+  let provider_id = first_id(created)
+
+  // A session pins it (model list comes from gamma's own fetcher).
+  let assert #(201, session) =
+    send_authorized(req(
+      port,
+      Post,
+      "/sessions",
+      "{\"provider\":\"" <> provider_id <> "\",\"model\":\"gamma-only\"}",
+    ))
+  let session_id = first_id(session)
+
+  // Referenced -> 409, with the disable hint.
+  should.equal(
+    send_authorized(req(port, Delete, "/providers/" <> provider_id, "")),
+    #(
+      409,
+      "{\"error\":\"provider is still pinned by sessions; disable it instead\"}",
+    ),
+  )
+  // Disabling is allowed (the reversible path) but does NOT unpin —
+  // the sessions still reference the row, so the guard holds.
+  let assert #(200, _disabled) =
+    send_authorized(req(
+      port,
+      Patch,
+      "/providers/" <> provider_id,
+      "{\"enabled\":false}",
+    ))
+  should.equal(
+    send_authorized(req(port, Delete, "/providers/" <> provider_id, "")),
+    #(
+      409,
+      "{\"error\":\"provider is still pinned by sessions; disable it instead\"}",
+    ),
+  )
+
+  // Unpin (hard-delete the session) and the provider deletes cleanly.
+  should.equal(
+    send_authorized(req(port, Delete, "/sessions/" <> session_id, ""))
+      |> fn(pair) { #(pair.0, "") },
+    #(204, ""),
+  )
+  should.equal(
+    send_authorized(req(port, Delete, "/providers/" <> provider_id, ""))
+      |> fn(pair) { #(pair.0, "") },
+    #(204, ""),
+  )
+}
+
+/// The provider-scoped model list (§11): live aliases from THAT
+/// provider's endpoint, unknown provider -> 404, disabled -> 400.
+pub fn provider_models_route_test() {
+  let #(_registry, _providers, port) = start_server_with(fn(_) { Nil })
+
+  // The fixture provider serves the default list.
+  should.equal(
+    send_authorized(req(
+      port,
+      Get,
+      "/providers/" <> store_mock.fixture_provider_id <> "/models",
+      "",
+    )),
+    #(200, "{\"models\":[\"default-alias\",\"alias-a\",\"alias-b\"]}"),
+  )
+
+  // A provider with its own endpoint serves its own list.
+  let assert #(201, created) =
+    send_authorized(req(
+      port,
+      Post,
+      "/providers",
+      "{\"name\":\"gamma\",\"base_url\":\"https://gamma.test/v1\"}",
+    ))
+  let gamma = first_id(created)
+  should.equal(
+    send_authorized(req(port, Get, "/providers/" <> gamma <> "/models", "")),
+    #(200, "{\"models\":[\"gamma-only\"]}"),
+  )
+
+  // Disabled providers refuse the live fetch.
+  let assert #(200, _) =
+    send_authorized(req(
+      port,
+      Patch,
+      "/providers/" <> gamma,
+      "{\"enabled\":false}",
+    ))
+  should.equal(
+    send_authorized(req(port, Get, "/providers/" <> gamma <> "/models", "")),
+    #(400, "{\"error\":\"provider is disabled\"}"),
+  )
+
+  // Unknown provider -> 404.
+  should.equal(send_authorized(req(port, Get, "/providers/nope/models", "")), #(
+    404,
+    "{\"error\":\"unknown provider\"}",
+  ))
 }

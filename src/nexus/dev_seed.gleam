@@ -1,6 +1,7 @@
 //// First-run provider seeding (`gleam run -m nexus/dev_seed`) — the
-//// P3 bridge until provider management lands over HTTP (P4) and in the
-//// UI (P5).
+//// out-of-band alternative to the provider CRUD HTTP API (P4, landed)
+//// for environments where the server is not running yet (CI, compose
+//// bootstrap); the settings UI is P5.
 ////
 //// The provider table is the only provider source after the P3 hard
 //// cut (BIFROST_* env vars are gone), and a fresh database starts with
