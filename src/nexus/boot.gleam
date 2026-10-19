@@ -37,8 +37,8 @@ pub fn main() -> Nil {
     Error(message) -> {
       io.println("config error: " <> message)
       io.println(
-        "required: BIFROST_BASE_URL, BIFROST_API_KEY, NEXUS_MODEL_DEFAULT, "
-        <> "NEXUS_ENCRYPTION_KEY",
+        "required: NEXUS_ENCRYPTION_KEY (base64 of 32 bytes); "
+        <> "see the README env table",
       )
       halt(2)
     }
@@ -49,6 +49,21 @@ pub fn main() -> Nil {
       let factory_name = process.new_name("nexus_factory")
       let registry_name = process.new_name("nexus_registry")
       let component_name = process.new_name("nexus_chat_component")
+      // The provider seam handed to the session registry: every session
+      // freezes the endpoint this resolves at create/hydration time
+      // (multi-provider plan §8). Mapping lives here so neither registry
+      // depends on the other.
+      let resolve_provider = fn(id) {
+        let providers = process.named_subject(provider_registry_name)
+        case provider_registry.resolve(providers, id) {
+          Ok(resolved) -> Ok(resolved.endpoint)
+          Error(provider_registry.Unknown) ->
+            Error(session_registry.ProviderUnknown)
+          Error(provider_registry.Disabled) ->
+            Error(session_registry.ProviderDisabled)
+          Error(_) -> Error(session_registry.ProviderKeyUnavailable)
+        }
+      }
       let root =
         supervisor.new(supervisor.OneForAll)
         // Store first (Phase 2): the registry hydrates from it at start —
@@ -87,22 +102,28 @@ pub fn main() -> Nil {
               factory_supervisor.get_by_name(factory_name),
               registry_name,
               persist.seam(process.named_subject(store_name)),
+              resolve_provider,
             )
           }),
         )
         |> supervisor.add(
-          // Lustre runtime third: after the registry (it resolves sessions
+          // Lustre runtime: after the registry (it resolves sessions
           // through it), before Mist (the WebSocket handler looks the
           // component up by name).
           ui_runtime.supervised(
             component_name,
-            cfg,
             process.named_subject(registry_name),
+            process.named_subject(provider_registry_name),
           ),
         )
         |> supervisor.add(
           supervision.supervisor(fn() {
-            mist.new(web.handler(cfg, registry_name, component_name))
+            mist.new(web.handler(
+              cfg,
+              registry_name,
+              provider_registry_name,
+              component_name,
+            ))
             |> mist.bind(cfg.http_bind)
             |> mist.port(cfg.http_port)
             |> mist.start
@@ -123,7 +144,6 @@ pub fn main() -> Nil {
             <> ":"
             <> int.to_string(cfg.http_port),
           )
-          io.println("default model alias: " <> cfg.model_default)
           case cfg.ui_token {
             Some(_) -> io.println("auth: token required")
             None -> io.println("auth: disabled (NEXUS_UI_TOKEN unset)")

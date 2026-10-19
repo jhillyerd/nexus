@@ -21,9 +21,6 @@ import store_mock
 
 fn test_config() -> config.Config {
   config.Config(
-    base_url: "https://bifrost.example/v1",
-    api_key: "sk-test",
-    model_default: "default-alias",
     encryption_key: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
     sse_first_response_timeout_ms: 1000,
     stream_idle_timeout_ms: 1000,
@@ -59,7 +56,7 @@ fn stats() -> openai.StreamStats {
 }
 
 fn happy_runner(
-  _cfg,
+  _endpoint,
   tr,
   _cancel,
   on_event: fn(loop.LoopEvent) -> Nil,
@@ -92,8 +89,29 @@ fn start_registry_with(
       factory_supervisor.get_by_name(factory_name),
       process.new_name("nexus_test_registry"),
       persistence,
+      fixture_resolver(),
     )
   started.data
+}
+
+/// The production resolver's offline stand-in: the fixture provider
+/// resolves to a fixed endpoint, everything else is unknown.
+pub fn fixture_resolver() -> session_registry.ResolveProvider {
+  fn(id) {
+    case id == store_mock.fixture_provider_id {
+      True -> Ok(test_endpoint())
+      False -> Error(session_registry.ProviderUnknown)
+    }
+  }
+}
+
+pub fn test_endpoint() -> openai.Endpoint {
+  openai.Endpoint(
+    base_url: "https://provider.example/v1",
+    api_key: None,
+    sse_first_response_timeout_ms: 1000,
+    stream_idle_timeout_ms: 1000,
+  )
 }
 
 /// Drain up to `n` events from a session-event subject.
@@ -527,6 +545,7 @@ fn start_registry_over(
       factory_supervisor.get_by_name(factory_name),
       process.new_name("nexus_test_registry"),
       persistence,
+      fixture_resolver(),
     )
   started.data
 }
@@ -682,4 +701,71 @@ pub fn boot_sweep_prune_failure_keeps_session_test() {
 
   let registry = start_registry_over(seam)
   listed_ids(registry) |> should.equal(["s1"])
+}
+
+// ---------------------------------------------------------------------------
+// P3: provider resolution on the create path
+// ---------------------------------------------------------------------------
+
+/// An unknown provider id refuses the create BEFORE any session actor or
+/// row exists (multi-provider §8: a session is only ever created with its
+/// (provider, model) pin in place).
+pub fn create_rejects_unknown_provider_test() {
+  let registry = start_registry()
+  session_registry.create_with_runner(registry, "p-nope", "alpha", happy_runner)
+  |> should.equal(
+    Error(session_registry.ProviderFailed(session_registry.ProviderUnknown)),
+  )
+  session_registry.list_sessions(registry) |> should.equal([])
+}
+
+/// A disabled provider cannot back a new session either — disabling is
+/// the reversible delete, and resolve refuses it.
+pub fn create_rejects_disabled_provider_test() {
+  let factory_name = process.new_name("nexus_test_factory")
+  let assert Ok(_factory) =
+    factory_supervisor.start(session_registry.factory_builder(factory_name))
+  let persistence = store_mock.seam(store_mock.start())
+  store_mock.ensure_fixture_provider(persistence)
+  let disabled: session_registry.ResolveProvider = fn(id) {
+    case id == store_mock.fixture_provider_id {
+      True -> Error(session_registry.ProviderDisabled)
+      False -> Error(session_registry.ProviderUnknown)
+    }
+  }
+  let assert Ok(started) =
+    session_registry.start(
+      test_config(),
+      factory_supervisor.get_by_name(factory_name),
+      process.new_name("nexus_test_registry"),
+      persistence,
+      disabled,
+    )
+  session_registry.create_with_runner(
+    started.data,
+    store_mock.fixture_provider_id,
+    "alpha",
+    happy_runner,
+  )
+  |> should.equal(
+    Error(session_registry.ProviderFailed(session_registry.ProviderDisabled)),
+  )
+}
+
+/// The runner a created session actually runs receives the endpoint the
+/// resolver produced — the frozen provider transport (P3 acceptance:
+/// "a session streams via its frozen endpoint").
+pub fn created_session_runner_gets_resolved_endpoint_test() {
+  let seen = process.new_subject()
+  let capturing = fn(endpoint, tr, _cancel, _on_event) {
+    process.send(seen, endpoint)
+    session.StreamDone(stats(), transcript.append_assistant(tr, "ok"))
+  }
+  let registry = start_registry()
+  let _record = create(registry, "alpha", capturing)
+  // A send makes the session's worker invoke the runner.
+  let assert Ok(sess) = session_registry.get(registry, "s1")
+  should.equal(session.send_message(sess, "hi"), session.Sent)
+  let assert Ok(endpoint) = process.receive(seen, 2000)
+  endpoint |> should.equal(test_endpoint())
 }

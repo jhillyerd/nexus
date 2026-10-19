@@ -22,6 +22,7 @@
 import gleam/bit_array
 import gleam/dynamic/decode
 import gleam/erlang/process
+import gleam/http/request
 import gleam/json
 import gleam/list
 import gleam/option.{None, Some}
@@ -30,6 +31,7 @@ import gleam/otp/factory_supervisor
 import gleam/string
 import gleeunit/should
 import glopenai/chat
+import glopenai/config as oai_config
 import nexus/config.{type Config}
 import nexus/loop
 import nexus/openai
@@ -180,9 +182,6 @@ fn smoke_config() -> Config {
   let assert Ok(base) =
     config.from_env(fn(name) {
       case name {
-        "BIFROST_BASE_URL" -> Ok("https://bifrost.example/v1")
-        "BIFROST_API_KEY" -> Ok("k")
-        "NEXUS_MODEL_DEFAULT" -> Ok("smart")
         "NEXUS_ENCRYPTION_KEY" ->
           Ok("MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
         _ -> Error(Nil)
@@ -355,12 +354,42 @@ fn start_registry() -> process.Subject(session_registry.Msg) {
       factory_supervisor.get_by_name(factory_name),
       process.new_name("nexus_m3_registry"),
       persistence,
+      fixture_resolver(),
     )
   started.data
 }
 
+/// The offline stand-in for the boot resolver: the fixture provider
+/// resolves to a fixed endpoint, anything else is unknown.
+fn fixture_resolver() -> session_registry.ResolveProvider {
+  fn(id) {
+    case id == store_mock.fixture_provider_id {
+      True -> Ok(test_endpoint())
+      False -> Error(session_registry.ProviderUnknown)
+    }
+  }
+}
+
+/// The endpoint shape the smoke session streams through. The base URL and
+/// key material never enter the request body — see the key-invariance
+/// golden test at the bottom of this suite.
+fn test_endpoint() -> openai.Endpoint {
+  openai.Endpoint(
+    base_url: "https://bifrost.example/v1",
+    api_key: Some("sk-smoke"),
+    sse_first_response_timeout_ms: 30_000,
+    stream_idle_timeout_ms: 120_000,
+  )
+}
+
+/// The same endpoint with a DIFFERENT key — used by the key-invariance
+/// golden test (plan §9).
+fn rekeyed_endpoint() -> openai.Endpoint {
+  openai.Endpoint(..test_endpoint(), api_key: Some("sk-other"))
+}
+
 fn happy_runner(
-  _cfg,
+  _endpoint,
   tr,
   _cancel,
   on_event: fn(loop.LoopEvent) -> Nil,
@@ -405,4 +434,58 @@ fn drain(
         Error(_) -> []
       }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-provider §9: credentials never touch the request body
+// ---------------------------------------------------------------------------
+
+/// Switching a provider's KEY (same base URL, same model) must leave
+/// request BODIES byte-identical — credentials appear only in the
+/// `Authorization` header, and are omitted entirely for keyless
+/// endpoints (`openai.drop_empty_bearer`). This is the multi-provider
+/// twin of the prefix goldens: re-keying a provider must not invalidate
+/// any session's cache prefix.
+pub fn golden_key_change_never_alters_request_bytes_test() {
+  let fixture = load_fixture()
+  let opts = loop_options()
+  let tr =
+    list.fold(
+      fixture.turns,
+      transcript.new(fixture.alias, fixture.system),
+      fn(tr, turn) { apply_turn(tr, turn.messages) },
+    )
+  let params = transcript.to_request(tr, opts)
+
+  // The wire request exactly as `nexus/openai` builds it: glopenai
+  // config from the endpoint, then `chat.create_request`.
+  let wire = fn(endpoint: openai.Endpoint) {
+    let cfg =
+      oai_config.new(option.unwrap(endpoint.api_key, ""))
+      |> oai_config.with_api_base(endpoint.base_url)
+    chat.create_request(cfg, params)
+  }
+  let keyed = wire(test_endpoint())
+  let rekeyed = wire(rekeyed_endpoint())
+  let keyless_endpoint = openai.Endpoint(..test_endpoint(), api_key: None)
+  let keyless_raw = wire(keyless_endpoint)
+
+  // Bodies identical across all three key worlds — and equal to the
+  // pure transcript body (the single encode path).
+  keyed.body |> should.equal(rekeyed.body)
+  keyed.body |> should.equal(keyless_raw.body)
+  keyed.body |> should.equal(transcript.request_body(tr, opts))
+
+  // The difference lives in the Authorization header ONLY.
+  request.get_header(keyed, "authorization")
+  |> should.equal(Ok("Bearer sk-smoke"))
+  request.get_header(rekeyed, "authorization")
+  |> should.equal(Ok("Bearer sk-other"))
+
+  // glopenai still prepends a (empty) bearer for keyless endpoints —
+  // nexus's transport seam strips it, and that strip changes nothing
+  // else: same body, no header.
+  let dropped = openai.drop_empty_bearer(keyless_raw, keyless_endpoint)
+  should.be_error(request.get_header(dropped, "authorization"))
+  dropped.body |> should.equal(keyed.body)
 }

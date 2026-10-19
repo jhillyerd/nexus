@@ -24,17 +24,19 @@ import lustre/element/html
 import lustre/element/keyed
 import lustre/event
 import lustre/server_component
-import nexus/config.{type Config}
-import nexus/openai
+import nexus/provider_registry
 import nexus/session.{type SessionEvent}
 import nexus/session_registry
 import nexus/timing
 
 /// Everything the component needs to talk to the rest of the app. The
-/// registry subject is resolved from its name at boot and stays stable
-/// across component restarts.
+/// registry subjects are resolved from their names at boot and stay
+/// stable across component restarts.
 pub type Flags {
-  Flags(cfg: Config, registry: Subject(session_registry.Msg))
+  Flags(
+    registry: Subject(session_registry.Msg),
+    providers: Subject(provider_registry.Msg),
+  )
 }
 
 /// Status of one assistant tool call.
@@ -130,11 +132,15 @@ pub fn rel_time(now_epoch: Int, at: Int) -> String {
 
 pub type Model {
   Model(
-    cfg: Config,
+    providers: Subject(provider_registry.Msg),
     registry: Subject(session_registry.Msg),
     // Long-lived subscription to the selected session's events. Created by
     // the `select` effect in `init` and reused across reconnects.
     events: Option(Subject(SessionEvent)),
+    /// The provider whose models fill the picker (multi-provider P3
+    /// bridge: the first enabled provider; the P5 picker generalizes
+    /// this to a real selection).
+    provider: Option(String),
     aliases: List(String),
     sessions: List(session.SessionSummary),
     metrics: List(session.MetricSample),
@@ -190,8 +196,11 @@ pub type Msg {
   ClientDisconnected
   // The session-event subscription created by the select effect in `init`.
   GotEvents(Subject(SessionEvent))
-  AliasesLoaded(List(String))
+  AliasesLoaded(provider: String, aliases: List(String))
   AliasesFailed
+  /// No enabled provider exists: the create panel has nothing to offer
+  /// until an operator configures one (P5 adds the management surface).
+  NoProviders
   SessionsLoaded(List(session.SessionSummary))
   SessionsFailed(String)
   Select(String)
@@ -275,9 +284,10 @@ pub fn from_session_event(event: SessionEvent) -> Msg {
 pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
   let model =
     Model(
-      cfg: flags.cfg,
+      providers: flags.providers,
       registry: flags.registry,
       events: None,
+      provider: None,
       aliases: [],
       sessions: [],
       metrics: [],
@@ -361,14 +371,30 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       effect.batch([aliases_effect(model), sessions_effect(model)]),
     )
 
-    AliasesLoaded(aliases) -> #(
-      Model(..model, aliases: aliases, picker: first_alias(model, aliases)),
+    AliasesLoaded(provider, aliases) -> #(
+      Model(
+        ..model,
+        provider: Some(provider),
+        aliases: aliases,
+        picker: first_alias(model, aliases),
+      ),
       effect.none(),
     )
 
     AliasesFailed -> #(
       Model(..model, log: [
         NoteLine(True, "could not load model aliases"),
+        ..model.log
+      ]),
+      effect.none(),
+    )
+
+    NoProviders -> #(
+      Model(..model, provider: None, aliases: [], log: [
+        NoteLine(
+          True,
+          "no provider configured — create one before starting a session",
+        ),
         ..model.log
       ]),
       effect.none(),
@@ -971,10 +997,25 @@ fn metrics_for(
 // ---------------------------------------------------------------------------
 
 fn aliases_effect(model: Model) -> Effect(Msg) {
+  // P3 bridge until the P5 picker: the create panel auto-targets the
+  // FIRST enabled provider and lists that provider's models. With zero
+  // enabled providers there is nothing to offer — the panel says so.
+  let providers = model.providers
   effect.from(fn(dispatch) {
-    case openai.list_models(openai.endpoint_from_config(model.cfg)) {
-      Ok(aliases) -> dispatch(AliasesLoaded(aliases))
+    case provider_registry.list_providers(providers) {
       Error(_) -> dispatch(AliasesFailed)
+      Ok(all) ->
+        case list.find(all, fn(p) { p.enabled }) {
+          Error(_) -> dispatch(NoProviders)
+          Ok(first) ->
+            // Generous actor-call timeout: the fetch itself is bounded by
+            // the endpoint's first-response budget (server-global SSE
+            // policy), this only has to outlive it.
+            case provider_registry.list_models(providers, first.id, 60_000) {
+              Ok(aliases) -> dispatch(AliasesLoaded(first.id, aliases))
+              Error(_) -> dispatch(AliasesFailed)
+            }
+        }
     }
   })
 }
@@ -1063,12 +1104,14 @@ fn create_effect(model: Model, alias: String) -> Effect(Msg) {
   effect.from(fn(dispatch) {
     // The registry builds the M3 agent-loop runner itself, from the tool
     // registry frozen at its boot — sessions created here get the full
-    // toolset, identical to the boot session.
-    // P1 multi-provider interim: no provider source exists yet (the
-    // provider registry lands in P2, the picker in P5), so the pin is
-    // empty and the store's write-through fails its FK — the session
-    // stays in-memory only until then.
-    case session_registry.create(registry, "", alias) {
+    // toolset. The provider pin is the auto-picked one (P3 bridge): no
+    // picker selection exists until P5.
+    let create = case model.provider {
+      Some(provider_id) -> session_registry.create(registry, provider_id, alias)
+      None ->
+        Error(session_registry.ProviderFailed(session_registry.ProviderUnknown))
+    }
+    case create {
       Ok(record) -> {
         let now = timing.wall_now_s()
         dispatch(
@@ -1092,10 +1135,21 @@ fn create_effect(model: Model, alias: String) -> Effect(Msg) {
       }
       Error(session_registry.EmptyModel) ->
         dispatch(CreateFailed("empty model"))
+      Error(session_registry.ProviderFailed(reason)) ->
+        dispatch(CreateFailed(describe_provider_error(reason)))
       Error(session_registry.StartFailed(reason)) ->
         dispatch(CreateFailed(reason))
     }
   })
+}
+
+/// Fixed text for a provider resolution failure on the create path.
+fn describe_provider_error(reason: session_registry.ProviderError) -> String {
+  case reason {
+    session_registry.ProviderUnknown -> "no provider configured"
+    session_registry.ProviderDisabled -> "provider is disabled"
+    session_registry.ProviderKeyUnavailable -> "provider key unavailable"
+  }
 }
 
 /// Run one registry metadata mutation, then refresh the session list so

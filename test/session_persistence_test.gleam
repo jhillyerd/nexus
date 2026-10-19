@@ -25,9 +25,6 @@ import store_mock
 
 fn test_config() -> config.Config {
   config.Config(
-    base_url: "https://bifrost.example/v1",
-    api_key: "sk-test",
-    model_default: "default-alias",
     encryption_key: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
     sse_first_response_timeout_ms: 1000,
     stream_idle_timeout_ms: 1000,
@@ -69,8 +66,28 @@ const args_a = "{\"url\":  \"https://example.com/a?x=1\", \"limit\": 3}"
 
 const args_b = "{\"q\": \"gleam  BEAM\",\"page\": 2}"
 
+/// The production resolver's offline stand-in (same as the registry
+/// suite's): the fixture provider resolves, anything else is unknown.
+fn fixture_resolver() -> session_registry.ResolveProvider {
+  fn(id) {
+    case id == store_mock.fixture_provider_id {
+      True -> Ok(test_endpoint())
+      False -> Error(session_registry.ProviderUnknown)
+    }
+  }
+}
+
+fn test_endpoint() -> openai.Endpoint {
+  openai.Endpoint(
+    base_url: "https://provider.example/v1",
+    api_key: None,
+    sse_first_response_timeout_ms: 1000,
+    stream_idle_timeout_ms: 1000,
+  )
+}
+
 fn happy_runner(
-  _cfg,
+  _endpoint,
   tr,
   _cancel,
   on_event: fn(loop.LoopEvent) -> Nil,
@@ -82,7 +99,7 @@ fn happy_runner(
 /// A turn shaped like the real agent loop: one assistant message with
 /// text AND two tool calls, tool results, then the final answer.
 fn tool_round_runner(
-  _cfg,
+  _endpoint,
   tr,
   _cancel,
   on_event: fn(loop.LoopEvent) -> Nil,
@@ -212,6 +229,7 @@ fn boot(seam: store.Store) -> Boot {
       registry_name,
       seam,
       tool_round_runner,
+      fixture_resolver(),
     )
   Boot(
     registry: started.data,
@@ -616,6 +634,7 @@ pub fn boot_fails_when_store_unreachable_test() {
       factory_supervisor.get_by_name(factory_name),
       process.new_name("nexus_broken_registry"),
       broken,
+      fixture_resolver(),
     )
   case started {
     Ok(_) -> panic as "registry must not start with an unreachable store"

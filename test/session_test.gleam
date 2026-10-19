@@ -14,9 +14,6 @@ import nexus/transcript
 
 fn test_config() -> config.Config {
   config.Config(
-    base_url: "https://bifrost.example/v1",
-    api_key: "sk-test",
-    model_default: "test-alias",
     encryption_key: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
     sse_first_response_timeout_ms: 1000,
     stream_idle_timeout_ms: 1000,
@@ -53,7 +50,7 @@ fn stats() -> openai.StreamStats {
 
 /// Emits two token deltas then reports success.
 fn happy_runner(
-  _cfg,
+  _endpoint,
   tr,
   _cancel,
   on_event: fn(loop.LoopEvent) -> Nil,
@@ -65,7 +62,7 @@ fn happy_runner(
 
 /// Emits one token, then blocks until cancelled (Stop) or times out.
 fn blocking_runner(
-  _cfg,
+  _endpoint,
   tr,
   cancel: process.Subject(Nil),
   on_event: fn(loop.LoopEvent) -> Nil,
@@ -80,7 +77,7 @@ fn blocking_runner(
 
 /// Emits two deltas separated by a delay, making a TTFT regression visible.
 fn delayed_runner(
-  _cfg,
+  _endpoint,
   tr,
   _cancel,
   on_event: fn(loop.LoopEvent) -> Nil,
@@ -93,7 +90,7 @@ fn delayed_runner(
 
 /// Emits a token then fails: nothing may be committed.
 fn failing_runner(
-  _cfg,
+  _endpoint,
   _tr,
   _cancel,
   on_event: fn(loop.LoopEvent) -> Nil,
@@ -104,7 +101,7 @@ fn failing_runner(
 
 /// Kills its own (worker) process: the monitor path must convert this into
 /// a TurnFailed without hurting the session actor.
-fn crashing_runner(_cfg, _tr, _cancel, _on_event) -> session.TurnOutcome {
+fn crashing_runner(_endpoint, _tr, _cancel, _on_event) -> session.TurnOutcome {
   process.kill(process.self())
   session.StreamErrored("unreachable")
 }
@@ -140,7 +137,7 @@ fn counter_loop(subj: process.Subject(CounterMsg), count: Int) -> Nil {
 /// First turn streams normally, later turns fail: session A gets two metric
 /// samples while committing the same history as a single-turn session.
 fn flaky_runner(counter: process.Subject(CounterMsg)) -> session.TurnRunner {
-  fn(_cfg, tr, _cancel, on_event: fn(loop.LoopEvent) -> Nil) {
+  fn(_endpoint, tr, _cancel, on_event: fn(loop.LoopEvent) -> Nil) {
     let turn = process.call(counter, 1000, fn(reply) { Ping(reply) })
     on_event(loop.StreamEvent(openai.TokenDelta("Hello")))
     on_event(loop.StreamEvent(openai.TokenDelta(" world")))
@@ -186,8 +183,25 @@ fn expect_event(
   event
 }
 
+fn test_endpoint() -> openai.Endpoint {
+  openai.Endpoint(
+    base_url: "https://provider.example/v1",
+    api_key: None,
+    sse_first_response_timeout_ms: 1000,
+    stream_idle_timeout_ms: 1000,
+  )
+}
+
 fn start_with(runner: session.TurnRunner) -> process.Subject(session.Msg) {
-  let assert Ok(started) = session.start(test_config(), runner)
+  let assert Ok(started) =
+    session.start_with_spec(session.SessionSpec(
+      cfg: test_config(),
+      model: "test-alias",
+      endpoint: test_endpoint(),
+      runner: runner,
+      commit_hook: fn(_) { Nil },
+      hydrate: None,
+    ))
   started.data
 }
 
@@ -345,13 +359,13 @@ pub fn fan_out_to_all_subscribers_test() {
 // ---------------------------------------------------------------------------
 
 /// Step 1 (plan §7): the constructor takes the selected alias through the
-/// spec and must not touch `cfg.model_default`.
+/// spec; there is no config default to fall back to after the P3 hard cut.
 pub fn selected_alias_is_frozen_test() {
-  let cfg = config.Config(..test_config(), model_default: "default-alias")
   let spec =
     session.SessionSpec(
-      cfg: cfg,
+      cfg: test_config(),
       model: "chosen-alias",
+      endpoint: test_endpoint(),
       runner: happy_runner,
       commit_hook: fn(_) { Nil },
       hydrate: None,
@@ -367,12 +381,36 @@ pub fn selected_alias_is_frozen_test() {
   let _ = expect_event(sub)
   let _ = expect_event(sub)
 
-  // The transcript carries the selected alias, not the config default.
+  // The transcript carries the selected alias, never anything else —
+  // there is no config default to fall back to after the P3 hard cut.
   let tr = session.snapshot(sess)
   transcript.model(tr) |> should.equal("chosen-alias")
-  // ...and the config value itself is untouched (Config is immutable, but
-  // this pins the contract against a future mutation path).
-  cfg.model_default |> should.equal("default-alias")
+}
+
+/// P3 (multi-provider §8): the session hands its runner the FROZEN
+/// endpoint from the spec — one provider per session, for every turn of
+/// its lifetime. A swapped-in different endpoint must never reach an
+/// existing session's runner.
+pub fn runner_receives_frozen_endpoint_test() {
+  let seen = process.new_subject()
+  let capturing = fn(endpoint, tr, _cancel, _on_event) {
+    process.send(seen, endpoint)
+    session.StreamDone(stats(), transcript.append_assistant(tr, "ok"))
+  }
+  let spec =
+    session.SessionSpec(
+      cfg: test_config(),
+      model: "test-alias",
+      endpoint: test_endpoint(),
+      runner: capturing,
+      commit_hook: fn(_) { Nil },
+      hydrate: None,
+    )
+  let assert Ok(started) = session.start_with_spec(spec)
+  let sess = started.data
+  should.equal(session.send_message(sess, "hi"), session.Sent)
+  let assert Ok(endpoint) = process.receive(seen, 2000)
+  endpoint |> should.equal(test_endpoint())
 }
 
 /// A completed turn leaves exactly one `Completed` sample.
@@ -528,7 +566,7 @@ pub fn describe_reports_streaming_test() {
 /// A fake runner that walks one tool round: streams a fragment, assembles
 /// a call, runs nothing, reports the result, then finishes the turn.
 fn tool_round_runner(
-  _cfg,
+  _endpoint,
   tr,
   _cancel,
   on_event: fn(loop.LoopEvent) -> Nil,
@@ -646,7 +684,7 @@ pub fn tool_history_replays_on_rejoin_test() {
 }
 
 fn guard_runner(
-  _cfg,
+  _endpoint,
   tr,
   _cancel,
   on_event: fn(loop.LoopEvent) -> Nil,

@@ -22,6 +22,9 @@
 // Usage: node e2e/integration.spec.mjs
 // Env:   BIFROST_BASE_URL, BIFROST_API_KEY (defaults to the live gateway),
 //        SEARXNG_BASE_URL (default https://search.bytemonkey.org/).
+// The suite seeds the gateway as a provider row (nexus/dev_seed) before
+// booting the server — the provider table is the only provider source
+// since the P3 hard cut (no BIFROST_* env reaches the server).
 
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
@@ -33,6 +36,39 @@ const PORT = 18085;
 const BASE = `http://127.0.0.1:${PORT}`;
 const BIFROST = process.env.BIFROST_BASE_URL ?? "https://bifrost.bytemonkey.org/v1";
 const BIFROST_KEY = process.env.BIFROST_API_KEY ?? "none";
+const ENC_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
+const DATABASE_URL = "postgres://nexus@127.0.0.1:5433/nexus";
+
+/// Seed the live gateway as a provider row (key encrypted under the same
+/// master key the server boots with). Idempotent by name; re-points the
+/// base URL if BIFROST_BASE_URL changed.
+function seedProvider() {
+  return new Promise((resolve, reject) => {
+    const env = {
+      ...process.env,
+      DATABASE_URL,
+      NEXUS_ENCRYPTION_KEY: ENC_KEY,
+      NEXUS_SEED_PROVIDER_NAME: "bifrost",
+      NEXUS_SEED_PROVIDER_BASE_URL: BIFROST,
+    };
+    if (BIFROST_KEY && BIFROST_KEY !== "none") {
+      env.NEXUS_SEED_PROVIDER_API_KEY = BIFROST_KEY;
+    }
+    const child = spawn("gleam", ["run", "-m", "nexus/dev_seed"], {
+      cwd: ROOT,
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    child.stdout.on("data", (d) => (out += d));
+    child.stderr.on("data", (d) => (out += d));
+    child.on("exit", (code) =>
+      code === 0
+        ? resolve()
+        : reject(new Error(`dev_seed failed (${code}):\n${out}`)),
+    );
+  });
+}
 const SEARXNG = process.env.SEARXNG_BASE_URL ?? "https://search.bytemonkey.org/";
 // Public target: hosts on this network resolve to private ranges, which the
 // production-posture SSRF guard refuses by design (verified during this run).
@@ -120,11 +156,7 @@ async function waitHealthy(timeoutMs = 60_000) {
 function startNexus({ port = PORT, systemPrompt = SYSTEM_PROMPT } = {}) {
   const env = {
     ...process.env,
-    BIFROST_BASE_URL: BIFROST,
-    BIFROST_API_KEY: BIFROST_KEY,
-    NEXUS_ENCRYPTION_KEY:
-      "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
-    NEXUS_MODEL_DEFAULT: "smart",
+    NEXUS_ENCRYPTION_KEY: ENC_KEY,
     NEXUS_HTTP_BIND: "127.0.0.1",
     NEXUS_HTTP_PORT: String(port),
     NEXUS_UI_TOKEN: TOKEN,
@@ -275,6 +307,7 @@ async function main() {
   console.log(`integration smoke`);
   console.log(`  bifrost: ${BIFROST}`);
   console.log(`  searxng: ${SEARXNG}`);
+  await seedProvider();
   const nexus = startNexus();
   const cacheCapture = { alias: null, system: null, turns: [], metrics: [], usage: [] };
   const cacheSessions = [];

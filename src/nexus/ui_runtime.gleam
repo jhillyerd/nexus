@@ -20,7 +20,7 @@ import lustre
 import lustre/component
 import lustre/server_component.{type ClientMessage}
 import mist
-import nexus/config.{type Config}
+import nexus/provider_registry
 import nexus/session_registry
 import nexus/ui
 
@@ -51,10 +51,13 @@ pub fn app(name: ComponentName) -> lustre.App(Flags, ui.Model, ui.Msg) {
 /// and before Mist (the WebSocket handler looks it up by name).
 pub fn supervised(
   name: ComponentName,
-  cfg: Config,
   registry: Subject(session_registry.Msg),
+  providers: Subject(provider_registry.Msg),
 ) -> supervision.ChildSpecification(Subject(lustre.RuntimeMessage(ui.Msg))) {
-  lustre.supervised(app(name), ui.Flags(cfg: cfg, registry: registry))
+  lustre.supervised(
+    app(name),
+    ui.Flags(registry: registry, providers: providers),
+  )
 }
 
 // ---------------------------------------------------------------------------

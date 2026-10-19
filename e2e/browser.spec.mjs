@@ -127,14 +127,43 @@ async function waitHealthy(port, timeoutMs = 30_000) {
   throw new Error(`nexus on :${port} never became healthy`);
 }
 
+const ENC_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
+const DATABASE_URL = "postgres://nexus@127.0.0.1:5433/nexus";
+
+/// Seed (or re-point) the suite's keyless provider. The provider table is
+/// the only provider source since the P3 hard cut — nexus reads no
+/// BIFROST_* env anymore — so the fake endpoint has to be a row first.
+/// dev_seed is idempotent by name and re-points base_url when the fake's
+/// port changed between runs.
+function seedProvider(bifrostPort) {
+  const env = {
+    ...process.env,
+    DATABASE_URL,
+    NEXUS_ENCRYPTION_KEY: ENC_KEY,
+    NEXUS_SEED_PROVIDER_NAME: "fake",
+    NEXUS_SEED_PROVIDER_BASE_URL: `http://127.0.0.1:${bifrostPort}/v1`,
+  };
+  return new Promise((resolve, reject) => {
+    const child = spawn("gleam", ["run", "-m", "nexus/dev_seed"], {
+      cwd: ROOT,
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    child.stdout.on("data", (d) => (out += d));
+    child.stderr.on("data", (d) => (out += d));
+    child.on("exit", (code) =>
+      code === 0
+        ? resolve()
+        : reject(new Error(`dev_seed failed (${code}):\n${out}`)),
+    );
+  });
+}
+
 function startNexus({ port, bifrostPort, searxPort, maxToolIterations }) {
   const env = {
     ...process.env,
-    BIFROST_BASE_URL: `http://127.0.0.1:${bifrostPort}/v1`,
-    BIFROST_API_KEY: "none",
-    NEXUS_ENCRYPTION_KEY:
-      "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
-    NEXUS_MODEL_DEFAULT: "smart",
+    NEXUS_ENCRYPTION_KEY: ENC_KEY,
     NEXUS_HTTP_BIND: "127.0.0.1",
     NEXUS_HTTP_PORT: String(port),
     NEXUS_UI_TOKEN: TOKEN,
@@ -221,6 +250,7 @@ async function main() {
   const services = await startServices();
   const mainPort = 18081;
   const guardPort = 18082;
+  await seedProvider(services.bifrostPort);
   const main = startNexus({ port: mainPort, maxToolIterations: 8, ...pick(services) });
   let guard = startNexus({ port: guardPort, maxToolIterations: 2, ...pick(services) });
   const base = `http://127.0.0.1:${mainPort}`;
@@ -257,12 +287,31 @@ async function main() {
       eq(res.status(), 200, "authenticated status");
       assert((await res.text()).includes("lustre-server-component"), "component host element");
     });
-    await test("auth: models api requires token", async () => {
-      eq((await page.request.get(base + "/models")).status(), 401, "no-token models");
-      const res = await page.request.get(`${base}/models`, { headers: { authorization: `Bearer ${TOKEN}` } });
-      eq(res.status(), 200, "bearer models");
-      const body = await res.json();
-      assert(body.models.includes("smart") && body.models.includes("fast"), "aliases");
+    await test("auth: session create pins provider + model (no token → 401)", async () => {
+      // GET /models is gone (P3 hard cut: no default provider); the
+      // create route is the scripted surface now.
+      eq((await page.request.get(base + "/models")).status(), 401, "no-token models gone");
+      eq((await page.request.get(`${base}/models`, { headers: { authorization: `Bearer ${TOKEN}` } })).status, 404, "models route removed");
+      const no = await page.request.post(`${base}/sessions`, {
+        data: { provider: "fake", model: "smart" },
+      });
+      eq(no.status(), 401, "no-token create");
+      const res = await page.request.post(`${base}/sessions`, {
+        headers: { authorization: `Bearer ${TOKEN}` },
+        data: { provider: "fake", model: "smart" },
+      });
+      eq(res.status(), 201, "bearer create pins fake/smart");
+      const unknown = await page.request.post(`${base}/sessions`, {
+        headers: { authorization: `Bearer ${TOKEN}` },
+        data: { provider: "nope", model: "smart" },
+      });
+      eq(unknown.status(), 400, "unknown provider refused");
+      // Leave no row behind: the next test asserts an empty session list.
+      const created = await res.json();
+      const gone = await page.request.delete(`${base}/sessions/${created.id}`, {
+        headers: { authorization: `Bearer ${TOKEN}` },
+      });
+      eq(gone.status(), 204, "created session cleaned up");
     });
 
     // -- 2. page load: shell, websocket, aliases, empty session list -------

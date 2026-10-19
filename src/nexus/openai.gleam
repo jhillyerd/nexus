@@ -35,7 +35,6 @@ import glopenai/chat
 import glopenai/config.{type Config as OpenAiConfig} as oai_config
 import glopenai/model
 import glopenai/shared.{type CompletionUsage}
-import nexus/config.{type Config}
 import nexus/hackney
 import nexus/timing
 import nexus/transcript.{type Options, type Transcript}
@@ -87,10 +86,10 @@ pub type StreamError {
 
 /// Runtime identity of one OpenAI-compatible endpoint: where to send, how
 /// to authenticate, and the stream timeouts to enforce. Deliberately
-/// narrow — callers holding the full server `Config` derive it via
-/// `endpoint_from_config`, while standalone tools (the TTFT audit
-/// harness) build it from their own configuration and never touch the
-/// server config surface.
+/// narrow — the server resolves one per session from the provider
+/// registry (frozen at session creation), while standalone tools (the
+/// TTFT audit harness) build it from their own configuration and never
+/// touch the server config surface.
 pub type Endpoint {
   Endpoint(
     /// OpenAI-compatible base URL including the `/v1` suffix.
@@ -101,16 +100,6 @@ pub type Endpoint {
     sse_first_response_timeout_ms: Int,
     /// Receive timeout between SSE events mid-stream, in ms.
     stream_idle_timeout_ms: Int,
-  )
-}
-
-/// Derive the transport endpoint from the server configuration.
-pub fn endpoint_from_config(cfg: Config) -> Endpoint {
-  Endpoint(
-    base_url: cfg.base_url,
-    api_key: Some(cfg.api_key),
-    sse_first_response_timeout_ms: cfg.sse_first_response_timeout_ms,
-    stream_idle_timeout_ms: cfg.stream_idle_timeout_ms,
   )
 }
 
