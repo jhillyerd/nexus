@@ -3,6 +3,12 @@
 //// and their monitors, and the child-start specification handed to the
 //// factory supervisor.
 ////
+//// Multi-provider P3: creation and lazy hydration resolve each session's
+//// provider id into a FROZEN `openai.Endpoint` through an injected
+//// resolver (boot maps `nexus/provider_registry`; tests inject a pure
+//// fn) — a session only ever exists with its (provider, model) pin in
+//// place, and the endpoint rides the spec for the actor's whole life.
+////
 //// Supervision model (M2 §4.1): session children run under the named
 //// factory supervisor with a **temporary** restart strategy, so the factory
 //// never silently replaces a PID behind our back. The registry owns the
@@ -46,6 +52,7 @@ import gleam/otp/supervision
 import gleam/result
 import gleam/string
 import nexus/config.{type Config}
+import nexus/openai
 import nexus/session
 import nexus/store.{type Store, type StoredSummary}
 import nexus/timing
@@ -74,8 +81,31 @@ pub type SessionRecord {
 /// maps onto a status code.
 pub type CreateError {
   EmptyModel
+  /// The pinned provider could not be resolved into a streaming
+  /// endpoint (unknown / disabled / key unavailable). Carries the typed
+  /// reason so callers can answer 400 vs 502 without string matching.
+  ProviderFailed(ProviderError)
   StartFailed(reason: String)
 }
+
+/// Why a provider id could not be turned into a frozen endpoint. The
+/// registry's own vocabulary, decoupled from `nexus/provider_registry`
+/// (the resolver is an injected fn; boot maps the registry's errors onto
+/// these, tests build them directly).
+pub type ProviderError {
+  ProviderUnknown
+  ProviderDisabled
+  /// The stored envelope failed authentication (a rotated-away master
+  /// key or a tampered row): the session cannot stream until an operator
+  /// intervenes. Surfaced as a server-side failure, not a client error.
+  ProviderKeyUnavailable
+}
+
+/// The provider seam: `provider_id` → the endpoint a session freezes for
+/// its lifetime. Production resolves through `nexus/provider_registry`;
+/// tests inject a pure fn.
+pub type ResolveProvider =
+  fn(String) -> Result(openai.Endpoint, ProviderError)
 
 pub type Msg {
   /// Start a new session pinned to `provider_id` + `model` using the
@@ -161,6 +191,9 @@ type State {
     /// every session this registry starts (create, restart, replacement)
     /// gets the identical tool schema.
     runner: session.TurnRunner,
+    /// The provider seam: resolves the endpoint frozen into each session
+    /// spec at create and lazy-hydration time.
+    resolve_provider: ResolveProvider,
     factory: Factory,
     sessions: Dict(String, Record),
     /// Phase 2: stored-but-not-live sessions (boot hydration). The first
@@ -232,6 +265,7 @@ pub fn start(
   factory: Factory,
   name: process.Name(Msg),
   persistence: Store,
+  resolve_provider: ResolveProvider,
 ) -> actor.StartResult(Subject(Msg)) {
   // The tool registry is built once, here, from the global config — before
   // any session exists — so every request any session of this VM ever
@@ -241,7 +275,8 @@ pub fn start(
     factory,
     name,
     persistence,
-    session.agent_runner(cfg, tools.default(cfg)),
+    session.agent_runner(cfg.max_tool_iterations, tools.default(cfg)),
+    resolve_provider,
   )
 }
 
@@ -254,6 +289,7 @@ pub fn start_with_runner(
   name: process.Name(Msg),
   persistence: Store,
   runner: session.TurnRunner,
+  resolve_provider: ResolveProvider,
 ) -> actor.StartResult(Subject(Msg)) {
   let builder =
     actor.new_with_initialiser(5000, fn(self) {
@@ -274,6 +310,7 @@ pub fn start_with_runner(
           actor.initialised(State(
             cfg: cfg,
             runner: runner,
+            resolve_provider: resolve_provider,
             factory: factory,
             sessions: dict.new(),
             dormant: dormant,
@@ -387,87 +424,98 @@ fn handle_create(
       process.send(reply, Error(EmptyModel))
       actor.continue(state)
     }
-    alias -> {
-      let counter = state.counter + 1
-      let id = "s" <> int.to_string(counter)
-      let name = process.new_name("nexus_session_" <> id)
-      let spec =
-        session.SessionSpec(
-          cfg: state.cfg,
-          model: alias,
-          runner: runner,
-          commit_hook: commit_hook_for(state.store, id),
-          hydrate: None,
-        )
-      case
-        factory_supervisor.start_child(
-          state.factory,
-          ChildArgument(spec:, name:),
-        )
-      {
-        Ok(started) -> {
-          let created_at = timing.wall_now_s()
-          // Write-through: the session row lands now, with the frozen
-          // alias and the frozen system prompt (contract rule 2), so
-          // hydration can rebuild the frozen prefix byte-identically.
-          let persisted = case
-            state.store.insert_session(
-              store.StoredSummary(
-                id: id,
-                provider_id: provider_id,
-                title: "",
-                title_source: session.AutoTitle,
-                model: alias,
-                pinned: False,
-                archived: False,
-                tags: [],
-                created_at: created_at,
-                last_active_at: created_at,
-                // 1 = the system prompt (Phase 1 message_count).
-                message_count: 1,
-              ),
-              state.cfg.system_prompt,
-            )
-          {
-            Ok(_) -> True
-            Error(error) -> {
-              log_store_error("insert_session " <> id, error)
-              False
-            }
-          }
-          let record =
-            Record(
-              id: id,
-              model: alias,
-              subject: started.data,
-              pid: started.pid,
-              monitor: process.monitor(started.pid),
-              spec: spec,
-              name: name,
-              start_error: None,
-              title: "",
-              title_source: session.AutoTitle,
-              pinned: False,
-              tags: [],
-              archived: False,
-              created_at: created_at,
-              persisted: persisted,
-            )
-          process.send(reply, Ok(as_public(record)))
-          actor.continue(
-            State(
-              ..state,
-              sessions: dict.insert(state.sessions, id, record),
-              counter: counter,
-            ),
-          )
-        }
+    alias ->
+      // Resolve the endpoint FIRST: a session is only ever created with
+      // its frozen (provider, model) pin in place — there is no
+      // create-then-attach path (multi-provider plan §8).
+      case state.resolve_provider(provider_id) {
         Error(reason) -> {
-          process.send(reply, Error(StartFailed(string.inspect(reason))))
+          process.send(reply, Error(ProviderFailed(reason)))
           actor.continue(state)
         }
+        Ok(endpoint) -> {
+          let counter = state.counter + 1
+          let id = "s" <> int.to_string(counter)
+          let name = process.new_name("nexus_session_" <> id)
+          let spec =
+            session.SessionSpec(
+              cfg: state.cfg,
+              model: alias,
+              endpoint: endpoint,
+              runner: runner,
+              commit_hook: commit_hook_for(state.store, id),
+              hydrate: None,
+            )
+          case
+            factory_supervisor.start_child(
+              state.factory,
+              ChildArgument(spec:, name:),
+            )
+          {
+            Ok(started) -> {
+              let created_at = timing.wall_now_s()
+              // Write-through: the session row lands now, with the frozen
+              // alias and the frozen system prompt (contract rule 2), so
+              // hydration can rebuild the frozen prefix byte-identically.
+              let persisted = case
+                state.store.insert_session(
+                  store.StoredSummary(
+                    id: id,
+                    provider_id: provider_id,
+                    title: "",
+                    title_source: session.AutoTitle,
+                    model: alias,
+                    pinned: False,
+                    archived: False,
+                    tags: [],
+                    created_at: created_at,
+                    last_active_at: created_at,
+                    // 1 = the system prompt (Phase 1 message_count).
+                    message_count: 1,
+                  ),
+                  state.cfg.system_prompt,
+                )
+              {
+                Ok(_) -> True
+                Error(error) -> {
+                  log_store_error("insert_session " <> id, error)
+                  False
+                }
+              }
+              let record =
+                Record(
+                  id: id,
+                  model: alias,
+                  subject: started.data,
+                  pid: started.pid,
+                  monitor: process.monitor(started.pid),
+                  spec: spec,
+                  name: name,
+                  start_error: None,
+                  title: "",
+                  title_source: session.AutoTitle,
+                  pinned: False,
+                  tags: [],
+                  archived: False,
+                  created_at: created_at,
+                  persisted: persisted,
+                )
+              process.send(reply, Ok(as_public(record)))
+              actor.continue(
+                State(
+                  ..state,
+                  sessions: dict.insert(state.sessions, id, record),
+                  counter: counter,
+                ),
+              )
+            }
+            Error(reason) -> {
+              process.send(reply, Error(StartFailed(string.inspect(reason))))
+              actor.continue(state)
+            }
+          }
+        }
       }
-    }
   }
 }
 
@@ -818,59 +866,87 @@ fn rebuild_transcript(state: State, id: String) -> Result(Transcript, String) {
 /// store. Replies through the returned state transition; unknown-store
 /// failures keep the session dormant (the next Get retries).
 fn lazy_start(state: State, summary: StoredSummary) -> Resolved {
-  case rebuild_transcript(state, summary.id) {
-    Error(error) -> {
-      log_store_error("lazy_start " <> summary.id, error)
+  // The dormant row pins its provider: resolve the endpoint by the
+  // persisted id, exactly like create did. A provider that went away
+  // (disabled, or its envelope no longer decrypts) keeps the session
+  // dormant rather than starting an actor that cannot stream — the same
+  // Get later (e.g. after re-enabling) retries it.
+  case state.resolve_provider(summary.provider_id) {
+    Error(reason) -> {
+      io.println(
+        "nexus registry: lazy_start "
+        <> summary.id
+        <> " failed: provider "
+        <> summary.provider_id
+        <> " cannot stream ("
+        <> case reason {
+          ProviderUnknown -> "unknown"
+          ProviderDisabled -> "disabled"
+          ProviderKeyUnavailable -> "key unavailable"
+        }
+        <> "); session stays dormant",
+      )
       Missing
     }
-    Ok(transcript) -> {
-      let spec =
-        session.SessionSpec(
-          cfg: state.cfg,
-          model: summary.model,
-          runner: state.runner,
-          commit_hook: commit_hook_for(state.store, summary.id),
-          hydrate: Some(transcript),
-        )
-      let argument =
-        ChildArgument(
-          spec: spec,
-          name: process.new_name("nexus_session_" <> summary.id),
-        )
-      case restart(state.factory, argument) {
-        Ok(started) -> {
-          let record =
-            Record(
-              id: summary.id,
-              model: summary.model,
-              subject: started.data,
-              pid: started.pid,
-              monitor: process.monitor(started.pid),
-              spec: spec,
-              name: argument.name,
-              start_error: None,
-              title: summary.title,
-              title_source: summary.title_source,
-              pinned: summary.pinned,
-              tags: summary.tags,
-              archived: summary.archived,
-              created_at: summary.created_at,
-              persisted: True,
-            )
-          Started(
-            State(
-              ..state,
-              sessions: dict.insert(state.sessions, summary.id, record),
-              dormant: dict.delete(state.dormant, summary.id),
-            ),
-          )
-        }
-        Error(reason) -> {
-          log_store_error("lazy_start " <> summary.id, string.inspect(reason))
+    Ok(endpoint) ->
+      case rebuild_transcript(state, summary.id) {
+        Error(error) -> {
+          log_store_error("lazy_start " <> summary.id, error)
           Missing
         }
+        Ok(transcript) -> {
+          let spec =
+            session.SessionSpec(
+              cfg: state.cfg,
+              model: summary.model,
+              endpoint: endpoint,
+              runner: state.runner,
+              commit_hook: commit_hook_for(state.store, summary.id),
+              hydrate: Some(transcript),
+            )
+          let argument =
+            ChildArgument(
+              spec: spec,
+              name: process.new_name("nexus_session_" <> summary.id),
+            )
+          case restart(state.factory, argument) {
+            Ok(started) -> {
+              let record =
+                Record(
+                  id: summary.id,
+                  model: summary.model,
+                  subject: started.data,
+                  pid: started.pid,
+                  monitor: process.monitor(started.pid),
+                  spec: spec,
+                  name: argument.name,
+                  start_error: None,
+                  title: summary.title,
+                  title_source: summary.title_source,
+                  pinned: summary.pinned,
+                  tags: summary.tags,
+                  archived: summary.archived,
+                  created_at: summary.created_at,
+                  persisted: True,
+                )
+              Started(
+                State(
+                  ..state,
+                  sessions: dict.insert(state.sessions, summary.id, record),
+                  dormant: dict.delete(state.dormant, summary.id),
+                ),
+              )
+            }
+            Error(reason) -> {
+              log_store_error(
+                "lazy_start " <> summary.id,
+                string.inspect(reason),
+              )
+              Missing
+            }
+          }
+        }
       }
-    }
   }
 }
 

@@ -44,6 +44,41 @@ when the generated module is stale. Schema changes: edit
 `gleam run -m nexus/store/migrate` (idempotent) or
 `docker compose exec nexus-db psql -U nexus -d nexus -f /docker-entrypoint-initdb.d/schema.sql`.
 
+## Providers
+
+nexus talks to N OpenAI-compatible `/v1` endpoints ("providers"). Each
+one is a row in the `provider` table with its base URL, an optional API
+key stored as AES-256-GCM ciphertext (encrypted under `NEXUS_ENCRYPTION_KEY`,
+AAD = provider id), and an `enabled` flag. Keyless providers (local
+Ollama / llama.cpp / vLLM) are first-class: no key, no `Authorization`
+header on the wire.
+
+Every session **pins one `(provider, model)` pair at creation** — frozen
+like the system prompt for the session's lifetime (KV-cache contract).
+Changing provider or model means creating a new session.
+
+A fresh database has zero providers, and the server boots fine that way
+(zero sessions too — nothing auto-creates). Until the provider CRUD HTTP
+API and settings UI land (P4/P5 of the multi-provider plan), seed the
+first provider out-of-band:
+
+```sh
+DATABASE_URL=postgres://nexus@127.0.0.1:5433/nexus \
+NEXUS_ENCRYPTION_KEY="$NEXUS_ENCRYPTION_KEY" \
+NEXUS_SEED_PROVIDER_NAME=bifrost \
+NEXUS_SEED_PROVIDER_BASE_URL=https://gateway.example/v1 \
+gleam run -m nexus/dev_seed
+
+# keyless provider? add NEXUS_SEED_PROVIDER_API_KEY=sk-… to the block
+# (omit it entirely — or leave it blank — to keep/create a keyless row)
+```
+
+The tool is idempotent by name (re-running reports "nothing to do"), and
+the key never appears in its output. Seed **before** booting the server
+or restart it afterwards — the provider registry loads the table once at
+start (a bad envelope fails boot loudly). The chat UI auto-targets the
+first enabled provider until the P5 picker lands.
+
 ## The UI
 
 The page is a Lustre **server component**: the Elm-architecture model
@@ -109,11 +144,16 @@ All routes except `GET /healthz` require the configured token when
 - `GET /` — authenticated chat page (Lustre server-component shell)
 - `GET /ws` — the server component's WebSocket transport
 - `GET /lustre/runtime.mjs` — the Lustre client runtime asset
-- `GET /models` — current Bifrost aliases: `{"models":["…"]}`
 - `GET /sessions` — summaries, pinned first then most recently active
   (default: active only)
 - `GET /sessions?archived=1` — archived summaries only
-- `POST /sessions` `{"model":"alias"}` — validate against Bifrost and create
+- `POST /sessions` `{"provider":"id-or-name","model":"alias"}` — both
+  required: the provider is resolved by id or name (unknown/disabled →
+  `400`), the alias validated against that provider's live model list,
+  and the `(provider, model)` pair pinned for the session's lifetime.
+  (There is no longer a global `GET /models` — with N providers there is
+  no default endpoint to answer it; the provider-scoped route lands with
+  the provider CRUD API.)
 - `PATCH /sessions/<id>` `{"title?","pinned?","tags?","archived?"}` — update
   metadata (present keys only; `title` implies a manual rename) → updated
   summary. Invariant: an archived session is never pinned — archiving
@@ -133,10 +173,10 @@ Playwright suites drive turns through `/send` and poll `/sessions`).
 Examples:
 
 ```sh
-curl -H "Authorization: Bearer $NEXUS_UI_TOKEN" "$BASE/models"
-curl -H "Authorization: Bearer $NEXUS_UI_TOKEN" "$BASE/sessions" \
+curl -H "Authorization: Bearer $NEXUS_UI_TOKEN" \
   -H 'content-type: application/json' \
-  -d "{\"model\":\"$NEXUS_MODEL_DEFAULT\"}"
+  -d "{\"provider\":\"$PROVIDER\",\"model\":\"$MODEL\"}" \
+  "$BASE/sessions"
 ```
 
 Verification lives in `e2e/` (see `e2e/README.md`): a Playwright browser
@@ -148,10 +188,12 @@ Bifrost/SearxNG, and the production cache check whose golden fixture is
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `BIFROST_BASE_URL` | — | Bifrost base URL **including `/v1`** (required) |
-| `BIFROST_API_KEY` | — | bearer token (required) |
-| `NEXUS_MODEL_DEFAULT` | — | model alias used when a session is created without an explicit model (required) |
 | `NEXUS_ENCRYPTION_KEY` | — | master key for provider API keys at rest: base64 of exactly 32 random bytes (`openssl rand -base64 32`, required) |
+
+The single-provider env trio (`BIFROST_BASE_URL`, `BIFROST_API_KEY`,
+`NEXUS_MODEL_DEFAULT`) is gone: the `provider` table in Postgres is the
+only provider source, and every session pins its `(provider, model)`
+pair explicitly at creation (see `docs/plans/multi-provider.md`).
 | `NEXUS_HTTP_BIND` | `127.0.0.1` | server bind (loopback per PRD) |
 | `NEXUS_HTTP_PORT` | `8080` | server port |
 | `NEXUS_UI_TOKEN` | unset | single-user bearer token; unset disables auth |

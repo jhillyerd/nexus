@@ -26,9 +26,6 @@ const key_b64 = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
 
 fn test_config() -> config.Config {
   config.Config(
-    base_url: "https://bifrost.example/v1",
-    api_key: "sk-test",
-    model_default: "default-alias",
     encryption_key: key_b64,
     sse_first_response_timeout_ms: 1000,
     stream_idle_timeout_ms: 1000,
@@ -137,7 +134,7 @@ pub fn create_masks_and_persists_ciphertext_test() {
       provider_registry.Create(
         provider.ProviderParams(
           name: "  Bifrost ",
-          base_url: "https://api.example/v1/",
+          base_url: "https://api.example/v1",
           api_key: Some("sk-live-007"),
         ),
         r,

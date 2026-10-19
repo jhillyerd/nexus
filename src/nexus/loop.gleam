@@ -28,7 +28,6 @@ import gleam/option.{type Option, None, Some}
 import gleam/string
 import glopenai/chat
 import glopenai/shared
-import nexus/config.{type Config}
 import nexus/openai
 import nexus/tool_calls.{type Accumulator}
 import nexus/tools.{type ToolSpec}
@@ -76,9 +75,11 @@ pub type LoopOutcome {
   LoopFailed(reason: String)
 }
 
-/// Production stream seam over the transport module.
-pub fn bifrost_stream(cfg: Config) -> StreamFn {
-  let endpoint = openai.endpoint_from_config(cfg)
+/// Production stream seam over the transport module. The endpoint is the
+/// session's frozen one (resolved from the provider registry at creation
+/// and never swapped — the multi-provider plan §8): one session, one
+/// endpoint, for every round-trip of every turn.
+pub fn endpoint_stream(endpoint: openai.Endpoint) -> StreamFn {
   fn(tr, opts, on_event, cancel) {
     openai.stream_with_cancel(endpoint, tr, opts, on_event, cancel)
   }

@@ -174,18 +174,20 @@ pub fn patch_body_decoders_test() {
 pub fn request_body_decoders_test() {
   web.parse_text_json("{\"text\":\"hello\"}")
   |> should.equal(Ok("hello"))
-  web.parse_model_json("{\"model\":\"alias-a\"}")
-  |> should.equal(Ok("alias-a"))
+  // POST /sessions now pins provider + model (multi-provider §11).
+  web.parse_create_json("{\"provider\":\"p1\",\"model\":\"alias-a\"}")
+  |> should.equal(Ok(web.CreateFields(provider: "p1", model: "alias-a")))
   web.parse_text_json("{\"model\":\"alias-a\"}")
   |> should.equal(Error(Nil))
-  web.parse_model_json("{\"text\":\"hello\"}")
+  web.parse_create_json("{\"model\":\"alias-a\"}")
+  |> should.equal(Error(Nil))
+  web.parse_create_json("{\"provider\":\"p1\"}")
   |> should.equal(Error(Nil))
 }
 
 pub fn protected_route_matrix_test() {
   [
     #(Get, []),
-    #(Get, ["models"]),
     #(Get, ["sessions"]),
     #(Post, ["sessions"]),
     #(Post, ["sessions", "s-1", "send"]),
@@ -204,7 +206,9 @@ pub fn protected_route_matrix_test() {
   })
   web.requires_auth(Get, ["healthz"]) |> should.be_false
   web.requires_auth(Get, ["nope"]) |> should.be_false
-  web.requires_auth(Patch, ["models"]) |> should.be_false
+  // GET /models was removed at the P3 hard cut (no default provider);
+  // an unknown path stays unprotected-but-404 like before.
+  web.requires_auth(Get, ["models"]) |> should.be_false
   web.requires_auth(Delete, ["models"]) |> should.be_false
 }
 

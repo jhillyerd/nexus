@@ -89,9 +89,12 @@ pub type TurnOutcome {
 
 /// A blocking turn runner. Runs inside a dedicated worker process; must
 /// honour the cancel subject (see `agent_runner` for the real one and the
-/// tests for fakes).
+/// tests for fakes). The endpoint is the session's frozen provider
+/// endpoint — resolved once at create/hydration, never swapped mid-session
+/// (multi-provider plan §8; a provider change is a fork, not an edit).
 pub type TurnRunner =
-  fn(Config, Transcript, Subject(Nil), fn(loop.LoopEvent) -> Nil) -> TurnOutcome
+  fn(openai.Endpoint, Transcript, Subject(Nil), fn(loop.LoopEvent) -> Nil) ->
+    TurnOutcome
 
 pub type SendResult {
   Sent
@@ -100,7 +103,12 @@ pub type SendResult {
 
 /// Everything needed to construct one session actor. The alias is frozen at
 /// construction (M2 §4.1): the transcript is created from `model`, never
-/// from `cfg.model_default`, and the config itself is never mutated.
+/// from a config default, and the config itself is never mutated.
+///
+/// Multi-provider P3 adds the second frozen half of the pin: `endpoint`,
+/// the provider transport resolved by the registry at create/hydration
+/// and held for the session's lifetime. Together `model` + `endpoint`
+/// fix every request byte of the session (KV-cache contract rule 5).
 ///
 /// Phase 2 adds two seams, both injected by the registry so this module
 /// never depends on it (dependency direction stays registry → session):
@@ -117,6 +125,8 @@ pub type SessionSpec {
   SessionSpec(
     cfg: Config,
     model: String,
+    /// The frozen provider endpoint — what the runner streams through.
+    endpoint: openai.Endpoint,
     runner: TurnRunner,
     /// Write-behind observer; `fn(_) { Nil }` when nobody persists.
     commit_hook: fn(Transcript) -> Nil,
@@ -235,6 +245,7 @@ const metrics_cap = 20
 type State {
   State(
     cfg: Config,
+    endpoint: openai.Endpoint,
     runner: TurnRunner,
     transcript: Transcript,
     subs: List(Subject(SessionEvent)),
@@ -252,15 +263,21 @@ type State {
 
 /// The real turn runner (M3): the bounded agent loop over the frozen tool
 /// registry. `specs` is built once at boot from the global config — never
-/// per session — so the tool schema is identical in every request.
-pub fn agent_runner(cfg: Config, specs: List(tools.ToolSpec)) -> TurnRunner {
-  let max_iterations = cfg.max_tool_iterations
-  fn(cfg, tr, cancel, on_event) {
+/// per session — so the tool schema is identical in every request; the
+/// endpoint arrives per call and is the session's frozen one.
+pub fn agent_runner(
+  max_iterations: Int,
+  specs: List(tools.ToolSpec),
+) -> TurnRunner {
+  fn(endpoint, tr, cancel, on_event) {
     case
       loop.run(
         specs,
         max_iterations,
-        loop.bifrost_stream(cfg),
+        // The session's frozen endpoint threads straight through: one
+        // provider per session for every iteration of every turn
+        // (byte-identical prefixes, single encode path).
+        loop.endpoint_stream(endpoint),
         tr,
         cancel,
         on_event,
@@ -279,22 +296,6 @@ pub fn start_with_spec(spec: SessionSpec) -> actor.StartResult(Subject(Msg)) {
   start_builder(spec) |> actor.start
 }
 
-/// Convenience constructor for tests and single-session boot: the spec's
-/// model is `cfg.model_default`, so existing callers stay unchanged. No
-/// commit hook, no hydration — plain Phase 1 semantics.
-pub fn start(
-  cfg: Config,
-  runner: TurnRunner,
-) -> actor.StartResult(Subject(Msg)) {
-  start_with_spec(SessionSpec(
-    cfg:,
-    model: cfg.model_default,
-    runner:,
-    commit_hook: fn(_) { Nil },
-    hydrate: None,
-  ))
-}
-
 /// Child specification for the supervision tree (boot).
 pub fn supervised(
   spec: SessionSpec,
@@ -309,6 +310,7 @@ fn start_builder(spec: SessionSpec) {
   let SessionSpec(
     cfg: cfg,
     model: model,
+    endpoint: endpoint,
     runner: runner,
     commit_hook: commit_hook,
     hydrate: hydrate,
@@ -316,10 +318,11 @@ fn start_builder(spec: SessionSpec) {
   actor.new_with_initialiser(1000, fn(self) {
     actor.initialised(State(
       cfg: cfg,
+      endpoint: endpoint,
       runner: runner,
       // The selected alias is frozen into the transcript (M2 §4.1);
-      // cfg.model_default is only what `start` defaults the spec to. A
-      // hydrated session starts from the rebuilt transcript — built by
+      // the provider endpoint is frozen beside it (multi-provider §8).
+      // A hydrated session starts from the rebuilt transcript — built by
       // the very same `transcript.new` + `append_*` path, so the actor
       // re-encodes byte-identically (KV-cache contract).
       transcript: case hydrate {
@@ -443,7 +446,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
               let on_event = fn(event) {
                 process.send(state.self, WorkerEvent(pid, event))
               }
-              let outcome = state.runner(state.cfg, tr, cancel, on_event)
+              let outcome = state.runner(state.endpoint, tr, cancel, on_event)
               process.send(state.self, WorkerDone(pid, outcome))
             })
           let monitor = process.monitor(worker)

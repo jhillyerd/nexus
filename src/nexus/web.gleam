@@ -23,8 +23,9 @@ import gleam/result
 import gleam/string
 import mist
 import nexus/config.{type Config}
-import nexus/openai
 import nexus/page
+import nexus/provider
+import nexus/provider_registry
 import nexus/session
 import nexus/session_registry
 import nexus/timing
@@ -32,20 +33,25 @@ import nexus/ui_runtime
 
 /// Registry-backed handler. Sessions are resolved by ID at request time so
 /// HTTP traffic reaches the live actor after a registry-owned restart.
+/// `providers_name` resolves the provider registry the session-create
+/// path validates against (multi-provider plan §11).
 pub fn handler(
   cfg: Config,
   registry_name: process.Name(session_registry.Msg),
+  providers_name: process.Name(provider_registry.Msg),
   component_name: ui_runtime.ComponentName,
 ) -> fn(Request(mist.Connection)) -> Response(mist.ResponseData) {
   let registry = process.named_subject(registry_name)
+  let providers = process.named_subject(providers_name)
   fn(req: Request(mist.Connection)) -> Response(mist.ResponseData) {
     case req.method, request.path_segments(req) {
       Get, [] -> protected(cfg, req, fn() { page_response(cfg.ui_token) })
-      Get, ["models"] -> protected(cfg, req, fn() { models_response(cfg) })
       Get, ["sessions"] ->
         protected(cfg, req, fn() { sessions_response(registry, req) })
       Post, ["sessions"] ->
-        protected(cfg, req, fn() { create_session_response(cfg, req, registry) })
+        protected(cfg, req, fn() {
+          create_session_response(cfg, req, registry, providers)
+        })
       Patch, ["sessions", id] ->
         protected(cfg, req, fn() { patch_session_response(req, registry, id) })
       Delete, ["sessions", id] ->
@@ -116,13 +122,10 @@ fn with_session(
   }
 }
 
-fn models_response(cfg: Config) -> Response(mist.ResponseData) {
-  case openai.list_models(openai.endpoint_from_config(cfg)) {
-    Ok(models) -> json_response(200, models_json(models))
-    Error(_) ->
-      json_response(502, err_json("unable to list models from Bifrost"))
-  }
-}
+// GET /models is gone (multi-provider §11): with N providers there is
+// no "default" endpoint to answer it — callers ask the provider-scoped
+// surface instead (P4's GET /providers/<id>/models; the registry's
+// ListModels message already exists).
 
 fn sessions_response(
   registry: process.Subject(session_registry.Msg),
@@ -154,57 +157,89 @@ fn create_session_response(
   cfg: Config,
   req: Request(mist.Connection),
   registry: process.Subject(session_registry.Msg),
+  providers: process.Subject(provider_registry.Msg),
 ) -> Response(mist.ResponseData) {
-  case read_model(req) {
+  // Multi-provider §11: the body pins BOTH halves of the session's
+  // identity — `provider` (id or name) and `model` (alias). There is no
+  // default provider to fall back to; both fields are required.
+  case read_create(req) {
     Error(_) -> json_response(400, err_json("unreadable body"))
-    Ok(model) ->
-      case string.trim(model) {
-        "" -> json_response(400, err_json("empty model"))
-        trimmed ->
-          case openai.list_models(openai.endpoint_from_config(cfg)) {
-            Error(_) ->
-              json_response(502, err_json("unable to list models from Bifrost"))
-            Ok(models) ->
-              case list.contains(models, trimmed) {
-                False ->
-                  json_response(400, err_json("unknown model: " <> trimmed))
-                True ->
-                  // Registry-owned runner: the frozen M3 toolset.
-                  // P1 multi-provider interim: no provider source exists
-                  // yet (the provider registry lands in P2, the request
-                  // field in P4), so the pin is empty and the store's
-                  // write-through fails its FK — the session stays
-                  // in-memory only until then.
-                  case session_registry.create(registry, "", trimmed) {
-                    Ok(record) -> {
-                      let now = timing.wall_now_s()
+    Ok(fields) ->
+      case string.trim(fields.model), string.trim(fields.provider) {
+        _, "" -> json_response(400, err_json("empty provider"))
+        "", _ -> json_response(400, err_json("empty model"))
+        trimmed_model, ident ->
+          case resolve_provider(providers, ident) {
+            Error(#(status, reason)) -> json_response(status, err_json(reason))
+            Ok(found) ->
+              // Validate the alias against the provider's own live model
+              // list — the same preflight the old single-provider route
+              // did, now scoped to the pinned provider.
+              case
+                provider_registry.list_models(
+                  providers,
+                  found.id,
+                  cfg.sse_first_response_timeout_ms + 5000,
+                )
+              {
+                Error(_) ->
+                  json_response(
+                    502,
+                    err_json("unable to list models from provider"),
+                  )
+                Ok(models) ->
+                  case list.contains(models, trimmed_model) {
+                    False ->
                       json_response(
-                        201,
-                        session_summary_json(
-                          session.SessionSummary(
-                            id: record.id,
-                            model: record.model,
-                            title: "",
-                            title_source: session.AutoTitle,
-                            pinned: False,
-                            tags: [],
-                            archived: False,
-                            message_count: 0,
-                            streaming: False,
-                            created_at: now,
-                            last_active_at: now,
-                            metrics: [],
-                          ),
-                        ),
+                        400,
+                        err_json("unknown model: " <> trimmed_model),
                       )
-                    }
-                    Error(session_registry.EmptyModel) ->
-                      json_response(400, err_json("empty model"))
-                    Error(session_registry.StartFailed(reason)) ->
-                      json_response(
-                        503,
-                        err_json("session unavailable: " <> reason),
-                      )
+                    True ->
+                      case
+                        session_registry.create(
+                          registry,
+                          found.id,
+                          trimmed_model,
+                        )
+                      {
+                        Ok(record) -> {
+                          let now = timing.wall_now_s()
+                          json_response(
+                            201,
+                            session_summary_json(
+                              session.SessionSummary(
+                                id: record.id,
+                                model: record.model,
+                                title: "",
+                                title_source: session.AutoTitle,
+                                pinned: False,
+                                tags: [],
+                                archived: False,
+                                message_count: 0,
+                                streaming: False,
+                                created_at: now,
+                                last_active_at: now,
+                                metrics: [],
+                              ),
+                            ),
+                          )
+                        }
+                        Error(session_registry.EmptyModel) ->
+                          json_response(400, err_json("empty model"))
+                        Error(session_registry.ProviderFailed(_)) ->
+                          // Pre-validation above owned the 400s; landing
+                          // here means the provider went away between
+                          // validation and create — a server-side race.
+                          json_response(
+                            502,
+                            err_json("provider became unusable"),
+                          )
+                        Error(session_registry.StartFailed(reason)) ->
+                          json_response(
+                            503,
+                            err_json("session unavailable: " <> reason),
+                          )
+                      }
                   }
               }
           }
@@ -212,12 +247,65 @@ fn create_session_response(
   }
 }
 
+/// Resolve the request's provider identifier (id or name) to registry
+/// metadata, refusing unknown and disabled providers with the plan's
+/// status mapping (§11: unknown → 400, disabled → 400). An exact ID match
+/// is checked FIRST: names are free-form, so a provider may be *named*
+/// after another provider's id — the id is the unambiguous key and must
+/// win when the two disagree.
+fn resolve_provider(
+  providers: process.Subject(provider_registry.Msg),
+  ident: String,
+) -> Result(provider.Provider, #(Int, String)) {
+  case provider_registry.list_providers(providers) {
+    Error(_) -> Error(#(502, "provider registry unavailable"))
+    Ok(all) -> {
+      let found = case list.find(all, fn(p) { p.id == ident }) {
+        Ok(by_id) -> Ok(by_id)
+        Error(_) -> list.find(all, fn(p) { p.name == ident })
+      }
+      case found {
+        Error(_) -> Error(#(400, "unknown provider: " <> ident))
+        Ok(found) ->
+          case found.enabled {
+            False -> Error(#(400, "provider is disabled: " <> found.name))
+            True -> Ok(found)
+          }
+      }
+    }
+  }
+}
+
 fn read_json(req: Request(mist.Connection)) -> Result(String, Nil) {
   read_body_json(req, text_decoder())
 }
 
-fn read_model(req: Request(mist.Connection)) -> Result(String, Nil) {
-  read_body_json(req, model_decoder())
+/// The POST /sessions body: `{"provider": …, "model": …}` (both
+/// required — a session always pins its provider explicitly).
+pub type CreateFields {
+  CreateFields(provider: String, model: String)
+}
+
+pub fn create_fields_decoder() -> decode.Decoder(CreateFields) {
+  use provider_id <- decode.field("provider", decode.string)
+  use model <- decode.field("model", decode.string)
+  decode.success(CreateFields(provider: provider_id, model: model))
+}
+
+pub fn parse_create_json(body: String) -> Result(CreateFields, Nil) {
+  json.parse(body, using: create_fields_decoder())
+  |> result.map_error(fn(_) { Nil })
+}
+
+fn read_create(req: Request(mist.Connection)) -> Result(CreateFields, Nil) {
+  case mist.read_body(req, max_body_limit: 1_000_000) {
+    Error(_) -> Error(Nil)
+    Ok(read) ->
+      case bit_array.to_string(read.body) {
+        Error(_) -> Error(Nil)
+        Ok(body) -> parse_create_json(body)
+      }
+  }
 }
 
 fn read_body_json(
@@ -579,15 +667,9 @@ fn text_decoder() -> decode.Decoder(String) {
   decode.success(text)
 }
 
-fn model_decoder() -> decode.Decoder(String) {
-  use model <- decode.field("model", decode.string)
-  decode.success(model)
-}
-
 pub fn requires_auth(method: Method, segments: List(String)) -> Bool {
   case method, segments {
     Get, []
-    | Get, ["models"]
     | Get, ["sessions"]
     | Get, ["lustre", "runtime.mjs"]
     | Get, ["ws"]
@@ -603,10 +685,5 @@ pub fn requires_auth(method: Method, segments: List(String)) -> Bool {
 
 pub fn parse_text_json(body: String) -> Result(String, Nil) {
   json.parse(body, using: text_decoder())
-  |> result.map_error(fn(_) { Nil })
-}
-
-pub fn parse_model_json(body: String) -> Result(String, Nil) {
-  json.parse(body, using: model_decoder())
   |> result.map_error(fn(_) { Nil })
 }

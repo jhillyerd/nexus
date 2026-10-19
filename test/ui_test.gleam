@@ -8,39 +8,15 @@ import gleam/option.{None, Some}
 import gleam/string
 import gleeunit/should
 import lustre/element
-import nexus/config.{type Config}
 import nexus/session
 import nexus/ui
 
-fn test_config() -> Config {
-  config.Config(
-    base_url: "http://127.0.0.1:9",
-    api_key: "k",
-    model_default: "smart",
-    encryption_key: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
-    sse_first_response_timeout_ms: 1,
-    stream_idle_timeout_ms: 1,
-    http_bind: "127.0.0.1",
-    http_port: 0,
-    ui_token: None,
-    system_prompt: "sys",
-    max_tool_iterations: 8,
-    http_fetch_max_bytes: 20_000,
-    http_fetch_timeout_ms: 2000,
-    http_fetch_allow_private: False,
-    searxng_base_url: None,
-    searxng_token: None,
-    pg_host: "127.0.0.1",
-    pg_port: 5433,
-    pg_database: "nexus",
-    pg_user: "nexus",
-    pg_password: None,
-  )
-}
-
 fn new_model() -> ui.Model {
   let #(model, _effect) =
-    ui.init(ui.Flags(cfg: test_config(), registry: process.new_subject()))
+    ui.init(ui.Flags(
+      registry: process.new_subject(),
+      providers: process.new_subject(),
+    ))
   model
 }
 
@@ -630,7 +606,7 @@ fn view_string(model: ui.Model) -> String {
 pub fn view_renders_shell_and_sidebar_test() {
   let model =
     new_model()
-    |> step(ui.AliasesLoaded(["smart", "fast"]))
+    |> step(ui.AliasesLoaded("p1", ["smart", "fast"]))
     |> step(ui.SessionsLoaded([summary("s-1", False)]))
   let html = view_string(model)
   should.be_true(string.contains(html, "id=\"app\""))

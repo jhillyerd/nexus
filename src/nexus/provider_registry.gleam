@@ -654,3 +654,34 @@ pub fn describe_stream_error(error: openai.StreamError) -> String {
     openai.Decode(_reason) -> "model list failed: unreadable model list"
   }
 }
+
+// ---------------------------------------------------------------------------
+// Client helpers (boot wiring, the HTTP layer, the UI bridge)
+// ---------------------------------------------------------------------------
+
+/// Resolve a provider id to its runtime endpoint. The one call on the
+/// session-create path; refuses unknown and disabled providers.
+pub fn resolve(
+  registry: Subject(Msg),
+  id: String,
+) -> Result(ResolvedProvider, RegistryError) {
+  actor.call(registry, 5000, fn(reply) { Resolve(id, reply) })
+}
+
+/// All providers as masked metadata, name-then-id sorted. Never keys.
+pub fn list_providers(
+  registry: Subject(Msg),
+) -> Result(List(Provider), RegistryError) {
+  actor.call(registry, 5000, List)
+}
+
+/// Live model list for one provider. The reply arrives from an unlinked
+/// fetch process, so the timeout must cover the fetch itself — it mirrors
+/// the endpoint's own first-response budget (server-global SSE policy).
+pub fn list_models(
+  registry: Subject(Msg),
+  id: String,
+  timeout_ms: Int,
+) -> Result(List(String), RegistryError) {
+  actor.call(registry, timeout_ms, fn(reply) { ListModels(id, reply) })
+}

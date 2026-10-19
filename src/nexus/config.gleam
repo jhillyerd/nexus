@@ -13,11 +13,6 @@ import nexus/crypto
 
 pub type Config {
   Config(
-    /// Bifrost OpenAI-compatible base URL including the `/v1` suffix.
-    base_url: String,
-    api_key: String,
-    /// Model alias used by the audit tool and the boot session.
-    model_default: String,
     /// Master key for provider API keys at rest: base64 of exactly 32
     /// random bytes (`openssl rand -base64 32`), validated at load so
     /// boot fails loudly on a missing/invalid key. Never logged or
@@ -73,10 +68,6 @@ pub fn load() -> Result(Config, String) {
 pub fn from_env(
   get: fn(String) -> Result(String, Nil),
 ) -> Result(Config, String) {
-  use base_url <- result.try(required(get, "BIFROST_BASE_URL"))
-  use base_url <- result.try(normalize_base_url(base_url))
-  use api_key <- result.try(required(get, "BIFROST_API_KEY"))
-  use model_default <- result.try(required(get, "NEXUS_MODEL_DEFAULT"))
   use encryption_key <- result.try(required_encryption_key(get))
   use first_response_ms <- result.try(optional_int(
     get,
@@ -138,9 +129,6 @@ pub fn from_env(
   use pg_user <- result.try(optional_string_or(get, "NEXUS_PG_USER", "nexus"))
   let pg_password = optional_string(get, "NEXUS_PG_PASSWORD")
   Ok(Config(
-    base_url: base_url,
-    api_key: api_key,
-    model_default: model_default,
     encryption_key: encryption_key,
     sse_first_response_timeout_ms: first_response_ms,
     stream_idle_timeout_ms: idle_ms,
@@ -250,20 +238,5 @@ fn required_encryption_key(
   case crypto.decode_key(raw) {
     Ok(_) -> Ok(raw)
     Error(error) -> Error("NEXUS_ENCRYPTION_KEY: " <> crypto.describe(error))
-  }
-}
-
-fn normalize_base_url(url: String) -> Result(String, String) {
-  let trimmed = case string.ends_with(url, "/") {
-    True -> string.drop_end(url, 1)
-    False -> url
-  }
-  case string.ends_with(trimmed, "/v1") {
-    True -> Ok(trimmed)
-    False ->
-      Error(
-        "BIFROST_BASE_URL should be the OpenAI-compatible base ending in /v1, got: "
-        <> url,
-      )
   }
 }
