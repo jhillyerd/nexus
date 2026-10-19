@@ -659,6 +659,15 @@ pub fn describe_stream_error(error: openai.StreamError) -> String {
 // Client helpers (boot wiring, the HTTP layer, the UI bridge)
 // ---------------------------------------------------------------------------
 
+/// CRUD/set-enabled calls wait on a store round-trip inside the actor:
+/// the seam's own call budget is 15s (`nexus/store/persist`), so this
+/// budget must sit ABOVE it — a successful-but-slow store write (6–15s)
+/// still gets its reply through before the caller's `actor.call` gives
+/// up. The read helpers below stay at 5s: they answer from actor state
+/// (and the decrypt memo) with no store hop, so a tight budget keeps
+/// their fail-fast behaviour.
+const crud_call_timeout_ms = 20_000
+
 /// Resolve a provider id to its runtime endpoint. The one call on the
 /// session-create path; refuses unknown and disabled providers.
 pub fn resolve(
@@ -689,7 +698,7 @@ pub fn create(
   registry: Subject(Msg),
   params: provider.ProviderParams,
 ) -> Result(Provider, RegistryError) {
-  actor.call(registry, 5000, fn(reply) { Create(params, reply) })
+  actor.call(registry, crud_call_timeout_ms, fn(reply) { Create(params, reply) })
 }
 
 /// PATCH a provider: present fields replace, absent keep; a present
@@ -699,7 +708,9 @@ pub fn update(
   id: String,
   patch: provider.ProviderUpdate,
 ) -> Result(Provider, RegistryError) {
-  actor.call(registry, 5000, fn(reply) { Update(id, patch, reply) })
+  actor.call(registry, crud_call_timeout_ms, fn(reply) {
+    Update(id, patch, reply)
+  })
 }
 
 /// Hard delete, guarded: 409-shaped `StillReferenced` while any session
@@ -708,7 +719,7 @@ pub fn delete(
   registry: Subject(Msg),
   id: String,
 ) -> Result(Nil, RegistryError) {
-  actor.call(registry, 5000, fn(reply) { Delete(id, reply) })
+  actor.call(registry, crud_call_timeout_ms, fn(reply) { Delete(id, reply) })
 }
 
 /// Toggle the reversible off-switch (Resolve/ListModels refuse disabled
@@ -718,7 +729,9 @@ pub fn set_enabled(
   id: String,
   enabled: Bool,
 ) -> Result(Provider, RegistryError) {
-  actor.call(registry, 5000, fn(reply) { SetEnabled(id, enabled, reply) })
+  actor.call(registry, crud_call_timeout_ms, fn(reply) {
+    SetEnabled(id, enabled, reply)
+  })
 }
 
 /// Live model list for one provider. The reply arrives from an unlinked
