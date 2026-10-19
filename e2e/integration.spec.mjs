@@ -37,7 +37,30 @@ const BASE = `http://127.0.0.1:${PORT}`;
 const BIFROST = process.env.BIFROST_BASE_URL ?? "https://bifrost.bytemonkey.org/v1";
 const BIFROST_KEY = process.env.BIFROST_API_KEY ?? "none";
 const ENC_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
-const DATABASE_URL = "postgres://nexus@127.0.0.1:5433/nexus";
+const DATABASE_URL = process.env.E2E_DATABASE_URL ?? "postgres://nexus@127.0.0.1:5433/nexus";
+
+/// Reset the shared e2e database so reruns are deterministic: stale
+/// sessions/providers from earlier runs (this suite or the browser one)
+/// must not leak into list assertions or provider resolution. Requires
+/// `psql` next to the (already mandatory) Postgres.
+function resetDatabase() {
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      "psql",
+      ["-q", DATABASE_URL, "-c", "truncate session_message, session, provider cascade;"],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let out = "";
+    child.stdout.on("data", (d) => (out += d));
+    child.stderr.on("data", (d) => (out += d));
+    child.on("error", (err) => reject(new Error(`psql not found (${err.message}) — it ships with the Postgres the suite already requires`)));
+    child.on("exit", (code) =>
+      code === 0
+        ? resolve()
+        : reject(new Error(`database reset failed (${code}):\n${out}`)),
+    );
+  });
+}
 
 /// Seed the live gateway as a provider row (key encrypted under the same
 /// master key the server boots with). Idempotent by name; re-points the
@@ -223,9 +246,15 @@ async function waitHealthyAt(port, timeoutMs = 60_000) {
 async function cacheSessionViaApi(port, alias, prompts) {
   const base = `http://127.0.0.1:${port}`;
   const headers = { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" };
-  const created = await (
-    await fetch(`${base}/sessions`, { method: "POST", headers, body: JSON.stringify({ model: alias }) })
-  ).json();
+  const createRes = await fetch(`${base}/sessions`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ provider: "bifrost", model: alias }),
+  });
+  if (createRes.status !== 201) {
+    throw new Error(`create failed: ${createRes.status} ${await createRes.text()}`);
+  }
+  const created = await createRes.json();
   const id = created.id;
   for (const prompt of prompts) {
     const res = await fetch(`${base}/sessions/${id}/send`, {
@@ -307,6 +336,7 @@ async function main() {
   console.log(`integration smoke`);
   console.log(`  bifrost: ${BIFROST}`);
   console.log(`  searxng: ${SEARXNG}`);
+  await resetDatabase();
   await seedProvider();
   const nexus = startNexus();
   const cacheCapture = { alias: null, system: null, turns: [], metrics: [], usage: [] };

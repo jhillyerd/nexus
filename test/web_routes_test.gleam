@@ -9,6 +9,7 @@ import gleam/http/request.{type Request}
 import gleam/int
 import gleam/list
 import gleam/option.{None, Some}
+import gleam/otp/actor
 import gleam/otp/factory_supervisor
 import gleam/result
 import gleam/string
@@ -18,6 +19,7 @@ import nexus/config.{type Config}
 import nexus/hackney
 import nexus/loop
 import nexus/openai
+import nexus/provider
 import nexus/provider_registry
 import nexus/session
 import nexus/session_registry
@@ -79,6 +81,21 @@ fn fake_stats() -> openai.StreamStats {
 /// microsecond clock, so concurrent/serial start_server calls never bind
 /// the same port.
 fn start_server() -> #(process.Subject(session_registry.Msg), Int) {
+  let #(registry, _providers, port) = start_server_with(fn(_providers) { Nil })
+  #(registry, port)
+}
+
+/// The full rig: factory + store mock + REAL provider registry (per-base-
+/// URL model fetcher, so tests can tell providers apart) + session
+/// registry + mist. `extra` runs against the fresh provider registry
+/// before the server starts — used to set up colliding providers.
+fn start_server_with(
+  extra: fn(process.Subject(provider_registry.Msg)) -> Nil,
+) -> #(
+  process.Subject(session_registry.Msg),
+  process.Subject(provider_registry.Msg),
+  Int,
+) {
   let port = 20_000 + { int.absolute_value(timing.now_us()) % 40_000 }
   let cfg = test_config()
   let factory_name = process.new_name("nexus_routes_factory")
@@ -98,9 +115,17 @@ fn start_server() -> #(process.Subject(session_registry.Msg), Int) {
       cfg,
       persistence,
       providers_name,
-      fn(_endpoint) { Ok(["default-alias", "alias-a", "alias-b"]) },
+      fn(endpoint) {
+        case endpoint.base_url {
+          // Per-provider lists let tests observe WHICH provider a create
+          // resolved — the one distinguishing signal on this rig.
+          "https://gamma.test/v1" -> Ok(["gamma-only"])
+          _ -> Ok(["default-alias", "alias-a", "alias-b"])
+        }
+      },
     )
   let providers = process.named_subject(providers_name)
+  extra(providers)
   let assert Ok(started) =
     session_registry.start(
       cfg,
@@ -119,7 +144,24 @@ fn start_server() -> #(process.Subject(session_registry.Msg), Int) {
     |> mist.port(port)
     |> mist.start
   process.sleep(100)
-  #(started.data, port)
+  #(started.data, providers, port)
+}
+
+/// Create a keyless provider through the real registry (ids are minted
+/// p1, p2, … past the fixture's).
+fn create_provider(
+  providers: process.Subject(provider_registry.Msg),
+  name: String,
+  base_url: String,
+) -> Nil {
+  let assert Ok(_) =
+    actor.call(providers, 5000, fn(reply) {
+      provider_registry.Create(
+        provider.ProviderParams(name: name, base_url: base_url, api_key: None),
+        reply,
+      )
+    })
+  Nil
 }
 
 fn req(
@@ -433,4 +475,40 @@ pub fn models_route_removed_test() {
     404,
     "{\"error\":\"not found\"}",
   ))
+}
+
+/// A provider may be NAMED after another provider's id — the id is the
+/// unambiguous key and must win: a request for "p1" pins the provider
+/// WITH ID p1, never the provider merely named "p1" (review finding on
+/// PR #12).
+pub fn create_session_provider_id_wins_over_name_test() {
+  let #(_registry, _providers, port) =
+    start_server_with(fn(providers) {
+      // Registry-minted ids: beta -> p1, the second -> p2, NAMED "p1".
+      create_provider(providers, "beta", "https://beta.test/v1")
+      create_provider(providers, "p1", "https://gamma.test/v1")
+    })
+  // p1 (id) is beta, whose fetcher serves the default list; the provider
+  // NAMED p1 serves only "gamma-only". If name-matching won, this would
+  // be a 400 unknown model instead of a 201...
+  should.equal(
+    send_authorized(req(
+      port,
+      Post,
+      "/sessions",
+      "{\"provider\":\"p1\",\"model\":\"alias-a\"}",
+    ))
+      |> fn(pair) { #(pair.0, "") },
+    #(201, ""),
+  )
+  // ...and this 400 proves it did not resolve to the provider named p1.
+  should.equal(
+    send_authorized(req(
+      port,
+      Post,
+      "/sessions",
+      "{\"provider\":\"p1\",\"model\":\"gamma-only\"}",
+    )),
+    #(400, "{\"error\":\"unknown model: gamma-only\"}"),
+  )
 }

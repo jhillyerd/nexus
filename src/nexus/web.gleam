@@ -249,15 +249,22 @@ fn create_session_response(
 
 /// Resolve the request's provider identifier (id or name) to registry
 /// metadata, refusing unknown and disabled providers with the plan's
-/// status mapping (§11: unknown → 400, disabled → 400).
+/// status mapping (§11: unknown → 400, disabled → 400). An exact ID match
+/// is checked FIRST: names are free-form, so a provider may be *named*
+/// after another provider's id — the id is the unambiguous key and must
+/// win when the two disagree.
 fn resolve_provider(
   providers: process.Subject(provider_registry.Msg),
   ident: String,
 ) -> Result(provider.Provider, #(Int, String)) {
   case provider_registry.list_providers(providers) {
     Error(_) -> Error(#(502, "provider registry unavailable"))
-    Ok(all) ->
-      case list.find(all, fn(p) { p.id == ident || p.name == ident }) {
+    Ok(all) -> {
+      let found = case list.find(all, fn(p) { p.id == ident }) {
+        Ok(by_id) -> Ok(by_id)
+        Error(_) -> list.find(all, fn(p) { p.name == ident })
+      }
+      case found {
         Error(_) -> Error(#(400, "unknown provider: " <> ident))
         Ok(found) ->
           case found.enabled {
@@ -265,6 +272,7 @@ fn resolve_provider(
             True -> Ok(found)
           }
       }
+    }
   }
 }
 

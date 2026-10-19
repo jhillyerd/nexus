@@ -128,7 +128,32 @@ async function waitHealthy(port, timeoutMs = 30_000) {
 }
 
 const ENC_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
-const DATABASE_URL = "postgres://nexus@127.0.0.1:5433/nexus";
+const DATABASE_URL = process.env.E2E_DATABASE_URL ?? "postgres://nexus@127.0.0.1:5433/nexus";
+
+/// Reset the shared e2e database so the suite starts from nothing —
+/// reruns and interleaved integration runs must not leave sessions
+/// (breaking the empty-list assertions) or extra providers (the create
+/// panel auto-targets the FIRST enabled provider by name, and e.g. an
+/// integration run's "bifrost" would sort before this suite's "fake").
+/// Requires `psql` next to the (already mandatory) Postgres.
+function resetDatabase() {
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      "psql",
+      ["-q", DATABASE_URL, "-c", "truncate session_message, session, provider cascade;"],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let out = "";
+    child.stdout.on("data", (d) => (out += d));
+    child.stderr.on("data", (d) => (out += d));
+    child.on("error", (err) => reject(new Error(`psql not found (${err.message}) — it ships with the Postgres the suite already requires`)));
+    child.on("exit", (code) =>
+      code === 0
+        ? resolve()
+        : reject(new Error(`database reset failed (${code}):\n${out}`)),
+    );
+  });
+}
 
 /// Seed (or re-point) the suite's keyless provider. The provider table is
 /// the only provider source since the P3 hard cut — nexus reads no
@@ -250,6 +275,7 @@ async function main() {
   const services = await startServices();
   const mainPort = 18081;
   const guardPort = 18082;
+  await resetDatabase();
   await seedProvider(services.bifrostPort);
   const main = startNexus({ port: mainPort, maxToolIterations: 8, ...pick(services) });
   let guard = startNexus({ port: guardPort, maxToolIterations: 2, ...pick(services) });
@@ -290,8 +316,18 @@ async function main() {
     await test("auth: session create pins provider + model (no token → 401)", async () => {
       // GET /models is gone (P3 hard cut: no default provider); the
       // create route is the scripted surface now.
-      eq((await page.request.get(base + "/models")).status(), 401, "no-token models gone");
-      eq((await page.request.get(`${base}/models`, { headers: { authorization: `Bearer ${TOKEN}` } })).status, 404, "models route removed");
+      // The route is gone entirely: the router's catch-all answers 404
+      // before the auth gate is even consulted.
+      eq((await page.request.get(base + "/models")).status(), 404, "models gone (no token)");
+      eq(
+        (
+          await page.request.get(`${base}/models`, {
+            headers: { authorization: `Bearer ${TOKEN}` },
+          })
+        ).status(),
+        404,
+        "models gone (with token)",
+      );
       const no = await page.request.post(`${base}/sessions`, {
         data: { provider: "fake", model: "smart" },
       });

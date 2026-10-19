@@ -67,8 +67,10 @@ DATABASE_URL=postgres://nexus@127.0.0.1:5433/nexus \
 NEXUS_ENCRYPTION_KEY="$NEXUS_ENCRYPTION_KEY" \
 NEXUS_SEED_PROVIDER_NAME=bifrost \
 NEXUS_SEED_PROVIDER_BASE_URL=https://gateway.example/v1 \
-NEXUS_SEED_PROVIDER_API_KEY=sk-... \        # omit for keyless endpoints
 gleam run -m nexus/dev_seed
+
+# keyless provider? add NEXUS_SEED_PROVIDER_API_KEY=sk-… to the block
+# (omit it entirely — or leave it blank — to keep/create a keyless row)
 ```
 
 The tool is idempotent by name (re-running reports "nothing to do"), and

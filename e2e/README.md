@@ -38,8 +38,11 @@ down and green again on auto-reconnect, and a mobile-viewport overflow check.
   schema applied — persistence is mandatory, so `gleam run` fails boot
   without it: `docker compose up -d` then
   `DATABASE_URL=postgres://nexus@127.0.0.1:5433/nexus gleam run -m nexus/store/migrate`.
-- The suites seed their own provider row (`gleam run -m nexus/dev_seed`)
-  before booting the server — the provider table is the only provider
+- Each suite **resets the database first** (`psql -c 'truncate
+  session_message, session, provider cascade'` against
+  `E2E_DATABASE_URL`, default `postgres://nexus@127.0.0.1:5433/nexus`)
+  so reruns and interleaved runs are deterministic, then seeds its own
+  provider row (`gleam run -m nexus/dev_seed`) before booting the server — the provider table is the only provider
   source since the multi-provider P3 hard cut, and no `BIFROST_*` env
   reaches the server anymore. The browser suite's fake is keyless; the
   integration smoke encrypts the real gateway key under the same
