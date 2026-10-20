@@ -1,7 +1,9 @@
 # AGENTS.md
 
-Repo guidance for coding agents working on nexus. Source of truth for the
-"why" behind these rules: `docs/plans/p2-verification.md`.
+Repo guidance for coding agents working on nexus. Sources of truth for the
+"why" behind these rules: `docs/plans/p2-verification.md` (schema) and
+`docs/plans/completed/m3-verification.md` (UI, agent loop, KV-cache
+verification).
 
 ## Database schema naming (decided, follow it)
 
@@ -64,3 +66,44 @@ quote-aware: single/double quotes, dollar quotes (`$$…$$`, `$tag$…$tag$`),
 `--` lines, and nested `/* */` comments are understood, so a `;` inside a
 `DO` block, `CREATE FUNCTION` body, or literal does not split a statement.
 Unit tests: `test/migrate_test.gleam`.
+
+## UI and agent-loop invariants (hard constraints — do not break)
+
+Pinned by the M3 browser suite (`docs/plans/completed/m3-verification.md`);
+`test/ui_test.gleam` keeps most of them green offline.
+
+- **Model and tool output is hostile text.** Everything the UI renders is
+  Lustre text nodes — no `innerHTML` anywhere (the module doc in
+  `src/nexus/ui.gleam` is the contract). Tool arguments and results appear
+  only as truncated, inert text previews. Regression tests feed
+  `<script>` payloads; keep them passing.
+- **UI display state mirrors the server's commit rules.** A failed turn
+  commits nothing server-side, so the UI rolls its uncommitted lines back
+  to the user line; a guard-tripped turn keeps its committed rounds and
+  final text. If you change the loop's commit rules, change the UI
+  rollback with it (`test/ui_test.gleam` pins both sides).
+- **One frozen toolset for every session.** The registry builds the
+  agent-loop runner once at boot
+  (`session.agent_runner(cfg.max_tool_iterations, tools.default(cfg))`).
+  Never add per-session tool configurations — an identical
+  `tools` / `tool_choice` envelope across sessions is part of the
+  KV-cache contract.
+- **The shadow root stays open** (`open_shadow_root(True)` in
+  `src/nexus/ui_runtime.gleam`), pierceable by the browser suite and
+  devtools. A closed root broke the whole browser suite once
+  (m3-verification §1, bug 2).
+
+## Changing the transcript / request-encoding path
+
+`test/m3_prefix_test.gleam` is the offline golden: it replays the archived
+real session in `test/fixtures/m3_cache_session.json` turn-by-turn through
+`nexus/transcript` (the single encode path) and asserts, per turn
+boundary, byte-deterministic re-encoding and suffix-only request growth
+with an unchanged envelope (`model`, `stream`, `tools`, `tool_choice`).
+
+If you legitimately change the encoding, this test fails **by design**:
+re-capture the fixture from a real session via the integration smoke's
+`capture` step (`node e2e/integration.spec.mjs`, which writes
+`e2e/cache-session.json` — the committed fixture is a copy), never
+hand-edit the JSON. The live half of the contract is that suite's cache
+gate: warm/cold TTFT median ratio ≤ 0.3.

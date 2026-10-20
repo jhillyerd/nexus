@@ -66,10 +66,38 @@ node e2e/browser.spec.mjs
 ```
 
 The suite writes `e2e/report.json` and exits non-zero on any failure.
-Realistic-service verification (live Bifrost aliases, Nomad-hosted SearxNG)
-is the integration smoke in `docs/plans/m3-verification.md` — the fake here
-exists so UI behaviour is asserted deterministically, not to replace it.
+The fake here exists so UI behaviour is asserted deterministically — the
+integration smoke below is its realistic-service counterpart, not a
+replacement.
 
 Note for non-Nix Erlang hosts: the WebSocket upgrade needs the `crypto` NIF
 to find `libcrypto`; export `LD_LIBRARY_PATH` pointing at an nixpkgs OpenSSL
 `lib` directory if `erl -eval 'crypto:start(),halt().'` fails.
+
+## Integration smoke (real services) — `node e2e/integration.spec.mjs`
+
+Production posture through the real browser UI: bearer auth on, SSRF guard
+on (`NEXUS_HTTP_FETCH_ALLOW_PRIVATE=false`), real Bifrost (llama.cpp and
+vLLM aliases), real SearxNG. Same preconditions as the browser suite
+(Postgres up; the suite truncates and seeds the gateway as a provider row
+itself). Needs network and ~10 minutes — a live-checkpoint activity, never
+CI (the CI runner has no node).
+
+```sh
+node e2e/integration.spec.mjs
+# Env: BIFROST_BASE_URL, BIFROST_API_KEY (default: the live gateway),
+#      SEARXNG_BASE_URL (default: https://search.bytemonkey.org/)
+```
+
+It writes `e2e/integration-report.json` and `e2e/cache-session.json`. The
+multi-turn cache check enforces the PRD KV-cache gate — warm/cold TTFT
+median ratio ≤ 0.3 (one retry after node settle if the first attempt is
+above the gate). Its final `capture` step archives the replayed cache
+session; the committed offline golden fixture
+`test/fixtures/m3_cache_session.json` (driving
+`test/m3_prefix_test.gleam`) is a copy of that capture. When the
+request-encoding path legitimately changes, re-capture the fixture through
+this step — never hand-edit the JSON.
+
+Historical evidence and measured numbers:
+`docs/plans/completed/m3-verification.md`.

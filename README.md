@@ -9,8 +9,10 @@ agent loop, and durable session storage in external Postgres (a `session`
 table plus append-only `session_message` rows;
 hydrate-on-boot, lazy start, write-behind commits). See
 `docs/plans/mvp-requirements.md`, `docs/plans/tech-stack.md`,
-`docs/plans/m3-verification.md`, and `docs/plans/p2-verification.md`.
-The next phase is designed in `docs/plans/multi-provider.md`.
+`docs/plans/completed/m3-verification.md`, and
+`docs/plans/p2-verification.md`.
+The multi-provider rollout is documented in
+`docs/plans/completed/multi-provider.md`.
 
 ## Development
 
@@ -233,7 +235,8 @@ curl -H "Authorization: Bearer $NEXUS_UI_TOKEN" \
 Verification lives in `e2e/` (see `e2e/README.md`): a Playwright browser
 suite against controlled services, an integration smoke against real
 Bifrost/SearxNG, and the production cache check whose golden fixture is
-`test/fixtures/m3_cache_session.json`. Results: `docs/plans/m3-verification.md`.
+`test/fixtures/m3_cache_session.json`. Results:
+`docs/plans/completed/m3-verification.md`.
 
 ## Environment
 
@@ -244,7 +247,7 @@ Bifrost/SearxNG, and the production cache check whose golden fixture is
 The single-provider env trio (`BIFROST_BASE_URL`, `BIFROST_API_KEY`,
 `NEXUS_MODEL_DEFAULT`) is gone: the `provider` table in Postgres is the
 only provider source, and every session pins its `(provider, model)`
-pair explicitly at creation (see `docs/plans/multi-provider.md`).
+pair explicitly at creation (see `docs/plans/completed/multi-provider.md`).
 | `NEXUS_HTTP_BIND` | `127.0.0.1` | server bind (loopback per PRD) |
 | `NEXUS_HTTP_PORT` | `8080` | server port |
 | `NEXUS_UI_TOKEN` | unset | single-user bearer token; unset disables auth |
