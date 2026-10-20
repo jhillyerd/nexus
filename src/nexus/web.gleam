@@ -221,6 +221,7 @@ fn create_session_response(
                             session_summary_json(
                               session.SessionSummary(
                                 id: record.id,
+                                provider_id: found.id,
                                 model: record.model,
                                 title: "",
                                 title_source: session.AutoTitle,
@@ -910,6 +911,7 @@ pub fn sessions_json(summaries: List(session.SessionSummary)) -> Json {
 pub fn session_summary_json(summary: session.SessionSummary) -> Json {
   json.object([
     #("id", json.string(summary.id)),
+    #("provider_id", json.string(summary.provider_id)),
     #("model", json.string(summary.model)),
     #("title", json.string(summary.title)),
     #("title_source", case summary.title_source {

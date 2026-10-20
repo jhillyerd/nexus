@@ -71,6 +71,7 @@ pub fn sessions_json_test() {
   let summary =
     session.SessionSummary(
       id: "s-2",
+      provider_id: "p1",
       model: "alias-b",
       title: "renamed by hand",
       title_source: session.ManualTitle,
@@ -135,6 +136,7 @@ pub fn filter_archived_test() {
 fn summary_with_archived(id: String, archived: Bool) -> session.SessionSummary {
   session.SessionSummary(
     id: id,
+    provider_id: "p1",
     model: "alias-b",
     title: "",
     title_source: session.AutoTitle,

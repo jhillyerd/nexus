@@ -154,6 +154,9 @@ pub type Msg {
 type Record {
   Record(
     id: String,
+    /// The frozen provider pin (multi-provider plan §8): carried so
+    /// summaries can report it without reaching into the spec's endpoint.
+    provider_id: String,
     model: String,
     subject: Subject(session.Msg),
     pid: Pid,
@@ -485,6 +488,7 @@ fn handle_create(
               let record =
                 Record(
                   id: id,
+                  provider_id: provider_id,
                   model: alias,
                   subject: started.data,
                   pid: started.pid,
@@ -914,6 +918,7 @@ fn lazy_start(state: State, summary: StoredSummary) -> Resolved {
               let record =
                 Record(
                   id: summary.id,
+                  provider_id: summary.provider_id,
                   model: summary.model,
                   subject: started.data,
                   pid: started.pid,
@@ -1156,6 +1161,7 @@ fn summarise(
 ) -> session.SessionSummary {
   session.SessionSummary(
     id: record.id,
+    provider_id: record.provider_id,
     model: record.model,
     title: record.title,
     title_source: record.title_source,
@@ -1179,6 +1185,7 @@ fn summarise(
 fn stored_summary_as(summary: StoredSummary) -> session.SessionSummary {
   session.SessionSummary(
     id: summary.id,
+    provider_id: summary.provider_id,
     model: summary.model,
     title: summary.title,
     title_source: summary.title_source,

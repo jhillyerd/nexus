@@ -59,7 +59,8 @@ Changing provider or model means creating a new session.
 
 A fresh database has zero providers, and the server boots fine that way
 (zero sessions too — nothing auto-creates). Create the first provider
-through the HTTP API (the settings UI is P5):
+in the chat UI's **Providers** panel (sidebar, below the create panel)
+or through the HTTP API:
 
 ```sh
 curl -s http://127.0.0.1:8080/providers \
@@ -87,8 +88,8 @@ The seed tool is idempotent by name (re-running reports "nothing to
 do"), and the key never appears in its output. Seed **before** booting
 the server or restart it afterwards — the provider registry loads the
 table once at start (a bad envelope fails boot loudly). Either way, the
-chat UI auto-targets the first enabled provider until the P5 picker
-lands.
+chat UI's provider picker lists every enabled provider and reloads the
+model aliases whenever the selection changes.
 
 ## The UI
 
@@ -113,14 +114,30 @@ The sidebar organizes sessions as **in-memory registry metadata**: a global
 Today / Yesterday / Previous 7 days / Older, with tag chips and a
 (title + tag) filter. Titles auto-generate from the first user message
 (truncated, no LLM call) and become manual once renamed, so auto-generation
-never clobbers them; the row subtitle is `model · relative time`.
-Archiving soft-hides a session behind the *Show archived* toggle
+never clobbers them; the row subtitle is
+`provider/model · relative time` — the pin is the session's identity,
+not just display. Archiving soft-hides a session behind the *Show
+archived* toggle
 (restorable); deleting removes it for good after a two-step confirmation.
 Archived sessions are never pinned — archiving clears the pin, and the
 sidebar offers no pin control on archived rows.
 All of this lives **beside the transcript** — the request-encoding path
 never sees it, and the golden metadata-isolation test asserts not a single
 request byte changes.
+
+The create panel pins a new session explicitly: a **provider select**
+(enabled providers only, keyless ones marked) followed by the model
+alias select, whose options are that provider's live `/v1/models` list —
+switching providers reloads it, and *Create session* stays disabled until
+both halves exist. Below it, the **Providers** panel manages providers
+in-UI: add (name, base URL, optional key — keyless is first-class), edit
+(name / base URL / replace key; the key field is write-only and renders
+empty — blank keeps the stored key, `has_key` is the only key fact
+shown), enable/disable (the reversible off-switch — the picker and
+session creates refuse disabled providers), and delete behind a
+two-step confirmation (refused with `409` semantics while any session
+pins the provider). Every mutation fails into a note in the log, never
+a silent no-op.
 
 ## Server
 
@@ -168,7 +185,8 @@ All routes except `GET /healthz` require the configured token when
   patch), and `enabled:false` is the reversible off-switch
 - `DELETE /providers/<id>` — hard delete (204); `409` while any session
   pins the provider — disable it instead
-- `GET /sessions` — summaries, pinned first then most recently active
+- `GET /sessions` — summaries (each carrying the pinned `provider_id`),
+  pinned first then most recently active
   (default: active only)
 - `GET /sessions?archived=1` — archived summaries only
 - `POST /sessions` `{"provider":"id-or-name","model":"alias"}` — both
