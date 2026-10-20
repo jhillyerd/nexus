@@ -101,7 +101,6 @@ fn start_server_with(
   let factory_name = process.new_name("nexus_routes_factory")
   let registry_name = process.new_name("nexus_routes_registry")
   let providers_name = process.new_name("nexus_routes_providers")
-  let component_name = process.new_name("nexus_routes_component")
   let assert Ok(_factory) =
     factory_supervisor.start(session_registry.factory_builder(factory_name))
   let persistence = store_mock.seam(store_mock.start())
@@ -139,7 +138,7 @@ fn start_server_with(
       },
     )
   let _ =
-    mist.new(web.handler(cfg, registry_name, providers_name, component_name))
+    mist.new(web.handler(cfg, registry_name, providers_name))
     |> mist.bind("127.0.0.1")
     |> mist.port(port)
     |> mist.start

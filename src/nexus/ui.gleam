@@ -34,10 +34,17 @@ import nexus/timing
 /// Everything the component needs to talk to the rest of the app. The
 /// registry subjects are resolved from their names at boot and stay
 /// stable across component restarts.
+///
+/// `session` is the client-supplied last-selected session (the `/ws`
+/// route's `session` query parameter, persisted by the page shell): each
+/// connection gets a fresh runtime and model, so this is what re-opens the
+/// same session after a reload instead of falling back to the arbitrary
+/// auto-selection. `None` for a first-time visitor.
 pub type Flags {
   Flags(
     registry: Subject(session_registry.Msg),
     providers: Subject(provider_registry.Msg),
+    session: Option(String),
   )
 }
 
@@ -136,8 +143,10 @@ pub type Model {
   Model(
     providers: Subject(provider_registry.Msg),
     registry: Subject(session_registry.Msg),
-    // Long-lived subscription to the selected session's events. Created by
-    // the `select` effect in `init` and reused across reconnects.
+    // Long-lived subscription to the selected session's events, owned by
+    // this connection's runtime (one runtime per /ws client since the
+    // per-client break; a reload is a new subject, and the session actor
+    // de-duplicates re-Joins by subject).
     events: Option(Subject(SessionEvent)),
     /// The provider whose models fill the create panel's picker (P5): the
     /// user's selection, defaulting to the first enabled provider. Aliases
@@ -182,7 +191,6 @@ pub type Model {
     // there is something to select.
     create_auto: Bool,
     model_label: String,
-    clients: Int,
     // ---- Session organization (registry metadata, display only) ----
     /// Free-text filter over titles + tags, case-insensitive.
     tag_filter: String,
@@ -203,10 +211,12 @@ pub type Model {
 
 pub type Msg {
   Ignored
-  // A client (re)connected to the component runtime.
-  ClientConnected
-  ClientDisconnected
   // The session-event subscription created by the select effect in `init`.
+  // A per-client runtime's connect point: the load cascade (and the
+  // re-Join of the client-supplied session) starts once the subject is in
+  // the model. There is deliberately no ClientConnected/ClientDisconnected
+  // — one runtime serves exactly one client for its whole life, so connect
+  // is `init` and disconnect is the runtime dying with its socket.
   GotEvents(Subject(SessionEvent))
   // ---- Providers (P5: management + provider-scoped picker) ----
   /// Masked metadata for every provider (management panel + picker).
@@ -337,7 +347,11 @@ pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
       aliases: [],
       sessions: [],
       metrics: [],
-      selected: None,
+      // A reload re-opens the client's last-selected session: the page
+      // shell persists it and supplies it on the /ws route. If it has since
+      // vanished, `after_sessions` drops it and the auto-selection rules
+      // take over — same as any stale selection.
+      selected: flags.session,
       picker: "",
       create_open: False,
       log: [],
@@ -350,7 +364,6 @@ pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
       composer: 0,
       create_auto: False,
       model_label: "connecting…",
-      clients: 0,
       tag_filter: "",
       filter_gen: 0,
       show_archived: False,
@@ -376,29 +389,20 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
   case msg {
     Ignored -> #(model, effect.none())
 
-    ClientConnected -> {
-      // Reconnect semantics: clear the stale view, then re-Join (Hello +
-      // replay is idempotent) and refresh the session list.
-      let model =
-        Model(
-          ..model,
-          clients: model.clients + 1,
-          log: [],
-          bubble: None,
-          streaming: False,
-          pending: [],
-          loop: None,
-          guard: False,
-          turn_base: 0,
-          model_label: "connecting…",
-        )
+    GotEvents(subject) -> {
+      // The connect point of a per-client runtime: the subscription
+      // subject exists, so load everything (and re-Join the client's
+      // session — Hello + replay is idempotent). This is the old
+      // ClientConnected arm minus the stale-view clearing a fresh model
+      // makes unnecessary.
+      let model = Model(..model, events: Some(subject))
       let eff = case model.selected {
         Some(id) ->
           effect.batch([
             join_effect(model, id),
-            // Provider metadata + aliases refresh on every (re)connect
-            // too: a transient registry/model-list failure at boot must
-            // not leave the panel stale for the lifetime of the component.
+            // Provider metadata + aliases refresh here too: a transient
+            // registry/model-list failure must not leave the panel stale
+            // for the lifetime of the connection.
             providers_effect(model),
             aliases_effect(model),
             sessions_effect(model),
@@ -412,20 +416,6 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       }
       #(model, eff)
     }
-
-    ClientDisconnected -> #(
-      Model(..model, clients: int.max(model.clients - 1, 0)),
-      effect.none(),
-    )
-
-    GotEvents(subject) -> #(
-      Model(..model, events: Some(subject)),
-      effect.batch([
-        providers_effect(model),
-        aliases_effect(model),
-        sessions_effect(model),
-      ]),
-    )
 
     // ---- Providers: list, picker, CRUD (P5) ----
     ProvidersLoaded(providers) -> {
@@ -1518,7 +1508,10 @@ fn mutate_effect(
 // ---------------------------------------------------------------------------
 
 pub fn view(model: Model) -> Element(Msg) {
-  let connected = model.clients > 0
+  // The connection dot always renders live: one runtime serves exactly
+  // one connected client, so a dead client cannot be rendered for. The
+  // browser-side indicator script still flips the dot on the client
+  // runtime's own lustre:close/lustre:connect transport events.
   html.div([attr.id("app")], [
     html.header([], [
       html.h1([], [html.text("nexus")]),
@@ -1526,27 +1519,20 @@ pub fn view(model: Model) -> Element(Msg) {
         html.text(model.model_label),
       ]),
       html.span(
-        [
-          attr.id("status"),
-          attr.class(case connected {
-            True -> "dot live"
-            False -> "dot off"
-          }),
-          attr.title("connection"),
-        ],
-        [
-          html.text(case connected {
-            True -> "●"
-            False -> "○"
-          }),
-        ],
+        [attr.id("status"), attr.class("dot live"), attr.title("connection")],
+        [html.text("●")],
       ),
     ]),
-    html.div([attr.id("layout")], [
-      sidebar(model),
-      chat(model),
-      metrics_panel(model),
-    ]),
+    // `data-selected` mirrors the (per-client) selection into the DOM so
+    // the page shell's static script can persist it and re-supply it on
+    // the next connection's /ws route.
+    html.div(
+      [
+        attr.id("layout"),
+        attr.attribute("data-selected", option.unwrap(model.selected, "")),
+      ],
+      [sidebar(model), chat(model), metrics_panel(model)],
+    ),
   ])
 }
 

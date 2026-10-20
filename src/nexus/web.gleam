@@ -35,12 +35,13 @@ import nexus/ui_runtime
 /// Registry-backed handler. Sessions are resolved by ID at request time so
 /// HTTP traffic reaches the live actor after a registry-owned restart.
 /// `providers_name` resolves the provider registry the session-create
-/// path validates against (multi-provider plan §11).
+/// path validates against (multi-provider plan §11). The `/ws` route
+/// starts a dedicated component runtime per connection from these same
+/// subjects (see `nexus/ui_runtime`).
 pub fn handler(
   cfg: Config,
   registry_name: process.Name(session_registry.Msg),
   providers_name: process.Name(provider_registry.Msg),
-  component_name: ui_runtime.ComponentName,
 ) -> fn(Request(mist.Connection)) -> Response(mist.ResponseData) {
   let registry = process.named_subject(registry_name)
   let providers = process.named_subject(providers_name)
@@ -81,10 +82,7 @@ pub fn handler(
         protected(cfg, req, fn() { runtime_asset_response() })
       Get, ["ws"] ->
         protected(cfg, req, fn() {
-          ui_runtime.websocket(
-            req,
-            ui_runtime.runtime_from_name(component_name),
-          )
+          ui_runtime.websocket(req, registry, providers)
         })
       _, _ -> json_response(404, err_json("not found"))
     }

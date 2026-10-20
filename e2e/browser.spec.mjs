@@ -14,7 +14,9 @@
 //   7. http_fetch + web_search loops with typed tool cards
 //   8. iteration-guard terminal rendering (max=2 instance)
 //   9. byte-identical request prefixes turn-over-turn (fake records them)
-//  10. mobile viewport has no horizontal overflow with tool cards
+//  10. mobile viewport: a second context gets an independent per-client
+//      runtime (own selection, non-mirroring panels, reload restores its
+//      own session) with no horizontal overflow with tool cards
 //  11. connection dot: red while the backend is down, green on reconnect
 //  12. provider management end-to-end (multi-provider P5): create a
 //      provider in the Providers panel, pick it in the create panel
@@ -232,6 +234,12 @@ function killTree(child) {
 
 async function connected(page) {
   await page.waitForSelector("#status.live", { timeout: 15_000 });
+}
+
+// The per-client selection mirror (`#layout[data-selected]`, persisted
+// client-side by the page shell and re-supplied on the /ws route).
+async function selectedId(p) {
+  return await p.locator("#layout").evaluate((el) => el.getAttribute("data-selected") || "");
 }
 
 async function sendAndWaitIdle(page, text) {
@@ -787,18 +795,69 @@ async function main() {
       }
     });
 
-    // -- 12. mobile viewport -----------------------------------------------------
-    await test("mobile: no horizontal overflow with tool cards", async () => {
+    // -- 12. mobile viewport + per-client runtimes -----------------------------
+    // Since the per-client runtime break every /ws connection owns its
+    // model: a second context gets a fresh runtime (its own auto-selection
+    // and Hello replay, never an inherited view), panels no longer mirror
+    // between contexts, and a reload re-opens the context's own
+    // last-selected session (persisted client-side, re-supplied on the
+    // /ws route). The mobile overflow check stays.
+    await test("mobile: independent per-client view, no overflow with cards", async () => {
+      const desktop = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+      const dpage = await desktop.newPage();
+      await dpage.goto(`${base}/?token=${TOKEN}`);
+      await connected(dpage);
+      await dpage.waitForSelector("#session-list .session-main", { timeout: 30_000 });
+
       const mobile = await browser.newContext({ viewport: { width: 390, height: 844 } });
       const mpage = await mobile.newPage();
       await mpage.goto(`${base}/?token=${TOKEN}`);
       await connected(mpage);
+      // Fresh runtime, fresh model: the session re-opens through this
+      // connection's own auto-selection and Hello replay, not an
+      // inherited view (the shared runtime used to mirror the first
+      // context's state into every later context).
       await mpage.waitForSelector(".turn.tool[data-call-id]", { timeout: 30_000 });
+      const selection = await selectedId(mpage);
+      assert(selection, "mobile context has its own selection");
+      eq(
+        await selectedId(dpage),
+        selection,
+        "fresh context auto-selects like any fresh model",
+      );
+
+      // Panels are per-client: opening the create panel on mobile must
+      // not open it on the desktop context.
+      await mpage.click("#new-session");
+      await poll(
+        async () => await mpage.locator("#create-panel").evaluate((el) => !el.hidden),
+        { timeout: 15_000, message: "mobile create panel open" },
+      );
+      eq(
+        await dpage.locator("#create-panel").evaluate((el) => el.hidden),
+        true,
+        "desktop create panel stays closed",
+      );
+
       const overflow = await mpage.evaluate(() => ({
         scrollWidth: document.documentElement.scrollWidth,
         innerWidth: window.innerWidth,
       }));
       assert(overflow.scrollWidth <= overflow.innerWidth + 1, `overflow: ${JSON.stringify(overflow)}`);
+
+      // Reload: the context's own last-selected session comes back through
+      // the client-supplied route parameter (cards replayed), and the
+      // opened panel — per-connection state — does not survive.
+      await mpage.reload();
+      await connected(mpage);
+      await mpage.waitForSelector(".turn.tool[data-call-id]", { timeout: 30_000 });
+      eq(await selectedId(mpage), selection, "reload restores own selection");
+      eq(
+        await mpage.locator("#create-panel").evaluate((el) => el.hidden),
+        true,
+        "panel state does not survive a reload",
+      );
+      await desktop.close();
       await mobile.close();
     });
 
