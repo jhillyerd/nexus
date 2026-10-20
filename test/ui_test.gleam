@@ -1061,6 +1061,45 @@ pub fn providers_loaded_falls_back_when_disabled_test() {
   model.provider |> should.equal(None)
 }
 
+pub fn providers_loaded_clears_stale_aliases_on_fallback_test() {
+  // The fallback (selection disabled or gone) must not leave the old
+  // provider's models offerable: Create stays disabled until the
+  // replacement list lands, and a stale alias can never be pinned to a
+  // provider it did not come from (the ProviderPicked rule, applied to
+  // programmatic selection changes).
+  let model =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(ui.AliasesLoaded("p1", ["gpt", "claude"]))
+    |> step(
+      ui.ProvidersLoaded([
+        prov("p1", "bifrost", False, True),
+        prov("p2", "ollama", True, False),
+      ]),
+    )
+  model.provider |> should.equal(Some("p2"))
+  model.aliases |> should.equal([])
+  model.picker |> should.equal("")
+  // No provider left at all: same clearing, nothing stale rendered.
+  let gone =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(ui.AliasesLoaded("p1", ["gpt"]))
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", False, True)]))
+  gone.provider |> should.equal(None)
+  gone.aliases |> should.equal([])
+  gone.picker |> should.equal("")
+  // An unchanged selection keeps its loaded aliases (no flicker on
+  // unrelated refreshes).
+  let kept =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(ui.AliasesLoaded("p1", ["gpt"]))
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+  kept.provider |> should.equal(Some("p1"))
+  kept.aliases |> should.equal(["gpt"])
+}
+
 pub fn provider_picked_scopes_and_clears_aliases_test() {
   let model =
     new_model()
@@ -1110,7 +1149,7 @@ pub fn provider_op_failure_notes_the_log_test() {
     |> step(ui.ProviderOpFailed("provider name already exists"))
   model.log
   |> should.equal([
-    ui.NoteLine(True, "provider update failed: provider name already exists"),
+    ui.NoteLine(True, "provider operation failed: provider name already exists"),
   ])
 }
 

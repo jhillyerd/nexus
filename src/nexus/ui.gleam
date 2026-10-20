@@ -433,9 +433,28 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       // still enabled; fall back to the first enabled row otherwise.
       let previous = model.provider
       let selected = pick_provider(providers, previous)
-      let model = Model(..model, provider_list: providers, provider: selected)
-      let eff = case selected, selected == previous {
-        Some(id), False -> aliases_for(model, id)
+      let changed = selected != previous
+      let model =
+        Model(
+          ..model,
+          provider_list: providers,
+          provider: selected,
+          // The old provider's models must not survive a selection
+          // change (the ProviderPicked rule): Create stays disabled
+          // until the replacement provider's list lands, so a stale
+          // alias can never be pinned to a provider it did not come
+          // from — and no options render when none remains.
+          aliases: case changed {
+            True -> []
+            False -> model.aliases
+          },
+          picker: case changed {
+            True -> ""
+            False -> model.picker
+          },
+        )
+      let eff = case selected, changed {
+        Some(id), True -> aliases_for(model, id)
         _, _ -> effect.none()
       }
       #(model, eff)
@@ -530,7 +549,9 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
 
     ProviderOpFailed(reason) -> #(
       Model(..model, log: [
-        NoteLine(True, "provider update failed: " <> reason),
+        // Operation-neutral: this path carries create, edit, disable,
+        // and delete failures alike (e.g. the pinned-delete 409 guard).
+        NoteLine(True, "provider operation failed: " <> reason),
         ..model.log
       ]),
       effect.none(),
