@@ -16,6 +16,10 @@
 //   9. byte-identical request prefixes turn-over-turn (fake records them)
 //  10. mobile viewport has no horizontal overflow with tool cards
 //  11. connection dot: red while the backend is down, green on reconnect
+//  12. provider management end-to-end (multi-provider P5): create a
+//      provider in the Providers panel, pick it in the create panel
+//      (aliases reload per provider), pin a session to it, stream a turn,
+//      and hit the delete/disable guard rails
 //
 // Usage: node e2e/browser.spec.mjs   (see e2e/README.md)
 
@@ -360,6 +364,14 @@ async function main() {
       );
       const options = await page.$$eval("#model-picker option", (els) => els.map((e) => e.value));
       assert(options.includes("smart") && options.includes("fast"), `alias options: ${options}`);
+      // The provider picker (P5) targets the seeded keyless provider by
+      // default — the first enabled row — and the aliases above belong
+      // to it.
+      const providerOptions = await page.$$eval("#provider-picker option", (els) => els.map((e) => e.textContent));
+      assert(
+        providerOptions.length === 1 && providerOptions[0].includes("fake") && providerOptions[0].includes("keyless"),
+        `provider options: ${providerOptions}`,
+      );
       // No session is minted for the visitor: the list stays empty and the
       // create panel auto-opens, so the model is the user's choice.
       await poll(
@@ -401,17 +413,19 @@ async function main() {
         { timeout: 15_000, message: "second session appears" },
       );
       const labels = await page.$$eval("#session-list .session-main", (els) => els.map((e) => e.textContent));
-      assert(labels.some((l) => l.startsWith("fast")), `new session label: ${labels}`);
+      // Subtitles are `provider/model · age` (P5), so the label carries
+      // the seeded provider's name before the alias.
+      assert(labels.some((l) => l.includes("fake/fast")), `new session label: ${labels}`);
       const currentLabels = await page.$$eval(
         "#session-list .session-main[aria-current='true']",
         (els) => els.map((e) => e.textContent),
       );
       eq(currentLabels.length, 1, "exactly one current session");
-      assert(currentLabels[0].startsWith("fast"), `current is the new session: ${currentLabels}`);
+      assert(currentLabels[0].includes("fake/fast"), `current is the new session: ${currentLabels}`);
       // Switch back to the original smart session (Created prepends, so
       // match by label rather than DOM position).
       await page
-        .locator("#session-list .session-main", { hasText: "smart ·" })
+        .locator("#session-list .session-main", { hasText: "fake/smart ·" })
         .first()
         .click();
       await poll(
@@ -419,7 +433,7 @@ async function main() {
         { timeout: 15_000, message: "header label after switch" },
       );
       const smartCurrent = await page
-        .locator("#session-list .session-main", { hasText: "smart ·" })
+        .locator("#session-list .session-main", { hasText: "fake/smart ·" })
         .first()
         .getAttribute("aria-current");
       eq(smartCurrent, "true", "smart session current again");
@@ -817,6 +831,124 @@ async function main() {
         "dot glyph after reconnect",
       );
       await ctx.close();
+    });
+
+    // -- 13. provider management + provider→model picker (P5) ---------------
+    // The P5 acceptance, end to end through the real UI: create a
+    // provider in the Providers panel, pick it in the create panel
+    // (model aliases reload per provider), create a session pinned to
+    // it, and stream a turn. Then the guard rails: the delete is
+    // refused while the new session pins the provider, and disable/
+    // enable flip the picker.
+    await test("providers: create in UI, pick, pin a session, stream a turn", async () => {
+      // Back on the MAIN instance: test 10 navigated `page` to the guard
+      // instance, and the indicator test used its own context.
+      await page.goto(`${base}/?token=${TOKEN}`);
+      await connected(page);
+      const fakeUrl = `http://127.0.0.1:${services.bifrostPort}/v1`;
+
+      // The panel lists the seeded keyless provider.
+      await poll(
+        async () => (await page.locator("#providers-panel .provider-row").count()) === 1,
+        { timeout: 15_000, message: "seeded provider row" },
+      );
+      const seededRow = page.locator(".provider-row").first();
+      assert(
+        (await seededRow.locator(".provider-sub").textContent()) === fakeUrl,
+        "seeded provider base url",
+      );
+      assert((await seededRow.locator(".badge").textContent()) === "keyless", "keyless badge");
+
+      // Add a second keyless provider through the UI form.
+      await page.click("#add-provider");
+      await page.fill('#add-provider-form input[name="name"]', "ui-made");
+      await page.fill('#add-provider-form input[name="base_url"]', fakeUrl);
+      await page.locator('#add-provider-form button[type="submit"]').click();
+      const madeRow = page.locator('.provider-row[data-provider-id]', { hasText: "ui-made" }).first();
+      await poll(async () => await madeRow.isVisible(), {
+        timeout: 15_000,
+        message: "created provider row appears",
+      });
+      const madeId = await madeRow.getAttribute("data-provider-id");
+      // The API agrees: masked metadata, keyless, never a key.
+      const providers = await (
+        await page.request.get(`${base}/providers`, { headers: { authorization: `Bearer ${TOKEN}` } })
+      ).json();
+      const made = providers.providers.find((p) => p.id === madeId);
+      eq(made.name, "ui-made", "created provider in API");
+      eq(made.has_key, false, "created provider keyless in API");
+      eq(made.base_url, fakeUrl, "created provider url in API");
+
+      // Pick it in the create panel: the model aliases reload scoped to
+      // the selection, and the session pins (provider, model).
+      const sessionsBefore = await page.locator("#session-list .session-main").count();
+      const panelOpen = () =>
+        page.locator("#create-panel").evaluate((el) => !el.hidden);
+      if (!(await panelOpen().catch(() => false))) {
+        await page.click("#new-session");
+      }
+      await poll(panelOpen, { timeout: 10_000, message: "create panel open" });
+      await poll(
+        async () => (await page.locator("#provider-picker option").count()) === 2,
+        { timeout: 15_000, message: "both providers in picker" },
+      );
+      await page.selectOption("#provider-picker", madeId);
+      await poll(
+        async () => (await page.locator("#model-picker option").count()) >= 2,
+        { timeout: 15_000, message: "aliases reloaded for the picked provider" },
+      );
+      await page.selectOption("#model-picker", "smart");
+      await page.click("#create-session");
+      await poll(
+        async () => (await page.locator("#session-list .session-main").count()) === sessionsBefore + 1,
+        { timeout: 15_000, message: "pinned session appears" },
+      );
+      // The row subtitle names the pinned provider (provider/model · age).
+      const madeSessionRow = page
+        .locator("#session-list .session-main", { hasText: "ui-made/smart ·" })
+        .first();
+      await poll(async () => await madeSessionRow.isVisible(), {
+        timeout: 10_000,
+        message: "session subtitle pins provider/model",
+      });
+
+      // Stream a turn end-to-end through the new provider.
+      await sendAndWaitIdle(page, "case:text provider ui round");
+      const assistant = await page.$$eval(".turn.assistant", (els) => els.map((e) => e.textContent));
+      assert(assistant.some((t) => t.includes("Plain answer")), `assistant turn via ui-made: ${assistant}`);
+
+      // Guard rail: deleting a provider its session pins is refused (the
+      // 409 semantics) and surfaces as a note.
+      await madeRow.getByRole("button", { name: "Delete", exact: true }).click();
+      await madeRow.getByRole("button", { name: "Delete forever", exact: true }).click();
+      await poll(
+        async () =>
+          (await page.locator(".note.err").last().textContent())
+            ?.includes("provider is still pinned by sessions"),
+        { timeout: 15_000, message: "409 guard note after pinned delete" },
+      );
+      await poll(async () => await madeRow.isVisible(), {
+        timeout: 10_000,
+        message: "pinned provider row survives refused delete",
+      });
+
+      // Disable: the row badges as disabled and the picker drops it.
+      await madeRow.getByRole("button", { name: "Disable", exact: true }).click();
+      await poll(
+        async () => (await madeRow.locator(".badge.off").textContent()) === "disabled",
+        { timeout: 15_000, message: "disabled badge" },
+      );
+      await poll(
+        async () => (await page.locator("#provider-picker option").count()) === 1,
+        { timeout: 15_000, message: "picker drops disabled provider" },
+      );
+      // Disabling blocks new resolutions, not the already-frozen session
+      // endpoint — the pinned session keeps streaming either way.
+      await madeRow.getByRole("button", { name: "Enable", exact: true }).click();
+      await poll(
+        async () => (await page.locator("#provider-picker option").count()) === 2,
+        { timeout: 15_000, message: "re-enabled provider back in picker" },
+      );
     });
   } catch (err) {
     console.error("fatal:", err);

@@ -135,6 +135,23 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
 #create-panel { margin-top: 1rem; padding-top: .8rem; border-top: 1px solid
   color-mix(in srgb, currentColor 15%, transparent); display: flex; flex-direction: column; gap: .45rem; }
 #create-panel[hidden] { display: none; }
+#providers-panel { margin-top: 1rem; padding-top: .8rem; border-top: 1px solid
+  color-mix(in srgb, currentColor 15%, transparent); display: flex; flex-direction: column; gap: .55rem; }
+.provider-list { display: flex; flex-direction: column; gap: .45rem; }
+.provider-row { display: flex; flex-direction: column; gap: .25rem; border: 1px solid transparent;
+  border-radius: 10px; padding: .3rem; }
+.provider-main { display: flex; flex-direction: column; gap: .1rem; }
+.provider-name { overflow-wrap: anywhere; }
+.provider-sub { font-size: .72rem; opacity: .6; overflow-wrap: anywhere; }
+.badge { font-size: .68rem; padding: .05rem .4rem; border-radius: 999px; align-self: flex-start;
+  border: 1px solid color-mix(in srgb, currentColor 35%, transparent); background:
+  color-mix(in srgb, currentColor 6%, transparent); }
+.badge.off { color: #b8860b; border-color: color-mix(in srgb, #b8860b 45%, transparent); }
+.provider-form { display: flex; flex-direction: column; gap: .3rem; }
+.provider-form[hidden] { display: none; }
+.provider-form input { min-width: 0; }
+.provider-form-buttons { display: flex; gap: .3rem; }
+.provider-form-buttons button { font-size: .75rem; padding: .25rem .6rem; }
 select, textarea, input { font: inherit; color: inherit; background: transparent; border-radius: 8px;
   border: 1px solid color-mix(in srgb, currentColor 25%, transparent); padding: .45rem .6rem; }
 #chat { min-width: 0; display: flex; flex-direction: column; }

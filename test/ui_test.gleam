@@ -8,6 +8,7 @@ import gleam/option.{None, Some}
 import gleam/string
 import gleeunit/should
 import lustre/element
+import nexus/provider
 import nexus/session
 import nexus/ui
 
@@ -28,6 +29,7 @@ fn step(model: ui.Model, msg: ui.Msg) -> ui.Model {
 fn summary(id: String, streaming: Bool) -> session.SessionSummary {
   session.SessionSummary(
     id: id,
+    provider_id: "p1",
     model: "smart",
     title: "",
     title_source: session.AutoTitle,
@@ -799,6 +801,7 @@ fn meta_summary(
 ) -> session.SessionSummary {
   session.SessionSummary(
     id: id,
+    provider_id: "p1",
     model: "smart",
     title: title,
     title_source: session.AutoTitle,
@@ -999,4 +1002,251 @@ pub fn view_inline_editors_hidden_until_opened_test() {
     |> step(ui.TagsToggled("s-1"))
     |> view_string
   should.be_true(string.contains(tags_open, "value=\"ops\""))
+}
+
+// ---------------------------------------------------------------------------
+// Providers panel + provider-scoped picker (multi-provider P5)
+// ---------------------------------------------------------------------------
+
+fn prov(
+  id: String,
+  name: String,
+  enabled: Bool,
+  has_key: Bool,
+) -> provider.Provider {
+  provider.Provider(
+    id: id,
+    name: name,
+    base_url: "http://127.0.0.1:9999/v1",
+    dialect: "openai",
+    enabled: enabled,
+    has_key: has_key,
+    created_at: 0,
+    updated_at: 0,
+  )
+}
+
+pub fn pick_provider_test() {
+  let providers = [
+    prov("p1", "bifrost", False, True),
+    prov("p2", "ollama", True, False),
+  ]
+  // No previous selection: the first ENABLED provider.
+  ui.pick_provider(providers, None) |> should.equal(Some("p2"))
+  ui.pick_provider([], None) |> should.equal(None)
+  // A live selection survives; a disabled or vanished one falls back.
+  ui.pick_provider(providers, Some("p2")) |> should.equal(Some("p2"))
+  ui.pick_provider(providers, Some("p1")) |> should.equal(Some("p2"))
+  ui.pick_provider(providers, Some("gone")) |> should.equal(Some("p2"))
+}
+
+pub fn providers_loaded_auto_picks_enabled_test() {
+  let model =
+    new_model()
+    |> step(
+      ui.ProvidersLoaded([
+        prov("p1", "bifrost", False, True),
+        prov("p2", "ollama", True, False),
+      ]),
+    )
+  model.provider |> should.equal(Some("p2"))
+  list.length(model.provider_list) |> should.equal(2)
+}
+
+pub fn providers_loaded_falls_back_when_disabled_test() {
+  let model =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p2", "ollama", True, False)]))
+    |> step(ui.ProvidersLoaded([prov("p2", "ollama", False, False)]))
+  model.provider |> should.equal(None)
+}
+
+pub fn providers_loaded_clears_stale_aliases_on_fallback_test() {
+  // The fallback (selection disabled or gone) must not leave the old
+  // provider's models offerable: Create stays disabled until the
+  // replacement list lands, and a stale alias can never be pinned to a
+  // provider it did not come from (the ProviderPicked rule, applied to
+  // programmatic selection changes).
+  let model =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(ui.AliasesLoaded("p1", ["gpt", "claude"]))
+    |> step(
+      ui.ProvidersLoaded([
+        prov("p1", "bifrost", False, True),
+        prov("p2", "ollama", True, False),
+      ]),
+    )
+  model.provider |> should.equal(Some("p2"))
+  model.aliases |> should.equal([])
+  model.picker |> should.equal("")
+  // No provider left at all: same clearing, nothing stale rendered.
+  let gone =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(ui.AliasesLoaded("p1", ["gpt"]))
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", False, True)]))
+  gone.provider |> should.equal(None)
+  gone.aliases |> should.equal([])
+  gone.picker |> should.equal("")
+  // An unchanged selection keeps its loaded aliases (no flicker on
+  // unrelated refreshes).
+  let kept =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(ui.AliasesLoaded("p1", ["gpt"]))
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+  kept.provider |> should.equal(Some("p1"))
+  kept.aliases |> should.equal(["gpt"])
+}
+
+pub fn provider_picked_scopes_and_clears_aliases_test() {
+  let model =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p2", "ollama", True, False)]))
+    |> step(ui.AliasesLoaded("p2", ["qwen", "llama"]))
+    |> step(ui.ProviderPicked("p2"))
+  // Re-picking the same provider changes nothing.
+  model.aliases |> should.equal(["qwen", "llama"])
+  let switched = step(model, ui.ProviderPicked("p9"))
+  // Another provider's models must never linger as pin options.
+  switched.aliases |> should.equal([])
+  switched.picker |> should.equal("")
+}
+
+pub fn provider_created_selects_first_provider_test() {
+  let model =
+    new_model() |> step(ui.ProviderCreated(prov("p3", "new", True, True)))
+  model.provider |> should.equal(Some("p3"))
+  // An existing selection is left alone.
+  let kept =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p2", "ollama", True, False)]))
+    |> step(ui.ProviderCreated(prov("p3", "new", True, True)))
+  kept.provider |> should.equal(Some("p2"))
+}
+
+pub fn provider_editors_toggle_one_at_a_time_test() {
+  let model =
+    new_model() |> step(ui.ProvidersLoaded([prov("p1", "a", True, True)]))
+  let model = step(model, ui.AddProviderToggled)
+  model.providers_open |> should.be_true
+  // Opening a row editor closes the add form, and vice versa; delete
+  // confirm closes both.
+  let model = step(model, ui.ProviderEditToggled("p1"))
+  model.provider_edit |> should.equal(Some("p1"))
+  model.providers_open |> should.be_false
+  let model = step(model, ui.ProviderDeleteRequested("p1"))
+  model.provider_confirm |> should.equal(Some("p1"))
+  model.provider_edit |> should.equal(None)
+  let model = step(model, ui.ProviderDeleteCancelled)
+  model.provider_confirm |> should.equal(None)
+}
+
+pub fn provider_op_failure_notes_the_log_test() {
+  let model =
+    new_model()
+    |> step(ui.ProviderOpFailed("provider name already exists"))
+  model.log
+  |> should.equal([
+    ui.NoteLine(True, "provider operation failed: provider name already exists"),
+  ])
+}
+
+pub fn view_renders_providers_panel_test() {
+  let html =
+    new_model()
+    |> step(
+      ui.ProvidersLoaded([
+        prov("p1", "bifrost", True, True),
+        prov("p2", "ollama", False, False),
+      ]),
+    )
+    |> view_string
+  should.be_true(string.contains(html, "Providers"))
+  should.be_true(string.contains(html, "bifrost"))
+  should.be_true(string.contains(html, "ollama"))
+  should.be_true(string.contains(html, "http://127.0.0.1:9999/v1"))
+  // Badges: key/keyless state, never key material.
+  should.be_true(string.contains(html, ">key<"))
+  should.be_true(string.contains(html, ">keyless<"))
+  should.be_true(string.contains(html, ">disabled<"))
+  // Controls mirror the session rows' compact pattern.
+  should.be_true(string.contains(html, ">Disable<"))
+  should.be_true(string.contains(html, ">Enable<"))
+  should.be_true(string.contains(html, ">Edit<"))
+  should.be_true(string.contains(html, ">Delete<"))
+  // Empty state before any provider exists.
+  let empty = new_model() |> view_string
+  should.be_true(string.contains(empty, "No providers yet."))
+}
+
+pub fn view_provider_forms_hidden_until_opened_test() {
+  let base =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> view_string
+  // Both forms render but are hidden (the session-editor pattern).
+  should.be_true(string.contains(base, "add-provider-form"))
+  should.be_true(string.contains(base, "provider-form"))
+  let adding =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(ui.AddProviderToggled)
+    |> view_string
+  should.be_true(string.contains(adding, "API key (optional)"))
+  let editing =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(ui.ProviderEditToggled("p1"))
+    |> view_string
+  // The key field is write-only: it starts EMPTY (blank = keep) even for
+  // a provider that HAS a key — has_key is the only key fact rendered.
+  should.be_true(string.contains(editing, "API key (blank keeps existing)"))
+  should.be_true(string.contains(editing, "value=\"bifrost\""))
+  should.be_false(string.contains(editing, "value=\"sk-"))
+}
+
+pub fn view_provider_picker_lists_enabled_only_test() {
+  let html =
+    new_model()
+    |> step(
+      ui.ProvidersLoaded([
+        prov("p1", "bifrost", True, True),
+        prov("p2", "ollama", True, False),
+        prov("p3", "old", False, True),
+      ]),
+    )
+    |> view_string
+  should.be_true(string.contains(html, "provider-picker"))
+  should.be_true(string.contains(html, ">bifrost<"))
+  // Keyless providers are called out in the option label; disabled
+  // providers do not appear at all.
+  should.be_true(string.contains(html, ">ollama (keyless)<"))
+  // Disabled providers appear in the MANAGEMENT panel but never as a
+  // picker option (option values carry the id).
+  should.be_false(string.contains(html, "value=\"p3\""))
+  // Zero enabled providers: a legible placeholder, not an empty select.
+  let none =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p3", "old", False, True)]))
+    |> view_string
+  should.be_true(string.contains(none, "no providers — add one below"))
+}
+
+pub fn view_session_subtitle_pins_provider_test() {
+  let html =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(ui.SessionsLoaded([summary("s-1", False)]))
+    |> view_string
+  // Subtitle: provider/model · age (§11). The summary pins p1, whose
+  // display name resolves from the masked list.
+  should.be_true(string.contains(html, "bifrost/smart · "))
+  // While the list lags, the id stands in — never blank.
+  let lagging =
+    new_model()
+    |> step(ui.SessionsLoaded([summary("s-1", False)]))
+    |> view_string
+  should.be_true(string.contains(lagging, "p1/smart · "))
 }

@@ -16,6 +16,7 @@ import gleam/erlang/process.{type Subject}
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/result
 import gleam/string
 import lustre/attribute as attr
 import lustre/effect.{type Effect}
@@ -24,6 +25,7 @@ import lustre/element/html
 import lustre/element/keyed
 import lustre/event
 import lustre/server_component
+import nexus/provider.{type Provider}
 import nexus/provider_registry
 import nexus/session.{type SessionEvent}
 import nexus/session_registry
@@ -137,10 +139,20 @@ pub type Model {
     // Long-lived subscription to the selected session's events. Created by
     // the `select` effect in `init` and reused across reconnects.
     events: Option(Subject(SessionEvent)),
-    /// The provider whose models fill the picker (multi-provider P3
-    /// bridge: the first enabled provider; the P5 picker generalizes
-    /// this to a real selection).
+    /// The provider whose models fill the create panel's picker (P5): the
+    /// user's selection, defaulting to the first enabled provider. Aliases
+    /// reload whenever this changes.
     provider: Option(String),
+    /// All providers as masked metadata (the Providers panel, the picker's
+    /// options, and provider-name resolution for session subtitles).
+    /// `has_key` only — key material never reaches this model.
+    provider_list: List(Provider),
+    /// The add-provider form is open (at most one form section-wide).
+    providers_open: Bool,
+    /// The provider row whose inline editor is open.
+    provider_edit: Option(String),
+    /// The provider row whose two-step delete confirmation is armed.
+    provider_confirm: Option(String),
     aliases: List(String),
     sessions: List(session.SessionSummary),
     metrics: List(session.MetricSample),
@@ -196,10 +208,40 @@ pub type Msg {
   ClientDisconnected
   // The session-event subscription created by the select effect in `init`.
   GotEvents(Subject(SessionEvent))
+  // ---- Providers (P5: management + provider-scoped picker) ----
+  /// Masked metadata for every provider (management panel + picker).
+  ProvidersLoaded(List(Provider))
+  ProvidersFailed(String)
+  /// The create panel's provider select changed: aliases reload scoped
+  /// to the new provider (multi-provider §12).
+  ProviderPicked(id: String)
+  /// The add-provider form toggled.
+  AddProviderToggled
+  /// The add-provider form submitted (blank key = keyless).
+  ProviderSubmitted(name: String, base_url: String, api_key: String)
+  /// A provider was created (the effect re-lists providers too).
+  ProviderCreated(Provider)
+  ProviderEditToggled(id: String)
+  /// The edit form submitted: blank fields keep the stored values; a
+  /// blank key keeps the stored envelope (write-only field, §12).
+  ProviderEditSubmitted(
+    id: String,
+    name: String,
+    base_url: String,
+    api_key: String,
+  )
+  /// Enable/disable flipped from a row control.
+  ProviderEnabledToggled(id: String, enabled: Bool)
+  ProviderDeleteRequested(id: String)
+  ProviderDeleteCancelled
+  ProviderDeleteConfirmed(id: String)
+  /// Any provider mutation failed; `reason` is the registry's fixed
+  /// text (e.g. the delete 409 guard) surfaced as a note.
+  ProviderOpFailed(String)
   AliasesLoaded(provider: String, aliases: List(String))
   AliasesFailed
   /// No enabled provider exists: the create panel has nothing to offer
-  /// until an operator configures one (P5 adds the management surface).
+  /// until an operator adds one in the Providers panel.
   NoProviders
   SessionsLoaded(List(session.SessionSummary))
   SessionsFailed(String)
@@ -288,6 +330,10 @@ pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
       registry: flags.registry,
       events: None,
       provider: None,
+      provider_list: [],
+      providers_open: False,
+      provider_edit: None,
+      provider_confirm: None,
       aliases: [],
       sessions: [],
       metrics: [],
@@ -350,13 +396,19 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         Some(id) ->
           effect.batch([
             join_effect(model, id),
-            // Aliases refresh on every (re)connect too: a transient
-            // list-models failure at boot must not leave the picker empty
-            // for the lifetime of the component.
+            // Provider metadata + aliases refresh on every (re)connect
+            // too: a transient registry/model-list failure at boot must
+            // not leave the panel stale for the lifetime of the component.
+            providers_effect(model),
             aliases_effect(model),
             sessions_effect(model),
           ])
-        None -> effect.batch([aliases_effect(model), sessions_effect(model)])
+        None ->
+          effect.batch([
+            providers_effect(model),
+            aliases_effect(model),
+            sessions_effect(model),
+          ])
       }
       #(model, eff)
     }
@@ -368,7 +420,141 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
 
     GotEvents(subject) -> #(
       Model(..model, events: Some(subject)),
-      effect.batch([aliases_effect(model), sessions_effect(model)]),
+      effect.batch([
+        providers_effect(model),
+        aliases_effect(model),
+        sessions_effect(model),
+      ]),
+    )
+
+    // ---- Providers: list, picker, CRUD (P5) ----
+    ProvidersLoaded(providers) -> {
+      // Keep the picker aimed at a provider that still exists and is
+      // still enabled; fall back to the first enabled row otherwise.
+      let previous = model.provider
+      let selected = pick_provider(providers, previous)
+      let changed = selected != previous
+      let model =
+        Model(
+          ..model,
+          provider_list: providers,
+          provider: selected,
+          // The old provider's models must not survive a selection
+          // change (the ProviderPicked rule): Create stays disabled
+          // until the replacement provider's list lands, so a stale
+          // alias can never be pinned to a provider it did not come
+          // from — and no options render when none remains.
+          aliases: case changed {
+            True -> []
+            False -> model.aliases
+          },
+          picker: case changed {
+            True -> ""
+            False -> model.picker
+          },
+        )
+      let eff = case selected, changed {
+        Some(id), True -> aliases_for(model, id)
+        _, _ -> effect.none()
+      }
+      #(model, eff)
+    }
+
+    ProvidersFailed(reason) -> #(
+      Model(..model, log: [
+        NoteLine(True, "could not load providers: " <> reason),
+        ..model.log
+      ]),
+      effect.none(),
+    )
+
+    ProviderPicked(id) ->
+      case model.provider {
+        Some(current) if current == id -> #(model, effect.none())
+        _ -> #(
+          // Stale aliases must not survive a provider switch: the picker
+          // empties until the new provider's list lands (Create is
+          // disabled while it is), and never offers another provider's
+          // models as the pin for a new session.
+          Model(..model, provider: Some(id), aliases: [], picker: ""),
+          aliases_for(model, id),
+        )
+      }
+
+    AddProviderToggled -> #(
+      Model(
+        ..model,
+        providers_open: !model.providers_open,
+        provider_edit: None,
+        provider_confirm: None,
+      ),
+      effect.none(),
+    )
+
+    ProviderSubmitted(name, base_url, api_key) -> #(
+      Model(..model, providers_open: False),
+      create_provider_effect(model, name, base_url, api_key),
+    )
+
+    ProviderCreated(provider) ->
+      // First-run flow: with nothing selected, the freshly created
+      // (enabled) provider becomes the picker's target at once.
+      case model.provider {
+        None -> #(
+          Model(..model, provider: Some(provider.id)),
+          aliases_for(model, provider.id),
+        )
+        Some(_) -> #(model, effect.none())
+      }
+
+    ProviderEditToggled(id) -> #(
+      Model(
+        ..model,
+        provider_edit: toggle_open(model.provider_edit, id),
+        providers_open: False,
+        provider_confirm: None,
+      ),
+      effect.none(),
+    )
+
+    ProviderEditSubmitted(id, name, base_url, api_key) -> #(
+      Model(..model, provider_edit: None),
+      update_provider_effect(model, id, name, base_url, api_key),
+    )
+
+    ProviderEnabledToggled(id, enabled) -> #(
+      model,
+      set_provider_enabled_effect(model, id, enabled),
+    )
+
+    ProviderDeleteRequested(id) -> #(
+      Model(
+        ..model,
+        provider_confirm: Some(id),
+        provider_edit: None,
+        providers_open: False,
+      ),
+      effect.none(),
+    )
+
+    ProviderDeleteCancelled -> #(
+      Model(..model, provider_confirm: None),
+      effect.none(),
+    )
+
+    ProviderDeleteConfirmed(id) -> #(
+      Model(..model, provider_confirm: None),
+      delete_provider_effect(model, id),
+    )
+
+    ProviderOpFailed(reason) -> #(
+      Model(..model, log: [
+        // Operation-neutral: this path carries create, edit, disable,
+        // and delete failures alike (e.g. the pinned-delete 409 guard).
+        NoteLine(True, "provider operation failed: " <> reason),
+        ..model.log
+      ]),
+      effect.none(),
     )
 
     AliasesLoaded(provider, aliases) -> #(
@@ -393,7 +579,7 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       Model(..model, provider: None, aliases: [], log: [
         NoteLine(
           True,
-          "no provider configured — create one before starting a session",
+          "no provider configured — add one in the Providers panel",
         ),
         ..model.log
       ]),
@@ -997,27 +1183,184 @@ fn metrics_for(
 // ---------------------------------------------------------------------------
 
 fn aliases_effect(model: Model) -> Effect(Msg) {
-  // P3 bridge until the P5 picker: the create panel auto-targets the
-  // FIRST enabled provider and lists that provider's models. With zero
-  // enabled providers there is nothing to offer — the panel says so.
+  // The create panel's picker follows the selected provider; with no
+  // enabled provider there is nothing to offer — the note points at the
+  // Providers panel that creates one.
+  case model.provider {
+    Some(id) -> aliases_for(model, id)
+    None -> effect.from(fn(dispatch) { dispatch(NoProviders) })
+  }
+}
+
+/// Fetch the selected provider's live model list (multi-provider §12:
+/// the picker is provider-scoped). Generous actor-call timeout: the
+/// fetch itself is bounded by the endpoint's first-response budget
+/// (server-global SSE policy), this only has to outlive it — and it
+/// runs off the registry's loop (see provider_registry `ListModels`).
+fn aliases_for(model: Model, provider_id: String) -> Effect(Msg) {
+  let providers = model.providers
+  effect.from(fn(dispatch) {
+    case provider_registry.list_models(providers, provider_id, 60_000) {
+      Ok(aliases) -> dispatch(AliasesLoaded(provider_id, aliases))
+      Error(_) -> dispatch(AliasesFailed)
+    }
+  })
+}
+
+/// All providers as masked metadata: the Providers panel, the picker's
+/// options, and subtitle name resolution all read this list.
+fn providers_effect(model: Model) -> Effect(Msg) {
   let providers = model.providers
   effect.from(fn(dispatch) {
     case provider_registry.list_providers(providers) {
-      Error(_) -> dispatch(AliasesFailed)
-      Ok(all) ->
-        case list.find(all, fn(p) { p.enabled }) {
-          Error(_) -> dispatch(NoProviders)
-          Ok(first) ->
-            // Generous actor-call timeout: the fetch itself is bounded by
-            // the endpoint's first-response budget (server-global SSE
-            // policy), this only has to outlive it.
-            case provider_registry.list_models(providers, first.id, 60_000) {
-              Ok(aliases) -> dispatch(AliasesLoaded(first.id, aliases))
-              Error(_) -> dispatch(AliasesFailed)
-            }
-        }
+      Ok(all) -> dispatch(ProvidersLoaded(all))
+      Error(error) ->
+        dispatch(ProvidersFailed(provider_registry.describe(error)))
     }
   })
+}
+
+/// The picker's target after a (re)load: the previous selection when it
+/// still exists and is enabled, else the first enabled provider.
+pub fn pick_provider(
+  providers: List(Provider),
+  previous: Option(String),
+) -> Option(String) {
+  let enabled = list.filter(providers, fn(p) { p.enabled })
+  case previous {
+    Some(id) ->
+      case list.any(enabled, fn(p) { p.id == id }) {
+        True -> Some(id)
+        False ->
+          list.map(enabled, fn(p) { p.id }) |> list.first |> option.from_result
+      }
+    None ->
+      list.map(enabled, fn(p) { p.id }) |> list.first |> option.from_result
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Provider CRUD effects (P5 management panel; §11 semantics via the
+// registry — the UI never sees key material, only blank-or-present)
+// ---------------------------------------------------------------------------
+
+/// Create a provider from the add-form's fields. A blank key is a
+/// KEYLESS provider (local endpoints); the plaintext exists only inside
+/// the registry call. The refreshed list follows the created row so the
+/// panel and picker update in one round-trip.
+fn create_provider_effect(
+  model: Model,
+  name: String,
+  base_url: String,
+  api_key: String,
+) -> Effect(Msg) {
+  let providers = model.providers
+  let params =
+    provider.ProviderParams(
+      name: name,
+      base_url: base_url,
+      api_key: blank_as_none(api_key),
+    )
+  effect.from(fn(dispatch) {
+    case provider_registry.create(providers, params) {
+      Ok(created) -> {
+        dispatch(ProviderCreated(created))
+        dispatch(reload_providers(providers))
+      }
+      Error(error) ->
+        dispatch(ProviderOpFailed(provider_registry.describe(error)))
+    }
+  })
+}
+
+/// Submit the edit form as a PATCH: blank fields keep the stored values,
+/// and a blank key keeps the stored envelope (there is deliberately no
+/// "remove the key" path — §11). An all-blank form is a plain no-op.
+fn update_provider_effect(
+  model: Model,
+  id: String,
+  name: String,
+  base_url: String,
+  api_key: String,
+) -> Effect(Msg) {
+  let patch =
+    provider.ProviderUpdate(
+      name: keep_blank(name),
+      base_url: keep_blank(base_url),
+      api_key: blank_as_none(api_key),
+      enabled: None,
+    )
+  case
+    option.is_none(patch.name)
+    && option.is_none(patch.base_url)
+    && option.is_none(patch.api_key)
+  {
+    True -> effect.none()
+    False -> {
+      let providers = model.providers
+      effect.from(fn(dispatch) {
+        case provider_registry.update(providers, id, patch) {
+          Ok(_) -> dispatch(reload_providers(providers))
+          Error(error) ->
+            dispatch(ProviderOpFailed(provider_registry.describe(error)))
+        }
+      })
+    }
+  }
+}
+
+/// Flip the reversible off-switch from a row control; the refreshed list
+/// carries the new flag (and re-aims the picker if the disabled row was
+/// its target).
+fn set_provider_enabled_effect(
+  model: Model,
+  id: String,
+  enabled: Bool,
+) -> Effect(Msg) {
+  let providers = model.providers
+  effect.from(fn(dispatch) {
+    case provider_registry.set_enabled(providers, id, enabled) {
+      Ok(_) -> dispatch(reload_providers(providers))
+      Error(error) ->
+        dispatch(ProviderOpFailed(provider_registry.describe(error)))
+    }
+  })
+}
+
+/// Hard delete (two-step confirmed): the registry's 409 guard surfaces
+/// as a note when sessions still pin the provider.
+fn delete_provider_effect(model: Model, id: String) -> Effect(Msg) {
+  let providers = model.providers
+  effect.from(fn(dispatch) {
+    case provider_registry.delete(providers, id) {
+      Ok(_) -> dispatch(reload_providers(providers))
+      Error(error) ->
+        dispatch(ProviderOpFailed(provider_registry.describe(error)))
+    }
+  })
+}
+
+/// The masked list as a message — the single refresh path after every
+/// mutation.
+fn reload_providers(providers: Subject(provider_registry.Msg)) -> Msg {
+  case provider_registry.list_providers(providers) {
+    Ok(all) -> ProvidersLoaded(all)
+    Error(error) -> ProvidersFailed(provider_registry.describe(error))
+  }
+}
+
+/// A present-but-blank field is the same as an absent one: keyless on
+/// create, keep-on-patch.
+fn blank_as_none(value: String) -> Option(String) {
+  case string.trim(value) {
+    "" -> None
+    _ -> Some(value)
+  }
+}
+
+/// PATCH "keep" semantics for text fields: blank keeps the stored value.
+fn keep_blank(value: String) -> Option(String) {
+  blank_as_none(value)
 }
 
 fn sessions_effect(model: Model) -> Effect(Msg) {
@@ -1104,8 +1447,8 @@ fn create_effect(model: Model, alias: String) -> Effect(Msg) {
   effect.from(fn(dispatch) {
     // The registry builds the M3 agent-loop runner itself, from the tool
     // registry frozen at its boot — sessions created here get the full
-    // toolset. The provider pin is the auto-picked one (P3 bridge): no
-    // picker selection exists until P5.
+    // toolset, pinned to the create panel's selected provider + model
+    // (multi-provider §8: the pin is explicit, never defaulted).
     let create = case model.provider {
       Some(provider_id) -> session_registry.create(registry, provider_id, alias)
       None ->
@@ -1118,6 +1461,7 @@ fn create_effect(model: Model, alias: String) -> Effect(Msg) {
           Created(
             session.SessionSummary(
               id: record.id,
+              provider_id: option.unwrap(model.provider, ""),
               model: record.model,
               title: "",
               title_source: session.AutoTitle,
@@ -1246,6 +1590,15 @@ fn sidebar(model: Model) -> Element(Msg) {
       ),
     ]),
     html.section([attr.id("create-panel"), attr.hidden(!model.create_open)], [
+      html.label([attr.for("provider-picker")], [html.text("Provider")]),
+      html.select(
+        [
+          attr.id("provider-picker"),
+          attr.aria("label", "Provider"),
+          provider_change(),
+        ],
+        provider_options(model),
+      ),
       html.label([attr.for("model-picker")], [html.text("Model alias")]),
       html.select(
         [
@@ -1267,13 +1620,231 @@ fn sidebar(model: Model) -> Element(Msg) {
         [
           attr.id("create-session"),
           attr.type_("button"),
-          attr.disabled(model.aliases == []),
+          attr.disabled(model.aliases == [] || model.provider == None),
           event.on_click(CreateRequested),
         ],
         [html.text("Create session")],
       ),
     ]),
+    providers_panel(model),
   ])
+}
+
+// ---------------------------------------------------------------------------
+// Providers panel (P5)
+// ---------------------------------------------------------------------------
+
+/// The provider-management section (multi-provider §12): list, add,
+/// edit, enable/disable, delete. Always visible — on a fresh database
+/// it is the only way forward (the create panel has nothing to offer
+/// until a provider exists). The key field is WRITE-ONLY: it renders
+/// with no value on edit (blank = keep) and only `has_key` is shown.
+fn providers_panel(model: Model) -> Element(Msg) {
+  html.section([attr.id("providers-panel")], [
+    html.div([attr.class("section-head")], [
+      html.h2([], [html.text("Providers")]),
+      html.button(
+        [
+          attr.id("add-provider"),
+          attr.type_("button"),
+          event.on_click(AddProviderToggled),
+        ],
+        [html.text("Add")],
+      ),
+    ]),
+    add_provider_form(model),
+    ..case model.provider_list {
+      [] -> [
+        html.p([attr.class("muted")], [
+          html.text("No providers yet. Add one to start chatting."),
+        ]),
+      ]
+      providers -> list.map(providers, provider_row(model, _))
+    }
+  ])
+}
+
+/// The add-provider form. The key input is a password field with
+/// autocomplete off — it never carries a value and never echoes one
+/// back; the registry is the only place plaintext exists.
+fn add_provider_form(model: Model) -> Element(Msg) {
+  html.form(
+    [
+      attr.id("add-provider-form"),
+      attr.class("provider-form"),
+      attr.action("#"),
+      attr.hidden(!model.providers_open),
+      provider_submitted(),
+    ],
+    [
+      html.input([
+        attr.type_("text"),
+        attr.name("name"),
+        attr.placeholder("Name (e.g. bifrost)"),
+        attr.aria("label", "New provider name"),
+      ]),
+      html.input([
+        attr.type_("text"),
+        attr.name("base_url"),
+        attr.placeholder("Base URL (https://…/v1)"),
+        attr.aria("label", "New provider base URL"),
+      ]),
+      html.input([
+        attr.type_("password"),
+        attr.name("api_key"),
+        attr.placeholder("API key (optional)"),
+        attr.aria("label", "New provider API key"),
+        attr.autocomplete("off"),
+      ]),
+      html.div([attr.class("provider-form-buttons")], [
+        html.button([attr.type_("submit")], [html.text("Add provider")]),
+        html.button([attr.type_("button"), event.on_click(AddProviderToggled)], [
+          html.text("Cancel"),
+        ]),
+      ]),
+    ],
+  )
+}
+
+/// One provider row: name, badges (key/keyless, off), base URL, the
+/// enable/disable + edit + delete controls, the hidden inline editor,
+/// and the two-step delete confirmation. Mirrors the session rows.
+fn provider_row(model: Model, p: Provider) -> Element(Msg) {
+  let id = p.id
+  html.div([attr.class("provider-row"), attr.data("provider-id", id)], [
+    html.div([attr.class("provider-main")], [
+      html.strong([attr.class("provider-name")], [html.text(p.name)]),
+      case p.enabled {
+        True -> element.none()
+        False -> span_badge("off", "disabled")
+      },
+      case p.has_key {
+        True -> span_badge("", "key")
+        False -> span_badge("", "keyless")
+      },
+      html.span([attr.class("provider-sub")], [html.text(p.base_url)]),
+    ]),
+    html.div([attr.class("row-controls")], [
+      control(
+        case p.enabled {
+          True -> "Disable"
+          False -> "Enable"
+        },
+        case p.enabled {
+          True -> "Disable this provider (reversible)"
+          False -> "Re-enable this provider"
+        },
+        ProviderEnabledToggled(id, !p.enabled),
+      ),
+      control("Edit", "Edit this provider", ProviderEditToggled(id)),
+      control(
+        "Delete",
+        "Delete this provider forever",
+        ProviderDeleteRequested(id),
+      ),
+    ]),
+    // Inline editor: name and base URL start from the stored values;
+    // the key field is blank by construction — blank keeps the stored
+    // envelope, so the stored key can be replaced but never read.
+    html.form(
+      [
+        attr.class("provider-form"),
+        attr.action("#"),
+        attr.hidden(model.provider_edit != Some(id)),
+        provider_edit_submitted(id),
+      ],
+      [
+        html.input([
+          attr.type_("text"),
+          attr.name("name"),
+          attr.value(p.name),
+          attr.placeholder("Name"),
+          attr.aria("label", "Name for " <> p.name),
+        ]),
+        html.input([
+          attr.type_("text"),
+          attr.name("base_url"),
+          attr.value(p.base_url),
+          attr.placeholder("Base URL (https://…/v1)"),
+          attr.aria("label", "Base URL for " <> p.name),
+        ]),
+        html.input([
+          attr.type_("password"),
+          attr.name("api_key"),
+          attr.placeholder("API key (blank keeps existing)"),
+          attr.aria("label", "Replacement API key for " <> p.name),
+          attr.autocomplete("off"),
+        ]),
+        html.div([attr.class("provider-form-buttons")], [
+          html.button([attr.type_("submit")], [html.text("Save")]),
+          html.button(
+            [attr.type_("button"), event.on_click(ProviderEditToggled(id))],
+            [html.text("Cancel")],
+          ),
+        ]),
+      ],
+    ),
+    // Two-step delete confirmation. The registry still refuses while
+    // sessions pin the provider (the 409 guard) — that refusal lands
+    // as a note in the log.
+    html.div(
+      [
+        attr.class("confirm-delete"),
+        attr.hidden(model.provider_confirm != Some(id)),
+      ],
+      [
+        html.span([], [
+          html.text(
+            "Delete " <> p.name <> "? Sessions pinning it block the delete.",
+          ),
+        ]),
+        html.button(
+          [
+            attr.type_("button"),
+            attr.class("danger"),
+            event.on_click(ProviderDeleteConfirmed(id)),
+          ],
+          [html.text("Delete forever")],
+        ),
+        html.button(
+          [attr.type_("button"), event.on_click(ProviderDeleteCancelled)],
+          [html.text("Keep")],
+        ),
+      ],
+    ),
+  ])
+}
+
+fn span_badge(class: String, label: String) -> Element(Msg) {
+  html.span([attr.class("badge " <> class)], [html.text(label)])
+}
+
+/// Options for the create panel's provider select: enabled providers
+/// only (the plan's `enabled = true` picker filter), the selected one
+/// marked. With none, a disabled placeholder keeps the control legible.
+fn provider_options(model: Model) -> List(Element(Msg)) {
+  let enabled = list.filter(model.provider_list, fn(p) { p.enabled })
+  case enabled {
+    [] -> [
+      html.option(
+        [attr.value(""), attr.selected(True)],
+        "no providers — add one below",
+      ),
+    ]
+    providers ->
+      list.map(providers, fn(p) {
+        html.option(
+          [
+            attr.value(p.id),
+            attr.selected(model.provider == Some(p.id)),
+          ],
+          case p.has_key {
+            True -> p.name
+            False -> p.name <> " (keyless)"
+          },
+        )
+      })
+  }
 }
 
 /// The tag-filter input. Uncontrolled like the composer: its text rides the
@@ -1401,8 +1972,13 @@ fn session_row(model: Model, summary: session.SessionSummary) -> Element(Msg) {
     "" -> summary.model
     titled -> titled
   }
+  // The subtitle pins the session's identity: provider/model (both
+  // frozen at creation, §8) plus its age. The provider name resolves
+  // from the masked list so renames show at once.
   let subtitle =
-    summary.model
+    provider_display(model, summary.provider_id)
+    <> "/"
+    <> summary.model
     <> " · "
     <> rel_time(timing.wall_now_s(), summary.last_active_at)
   html.div(
@@ -1882,6 +2458,74 @@ fn picker_change() -> attr.Attribute(Msg) {
     |> decode.map(PickerChanged)
   event.on("change", decoder)
   |> server_component.include(["target.value"])
+}
+
+/// The create panel's provider select: switching providers re-scopes
+/// the model picker (multi-provider §12).
+fn provider_change() -> attr.Attribute(Msg) {
+  let decoder =
+    decode.at(["target", "value"], decode.string)
+    |> decode.map(ProviderPicked)
+  event.on("change", decoder)
+  |> server_component.include(["target.value"])
+}
+
+/// The add-provider form submits with its three fields riding the form
+/// data (the composer pattern). The key field is a password input — its
+/// value crosses here once and exists in the clear only inside the
+/// registry call.
+fn provider_submitted() -> attr.Attribute(Msg) {
+  event.on_submit(fn(entries) {
+    case
+      form_field(entries, "name"),
+      form_field(entries, "base_url"),
+      form_field(entries, "api_key")
+    {
+      Ok(name), Ok(base_url), api_key ->
+        ProviderSubmitted(name, base_url, result.unwrap(api_key, ""))
+      _, _, _ -> Ignored
+    }
+  })
+  |> server_component.include(["detail.formData"])
+}
+
+/// The edit form: blank fields keep the stored values (name, base URL,
+/// and key alike — §11 PATCH semantics).
+fn provider_edit_submitted(id: String) -> attr.Attribute(Msg) {
+  event.on_submit(fn(entries) {
+    case
+      form_field(entries, "name"),
+      form_field(entries, "base_url"),
+      form_field(entries, "api_key")
+    {
+      Ok(name), Ok(base_url), api_key ->
+        ProviderEditSubmitted(id, name, base_url, result.unwrap(api_key, ""))
+      _, _, _ -> Ignored
+    }
+  })
+  |> server_component.include(["detail.formData"])
+}
+
+/// One required form field; an optional field defaults to "".
+fn form_field(
+  entries: List(#(String, String)),
+  name: String,
+) -> Result(String, Nil) {
+  case list.find(entries, fn(entry) { entry.0 == name }) {
+    Ok(#(_, value)) -> Ok(value)
+    Error(_) -> Error(Nil)
+  }
+}
+
+/// The display name for a summary's pinned provider, resolved from the
+/// masked list (renames show at once); the id stands in while the list
+/// lags. Deletes are guarded while sessions pin a provider, so the
+/// fallback is cosmetic, not semantic.
+fn provider_display(model: Model, provider_id: String) -> String {
+  case list.find(model.provider_list, fn(p) { p.id == provider_id }) {
+    Ok(p) -> p.name
+    Error(_) -> provider_id
+  }
 }
 
 /// The tag-filter input is uncontrolled: every keystroke carries its own

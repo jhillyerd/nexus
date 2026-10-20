@@ -71,6 +71,7 @@ pub fn sessions_json_test() {
   let summary =
     session.SessionSummary(
       id: "s-2",
+      provider_id: "p1",
       model: "alias-b",
       title: "renamed by hand",
       title_source: session.ManualTitle,
@@ -86,6 +87,9 @@ pub fn sessions_json_test() {
   let data = json.to_string(web.sessions_json([summary]))
   should.be_true(string.contains(data, "\"sessions\":["))
   should.be_true(string.contains(data, "\"id\":\"s-2\""))
+  // The pinned provider is part of the summary wire shape (multi-provider
+  // §11): the id is the stable key — display names resolve caller-side.
+  should.be_true(string.contains(data, "\"provider_id\":\"p1\""))
   should.be_true(string.contains(data, "\"model\":\"alias-b\""))
   should.be_true(string.contains(data, "\"message_count\":4"))
   should.be_true(string.contains(data, "\"streaming\":true"))
@@ -135,6 +139,7 @@ pub fn filter_archived_test() {
 fn summary_with_archived(id: String, archived: Bool) -> session.SessionSummary {
   session.SessionSummary(
     id: id,
+    provider_id: "p1",
     model: "alias-b",
     title: "",
     title_source: session.AutoTitle,

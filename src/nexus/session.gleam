@@ -190,6 +190,12 @@ pub type SessionStatus {
 pub type SessionSummary {
   SessionSummary(
     id: String,
+    /// The pinned provider (its registry id; display names are resolved
+    /// by the caller — the UI looks the name up in its provider list, so
+    /// the session registry stays decoupled from the provider registry).
+    /// A rename never reaches summaries; a provider cannot be deleted
+    /// while sessions pin it, so the id always resolves.
+    provider_id: String,
     model: String,
     title: String,
     title_source: TitleSource,
