@@ -25,7 +25,6 @@ import nexus/config
 import nexus/provider_registry
 import nexus/session_registry
 import nexus/store/persist
-import nexus/ui_runtime
 import nexus/web
 
 @external(erlang, "nexus_boot_ffi", "halt")
@@ -48,7 +47,6 @@ pub fn main() -> Nil {
       let provider_registry_name = process.new_name("nexus_provider_registry")
       let factory_name = process.new_name("nexus_factory")
       let registry_name = process.new_name("nexus_registry")
-      let component_name = process.new_name("nexus_chat_component")
       // The provider seam handed to the session registry: every session
       // freezes the endpoint this resolves at create/hydration time
       // (multi-provider plan §8). Mapping lives here so neither registry
@@ -107,23 +105,13 @@ pub fn main() -> Nil {
           }),
         )
         |> supervisor.add(
-          // Lustre runtime: after the registry (it resolves sessions
-          // through it), before Mist (the WebSocket handler looks the
-          // component up by name).
-          ui_runtime.supervised(
-            component_name,
-            process.named_subject(registry_name),
-            process.named_subject(provider_registry_name),
-          ),
-        )
-        |> supervisor.add(
+          // Mist last. There is no shared UI child anymore (the per-client
+          // break): the /ws handler starts one linked component runtime
+          // per connection, so a UI crash costs one socket — the browser
+          // reconnects into a fresh runtime — instead of restarting this
+          // OneForAll tree (and every session actor with it).
           supervision.supervisor(fn() {
-            mist.new(web.handler(
-              cfg,
-              registry_name,
-              provider_registry_name,
-              component_name,
-            ))
+            mist.new(web.handler(cfg, registry_name, provider_registry_name))
             |> mist.bind(cfg.http_bind)
             |> mist.port(cfg.http_port)
             |> mist.start

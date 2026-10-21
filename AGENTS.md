@@ -92,6 +92,16 @@ Pinned by the M3 browser suite (`docs/plans/completed/m3-verification.md`);
   `src/nexus/ui_runtime.gleam`), pierceable by the browser suite and
   devtools. A closed root broke the whole browser suite once
   (m3-verification §1, bug 2).
+- **One Lustre runtime per `/ws` connection.** `ui_runtime.init_socket`
+  starts a per-connection runtime (`lustre.start_server_component`)
+  linked to its socket — no shared component child in `boot.gleam`, no
+  cross-client model, so tabs never mirror each other's selection or
+  panels. The client's last-selected session rides the `/ws` route query
+  (`ui.Flags.session`, persisted by the page shell's `session_js`), which
+  is what re-opens the same session after a reload; `GotEvents` is the
+  connect point (no ClientConnected/Disconnected msgs). Do not
+  reintroduce shared UI state across connections — the settings surface
+  builds on per-client state.
 
 ## Changing the transcript / request-encoding path
 

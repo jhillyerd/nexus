@@ -1,21 +1,33 @@
-//// M3 runtime wiring for the Lustre server component: app construction,
-//// supervision child spec, WebSocket upgrade glue, and the client-runtime
-//// asset route.
+//// Runtime wiring for the Lustre server component: app construction,
+//// per-connection runtime startup, WebSocket upgrade glue, and the
+//// client-runtime asset route.
 ////
-//// One persistent, named component runtime is started by `nexus/boot`
-//// between the session registry and Mist. Each WebSocket connection
-//// registers a fresh subject with that shared runtime (the multi-client
-//// pattern); closing a socket deregisters only that subject — the
-//// component itself keeps running with its model and subscriptions intact,
-//// which is what gives reconnects their snapshot/replay semantics.
+//// Each WebSocket connection gets its **own** component runtime and model
+//// (the per-client break): `init_socket` starts one via
+//// `lustre.start_server_component` and registers the socket's subject with
+//// it — closing a socket deregisters only that subject because the runtime
+//// itself is going away. gleam_otp's `actor.start` spawns the runtime
+//// linked to the calling process — the socket handler — and the runtime
+//// does not trap exits, so the pair die together: a closed or crashed
+//// socket takes its runtime (and session subscription) down, and a crashed
+//// runtime takes the socket down so the browser reconnects into a fresh
+//// runtime. Nothing is shared between browsers, so tabs no longer mirror
+//// each other's selected session or panels; sessions themselves are
+//// server-global, so every client still sees the same sidebar.
+////
+//// A reload therefore boots a fresh model: the page shell (`nexus/page`)
+//// persists the client's last-selected session and re-supplies it as the
+//// `/ws` route's `session` query parameter, which lands in
+//// `ui.Flags.session` so `init` re-opens that session (Hello + replay
+//// re-render the transcript).
 
 import gleam/erlang/application
-import gleam/erlang/process.{type Name, type Subject}
+import gleam/erlang/process.{type Subject}
 import gleam/http/request.{type Request}
 import gleam/http/response.{type Response}
 import gleam/json
-import gleam/option.{None, Some}
-import gleam/otp/supervision
+import gleam/list
+import gleam/option.{type Option, None, Some}
 import lustre
 import lustre/component
 import lustre/server_component.{type ClientMessage}
@@ -24,40 +36,21 @@ import nexus/provider_registry
 import nexus/session_registry
 import nexus/ui
 
-/// Name for the shared component runtime, created once in `nexus/boot`.
-pub type ComponentName =
-  Name(lustre.RuntimeMessage(ui.Msg))
-
 pub type Flags =
   ui.Flags
 
-/// The M3 app: the M2 UI as a Lustre server component. `on_connect` /
-/// `on_disconnect` track connected clients and drive reconnect behaviour.
-pub fn app(name: ComponentName) -> lustre.App(Flags, ui.Model, ui.Msg) {
+/// The chat UI as a Lustre server component, started once per WebSocket
+/// connection. There are deliberately no on_connect/on_disconnect hooks:
+/// one runtime serves exactly one client for its whole life, so connect is
+/// `init` and disconnect is the runtime dying with its socket.
+pub fn app() -> lustre.App(Flags, ui.Model, ui.Msg) {
   lustre.component(init: ui.init, update: ui.update, view: ui.view, options: [
-    component.on_connect(ui.ClientConnected),
-    component.on_disconnect(ui.ClientDisconnected),
     // Lustre server components always render into a shadow root; an *open*
     // root keeps the rendered tree pierceable (integration tests, browser
     // devtools) while `adopt_styles` (on by default) clones the page's
     // stylesheet in so the M3 markup stays styled exactly like M2.
     component.open_shadow_root(True),
   ])
-  |> lustre.named(name)
-}
-
-/// Child specification for the root supervisor: a named, supervised server
-/// component. Started after the registry (it resolves sessions through it)
-/// and before Mist (the WebSocket handler looks it up by name).
-pub fn supervised(
-  name: ComponentName,
-  registry: Subject(session_registry.Msg),
-  providers: Subject(provider_registry.Msg),
-) -> supervision.ChildSpecification(Subject(lustre.RuntimeMessage(ui.Msg))) {
-  lustre.supervised(
-    app(name),
-    ui.Flags(registry: registry, providers: providers),
-  )
 }
 
 // ---------------------------------------------------------------------------
@@ -71,23 +64,56 @@ type SocketState {
   )
 }
 
-/// Upgrade a request to the component's WebSocket transport. The browser-side
-/// runtime (served from `/lustre/runtime.mjs`) connects here.
+/// Upgrade a request to the component's WebSocket transport, starting a
+/// dedicated runtime for this connection. The browser-side runtime (served
+/// from `/lustre/runtime.mjs`) connects here.
 pub fn websocket(
   req: Request(mist.Connection),
-  runtime: lustre.Runtime(ui.Msg),
+  registry: Subject(session_registry.Msg),
+  providers: Subject(provider_registry.Msg),
 ) -> Response(mist.ResponseData) {
   mist.websocket(
     request: req,
-    on_init: fn(_conn) { init_socket(runtime) },
+    on_init: fn(_conn) { init_socket(runtime_flags(req, registry, providers)) },
     handler: loop_socket,
     on_close: close_socket,
   )
 }
 
+/// The per-connection flags: the registry/provider subjects plus the
+/// client-supplied last-selected session from the route's query string
+/// (the page shell persists it; see `nexus/page`).
+fn runtime_flags(
+  req: Request(mist.Connection),
+  registry: Subject(session_registry.Msg),
+  providers: Subject(provider_registry.Msg),
+) -> Flags {
+  ui.Flags(
+    registry: registry,
+    providers: providers,
+    session: query_param(req, "session"),
+  )
+}
+
+fn query_param(req: Request(mist.Connection), key: String) -> Option(String) {
+  case request.get_query(req) {
+    Ok(pairs) ->
+      case list.key_find(pairs, key) {
+        Ok(value) -> Some(value)
+        Error(_) -> None
+      }
+    Error(_) -> None
+  }
+}
+
 fn init_socket(
-  runtime: lustre.Runtime(ui.Msg),
+  flags: Flags,
 ) -> #(SocketState, option.Option(process.Selector(ClientMessage(ui.Msg)))) {
+  // One runtime per connection, linked to this socket process (see the
+  // module doc). `start_server_component` only fails if the actor cannot
+  // start at all; crashing here drops the socket and the client runtime
+  // reconnects to try again.
+  let assert Ok(runtime) = lustre.start_server_component(app(), flags)
   let client = process.new_subject()
   let selector =
     process.new_selector()
@@ -123,9 +149,10 @@ fn loop_socket(
 }
 
 fn close_socket(state: SocketState) -> Nil {
-  // Only deregister this connection's subject: the shared runtime (and the
-  // session subscription it owns) survives for reconnects and other clients.
-  server_component.deregister_subject(state.client)
+  // The link already ties the runtime to this socket process; shutdown is
+  // the clean stop for the normal close path. No deregistration is needed:
+  // the runtime served exactly this client and is going away with it.
+  lustre.shutdown()
   |> lustre.send(to: state.runtime)
 }
 
@@ -150,19 +177,4 @@ pub fn runtime_asset_response() -> Result(Response(mist.ResponseData), Nil) {
       }
     }
   }
-}
-
-/// Recover the shared `Runtime` handle from its registered name. `Runtime`
-/// is the runtime's `Subject` under the hood (same coercion Lustre itself
-/// uses in `server_component.subject`), which is what makes name-based
-/// lookup after a supervised restart work.
-@external(erlang, "gleam@function", "identity")
-fn coerce_runtime(
-  subject: Subject(lustre.RuntimeMessage(ui.Msg)),
-) -> lustre.Runtime(ui.Msg)
-
-pub fn runtime_from_name(
-  name: Name(lustre.RuntimeMessage(ui.Msg)),
-) -> lustre.Runtime(ui.Msg) {
-  coerce_runtime(process.named_subject(name))
 }

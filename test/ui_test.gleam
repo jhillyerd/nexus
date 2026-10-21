@@ -4,7 +4,7 @@
 
 import gleam/erlang/process
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/option.{type Option, None, Some}
 import gleam/string
 import gleeunit/should
 import lustre/element
@@ -17,6 +17,19 @@ fn new_model() -> ui.Model {
     ui.init(ui.Flags(
       registry: process.new_subject(),
       providers: process.new_subject(),
+      session: None,
+    ))
+  model
+}
+
+/// A model whose connection supplied a last-selected session (the /ws
+/// route's `session` parameter, persisted by the page shell).
+fn new_model_with_session(id: Option(String)) -> ui.Model {
+  let #(model, _effect) =
+    ui.init(ui.Flags(
+      registry: process.new_subject(),
+      providers: process.new_subject(),
+      session: id,
     ))
   model
 }
@@ -213,22 +226,62 @@ pub fn stop_keeps_state_until_terminal_event_test() {
 }
 
 // ---------------------------------------------------------------------------
-// Reconnect
+// Per-client connect (the runtime break)
 // ---------------------------------------------------------------------------
 
-pub fn client_connected_resets_and_counts_test() {
-  let model =
-    new_model()
-    |> step(ui.UserEcho("hi"))
-    |> step(ui.ClientConnected)
-  model.clients |> should.equal(1)
-  model.log |> should.equal([])
-  model.model_label |> should.equal("connecting…")
+/// A first-time visitor supplies no session: nothing is selected until the
+/// loaded list auto-selects (or the user picks one).
+pub fn init_without_client_session_selects_nothing_test() {
+  new_model().selected |> should.equal(None)
 }
 
-pub fn client_disconnect_never_goes_negative_test() {
-  let model = new_model() |> step(ui.ClientDisconnected)
-  model.clients |> should.equal(0)
+/// A reload supplies the client's last-selected session: the fresh
+/// per-connection model re-opens exactly that one.
+pub fn init_with_client_session_preselects_it_test() {
+  new_model_with_session(Some("s1")).selected
+  |> should.equal(Some("s1"))
+}
+
+/// The supplied session survives the session-list load: the auto-selection
+/// rule (first active) must not clobber it.
+pub fn sessions_loaded_keeps_client_session_test() {
+  let model =
+    new_model_with_session(Some("s2"))
+    |> step(ui.SessionsLoaded([summary("s1", False), summary("s2", False)]))
+  model.selected |> should.equal(Some("s2"))
+}
+
+/// A stale supplied session (deleted server-side while the tab was away)
+/// drops out and the auto-selection rules take over — same as any other
+/// vanished selection.
+pub fn sessions_loaded_drops_stale_client_session_test() {
+  let model =
+    new_model_with_session(Some("gone"))
+    |> step(ui.SessionsLoaded([summary("s1", False), summary("s2", False)]))
+  model.selected |> should.equal(Some("s1"))
+}
+
+/// A fresh model can see Hello (replay) before the summaries land; Hello
+/// then finds an empty session list and reports `streaming: False`. The
+/// loaded summary must reconcile the busy state — otherwise the composer
+/// looks idle and a send is rejected with "busy" mid-stream.
+pub fn sessions_loaded_reconciles_streaming_after_hello_test() {
+  let model =
+    new_model_with_session(Some("s1"))
+    |> step(ui.Hello("smart", []))
+    |> step(ui.SessionsLoaded([summary("s1", True)]))
+  model.streaming |> should.be_true
+}
+
+/// The reconcile only fires for the unchanged selection: a vanished or
+/// switched selection keeps the state `after_sessions` computed.
+pub fn sessions_loaded_reconcile_skips_changed_selection_test() {
+  let model =
+    new_model_with_session(Some("gone"))
+    |> step(ui.Hello("smart", []))
+    |> step(ui.SessionsLoaded([summary("s1", True)]))
+  model.selected |> should.equal(Some("s1"))
+  model.streaming |> should.be_false
 }
 
 // ---------------------------------------------------------------------------

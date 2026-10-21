@@ -30,7 +30,9 @@ terminal rendering, byte-identical request-prefix growth per session
 session-organization pass (auto-title from the first message, manual rename,
 tag chips + filter, pin to the pinned section, archive/restore behind the
 toggle, two-step delete), the connection dot going red while the backend is
-down and green again on auto-reconnect, a mobile-viewport overflow check,
+down and green again on auto-reconnect, a mobile-viewport second-context
+check (per-client runtimes: a fresh context owns its selection and panels,
+reload restores its own session, no horizontal overflow with tool cards),
 and (multi-provider P5) provider management end-to-end: a provider created
 in the Providers panel, picked in the create panel with its model aliases
 reloading, a session pinned to it streaming a turn, and the delete-guard /

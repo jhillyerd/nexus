@@ -102,6 +102,11 @@ time. The server-rendered shell (`nexus/page`) hosts the component and a
 connection dot that mirrors the client runtime's own connect/close
 events, so a dropped backend still turns the dot red.
 
+Every connection gets its **own runtime and model**: tabs never mirror
+each other's selected session or open panels. The shell also persists the
+last-selected session client-side and re-supplies it on the `/ws` route,
+so a reload re-opens the same session.
+
 The transcript renders assistant tool calls as compact cards (tool name,
 stable call id, truncated argument preview, running/completed/failed
 status, and a truncated inert result preview — no `innerHTML`, escaped
@@ -145,8 +150,12 @@ a silent no-op.
 
 `gleam run` starts the store actor (Postgres pool — first, and boot fails
 if it cannot start), a factory supervisor, a session registry hydrated
-from the store, the Lustre server-component runtime, and a Mist server at
-the bound address (default `127.0.0.1:8080`). No session is created at
+from the store, and a Mist server at the bound address (default
+`127.0.0.1:8080`). The Lustre server-component runtime is not a boot
+child: each `/ws` connection starts its own runtime, linked to its
+socket, so a UI crash costs that one connection (the browser reconnects
+into a fresh runtime) instead of a supervision-tree restart. No session
+is created at
 boot — sessions are always user-initiated (the sidebar's create panel
 auto-opens whenever no active session is selectable), and never-used
 sessions (system prompt only, untitled, unpinned) past a 15-minute grace
@@ -307,9 +316,10 @@ the stream timeouts `NEXUS_AUDIT_SSE_FIRST_RESPONSE_TIMEOUT_MS` (30000) /
   the squirrel-generated typed queries over `src/nexus/store/sql/*.sql`
 - `nexus/web` — the HTTP surface: JSON scripting API, the Lustre shell
   page, and the component's transport routes (`/ws`, `/lustre/runtime.mjs`)
-- `nexus/page` — the server-rendered Lustre page shell (auth, connection dot)
-- `nexus/ui`, `nexus/ui_runtime` — the server-component model/view and the
-  WebSocket + runtime glue
+- `nexus/page` — the server-rendered Lustre page shell (auth, connection
+  dot, last-selected-session echo script)
+- `nexus/ui`, `nexus/ui_runtime` — the server-component model/view and
+  the per-connection runtime + WebSocket glue
 - `nexus/boot` — supervision tree and startup
 - `audit/ttft`, `audit/config` — the warm/cold TTFT audit tool and its
   standalone configuration loader
