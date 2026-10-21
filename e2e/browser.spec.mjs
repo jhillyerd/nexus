@@ -18,8 +18,9 @@
 //      runtime (own selection, non-mirroring panels, reload restores its
 //      own session) with no horizontal overflow with tool cards
 //  11. connection dot: red while the backend is down, green on reconnect
-//  12. provider management end-to-end (multi-provider P5): create a
-//      provider in the Providers panel, pick it in the create panel
+//  12. provider management end-to-end (multi-provider P5, now in the
+//      Settings view): create a provider in Settings, test its
+//      connection (live model aliases), pick it in the create panel
 //      (aliases reload per provider), pin a session to it, stream a turn,
 //      and hit the delete/disable guard rails
 //
@@ -933,12 +934,14 @@ async function main() {
     });
 
     // -- 13. provider management + provider→model picker (P5) ---------------
-    // The P5 acceptance, end to end through the real UI: create a
-    // provider in the Providers panel, pick it in the create panel
-    // (model aliases reload per provider), create a session pinned to
-    // it, and stream a turn. Then the guard rails: the delete is
-    // refused while the new session pins the provider, and disable/
-    // enable flip the picker.
+    // The P5 acceptance, end to end through the real UI — now inside the
+    // Settings view (the header button swaps the main area; provider
+    // management moved off the sidebar): create a provider in Settings,
+    // test the seeded provider's connection (live model aliases), pick
+    // it in the create panel (model aliases reload per provider), create
+    // a session pinned to it, and stream a turn. Then the guard rails:
+    // the delete is refused while the new session pins the provider, and
+    // disable/enable flip the picker.
     await test("providers: create in UI, pick, pin a session, stream a turn", async () => {
       // Back on the MAIN instance: test 10 navigated `page` to the guard
       // instance, and the indicator test used its own context.
@@ -946,7 +949,10 @@ async function main() {
       await connected(page);
       const fakeUrl = `http://127.0.0.1:${services.bifrostPort}/v1`;
 
-      // The panel lists the seeded keyless provider.
+      // Provider management lives in the Settings view now — open it.
+      await page.click("#settings");
+
+      // The page lists the seeded keyless provider.
       await poll(
         async () => (await page.locator("#providers-panel .provider-row").count()) === 1,
         { timeout: 15_000, message: "seeded provider row" },
@@ -957,6 +963,18 @@ async function main() {
         "seeded provider base url",
       );
       assert((await seededRow.locator(".badge").textContent()) === "keyless", "keyless badge");
+
+      // The Test control fetches the provider's live model list on
+      // demand and renders the fake gateway's aliases.
+      await seededRow.getByRole("button", { name: "Test", exact: true }).click();
+      await poll(
+        async () =>
+          (await seededRow.locator(".models-status.ok").textContent())
+            ?.includes("smart")
+          && (await seededRow.locator(".models-status.ok").textContent())
+            ?.includes("fast"),
+        { timeout: 15_000, message: "test button lists model aliases" },
+      );
 
       // Add a second keyless provider through the UI form.
       await page.click("#add-provider");
@@ -978,8 +996,10 @@ async function main() {
       eq(made.has_key, false, "created provider keyless in API");
       eq(made.base_url, fakeUrl, "created provider url in API");
 
-      // Pick it in the create panel: the model aliases reload scoped to
-      // the selection, and the session pins (provider, model).
+      // Back to chat for the create-panel flow: pick it in the create
+      // panel, the model aliases reload scoped to the selection, and the
+      // session pins (provider, model).
+      await page.click("#settings");
       const sessionsBefore = await page.locator("#session-list .session-main").count();
       const panelOpen = () =>
         page.locator("#create-panel").evaluate((el) => !el.hidden);
@@ -1017,33 +1037,45 @@ async function main() {
       assert(assistant.some((t) => t.includes("Plain answer")), `assistant turn via ui-made: ${assistant}`);
 
       // Guard rail: deleting a provider its session pins is refused (the
-      // 409 semantics) and surfaces as a note.
+      // 409 semantics) — the refusal note lands in the chat log, so the
+      // row-survival is asserted in Settings and the note back in chat.
+      await page.click("#settings");
       await madeRow.getByRole("button", { name: "Delete", exact: true }).click();
       await madeRow.getByRole("button", { name: "Delete forever", exact: true }).click();
+      await poll(async () => await madeRow.isVisible(), {
+        timeout: 10_000,
+        message: "pinned provider row survives refused delete",
+      });
+      await page.click("#settings");
       await poll(
         async () =>
           (await page.locator(".note.err").last().textContent())
             ?.includes("provider is still pinned by sessions"),
         { timeout: 15_000, message: "409 guard note after pinned delete" },
       );
-      await poll(async () => await madeRow.isVisible(), {
-        timeout: 10_000,
-        message: "pinned provider row survives refused delete",
-      });
 
-      // Disable: the row badges as disabled and the picker drops it.
+      // Disable: the row badges as disabled (in Settings) and the picker
+      // drops it (back in chat).
+      await page.click("#settings");
       await madeRow.getByRole("button", { name: "Disable", exact: true }).click();
       await poll(
         async () => (await madeRow.locator(".badge.off").textContent()) === "disabled",
         { timeout: 15_000, message: "disabled badge" },
       );
+      await page.click("#settings");
       await poll(
         async () => (await page.locator("#provider-picker option").count()) === 1,
         { timeout: 15_000, message: "picker drops disabled provider" },
       );
       // Disabling blocks new resolutions, not the already-frozen session
       // endpoint — the pinned session keeps streaming either way.
+      await page.click("#settings");
       await madeRow.getByRole("button", { name: "Enable", exact: true }).click();
+      await poll(
+        async () => (await madeRow.locator(".badge").count()) === 1,
+        { timeout: 15_000, message: "re-enabled provider badge restored" },
+      );
+      await page.click("#settings");
       await poll(
         async () => (await page.locator("#provider-picker option").count()) === 2,
         { timeout: 15_000, message: "re-enabled provider back in picker" },

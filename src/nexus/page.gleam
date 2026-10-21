@@ -173,11 +173,13 @@ lustre-server-component { display: contents; }
 header { display: flex; align-items: baseline; gap: .75rem; padding: .6rem 1rem;
   border-bottom: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
 header h1 { font-size: 1.05rem; margin: 0; }
+header button { font-size: .8rem; padding: .28rem .7rem; }
 .muted { opacity: .6; font-size: .85rem; }
 .dot { margin-left: auto; font-size: 1.2rem; }
 .dot.live { color: #2e9e5b; }
 .dot.off { color: #c0392b; }
 #layout { flex: 1; min-height: 0; display: grid; grid-template-columns: 17rem minmax(0,1fr) 16rem; }
+#layout.settings-mode { grid-template-columns: minmax(0,1fr); }
 aside { overflow-y: auto; padding: .8rem; border-right: 1px solid
   color-mix(in srgb, currentColor 15%, transparent); }
 #metrics-panel { border-right: 0; border-left: 1px solid
@@ -221,8 +223,14 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
 #create-panel { margin-top: 1rem; padding-top: .8rem; border-top: 1px solid
   color-mix(in srgb, currentColor 15%, transparent); display: flex; flex-direction: column; gap: .45rem; }
 #create-panel[hidden] { display: none; }
-#providers-panel { margin-top: 1rem; padding-top: .8rem; border-top: 1px solid
-  color-mix(in srgb, currentColor 15%, transparent); display: flex; flex-direction: column; gap: .55rem; }
+.settings-page { overflow-y: auto; padding: 1.2rem 1.2rem 2.5rem; display: flex; flex-direction: column;
+  gap: 1rem; }
+.settings-page section { display: flex; flex-direction: column; gap: .55rem; width: 100%;
+  max-width: 46rem; }
+.models-status { font-size: .74rem; overflow-wrap: anywhere; }
+.models-status.loading { opacity: .6; }
+.models-status.ok { color: #2e9e5b; }
+.models-status.failed { color: #c0392b; }
 .provider-list { display: flex; flex-direction: column; gap: .45rem; }
 .provider-row { display: flex; flex-direction: column; gap: .25rem; border: 1px solid transparent;
   border-radius: 10px; padding: .3rem; }
@@ -279,8 +287,10 @@ button:disabled { opacity: .45; cursor: default; }
 .metric strong { display: block; margin-bottom: .15rem; }
 @media (max-width: 900px) {
   #layout { grid-template-columns: 1fr; grid-template-rows: auto minmax(0,1fr) auto; }
+  #layout.settings-mode { grid-template-rows: minmax(0,1fr); }
   aside { border: 0; border-bottom: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
   #metrics-panel { border-bottom: 0; border-top: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
+  .settings-page { padding: .8rem .8rem 2rem; }
 }
 "
 }
