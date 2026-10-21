@@ -651,6 +651,10 @@ fn should_contain(haystack: String, needle: String) {
   should.be_true(string.contains(haystack, needle))
 }
 
+fn should_not_contain(haystack: String, needle: String) {
+  should.be_false(string.contains(haystack, needle))
+}
+
 // ---------------------------------------------------------------------------
 // View strings
 // ---------------------------------------------------------------------------
@@ -1172,9 +1176,12 @@ pub fn provider_created_selects_first_provider_test() {
   // The creation lands in the settings sub-component; the signal fold
   // in ui.update re-aims the picker — and, with no provider before it,
   // returns the view to chat (the auto-opened settings page has served
-  // its purpose).
+  // its purpose). Start from the AUTO-OPENED settings view (first load
+  // empty) so the ChatView assertion is load-bearing, not the default.
+  let opened = new_model() |> step(ui.ProvidersLoaded([]))
+  opened.view |> should.equal(ui.SettingsView)
   let model =
-    new_model()
+    opened
     |> step(ui.Settings(ui_settings.Created(prov("p3", "new", True, True))))
   model.provider |> should.equal(Some("p3"))
   model.view |> should.equal(ui.ChatView)
@@ -1394,6 +1401,12 @@ pub fn provider_test_button_state_machine_test() {
     )
   failed.settings.models
   |> should.equal(ui_settings.ModelsFailed("p1", "provider is disabled"))
+  // A LATE reply for a superseded request cannot clobber the newer
+  // result: only the request that is still loading accepts its reply.
+  let stale =
+    step(ok, ui.Settings(ui_settings.TestFailed("p2", "late failure")))
+  stale.settings.models
+  |> should.equal(ui_settings.ModelsOk("p1", ["smart", "fast"]))
 }
 
 pub fn view_renders_models_status_under_its_row_test() {
@@ -1409,6 +1422,8 @@ pub fn view_renders_models_status_under_its_row_test() {
     |> step(ui.Settings(ui_settings.TestRequested("p2")))
     |> step(ui.Settings(ui_settings.TestRequested("p1")))
     |> step(ui.Settings(ui_settings.ModelsLoaded("p1", ["smart", "fast"])))
+    // p2's superseded request replies late — it must be ignored.
+    |> step(ui.Settings(ui_settings.TestFailed("p2", "late failure")))
     |> view_string
   // The settled result renders under its own row (Lustre sorts attrs,
   // so data-provider-id precedes class on the row div) — between p1's
@@ -1418,8 +1433,46 @@ pub fn view_renders_models_status_under_its_row_test() {
   let ok_at = position_of(html, "ok · models: smart, fast")
   should.be_true(first_at < ok_at && ok_at < second_at)
   // One test result at a time: the superseded request for p2 leaves no
-  // loading marker behind.
+  // loading marker behind — and its late failure reply renders nowhere.
   should.be_false(string.contains(html, "testing…"))
+  should.be_false(string.contains(html, "late failure"))
+}
+
+pub fn provider_mutation_failure_shows_in_settings_test() {
+  // The user is ON the settings page when a mutation fails, so the
+  // reason must render there — the chat-log note (OpFailed signal) is
+  // the transcript copy, not the only feedback.
+  let model =
+    new_model()
+    |> step(ui.SettingsToggled)
+    |> step(
+      ui.Settings(ui_settings.MutateFailed("provider name already exists")),
+    )
+  model.settings.last_error
+  |> should.equal(Some("provider name already exists"))
+  model
+  |> view_string
+  |> should_contain("provider operation failed: provider name already exists")
+  // The next successful mutation clears it.
+  let cleared = step(model, ui.Settings(ui_settings.Mutated))
+  cleared.settings.last_error |> should.equal(None)
+  cleared
+  |> view_string
+  |> should_not_contain("provider operation failed")
+}
+
+pub fn providers_emptied_later_does_not_reopen_settings_test() {
+  // The auto-open fires on the connection's FIRST provider load only:
+  // a list that becomes empty later (external deletes + refresh) must
+  // not hijack an in-progress chat view into settings.
+  let model =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "a", True, True)]))
+    |> step(ui.ProvidersLoaded([]))
+  model.view |> should.equal(ui.ChatView)
+  // The first-run rule still holds when the first load IS empty.
+  let fresh = new_model() |> step(ui.ProvidersLoaded([]))
+  fresh.view |> should.equal(ui.SettingsView)
 }
 
 fn position_of(haystack: String, needle: String) -> Int {
@@ -1440,6 +1493,7 @@ pub fn settings_view_escapes_hostile_text_test() {
       ]),
     )
     |> step(ui.SettingsToggled)
+    |> step(ui.Settings(ui_settings.TestRequested("p1")))
     |> step(
       ui.Settings(
         ui_settings.ModelsLoaded("p1", ["<img src=x onerror=alert(2)>"]),

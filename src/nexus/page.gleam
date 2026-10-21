@@ -231,6 +231,7 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
 .models-status.loading { opacity: .6; }
 .models-status.ok { color: #2e9e5b; }
 .models-status.failed { color: #c0392b; }
+.settings-error { font-size: .78rem; color: #c0392b; overflow-wrap: anywhere; }
 .provider-list { display: flex; flex-direction: column; gap: .45rem; }
 .provider-row { display: flex; flex-direction: column; gap: .25rem; border: 1px solid transparent;
   border-radius: 10px; padding: .3rem; }

@@ -55,6 +55,11 @@ pub type State {
     confirm: Option(String),
     /// The latest on-demand connection test.
     models: ModelsState,
+    /// The latest provider-mutation failure, rendered in the settings
+    /// page — the user is standing here when a mutation fails, so the
+    /// reason must be visible without switching views (the chat-log
+    /// note via `OpFailed` stays for the transcript).
+    last_error: Option(String),
   )
 }
 
@@ -106,7 +111,13 @@ pub type Signal {
 }
 
 pub fn init() -> State {
-  State(open: False, edit: None, confirm: None, models: ModelsIdle)
+  State(
+    open: False,
+    edit: None,
+    confirm: None,
+    models: ModelsIdle,
+    last_error: None,
+  )
 }
 
 /// The sub-update. `providers` is the registry subject for this
@@ -133,7 +144,7 @@ pub fn update(
       [],
     )
 
-    Created(provider) -> #(state, effect.none(), [
+    Created(provider) -> #(State(..state, last_error: None), effect.none(), [
       ProviderCreated(provider),
       ProvidersChanged,
     ])
@@ -175,9 +186,15 @@ pub fn update(
       [],
     )
 
-    Mutated -> #(state, effect.none(), [ProvidersChanged])
+    Mutated -> #(State(..state, last_error: None), effect.none(), [
+      ProvidersChanged,
+    ])
 
-    MutateFailed(reason) -> #(state, effect.none(), [OpFailed(reason)])
+    MutateFailed(reason) -> #(
+      State(..state, last_error: Some(reason)),
+      effect.none(),
+      [OpFailed(reason)],
+    )
 
     TestRequested(id) -> #(
       State(..state, models: ModelsLoading(id)),
@@ -185,17 +202,29 @@ pub fn update(
       [],
     )
 
-    ModelsLoaded(id, aliases) -> #(
-      State(..state, models: ModelsOk(id, aliases)),
-      effect.none(),
-      [],
-    )
+    ModelsLoaded(id, aliases) ->
+      // A reply is only live while its request is the current test: a
+      // late reply for a superseded request must not clobber the newer
+      // result (each row's status renders only under its own id, but
+      // the state is single-slot).
+      case state.models {
+        ModelsLoading(loading) if loading == id -> #(
+          State(..state, models: ModelsOk(id, aliases)),
+          effect.none(),
+          [],
+        )
+        _ -> #(state, effect.none(), [])
+      }
 
-    TestFailed(id, reason) -> #(
-      State(..state, models: ModelsFailed(id, reason)),
-      effect.none(),
-      [],
-    )
+    TestFailed(id, reason) ->
+      case state.models {
+        ModelsLoading(loading) if loading == id -> #(
+          State(..state, models: ModelsFailed(id, reason)),
+          effect.none(),
+          [],
+        )
+        _ -> #(state, effect.none(), [])
+      }
   }
 }
 
@@ -226,6 +255,16 @@ pub fn view(state: State, provider_list: List(Provider)) -> Element(Msg) {
           <> "at rest and never shown back.",
         ),
       ]),
+      // The latest mutation failure renders HERE (the user is on this
+      // page when it happens) — the chat-log note via `OpFailed` is the
+      // durable transcript copy.
+      case state.last_error {
+        Some(reason) ->
+          html.p([attr.class("settings-error")], [
+            html.text("provider operation failed: " <> reason),
+          ])
+        None -> element.none()
+      },
       add_provider_form(state),
       ..case provider_list {
         [] -> [
@@ -313,10 +352,21 @@ fn provider_row(state: State, p: Provider) -> Element(Msg) {
         EnabledToggled(id, !p.enabled),
       ),
       control("Edit", "Edit this provider", EditToggled(id)),
-      control(
-        "Test",
-        "Test this provider (fetch its live model list)",
-        TestRequested(id),
+      // The on-demand connection test: one at a time — the control
+      // disables while any test is in flight, so repeat clicks cannot
+      // stack concurrent fetches.
+      html.button(
+        [
+          attr.class("ctl"),
+          attr.type_("button"),
+          attr.title("Test this provider (fetch its live model list)"),
+          attr.disabled(case state.models {
+            ModelsLoading(_) -> True
+            _ -> False
+          }),
+          event.on_click(TestRequested(id)),
+        ],
+        [html.text("Test")],
       ),
       control("Delete", "Delete this provider forever", DeleteRequested(id)),
     ]),
@@ -416,8 +466,10 @@ fn span_badge(class: String, label: String) -> Element(Msg) {
   html.span([attr.class("badge " <> class)], [html.text(label)])
 }
 
-/// One compact row-control button.
-fn control(label: String, title: String, msg: Msg) -> Element(Msg) {
+/// One compact row-control button. Generic in the message type so the
+/// parent's session rows reuse the same builder (ui.gleam imports this
+/// module; the reverse would be circular).
+pub fn control(label: String, title: String, msg: a) -> Element(a) {
   html.button(
     [
       attr.class("ctl"),
@@ -521,19 +573,27 @@ fn delete_provider_effect(
   })
 }
 
-/// The Test control's fetch: the registry's live model list. Generous
-/// actor-call timeout mirroring the create-panel aliases path (the
-/// fetch itself is bounded by the endpoint's first-response budget).
+/// The Test control's fetch: the registry's live model list. Lustre
+/// performs `effect.from` tasks inline in the component runtime's
+/// message loop, and `list_models` is a blocking actor call that waits
+/// out its timeout when the endpoint hangs (the registry replies from
+/// an unlinked fetch process) — so the call must NOT run on the
+/// runtime: spawn it unlinked and dispatch the reply back (the same
+/// off-loop shape the registry itself uses for the fetch). The
+/// generous timeout mirrors the create-panel aliases path.
 fn models_effect(
   providers: Subject(provider_registry.Msg),
   id: String,
 ) -> Effect(Msg) {
   effect.from(fn(dispatch) {
-    case provider_registry.list_models(providers, id, 60_000) {
-      Ok(aliases) -> dispatch(ModelsLoaded(id, aliases))
-      Error(error) ->
-        dispatch(TestFailed(id, provider_registry.describe(error)))
-    }
+    process.spawn_unlinked(fn() {
+      case provider_registry.list_models(providers, id, 60_000) {
+        Ok(aliases) -> dispatch(ModelsLoaded(id, aliases))
+        Error(error) ->
+          dispatch(TestFailed(id, provider_registry.describe(error)))
+      }
+    })
+    Nil
   })
 }
 
@@ -541,8 +601,10 @@ fn models_effect(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Toggle a per-row editor open-state: clicking the same row closes it.
-fn toggle_open(current: Option(String), id: String) -> Option(String) {
+/// Toggle a per-row editor open-state: clicking the same row closes
+/// it. Shared with the parent's session rows (ui.gleam imports this
+/// module; the reverse would be circular).
+pub fn toggle_open(current: Option(String), id: String) -> Option(String) {
   case current {
     Some(open) if open == id -> None
     _ -> Some(id)

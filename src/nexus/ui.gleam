@@ -179,6 +179,11 @@ pub type Model {
     /// first-run auto-open rule (empty provider list → settings) then
     /// stops firing — mirroring `create_auto`.
     settings_manual: Bool,
+    /// True once any `ProvidersLoaded` has arrived on this connection:
+    /// the auto-open rule fires only on the FIRST load, so a provider
+    /// list that later becomes empty (e.g. external deletes + reconnect
+    /// refresh) never hijacks a session in progress back into settings.
+    providers_seen: Bool,
     aliases: List(String),
     sessions: List(session.SessionSummary),
     metrics: List(session.MetricSample),
@@ -344,6 +349,7 @@ pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
       view: ChatView,
       settings: ui_settings.init(),
       settings_manual: False,
+      providers_seen: False,
       aliases: [],
       sessions: [],
       metrics: [],
@@ -447,14 +453,16 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         Some(id), True -> aliases_for(model, id)
         _, _ -> effect.none()
       }
-      // First run: an empty provider list auto-opens the Settings view
-      // (the guided path the always-visible sidebar panel used to
-      // provide) — unless the user has toggled the view by hand.
-      // Idempotent on repeated empty refreshes.
-      let model = case providers, model.settings_manual {
-        [], False -> Model(..model, view: SettingsView)
-        _, _ -> model
+      // First run: the connection's FIRST provider load arriving empty
+      // auto-opens the Settings view (the guided path the always-visible
+      // sidebar panel used to provide) — unless the user toggled the
+      // view by hand. Later loads never re-open it (a list that becomes
+      // empty mid-session must not hijack the chat view).
+      let model = case providers, model.providers_seen, model.settings_manual {
+        [], False, False -> Model(..model, view: SettingsView)
+        _, _, _ -> model
       }
+      let model = Model(..model, providers_seen: True)
       #(model, eff)
     }
 
@@ -837,7 +845,7 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     RenameToggled(id) -> #(
       Model(
         ..model,
-        rename_open: toggle_open(model.rename_open, id),
+        rename_open: ui_settings.toggle_open(model.rename_open, id),
         tags_open: None,
         confirm_delete: None,
       ),
@@ -861,7 +869,7 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     TagsToggled(id) -> #(
       Model(
         ..model,
-        tags_open: toggle_open(model.tags_open, id),
+        tags_open: ui_settings.toggle_open(model.tags_open, id),
         rename_open: None,
         confirm_delete: None,
       ),
@@ -921,14 +929,6 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       ]),
       effect.none(),
     )
-  }
-}
-
-/// Toggle a per-row editor open-state: clicking the same row closes it.
-fn toggle_open(current: Option(String), id: String) -> Option(String) {
-  case current {
-    Some(open) if open == id -> None
-    _ -> Some(id)
   }
 }
 
@@ -1757,7 +1757,7 @@ fn session_row(model: Model, summary: session.SessionSummary) -> Element(Msg) {
         case summary.archived {
           True -> element.none()
           False ->
-            control(
+            ui_settings.control(
               case summary.pinned {
                 True -> "Unpin"
                 False -> "Pin"
@@ -1769,9 +1769,13 @@ fn session_row(model: Model, summary: session.SessionSummary) -> Element(Msg) {
               PinToggled(id),
             )
         },
-        control("Rename", "Rename this session", RenameToggled(id)),
-        control("Tags", "Edit tags for this session", TagsToggled(id)),
-        control(
+        ui_settings.control("Rename", "Rename this session", RenameToggled(id)),
+        ui_settings.control(
+          "Tags",
+          "Edit tags for this session",
+          TagsToggled(id),
+        ),
+        ui_settings.control(
           case summary.archived {
             True -> "Restore"
             False -> "Archive"
@@ -1782,7 +1786,11 @@ fn session_row(model: Model, summary: session.SessionSummary) -> Element(Msg) {
           },
           Archived(id, !summary.archived),
         ),
-        control("Delete", "Delete this session forever", DeleteRequested(id)),
+        ui_settings.control(
+          "Delete",
+          "Delete this session forever",
+          DeleteRequested(id),
+        ),
       ]),
       // Inline rename editor (hidden until opened; the input is
       // uncontrolled-with-value — patches only fire when the stored title
@@ -1855,19 +1863,6 @@ fn session_row(model: Model, summary: session.SessionSummary) -> Element(Msg) {
         ],
       ),
     ],
-  )
-}
-
-/// One compact row-control button.
-fn control(label: String, title: String, msg: Msg) -> Element(Msg) {
-  html.button(
-    [
-      attr.class("ctl"),
-      attr.type_("button"),
-      attr.title(title),
-      event.on_click(msg),
-    ],
-    [html.text(label)],
   )
 }
 

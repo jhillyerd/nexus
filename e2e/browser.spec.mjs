@@ -237,6 +237,32 @@ async function connected(page) {
   await page.waitForSelector("#status.live", { timeout: 15_000 });
 }
 
+// Settings-view navigation (the header toggle swaps the main area):
+// every transition ASSERTS arrival, so a wrong-view divergence fails
+// here with a clear message instead of as a confusing poll timeout on
+// a chat-only (or settings-only) selector further down.
+async function settingsOpen(page) {
+  return (await page.locator("#layout.settings-mode").count()) === 1;
+}
+
+async function openSettings(page) {
+  if (await settingsOpen(page)) return;
+  await page.click("#settings");
+  await poll(() => settingsOpen(page), {
+    timeout: 10_000,
+    message: "settings view open",
+  });
+}
+
+async function backToChat(page) {
+  if (!(await settingsOpen(page))) return;
+  await page.click("#settings");
+  await poll(async () => !(await settingsOpen(page)), {
+    timeout: 10_000,
+    message: "chat view restored",
+  });
+}
+
 // The per-client selection mirror (`#layout[data-selected]`, persisted
 // client-side by the page shell and re-supplied on the /ws route).
 async function selectedId(p) {
@@ -950,7 +976,7 @@ async function main() {
       const fakeUrl = `http://127.0.0.1:${services.bifrostPort}/v1`;
 
       // Provider management lives in the Settings view now — open it.
-      await page.click("#settings");
+      await openSettings(page);
 
       // The page lists the seeded keyless provider.
       await poll(
@@ -999,7 +1025,7 @@ async function main() {
       // Back to chat for the create-panel flow: pick it in the create
       // panel, the model aliases reload scoped to the selection, and the
       // session pins (provider, model).
-      await page.click("#settings");
+      await backToChat(page);
       const sessionsBefore = await page.locator("#session-list .session-main").count();
       const panelOpen = () =>
         page.locator("#create-panel").evaluate((el) => !el.hidden);
@@ -1039,14 +1065,22 @@ async function main() {
       // Guard rail: deleting a provider its session pins is refused (the
       // 409 semantics) — the refusal note lands in the chat log, so the
       // row-survival is asserted in Settings and the note back in chat.
-      await page.click("#settings");
+      await openSettings(page);
       await madeRow.getByRole("button", { name: "Delete", exact: true }).click();
       await madeRow.getByRole("button", { name: "Delete forever", exact: true }).click();
       await poll(async () => await madeRow.isVisible(), {
         timeout: 10_000,
         message: "pinned provider row survives refused delete",
       });
-      await page.click("#settings");
+      // The refusal is ALSO visible right where the action happened:
+      // the settings page renders the mutation error inline.
+      await poll(
+        async () =>
+          (await page.locator(".settings-error").textContent())
+            ?.includes("provider is still pinned by sessions"),
+        { timeout: 15_000, message: "409 guard error visible in settings" },
+      );
+      await backToChat(page);
       await poll(
         async () =>
           (await page.locator(".note.err").last().textContent())
@@ -1056,26 +1090,26 @@ async function main() {
 
       // Disable: the row badges as disabled (in Settings) and the picker
       // drops it (back in chat).
-      await page.click("#settings");
+      await openSettings(page);
       await madeRow.getByRole("button", { name: "Disable", exact: true }).click();
       await poll(
         async () => (await madeRow.locator(".badge.off").textContent()) === "disabled",
         { timeout: 15_000, message: "disabled badge" },
       );
-      await page.click("#settings");
+      await backToChat(page);
       await poll(
         async () => (await page.locator("#provider-picker option").count()) === 1,
         { timeout: 15_000, message: "picker drops disabled provider" },
       );
       // Disabling blocks new resolutions, not the already-frozen session
       // endpoint — the pinned session keeps streaming either way.
-      await page.click("#settings");
+      await openSettings(page);
       await madeRow.getByRole("button", { name: "Enable", exact: true }).click();
       await poll(
         async () => (await madeRow.locator(".badge").count()) === 1,
         { timeout: 15_000, message: "re-enabled provider badge restored" },
       );
-      await page.click("#settings");
+      await backToChat(page);
       await poll(
         async () => (await page.locator("#provider-picker option").count()) === 2,
         { timeout: 15_000, message: "re-enabled provider back in picker" },
