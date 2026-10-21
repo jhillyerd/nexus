@@ -180,6 +180,7 @@ header button { font-size: .8rem; padding: .28rem .7rem; }
 .dot.off { color: #c0392b; }
 #layout { flex: 1; min-height: 0; display: grid; grid-template-columns: 17rem minmax(0,1fr) 16rem; }
 #layout.settings-mode { grid-template-columns: minmax(0,1fr); }
+#layout.settings-mode > aside, #layout.settings-mode > main { display: none; }
 aside { overflow-y: auto; padding: .8rem; border-right: 1px solid
   color-mix(in srgb, currentColor 15%, transparent); }
 #metrics-panel { border-right: 0; border-left: 1px solid

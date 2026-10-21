@@ -1375,9 +1375,13 @@ pub fn settings_header_button_flips_label_test() {
   should.be_true(string.contains(chat, ">Settings<"))
   let open = new_model() |> step(ui.SettingsToggled) |> view_string
   should.be_true(string.contains(open, ">Back to chat<"))
-  // The chat layout is swapped for the settings page.
-  should.be_true(string.contains(open, "settings-page"))
-  should.be_false(string.contains(open, "id=\"session-list\""))
+  // The settings page renders — and the chat subtree STAYS MOUNTED
+  // (hidden via CSS): the composer's uncontrolled textarea must survive
+  // the view swap, or an unsent draft would be destroyed by a settings
+  // peek (the element keeps its value while merely hidden).
+  should.be_true(string.contains(open, "id=\"settings-page\""))
+  should.be_true(string.contains(open, "id=\"composer\""))
+  should.be_true(string.contains(open, "settings-mode"))
 }
 
 pub fn provider_test_button_state_machine_test() {
@@ -1453,12 +1457,11 @@ pub fn provider_mutation_failure_shows_in_settings_test() {
   model
   |> view_string
   |> should_contain("provider operation failed: provider name already exists")
-  // The next successful mutation clears it.
+  // The next successful mutation clears it (the chat-log transcript
+  // note stays by design; the settings-page element is what clears).
   let cleared = step(model, ui.Settings(ui_settings.Mutated))
   cleared.settings.last_error |> should.equal(None)
-  cleared
-  |> view_string
-  |> should_not_contain("provider operation failed")
+  cleared |> view_string |> should_not_contain("settings-error")
 }
 
 pub fn providers_emptied_later_does_not_reopen_settings_test() {

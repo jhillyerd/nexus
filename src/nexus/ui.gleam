@@ -1449,9 +1449,19 @@ pub fn view(model: Model) -> Element(Msg) {
           [attr.attribute("data-selected", option.unwrap(model.selected, ""))],
         )
       ],
+      // The chat children stay MOUNTED in the Settings view (hidden via
+      // CSS, `#layout.settings-mode`): the composer's textarea is
+      // uncontrolled, so unmounting it would destroy an unsent draft —
+      // peeking at settings must not cost the user their message. The
+      // settings page renders as an extra child; the diff only ever
+      // appends/removes it, so the chat subtree's element identity
+      // (including the keyed composer) survives both directions.
       case model.view {
         ChatView -> [sidebar(model), chat(model), metrics_panel(model)]
         SettingsView -> [
+          sidebar(model),
+          chat(model),
+          metrics_panel(model),
           element.map(
             ui_settings.view(model.settings, model.provider_list),
             Settings,
