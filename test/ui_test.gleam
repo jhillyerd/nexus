@@ -261,6 +261,29 @@ pub fn sessions_loaded_drops_stale_client_session_test() {
   model.selected |> should.equal(Some("s1"))
 }
 
+/// A fresh model can see Hello (replay) before the summaries land; Hello
+/// then finds an empty session list and reports `streaming: False`. The
+/// loaded summary must reconcile the busy state — otherwise the composer
+/// looks idle and a send is rejected with "busy" mid-stream.
+pub fn sessions_loaded_reconciles_streaming_after_hello_test() {
+  let model =
+    new_model_with_session(Some("s1"))
+    |> step(ui.Hello("smart", []))
+    |> step(ui.SessionsLoaded([summary("s1", True)]))
+  model.streaming |> should.be_true
+}
+
+/// The reconcile only fires for the unchanged selection: a vanished or
+/// switched selection keeps the state `after_sessions` computed.
+pub fn sessions_loaded_reconcile_skips_changed_selection_test() {
+  let model =
+    new_model_with_session(Some("gone"))
+    |> step(ui.Hello("smart", []))
+    |> step(ui.SessionsLoaded([summary("s1", True)]))
+  model.selected |> should.equal(Some("s1"))
+  model.streaming |> should.be_false
+}
+
 // ---------------------------------------------------------------------------
 // Event translation
 // ---------------------------------------------------------------------------

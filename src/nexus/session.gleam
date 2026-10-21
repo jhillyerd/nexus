@@ -432,9 +432,22 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       })
       // M3: the UI component keeps one long-lived subscription across
       // reconnects, so a re-Join must not duplicate the fan-out entry.
+      // Per-client break: subscriber subjects are owned by per-connection
+      // Lustre runtimes that die with their sockets — monitor a new
+      // subscriber's owner so its exit prunes the entry in the
+      // `WorkerDown` arm (every monitored ProcessDown funnels there).
       let subs = case list.contains(state.subs, sub) {
         True -> state.subs
-        False -> [sub, ..state.subs]
+        False -> {
+          case process.subject_owner(sub) {
+            Ok(owner) -> {
+              let _ = process.monitor(owner)
+              Nil
+            }
+            Error(_) -> Nil
+          }
+          [sub, ..state.subs]
+        }
       }
       actor.continue(State(..state, subs:))
     }
@@ -642,6 +655,21 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
     }
 
     WorkerDown(worker) -> {
+      // Every monitored process funnels here (the selector maps all
+      // ProcessDowns), not just turn workers: a subscriber runtime that
+      // died with its socket prunes its fan-out entry. Without this,
+      // stale subjects accumulate per historical connection — sends to
+      // them are silent no-ops, but the list would grow unboundedly.
+      let state =
+        State(
+          ..state,
+          subs: list.filter(state.subs, fn(sub) {
+            case process.subject_owner(sub) {
+              Ok(owner) -> owner != worker
+              Error(_) -> True
+            }
+          }),
+        )
       let is_current = case state.turn {
         Starting(candidate, ..) | Streaming(candidate, ..) ->
           candidate == worker

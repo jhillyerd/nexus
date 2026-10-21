@@ -578,6 +578,20 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
 
     SessionsLoaded(summaries) -> {
       let next = after_sessions(model, summaries)
+      // A fresh per-client model can see Hello (replay) before the
+      // summaries land: Hello then found an empty session list and
+      // reported `streaming: False`. Reconcile from the authoritative
+      // summary when the selection is unchanged, so the composer shows
+      // the true busy state instead of accepting a send that the session
+      // will reject with "busy".
+      let next = case next.selected, model.selected {
+        Some(id), Some(previous) if id == previous ->
+          case list.find(summaries, fn(s) { s.id == id }) {
+            Ok(summary) -> Model(..next, streaming: summary.streaming)
+            Error(_) -> next
+          }
+        _, _ -> next
+      }
       let eff = case next.selected {
         Some(id) ->
           case model.selected {

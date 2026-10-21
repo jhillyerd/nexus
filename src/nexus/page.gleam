@@ -83,20 +83,40 @@ fn indicator_js() -> String {
 
 /// Per-client runtime break: each /ws connection owns its model, so a
 /// reload must tell the fresh runtime which session to re-open. This
-/// static script is the only client-side keeper of that choice: before
-/// the runtime module loads (it is deferred; this classic script runs
-/// during parsing) it appends the persisted last-selected session to the
-/// `route` attribute's query string, and once the component renders it
-/// mirrors the server-rendered `#layout[data-selected]` back into
-/// localStorage. The script is static, token-free, and never touches the
-/// rendered DOM — auth still rides the query string.
+/// static script is the only client-side keeper of that choice. Storage is
+/// `sessionStorage` — per-tab and reload-surviving, so one tab's selection
+/// never leaks into another tab's restore (a brand-new tab falls back to
+/// the server's auto-selection). Before the runtime module loads (it is
+/// deferred; this classic script runs during parsing) it appends the
+/// stored session to the `route` attribute's query string; once the
+/// component renders it mirrors the server-rendered
+/// `#layout[data-selected]` back into storage, and on `lustre:close` it
+/// re-syncs the route's `session` parameter with the CURRENT selection so
+/// a reconnect without a reload re-opens what this tab is looking at, not
+/// what it opened at load. The script is static, token-free, and never
+/// touches the rendered DOM — auth still rides the query string.
 fn session_js() -> String {
   "(function () {\n"
   <> "  'use strict';\n"
   <> "  var host = document.querySelector('lustre-server-component');\n"
   <> "  if (!host) return;\n"
-  <> "  var stored = null;\n"
-  <> "  try { stored = localStorage.getItem('nexus.session'); } catch (e) {}\n"
+  <> "  var read = function () {\n"
+  <> "    try { return sessionStorage.getItem('nexus.session'); } catch (e) { return null; }\n"
+  <> "  };\n"
+  <> "  var write = function (id) {\n"
+  <> "    try {\n"
+  <> "      if (id) sessionStorage.setItem('nexus.session', id);\n"
+  <> "      else sessionStorage.removeItem('nexus.session');\n"
+  <> "    } catch (e) {}\n"
+  <> "  };\n"
+  <> "  var currentId = function () {\n"
+  <> "    var layout = host.shadowRoot && host.shadowRoot.getElementById('layout');\n"
+  <> "    return layout ? (layout.getAttribute('data-selected') || '') : null;\n"
+  <> "  };\n"
+  <> "  // Pre-connect: append this tab's last-selected session to the ws\n"
+  <> "  // route. The attribute is final before the element upgrades, so\n"
+  <> "  // the runtime connects once, with the session in hand.\n"
+  <> "  var stored = read();\n"
   <> "  if (stored) {\n"
   <> "    var route = host.getAttribute('route');\n"
   <> "    if (route) {\n"
@@ -106,13 +126,26 @@ fn session_js() -> String {
   <> "    }\n"
   <> "  }\n"
   <> "  var persist = function () {\n"
-  <> "    var layout = host.shadowRoot && host.shadowRoot.getElementById('layout');\n"
-  <> "    if (!layout) return;\n"
-  <> "    var id = layout.getAttribute('data-selected') || '';\n"
-  <> "    try {\n"
-  <> "      if (id) localStorage.setItem('nexus.session', id);\n"
-  <> "      else localStorage.removeItem('nexus.session');\n"
-  <> "    } catch (e) {}\n"
+  <> "    var id = currentId();\n"
+  <> "    if (id === null) return;\n"
+  <> "    write(id);\n"
+  <> "  };\n"
+  <> "  // A reconnect (no reload) re-uses the route attribute, so sync it\n"
+  <> "  // with the current selection whenever the transport drops: the\n"
+  <> "  // next connect then re-opens what this tab is looking at. The\n"
+  <> "  // attribute is only touched when the parameter actually changes.\n"
+  <> "  var syncRoute = function () {\n"
+  <> "    var id = currentId();\n"
+  <> "    if (id === null) return;\n"
+  <> "    write(id);\n"
+  <> "    var route = host.getAttribute('route');\n"
+  <> "    if (!route) return;\n"
+  <> "    var url = new URL(route, location.href);\n"
+  <> "    var carried = url.searchParams.get('session') || '';\n"
+  <> "    if (carried === id) return;\n"
+  <> "    if (id) url.searchParams.set('session', id);\n"
+  <> "    else url.searchParams.delete('session');\n"
+  <> "    host.setAttribute('route', url.pathname + url.search);\n"
   <> "  };\n"
   <> "  var watch = function () {\n"
   <> "    if (!host.shadowRoot || host.__nexusSel) return;\n"
@@ -124,6 +157,7 @@ fn session_js() -> String {
   <> "    });\n"
   <> "    persist();\n"
   <> "  };\n"
+  <> "  host.addEventListener('lustre:close', syncRoute);\n"
   <> "  host.addEventListener('lustre:connect', watch);\n"
   <> "})();"
 }

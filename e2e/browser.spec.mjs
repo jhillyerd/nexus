@@ -801,7 +801,10 @@ async function main() {
     // and Hello replay, never an inherited view), panels no longer mirror
     // between contexts, and a reload re-opens the context's own
     // last-selected session (persisted client-side, re-supplied on the
-    // /ws route). The mobile overflow check stays.
+    // /ws route). A second session created in the mobile context makes
+    // the divergence real: the two contexts hold DIFFERENT selections at
+    // the same time, which a shared runtime could never show. The mobile
+    // overflow check stays.
     await test("mobile: independent per-client view, no overflow with cards", async () => {
       const desktop = await browser.newContext({ viewport: { width: 1280, height: 900 } });
       const dpage = await desktop.newPage();
@@ -818,11 +821,11 @@ async function main() {
       // inherited view (the shared runtime used to mirror the first
       // context's state into every later context).
       await mpage.waitForSelector(".turn.tool[data-call-id]", { timeout: 30_000 });
-      const selection = await selectedId(mpage);
-      assert(selection, "mobile context has its own selection");
+      const first = await selectedId(mpage);
+      assert(first, "mobile context has its own selection");
       eq(
         await selectedId(dpage),
-        selection,
+        first,
         "fresh context auto-selects like any fresh model",
       );
 
@@ -845,18 +848,55 @@ async function main() {
       }));
       assert(overflow.scrollWidth <= overflow.innerWidth + 1, `overflow: ${JSON.stringify(overflow)}`);
 
-      // Reload: the context's own last-selected session comes back through
-      // the client-supplied route parameter (cards replayed), and the
-      // opened panel — per-connection state — does not survive.
+      // Diverge the contexts for real: create a second session in the
+      // mobile context (its model learns it; the desktop context's model
+      // never does), so mobile holds the new session while desktop keeps
+      // the original — two live connections, two different selections.
+      await mpage.selectOption("#model-picker", "fast");
+      await mpage.click("#create-session");
+      await poll(
+        async () => (await mpage.locator("#session-list .session-main").count()) === 2,
+        { timeout: 15_000, message: "second session appears on mobile" },
+      );
+      const second = await selectedId(mpage);
+      assert(second && second !== first, `mobile moved to its new session: ${second} vs ${first}`);
+      eq(
+        await selectedId(dpage),
+        first,
+        "desktop keeps its own selection while mobile diverges",
+      );
+      eq(
+        await dpage.locator("#session-list .session-main").count(),
+        1,
+        "desktop model never sees the other context's session",
+      );
+
+      // Reload: the context's own last-selected session (the second one —
+      // not the auto-selected first) comes back through the client-
+      // supplied route parameter, and the opened panel — per-connection
+      // state — does not survive.
       await mpage.reload();
       await connected(mpage);
-      await mpage.waitForSelector(".turn.tool[data-call-id]", { timeout: 30_000 });
-      eq(await selectedId(mpage), selection, "reload restores own selection");
+      await poll(
+        async () => (await selectedId(mpage)) === second,
+        { timeout: 15_000, message: "reload restores the diverged selection" },
+      );
       eq(
         await mpage.locator("#create-panel").evaluate((el) => el.hidden),
         true,
         "panel state does not survive a reload",
       );
+      eq(
+        await selectedId(dpage),
+        first,
+        "desktop selection untouched by the mobile reload",
+      );
+
+      // Leave one session behind, as the suite found it: later tests
+      // count rows and chat-request chains.
+      await mpage.request.delete(`${base}/sessions/${second}`, {
+        headers: { authorization: `Bearer ${TOKEN}` },
+      });
       await desktop.close();
       await mobile.close();
     });
