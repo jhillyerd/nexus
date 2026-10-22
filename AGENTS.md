@@ -47,6 +47,12 @@ The persistence layer lives in `sql/schema.sql` + `src/nexus/store/sql/`.
   `on conflict (session_id, seq) do nothing` so crash-recovery replays are
   idempotent. An assistant message with N calls is N consecutive rows and
   the first row carries the message text (`''` on continuation rows).
+- **`session_message.reasoning` is display-only chain of thought** (nullable
+  `text`, `''`-sentinel → NULL like `insert_provider.sql`'s key pattern).
+  It rides a sidecar on the transcript (`transcript.reasoning_at`), never
+  `messages`, so it is structurally unable to change a request byte; a
+  turn that produced only reasoning commits nothing (no empty assistant
+  messages — the pre-reasoning `"" -> tr` guard still holds).
 
 ## Changing the schema or queries
 
@@ -80,8 +86,10 @@ Pinned by the M3 browser suite (`docs/plans/completed/m3-verification.md`);
 - **UI display state mirrors the server's commit rules.** A failed turn
   commits nothing server-side, so the UI rolls its uncommitted lines back
   to the user line; a guard-tripped turn keeps its committed rounds and
-  final text. If you change the loop's commit rules, change the UI
-  rollback with it (`test/ui_test.gleam` pins both sides).
+  final text. Reasoning follows the same rule: the live "thinking" buffer
+  commits only when the assistant output it preceded commits, and a
+  reasoning-only turn discards it. If you change the loop's commit rules,
+  change the UI rollback with it (`test/ui_test.gleam` pins both sides).
 - **One frozen toolset for every session.** The registry builds the
   agent-loop runner once at boot
   (`session.agent_runner(cfg.max_tool_iterations, tools.default(cfg))`).

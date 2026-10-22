@@ -157,3 +157,64 @@ pub fn tools_encoded_deterministically_test() {
     "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_time\"",
   ))
 }
+
+// ---------------------------------------------------------------------------
+// Reasoning sidecar (display-only, never in a request byte)
+// ---------------------------------------------------------------------------
+
+pub fn reasoning_never_changes_request_bytes_test() {
+  let opts = transcript.default_options()
+  let plain =
+    transcript.new("m", "s")
+    |> transcript.append_user("q")
+    |> transcript.append_assistant("a")
+  let reasoned =
+    transcript.new("m", "s")
+    |> transcript.append_user("q")
+    |> transcript.append_assistant_with_reasoning(
+      "a",
+      reasoning: Some("secret thoughts"),
+    )
+  transcript.request_body(plain, opts)
+  |> should.equal(transcript.request_body(reasoned, opts))
+
+  // Same for tool-call rounds: the reasoning rides beside the message.
+  let calls = [#("c1", "echo", "{}")]
+  let plain_tools =
+    plain
+    |> transcript.append_assistant_tool_calls(
+      text: Some("t"),
+      calls: calls,
+      reasoning: None,
+    )
+  let reasoned_tools =
+    reasoned
+    |> transcript.append_assistant_tool_calls(
+      text: Some("t"),
+      calls: calls,
+      reasoning: Some("why"),
+    )
+  transcript.request_body(plain_tools, opts)
+  |> should.equal(transcript.request_body(reasoned_tools, opts))
+}
+
+pub fn reasoning_at_indexes_chronologically_test() {
+  let tr =
+    transcript.new("m", "s")
+    |> transcript.append_user("q")
+    |> transcript.append_assistant_with_reasoning("a", reasoning: Some("chain"))
+    |> transcript.append_user("again")
+    |> transcript.append_assistant("b")
+  // system=0, user=1, assistant=2 (reasoned), user=3, assistant=4.
+  transcript.reasoning_at(tr, 2) |> should.equal(Some("chain"))
+  transcript.reasoning_at(tr, 0) |> should.equal(None)
+  transcript.reasoning_at(tr, 4) |> should.equal(None)
+}
+
+pub fn empty_reasoning_is_dropped_test() {
+  let tr =
+    transcript.new("m", "s")
+    |> transcript.append_user("q")
+    |> transcript.append_assistant_with_reasoning("a", reasoning: Some(""))
+  transcript.reasoning_at(tr, 2) |> should.equal(None)
+}

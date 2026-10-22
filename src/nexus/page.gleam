@@ -255,6 +255,15 @@ select, textarea, input { font: inherit; color: inherit; background: transparent
 .turn { max-width: 46rem; padding: .55rem .8rem; border-radius: 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .turn.user { align-self: flex-end; background: color-mix(in srgb, #3b82f6 18%, transparent); }
 .turn.assistant { align-self: flex-start; background: color-mix(in srgb, currentColor 8%, transparent); }
+details.turn.reasoning { align-self: flex-start; max-width: 46rem; padding: .35rem .7rem; border-radius: 10px;
+  font-size: .8rem; color: color-mix(in srgb, currentColor 80%, transparent);
+  border: 1px dashed color-mix(in srgb, currentColor 22%, transparent);
+  background: color-mix(in srgb, currentColor 4%, transparent); }
+details.turn.reasoning > summary { cursor: pointer; font-style: italic; opacity: .75; font-size: .72rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; list-style: revert; }
+details.turn.reasoning.live > summary { color: color-mix(in srgb, currentColor 85%, #b8860b); opacity: 1; }
+.reasoning-body { white-space: pre-wrap; overflow-wrap: anywhere; padding: .3rem 0 .1rem;
+  max-height: 40vh; overflow-y: auto; }
 .turn.tool { align-self: flex-start; font-size: .78rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   padding: .45rem .6rem; gap: .25rem; }
 .tool-head { display: flex; align-items: baseline; gap: .5rem; min-width: 0; flex-wrap: wrap; }

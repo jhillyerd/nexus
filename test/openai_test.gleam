@@ -45,6 +45,7 @@ fn acc() -> openai.Acc {
     started_us: 0,
     ttft_us: None,
     token_deltas: 0,
+    reasoning_deltas: 0,
     tool_call_deltas: 0,
     events_parsed: 0,
     decode_errors: 0,
@@ -151,4 +152,74 @@ pub fn later_usage_chunk_replaces_earlier_test() {
   acc2.usage |> should.equal(Some(second))
   acc2.token_deltas |> should.equal(1)
   acc2.events_parsed |> should.equal(2)
+}
+
+// ---------------------------------------------------------------------------
+// Reasoning deltas (chain of thought)
+// ---------------------------------------------------------------------------
+
+import gleam/erlang/process
+import gleam/list
+
+/// Run one SSE data payload through `handle_data`, returning the stats
+/// accumulator and every event forwarded to the callback.
+fn fold_data(data: String) -> #(openai.Acc, List(openai.StreamEvent)) {
+  let events = process.new_subject()
+  let acc =
+    openai.handle_data(data, 5, acc(), fn(event) { process.send(events, event) })
+  #(acc, drain(events, []))
+}
+
+fn drain(
+  events: process.Subject(openai.StreamEvent),
+  acc: List(openai.StreamEvent),
+) -> List(openai.StreamEvent) {
+  case process.receive(events, 50) {
+    Ok(event) -> drain(events, [event, ..acc])
+    Error(_) -> list.reverse(acc)
+  }
+}
+
+fn chunk_json(delta_fields: String) -> String {
+  "{\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":0,"
+  <> "\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":"
+  <> delta_fields
+  <> "}]}"
+}
+
+pub fn reasoning_content_delta_is_forwarded_test() {
+  let #(acc, events) =
+    fold_data(chunk_json(
+      "{\"role\":\"assistant\",\"reasoning_content\":\"step one\"}",
+    ))
+  events
+  |> should.equal([openai.ReasoningDelta("step one")])
+  acc.reasoning_deltas |> should.equal(1)
+  // Reasoning is model output: it starts the TTFT clock.
+  acc.ttft_us |> should.equal(Some(5))
+  acc.events_parsed |> should.equal(1)
+}
+
+pub fn openrouter_reasoning_shape_is_forwarded_test() {
+  let #(_, events) = fold_data(chunk_json("{\"reasoning\":\"step two\"}"))
+  events |> should.equal([openai.ReasoningDelta("step two")])
+}
+
+pub fn plain_chunk_emits_no_reasoning_test() {
+  let #(acc, events) = fold_data(chunk_json("{\"content\":\"hello\"}"))
+  events |> should.equal([openai.TokenDelta("hello")])
+  acc.reasoning_deltas |> should.equal(0)
+}
+
+pub fn empty_reasoning_field_is_skipped_test() {
+  let #(acc, events) = fold_data(chunk_json("{\"reasoning_content\":\"\"}"))
+  events |> should.equal([])
+  acc.reasoning_deltas |> should.equal(0)
+}
+
+pub fn done_sentinel_has_no_reasoning_test() {
+  let #(acc, events) = fold_data("[DONE]")
+  events |> should.equal([])
+  acc.saw_done |> should.equal(True)
+  acc.reasoning_deltas |> should.equal(0)
 }

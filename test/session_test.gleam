@@ -40,6 +40,7 @@ fn stats() -> openai.StreamStats {
     ttft_ms: Some(12),
     duration_ms: 345,
     token_deltas: 2,
+    reasoning_deltas: 0,
     tool_call_deltas: 0,
     events_parsed: 7,
     decode_errors: 0,
@@ -596,9 +597,13 @@ fn tool_round_runner(
   session.StreamDone(
     stats(),
     tr
-      |> transcript.append_assistant_tool_calls(text: None, calls: [
-        #("call_1", "http_fetch", "{\"url\":\"https://example.invalid/\"}"),
-      ])
+      |> transcript.append_assistant_tool_calls(
+        text: None,
+        calls: [
+          #("call_1", "http_fetch", "{\"url\":\"https://example.invalid/\"}"),
+        ],
+        reasoning: None,
+      )
       |> transcript.append_tool_result(
         tool_call_id: "call_1",
         content: "{\"status\":200}",
@@ -713,4 +718,48 @@ pub fn guard_hit_renders_terminal_failure_test() {
     option.unwrap(sample.failure_reason, ""),
     "guard",
   ))
+}
+
+// ---------------------------------------------------------------------------
+// Reasoning (chain of thought)
+// ---------------------------------------------------------------------------
+
+/// Emits reasoning deltas, then content, committing both with the message.
+fn reasoning_runner(
+  _endpoint,
+  tr,
+  _cancel,
+  on_event: fn(loop.LoopEvent) -> Nil,
+) -> session.TurnOutcome {
+  on_event(loop.StreamEvent(openai.ReasoningDelta("pondering ")))
+  on_event(loop.StreamEvent(openai.ReasoningDelta("deeply")))
+  on_event(loop.StreamEvent(openai.TokenDelta("answer")))
+  session.StreamDone(
+    stats(),
+    transcript.append_assistant_with_reasoning(
+      tr,
+      "answer",
+      Some("pondering deeply"),
+    ),
+  )
+}
+
+pub fn reasoning_streams_live_and_replays_on_rejoin_test() {
+  let sess = start_with(reasoning_runner)
+  let sub = join(sess)
+  let _ = expect_event(sub)
+  should.equal(session.send_message(sess, "think"), session.Sent)
+  expect_event(sub) |> should.equal(session.UserEcho("think"))
+  expect_event(sub) |> should.equal(session.Reasoning("pondering "))
+  expect_event(sub) |> should.equal(session.Reasoning("deeply"))
+  expect_event(sub) |> should.equal(session.Token("answer"))
+  let assert session.TurnDone(_) = expect_event(sub)
+
+  // A fresh subscriber replays the committed reasoning just before the
+  // assistant message it preceded.
+  let sub2 = join(sess)
+  let assert session.Hello(_, 3, _) = expect_event(sub2)
+  expect_event(sub2) |> should.equal(session.UserEcho("think"))
+  expect_event(sub2) |> should.equal(session.ReasoningFull("pondering deeply"))
+  expect_event(sub2) |> should.equal(session.AssistantFull("answer"))
 }

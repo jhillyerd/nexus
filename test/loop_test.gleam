@@ -18,6 +18,7 @@ fn stats() -> openai.StreamStats {
     ttft_ms: Some(10),
     duration_ms: 100,
     token_deltas: 1,
+    reasoning_deltas: 0,
     tool_call_deltas: 1,
     events_parsed: 3,
     decode_errors: 0,
@@ -272,9 +273,13 @@ pub fn tool_round_extends_request_byte_identically_test() {
   let tr1 = tr_with_user()
   let tr2 =
     tr1
-    |> transcript.append_assistant_tool_calls(text: None, calls: [
-      #("c1", "echo", "{}"),
-    ])
+    |> transcript.append_assistant_tool_calls(
+      text: None,
+      calls: [
+        #("c1", "echo", "{}"),
+      ],
+      reasoning: None,
+    )
     |> transcript.append_tool_result(tool_call_id: "c1", content: "echo:{}")
   let tr3 = tr2 |> transcript.append_assistant("based on the tool: yes")
 
@@ -312,4 +317,92 @@ pub fn tool_schema_is_frozen_from_spec_list_test() {
     ])
   let #(outcome, _) = run_recording(specs, 8, stream, tr_with_user())
   let assert loop.LoopDone(_, _) = outcome
+}
+
+// ---------------------------------------------------------------------------
+// Reasoning (chain of thought)
+// ---------------------------------------------------------------------------
+
+pub fn reasoning_streams_and_commits_with_text_test() {
+  let #(outcome, events) =
+    run_recording(
+      [],
+      8,
+      scripted_stream([
+        Round(
+          [
+            openai.ReasoningDelta("let me think "),
+            openai.ReasoningDelta("hard"),
+            openai.TokenDelta("the answer"),
+          ],
+          openai.Completed(stats()),
+        ),
+      ]),
+      tr_with_user(),
+    )
+  // Raw reasoning deltas are forwarded live, in order, before the content.
+  events
+  |> list.filter(fn(event) {
+    case event {
+      loop.StreamEvent(_) -> True
+      _ -> False
+    }
+  })
+  |> should.equal([
+    loop.StreamEvent(openai.ReasoningDelta("let me think ")),
+    loop.StreamEvent(openai.ReasoningDelta("hard")),
+    loop.StreamEvent(openai.TokenDelta("the answer")),
+  ])
+  // And committed with the assistant message (system=0, user=1, answer=2).
+  case outcome {
+    loop.LoopDone(_, tr) ->
+      transcript.reasoning_at(tr, 2) |> should.equal(Some("let me think hard"))
+    _ -> panic as "expected LoopDone"
+  }
+}
+
+pub fn reasoning_attaches_to_tool_call_message_test() {
+  let #(outcome, _) =
+    run_recording(
+      [echo_tool()],
+      8,
+      scripted_stream([
+        Round(
+          [
+            openai.ReasoningDelta("need the echo tool"),
+            call_delta("c1", "echo", "{}"),
+          ],
+          openai.Completed(stats()),
+        ),
+      ]),
+      tr_with_user(),
+    )
+  case outcome {
+    // The script repeats its only round, so the loop keeps issuing the
+    // call until the guard trips; every round carries the reasoning.
+    loop.LoopGuardHit(_, tr) | loop.LoopDone(_, tr) | loop.LoopStopped(tr) ->
+      transcript.reasoning_at(tr, 2) |> should.equal(Some("need the echo tool"))
+    loop.LoopFailed(reason) -> panic as { "unexpected LoopFailed: " <> reason }
+  }
+}
+
+pub fn reasoning_only_stop_commits_nothing_test() {
+  let #(outcome, _) =
+    run_recording(
+      [],
+      8,
+      scripted_stream([
+        Round([openai.ReasoningDelta("hm")], openai.Cancelled),
+      ]),
+      tr_with_user(),
+    )
+  case outcome {
+    loop.LoopStopped(tr) -> {
+      // No empty assistant message, no reasoning entry: request bytes for
+      // a retry stay identical to the pre-send transcript.
+      transcript.length(tr) |> should.equal(2)
+      transcript.reasoning_at(tr, 2) |> should.equal(None)
+    }
+    _ -> panic as "expected LoopStopped"
+  }
 }

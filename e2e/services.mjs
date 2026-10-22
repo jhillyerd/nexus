@@ -198,6 +198,20 @@ async function playScenario(res, request, state) {
       finish();
       return;
     }
+    case "reasoning": {
+      // DeepSeek-R1 / vLLM shape: reasoning_content fragments stream before
+      // any content, so the UI's live thinking block is exercised live and
+      // the committed block above.
+      sse(res, chunk({ role: "assistant", reasoning_content: "" }));
+      for (const part of ["weighing ", "the ", "evidence ", "carefully "]) {
+        sse(res, chunk({ reasoning_content: part }));
+        await sleep(350);
+      }
+      await streamText("Reasoned answer from the scripted model.");
+      sse(res, chunk({}, "stop"));
+      finish();
+      return;
+    }
     case "slow": {
       sse(res, chunk({ role: "assistant", content: "" }));
       for (let i = 0; i < 40; i++) {
