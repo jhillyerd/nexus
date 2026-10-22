@@ -1,8 +1,8 @@
 //// The M3 page shell: server-rendered HTML hosting the Lustre server
 //// component. The page carries no client-side application code — just the
 //// prebuilt Lustre client runtime, a `<lustre-server-component>` element
-//// whose `route` points at the WebSocket transport, and two tiny static
-//// scripts (see `indicator_js` and `session_js`).
+//// whose `route` points at the WebSocket transport, and three tiny static
+//// scripts (see `indicator_js`, `session_js`, and `autoscroll_js`).
 ////
 //// The bearer token (when auth is on) is echoed into the route's query
 //// string server-side, mirroring the M2 `?token=` convention: the token
@@ -50,6 +50,8 @@ pub fn html(token: Option(String)) -> String {
     indicator_js(),
     "\n",
     session_js(),
+    "\n",
+    autoscroll_js(),
     "\n</script>\n</body>\n</html>\n",
   ])
 }
@@ -162,6 +164,137 @@ fn session_js() -> String {
   <> "})();"
 }
 
+/// Auto-follow for the chat log (`#log`): only the browser knows the
+/// scroll position and the user's scroll intent, so (like the indicator
+/// and session scripts) a static script owns what the server view
+/// cannot. While the log sits near its bottom the latest content is kept
+/// in view — every streamed chunk scrolls immediately (`scrollTop =
+/// scrollHeight`, no debounce, no overshoot) with one animation-frame
+/// follow-up for late layout. An explicit upward gesture (wheel up,
+/// touch drag, arrow/page/home keys) unpins at once so a quick flick
+/// beats the stream; any other scroll re-pins near the bottom. The
+/// server renders the inert `#jump-latest` button (`nexus/ui`); this
+/// script mirrors the pin state onto its `hidden` attribute and handles
+/// clicks by delegation on the shadow root, so the press never
+/// round-trips through the server. Opening or switching a session
+/// (`#layout[data-selected]`) or a remount re-opens at the latest
+/// message, following again. The script is static and token-free; auth
+/// still rides the query string.
+fn autoscroll_js() -> String {
+  "(function () {\n"
+  <> "  'use strict';\n"
+  <> "  var host = document.querySelector('lustre-server-component');\n"
+  <> "  if (!host) return;\n"
+  <> "  var THRESHOLD = 80; // px from the bottom that still counts as following\n"
+  <> "  var ECHO_MS = 150; // scroll events this soon after our own set are echoes\n"
+  <> "  var root = null;\n"
+  <> "  var log = null;\n"
+  <> "  var pinned = true;\n"
+  <> "  var lastSet = 0;\n"
+  <> "  var waiting = null;\n"
+  <> "  var syncButton = function () {\n"
+  <> "    // hidden mirrors the pin: following -> hidden, reading -> shown.\n"
+  <> "    var btn = root && root.getElementById('jump-latest');\n"
+  <> "    if (btn && btn.hidden !== pinned) btn.hidden = pinned;\n"
+  <> "  };\n"
+  <> "  var toBottom = function () {\n"
+  <> "    if (!log) return;\n"
+  <> "    lastSet = performance.now();\n"
+  <> "    log.scrollTop = log.scrollHeight;\n"
+  <> "    requestAnimationFrame(function () {\n"
+  <> "      if (!log || !pinned) return;\n"
+  <> "      lastSet = performance.now();\n"
+  <> "      log.scrollTop = log.scrollHeight;\n"
+  <> "    });\n"
+  <> "  };\n"
+  <> "  var onScroll = function () {\n"
+  <> "    // Content may have grown since our own set, so the distance\n"
+  <> "    // would lie; everything else re-evaluates the pin.\n"
+  <> "    if (performance.now() - lastSet < ECHO_MS) return;\n"
+  <> "    pinned = log.scrollHeight - log.scrollTop - log.clientHeight\n"
+  <> "      < THRESHOLD;\n"
+  <> "    syncButton();\n"
+  <> "  };\n"
+  <> "  var unpin = function () {\n"
+  <> "    if (pinned) {\n"
+  <> "      pinned = false;\n"
+  <> "      syncButton();\n"
+  <> "    }\n"
+  <> "  };\n"
+  <> "  var logReady = function (el) {\n"
+  <> "    log = el;\n"
+  <> "    if (log.__nexusFollow) return;\n"
+  <> "    log.__nexusFollow = true;\n"
+  <> "    log.addEventListener('scroll', onScroll, { passive: true });\n"
+  <> "    log.addEventListener(\n"
+  <> "      'wheel',\n"
+  <> "      function (e) {\n"
+  <> "        if (e.deltaY < 0) unpin();\n"
+  <> "      },\n"
+  <> "      { passive: true }\n"
+  <> "    );\n"
+  <> "    log.addEventListener('touchmove', unpin, { passive: true });\n"
+  <> "    log.addEventListener('keydown', function (e) {\n"
+  <> "      if (e.key === 'ArrowUp' || e.key === 'PageUp' || e.key === 'Home')\n"
+  <> "        unpin();\n"
+  <> "    });\n"
+  <> "    new MutationObserver(function () {\n"
+  <> "      if (pinned) toBottom();\n"
+  <> "    }).observe(log, {\n"
+  <> "      childList: true,\n"
+  <> "      subtree: true,\n"
+  <> "      characterData: true,\n"
+  <> "    });\n"
+  <> "    pinned = true;\n"
+  <> "    toBottom();\n"
+  <> "    syncButton();\n"
+  <> "  };\n"
+  <> "  var setup = function () {\n"
+  <> "    root = host.shadowRoot;\n"
+  <> "    if (!root) return;\n"
+  <> "    if (!root.__nexusJump) {\n"
+  <> "      root.__nexusJump = true;\n"
+  <> "      root.addEventListener('click', function (e) {\n"
+  <> "        var t = e.target;\n"
+  <> "        if (t && t.closest && t.closest('#jump-latest')) {\n"
+  <> "          pinned = true;\n"
+  <> "          toBottom();\n"
+  <> "          syncButton();\n"
+  <> "        }\n"
+  <> "      });\n"
+  <> "      // A session switch re-renders #log for another conversation:\n"
+  <> "      // open it at the latest message, following again.\n"
+  <> "      new MutationObserver(function () {\n"
+  <> "        pinned = true;\n"
+  <> "        toBottom();\n"
+  <> "        syncButton();\n"
+  <> "      }).observe(root, {\n"
+  <> "        subtree: true,\n"
+  <> "        attributeFilter: ['data-selected'],\n"
+  <> "      });\n"
+  <> "    }\n"
+  <> "    var el = root.getElementById('log');\n"
+  <> "    if (el) {\n"
+  <> "      if (el !== log) logReady(el);\n"
+  <> "      return;\n"
+  <> "    }\n"
+  <> "    if (waiting) return;\n"
+  <> "    waiting = new MutationObserver(function () {\n"
+  <> "      var found = root && root.getElementById('log');\n"
+  <> "      if (found) {\n"
+  <> "        waiting.disconnect();\n"
+  <> "        waiting = null;\n"
+  <> "        logReady(found);\n"
+  <> "      }\n"
+  <> "    });\n"
+  <> "    waiting.observe(root, { childList: true, subtree: true });\n"
+  <> "  };\n"
+  <> "  host.addEventListener('lustre:mount', setup);\n"
+  <> "  host.addEventListener('lustre:connect', setup);\n"
+  <> "  setup();\n"
+  <> "})();"
+}
+
 fn css() -> String {
   "
 :root { color-scheme: light dark; }
@@ -251,7 +384,12 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
 select, textarea, input { font: inherit; color: inherit; background: transparent; border-radius: 8px;
   border: 1px solid color-mix(in srgb, currentColor 25%, transparent); padding: .45rem .6rem; }
 #chat { min-width: 0; display: flex; flex-direction: column; }
-#log { flex: 1; overflow-y: auto; padding: 1rem; display: flex; flex-direction: column; gap: .8rem; }
+#log-wrap { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; }
+#log { flex: 1; min-height: 0; overflow-y: auto; padding: 1rem; display: flex; flex-direction: column; gap: .8rem; }
+#jump-latest { position: absolute; right: 1rem; bottom: .8rem; width: 2.2rem; height: 2.2rem;
+  padding: 0; border-radius: 50%; font-size: 1.1rem; line-height: 1; opacity: .85; }
+#jump-latest:hover { opacity: 1; }
+#jump-latest[hidden] { display: none; }
 .turn { max-width: 46rem; padding: .55rem .8rem; border-radius: 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .turn.user { align-self: flex-end; background: color-mix(in srgb, #3b82f6 18%, transparent); }
 .turn.assistant { align-self: flex-start; background: color-mix(in srgb, currentColor 8%, transparent); }
