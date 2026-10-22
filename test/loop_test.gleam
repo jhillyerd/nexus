@@ -340,16 +340,19 @@ pub fn reasoning_streams_and_commits_with_text_test() {
       ]),
       tr_with_user(),
     )
-  // Raw reasoning deltas are forwarded live, before the content.
+  // Raw reasoning deltas are forwarded live, in order, before the content.
   events
   |> list.filter(fn(event) {
     case event {
-      loop.StreamEvent(openai.ReasoningDelta(_)) -> True
+      loop.StreamEvent(_) -> True
       _ -> False
     }
   })
-  |> list.length
-  |> should.equal(2)
+  |> should.equal([
+    loop.StreamEvent(openai.ReasoningDelta("let me think ")),
+    loop.StreamEvent(openai.ReasoningDelta("hard")),
+    loop.StreamEvent(openai.TokenDelta("the answer")),
+  ])
   // And committed with the assistant message (system=0, user=1, answer=2).
   case outcome {
     loop.LoopDone(_, tr) ->

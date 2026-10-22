@@ -644,8 +644,14 @@ async function main() {
         async () => {
           const live = page.locator("details.turn.reasoning.live");
           if ((await live.count()) === 0) return false;
-          const body = await live.last().locator(".reasoning-body").evaluate((el) => el.textContent);
-          return body.includes("weighing");
+          const state = await live.last().evaluate((el) => ({
+            open: el.open,
+            label: el.querySelector("summary")?.textContent ?? "",
+            body: el.querySelector(".reasoning-body")?.textContent ?? "",
+          }));
+          return (
+            state.open && state.label.includes("thinking") && state.body.includes("weighing")
+          );
         },
         { timeout: 30_000, interval: 100, message: "live thinking block streaming" },
       );

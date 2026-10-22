@@ -111,9 +111,9 @@ The transcript renders assistant tool calls as compact cards (tool name,
 stable call id, truncated argument preview, running/completed/failed
 status, and a truncated inert result preview — no `innerHTML`, escaped
 text only), the model's **reasoning** (chain of thought) as a live
-"thinking…" block that collapses into an inert, expandable summary once
-the turn commits (replayed from history on reconnect, rolled back with a
-failed turn), an iteration chip (`iter n/max · phase`) while the agent
+"thinking…” block that collapses into an inert, expandable summary
+when assistant output begins (replayed from history on reconnect,
+rolled back with a failed turn), an iteration chip (`iter n/max · phase`) while the agent
 loop runs, terminal guard rendering when the iteration cap trips, and
 full tool-history replay on reconnect or reload. Failed turns roll their
 uncommitted display back (the server commits nothing); guard-tripped

@@ -785,9 +785,16 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     // A tool call's arguments are streaming in fragments. Any assistant
     // text seen so far belongs *before* the call (the loop commits text at
     // assembly time), so the bubble is committed first; the fragments then
-    // accumulate into a pending card keyed by the chunk index.
+    // accumulate into a pending card keyed by the chunk index. The
+    // thinking buffer defers to the assembly commit unless text already
+    // commits it: on a stop the loop commits only non-empty text (with
+    // its reasoning), so with no text yet an early commit here would
+    // orphan the reasoning line after a stop.
     ToolCallDelta(index, id, name, fragment) -> {
-      let model = model |> commit_thinking |> commit_bubble
+      let model = case model.bubble {
+        Some(_) -> model |> commit_thinking |> commit_bubble
+        None -> model
+      }
       let pending =
         upsert_pending(model.pending, PendingCall(index, id, name, fragment))
       #(Model(..model, pending: pending, streaming: True), effect.none())
@@ -1199,6 +1206,10 @@ fn after_sessions(
     bubble: case ended {
       True -> None
       False -> model.bubble
+    },
+    thinking: case ended {
+      True -> None
+      False -> model.thinking
     },
     streaming: case ended {
       True -> False

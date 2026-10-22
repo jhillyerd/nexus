@@ -65,7 +65,9 @@ pub type StreamEvent {
 
 pub type StreamStats {
   StreamStats(
-    /// Send → first content/tool delta, ms. `None` if no content arrived.
+    /// Send → first reasoning/content/tool delta, ms — reasoning models
+    /// lead with chain of thought, so the clock starts there.
+    /// `None` if no output arrived.
     ttft_ms: Option(Int),
     duration_ms: Int,
     token_deltas: Int,

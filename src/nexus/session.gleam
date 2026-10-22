@@ -582,12 +582,34 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
 
         // Reasoning is forwarded to subscribers only — it is display
         // state that never joins the turn's committed text accounting
-        // (chars/deltas keep counting content, like the metrics do).
-        Streaming(candidate, ..), loop.StreamEvent(openai.ReasoningDelta(text))
+        // (chars/deltas keep counting content, like the metrics do). The
+        // first reasoning delta still starts the turn's TTFT clock:
+        // reasoning models lead with it, so the displayed TTFT must
+        // match the stream stats (send → first reasoning/content/tool
+        // delta) instead of waiting for a content token that a
+        // reasoning-only turn never produces.
+        Streaming(candidate, monitor, cancel, acc, deltas, started_us, first),
+          loop.StreamEvent(openai.ReasoningDelta(text))
           if candidate == worker
         -> {
           broadcast(state.subs, Reasoning(text))
-          actor.continue(state)
+          actor.continue(
+            State(
+              ..state,
+              turn: Streaming(
+                candidate,
+                monitor,
+                cancel,
+                acc,
+                deltas,
+                started_us,
+                case first {
+                  Some(_) -> first
+                  None -> Some(timing.now_us())
+                },
+              ),
+            ),
+          )
         }
 
         Streaming(candidate, ..),

@@ -261,7 +261,7 @@ details.turn.reasoning { align-self: flex-start; max-width: 46rem; padding: .35r
   background: color-mix(in srgb, currentColor 4%, transparent); }
 details.turn.reasoning > summary { cursor: pointer; font-style: italic; opacity: .75; font-size: .72rem;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace; list-style: revert; }
-details.turn.reasoning.live > summary { color: #b8860b; opacity: 1; }
+details.turn.reasoning.live > summary { color: color-mix(in srgb, currentColor 85%, #b8860b); opacity: 1; }
 .reasoning-body { white-space: pre-wrap; overflow-wrap: anywhere; padding: .3rem 0 .1rem;
   max-height: 40vh; overflow-y: auto; }
 .turn.tool { align-self: flex-start; font-size: .78rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
