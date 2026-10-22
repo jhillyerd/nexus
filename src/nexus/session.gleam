@@ -47,8 +47,15 @@ pub type SessionEvent {
   UserEcho(text: String)
   /// A complete assistant turn, used for history replay on (re)connect.
   AssistantFull(text: String)
+  /// A committed assistant message's full reasoning — history replay,
+  /// always sent just before that message's own events.
+  ReasoningFull(text: String)
   /// A streamed fragment of the assistant turn in flight.
   Token(text: String)
+  /// A streamed fragment of the model's reasoning (chain of thought),
+  /// emitted before any content. Display-only — reasoning is never
+  /// replayed into a request.
+  Reasoning(text: String)
   /// The turn finished; stats for the metrics line.
   TurnDone(stats: openai.StreamStats)
   /// The turn was stopped by the user; `chars` were committed.
@@ -390,16 +397,17 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
         })
       state.transcript
       |> transcript.messages
-      |> list.each(fn(message) {
+      |> list.index_fold(Nil, fn(_, message, index) {
         case message {
           chat.UserMessage(content: chat.UserTextContent(text), ..) ->
             process.send(sub, UserEcho(text))
-          chat.AssistantMessage(
-            content: Some(chat.AssistantTextContent(text)),
-            tool_calls: None,
-            ..,
-          ) -> process.send(sub, AssistantFull(text))
           chat.AssistantMessage(content: text, tool_calls: calls, ..) -> {
+            // Reasoning replay first: it was streamed before the message's
+            // own output, so it replays before it too.
+            case transcript.reasoning_at(state.transcript, index) {
+              Some(reasoning) -> process.send(sub, ReasoningFull(reasoning))
+              None -> Nil
+            }
             case text {
               Some(chat.AssistantTextContent(content)) ->
                 process.send(sub, AssistantFull(content))
@@ -429,6 +437,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
             )
           _ -> Nil
         }
+        Nil
       })
       // M3: the UI component keeps one long-lived subscription across
       // reconnects, so a re-Join must not duplicate the fan-out entry.
@@ -569,6 +578,16 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
               ),
             ),
           )
+        }
+
+        // Reasoning is forwarded to subscribers only — it is display
+        // state that never joins the turn's committed text accounting
+        // (chars/deltas keep counting content, like the metrics do).
+        Streaming(candidate, ..), loop.StreamEvent(openai.ReasoningDelta(text))
+          if candidate == worker
+        -> {
+          broadcast(state.subs, Reasoning(text))
+          actor.continue(state)
         }
 
         Streaming(candidate, ..),

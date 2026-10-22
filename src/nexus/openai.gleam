@@ -46,6 +46,11 @@ fn ensure_hackney_started() -> Result(Nil, String)
 pub type StreamEvent {
   /// A fragment of assistant text content.
   TokenDelta(text: String)
+  /// A fragment of the model's reasoning (chain of thought) — emitted by
+  /// reasoning models before any content/tool output. Decoded here
+  /// because glopenai 1.0.0's delta decoder drops the non-standard
+  /// `reasoning_content` / `reasoning` fields.
+  ReasoningDelta(text: String)
   /// A fragment of a native tool call, still unassembled.
   ToolCallDelta(
     index: Int,
@@ -64,6 +69,7 @@ pub type StreamStats {
     ttft_ms: Option(Int),
     duration_ms: Int,
     token_deltas: Int,
+    reasoning_deltas: Int,
     tool_call_deltas: Int,
     /// SSE events that decoded into stream chunks.
     events_parsed: Int,
@@ -263,6 +269,7 @@ fn stream_request(
                 started_us: started_us,
                 ttft_us: None,
                 token_deltas: 0,
+                reasoning_deltas: 0,
                 tool_call_deltas: 0,
                 events_parsed: 0,
                 decode_errors: 0,
@@ -369,7 +376,10 @@ fn raw_stream_loop(
   }
 }
 
-fn handle_data(
+/// Fold one SSE data payload: decode + forward any reasoning fragment,
+/// then the glopenai chunk. Public (and side-effect-free beyond `on_event`)
+/// so the reasoning-aware decode/fold is offline-testable.
+pub fn handle_data(
   data: String,
   now_us: Int,
   acc: Acc,
@@ -377,7 +387,23 @@ fn handle_data(
 ) -> Acc {
   case data {
     "" -> acc
-    _ ->
+    _ -> {
+      // Reasoning rides outside glopenai's chunk type (1.0.0 has no
+      // reasoning fields), so it is decoded from the raw data first:
+      // DeepSeek-R1 / vLLM style `delta.reasoning_content`, OpenRouter
+      // style `delta.reasoning`. Emitted BEFORE the chunk's own events so
+      // ordering matches the wire (reasoning precedes content).
+      let acc = case decode_reasoning(data) {
+        Some(text) if text != "" -> {
+          on_event(ReasoningDelta(text))
+          Acc(
+            ..acc,
+            reasoning_deltas: acc.reasoning_deltas + 1,
+            ttft_us: Some(acc.ttft_us |> option.unwrap(now_us)),
+          )
+        }
+        _ -> acc
+      }
       case chat.parse_stream_chunk(data) {
         Ok(None) -> Acc(..acc, saw_done: True)
         Ok(Some(chunk)) -> handle_chunk(chunk, now_us, acc, on_event)
@@ -391,6 +417,7 @@ fn handle_data(
             )),
           )
       }
+    }
   }
 }
 
@@ -426,6 +453,52 @@ fn data_lines_value(data_lines: List(String)) -> Result(String, Nil) {
   }
 }
 
+/// Decode the reasoning fragment of one SSE data payload, if any.
+/// Tolerant by design: a payload without reasoning fields (or a non-JSON
+/// one like the `[DONE]` sentinel) decodes to `None`; the glopenai chunk
+/// decoder remains the authority on malformed payloads.
+fn decode_reasoning(data: String) -> Option(String) {
+  case json.parse(data, using: chunk_reasoning_decoder()) {
+    Ok(reasoning) -> reasoning
+    Error(_) -> None
+  }
+}
+
+fn chunk_reasoning_decoder() -> decode.Decoder(Option(String)) {
+  use choices <- decode.optional_field(
+    "choices",
+    [],
+    decode.list(delta_reasoning_decoder()),
+  )
+  decode.success(case choices {
+    [first, ..] -> first
+    [] -> None
+  })
+}
+
+fn delta_reasoning_decoder() -> decode.Decoder(Option(String)) {
+  use delta <- decode.optional_field(
+    "delta",
+    None,
+    decode.optional(reasoning_text_decoder()),
+  )
+  decode.success(option.unwrap(delta, None))
+}
+
+fn reasoning_text_decoder() -> decode.Decoder(Option(String)) {
+  use reasoning_content <- decode.optional_field(
+    "reasoning_content",
+    None,
+    decode.optional(decode.string),
+  )
+  use reasoning <- decode.optional_field(
+    "reasoning",
+    None,
+    decode.optional(decode.string),
+  )
+  decode.success(option.or(reasoning_content, reasoning))
+}
+
 /// Accumulator threaded through the stream loop. Public so the per-chunk
 /// fold (`handle_chunk`) is offline-testable.
 pub type Acc {
@@ -433,6 +506,7 @@ pub type Acc {
     started_us: Int,
     ttft_us: Option(Int),
     token_deltas: Int,
+    reasoning_deltas: Int,
     tool_call_deltas: Int,
     events_parsed: Int,
     decode_errors: Int,
@@ -518,6 +592,7 @@ fn finish_stream(
       ttft_ms: ttft_ms,
       duration_ms: timing.elapsed_ms(started_us, ended_us),
       token_deltas: acc.token_deltas,
+      reasoning_deltas: acc.reasoning_deltas,
       tool_call_deltas: acc.tool_call_deltas,
       events_parsed: acc.events_parsed,
       decode_errors: acc.decode_errors,

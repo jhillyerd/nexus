@@ -6,10 +6,12 @@
 //// picker, session sidebar, streaming log with a single in-flight assistant
 //// bubble, **typed tool-call cards** (name, stable call id, argument
 //// preview, running/completed/failed status, compact inert result
-//// preview), loop/iteration status, and the per-session metrics panel.
-//// Tool events are never rendered as model text, live or on Hello replay.
-//// All dynamic text is produced with Lustre `text` nodes; there is no
-//// `innerHTML` anywhere.
+//// preview), loop/iteration status, the model's streamed **reasoning**
+//// (chain of thought, as an inert collapsible block whose commit/rollback
+//// mirrors the server's), and the per-session metrics panel. Tool and
+//// reasoning events are never rendered as model text, live or on Hello
+//// replay. All dynamic text is produced with Lustre `text` nodes; there is
+//// no `innerHTML` anywhere.
 ////
 //// The shell hosts two views (per client): the chat layout and the
 //// Settings page (`nexus/ui_settings`, provider management), swapped
@@ -67,6 +69,10 @@ pub type ToolStatus {
 pub type Line {
   UserLine(text: String)
   AssistantLine(text: String)
+  /// The reasoning (chain of thought) a committed assistant message was
+  /// preceded by — replayed from history or committed from the live
+  /// thinking stream. Rendered as an inert, collapsed block.
+  ReasoningLine(text: String)
   /// One assistant tool call. Rendered as a compact card: tool name, stable
   /// call id, truncated argument preview, status, and (once available) a
   /// truncated inert result preview. `result` is None while running.
@@ -192,6 +198,11 @@ pub type Model {
     create_open: Bool,
     log: List(Line),
     bubble: Option(String),
+    // The reasoning (chain of thought) streaming in ahead of the bubble —
+    // the display-side twin of the server's reasoning-only-commit rule:
+    // it is committed to the log only when the turn's assistant output
+    // commits, and rolls back with a failed turn.
+    thinking: Option(String),
     streaming: Bool,
     // Tool calls whose arguments are still streaming (not yet assembled).
     pending: List(PendingCall),
@@ -275,7 +286,12 @@ pub type Msg {
   Hello(model: String, metrics: List(session.MetricSample))
   UserEcho(String)
   AssistantFull(String)
+  /// A committed assistant message's reasoning, replayed with history
+  /// (always just before that message's own events).
+  ReasoningFull(String)
   Token(String)
+  /// A streamed fragment of the model's reasoning (chain of thought).
+  Reasoning(String)
   TurnDone
   TurnStopped
   TurnFailed(String)
@@ -319,7 +335,9 @@ pub fn from_session_event(event: SessionEvent) -> Msg {
     session.Hello(model, _messages, metrics) -> Hello(model, metrics)
     session.UserEcho(text) -> UserEcho(text)
     session.AssistantFull(text) -> AssistantFull(text)
+    session.ReasoningFull(text) -> ReasoningFull(text)
     session.Token(text) -> Token(text)
+    session.Reasoning(text) -> Reasoning(text)
     session.TurnDone(_stats) -> TurnDone
     session.TurnStopped(_chars) -> TurnStopped
     session.TurnFailed(reason) -> TurnFailed(reason)
@@ -362,6 +380,7 @@ pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
       create_open: False,
       log: [],
       bubble: None,
+      thinking: None,
       streaming: False,
       pending: [],
       loop: None,
@@ -627,6 +646,7 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             selected: Some(id),
             log: [],
             bubble: None,
+            thinking: None,
             streaming: False,
             pending: [],
             loop: None,
@@ -731,7 +751,26 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       effect.none(),
     )
 
+    ReasoningFull(text) -> #(
+      Model(..model, log: [ReasoningLine(text), ..model.log]),
+      effect.none(),
+    )
+
+    // Reasoning streams ahead of the content bubble and accumulates in
+    // its own buffer — the display twin of the loop's reasoning cell.
+    Reasoning(text) -> {
+      let thinking = case model.thinking {
+        Some(acc) -> Some(acc <> text)
+        None -> Some(text)
+      }
+      #(Model(..model, thinking: thinking, streaming: True), effect.none())
+    }
+
+    // The first content token ends the reasoning phase: commit the
+    // thinking buffer as a line (pushed BEFORE the bubble's own eventual
+    // commit, so it renders above the text it preceded).
     Token(text) -> {
+      let model = commit_thinking(model)
       let bubble = case model.bubble {
         Some(acc) -> Some(acc <> text)
         None -> Some(text)
@@ -748,7 +787,7 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     // assembly time), so the bubble is committed first; the fragments then
     // accumulate into a pending card keyed by the chunk index.
     ToolCallDelta(index, id, name, fragment) -> {
-      let model = commit_bubble(model)
+      let model = model |> commit_thinking |> commit_bubble
       let pending =
         upsert_pending(model.pending, PendingCall(index, id, name, fragment))
       #(Model(..model, pending: pending, streaming: True), effect.none())
@@ -758,7 +797,7 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     // (and any sibling fragments — the "tools" phase boundary clears the
     // rest), then commit a running card for the stable id.
     ToolCallAssembled(id, name, arguments) -> {
-      let model = commit_bubble(model)
+      let model = model |> commit_thinking |> commit_bubble
       let pending = drop_pending(model.pending, id, name)
       #(
         Model(..model, pending: pending, log: [
@@ -808,12 +847,13 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     // bubble is discarded.
     TurnFailed(reason) -> {
       let model = case model.guard {
-        True -> commit_bubble(model)
+        True -> commit_turn_output(model)
         False ->
           Model(
             ..model,
             log: rollback_log(model.log, model.turn_base),
             bubble: None,
+            thinking: None,
           )
       }
       #(
@@ -976,10 +1016,22 @@ type BubblePolicy {
 /// stay (completed rounds are committed server-side on done/stopped/guard).
 fn finish_turn(model: Model, policy: BubblePolicy) -> Model {
   let model = case policy {
-    CommitBubble -> commit_bubble(model)
-    DropBubble -> Model(..model, bubble: None)
+    CommitBubble -> commit_turn_output(model)
+    DropBubble -> Model(..model, bubble: None, thinking: None)
   }
   Model(..model, pending: [], loop: None, guard: False, streaming: False)
+}
+
+/// Commit one finished turn's visible output, mirroring the loop's own
+/// commit rule: reasoning commits only alongside the assistant output it
+/// preceded. A turn that produced reasoning but no text/tool output
+/// commits NOTHING server-side, so the thinking buffer is dropped here
+/// too — display state must mirror the server's transcript exactly.
+fn commit_turn_output(model: Model) -> Model {
+  case model.bubble {
+    Some(_text) -> model |> commit_thinking |> commit_bubble
+    None -> Model(..model, thinking: None)
+  }
 }
 
 /// Commit the streaming bubble (if any) as a completed assistant line —
@@ -988,6 +1040,17 @@ fn commit_bubble(model: Model) -> Model {
   case model.bubble {
     Some(text) ->
       Model(..model, bubble: None, log: [AssistantLine(text), ..model.log])
+    None -> model
+  }
+}
+
+/// Commit the streaming thinking buffer (if any) as a reasoning line.
+/// Pushed BEFORE whatever assistant line follows it in the same turn, so
+/// in the rendered (oldest-first) log it sits above its own message.
+fn commit_thinking(model: Model) -> Model {
+  case model.thinking {
+    Some(text) ->
+      Model(..model, thinking: None, log: [ReasoningLine(text), ..model.log])
     None -> model
   }
 }
@@ -1984,6 +2047,7 @@ fn log_lines(model: Model) -> List(Element(Msg)) {
       case line {
         UserLine(text) -> turn("user", text)
         AssistantLine(text) -> turn("assistant", text)
+        ReasoningLine(text) -> reasoning_block(text, False)
         ToolLine(..) -> tool_card(line)
         NoteLine(err, text) ->
           html.div(
@@ -1997,11 +2061,17 @@ fn log_lines(model: Model) -> List(Element(Msg)) {
           )
       }
     })
-  // In-flight state renders newest-last: committed lines, the streaming
-  // bubble, then tool calls still assembling their arguments.
-  let with_bubble = case model.bubble {
-    Some(text) -> list.append(completed, [turn("assistant", text)])
+  // In-flight state renders newest-last: committed lines, the live
+  // thinking block, the streaming bubble, then tool calls still
+  // assembling their arguments — reasoning precedes content, live and
+  // committed alike.
+  let with_thinking = case model.thinking {
+    Some(text) -> list.append(completed, [reasoning_block(text, True)])
     None -> completed
+  }
+  let with_bubble = case model.bubble {
+    Some(text) -> list.append(with_thinking, [turn("assistant", text)])
+    None -> with_thinking
   }
   case model.pending {
     [] -> with_bubble
@@ -2011,6 +2081,35 @@ fn log_lines(model: Model) -> List(Element(Msg)) {
 
 fn turn(kind: String, text: String) -> Element(Msg) {
   html.div([attr.class("turn " <> kind)], [html.span([], [html.text(text)])])
+}
+
+/// The model's reasoning (chain of thought) as an inert collapsible
+/// block: open with a "thinking…" label while it streams, collapsed with
+/// a "reasoning" label once committed. A native `<details>` — no script,
+/// and the body is a Lustre text node, so hostile reasoning text is
+/// escaped like every other model output.
+fn reasoning_block(text: String, live: Bool) -> Element(Msg) {
+  html.details(
+    [
+      attr.class(
+        "turn reasoning"
+        <> case live {
+          True -> " live"
+          False -> ""
+        },
+      ),
+      attr.open(live),
+    ],
+    [
+      html.summary([attr.class("reasoning-label")], [
+        html.text(case live {
+          True -> "thinking…"
+          False -> "reasoning"
+        }),
+      ]),
+      html.div([attr.class("reasoning-body")], [html.text(text)]),
+    ],
+  )
 }
 
 /// One assistant tool call as a compact card: head (name, stable call id,

@@ -47,6 +47,7 @@ fn stats() -> openai.StreamStats {
     ttft_ms: Some(1),
     duration_ms: 2,
     token_deltas: 1,
+    reasoning_deltas: 0,
     tool_call_deltas: 0,
     events_parsed: 1,
     decode_errors: 0,

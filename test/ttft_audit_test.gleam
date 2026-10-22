@@ -73,6 +73,7 @@ fn turn(
       ttft_ms: Some(ttft_ms),
       duration_ms: 100,
       token_deltas: 4,
+      reasoning_deltas: 0,
       tool_call_deltas: 0,
       events_parsed: 8,
       decode_errors: 0,

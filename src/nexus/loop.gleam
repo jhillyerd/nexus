@@ -48,6 +48,15 @@ fn put_calls(calls: Accumulator) -> Nil
 @external(erlang, "nexus_loop_ffi", "take_calls")
 fn take_calls() -> Accumulator
 
+@external(erlang, "nexus_loop_ffi", "put_reasoning")
+fn put_reasoning(text: String) -> Nil
+
+@external(erlang, "nexus_loop_ffi", "take_reasoning")
+fn take_reasoning() -> String
+
+@external(erlang, "nexus_loop_ffi", "peek_reasoning")
+fn peek_reasoning() -> String
+
 /// The stream seam: one (cancellable) model round-trip. Production wraps
 /// `openai.stream_with_cancel`; tests inject fakes.
 pub type StreamFn =
@@ -104,7 +113,7 @@ pub fn run(
     cancel,
     on_event,
     1,
-    StatsAcc(None, 0, 0, 0, 0, 0, False, None),
+    StatsAcc(None, 0, 0, 0, 0, 0, 0, False, None),
   )
 }
 
@@ -113,6 +122,7 @@ type StatsAcc {
     ttft_ms: Option(Int),
     duration_ms: Int,
     token_deltas: Int,
+    reasoning_deltas: Int,
     tool_call_deltas: Int,
     events_parsed: Int,
     decode_errors: Int,
@@ -142,6 +152,7 @@ fn iterate(
   cell_init()
   put_text("")
   put_calls(tool_calls.new())
+  put_reasoning("")
   let outcome = stream(tr, opts, fn(event) { forward(event, on_event) }, cancel)
   let partial_text = take_text()
   let assembled =
@@ -150,21 +161,15 @@ fn iterate(
   case outcome {
     openai.Failed(reason) -> LoopFailed(error_string(reason))
     openai.Cancelled -> {
-      // Commit whatever partial text arrived, exactly like a plain stop.
-      let tr2 = case partial_text {
-        "" -> tr
-        text -> transcript.append_assistant(tr, text)
-      }
+      // Commit whatever partial output arrived, exactly like a plain stop.
+      let tr2 = append_iteration_output(tr, partial_text)
       LoopStopped(tr2)
     }
     openai.Completed(iteration_stats) -> {
       let stats = fold_stats(stats, iteration_stats)
       case assembled {
         [] -> {
-          let tr2 = case partial_text {
-            "" -> tr
-            text -> transcript.append_assistant(tr, text)
-          }
+          let tr2 = append_iteration_output(tr, partial_text)
           LoopDone(stats_to_openai(stats), tr2)
         }
         _ ->
@@ -174,10 +179,7 @@ fn iterate(
               // The trailing assistant tool-call message is NOT appended
               // (its results would dangle) and the calls are not run.
               on_event(LoopStatus(iteration, max_iterations, "guard"))
-              let tr2 = case partial_text {
-                "" -> tr
-                text -> transcript.append_assistant(tr, text)
-              }
+              let tr2 = append_iteration_output(tr, partial_text)
               LoopGuardHit(max_iterations, tr2)
             }
             False -> {
@@ -208,6 +210,8 @@ fn iterate(
 fn forward(event: openai.StreamEvent, on_event: fn(LoopEvent) -> Nil) -> Nil {
   case event {
     openai.TokenDelta(fragment) -> put_text(take_text_fresh() <> fragment)
+    openai.ReasoningDelta(fragment) ->
+      put_reasoning(peek_reasoning() <> fragment)
     openai.ToolCallDelta(index, id, name, args_fragment) -> {
       let chunk =
         chat.ToolCallChunk(
@@ -256,7 +260,36 @@ fn append_calls(
   }
   // Emit assembled events here (not during streaming): arguments are only
   // complete once the stream closes. The caller already saw the fragments.
-  transcript.append_assistant_tool_calls(tr, text: text, calls: calls)
+  transcript.append_assistant_tool_calls(
+    tr,
+    text: text,
+    calls: calls,
+    reasoning: reasoning_opt(take_reasoning()),
+  )
+}
+
+/// Commit one iteration's final assistant output (no tool calls): the
+/// text plus its reasoning. An EMPTY text commits nothing — including the
+/// reasoning — matching the pre-reasoning `"" -> tr` guard exactly: no
+/// empty assistant messages, so a reasoning model that produced only
+/// chain-of-thought leaves the request bytes untouched.
+fn append_iteration_output(tr: Transcript, partial_text: String) -> Transcript {
+  case partial_text {
+    "" -> tr
+    text ->
+      transcript.append_assistant_with_reasoning(
+        tr,
+        text,
+        reasoning: reasoning_opt(take_reasoning()),
+      )
+  }
+}
+
+fn reasoning_opt(text: String) -> Option(String) {
+  case text {
+    "" -> None
+    reasoning -> Some(reasoning)
+  }
 }
 
 fn execute_all(
@@ -308,6 +341,7 @@ fn fold_stats(acc: StatsAcc, add: openai.StreamStats) -> StatsAcc {
     },
     duration_ms: acc.duration_ms + add.duration_ms,
     token_deltas: acc.token_deltas + add.token_deltas,
+    reasoning_deltas: acc.reasoning_deltas + add.reasoning_deltas,
     tool_call_deltas: acc.tool_call_deltas + add.tool_call_deltas,
     events_parsed: acc.events_parsed + add.events_parsed,
     decode_errors: acc.decode_errors + add.decode_errors,
@@ -324,6 +358,7 @@ fn stats_to_openai(acc: StatsAcc) -> openai.StreamStats {
     ttft_ms: acc.ttft_ms,
     duration_ms: acc.duration_ms,
     token_deltas: acc.token_deltas,
+    reasoning_deltas: acc.reasoning_deltas,
     tool_call_deltas: acc.tool_call_deltas,
     events_parsed: acc.events_parsed,
     decode_errors: acc.decode_errors,

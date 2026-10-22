@@ -635,6 +635,64 @@ async function main() {
       assert(metrics.some((m) => m.includes("cached 800/1000")), `cached tokens visible: ${metrics}`);
     });
 
+    // -- 4b. reasoning (chain of thought) -------------------------------------
+    await test("reasoning: streams live, commits collapsed, replays on reload", async () => {
+      await page.fill("#input", "case:reasoning think it through");
+      await page.press("#input", "Enter");
+      // Live: an OPEN details block labelled "thinking…" whose body grows.
+      await poll(
+        async () => {
+          const live = page.locator("details.turn.reasoning.live");
+          if ((await live.count()) === 0) return false;
+          const body = await live.last().locator(".reasoning-body").evaluate((el) => el.textContent);
+          return body.includes("weighing");
+        },
+        { timeout: 30_000, interval: 100, message: "live thinking block streaming" },
+      );
+      await poll(() => page.locator("#send").evaluate((el) => !el.disabled), {
+        timeout: 120_000,
+        message: "send re-enabled after reasoning turn",
+      });
+      // Committed: a CLOSED block labelled "reasoning", rendered above the
+      // assistant text it preceded.
+      const committed = await page.$$eval("details.turn.reasoning", (els) =>
+        els.map((e) => ({
+          open: e.open,
+          label: e.querySelector("summary")?.textContent ?? "",
+          body: e.querySelector(".reasoning-body")?.textContent ?? "",
+        })),
+      );
+      assert(
+        committed.some(
+          (b) => !b.open && b.label.includes("reasoning") && b.body.includes("carefully"),
+        ),
+        `committed reasoning block: ${JSON.stringify(committed)}`,
+      );
+      const classes = await page.$$eval("#log > *", (els) => els.map((e) => e.className));
+      // Within the LAST turn: its reasoning block must precede its answer.
+      const reasoningAt = classes.findLastIndex((c) => /(^| )reasoning( |$)/.test(c));
+      const answerAt = classes.findIndex(
+        (c, i) => i > reasoningAt && /(^| )assistant( |$)/.test(c),
+      );
+      assert(
+        reasoningAt !== -1 && answerAt !== -1 && reasoningAt < answerAt,
+        `reasoning renders above the answer: ${classes}`,
+      );
+      // Reload: the reasoning replays from persistence, collapsed.
+      await page.reload();
+      await poll(
+        async () =>
+          (await page.locator("details.turn.reasoning:not(.live)").count()) > 0,
+        { timeout: 30_000, message: "reasoning replayed after reload" },
+      );
+      const replayed = await page.locator("details.turn.reasoning:not(.live)").last().evaluate((el) => ({
+        open: el.open,
+        body: el.querySelector(".reasoning-body")?.textContent ?? "",
+      }));
+      assert(!replayed.open, `replayed reasoning collapsed: ${JSON.stringify(replayed)}`);
+      assert(replayed.body.includes("carefully"), `replayed body: ${replayed.body}`);
+    });
+
     // -- 5. stop during streaming ---------------------------------------------
     await test("stop: mid-stream stop commits partial text", async () => {
       await page.fill("#input", "case:slow stream slowly");

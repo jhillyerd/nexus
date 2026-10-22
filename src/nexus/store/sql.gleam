@@ -9,6 +9,10 @@ import gleam/option.{type Option}
 import pog
 
 /// Append a user or plain-assistant row. Idempotent on replay.
+/// reasoning is display-only chain-of-thought; the '' sentinel inserts
+/// NULL — Postgres exposes no parameter nullability, so squirrel
+/// parameters cannot be nullable and the sentinel is its documented
+/// workaround (see insert_provider.sql).
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
@@ -19,12 +23,17 @@ pub fn append_plain_message(
   arg_2: Int,
   arg_3: String,
   arg_4: String,
+  arg_5: String,
 ) -> Result(pog.Returned(Nil), pog.QueryError) {
   let decoder = decode.map(decode.dynamic, fn(_) { Nil })
 
   "-- Append a user or plain-assistant row. Idempotent on replay.
-insert into session_message (session_id, seq, role, content)
-values ($1, $2, $3, $4)
+-- reasoning is display-only chain-of-thought; the '' sentinel inserts
+-- NULL — Postgres exposes no parameter nullability, so squirrel
+-- parameters cannot be nullable and the sentinel is its documented
+-- workaround (see insert_provider.sql).
+insert into session_message (session_id, seq, role, content, reasoning)
+values ($1, $2, $3, $4, nullif($5, ''::text))
 on conflict (session_id, seq) do nothing
 "
   |> pog.query
@@ -32,12 +41,15 @@ on conflict (session_id, seq) do nothing
   |> pog.parameter(pog.int(arg_2))
   |> pog.parameter(pog.text(arg_3))
   |> pog.parameter(pog.text(arg_4))
+  |> pog.parameter(pog.text(arg_5))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }
 
 /// Append one assistant tool-call row (content = the message text, '' for
-/// continuation rows of the same assistant message).
+/// continuation rows of the same assistant message). The run's FIRST row
+/// also carries the message's reasoning; the '' sentinel inserts NULL
+/// (Postgres exposes no parameter nullability — see insert_provider.sql).
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
@@ -50,13 +62,16 @@ pub fn append_tool_call(
   arg_4: String,
   arg_5: String,
   arg_6: String,
+  arg_7: String,
 ) -> Result(pog.Returned(Nil), pog.QueryError) {
   let decoder = decode.map(decode.dynamic, fn(_) { Nil })
 
   "-- Append one assistant tool-call row (content = the message text, '' for
--- continuation rows of the same assistant message).
-insert into session_message (session_id, seq, role, content, tool_call_id, tool_name, tool_args)
-values ($1, $2, 'assistant', $3, $4, $5, $6)
+-- continuation rows of the same assistant message). The run's FIRST row
+-- also carries the message's reasoning; the '' sentinel inserts NULL
+-- (Postgres exposes no parameter nullability — see insert_provider.sql).
+insert into session_message (session_id, seq, role, content, tool_call_id, tool_name, tool_args, reasoning)
+values ($1, $2, 'assistant', $3, $4, $5, $6, nullif($7, ''::text))
 on conflict (session_id, seq) do nothing
 "
   |> pog.query
@@ -66,6 +81,7 @@ on conflict (session_id, seq) do nothing
   |> pog.parameter(pog.text(arg_4))
   |> pog.parameter(pog.text(arg_5))
   |> pog.parameter(pog.text(arg_6))
+  |> pog.parameter(pog.text(arg_7))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }
@@ -663,6 +679,7 @@ pub type LoadMessagesRow {
     tool_name: Option(String),
     tool_args: Option(String),
     tool_ok: Option(Bool),
+    reasoning: Option(String),
     message_count: Int,
   )
 }
@@ -687,7 +704,8 @@ pub fn load_messages(
     use tool_name <- decode.field(4, decode.optional(decode.string))
     use tool_args <- decode.field(5, decode.optional(decode.string))
     use tool_ok <- decode.field(6, decode.optional(decode.bool))
-    use message_count <- decode.field(7, decode.int)
+    use reasoning <- decode.field(7, decode.optional(decode.string))
+    use message_count <- decode.field(8, decode.int)
     decode.success(LoadMessagesRow(
       seq:,
       role:,
@@ -696,6 +714,7 @@ pub fn load_messages(
       tool_name:,
       tool_args:,
       tool_ok:,
+      reasoning:,
       message_count:,
     ))
   }
@@ -704,7 +723,7 @@ pub fn load_messages(
 -- denormalized message_count (the authoritative persisted transcript
 -- length, including the system prompt — a multi-call assistant message is
 -- one message but several rows, so rows alone would undercount).
-select m.seq, m.role, m.content, m.tool_call_id, m.tool_name, m.tool_args, m.tool_ok, s.message_count
+select m.seq, m.role, m.content, m.tool_call_id, m.tool_name, m.tool_args, m.tool_ok, m.reasoning, s.message_count
 from session_message m
 join session s on s.id = m.session_id
 where m.session_id = $1

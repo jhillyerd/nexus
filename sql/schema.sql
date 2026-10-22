@@ -81,5 +81,10 @@ CREATE TABLE IF NOT EXISTS session_message (
   tool_name    text,
   tool_args    text,                           -- raw argument JSON as the model emitted it. NOTE: deliberately text, not jsonb: jsonb normalizes (sorts keys, strips whitespace, dedupes), which would break the byte-identical hydration contract for tool-call arguments that sit above the request tail (see docs/plans/p2-verification.md)
   tool_ok      boolean,
+  reasoning    text,                           -- display-only chain-of-thought emitted before an assistant message; NULL for user/tool rows and reasoning-free messages. Plain text for the same byte-stability rationale as tool_args. Never sent back to the model.
   UNIQUE (session_id, seq)
 );
+
+-- Reasoning column for databases created before it existed (the CREATE
+-- TABLE above already includes it for fresh ones; both are idempotent).
+ALTER TABLE session_message ADD COLUMN IF NOT EXISTS reasoning text;

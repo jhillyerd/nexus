@@ -167,10 +167,20 @@ fn flush_assistant(
   case string.trim(text), list.reverse(calls) {
     "", [] -> tr
     "", calls ->
-      transcript.append_assistant_tool_calls(tr, text: None, calls: calls)
+      transcript.append_assistant_tool_calls(
+        tr,
+        text: None,
+        calls: calls,
+        reasoning: None,
+      )
     text, [] -> transcript.append_assistant(tr, text)
     text, calls ->
-      transcript.append_assistant_tool_calls(tr, text: Some(text), calls: calls)
+      transcript.append_assistant_tool_calls(
+        tr,
+        text: Some(text),
+        calls: calls,
+        reasoning: None,
+      )
   }
 }
 
@@ -403,6 +413,7 @@ fn fake_stats() -> openai.StreamStats {
     ttft_ms: Some(1),
     duration_ms: 2,
     token_deltas: 1,
+    reasoning_deltas: 0,
     tool_call_deltas: 0,
     events_parsed: 1,
     decode_errors: 0,

@@ -1508,3 +1508,106 @@ pub fn settings_view_escapes_hostile_text_test() {
   should.be_true(string.contains(html, "&lt;img"))
   should.be_false(string.contains(html, "<img src="))
 }
+
+// ---------------------------------------------------------------------------
+// Reasoning (chain of thought)
+// ---------------------------------------------------------------------------
+
+pub fn reasoning_streams_into_thinking_block_test() {
+  let model =
+    new_model()
+    |> step(ui.UserEcho("hi"))
+    |> step(ui.Reasoning("step "))
+    |> step(ui.Reasoning("one"))
+  model.thinking |> should.equal(Some("step one"))
+  model.streaming |> should.be_true
+  let html = model |> view_string
+  should_contain(html, "turn reasoning live")
+  should_contain(html, "thinking…")
+  should_contain(html, "step one")
+}
+
+pub fn first_token_commits_reasoning_above_text_test() {
+  let model =
+    new_model()
+    |> step(ui.UserEcho("hi"))
+    |> step(ui.Reasoning("chain"))
+    |> step(ui.Token("answer"))
+    |> step(ui.TurnDone)
+  model.thinking |> should.equal(None)
+  model.bubble |> should.equal(None)
+  // ReasoningLine was pushed before AssistantLine, so it renders above it.
+  model.log
+  |> should.equal([
+    ui.AssistantLine("answer"),
+    ui.ReasoningLine("chain"),
+    ui.UserLine("hi"),
+  ])
+}
+
+pub fn reasoning_commits_before_tool_call_test() {
+  let model =
+    new_model()
+    |> step(ui.UserEcho("hi"))
+    |> step(ui.Reasoning("need a tool"))
+    |> step(ui.ToolCallAssembled("call_1", "echo", "{}"))
+  model.log
+  |> should.equal([
+    ui.ToolLine("call_1", "echo", "{}", ui.ToolRunning, None),
+    ui.ReasoningLine("need a tool"),
+    ui.UserLine("hi"),
+  ])
+  model.thinking |> should.equal(None)
+}
+
+pub fn replayed_reasoning_renders_collapsed_test() {
+  let model =
+    new_model()
+    |> step(ui.ReasoningFull("the chain of thought"))
+    |> step(ui.AssistantFull("the answer"))
+  let html = model |> view_string
+  should_contain(html, "turn reasoning\"")
+  should_not_contain(html, "thinking…")
+  should_contain(html, "the chain of thought")
+}
+
+pub fn reasoning_only_turn_discards_thinking_on_done_test() {
+  let model =
+    new_model()
+    |> step(ui.UserEcho("hi"))
+    |> step(ui.Reasoning("never finished"))
+    |> step(ui.TurnDone)
+  // The server committed nothing (no empty assistant messages), so the
+  // display rolls the uncommitted thinking back with the turn.
+  model.thinking |> should.equal(None)
+  model.log |> should.equal([ui.UserLine("hi")])
+}
+
+pub fn failed_turn_rolls_back_reasoning_test() {
+  let model =
+    new_model()
+    |> step(ui.UserEcho("hi"))
+    |> step(ui.Reasoning("doomed"))
+    |> step(ui.Token("partial"))
+    |> step(ui.TurnFailed("non-200"))
+  model.log
+  |> should.equal([ui.NoteLine(True, "turn failed: non-200"), ui.UserLine("hi")])
+  model.thinking |> should.equal(None)
+  model.bubble |> should.equal(None)
+}
+
+pub fn view_escapes_reasoning_content_test() {
+  let model =
+    new_model()
+    |> step(ui.ReasoningFull("<script>alert(1)</script>"))
+  let html = model |> view_string
+  should_not_contain(html, "<script>alert(1)</script>")
+  should_contain(html, "&lt;script&gt;")
+}
+
+pub fn from_session_event_maps_reasoning_test() {
+  ui.from_session_event(session.Reasoning("bit"))
+  |> should.equal(ui.Reasoning("bit"))
+  ui.from_session_event(session.ReasoningFull("whole"))
+  |> should.equal(ui.ReasoningFull("whole"))
+}

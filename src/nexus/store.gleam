@@ -105,7 +105,13 @@ pub type StoredProvider {
 /// same type; `seq` is assigned by the store, not carried here.
 pub type MessageRow {
   UserRow(content: String)
-  AssistantRow(content: String)
+  AssistantRow(
+    content: String,
+    /// The model's chain-of-thought for this message, when it emitted
+    /// any. Display-only — never sent back to the model. Plain text for
+    /// the same byte-stability rationale as `tool_args` (never jsonb).
+    reasoning: Option(String),
+  )
   ToolCallRow(
     /// The assistant message's text — set on the FIRST row of a run, ''
     /// on continuation rows.
@@ -115,6 +121,9 @@ pub type MessageRow {
     /// Raw model-emitted argument JSON, byte-stable (a `text` column on
     /// purpose: jsonb would normalize it — see docs/plans/p2-verification.md).
     arguments: String,
+    /// The message's reasoning — set on the FIRST row of a run only,
+    /// exactly like `content`.
+    reasoning: Option(String),
   )
   ToolResultRow(call_id: String, name: String, ok: Bool, content: String)
 }
@@ -197,23 +206,46 @@ pub fn transcript_rows(
   tr: Transcript,
   already_persisted: Int,
 ) -> List(MessageRow) {
-  tr
-  |> transcript.messages
-  |> list.drop(int_max(already_persisted, 0))
-  |> messages_to_rows
+  let base = int_max(already_persisted, 0)
+  let #(rows, _) =
+    tr
+    |> transcript.messages
+    |> list.drop(base)
+    |> messages_to_rows_with(base, fn(index) {
+      transcript.reasoning_at(tr, index)
+    })
+  rows
 }
 
 /// Translate chronological transcript messages into rows. Messages this
 /// module's constructors never produce (developer messages, non-text user
-/// content) are skipped — see the module docs for the row model.
+/// content) are skipped — see the module docs for the row model. This is
+/// the reasoning-free shape; the write-behind lane uses
+/// `messages_to_rows_with` against the transcript's sidecar.
 pub fn messages_to_rows(messages: List(ChatMessage)) -> List(MessageRow) {
-  let #(rows, _) =
-    list.fold(messages, #([], dict.new()), fn(acc, message) {
-      let #(rows, names) = acc
+  let #(rows, _) = messages_to_rows_with(messages, 0, fn(_) { None })
+  rows
+}
+
+/// The reasoning-aware row mapping: `reasoning_at` resolves a message's
+/// chronological index into its recorded chain-of-thought, so assistant
+/// rows carry it without it ever existing as a message. `base` is the
+/// chronological index of `messages`' head (non-zero when the caller
+/// already dropped a persisted prefix).
+fn messages_to_rows_with(
+  messages: List(ChatMessage),
+  base: Int,
+  reasoning_at: fn(Int) -> Option(String),
+) -> #(List(MessageRow), dict.Dict(String, String)) {
+  let #(rows, names, _) =
+    list.index_fold(messages, #([], dict.new(), 0), fn(acc, message, index) {
+      let #(rows, names, _index) = acc
+      let reasoning = reasoning_at(base + index)
       case message {
         chat.UserMessage(content: chat.UserTextContent(text), ..) -> #(
           [UserRow(text), ..rows],
           names,
+          index + 1,
         )
         chat.AssistantMessage(content: text, tool_calls: calls, ..) ->
           case calls {
@@ -240,21 +272,26 @@ pub fn messages_to_rows(messages: List(ChatMessage)) -> List(MessageRow) {
                         call_id: id,
                         name: f.name,
                         arguments: f.arguments,
+                        reasoning: case index {
+                          0 -> reasoning
+                          _ -> None
+                        },
                       ),
                       ..rows
                     ],
                     dict.insert(names, id, f.name),
                   )
                 })
-              #(list.append(new_rows, rows), names)
+              #(list.append(new_rows, rows), names, index + 1)
             }
             None ->
               case text {
                 Some(chat.AssistantTextContent(content)) -> #(
-                  [AssistantRow(content), ..rows],
+                  [AssistantRow(content, reasoning), ..rows],
                   names,
+                  index + 1,
                 )
-                _ -> #(rows, names)
+                _ -> #(rows, names, index + 1)
               }
           }
         chat.ToolMessage(
@@ -271,14 +308,15 @@ pub fn messages_to_rows(messages: List(ChatMessage)) -> List(MessageRow) {
             ..rows
           ],
           names,
+          index + 1,
         )
         // System prompts are not rows (sessions.system_prompt); the other
         // shapes have no constructor in nexus — skipping is losing nothing
         // that can exist.
-        _ -> #(rows, names)
+        _ -> #(rows, names, index + 1)
       }
     })
-  list.reverse(rows)
+  #(list.reverse(rows), names)
 }
 
 /// Rebuild a transcript from stored rows through the one construction
@@ -298,20 +336,25 @@ fn append_rows(tr: Transcript, rows: List(MessageRow)) -> Transcript {
     [] -> tr
     [UserRow(content), ..rest] ->
       append_rows(transcript.append_user(tr, content), rest)
-    [AssistantRow(content), ..rest] ->
-      append_rows(transcript.append_assistant(tr, content), rest)
+    [AssistantRow(content, reasoning), ..rest] ->
+      append_rows(
+        transcript.append_assistant_with_reasoning(tr, content, reasoning),
+        rest,
+      )
     [ToolResultRow(call_id: id, content: content, ..), ..rest] ->
       append_rows(transcript.append_tool_result(tr, id, content), rest)
     [ToolCallRow(..), ..] -> {
       // A maximal run of consecutive tool-call rows is one assistant
       // message: the first row's content is the message text, the run's
-      // calls are the message's tool calls.
+      // calls are the message's tool calls, and the first row's
+      // reasoning is the message's reasoning.
       let #(group, rest) = split_call_run(rows, [])
-      let assert [ToolCallRow(content: text, ..), ..] = group
+      let assert [ToolCallRow(content: text, reasoning: reasoning, ..), ..] =
+        group
       let calls =
         list.filter_map(group, fn(row) {
           case row {
-            ToolCallRow(_, id, name, arguments) -> Ok(#(id, name, arguments))
+            ToolCallRow(_, id, name, arguments, _) -> Ok(#(id, name, arguments))
             _ -> Error(Nil)
           }
         })
@@ -323,6 +366,7 @@ fn append_rows(tr: Transcript, rows: List(MessageRow)) -> Transcript {
             text -> Some(text)
           },
           calls: calls,
+          reasoning: reasoning,
         ),
         rest,
       )

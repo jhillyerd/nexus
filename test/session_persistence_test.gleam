@@ -51,6 +51,7 @@ fn stats() -> openai.StreamStats {
     ttft_ms: Some(1),
     duration_ms: 2,
     token_deltas: 1,
+    reasoning_deltas: 0,
     tool_call_deltas: 0,
     events_parsed: 1,
     decode_errors: 0,
@@ -110,10 +111,14 @@ fn tool_round_runner(
   on_event(loop.ToolResultEvent("call_b", "web_search", True, "search body"))
   let tr =
     tr
-    |> transcript.append_assistant_tool_calls(text: Some("checking"), calls: [
-      #("call_a", "http_fetch", args_a),
-      #("call_b", "web_search", args_b),
-    ])
+    |> transcript.append_assistant_tool_calls(
+      text: Some("checking"),
+      calls: [
+        #("call_a", "http_fetch", args_a),
+        #("call_b", "web_search", args_b),
+      ],
+      reasoning: None,
+    )
     |> transcript.append_tool_result("call_a", "fetched body")
     |> transcript.append_tool_result("call_b", "search body")
     |> transcript.append_assistant("all done")
@@ -138,10 +143,14 @@ fn rich_transcript() -> Transcript {
   |> transcript.append_user("first question")
   |> transcript.append_assistant("plain answer")
   |> transcript.append_user("go use tools")
-  |> transcript.append_assistant_tool_calls(text: Some("checking"), calls: [
-    #("call_a", "http_fetch", args_a),
-    #("call_b", "web_search", args_b),
-  ])
+  |> transcript.append_assistant_tool_calls(
+    text: Some("checking"),
+    calls: [
+      #("call_a", "http_fetch", args_a),
+      #("call_b", "web_search", args_b),
+    ],
+    reasoning: None,
+  )
   |> transcript.append_tool_result("call_a", "fetched body")
   |> transcript.append_tool_result("call_b", "search body")
   |> transcript.append_assistant("all done")
@@ -168,9 +177,13 @@ pub fn rows_round_trip_without_call_text_test() {
   let tr =
     transcript.new("alias-1", "sys")
     |> transcript.append_user("q")
-    |> transcript.append_assistant_tool_calls(text: None, calls: [
-      #("c1", "web_search", args_b),
-    ])
+    |> transcript.append_assistant_tool_calls(
+      text: None,
+      calls: [
+        #("c1", "web_search", args_b),
+      ],
+      reasoning: None,
+    )
     |> transcript.append_tool_result("c1", "r")
   let rows = store.transcript_rows(tr, 1)
   let rebuilt = store.transcript_from_rows("alias-1", "sys", rows)
@@ -640,4 +653,54 @@ pub fn boot_fails_when_store_unreachable_test() {
     Ok(_) -> panic as "registry must not start with an unreachable store"
     Error(_) -> Nil
   }
+}
+
+// ---------------------------------------------------------------------------
+// Reasoning round-trip
+// ---------------------------------------------------------------------------
+
+pub fn reasoning_rows_round_trip_test() {
+  let tr =
+    transcript.new("alias-1", test_config().system_prompt)
+    |> transcript.append_user("think hard")
+    |> transcript.append_assistant_with_reasoning(
+      "the answer",
+      reasoning: Some("step one, then step two"),
+    )
+    |> transcript.append_user("again")
+    |> transcript.append_assistant("done")
+  let rows = store.transcript_rows(tr, 1)
+  rows
+  |> should.equal([
+    store.UserRow("think hard"),
+    store.AssistantRow("the answer", Some("step one, then step two")),
+    store.UserRow("again"),
+    store.AssistantRow("done", None),
+  ])
+  let rebuilt =
+    store.transcript_from_rows("alias-1", test_config().system_prompt, rows)
+  transcript.reasoning_at(rebuilt, 2)
+  |> should.equal(Some("step one, then step two"))
+  transcript.reasoning_at(rebuilt, 4) |> should.equal(None)
+}
+
+pub fn tool_call_reasoning_rides_first_row_of_run_test() {
+  let tr =
+    transcript.new("alias-1", "sys")
+    |> transcript.append_user("q")
+    |> transcript.append_assistant_tool_calls(
+      text: None,
+      calls: [#("c1", "echo", "{}"), #("c2", "echo", "{}")],
+      reasoning: Some("two calls needed"),
+    )
+    |> transcript.append_tool_result("c1", "r1")
+    |> transcript.append_tool_result("c2", "r2")
+  store.transcript_rows(tr, 1)
+  |> should.equal([
+    store.UserRow("q"),
+    store.ToolCallRow("", "c1", "echo", "{}", Some("two calls needed")),
+    store.ToolCallRow("", "c2", "echo", "{}", None),
+    store.ToolResultRow("c1", "echo", True, "r1"),
+    store.ToolResultRow("c2", "echo", True, "r2"),
+  ])
 }

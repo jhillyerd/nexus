@@ -597,11 +597,27 @@ fn append_row(
 ) -> Result(pog.Returned(Nil), pog.QueryError) {
   case row {
     store.UserRow(content) ->
-      sql.append_plain_message(db, id, seq, "user", content)
-    store.AssistantRow(content) ->
-      sql.append_plain_message(db, id, seq, "assistant", content)
-    store.ToolCallRow(content, call_id, name, arguments) ->
-      sql.append_tool_call(db, id, seq, content, call_id, name, arguments)
+      sql.append_plain_message(db, id, seq, "user", content, "")
+    store.AssistantRow(content, reasoning) ->
+      sql.append_plain_message(
+        db,
+        id,
+        seq,
+        "assistant",
+        content,
+        option.unwrap(reasoning, ""),
+      )
+    store.ToolCallRow(content, call_id, name, arguments, reasoning) ->
+      sql.append_tool_call(
+        db,
+        id,
+        seq,
+        content,
+        call_id,
+        name,
+        arguments,
+        option.unwrap(reasoning, ""),
+      )
     store.ToolResultRow(call_id, name, ok, content) ->
       sql.append_tool_result(db, id, seq, content, call_id, name, ok)
   }
@@ -709,8 +725,9 @@ fn message_row_from_row(row: sql.LoadMessagesRow) -> store.MessageRow {
         call_id: call_id,
         name: name,
         arguments: row.tool_args |> option.unwrap(""),
+        reasoning: row.reasoning,
       )
-    "assistant", None -> store.AssistantRow(row.content)
+    "assistant", None -> store.AssistantRow(row.content, row.reasoning)
     "tool", Some(call_id) ->
       store.ToolResultRow(
         call_id: call_id,
@@ -725,7 +742,7 @@ fn message_row_from_row(row: sql.LoadMessagesRow) -> store.MessageRow {
         ok: row.tool_ok |> option.unwrap(True),
         content: row.content,
       )
-    _, _ -> store.AssistantRow(row.content)
+    _, _ -> store.AssistantRow(row.content, row.reasoning)
   }
 }
 
