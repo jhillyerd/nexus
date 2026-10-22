@@ -11,6 +11,7 @@ import lustre/element
 import nexus/provider
 import nexus/session
 import nexus/ui
+import nexus/ui_settings
 
 fn new_model() -> ui.Model {
   let #(model, _effect) =
@@ -650,6 +651,10 @@ fn should_contain(haystack: String, needle: String) {
   should.be_true(string.contains(haystack, needle))
 }
 
+fn should_not_contain(haystack: String, needle: String) {
+  should.be_false(string.contains(haystack, needle))
+}
+
 // ---------------------------------------------------------------------------
 // View strings
 // ---------------------------------------------------------------------------
@@ -1168,38 +1173,55 @@ pub fn provider_picked_scopes_and_clears_aliases_test() {
 }
 
 pub fn provider_created_selects_first_provider_test() {
+  // The creation lands in the settings sub-component; the signal fold
+  // in ui.update re-aims the picker — and, with no provider before it,
+  // returns the view to chat (the auto-opened settings page has served
+  // its purpose). Start from the AUTO-OPENED settings view (first load
+  // empty) so the ChatView assertion is load-bearing, not the default.
+  let opened = new_model() |> step(ui.ProvidersLoaded([]))
+  opened.view |> should.equal(ui.SettingsView)
   let model =
-    new_model() |> step(ui.ProviderCreated(prov("p3", "new", True, True)))
+    opened
+    |> step(ui.Settings(ui_settings.Created(prov("p3", "new", True, True))))
   model.provider |> should.equal(Some("p3"))
-  // An existing selection is left alone.
+  model.view |> should.equal(ui.ChatView)
+  // An existing selection is left alone — and a settings visit that was
+  // NOT the first-run auto-open stays in settings.
   let kept =
     new_model()
     |> step(ui.ProvidersLoaded([prov("p2", "ollama", True, False)]))
-    |> step(ui.ProviderCreated(prov("p3", "new", True, True)))
+    |> step(ui.SettingsToggled)
+    |> step(ui.Settings(ui_settings.Created(prov("p3", "new", True, True))))
   kept.provider |> should.equal(Some("p2"))
+  kept.view |> should.equal(ui.SettingsView)
 }
 
 pub fn provider_editors_toggle_one_at_a_time_test() {
   let model =
     new_model() |> step(ui.ProvidersLoaded([prov("p1", "a", True, True)]))
-  let model = step(model, ui.AddProviderToggled)
-  model.providers_open |> should.be_true
+  let model = step(model, ui.Settings(ui_settings.AddToggled))
+  model.settings.open |> should.be_true
   // Opening a row editor closes the add form, and vice versa; delete
   // confirm closes both.
-  let model = step(model, ui.ProviderEditToggled("p1"))
-  model.provider_edit |> should.equal(Some("p1"))
-  model.providers_open |> should.be_false
-  let model = step(model, ui.ProviderDeleteRequested("p1"))
-  model.provider_confirm |> should.equal(Some("p1"))
-  model.provider_edit |> should.equal(None)
-  let model = step(model, ui.ProviderDeleteCancelled)
-  model.provider_confirm |> should.equal(None)
+  let model = step(model, ui.Settings(ui_settings.EditToggled("p1")))
+  model.settings.edit |> should.equal(Some("p1"))
+  model.settings.open |> should.be_false
+  let model = step(model, ui.Settings(ui_settings.DeleteRequested("p1")))
+  model.settings.confirm |> should.equal(Some("p1"))
+  model.settings.edit |> should.equal(None)
+  let model = step(model, ui.Settings(ui_settings.DeleteCancelled))
+  model.settings.confirm |> should.equal(None)
 }
 
 pub fn provider_op_failure_notes_the_log_test() {
+  // Mutations run in the settings sub-component; their failures travel
+  // back as a signal and land in the chat log (settings has no log of
+  // its own).
   let model =
     new_model()
-    |> step(ui.ProviderOpFailed("provider name already exists"))
+    |> step(
+      ui.Settings(ui_settings.MutateFailed("provider name already exists")),
+    )
   model.log
   |> should.equal([
     ui.NoteLine(True, "provider operation failed: provider name already exists"),
@@ -1215,6 +1237,7 @@ pub fn view_renders_providers_panel_test() {
         prov("p2", "ollama", False, False),
       ]),
     )
+    |> step(ui.SettingsToggled)
     |> view_string
   should.be_true(string.contains(html, "Providers"))
   should.be_true(string.contains(html, "bifrost"))
@@ -1224,13 +1247,15 @@ pub fn view_renders_providers_panel_test() {
   should.be_true(string.contains(html, ">key<"))
   should.be_true(string.contains(html, ">keyless<"))
   should.be_true(string.contains(html, ">disabled<"))
-  // Controls mirror the session rows' compact pattern.
+  // Controls mirror the session rows' compact pattern — plus the
+  // on-demand connection test.
   should.be_true(string.contains(html, ">Disable<"))
   should.be_true(string.contains(html, ">Enable<"))
   should.be_true(string.contains(html, ">Edit<"))
+  should.be_true(string.contains(html, ">Test<"))
   should.be_true(string.contains(html, ">Delete<"))
-  // Empty state before any provider exists.
-  let empty = new_model() |> view_string
+  // Empty state: the auto-opened settings page on a fresh database.
+  let empty = new_model() |> step(ui.ProvidersLoaded([])) |> view_string
   should.be_true(string.contains(empty, "No providers yet."))
 }
 
@@ -1238,6 +1263,7 @@ pub fn view_provider_forms_hidden_until_opened_test() {
   let base =
     new_model()
     |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(ui.SettingsToggled)
     |> view_string
   // Both forms render but are hidden (the session-editor pattern).
   should.be_true(string.contains(base, "add-provider-form"))
@@ -1245,13 +1271,15 @@ pub fn view_provider_forms_hidden_until_opened_test() {
   let adding =
     new_model()
     |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
-    |> step(ui.AddProviderToggled)
+    |> step(ui.SettingsToggled)
+    |> step(ui.Settings(ui_settings.AddToggled))
     |> view_string
   should.be_true(string.contains(adding, "API key (optional)"))
   let editing =
     new_model()
     |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
-    |> step(ui.ProviderEditToggled("p1"))
+    |> step(ui.SettingsToggled)
+    |> step(ui.Settings(ui_settings.EditToggled("p1")))
     |> view_string
   // The key field is write-only: it starts EMPTY (blank = keep) even for
   // a provider that HAS a key — has_key is the only key fact rendered.
@@ -1284,7 +1312,7 @@ pub fn view_provider_picker_lists_enabled_only_test() {
     new_model()
     |> step(ui.ProvidersLoaded([prov("p3", "old", False, True)]))
     |> view_string
-  should.be_true(string.contains(none, "no providers — add one below"))
+  should.be_true(string.contains(none, "no providers — add one in Settings"))
 }
 
 pub fn view_session_subtitle_pins_provider_test() {
@@ -1302,4 +1330,181 @@ pub fn view_session_subtitle_pins_provider_test() {
     |> step(ui.SessionsLoaded([summary("s-1", False)]))
     |> view_string
   should.be_true(string.contains(lagging, "p1/smart · "))
+}
+
+// ---------------------------------------------------------------------------
+// Settings view (relocation from the sidebar; per-client)
+// ---------------------------------------------------------------------------
+
+pub fn settings_closed_by_default_test() {
+  let model = new_model()
+  model.view |> should.equal(ui.ChatView)
+  model.settings_manual |> should.be_false
+  // The chat shell renders the header toggle but no provider surface.
+  let html = model |> view_string
+  should.be_true(string.contains(html, "id=\"settings\""))
+  should.be_false(string.contains(html, "providers-panel"))
+  should.be_false(string.contains(html, "provider-row"))
+}
+
+pub fn settings_auto_opens_on_empty_provider_list_test() {
+  // Fresh database: the empty provider list opens the settings view by
+  // itself — the guided first-run path the always-visible sidebar panel
+  // used to provide. Idempotent on repeated empty refreshes.
+  let model = new_model() |> step(ui.ProvidersLoaded([]))
+  model.view |> should.equal(ui.SettingsView)
+  let again = step(model, ui.ProvidersLoaded([]))
+  again.view |> should.equal(ui.SettingsView)
+}
+
+pub fn settings_manual_close_beats_auto_open_test() {
+  // A user who deliberately closes the settings page is not pulled back
+  // on the next (still empty) refresh — the create_auto latch pattern.
+  let model =
+    new_model()
+    |> step(ui.ProvidersLoaded([]))
+    |> step(ui.SettingsToggled)
+  model.view |> should.equal(ui.ChatView)
+  model.settings_manual |> should.be_true
+  let again = step(model, ui.ProvidersLoaded([]))
+  again.view |> should.equal(ui.ChatView)
+}
+
+pub fn settings_header_button_flips_label_test() {
+  let chat = new_model() |> view_string
+  should.be_true(string.contains(chat, ">Settings<"))
+  let open = new_model() |> step(ui.SettingsToggled) |> view_string
+  should.be_true(string.contains(open, ">Back to chat<"))
+  // The settings page renders — and the chat subtree STAYS MOUNTED
+  // (hidden via CSS): the composer's uncontrolled textarea must survive
+  // the view swap, or an unsent draft would be destroyed by a settings
+  // peek (the element keeps its value while merely hidden).
+  should.be_true(string.contains(open, "id=\"settings-page\""))
+  should.be_true(string.contains(open, "id=\"composer\""))
+  should.be_true(string.contains(open, "settings-mode"))
+}
+
+pub fn provider_test_button_state_machine_test() {
+  let base =
+    new_model() |> step(ui.ProvidersLoaded([prov("p1", "a", True, True)]))
+  let requested = step(base, ui.Settings(ui_settings.TestRequested("p1")))
+  requested.settings.models
+  |> should.equal(ui_settings.ModelsLoading("p1"))
+  let ok =
+    step(
+      requested,
+      ui.Settings(ui_settings.ModelsLoaded("p1", ["smart", "fast"])),
+    )
+  ok.settings.models
+  |> should.equal(ui_settings.ModelsOk("p1", ["smart", "fast"]))
+  // A failed test keeps the registry's fixed reason text.
+  let failed =
+    step(
+      requested,
+      ui.Settings(ui_settings.TestFailed("p1", "provider is disabled")),
+    )
+  failed.settings.models
+  |> should.equal(ui_settings.ModelsFailed("p1", "provider is disabled"))
+  // A LATE reply for a superseded request cannot clobber the newer
+  // result: only the request that is still loading accepts its reply.
+  let stale =
+    step(ok, ui.Settings(ui_settings.TestFailed("p2", "late failure")))
+  stale.settings.models
+  |> should.equal(ui_settings.ModelsOk("p1", ["smart", "fast"]))
+}
+
+pub fn view_renders_models_status_under_its_row_test() {
+  let html =
+    new_model()
+    |> step(
+      ui.ProvidersLoaded([
+        prov("p1", "first", True, True),
+        prov("p2", "second", True, False),
+      ]),
+    )
+    |> step(ui.SettingsToggled)
+    |> step(ui.Settings(ui_settings.TestRequested("p2")))
+    |> step(ui.Settings(ui_settings.TestRequested("p1")))
+    |> step(ui.Settings(ui_settings.ModelsLoaded("p1", ["smart", "fast"])))
+    // p2's superseded request replies late — it must be ignored.
+    |> step(ui.Settings(ui_settings.TestFailed("p2", "late failure")))
+    |> view_string
+  // The settled result renders under its own row (Lustre sorts attrs,
+  // so data-provider-id precedes class on the row div) — between p1's
+  // row start and p2's row.
+  let first_at = position_of(html, "data-provider-id=\"p1\"")
+  let second_at = position_of(html, "data-provider-id=\"p2\"")
+  let ok_at = position_of(html, "ok · models: smart, fast")
+  should.be_true(first_at < ok_at && ok_at < second_at)
+  // One test result at a time: the superseded request for p2 leaves no
+  // loading marker behind — and its late failure reply renders nowhere.
+  should.be_false(string.contains(html, "testing…"))
+  should.be_false(string.contains(html, "late failure"))
+}
+
+pub fn provider_mutation_failure_shows_in_settings_test() {
+  // The user is ON the settings page when a mutation fails, so the
+  // reason must render there — the chat-log note (OpFailed signal) is
+  // the transcript copy, not the only feedback.
+  let model =
+    new_model()
+    |> step(ui.SettingsToggled)
+    |> step(
+      ui.Settings(ui_settings.MutateFailed("provider name already exists")),
+    )
+  model.settings.last_error
+  |> should.equal(Some("provider name already exists"))
+  model
+  |> view_string
+  |> should_contain("provider operation failed: provider name already exists")
+  // The next successful mutation clears it (the chat-log transcript
+  // note stays by design; the settings-page element is what clears).
+  let cleared = step(model, ui.Settings(ui_settings.Mutated))
+  cleared.settings.last_error |> should.equal(None)
+  cleared |> view_string |> should_not_contain("settings-error")
+}
+
+pub fn providers_emptied_later_does_not_reopen_settings_test() {
+  // The auto-open fires on the connection's FIRST provider load only:
+  // a list that becomes empty later (external deletes + refresh) must
+  // not hijack an in-progress chat view into settings.
+  let model =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "a", True, True)]))
+    |> step(ui.ProvidersLoaded([]))
+  model.view |> should.equal(ui.ChatView)
+  // The first-run rule still holds when the first load IS empty.
+  let fresh = new_model() |> step(ui.ProvidersLoaded([]))
+  fresh.view |> should.equal(ui.SettingsView)
+}
+
+fn position_of(haystack: String, needle: String) -> Int {
+  case string.split_once(haystack, needle) {
+    Ok(#(before, _)) -> string.length(before)
+    Error(_) -> -1
+  }
+}
+
+pub fn settings_view_escapes_hostile_text_test() {
+  // Provider names and model aliases are hostile text: everything the
+  // settings page renders is an inert Lustre text node.
+  let html =
+    new_model()
+    |> step(
+      ui.ProvidersLoaded([
+        prov("p1", "<script>alert(1)</script>", True, True),
+      ]),
+    )
+    |> step(ui.SettingsToggled)
+    |> step(ui.Settings(ui_settings.TestRequested("p1")))
+    |> step(
+      ui.Settings(
+        ui_settings.ModelsLoaded("p1", ["<img src=x onerror=alert(2)>"]),
+      ),
+    )
+    |> view_string
+  should.be_true(string.contains(html, "&lt;script&gt;"))
+  should.be_false(string.contains(html, "<script>alert"))
+  should.be_true(string.contains(html, "&lt;img"))
+  should.be_false(string.contains(html, "<img src="))
 }
