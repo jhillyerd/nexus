@@ -945,6 +945,9 @@ async function main() {
       // row sizes to #chat's content, the page scrollbar appears, and the
       // auto-follow script has nothing to scroll (the mobile breakpoint
       // always had explicit rows, which is why this only bit desktop).
+      // The transcript must be long enough that #log genuinely overflows,
+      // so wait for the replayed history before measuring.
+      await dpage.waitForSelector(".turn.tool[data-call-id]", { timeout: 30_000 });
       const dOverflow = await dpage.evaluate(() => {
         const sr = document.querySelector("lustre-server-component")?.shadowRoot;
         const layout = sr?.getElementById("layout");
@@ -955,8 +958,14 @@ async function main() {
           layoutScrollH: layout?.scrollHeight,
           layoutClientH: layout?.clientHeight,
           logScrolls: log ? log.scrollHeight > log.clientHeight + 1 : false,
+          logScrollH: log?.scrollHeight,
+          logClientH: log?.clientHeight,
         };
       });
+      assert(
+        dOverflow.logScrolls,
+        `#log does not scroll internally with a long transcript: ${JSON.stringify(dOverflow)}`,
+      );
       assert(
         dOverflow.docScrollHeight <= dOverflow.innerHeight + 1,
         `desktop page grows instead of #log scrolling: ${JSON.stringify(dOverflow)}`,

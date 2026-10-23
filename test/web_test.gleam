@@ -381,7 +381,13 @@ pub fn m3_page_autoscroll_script_test() {
   // Streaming grows text nodes in place, so the observer must watch
   // characterData, and session switches ride #layout[data-selected].
   should.be_true(string.contains(html, "characterData: true"))
-  should.be_true(string.contains(html, "attributeFilter: ['data-selected']"))
+  // Both shell scripts watch data-selected (session_js persists the
+  // selection, the autoscroll script force-jumps on a switch) — count it
+  // so this test fails if the autoscroll half silently loses its
+  // observer, which a plain contains would never catch.
+  string.split(html, "attributeFilter: ['data-selected']")
+  |> list.length
+  |> should.equal(3)
   // The hidden-button CSS hook exists, and the scroll is inert and
   // exact — never the old repo's overshoot.
   should.be_true(string.contains(html, "#jump-latest[hidden]"))
