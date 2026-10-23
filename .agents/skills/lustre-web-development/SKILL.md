@@ -53,7 +53,14 @@ pub fn app() -> lustre.App(Flags, Model, Msg) {
 }
 
 pub type Model {
-  Model(selected: Option(String) // ... your fields
+  Model(
+    // The actor that feeds events, retained from Flags — the GotEvents
+    // arm below needs it to wire the fresh subject; dropped, the
+    // subscription would have no destination.
+    actor: Subject(EventMsg),
+    // THIS runtime's subscription subject; None until GotEvents lands.
+    events: Option(Subject(EventMsg)),
+    selected: Option(String), // ... your fields
   )
 }
 
@@ -64,7 +71,10 @@ pub opaque type Msg {
 }
 
 fn init(flags: Flags) -> #(Model, effect.Effect(Msg)) {
-  #(Model(flags.selected), subscribe())
+  #(
+    Model(actor: flags.events, events: None, selected: flags.selected),
+    subscribe(),
+  )
 }
 
 // Subscribe via a fresh subject owned by THIS runtime. Hand the subject
@@ -78,6 +88,19 @@ fn subscribe() -> effect.Effect(Msg) {
     process.new_selector()
     |> process.select_map(subject, ExternalMsg)
   })
+}
+
+// In `update`: hand the fresh subject to the actor retained in the
+// model, so external events can reach this client. Subscribe is a
+// constructor of YOUR EventMsg telling the actor to fan out to the
+// subject (nexus sends session.Join here). This arm is also the place
+// for the initial data load — a fresh model starts empty.
+GotEvents(subject) -> {
+  let actor = model.actor
+  #(
+    Model(..model, events: Some(subject)),
+    effect.from(fn(_dispatch) { process.send(actor, Subscribe(subject)) }),
+  )
 }
 ```
 
@@ -319,7 +342,10 @@ pub fn serve(request: Request(Connection), ctx: Context) {
   // last-selected id persisted by the page shell) onto the Flags.
   mist.websocket(
     request:,
-    on_init: init_socket(runtime_flags(request, ctx)),
+    // on_init wants a callback receiving the connection — wrap the
+    // call. Calling init_socket here would run it eagerly in the
+    // router process and pass its state tuple where a function belongs.
+    on_init: fn(_connection) { init_socket(runtime_flags(request, ctx)) },
     handler: loop_socket,
     on_close: close_socket,
   )
