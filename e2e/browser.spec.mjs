@@ -37,6 +37,16 @@ const results = [];
 let current = null;
 // Hoisted so failure diagnostics (dumpPageState) can reach the live page.
 let page = null;
+// Every page the suite opens contributes here; the final test asserts it
+// is empty. A pageerror means a shell script or the runtime threw in the
+// browser — exactly the class of bug (an undefined function left behind
+// by an edit) that per-test assertions can miss.
+const pageErrors = [];
+const track = (p) =>
+  p.on("pageerror", (err) => {
+    pageErrors.push(String(err));
+    console.log(`  [pageerror] ${err}`);
+  });
 
 function test(name, fn) {
   current = { name, status: "pass", error: null, ms: 0 };
@@ -335,7 +345,7 @@ async function main() {
     });
     const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
     page = await context.newPage();
-    page.on("pageerror", (err) => console.log(`  [pageerror] ${err}`));
+    track(page);
     page.on("console", (msg) => {
       if (["error", "warning"].includes(msg.type())) {
         console.log(`  [console.${msg.type()}] ${msg.text().slice(0, 200)}`);
@@ -899,12 +909,14 @@ async function main() {
     await test("mobile: independent per-client view, no overflow with cards", async () => {
       const desktop = await browser.newContext({ viewport: { width: 1280, height: 900 } });
       const dpage = await desktop.newPage();
+      track(dpage);
       await dpage.goto(`${base}/?token=${TOKEN}`);
       await connected(dpage);
       await dpage.waitForSelector("#session-list .session-main", { timeout: 30_000 });
 
       const mobile = await browser.newContext({ viewport: { width: 390, height: 844 } });
       const mpage = await mobile.newPage();
+      track(mpage);
       await mpage.goto(`${base}/?token=${TOKEN}`);
       await connected(mpage);
       // Fresh runtime, fresh model: the session re-opens through this
@@ -1035,6 +1047,7 @@ async function main() {
       // lustre:close event. Uses the guard instance (done with its turn).
       const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
       const ipage = await ctx.newPage();
+      track(ipage);
       await ipage.goto(`${guardBase}/?token=${TOKEN}`);
       await connected(ipage);
 
@@ -1214,6 +1227,14 @@ async function main() {
         async () => (await page.locator("#provider-picker option").count()) === 2,
         { timeout: 15_000, message: "re-enabled provider back in picker" },
       );
+    });
+
+    // -- 19. no uncaught page errors ----------------------------------------
+    // Guards the shell scripts (and the runtime wiring) as a whole: any
+    // uncaught exception on any page the suite opened fails the run — a
+    // dead script otherwise sails through with green per-behavior tests.
+    await test("page: no uncaught browser errors", async () => {
+      eq(pageErrors.length, 0, `pageerrors: ${pageErrors.join(" | ")}`);
     });
   } catch (err) {
     console.error("fatal:", err);
