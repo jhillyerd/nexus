@@ -17,61 +17,96 @@ A guide for building web applications with Gleam's Lustre framework, focusing on
 Server components use Lustre with WebSocket connections for real-time updates. The pattern consists of three files:
 
 1. **Component file** (e.g., `src/agent/chat.gleam`): The Lustre application
-2. **Socket file** (e.g., `src/agent/socket.gleam`): WebSocket handler
+2. **Socket file** (e.g., `src/agent/socket.gleam`): WebSocket handler —
+   starts **one runtime per connection**
 3. **Router integration**: Add routes to both HTTP and WebSocket handlers
 
-### Component Structure
+### Component Structure: One Runtime per Connection (default)
+
+A server-component runtime owns exactly one model. Start a single runtime
+at boot and share it between clients, and every connected browser shares
+that model — tabs mirror each other's selection, open panels, and drafts.
+Any app with per-client state wants one runtime per WebSocket connection
+(verified on Lustre 5.7.1):
 
 ```gleam
-import gleam/erlang/process
-import lustre.{type App}
-import lustre/attribute as at
-import lustre/element/html as ht
-import lustre/element.{type Element}
+import gleam/erlang/process.{type Subject}
+import gleam/option.{type Option}
+import lustre
+import lustre/component
 import lustre/effect
-import lustre/event
 import lustre/server_component
 
-pub fn component() -> App(process.Name(ExternalMsg), Model, Msg) {
-  lustre.application(init, update, view)
+/// Per-connection inputs: actor subjects plus anything client-specific
+/// (e.g. the client's last selection, read from the route's query string
+/// by the page shell). `init` receives these as plain values — nothing
+/// is globally registered.
+pub type Flags {
+  Flags(events: Subject(EventMsg), selected: Option(String))
+}
+
+pub fn app() -> lustre.App(Flags, Model, Msg) {
+  lustre.component(init: init, update: update, view: view, options: [
+    // Open by default; keep it open — see CSS Integration / Shadow DOM.
+    component.open_shadow_root(True),
+  ])
 }
 
 pub type Model {
-  Model(
-    // Your model fields
+  Model(selected: Option(String) // ... your fields
   )
 }
 
-fn init(name: process.Name(ExternalMsg)) -> #(Model, effect.Effect(Msg)) {
-  let model = Model()
-  #(model, subscribe(name, ExternalMsg))
-}
-
-pub type ExternalMsg {
-  // Messages from other actors
-  YourExternalMsg
-}
-
 pub opaque type Msg {
-  ExternalMsg(ExternalMsg)
-  // Your internal messages
-  UserClickedButton
-  UserTypedInput(String)
+  GotEvents(Subject(EventMsg))
+  ExternalMsg(EventMsg)
+  // ... your messages
 }
 
-fn subscribe(
-  name: process.Name(ext),
-  on_msg: fn(ext) -> msg,
-) -> effect.Effect(msg) {
-  use _, _ <- server_component.select
+fn init(flags: Flags) -> #(Model, effect.Effect(Msg)) {
+  #(Model(flags.selected), subscribe())
+}
 
-  let assert Ok(_) = process.register(process.self(), name)
-  let subj = process.named_subject(name)
-
-  process.new_selector()
-  |> process.select_map(subj, on_msg)
+// Subscribe via a fresh subject owned by THIS runtime. Hand the subject
+// to whoever should feed events (here via GotEvents) — that dispatch is
+// also the connect point of a per-client runtime: there are no
+// on_connect/on_disconnect hooks, connect is `init` and disconnect is
+// the runtime dying with its socket.
+fn subscribe() -> effect.Effect(Msg) {
+  server_component.select(fn(dispatch, subject: Subject(EventMsg)) {
+    dispatch(GotEvents(subject))
+    process.new_selector()
+    |> process.select_map(subject, ExternalMsg)
+  })
 }
 ```
+
+Lifecycle rules that make the per-connection split work:
+
+- The socket's `on_init` calls `lustre.start_server_component(app(),
+  flags)`; the runtime spawns **linked to the socket process** and does
+  not trap exits, so socket and runtime die together. A closed socket
+  takes its runtime down; a crashed runtime takes the socket down, and
+  the browser reconnects into a fresh runtime. `close_socket` sends
+  `lustre.shutdown()` for the clean stop (see
+  [Socket Handler Pattern](#socket-handler-pattern)).
+- The runtime is never a supervisor child and never registered under a
+  process name.
+- Client state across reload: the page shell persists the client's last
+  selection and re-supplies it as a query parameter on the component's
+  `route`, landing in `Flags`. Use `sessionStorage` (per-tab), not
+  `localStorage` — a shared key lets one tab's selection restore in
+  another tab's reload, breaking the per-client invariant.
+
+### Shared Runtime (single client only)
+
+The older pattern — one runtime started in the supervisor under a
+`process.Name`, the component's `init` doing
+`process.register(process.self(), name)` and selecting on
+`process.named_subject(name)` — still works, and is fine when exactly
+one browser will ever connect (a kiosk, an internal dashboard). Don't
+use it for multi-client apps: the shared model silently couples every
+client.
 
 ## Event Handlers
 
@@ -260,6 +295,9 @@ text or send-on-Enter flows, prefer the uncontrolled pattern above.
 
 ### Socket Handler Pattern
 
+The socket handler owns the per-connection runtime: build `Flags`
+(actor subjects + route query params), start the runtime, shuttle frames.
+
 ```gleam
 import gleam/erlang/process.{type Selector, type Subject}
 import gleam/http/request.{type Request}
@@ -268,7 +306,6 @@ import gleam/option.{type Option, Some}
 import lustre
 import lustre/server_component
 import mist.{type Connection}
-import web
 
 pub fn html() {
   server_component.element([server_component.route("/ws/chat")], [])
@@ -277,10 +314,12 @@ pub fn html() {
   |> web.html_response
 }
 
-pub fn serve(request: Request(Connection), component) {
+pub fn serve(request: Request(Connection), ctx: Context) {
+  // runtime_flags reads the client-supplied query params (e.g. the
+  // last-selected id persisted by the page shell) onto the Flags.
   mist.websocket(
     request:,
-    on_init: init_socket(_, component),
+    on_init: init_socket(runtime_flags(request, ctx)),
     handler: loop_socket,
     on_close: close_socket,
   )
@@ -288,24 +327,30 @@ pub fn serve(request: Request(Connection), component) {
 
 type Socket {
   Socket(
-    component: lustre.Runtime(your_component.Msg),
-    self: Subject(server_component.ClientMessage(your_component.Msg)),
+    runtime: lustre.Runtime(your_component.Msg),
+    client: Subject(server_component.ClientMessage(your_component.Msg)),
   )
 }
 
 type SocketMessage =
   server_component.ClientMessage(your_component.Msg)
 
-fn init_socket(_, component) -> #(Socket, Option(Selector(SocketMessage))) {
-  let self = process.new_subject()
+// One runtime per connection, linked to this socket process (it does
+// not trap exits, so the pair die together). `start_server_component`
+// only fails if the actor cannot start at all; crashing here drops the
+// socket and the client runtime reconnects to try again.
+fn init_socket(flags: Flags) -> #(Socket, Option(Selector(SocketMessage))) {
+  let assert Ok(runtime) =
+    lustre.start_server_component(your_component.app(), flags)
+  let client = process.new_subject()
   let selector =
     process.new_selector()
-    |> process.select(self)
+    |> process.select(client)
 
-  server_component.register_subject(self)
-  |> lustre.send(to: component)
+  server_component.register_subject(client)
+  |> lustre.send(to: runtime)
 
-  #(Socket(component:, self:), Some(selector))
+  #(Socket(runtime:, client:), Some(selector))
 }
 
 fn loop_socket(
@@ -317,7 +362,7 @@ fn loop_socket(
     // Client → Server messages (input, clicks)
     mist.Text(json) -> {
       case json.parse(json, server_component.runtime_message_decoder()) {
-        Ok(runtime_message) -> lustre.send(state.component, runtime_message)
+        Ok(runtime_message) -> lustre.send(state.runtime, runtime_message)
         Error(_) -> Nil
       }
       mist.continue(state)
@@ -337,8 +382,11 @@ fn loop_socket(
 }
 
 fn close_socket(state: Socket) -> Nil {
-  server_component.deregister_subject(state.self)
-  |> lustre.send(to: state.component)
+  // The link already ties the runtime to this socket; shutdown is the
+  // clean stop for the normal close path. No deregister_subject needed:
+  // the runtime served exactly this client and is going away with it.
+  lustre.shutdown()
+  |> lustre.send(to: state.runtime)
 }
 ```
 
@@ -346,14 +394,17 @@ fn close_socket(state: Socket) -> Nil {
 
 ### Add to Context
 
+The context carries the actor subjects the per-connection `Flags` need —
+not a component runtime (each connection brings its own).
+
 ```gleam
 // In src/web.gleam
-import your_component
+import some_actor
 
 pub type Context {
   Context(
     db: process.Name(pog.Message),
-    your_component: lustre.Runtime(your_component.Msg),
+    some_actor: Subject(some_actor.Msg),
   )
 }
 ```
@@ -375,29 +426,18 @@ case wisp.path_segments(req) {
 // In src/router.gleam - mist_handler
 case request.path_segments(req) {
   // ... existing routes ...
-  ["ws", "chat"] -> your_socket.serve(req, ctx.your_component)
+  ["ws", "chat"] -> your_socket.serve(req, ctx)
   _ -> next(req)
 }
 ```
 
-### Update Supervisor
+### No Supervisor Child
 
-```gleam
-// In src/nexus.gleam
-import your_component
-
-let your_component = process.new_name("your_component")
-
-use your_component_runtime <- try(
-  lustre.start_server_component(your_component.component(), your_component)
-  |> what_failed("your component"),
-)
-
-// Pass to mist_starter
-supervisor.add(mist_starter(db_pool, automation_viewer_component, your_component_runtime))
-
-// Update mist_starter signature and Context
-```
+With one runtime per connection there is **no component entry in the
+supervision tree** — no `process.new_name`, no boot-time
+`lustre.start_server_component`. The socket's `on_init` starts the
+runtime linked to itself; app boot only starts the actors whose
+subjects go into `Flags`.
 
 ## Common Patterns
 
@@ -450,6 +490,56 @@ fn update(model: Model, msg: Msg) -> #(Model, effect.Effect(Msg)) {
 }
 ```
 
+## Sub-Components (element.map / effect.map)
+
+When one component grows a second surface (a settings page, an editor
+panel), split it into a sub-component module with its own
+`State`/`Msg`/`update`/`view`, and lift it into the parent app
+(`element.map`/`effect.map` are the whole mechanism; verified on Lustre
+5.7.1). Keep the split one-way:
+
+- the parent owns the shared data and passes it into `view` as arguments;
+- the sub-component owns its own editor states and effects;
+- results the parent must act on travel back as an explicit `Signal`
+  out-msg returned from `update` — the sub-component never reaches into
+  the parent's model.
+
+```gleam
+// Parent Msg wraps the sub-component's Msg
+pub type Msg {
+  Settings(settings_component.Msg)
+  // ...
+}
+
+// In the parent's update: delegate, fold the signals, lift the effect
+Settings(msg) -> {
+  let #(state, inner_eff, signals) =
+    settings_component.update(model.settings, msg, model.shared_data)
+  let #(model, effs) = fold_signals(model, signals)
+  #(model, effect.batch([effect.map(inner_eff, Settings), ..effs]))
+}
+
+// In the parent's view: lift the sub-view
+element.map(
+  settings_component.view(model.settings, model.shared_data),
+  Settings,
+)
+```
+
+The `Signal` list keeps the child's outcomes — "a record was created",
+"the list changed", "operation failed: reason" — as data the parent
+interprets, so the two modules stay decoupled in both directions.
+
+## Rendering Untrusted Text
+
+Everything a model, tool, or external service produces is hostile text.
+Render it exclusively as Lustre text nodes (`ht.text(...)`, or element
+content) — the virtual DOM never interprets it, so payloads like
+`<script>` or misclosed markup display inertly. Never splice untrusted
+strings into inline-JS attributes (`at.attribute("onclick", ...)` with
+interpolation) or any raw-HTML escape hatch; tool output belongs in the
+view as truncated, inert text previews.
+
 ## Common Pitfalls
 
 ### 1. Conditional preventDefault in Server Components
@@ -480,7 +570,10 @@ arity error (all args already supplied).
 
 **Error**: Component not getting messages from actors
 
-**Fix**: Ensure `subscribe` effect is in `init` and `process.register()` succeeds
+**Fix**: Ensure the `server_component.select` effect is in `init` and the
+feeding actor actually holds the per-connection subject (dispatch it from
+the selector callback). With the single-client shared runtime, also check
+`process.register()` succeeded
 
 ### 5. Duplicate Route Definitions
 
@@ -490,9 +583,9 @@ arity error (all args already supplied).
 
 ### 6. Context Type Mismatch
 
-**Error**: Type errors when accessing component in Context
+**Error**: Type errors building per-connection flags or accessing actors in Context
 
-**Fix**: Update `web.Context` type and `mist_starter` function signature to include new component
+**Fix**: Update `web.Context` to carry the actor subjects the `Flags` need and adjust the `mist_starter` signature to pass them through
 
 ### 7. Attribute Module Confusion
 
@@ -543,6 +636,36 @@ ht.button(
 ```
 
 **Key pattern**: `this.getRootNode()` returns the shadow root when called from an element inside it. Use this to query other elements within the same server component.
+
+### Page-Shell JS for Browser-Only State
+
+Some state — scroll position, viewport geometry, the user's scroll
+*intent* — exists only in the browser and must not round-trip through the
+server. Give the page shell a small **static, token-free script** that
+owns what the server view cannot know (chat-log auto-follow is the
+canonical example):
+
+- Find the host (`document.querySelector('lustre-server-component')`),
+  then its shadow root; query elements inside the root, not `document`.
+- Follow new content with a `MutationObserver` on the scroll container
+  (`scrollTop = scrollHeight` immediately, plus one
+  `requestAnimationFrame` follow-up for late layout — no debounce).
+- Unpin on explicit upward gestures (wheel up, touch drag,
+  ArrowUp/PageUp/Home, scrollbar drag); re-pin when the user scrolls back
+  near the bottom.
+- Let the server keep owning the markup: mirror the pin state onto a
+  server-rendered inert element's attribute (e.g. toggle its `hidden`),
+  and handle its clicks by delegation on the shadow root so the press
+  never becomes a server message.
+- This requires an **open** shadow root (the default) — see
+  [CSS Inheritance in Shadow DOM](#css-inheritance-in-shadow-dom).
+
+Scrollbar-drag subtlety while content streams in: your own `scrollTop`
+sets fire `scroll` events (echoes) — ignore events for a short window
+after each set, but treat a `scrollTop` materially **below** your last
+set position as a scrollbar drag (content growth never lowers
+`scrollTop`) and unpin immediately, or the rAF follow-up will yank the
+drag back.
 
 ### Limitations
 
@@ -595,6 +718,8 @@ clearing mechanism) — before any browser was involved.
 7. ✅ Multiple browser tabs work independently
 8. ✅ Composer: Enter sends and the field clears + refocuses; Shift+Enter
    inserts a newline (and only sends on the next plain Enter)
+9. ✅ Reload re-opens the client's own state (per-tab); two tabs never
+   mirror each other's selection or panels
 
 ## Reference
 
