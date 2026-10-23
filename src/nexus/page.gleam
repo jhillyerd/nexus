@@ -311,7 +311,14 @@ header button { font-size: .8rem; padding: .28rem .7rem; }
 .dot { margin-left: auto; font-size: 1.2rem; }
 .dot.live { color: #2e9e5b; }
 .dot.off { color: #c0392b; }
-#layout { flex: 1; min-height: 0; display: grid; grid-template-columns: 17rem minmax(0,1fr) 16rem; }
+#layout { flex: 1; min-height: 0; display: grid; grid-template-columns: 17rem minmax(0,1fr) 16rem;
+  grid-template-rows: minmax(0,1fr); }
+  /* ^ the explicit row is not cosmetic: without it the single implicit row
+     is content-sized, so a long #log grows the row past the viewport and
+     the whole page scrolls instead of #log (measured on desktop; the
+     mobile breakpoint below always had explicit rows and never showed
+     it). minmax(0,1fr) keeps the row exactly the container height, so
+     #chat -> #log-wrap -> #log clamp in sequence and #log scrolls. */
 #layout.settings-mode { grid-template-columns: minmax(0,1fr); }
 #layout.settings-mode > aside, #layout.settings-mode > main { display: none; }
 aside { overflow-y: auto; padding: .8rem; border-right: 1px solid

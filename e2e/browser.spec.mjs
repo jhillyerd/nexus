@@ -939,6 +939,33 @@ async function main() {
       }));
       assert(overflow.scrollWidth <= overflow.innerWidth + 1, `overflow: ${JSON.stringify(overflow)}`);
 
+      // Desktop height clamp: a transcript must scroll inside #log, never
+      // grow the document. The #layout grid needs its explicit
+      // `grid-template-rows: minmax(0,1fr)` — without it the implicit auto
+      // row sizes to #chat's content, the page scrollbar appears, and the
+      // auto-follow script has nothing to scroll (the mobile breakpoint
+      // always had explicit rows, which is why this only bit desktop).
+      const dOverflow = await dpage.evaluate(() => {
+        const sr = document.querySelector("lustre-server-component")?.shadowRoot;
+        const layout = sr?.getElementById("layout");
+        const log = sr?.getElementById("log");
+        return {
+          docScrollHeight: document.documentElement.scrollHeight,
+          innerHeight: window.innerHeight,
+          layoutScrollH: layout?.scrollHeight,
+          layoutClientH: layout?.clientHeight,
+          logScrolls: log ? log.scrollHeight > log.clientHeight + 1 : false,
+        };
+      });
+      assert(
+        dOverflow.docScrollHeight <= dOverflow.innerHeight + 1,
+        `desktop page grows instead of #log scrolling: ${JSON.stringify(dOverflow)}`,
+      );
+      assert(
+        dOverflow.layoutScrollH <= dOverflow.layoutClientH + 1,
+        `#layout row is content-sized (missing grid-template-rows): ${JSON.stringify(dOverflow)}`,
+      );
+
       // Diverge the contexts for real: create a second session in the
       // mobile context (its model learns it; the desktop context's model
       // never does), so mobile holds the new session while desktop keeps
