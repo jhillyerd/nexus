@@ -6,9 +6,14 @@
 //// picker, session sidebar, streaming log with a single in-flight assistant
 //// bubble, **typed tool-call cards** (name, stable call id, argument
 //// preview, running/completed/failed status, compact inert result
+//// picker, session sidebar, streaming log with a single in-flight assistant
+//// bubble, **typed tool-call cards** (name, stable call id, argument
+//// preview, running/completed/failed status, compact inert result
 //// preview), loop/iteration status, the model's streamed **reasoning**
 //// (chain of thought, as an inert collapsible block whose commit/rollback
-//// mirrors the server's), and the per-session metrics panel. Tool and
+//// mirrors the server's), and the per-session metrics panel. Log
+//// auto-follow and the jump-to-latest control are browser-only behaviour
+//// driven by the page shell's static autoscroll script. Tool and
 //// reasoning events are never rendered as model text, live or on Hello
 //// replay. All dynamic text is produced with Lustre `text` nodes; there is
 //// no `innerHTML` anywhere.
@@ -1953,10 +1958,35 @@ fn session_row(model: Model, summary: session.SessionSummary) -> Element(Msg) {
 fn chat(model: Model) -> Element(Msg) {
   let has_session = option.is_some(model.selected)
   html.main([attr.id("chat")], [
-    html.div([attr.id("log"), attr.aria("live", "polite")], log_lines(model)),
+    // `#log-wrap` anchors the jump button to the log's bottom edge (the
+    // log itself is the scroll container, so the button must not live in
+    // it). See `jump_latest` for why the button is inert.
+    html.div([attr.id("log-wrap")], [
+      html.div([attr.id("log"), attr.aria("live", "polite")], log_lines(model)),
+      jump_latest(),
+    ]),
     loop_chip(model),
     composer(model, has_session),
   ])
+}
+
+/// Server-rendered "jump to latest" control, hidden until the page
+/// shell's autoscroll script un-hides it. Inert by construction — no
+/// event handler, a text node, nothing derived from model output: only
+/// the browser knows the scroll position and the user's intent, so the
+/// static `autoscroll_js` script in `nexus/page` owns the behaviour
+/// (delegated click, `hidden` toggling). It starts hidden because a
+/// fresh view opens at the bottom.
+fn jump_latest() -> Element(Msg) {
+  html.button(
+    [
+      attr.id("jump-latest"),
+      attr.type_("button"),
+      attr.aria("label", "Jump to latest"),
+      attr.hidden(True),
+    ],
+    [html.text("↓")],
+  )
 }
 
 /// Iteration status for the turn in flight: "iter 2/8 · tools". Hidden when

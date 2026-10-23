@@ -1357,6 +1357,24 @@ pub fn settings_auto_opens_on_empty_provider_list_test() {
   again.view |> should.equal(ui.SettingsView)
 }
 
+pub fn view_jump_latest_button_test() {
+  // The "jump to latest" control is server-rendered structure only, and
+  // inert by construction: hidden up front (a fresh view opens at the
+  // bottom; Lustre SSR sorts attributes), no event handler, and none of
+  // the old repo's inline `onclick` script. It is a sibling AFTER #log,
+  // inside #log-wrap, so it never lands in the log's aria-live region
+  // (with no session selected the log renders empty, pinning the exact
+  // structure).
+  new_model()
+  |> view_string
+  |> should_contain(
+    "<div id=\"log-wrap\"><div aria-live=\"polite\" id=\"log\"></div>"
+    <> "<button aria-label=\"Jump to latest\" hidden id=\"jump-latest\" "
+    <> "type=\"button\">↓</button></div>",
+  )
+  should.be_false(string.contains(new_model() |> view_string, "onclick"))
+}
+
 pub fn settings_manual_close_beats_auto_open_test() {
   // A user who deliberately closes the settings page is not pulled back
   // on the next (still empty) refresh — the create_auto latch pattern.
