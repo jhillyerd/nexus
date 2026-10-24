@@ -114,7 +114,9 @@ Pure request/parse helpers plus one runner — no actor of its own:
 - New messages: `UtilityStart` (debounce fired, spawn the worker) and
   `UtilityDone(pid, result)`. State gains `utility: UtilityState`
   (`Idle | Running(pid, cancel_subject)`) and a once-per-session
-  `utility_fired: Bool`.
+  `utility_attempted: Bool` that flips **only when an attempt
+  completes** (applied or failed) — never when one is armed or
+  cancelled.
 - **Trigger.** At the turn-commit point (~L677), when the turn
   committed, `transcript.length(tr) >= 3` (system + first user + first
   assistant), the once-flag is unset, and config enables the feature →
@@ -122,7 +124,12 @@ Pure request/parse helpers plus one runner — no actor of its own:
   it fires and no turn is running, spawn an **unlinked** utility worker
   (mirror of the turn worker at ~L470) holding the committed
   transcript snapshot and a cancel subject. Failed turns (`StreamErrored`,
-  nothing committed) never trigger it.
+  nothing committed) never trigger it. A worker cancelled by an
+  incoming `Send` does **not** count as an attempt: `utility_attempted`
+  stays unset and the next turn-commit point re-arms the debounce, so
+  a fast follow-up can kill at most the in-flight try, never the
+  session's only one — the heuristic title is always eventually
+  upgraded (or replaced by a manual rename).
 - **Cancellation.** A `Send` arriving while a utility worker runs
   sends its cancel subject and proceeds normally — the session never
   reports `Busy` because of a utility call. This is required fairness
@@ -229,8 +236,9 @@ carry everything.
 - **`test/session_test.gleam`** (extend, fake `utility_runner`): fires
   once after the first committed exchange; not on failed turns; never
   marks the session `Busy`; cancelled when a `Send` arrives
-  mid-flight; `MetaUpdated` broadcast only when the registry guard
-  applied.
+  mid-flight, and a cancelled attempt does not consume the once-flag
+  (it re-arms at the next commit point); `MetaUpdated` broadcast only
+  when the registry guard applied.
 - **`test/session_persistence_test.gleam`** + `test/store_mock.gleam`:
   `auto_title_upgrade` guard semantics (auto → applies and replaces
   the heuristic; manual → refused, reply `False`).
@@ -281,9 +289,11 @@ request; until then Y stays title-only.
 - **Serialized single-slot backends** (llama.cpp `-np 1`): debounce +
   cap + cancel-on-send make the side call harmless to interactive
   latency.
-- **Fast typers vs. debounce**: the cancel path makes the race
-  harmless (worst case the title arrives after turn 2's commit — the
-  once-flag already fired, the upgrade still applies via the guard).
+- **Fast typers vs. debounce**: cancellation must not consume the
+  session's only attempt. `utility_attempted` flips only on a
+  *completed* attempt; a `Send` that cancels an in-flight worker
+  leaves it unset, and the next turn-commit point re-arms the debounce.
+  Worst case the title lands one turn later than it could have.
 - **Open**: exact Y wording and whether the title upgrade should also
   fire for sessions rehydrated from the store that already have a
   heuristic title but were created before this feature (proposal: no —

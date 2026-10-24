@@ -38,10 +38,22 @@ which nexus's encode path already follows — keep it that way.
 | **SGLang** | RadixAttention: radix **tree** over token prefixes shared across all requests | evicts only *leaves* (unlocked, not shadowed); interior/shared prefixes persist; `lru` default policy | branching is the native case (tree of conversations) | `cached_tokens` in usage (enable cache report) | — |
 | **Hosted OpenAI** (and similar) | automatic prefix caching, prefixes ≥ ~1024 tokens | minutes-scale TTL | longest-prefix match; branches share the span before the fork | `usage.prompt_tokens_details.cached_tokens` | cached input billed at a discount; TTL means long-idle sessions re-prefill |
 
-Sources: vLLM `docs/design/prefix_caching` + `features/automatic_prefix_caching`;
-llama.cpp `tools/server` README + discussion #13606 (KV cache reuse
-tutorial); Ollama PR #5492 / #6735, issue #5303; SGLang radix-cache
-eviction docs and the RadixAttention paper; OpenAI pricing/docs.
+Sources:
+
+- vLLM: <https://docs.vllm.ai/en/latest/design/prefix_caching/> and
+  <https://docs.vllm.ai/en/latest/features/automatic_prefix_caching/>
+- llama.cpp: server README
+  <https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md>;
+  KV-cache-reuse tutorial (discussion #13606)
+  <https://github.com/ggml-org/llama.cpp/discussions/13606>
+- Ollama: PR #5492 <https://github.com/ollama/ollama/pull/5492>,
+  PR #6735 <https://github.com/ollama/ollama/pull/6735>,
+  issue #5303 <https://github.com/ollama/ollama/issues/5303>
+- SGLang: radix-cache eviction policy
+  <https://docs.sglang.io/docs/advanced_features/radix_eviction_policy>;
+  RadixAttention paper <https://arxiv.org/abs/2312.07104>
+- Hosted OpenAI: prompt caching guide
+  <https://platform.openai.com/docs/guides/prompt-caching>
 
 ## 3. Client rules (what keeps prefixes reusable)
 
@@ -65,8 +77,14 @@ eviction docs and the RadixAttention paper; OpenAI pricing/docs.
    as the reasoning sidecar).
 5. **On serialized single-slot backends (llama.cpp `-np 1`, small
    Ollama), side calls block the user's next turn.** Fire them only
-   when idle, cap their output, and cancel on the next user send —
-   dropping the connection cancels server-side and frees the slot.
+   when idle, cap their output, and cancel on the next user send.
+   Dropping the connection *requests* server-side cancellation, but it
+   is backend- and proxy-dependent, not a guarantee: modern
+   `llama-server` watches for client disconnects, while some builds
+   and buffering intermediaries have kept disconnected requests
+   running. Treat cancel as best-effort, keep the output cap small,
+   and verify disconnect behavior on the deployed endpoint before
+   relying on it for interactive latency.
 6. **Measure with `cached_tokens`, not TTFT alone.** TTFT carries
    queueing noise; `cached_tokens` (and llama.cpp's `timings.cache_n`)
    is the direct hit signal. The e2e cache gate (warm/cold TTFT median
