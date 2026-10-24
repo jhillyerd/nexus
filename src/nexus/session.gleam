@@ -364,6 +364,12 @@ type State {
     commit_hook: fn(Transcript) -> Nil,
     /// Utility side-call state (utility-titles plan §4.2).
     utility: UtilityState,
+    /// A debounce is OWED: `UtilityStart` fired while a turn was in flight
+    /// (the side call must not queue behind it), so the trigger is deferred
+    /// to the turn's end — committed or failed — instead of being dropped
+    /// or rescheduled (a timer-based re-arm would spin at delay 0). The
+    /// turn's own commit-point arm also consumes this.
+    utility_pending: Bool,
     /// The session's ONE title attempt (utility-titles plan §4.2). Flips
     /// only when an attempt COMPLETES (applied or failed) — never when one
     /// is armed or cancelled — so a fast follow-up can kill at most the
@@ -449,6 +455,7 @@ fn start_builder(spec: SessionSpec) {
       subs: [],
       turn: Idle,
       utility: UtilityIdle,
+      utility_pending: False,
       // A hydrated (restored) session's first exchange predates this actor:
       // the utility-titles plan's §8 proposal — only sessions whose first
       // exchange happens in the actor's lifetime attempt the upgrade. A
@@ -826,11 +833,13 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
     UtilityStart ->
       // The debounce fired. Every condition is re-checked at fire time, so
       // a stale or racing timer is simply dropped. When the ONLY blocker is
-      // a turn in flight, re-arm instead of dropping: the side call must
-      // not queue behind a turn (serialized backends), and the chain then
-      // fires into the next quiet window — including after a turn that
-      // FAILS (a failed turn re-arms nothing itself), so the already-
-      // committed first exchange is never stranded untitled.
+      // a turn in flight, mark a trigger OWED instead: the side call must
+      // not queue behind a turn (serialized backends), and the owed trigger
+      // is delivered when the turn ends — even a turn that then FAILS (a
+      // failed turn re-arms nothing itself), so the already-committed first
+      // exchange is never stranded untitled. Deliberately NOT a timer
+      // re-arm: with NEXUS_UTILITY_DELAY_MS = 0 that would busy-loop for
+      // the whole turn.
       case
         state.turn,
         state.utility,
@@ -866,18 +875,19 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
             })
           let monitor = process.monitor(worker)
           actor.continue(
-            State(..state, utility: UtilityStarting(worker, monitor, False)),
+            State(
+              ..state,
+              utility: UtilityStarting(worker, monitor, False),
+              utility_pending: False,
+            ),
           )
         }
-        _, UtilityIdle, False, True, True -> {
-          process.send_after(
-            state.self,
-            state.cfg.utility_delay_ms,
-            UtilityStart,
-          )
-          actor.continue(state)
-        }
-        _, _, _, _, _ -> actor.continue(state)
+        _, UtilityIdle, False, True, True ->
+          actor.continue(State(..state, utility_pending: True))
+        // Genuinely terminal (attempt in flight, flag consumed, feature
+        // off): drop, and with it any owed trigger that can no longer
+        // matter.
+        _, _, _, _, _ -> actor.continue(State(..state, utility_pending: False))
       }
 
     UtilityStarted(worker, cancel) ->
@@ -997,15 +1007,16 @@ fn cancel_utility(state: State) -> State {
 }
 
 /// The utility trigger, called at the turn-commit point: when the turn
-/// committed, the transcript holds a first exchange (system + first user +
-/// first assistant), the once-per-session attempt is still available, the
-/// feature is enabled, and no side call is in flight → arm the debounce
-/// timer (`NEXUS_UTILITY_DELAY_MS`). Nothing else changes here: the timer's
+/// committed — or an earlier-committed exchange still owes a deferred
+/// trigger (`utility_pending`, set when the debounce fired mid-turn) — and
+/// the once-per-session attempt is still available, the feature is
+/// enabled, and no side call is in flight → arm the debounce timer
+/// (`NEXUS_UTILITY_DELAY_MS`). Nothing else changes here: the timer's
 /// message re-checks every condition at fire time, so racing timers are
-/// harmless, and a failed turn (nothing committed) never triggers this.
+/// harmless.
 fn arm_utility(state: State, committed: Bool) -> State {
   case
-    committed,
+    committed || state.utility_pending,
     state.utility_attempted,
     state.cfg.utility_enabled,
     state.utility,
@@ -1013,9 +1024,12 @@ fn arm_utility(state: State, committed: Bool) -> State {
   {
     True, False, True, UtilityIdle, True -> {
       process.send_after(state.self, state.cfg.utility_delay_ms, UtilityStart)
-      state
+      State(..state, utility_pending: False)
     }
-    _, _, _, _, _ -> state
+    // The side call is still busy (e.g. a cancelled-but-unreported
+    // worker): keep the owed trigger for a later turn end.
+    True, False, True, _, _ -> state
+    _, _, _, _, _ -> State(..state, utility_pending: False)
   }
 }
 
@@ -1041,7 +1055,16 @@ fn finish_utility(
     UtilityFailed, False -> True
   }
   let state =
-    State(..state, utility: UtilityIdle, utility_attempted: utility_attempted)
+    State(
+      ..state,
+      utility: UtilityIdle,
+      utility_attempted: utility_attempted,
+      // The once-flag is spent: an owed trigger could never fire again.
+      utility_pending: case utility_attempted {
+        True -> False
+        False -> state.utility_pending
+      },
+    )
   case result {
     UtilityApplied(title, tags) -> {
       broadcast(state.subs, MetaUpdated(Some(title), tags))
