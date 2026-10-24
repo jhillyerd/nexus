@@ -162,6 +162,35 @@ where id = $2 and title_source = 'auto' and title = ''
   |> pog.execute(db)
 }
 
+/// Model-title upgrade (utility-titles plan §4.4): the guard is provenance
+/// ONLY — the heuristic placeholder may be upgraded while the title is still
+/// auto-generated; a manual rename wins forever. Twin of the registry's
+/// in-memory UpgradeAutoTitle guard.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn auto_title_upgrade(
+  db: pog.Connection,
+  title: String,
+  id: String,
+) -> Result(pog.Returned(Nil), pog.QueryError) {
+  let decoder = decode.map(decode.dynamic, fn(_) { Nil })
+
+  "-- Model-title upgrade (utility-titles plan §4.4): the guard is provenance
+-- ONLY — the heuristic placeholder may be upgraded while the title is still
+-- auto-generated; a manual rename wins forever. Twin of the registry's
+-- in-memory UpgradeAutoTitle guard.
+update session set title = $1
+where id = $2 and title_source = 'auto'
+"
+  |> pog.query
+  |> pog.parameter(pog.text(title))
+  |> pog.parameter(pog.text(id))
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
 /// Turn commit: recency + denormalized count (absolute, idempotent).
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of

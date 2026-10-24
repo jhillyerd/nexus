@@ -32,6 +32,10 @@ fn test_config() -> config.Config {
     pg_database: "nexus",
     pg_user: "nexus",
     pg_password: None,
+    // Utility side-call on (the default): tests inject no-op fakes, and a
+    // debounced failed attempt is invisible to event assertions.
+    utility_enabled: True,
+    utility_delay_ms: 1500,
   )
 }
 
@@ -193,6 +197,16 @@ fn test_endpoint() -> openai.Endpoint {
   )
 }
 
+/// Utility seams for tests that never exercise the side call: the runner
+/// refuses (best-effort failure, discarded) and the apply is never reached.
+fn no_utility_runner(_endpoint, _tr, _cancel) -> Result(String, String) {
+  Error("no utility call expected in this test")
+}
+
+fn no_utility_apply(_title: String) -> Result(session.UtilityMeta, Nil) {
+  Error(Nil)
+}
+
 fn start_with(runner: session.TurnRunner) -> process.Subject(session.Msg) {
   let assert Ok(started) =
     session.start_with_spec(session.SessionSpec(
@@ -202,6 +216,10 @@ fn start_with(runner: session.TurnRunner) -> process.Subject(session.Msg) {
       runner: runner,
       commit_hook: fn(_) { Nil },
       hydrate: None,
+      // No utility attempt is expected in these tests: the fake refuses,
+      // and a failed attempt broadcasts nothing.
+      utility_runner: no_utility_runner,
+      utility_apply: no_utility_apply,
     ))
   started.data
 }
@@ -370,6 +388,8 @@ pub fn selected_alias_is_frozen_test() {
       runner: happy_runner,
       commit_hook: fn(_) { Nil },
       hydrate: None,
+      utility_runner: no_utility_runner,
+      utility_apply: no_utility_apply,
     )
   let assert Ok(started) = session.start_with_spec(spec)
   let sess = started.data
@@ -406,6 +426,8 @@ pub fn runner_receives_frozen_endpoint_test() {
       runner: capturing,
       commit_hook: fn(_) { Nil },
       hydrate: None,
+      utility_runner: no_utility_runner,
+      utility_apply: no_utility_apply,
     )
   let assert Ok(started) = session.start_with_spec(spec)
   let sess = started.data

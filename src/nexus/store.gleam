@@ -157,6 +157,12 @@ pub type Store {
     /// Guarded like the registry: applies only while the stored title is
     /// the untouched auto default. `Ok(True)` when it applied.
     auto_title: fn(String, String) -> Result(Bool, StoreError),
+    /// Guarded by provenance ONLY (utility-titles plan §4.4): replaces the
+    /// stored title while `title_source = 'auto'` — the model title may
+    /// upgrade the heuristic placeholder; a manual rename wins forever.
+    /// Twin of the registry's UpgradeAutoTitle in-memory guard.
+    /// `Ok(True)` when it applied.
+    auto_title_upgrade: fn(String, String) -> Result(Bool, StoreError),
     set_tags: fn(String, List(String)) -> Result(Nil, StoreError),
     set_pinned: fn(String, Bool) -> Result(Nil, StoreError),
     /// Archiving clears the pin (Phase 1 invariant, enforced in SQL too).

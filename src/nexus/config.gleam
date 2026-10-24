@@ -56,6 +56,14 @@ pub type Config {
     pg_user: String,
     /// Phase 2 persistence: optional password; never logged or echoed.
     pg_password: Option(String),
+    /// Utility calls (utility-titles plan §4.6): the once-per-session
+    /// model-generated title upgrade, branched off the committed
+    /// transcript's cached prefix. Off switches the feature entirely —
+    /// the heuristic first-message title then stays forever.
+    utility_enabled: Bool,
+    /// Utility debounce: how long after a turn commit the side call waits
+    /// (so a fast follow-up message cancels it before it starts).
+    utility_delay_ms: Int,
   )
 }
 
@@ -128,6 +136,16 @@ pub fn from_env(
   ))
   use pg_user <- result.try(optional_string_or(get, "NEXUS_PG_USER", "nexus"))
   let pg_password = optional_string(get, "NEXUS_PG_PASSWORD")
+  use utility_enabled <- result.try(optional_bool(
+    get,
+    "NEXUS_UTILITY_ENABLED",
+    True,
+  ))
+  use utility_delay_ms <- result.try(optional_int(
+    get,
+    "NEXUS_UTILITY_DELAY_MS",
+    1500,
+  ))
   Ok(Config(
     encryption_key: encryption_key,
     sse_first_response_timeout_ms: first_response_ms,
@@ -147,6 +165,8 @@ pub fn from_env(
     pg_database: pg_database,
     pg_user: pg_user,
     pg_password: pg_password,
+    utility_enabled: utility_enabled,
+    utility_delay_ms: utility_delay_ms,
   ))
 }
 

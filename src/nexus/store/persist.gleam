@@ -56,6 +56,11 @@ pub type Msg {
   Commit(id: String, transcript: Transcript)
   SetTitle(id: String, title: String, reply: Subject(Result(Nil, String)))
   AutoTitle(id: String, title: String, reply: Subject(Result(Bool, String)))
+  AutoTitleUpgrade(
+    id: String,
+    title: String,
+    reply: Subject(Result(Bool, String)),
+  )
   SetTags(id: String, tags: List(String), reply: Subject(Result(Nil, String)))
   SetPinned(id: String, pinned: Bool, reply: Subject(Result(Nil, String)))
   Archive(id: String, reply: Subject(Result(Nil, String)))
@@ -185,6 +190,11 @@ pub fn seam(store_actor: Subject(Msg)) -> store.Store {
     auto_title: fn(id, title) {
       actor.call(store_actor, call_timeout_ms, fn(reply) {
         AutoTitle(id, title, reply)
+      })
+    },
+    auto_title_upgrade: fn(id, title) {
+      actor.call(store_actor, call_timeout_ms, fn(reply) {
+        AutoTitleUpgrade(id, title, reply)
       })
     },
     set_tags: fn(id, tags) {
@@ -363,6 +373,18 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
     AutoTitle(id, title, reply) -> {
       let result =
         sql.auto_title(state.db, title, id)
+        |> result.map(fn(returned) { returned.count > 0 })
+        |> result.map_error(query_error)
+      process.send(reply, result)
+      actor.continue(state)
+    }
+
+    AutoTitleUpgrade(id, title, reply) -> {
+      // Same guard semantics as the registry's UpgradeAutoTitle: provenance
+      // only — the SQL refuses a manual title, and the affected-row count
+      // says whether it applied.
+      let result =
+        sql.auto_title_upgrade(state.db, title, id)
         |> result.map(fn(returned) { returned.count > 0 })
         |> result.map_error(query_error)
       process.send(reply, result)

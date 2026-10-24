@@ -43,6 +43,10 @@ fn test_config() -> config.Config {
     pg_database: "nexus",
     pg_user: "nexus",
     pg_password: None,
+    // Utility side-call on (the default): tests inject no-op fakes, and a
+    // debounced failed attempt is invisible to event assertions.
+    utility_enabled: True,
+    utility_delay_ms: 1500,
   )
 }
 
@@ -242,6 +246,7 @@ fn boot(seam: store.Store) -> Boot {
       registry_name,
       seam,
       tool_round_runner,
+      fn(_endpoint, _tr, _cancel) { Error("no utility call in this test") },
       fixture_resolver(),
     )
   Boot(

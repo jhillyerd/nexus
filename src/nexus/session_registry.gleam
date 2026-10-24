@@ -58,6 +58,7 @@ import nexus/store.{type Store, type StoredSummary}
 import nexus/timing
 import nexus/tools
 import nexus/transcript.{type Transcript}
+import nexus/utility
 
 /// The factory's child-start argument: everything needed to (re)start one
 /// session actor identically.
@@ -107,6 +108,17 @@ pub type ProviderError {
 pub type ResolveProvider =
   fn(String) -> Result(openai.Endpoint, ProviderError)
 
+/// Reply payload for `UpgradeAutoTitle`: what the guard decided. Carries
+/// the fresh display metadata on success so the session actor can broadcast
+/// `MetaUpdated` truthfully without a second round-trip.
+pub type UpgradeOutcome {
+  /// Applied: the session's fresh title + tags.
+  UpgradeApplied(title: String, tags: List(String))
+  /// Refused: `title_source` is manual (a rename wins forever), the id is
+  /// unknown, or the title was empty.
+  UpgradeRefused
+}
+
 pub type Msg {
   /// Start a new session pinned to `provider_id` + `model` using the
   /// registry's frozen tool runner (built once at registry start, so the
@@ -138,6 +150,12 @@ pub type Msg {
   /// only while the title is still the untouched auto default, so a manual
   /// rename is never overwritten. Keeps `title_source` auto.
   AutoTitle(id: String, title: String, reply: Subject(Bool))
+  /// Model-generated title upgrade (utility-titles plan §4.3): replaces
+  /// the heuristic placeholder while `title_source = 'auto'` — a manual
+  /// rename wins forever. The reply says what happened (and carries the
+  /// fresh metadata); the store write-through carries the same guard, so
+  /// the twin invariant of the `AutoTitle` pair holds.
+  UpgradeAutoTitle(id: String, title: String, reply: Subject(UpgradeOutcome))
   SetPinned(id: String, pinned: Bool, reply: Subject(Bool))
   SetTags(id: String, tags: List(String), reply: Subject(Bool))
   SetArchived(id: String, archived: Bool, reply: Subject(Bool))
@@ -194,6 +212,14 @@ type State {
     /// every session this registry starts (create, restart, replacement)
     /// gets the identical tool schema.
     runner: session.TurnRunner,
+    /// The utility side-call runner over the SAME frozen tool set —
+    /// built once at boot beside `runner`, so the title branch's envelope
+    /// is byte-identical to a turn request's by construction.
+    utility_runner: session.UtilityRunner,
+    /// This actor's own subject: the utility apply closures ask the
+    /// UpgradeAutoTitle guard through it from the (unlinked) utility
+    /// worker process.
+    self: Subject(Msg),
     /// The provider seam: resolves the endpoint frozen into each session
     /// spec at create and lazy-hydration time.
     resolve_provider: ResolveProvider,
@@ -272,26 +298,32 @@ pub fn start(
 ) -> actor.StartResult(Subject(Msg)) {
   // The tool registry is built once, here, from the global config — before
   // any session exists — so every request any session of this VM ever
-  // sends carries the identical (byte-stable) tool schema.
+  // sends carries the identical (byte-stable) tool schema. The SAME specs
+  // build the utility side-call runner, so the title branch's envelope is
+  // the turn envelope by construction (KV-cache contract).
+  let specs = tools.default(cfg)
   start_with_runner(
     cfg,
     factory,
     name,
     persistence,
-    session.agent_runner(cfg.max_tool_iterations, tools.default(cfg)),
+    session.agent_runner(cfg.max_tool_iterations, specs),
+    session.utility_runner(specs),
     resolve_provider,
   )
 }
 
-/// Test seam: the same registry with an injected turn runner — hydration
-/// (boot, lazy start, restart recovery) then uses it for every session it
-/// starts, exactly like production uses the frozen agent-loop runner.
+/// Test seam: the same registry with injected turn + utility runners —
+/// hydration (boot, lazy start, restart recovery) then uses them for every
+/// session it starts, exactly like production uses the frozen boot-built
+/// runners.
 pub fn start_with_runner(
   cfg: Config,
   factory: Factory,
   name: process.Name(Msg),
   persistence: Store,
   runner: session.TurnRunner,
+  utility_runner: session.UtilityRunner,
   resolve_provider: ResolveProvider,
 ) -> actor.StartResult(Subject(Msg)) {
   let builder =
@@ -313,6 +345,8 @@ pub fn start_with_runner(
           actor.initialised(State(
             cfg: cfg,
             runner: runner,
+            utility_runner: utility_runner,
+            self: self,
             resolve_provider: resolve_provider,
             factory: factory,
             sessions: dict.new(),
@@ -448,6 +482,8 @@ fn handle_create(
               runner: runner,
               commit_hook: commit_hook_for(state.store, id),
               hydrate: None,
+              utility_runner: state.utility_runner,
+              utility_apply: utility_apply_for(state.self, id),
             )
           case
             factory_supervisor.start_child(
@@ -653,6 +689,73 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
         },
       )
 
+    UpgradeAutoTitle(id, title, reply) -> {
+      // Model-title upgrade (utility-titles plan §4.3): the guard is
+      // `title_source = 'auto'` ONLY — the heuristic placeholder may be
+      // upgraded, a manual rename wins forever. The in-memory update and
+      // the store write-through carry the same guard (twin-invariant
+      // pattern of the AutoTitle pair: the SQL refuses what the memory
+      // would have refused, so a write-through cannot resurrect a clobbered
+      // title). Unlike AutoTitle there is no empty-title precondition: an
+      // auto title may be REPLACED. The outcome carries the fresh metadata
+      // so the caller can broadcast it.
+      let title = string.trim(title)
+      let #(state, outcome) = case title {
+        "" -> #(state, UpgradeRefused)
+        _ ->
+          case dict.get(state.sessions, id) {
+            Ok(record) ->
+              case record.title_source {
+                session.AutoTitle -> {
+                  write_through_or_log(id, fn() {
+                    state.store.auto_title_upgrade(id, title)
+                    |> result.map(fn(_) { Nil })
+                  })
+                  #(
+                    State(
+                      ..state,
+                      sessions: dict.insert(
+                        state.sessions,
+                        id,
+                        Record(..record, title: title),
+                      ),
+                    ),
+                    UpgradeApplied(title, record.tags),
+                  )
+                }
+                session.ManualTitle -> #(state, UpgradeRefused)
+              }
+            Error(_) ->
+              case dict.get(state.dormant, id) {
+                Ok(summary) ->
+                  case summary.title_source {
+                    session.AutoTitle -> {
+                      write_through_or_log(id, fn() {
+                        state.store.auto_title_upgrade(id, title)
+                        |> result.map(fn(_) { Nil })
+                      })
+                      #(
+                        State(
+                          ..state,
+                          dormant: dict.insert(
+                            state.dormant,
+                            id,
+                            store.StoredSummary(..summary, title: title),
+                          ),
+                        ),
+                        UpgradeApplied(title, summary.tags),
+                      )
+                    }
+                    session.ManualTitle -> #(state, UpgradeRefused)
+                  }
+                Error(_) -> #(state, UpgradeRefused)
+              }
+          }
+      }
+      process.send(reply, outcome)
+      actor.continue(state)
+    }
+
     SetPinned(id, pinned, reply) ->
       // Invariant: an archived session is never pinned. Pinning is
       // refused (reply False, record untouched) so a pin can never
@@ -853,6 +956,25 @@ fn commit_hook_for(persistence: Store, id: String) -> fn(Transcript) -> Nil {
   fn(transcript) { persistence.commit(id, transcript) }
 }
 
+/// The utility apply seam for one session — the injected `UtilityApply`.
+/// A closure over this actor's subject and the id (exactly like the
+/// commit hook), performing the `UpgradeAutoTitle` ask. It runs inside the
+/// unlinked utility WORKER process — never the session actor — so the ask
+/// cannot deadlock: the registry answers it without ever calling back into
+/// a session. The outcome's fresh metadata feeds the session's
+/// `MetaUpdated` broadcast.
+fn utility_apply_for(
+  registry: Subject(Msg),
+  id: String,
+) -> fn(String) -> Result(session.UtilityMeta, Nil) {
+  fn(title) {
+    case upgrade_auto_title(registry, id, title) {
+      UpgradeApplied(title, tags) -> Ok(session.UtilityMeta(title, tags))
+      UpgradeRefused -> Error(Nil)
+    }
+  }
+}
+
 /// Rebuild a stored session's transcript through the one construction
 /// path: `transcript.new(model, system_prompt)` + `append_*` over the rows
 /// in seq order.
@@ -907,6 +1029,8 @@ fn lazy_start(state: State, summary: StoredSummary) -> Resolved {
               runner: state.runner,
               commit_hook: commit_hook_for(state.store, summary.id),
               hydrate: Some(transcript),
+              utility_runner: state.utility_runner,
+              utility_apply: utility_apply_for(state.self, summary.id),
             )
           let argument =
             ChildArgument(
@@ -1099,30 +1223,11 @@ fn normalize_tags(tags: List(String)) -> List(String) {
 /// never enters a request body. Shared by the HTTP send boundary and the
 /// UI component's send effect (both are places that already hold the
 /// outgoing text; message content never crosses session→registry).
-const title_limit = 60
-
+///
+/// The shaping rule lives in `nexus/utility.shape_title` — the SAME rule
+/// caps a model-generated title, so the two can never drift apart.
 pub fn title_from_first_message(text: String) -> String {
-  let flat = collapse_whitespace(text)
-  case string.length(flat) > title_limit {
-    True -> string.slice(flat, 0, title_limit) <> "…"
-    False -> flat
-  }
-}
-
-/// Collapse every whitespace run (spaces, tabs, newlines) to single spaces
-/// and trim — a multi-line first message still reads as one title line.
-/// The CRLF pair must go first: Erlang's Unicode `string:replace` does not
-/// match a lone "\r" inside "\r\n".
-fn collapse_whitespace(text: String) -> String {
-  text
-  |> string.replace("\r\n", " ")
-  |> string.replace("\r", " ")
-  |> string.replace("\n", " ")
-  |> string.replace("\t", " ")
-  |> string.split(" ")
-  |> list.filter(fn(part) { part != "" })
-  |> string.join(" ")
-  |> string.trim
+  utility.shape_title(text)
 }
 
 /// Sidebar order: pinned first, then most recently active first; ties break
@@ -1278,6 +1383,17 @@ pub fn set_title(registry: Subject(Msg), id: String, title: String) -> Bool {
 /// is still the untouched auto default.
 pub fn auto_title(registry: Subject(Msg), id: String, title: String) -> Bool {
   actor.call(registry, 5000, fn(reply) { AutoTitle(id:, title:, reply:) })
+}
+
+/// The model-title upgrade (the utility worker's apply step). Applies only
+/// while `title_source = 'auto'` — a manual rename wins forever. The reply
+/// carries the fresh metadata when it applied.
+pub fn upgrade_auto_title(
+  registry: Subject(Msg),
+  id: String,
+  title: String,
+) -> UpgradeOutcome {
+  actor.call(registry, 5000, fn(reply) { UpgradeAutoTitle(id:, title:, reply:) })
 }
 
 pub fn set_pinned(registry: Subject(Msg), id: String, pinned: Bool) -> Bool {

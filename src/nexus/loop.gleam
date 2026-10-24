@@ -94,6 +94,22 @@ pub fn endpoint_stream(endpoint: openai.Endpoint) -> StreamFn {
   }
 }
 
+/// The frozen request envelope: streaming on, the boot-built tool schemas,
+/// auto tool choice. This is the ONE construction site — both the agent
+/// loop and the utility runner consume it, so their envelopes are
+/// byte-identical by construction (KV-cache contract): the tool schema is
+/// built once at boot from the global config, never per session, and
+/// generation-side params (the utility's only delta,
+/// `max_completion_tokens`) do not tokenize into the prompt.
+pub fn frozen_options(specs: List(ToolSpec)) -> Options {
+  transcript.Options(
+    ..transcript.default_options(),
+    stream: True,
+    tools: tools.schemas(specs),
+    tool_choice: Some(chat.ToolChoiceModeChoice(chat.ToolChoiceAuto)),
+  )
+}
+
 /// Run the loop for one user turn. `tr` must already include the user
 /// message; the returned transcript (on non-failed outcomes) extends it.
 pub fn run(
@@ -142,13 +158,7 @@ fn iterate(
   stats,
 ) -> LoopOutcome {
   on_event(LoopStatus(iteration, max_iterations, "request"))
-  let opts =
-    transcript.Options(
-      ..transcript.default_options(),
-      stream: True,
-      tools: tools.schemas(specs),
-      tool_choice: Some(chat.ToolChoiceModeChoice(chat.ToolChoiceAuto)),
-    )
+  let opts = frozen_options(specs)
   cell_init()
   put_text("")
   put_calls(tool_calls.new())

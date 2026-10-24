@@ -24,6 +24,7 @@ pub type Event {
   EvCommit(id: String, messages: Int)
   EvSetTitle(id: String, title: String)
   EvAutoTitle(id: String, title: String)
+  EvAutoTitleUpgrade(id: String, title: String)
   EvSetTags(id: String, tags: List(String))
   EvSetPinned(id: String, pinned: Bool)
   EvArchive(id: String)
@@ -55,6 +56,11 @@ pub type MockMsg {
   Commit(id: String, transcript: Transcript)
   SetTitle(id: String, title: String, reply: Subject(Result(Nil, String)))
   AutoTitle(id: String, title: String, reply: Subject(Result(Bool, String)))
+  AutoTitleUpgrade(
+    id: String,
+    title: String,
+    reply: Subject(Result(Bool, String)),
+  )
   SetTags(id: String, tags: List(String), reply: Subject(Result(Nil, String)))
   SetPinned(id: String, pinned: Bool, reply: Subject(Result(Nil, String)))
   Archive(id: String, reply: Subject(Result(Nil, String)))
@@ -173,6 +179,9 @@ pub fn seam(mock: Subject(MockMsg)) -> Store {
     },
     auto_title: fn(id, title) {
       call(mock, 5000, fn(r) { AutoTitle(id, title, r) })
+    },
+    auto_title_upgrade: fn(id, title) {
+      call(mock, 5000, fn(r) { AutoTitleUpgrade(id, title, r) })
     },
     set_tags: fn(id, tags) { call(mock, 5000, fn(r) { SetTags(id, tags, r) }) },
     set_pinned: fn(id, pinned) {
@@ -406,6 +415,36 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
               )
             }
             _, _ -> {
+              process.send(reply, Ok(False))
+              actor.continue(state)
+            }
+          }
+      }
+
+    AutoTitleUpgrade(id, title, reply) ->
+      // Mirrors `auto_title_upgrade.sql` (utility-titles plan §4.4): the
+      // guard is provenance ONLY — an auto title (even the heuristic
+      // placeholder, even a previously upgraded one) may be replaced; a
+      // manual rename wins forever.
+      case dict.get(state.sessions, id) {
+        Error(_) -> {
+          process.send(reply, Error("no stored session " <> id))
+          actor.continue(state)
+        }
+        Ok(stored) ->
+          case stored.summary.title_source {
+            session.AutoTitle -> {
+              process.send(reply, Ok(True))
+              actor.continue(
+                State(
+                  ..update(state, id, fn(summary) {
+                    store.StoredSummary(..summary, title: title)
+                  }),
+                  events: [EvAutoTitleUpgrade(id, title), ..state.events],
+                ),
+              )
+            }
+            _ -> {
               process.send(reply, Ok(False))
               actor.continue(state)
             }

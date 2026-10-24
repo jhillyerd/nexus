@@ -300,6 +300,11 @@ pub type Msg {
   TurnDone
   TurnStopped
   TurnFailed(String)
+  /// The session's organizational metadata changed server-side (the
+  /// model-generated title upgrade landed). Refreshes the session list so
+  /// EVERY connected tab's sidebar updates — not just the client that
+  /// happens to be mid-turn.
+  MetaUpdated(title: Option(String), tags: List(String))
   // M3 tool events: translated 1:1 so the replay/live pipelines carry them;
   // rendering lands with the M3 UI workstream. No-ops in `update` for now.
   ToolCallDelta(
@@ -346,6 +351,7 @@ pub fn from_session_event(event: SessionEvent) -> Msg {
     session.TurnDone(_stats) -> TurnDone
     session.TurnStopped(_chars) -> TurnStopped
     session.TurnFailed(reason) -> TurnFailed(reason)
+    session.MetaUpdated(title, tags) -> MetaUpdated(title, tags)
     session.ToolCallDelta(index, id, name, fragment) ->
       ToolCallDelta(index, id, name, fragment)
     session.ToolCallAssembled(id, name, arguments) ->
@@ -786,6 +792,12 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     TurnDone -> #(finish_turn(model, CommitBubble), sessions_effect(model))
 
     TurnStopped -> #(finish_turn(model, CommitBubble), sessions_effect(model))
+
+    // Server-side metadata change (title upgrade): the payload is display
+    // metadata — the refresh re-reads the whole list from the registry, so
+    // every subscribed tab's sidebar re-renders with the new title. Titles
+    // render as text nodes, so hostile model output stays inert.
+    MetaUpdated(_title, _tags) -> #(model, sessions_effect(model))
 
     // A tool call's arguments are streaming in fragments. Any assistant
     // text seen so far belongs *before* the call (the loop commits text at
