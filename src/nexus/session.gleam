@@ -12,6 +12,13 @@
 //// - `Stop` cancels the in-flight turn through the seam's cancel subject;
 ////   partial text received so far is committed as the assistant turn.
 ////
+//// Utility side-call (utility-titles plan §4.2): after the first committed
+//// exchange, a debounced, once-per-session title branch runs in its own
+//// unlinked worker beside the turn machinery. It is invisible to callers —
+//// a `Send` cancels it instead of reporting `Busy` — and structurally
+//// isolated: the branch never enters the session's transcript, like the
+//// reasoning sidecar.
+////
 //// KV-cache contract: the transcript is only ever appended to
 //// (`append_user` / `append_assistant`), and every request is rebuilt from
 //// the immutable message list through `nexus/transcript.to_request` — the
@@ -38,6 +45,7 @@ import nexus/openai
 import nexus/timing
 import nexus/tools
 import nexus/transcript.{type Transcript}
+import nexus/utility
 
 /// Events broadcast to subscribers (Mist SSE connections, tests).
 pub type SessionEvent {
@@ -78,6 +86,12 @@ pub type SessionEvent {
   /// M3: loop progress — `iteration` is 1-based; `phase` is "request",
   /// "tools", or "guard" (terminal rendering when the guard trips).
   LoopStatus(iteration: Int, max_iterations: Int, phase: String)
+  /// The session's organizational metadata changed server-side — P2: the
+  /// model-generated title upgrade landed. Broadcast to subscribers ONLY
+  /// when something applied, so every connected tab refreshes its sidebar
+  /// (the registry mutations of the acting client refresh via their own
+  /// reply path). Display metadata; never enters a request body.
+  MetaUpdated(title: Option(String), tags: List(String))
 }
 
 /// What a turn runner reports when its blocking stream returns. The
@@ -102,6 +116,49 @@ pub type TurnOutcome {
 pub type TurnRunner =
   fn(openai.Endpoint, Transcript, Subject(Nil), fn(loop.LoopEvent) -> Nil) ->
     TurnOutcome
+
+/// The utility side-call seam (utility-titles plan §4.2): ONE blocking
+/// model round-trip over a committed transcript snapshot — the title
+/// branch. Returns the parsed title, or `Error` for anything unusable
+/// (transport failure, cancellation, a tool-call answer, a refusal):
+/// best-effort, discarded, never retried. The endpoint is the session's
+/// frozen one; `cancel` must be owned by the calling process.
+pub type UtilityRunner =
+  fn(openai.Endpoint, Transcript, Subject(Nil)) -> Result(String, String)
+
+/// Fresh display metadata as the apply step reports it: what actually
+/// landed, carried to the `MetaUpdated` broadcast.
+pub type UtilityMeta {
+  UtilityMeta(title: String, tags: List(String))
+}
+
+/// The apply seam: guarded title application — in production the registry
+/// `UpgradeAutoTitle` ask (guard `title_source = 'auto'` only), injected
+/// exactly like the turn runner so this module never depends on the
+/// registry (dependency direction stays registry → session, and the
+/// session actor never blocks on an ask). `Error` when the guard refused
+/// (a manual rename wins forever, unknown id, empty title).
+pub type UtilityApply =
+  fn(String) -> Result(UtilityMeta, Nil)
+
+/// What a completed utility attempt reports to the actor.
+pub type UtilityResult {
+  /// The guard applied the title; carries the fresh display metadata.
+  UtilityApplied(title: String, tags: List(String))
+  /// Nothing applied: stream failed/cancelled, or the guard refused.
+  UtilityFailed
+}
+
+/// The real utility runner (utility-titles plan §4.2), built ONCE at boot
+/// beside `agent_runner`: closes over the shared frozen envelope
+/// (`loop.frozen_options` — byte-identical to every turn request by
+/// construction), so the only per-call delta is the generation-side token
+/// cap applied inside `utility.run`. `specs` is the same boot-frozen tool
+/// registry the agent loop uses — never a per-session set.
+pub fn utility_runner(specs: List(tools.ToolSpec)) -> UtilityRunner {
+  let base = loop.frozen_options(specs)
+  fn(endpoint, tr, cancel) { utility.run(endpoint, tr, base, cancel) }
+}
 
 pub type SendResult {
   Sent
@@ -128,6 +185,15 @@ pub type SendResult {
 ///   have been built through `nexus/transcript.new` + the `append_*`
 ///   functions (the one construction path); a hydrated actor therefore
 ///   re-encodes byte-identically by construction.
+///
+/// Utility-titles P2 adds two more injected seams, again built by the
+/// registry so the dependency direction stays registry → session:
+///
+/// - `utility_runner` performs the one side-call (title branch) over a
+///   committed transcript snapshot; the real one is `utility_runner`
+///   below, tests inject fakes.
+/// - `utility_apply` lands the parsed title behind the registry's
+///   `title_source = 'auto'` guard (a manual rename wins forever).
 pub type SessionSpec {
   SessionSpec(
     cfg: Config,
@@ -140,6 +206,10 @@ pub type SessionSpec {
     /// Starting transcript for a hydrated (restored) session; `None`
     /// builds `transcript.new(model, cfg.system_prompt)` as before.
     hydrate: Option(Transcript),
+    /// The utility side-call (title branch) — see `UtilityRunner`.
+    utility_runner: UtilityRunner,
+    /// Guarded title application — see `UtilityApply`.
+    utility_apply: UtilityApply,
   )
 }
 
@@ -232,6 +302,11 @@ pub type Msg {
   TurnStarted(worker: Pid, cancel: Subject(Nil))
   WorkerEvent(worker: Pid, event: loop.LoopEvent)
   WorkerDone(worker: Pid, outcome: TurnOutcome)
+  /// Utility plumbing (internal, utility-titles plan §4.2): the debounce
+  /// fired, a worker took the cancel subject, an attempt completed.
+  UtilityStart
+  UtilityStarted(worker: Pid, cancel: Subject(Nil))
+  UtilityDone(worker: Pid, result: UtilityResult)
   /// Monitor plumbing: a monitored process went down.
   WorkerDown(worker: Pid)
   /// Selector plumbing for non-process monitors; always ignored.
@@ -249,6 +324,22 @@ type TurnState {
     deltas: Int,
     started_us: Int,
     first_delta_us: Option(Int),
+  )
+}
+
+/// Utility side-call lifecycle (utility-titles plan §4.2). Mirrors the
+/// turn lifecycle but is invisible to callers: the session never reports
+/// `Busy` because of a side call. `cancelled` is set when a `Send` raced
+/// the attempt — a cancelled attempt's completion must not consume
+/// `utility_attempted`.
+type UtilityState {
+  UtilityIdle
+  UtilityStarting(worker: Pid, monitor: Monitor, cancelled: Bool)
+  UtilityRunning(
+    worker: Pid,
+    monitor: Monitor,
+    cancel: Subject(Nil),
+    cancelled: Bool,
   )
 }
 
@@ -271,6 +362,23 @@ type State {
     /// Phase 2 write-behind observer — the store's commit lane. Runs at
     /// commit points only, is a plain send, and never blocks.
     commit_hook: fn(Transcript) -> Nil,
+    /// Utility side-call state (utility-titles plan §4.2).
+    utility: UtilityState,
+    /// A debounce is OWED: `UtilityStart` fired while a turn was in flight
+    /// (the side call must not queue behind it), so the trigger is deferred
+    /// to the turn's end — committed or failed — instead of being dropped
+    /// or rescheduled (a timer-based re-arm would spin at delay 0). The
+    /// turn's own commit-point arm also consumes this.
+    utility_pending: Bool,
+    /// The session's ONE title attempt (utility-titles plan §4.2). Flips
+    /// only when an attempt COMPLETES (applied or failed) — never when one
+    /// is armed or cancelled — so a fast follow-up can kill at most the
+    /// in-flight try, never the session's only one.
+    utility_attempted: Bool,
+    /// The injected side-call seams (see `SessionSpec`): the LLM branch
+    /// and the guarded title application, both run by the unlinked worker.
+    utility_runner: UtilityRunner,
+    utility_apply: UtilityApply,
   )
 }
 
@@ -327,6 +435,8 @@ fn start_builder(spec: SessionSpec) {
     runner: runner,
     commit_hook: commit_hook,
     hydrate: hydrate,
+    utility_runner: utility_runner,
+    utility_apply: utility_apply,
   ) = spec
   actor.new_with_initialiser(1000, fn(self) {
     actor.initialised(State(
@@ -344,10 +454,24 @@ fn start_builder(spec: SessionSpec) {
       },
       subs: [],
       turn: Idle,
+      utility: UtilityIdle,
+      utility_pending: False,
+      // A hydrated (restored) session's first exchange predates this actor:
+      // the utility-titles plan's §8 proposal — only sessions whose first
+      // exchange happens in the actor's lifetime attempt the upgrade. A
+      // restart therefore never re-titles an already-upgraded session (the
+      // upgrade leaves title_source = 'auto', so the store alone cannot
+      // tell "upgraded" from "still the heuristic placeholder").
+      utility_attempted: case hydrate {
+        Some(_) -> True
+        None -> False
+      },
       self: self,
       metrics: [],
       last_commit_s: 0,
       commit_hook: commit_hook,
+      utility_runner: utility_runner,
+      utility_apply: utility_apply,
     ))
     |> actor.returning(self)
     |> actor.selecting(
@@ -461,7 +585,14 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       actor.continue(State(..state, subs:))
     }
 
-    Send(text, reply) ->
+    Send(text, reply) -> {
+      // A utility side-call in flight never blocks a send: cancel it and
+      // proceed normally — the session must never report `Busy` because of
+      // a side call (required fairness on serialized backends: the side
+      // call would otherwise queue the user's turn behind it). The
+      // cancelled attempt does not consume `utility_attempted`; the next
+      // turn-commit point re-arms the debounce.
+      let state = cancel_utility(state)
       case state.turn {
         Idle -> {
           let tr = transcript.append_user(state.transcript, text)
@@ -498,6 +629,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           actor.continue(state)
         }
       }
+    }
 
     Stop ->
       case state.turn {
@@ -679,7 +811,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
             }
             False -> Nil
           }
-          actor.continue(
+          let state =
             State(
               ..state,
               transcript: tr,
@@ -689,11 +821,102 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
                 True -> timing.wall_now_s()
                 False -> state.last_commit_s
               },
-            ),
-          )
+            )
+          // The utility trigger (utility-titles plan §4.2): the turn
+          // committed → maybe arm the title-branch debounce. A failed turn
+          // (nothing committed) never triggers it.
+          actor.continue(arm_utility(state, committed))
         }
       }
     }
+
+    UtilityStart ->
+      // The debounce fired. Every condition is re-checked at fire time, so
+      // a stale or racing timer is simply dropped. When the ONLY blocker is
+      // a turn in flight, mark a trigger OWED instead: the side call must
+      // not queue behind a turn (serialized backends), and the owed trigger
+      // is delivered when the turn ends — even a turn that then FAILS (a
+      // failed turn re-arms nothing itself), so the already-committed first
+      // exchange is never stranded untitled. Deliberately NOT a timer
+      // re-arm: with NEXUS_UTILITY_DELAY_MS = 0 that would busy-loop for
+      // the whole turn.
+      case
+        state.turn,
+        state.utility,
+        state.utility_attempted,
+        state.cfg.utility_enabled,
+        transcript.length(state.transcript) >= 3
+      {
+        Idle, UtilityIdle, False, True, True -> {
+          // Unlinked worker (mirror of the turn worker): holds the
+          // committed transcript snapshot — an immutable value, and the
+          // branch (Y + reply B) never enters the session's transcript,
+          // structurally unable to change a request byte — and creates its
+          // own cancel subject (stream_with_cancel ownership rule). The
+          // WORKER applies the title through the registry ask (the actor
+          // never blocks), then reports the outcome.
+          let snapshot = state.transcript
+          let worker =
+            process.spawn_unlinked(fn() {
+              let cancel = process.new_subject()
+              let pid = process.self()
+              process.send(state.self, UtilityStarted(pid, cancel))
+              let result = case
+                state.utility_runner(state.endpoint, snapshot, cancel)
+              {
+                Ok(title) ->
+                  case state.utility_apply(title) {
+                    Ok(meta) -> UtilityApplied(meta.title, meta.tags)
+                    Error(Nil) -> UtilityFailed
+                  }
+                Error(_) -> UtilityFailed
+              }
+              process.send(state.self, UtilityDone(pid, result))
+            })
+          let monitor = process.monitor(worker)
+          actor.continue(
+            State(
+              ..state,
+              utility: UtilityStarting(worker, monitor, False),
+              utility_pending: False,
+            ),
+          )
+        }
+        _, UtilityIdle, False, True, True ->
+          actor.continue(State(..state, utility_pending: True))
+        // Genuinely terminal (attempt in flight, flag consumed, feature
+        // off): drop, and with it any owed trigger that can no longer
+        // matter.
+        _, _, _, _, _ -> actor.continue(State(..state, utility_pending: False))
+      }
+
+    UtilityStarted(worker, cancel) ->
+      case state.utility {
+        UtilityStarting(pid, monitor, cancelled) if pid == worker -> {
+          // A Send raced the handshake: cancel immediately, exactly like a
+          // turn's stop_requested.
+          case cancelled {
+            True -> process.send(cancel, Nil)
+            False -> Nil
+          }
+          actor.continue(
+            State(
+              ..state,
+              utility: UtilityRunning(worker, monitor, cancel, cancelled),
+            ),
+          )
+        }
+        _ -> actor.continue(state)
+      }
+
+    UtilityDone(worker, result) ->
+      case state.utility {
+        UtilityStarting(pid, monitor, cancelled) if pid == worker ->
+          finish_utility(state, monitor, cancelled, result)
+        UtilityRunning(pid, monitor, _, cancelled) if pid == worker ->
+          finish_utility(state, monitor, cancelled, result)
+        _ -> actor.continue(state)
+      }
 
     WorkerDown(worker) -> {
       // Every monitored process funnels here (the selector maps all
@@ -716,30 +939,43 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           candidate == worker
         Idle -> False
       }
-      case is_current {
-        False -> actor.continue(state)
-        True -> {
-          broadcast(state.subs, TurnFailed("turn worker exited unexpectedly"))
-          actor.continue(
-            State(
-              ..state,
-              turn: Idle,
-              metrics: push_metric(
-                state.metrics,
-                MetricSample(
-                  outcome: Failed,
-                  ttft_ms: None,
-                  duration_ms: turn_duration_ms(state.turn),
-                  token_deltas: turn_deltas(state.turn),
-                  prompt_tokens: None,
-                  cached_tokens: None,
-                  stopped_chars: None,
-                  failure_reason: Some("turn worker exited unexpectedly"),
+      // A crashed UTILITY worker is best-effort: reset the side-call state
+      // WITHOUT consuming `utility_attempted` (a crash must not eat the
+      // session's only attempt) — the next turn-commit point re-arms.
+      case state.utility {
+        UtilityStarting(pid, _, _)
+          | UtilityRunning(pid, _, _, _)
+          if pid == worker
+        -> actor.continue(State(..state, utility: UtilityIdle))
+        _ ->
+          case is_current {
+            False -> actor.continue(state)
+            True -> {
+              broadcast(
+                state.subs,
+                TurnFailed("turn worker exited unexpectedly"),
+              )
+              actor.continue(
+                State(
+                  ..state,
+                  turn: Idle,
+                  metrics: push_metric(
+                    state.metrics,
+                    MetricSample(
+                      outcome: Failed,
+                      ttft_ms: None,
+                      duration_ms: turn_duration_ms(state.turn),
+                      token_deltas: turn_deltas(state.turn),
+                      prompt_tokens: None,
+                      cached_tokens: None,
+                      stopped_chars: None,
+                      failure_reason: Some("turn worker exited unexpectedly"),
+                    ),
+                  ),
                 ),
-              ),
-            ),
-          )
-        }
+              )
+            }
+          }
       }
     }
 
@@ -749,6 +985,93 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
 
 fn broadcast(subs: List(Subject(SessionEvent)), event: SessionEvent) -> Nil {
   list.each(subs, fn(sub) { process.send(sub, event) })
+}
+
+// ---------------------------------------------------------------------------
+// Utility side-call (utility-titles plan §4.2): trigger, cancel, result
+// ---------------------------------------------------------------------------
+
+/// Cancel any in-flight utility attempt (a `Send` arriving mid-flight).
+/// The attempt's completion will still arrive as `UtilityDone`, but the
+/// `cancelled` mark keeps it from consuming `utility_attempted`.
+fn cancel_utility(state: State) -> State {
+  case state.utility {
+    UtilityIdle -> state
+    UtilityStarting(worker, monitor, _) ->
+      State(..state, utility: UtilityStarting(worker, monitor, True))
+    UtilityRunning(worker, monitor, cancel, _) -> {
+      process.send(cancel, Nil)
+      State(..state, utility: UtilityRunning(worker, monitor, cancel, True))
+    }
+  }
+}
+
+/// The utility trigger, called at the turn-commit point: when the turn
+/// committed — or an earlier-committed exchange still owes a deferred
+/// trigger (`utility_pending`, set when the debounce fired mid-turn) — and
+/// the once-per-session attempt is still available, the feature is
+/// enabled, and no side call is in flight → arm the debounce timer
+/// (`NEXUS_UTILITY_DELAY_MS`). Nothing else changes here: the timer's
+/// message re-checks every condition at fire time, so racing timers are
+/// harmless.
+fn arm_utility(state: State, committed: Bool) -> State {
+  case
+    committed || state.utility_pending,
+    state.utility_attempted,
+    state.cfg.utility_enabled,
+    state.utility,
+    transcript.length(state.transcript) >= 3
+  {
+    True, False, True, UtilityIdle, True -> {
+      process.send_after(state.self, state.cfg.utility_delay_ms, UtilityStart)
+      State(..state, utility_pending: False)
+    }
+    // The side call is still busy (e.g. a cancelled-but-unreported
+    // worker): keep the owed trigger for a later turn end.
+    True, False, True, _, _ -> state
+    _, _, _, _, _ -> State(..state, utility_pending: False)
+  }
+}
+
+/// A completed utility attempt: the once-flag flips ONLY here (never when
+/// armed or cancelled), and the new metadata is broadcast to subscribers
+/// ONLY when something applied — every connected tab's sidebar refreshes
+/// from the event.
+fn finish_utility(
+  state: State,
+  monitor: Monitor,
+  cancelled: Bool,
+  result: UtilityResult,
+) -> actor.Next(State, Msg) {
+  process.demonitor_process(monitor)
+  // The once-flag: an APPLIED title consumes the attempt even when a Send's
+  // cancellation raced it — the registry applied, so a second request would
+  // be pure waste. A FAILED attempt consumes it only when it actually
+  // completed on its own; a cancelled one is re-armed by the next
+  // turn-commit point.
+  let utility_attempted = case result, cancelled {
+    UtilityApplied(..), _ -> True
+    UtilityFailed, True -> state.utility_attempted
+    UtilityFailed, False -> True
+  }
+  let state =
+    State(
+      ..state,
+      utility: UtilityIdle,
+      utility_attempted: utility_attempted,
+      // The once-flag is spent: an owed trigger could never fire again.
+      utility_pending: case utility_attempted {
+        True -> False
+        False -> state.utility_pending
+      },
+    )
+  case result {
+    UtilityApplied(title, tags) -> {
+      broadcast(state.subs, MetaUpdated(Some(title), tags))
+      actor.continue(state)
+    }
+    UtilityFailed -> actor.continue(state)
+  }
 }
 
 /// Finalise a turn. The worker returns the full extended transcript for

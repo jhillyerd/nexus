@@ -44,6 +44,10 @@ fn test_config() -> config.Config {
     pg_database: "nexus",
     pg_user: "nexus",
     pg_password: None,
+    // Utility side-call on (the default): tests inject no-op fakes, and a
+    // debounced failed attempt is invisible to event assertions.
+    utility_enabled: True,
+    utility_delay_ms: 1500,
   )
 }
 

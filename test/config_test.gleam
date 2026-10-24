@@ -23,6 +23,8 @@ fn set_all(pairs: List(#(String, String))) -> Nil {
   envoy.unset("NEXUS_HTTP_PORT")
   envoy.unset("NEXUS_UI_TOKEN")
   envoy.unset("NEXUS_SYSTEM_PROMPT")
+  envoy.unset("NEXUS_UTILITY_ENABLED")
+  envoy.unset("NEXUS_UTILITY_DELAY_MS")
   list.each(pairs, fn(pair) { envoy.set(pair.0, pair.1) })
 }
 
@@ -102,4 +104,18 @@ pub fn load_rejects_non_integer_test() {
   ])
   let assert Error(message) = config.load()
   should.be_true(string.contains(message, "NEXUS_SSE_FIRST_RESPONSE_TIMEOUT_MS"))
+}
+
+/// A negative delay would only surface as a timer crash at the first
+/// committed exchange — misconfiguration must fail the load instead.
+pub fn load_rejects_negative_utility_delay_test() {
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_UTILITY_DELAY_MS", "-1"),
+  ])
+  let assert Error(message) = config.load()
+  message
+  |> should.equal(
+    "environment variable NEXUS_UTILITY_DELAY_MS must be >= 0: -1",
+  )
 }

@@ -50,6 +50,12 @@ fn test_config() -> Config {
     pg_database: "nexus",
     pg_user: "nexus",
     pg_password: None,
+    // These suites boot the registry via `start`, whose real utility
+    // runner would stream from a network endpoint once a debounce fired —
+    // and they never assert on the side call. Keep the feature off so
+    // `gleam test` stays strictly offline/network-free (AGENTS.md).
+    utility_enabled: False,
+    utility_delay_ms: 1500,
   )
 }
 
