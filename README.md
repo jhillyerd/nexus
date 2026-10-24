@@ -276,7 +276,7 @@ pair explicitly at creation (see `docs/plans/completed/multi-provider.md`).
 | `NEXUS_PG_USER` | `nexus` | database user |
 | `NEXUS_PG_PASSWORD` | unset | optional password; never logged or echoed |
 | `NEXUS_UTILITY_ENABLED` | `true` | once-per-session model-generated title upgrade (a side call branched off the committed transcript's cached prefix); `false` keeps the heuristic first-message title forever |
-| `NEXUS_UTILITY_DELAY_MS` | `1500` | debounce after a turn commit before the title side call starts (a sent message cancels it, without consuming the session's one attempt) |
+| `NEXUS_UTILITY_DELAY_MS` | `1500` | debounce after a turn commit before the title side call starts (a send cancels an in-flight call without consuming the session's one attempt) |
 
 With `NEXUS_UI_TOKEN` set, open `/?token=<token>`. The page forwards the
 token as a `Bearer` header for `fetch` requests and as a query parameter

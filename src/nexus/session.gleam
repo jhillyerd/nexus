@@ -449,7 +449,16 @@ fn start_builder(spec: SessionSpec) {
       subs: [],
       turn: Idle,
       utility: UtilityIdle,
-      utility_attempted: False,
+      // A hydrated (restored) session's first exchange predates this actor:
+      // the utility-titles plan's §8 proposal — only sessions whose first
+      // exchange happens in the actor's lifetime attempt the upgrade. A
+      // restart therefore never re-titles an already-upgraded session (the
+      // upgrade leaves title_source = 'auto', so the store alone cannot
+      // tell "upgraded" from "still the heuristic placeholder").
+      utility_attempted: case hydrate {
+        Some(_) -> True
+        None -> False
+      },
       self: self,
       metrics: [],
       last_commit_s: 0,
@@ -816,8 +825,12 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
 
     UtilityStart ->
       // The debounce fired. Every condition is re-checked at fire time, so
-      // a stale or racing timer (a turn started meanwhile, a side call in
-      // flight) is simply dropped — a later turn-commit point re-arms.
+      // a stale or racing timer is simply dropped. When the ONLY blocker is
+      // a turn in flight, re-arm instead of dropping: the side call must
+      // not queue behind a turn (serialized backends), and the chain then
+      // fires into the next quiet window — including after a turn that
+      // FAILS (a failed turn re-arms nothing itself), so the already-
+      // committed first exchange is never stranded untitled.
       case
         state.turn,
         state.utility,
@@ -855,6 +868,14 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           actor.continue(
             State(..state, utility: UtilityStarting(worker, monitor, False)),
           )
+        }
+        _, UtilityIdle, False, True, True -> {
+          process.send_after(
+            state.self,
+            state.cfg.utility_delay_ms,
+            UtilityStart,
+          )
+          actor.continue(state)
         }
         _, _, _, _, _ -> actor.continue(state)
       }
@@ -1009,9 +1030,15 @@ fn finish_utility(
   result: UtilityResult,
 ) -> actor.Next(State, Msg) {
   process.demonitor_process(monitor)
-  let utility_attempted = case cancelled {
-    True -> state.utility_attempted
-    False -> True
+  // The once-flag: an APPLIED title consumes the attempt even when a Send's
+  // cancellation raced it — the registry applied, so a second request would
+  // be pure waste. A FAILED attempt consumes it only when it actually
+  // completed on its own; a cancelled one is re-armed by the next
+  // turn-commit point.
+  let utility_attempted = case result, cancelled {
+    UtilityApplied(..), _ -> True
+    UtilityFailed, True -> state.utility_attempted
+    UtilityFailed, False -> True
   }
   let state =
     State(..state, utility: UtilityIdle, utility_attempted: utility_attempted)

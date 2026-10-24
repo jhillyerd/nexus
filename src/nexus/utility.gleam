@@ -39,8 +39,12 @@ const title_limit = 60
 
 /// Bounds the side call's cost and rambling. Generation-side params do not
 /// affect the tokenized prompt (utility-titles plan §4.1), so the prefix is
-/// untouched.
-const utility_token_cap = 64
+/// untouched. Deliberately generous headroom over the one-line title:
+/// reasoning models emit their chain of thought INSIDE this completion
+/// budget, so a tight cap lets a thinking model exhaust it before any
+/// title text arrives — wasting the session's only attempt. The reply
+/// itself stays bounded by `shape_title`'s 60-character cap.
+const utility_token_cap = 512
 
 /// The appended user instruction (Y in the plan). Tool use is forbidden
 /// in the prompt because the frozen `tools` array renders into the prompt

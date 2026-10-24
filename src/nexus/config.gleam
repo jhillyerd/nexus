@@ -141,7 +141,7 @@ pub fn from_env(
     "NEXUS_UTILITY_ENABLED",
     True,
   ))
-  use utility_delay_ms <- result.try(optional_int(
+  use utility_delay_ms <- result.try(optional_non_negative_int(
     get,
     "NEXUS_UTILITY_DELAY_MS",
     1500,
@@ -228,6 +228,27 @@ fn optional_int(
             "environment variable " <> name <> " is not an integer: " <> raw,
           )
       }
+  }
+}
+
+/// Like `optional_int`, but a negative value fails the load. For delays
+/// handed to timers: a bad sign would otherwise surface as a runtime crash
+/// at first use instead of the loud boot failure this module promises.
+fn optional_non_negative_int(
+  get: fn(String) -> Result(String, Nil),
+  name: String,
+  default: Int,
+) -> Result(Int, String) {
+  use value <- result.try(optional_int(get, name, default))
+  case value < 0 {
+    True ->
+      Error(
+        "environment variable "
+        <> name
+        <> " must be >= 0: "
+        <> int.to_string(value),
+      )
+    False -> Ok(value)
   }
 }
 
