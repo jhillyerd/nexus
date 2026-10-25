@@ -246,7 +246,9 @@ fn boot(seam: store.Store) -> Boot {
       registry_name,
       seam,
       tool_round_runner,
-      fn(_endpoint, _tr, _cancel) { Error("no utility call in this test") },
+      fn(_endpoint, _tr, _cancel, _allow_pass) {
+        Error("no utility call in this test")
+      },
       fixture_resolver(),
     )
   Boot(

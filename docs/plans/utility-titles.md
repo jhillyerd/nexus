@@ -2,7 +2,7 @@
 title: Nexus — model-generated session titles via prefix-cache piggybacking
 status: draft
 tags: [nexus, titles, kv-cache, utility]
-updated: 2026-10-24
+updated: 2026-10-25
 ---
 
 # Nexus: model-generated session titles via prefix-cache piggybacking
@@ -19,6 +19,16 @@ cache-capable backends and needs **no second model**.
 > verification this pass. Serving facts live in the
 > `.agents/skills/llm-api` skill; this doc cites them, it does not
 > re-derive them.
+>
+> Decision from the 2026-10-25 session (landed): **PASS postpone**. The
+> first exchange often gives the model too little to title specifically
+> (a greeting-only opener), so the model may reply exactly PASS and the
+> attempt re-arms at the next turn-commit point. Exactly ONE pass is
+> honored per session, then attempts run under a forced instruction with
+> no PASS option, so the forced attempt cannot defer again. Retrying is
+> cheap here by construction: the re-armed attempt reuses the still-warm
+> cached prefix (~Y + title tokens again), and cancel-on-send + debounce
+> already bound the latency harm on serialized backends.
 
 ## 1. Goal and non-goals
 
@@ -81,27 +91,41 @@ tokens instead.
 
 Pure request/parse helpers plus one runner — no actor of its own:
 
-- `instruction() -> String` — the appended user message Y. Wording
-  (refine at implementation): *"You are being asked a housekeeping
-  question about the conversation above. In one line, give this
-  conversation a concise sentence-case title of 3–7 words. Do not call
-  any tools. Reply with the title only."* Tool use is forbidden in the
-  prompt because the frozen `tools` array renders into the prompt and
-  cannot be stripped without diverging the prefix.
-- `prepare(tr) -> Transcript` — `transcript.append_user(tr, instruction())`.
+- `instruction(allow_pass) -> String` — the appended user message Y, in
+  two variants. Both share the base wording and the tool prohibition
+  ("Do not call any tools. Reply with the title only."). The allowed
+  variant adds: *"If the conversation so far does not yet give you
+  enough to write a specific title, reply with exactly PASS instead."*
+  The forced variant adds: *"Even if the conversation is still slight,
+  reply with the best title you can — do not defer."* — and must not
+  mention the sentinel at all, so a model that never saw the option
+  cannot be steered into it. Tool use is forbidden in the prompt
+  because the frozen `tools` array renders into the prompt and cannot
+  be stripped without diverging the prefix.
+- `prepare(tr, allow_pass) -> Transcript` —
+  `transcript.append_user(tr, instruction(allow_pass))`.
 - `options(base) -> Options` — the loop's Options with exactly one
   delta: `max_completion_tokens: Some(64)`. Generation-side params do
   not affect the tokenized prompt (llm-api skill §3.3), so the prefix
   is untouched; the cap bounds cost and rambling.
-- `parse(text) -> String` — trim, strip Markdown code fences, collapse
-  whitespace, and cap length with the same rule as
-  `title_from_first_message`; reject empty. (Title text is display
-  data: the UI renders it as a Lustre text node, so hostile output is
-  inert by the existing no-`innerHTML` contract.)
-- `run(endpoint, tr, base_opts, cancel) -> Result(String, String)` —
-  one non-loop stream via `openai.stream_with_cancel`, accumulating
-  text deltas; any assembled tool call, or a refusal, is a failure and
-  the result is discarded (best-effort: no retry in this pass).
+- `parse(allow_pass, text) -> Result(Verdict, Nil)` — trim, strip
+  Markdown code fences, collapse whitespace, and cap length with the
+  same rule as `title_from_first_message`; reject empty (a refusal
+  arrives as no content, so it fails here too). `Verdict` is
+  `Title(String) | Pass`: the PASS sentinel matches only a WHOLE shaped
+  reply, case-insensitively — a real title that merely contains the
+  word ("Password Manager Setup") never postpones. Under the forced
+  instruction a PASS reply is rejected as an unusable title (a
+  failure), not a postpone — the forced attempt cannot defer again.
+  (Title text is display data: the UI renders it as a Lustre text
+  node, so hostile output is inert by the existing no-`innerHTML`
+  contract.)
+- `run(endpoint, tr, base_opts, cancel, allow_pass) ->
+  Result(Verdict, String)` — one non-loop stream via
+  `openai.stream_with_cancel`, accumulating text deltas; any assembled
+  tool call, or a refusal, is a failure, and a PASS (allowed attempts
+  only) comes back as `Ok(Pass)` for the actor's postpone policy — the
+  result is discarded on failure (best-effort: no retry in this pass).
 
 ### 4.2 Session actor (`src/nexus/session.gleam`)
 
@@ -113,10 +137,14 @@ Pure request/parse helpers plus one runner — no actor of its own:
   `fn`** consumed by both the agent loop and the utility runner.
 - New messages: `UtilityStart` (debounce fired, spawn the worker) and
   `UtilityDone(pid, result)`. State gains `utility: UtilityState`
-  (`Idle | Running(pid, cancel_subject)`) and a once-per-session
+  (`Idle | Running(pid, cancel_subject)`), a once-per-session
   `utility_attempted: Bool` that flips **only when an attempt
   completes** (applied or failed) — never when one is armed or
-  cancelled.
+  cancelled — and `utility_passes: Int`, the PASS replies honored so
+  far (`max_utility_passes = 1`, a const: an uncapped pass-forever
+  policy would re-arm a side call after every turn of a perpetual
+  small-talk session and never converge). The runner receives
+  `allow_pass = utility_passes < max_utility_passes`.
 - **Trigger.** At the turn-commit point (~L677), when the turn
   committed, `transcript.length(tr) >= 3` (system + first user + first
   assistant), the once-flag is unset, and config enables the feature →
@@ -130,6 +158,15 @@ Pure request/parse helpers plus one runner — no actor of its own:
   a fast follow-up can kill at most the in-flight try, never the
   session's only one — the heuristic title is always eventually
   upgraded (or replaced by a manual rename).
+- **PASS postpone.** A completed attempt reporting PASS (`UtilityPassed`)
+  consumes nothing: the once-flag stays unset and the next turn-commit
+  point re-arms the debounce, with the forced instruction because
+  `utility_passes` has incremented. A PASS that raced a `Send`
+  (cancelled mark) delivers any owed trigger immediately, like a
+  cancelled failure. A PASS under the forced instruction is an unusable
+  title: the worker maps it to `UtilityFailed`, so it consumes the
+  attempt like any failure — no runner can smuggle an endless postpone
+  past the actor boundary.
 - **Cancellation.** A `Send` arriving while a utility worker runs
   sends its cancel subject and proceeds normally — the session never
   reports `Busy` because of a utility call. This is required fairness
@@ -231,14 +268,20 @@ carry everything.
     Options delta is `max_completion_tokens`.
   - *Parser*: code-fenced output, multi-line, leading prose,
     `<script>` payloads (must pass through inert + capped), empty,
-    refusal.
-  - *Instruction*: Y forbids tool calls; Y is a single user message.
+    refusal; PASS sentinel (bare / padded / fenced, case-insensitive),
+    whole-string matching ("Password Manager Setup" and "PASS." are
+    titles, not passes), and forced-instruction rejection.
+  - *Instruction*: Y forbids tool calls (both variants); Y is a single
+    user message; only the allowed variant mentions PASS.
 - **`test/session_test.gleam`** (extend, fake `utility_runner`): fires
   once after the first committed exchange; not on failed turns; never
   marks the session `Busy`; cancelled when a `Send` arrives
   mid-flight, and a cancelled attempt does not consume the once-flag
   (it re-arms at the next commit point); `MetaUpdated` broadcast only
-  when the registry guard applied.
+  when the registry guard applied; PASS postpone — a PASS consumes
+  nothing and the re-armed attempt arrives forced, its title applies,
+  and only then is the flag spent; a PASS under the forced attempt
+  consumes the attempt (no third try).
 - **`test/session_persistence_test.gleam`** + `test/store_mock.gleam`:
   `auto_title_upgrade` guard semantics (auto → applies and replaces
   the heuristic; manual → refused, reply `False`).
@@ -294,6 +337,13 @@ request; until then Y stays title-only.
   *completed* attempt; a `Send` that cancels an in-flight worker
   leaves it unset, and the next turn-commit point re-arms the debounce.
   Worst case the title lands one turn later than it could have.
+- **Not enough signal in the first exchange** (greeting-only openers):
+  resolved by the PASS postpone (see the 2026-10-25 decision above) —
+  the model self-assesses and defers once, then the forced instruction
+  removes the deferral option (a failed forced attempt still just
+  spends the attempt, leaving the heuristic placeholder). Bounded cost:
+  one extra ~Y + title-token side call per passing session on
+  cache-capable backends.
 - **Open**: exact Y wording and whether the title upgrade should also
   fire for sessions rehydrated from the store that already have a
   heuristic title but were created before this feature (proposal: no —

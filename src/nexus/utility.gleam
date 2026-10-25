@@ -6,6 +6,16 @@
 //// instruction message; the reply becomes the title while
 //// `title_source = 'auto'` and is otherwise discarded (best-effort).
 ////
+//// PASS postpone: when the first exchange gives the model too little to
+//// title specifically (a greeting-only opener, say), it may reply
+//// exactly PASS instead. A PASS is not a failure and not a title: the
+//// session actor treats it as "not yet" — the once-per-session attempt
+//// stays available and re-arms at the next turn-commit point. Exactly
+//// one pass is honored per session; after that the forced instruction
+//// (no PASS option) demands the best title available, so the forced
+//// attempt cannot defer again. A PASS under the forced instruction is an
+//// unusable title, not a postpone.
+////
 //// Structure: pure request/parse helpers plus one blocking runner — no
 //// actor of its own. The runner executes inside the session's unlinked
 //// utility worker (like the turn worker), never the session actor.
@@ -49,16 +59,36 @@ const utility_token_cap = 512
 /// The appended user instruction (Y in the plan). Tool use is forbidden
 /// in the prompt because the frozen `tools` array renders into the prompt
 /// and cannot be stripped without diverging the cached prefix.
-pub fn instruction() -> String {
-  "You are being asked a housekeeping question about the conversation above. "
-  <> "In one line, give this conversation a concise sentence-case title of "
-  <> "3–7 words. Do not call any tools. Reply with the title only."
+///
+/// `allow_pass` picks the variant: the first (unpassed) attempt offers
+/// the PASS escape hatch — the model judges whether the conversation has
+/// enough signal for a specific title — while a re-armed attempt after a
+/// pass uses the forced variant, which must not mention the sentinel at
+/// all (a model that never saw the option cannot be steered into it).
+pub fn instruction(allow_pass: Bool) -> String {
+  let base =
+    "You are being asked a housekeeping question about the conversation above. "
+    <> "In one line, give this conversation a concise sentence-case title of "
+    <> "3–7 words."
+  let tail = " Do not call any tools. Reply with the title only."
+  case allow_pass {
+    True ->
+      base
+      <> " If the conversation so far does not yet give you enough to write "
+      <> "a specific title, reply with exactly PASS instead."
+      <> tail
+    False ->
+      base
+      <> " Even if the conversation is still slight, reply with the best "
+      <> "title you can — do not defer."
+      <> tail
+  }
 }
 
 /// The utility transcript: the committed snapshot plus the instruction as
 /// one user message (Y). Never committed back into the session.
-pub fn prepare(tr: Transcript) -> Transcript {
-  transcript.append_user(tr, instruction())
+pub fn prepare(tr: Transcript, allow_pass: Bool) -> Transcript {
+  transcript.append_user(tr, instruction(allow_pass))
 }
 
 /// The loop's frozen envelope with exactly one delta: the generation-side
@@ -68,15 +98,44 @@ pub fn options(base: Options) -> Options {
   transcript.Options(..base, max_completion_tokens: Some(utility_token_cap))
 }
 
-/// Parse a utility reply into a title: trim, strip Markdown code fences,
+/// A parsed utility reply: a display title, or the model's PASS — its
+/// "not enough signal yet" verdict, honored once per session (the session
+/// actor owns that policy; this module only reports it).
+pub type Verdict {
+  Title(String)
+  Pass
+}
+
+/// Parse a utility reply into a verdict: trim, strip Markdown code fences,
 /// collapse whitespace, cap length with the same rule as
 /// `title_from_first_message`, and reject empty (a refusal arrives as no
 /// content, so it fails here too).
-pub fn parse(text: String) -> Result(String, Nil) {
+///
+/// The PASS sentinel matches only a whole (shaped) reply, case-
+/// insensitively — a real title that merely contains the word ("Password
+/// Manager Setup") never postpones. Under the forced instruction
+/// (`allow_pass = False`) a PASS reply is rejected as an unusable title:
+/// the forced attempt cannot defer again, so it is a failure, not a
+/// postpone.
+pub fn parse(allow_pass: Bool, text: String) -> Result(Verdict, Nil) {
   case shape_title(strip_code_fences(text)) {
     "" -> Error(Nil)
-    title -> Ok(title)
+    shaped ->
+      case is_pass(shaped) {
+        False -> Ok(Title(shaped))
+        True ->
+          case allow_pass {
+            True -> Ok(Pass)
+            False -> Error(Nil)
+          }
+      }
   }
+}
+
+/// The PASS sentinel test: exact match on the shaped reply, case
+/// folded. Public so tests and future callers share one definition.
+pub fn is_pass(shaped: String) -> Bool {
+  string.lowercase(shaped) == "pass"
 }
 
 /// Shape raw text into a display title: strip code fences, collapse every
@@ -153,14 +212,15 @@ pub fn run(
   tr: Transcript,
   base_opts: Options,
   cancel: Subject(Nil),
-) -> Result(String, String) {
+  allow_pass: Bool,
+) -> Result(Verdict, String) {
   // The stream feed runs synchronously in THIS process, so fragments land
   // in this subject's mailbox and are drained after the call returns.
   let acc = process.new_subject()
   let outcome =
     openai.stream_with_cancel(
       endpoint,
-      prepare(tr),
+      prepare(tr, allow_pass),
       options(base_opts),
       fn(event) {
         case event {
@@ -187,9 +247,9 @@ pub fn run(
               }
             })
             |> string.concat
-            |> parse
+            |> parse(allow_pass, _)
           {
-            Ok(title) -> Ok(title)
+            Ok(verdict) -> Ok(verdict)
             Error(Nil) -> Error("no usable title in utility reply")
           }
       }

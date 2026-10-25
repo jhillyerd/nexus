@@ -200,7 +200,12 @@ fn test_endpoint() -> openai.Endpoint {
 
 /// Utility seams for tests that never exercise the side call: the runner
 /// refuses (best-effort failure, discarded) and the apply is never reached.
-fn no_utility_runner(_endpoint, _tr, _cancel) -> Result(String, String) {
+fn no_utility_runner(
+  _endpoint,
+  _tr,
+  _cancel,
+  _allow_pass,
+) -> Result(utility.Verdict, String) {
   Error("no utility call expected in this test")
 }
 
@@ -795,6 +800,9 @@ pub fn reasoning_streams_live_and_replays_on_rejoin_test() {
 type UtilityEvent {
   /// The runner was invoked, with the committed snapshot's message count.
   UtilCalled(messages: Int)
+  /// The runner was invoked with `allow_pass = False` — a re-armed
+  /// attempt after a pass MUST arrive this way (the one-pass policy).
+  UtilForcedAttempt
   /// The runner observed its cancel subject fire.
   UtilCancelled
   /// The runner observed the test's release signal.
@@ -857,9 +865,47 @@ fn ok_utility(
   events: process.Subject(UtilityEvent),
   title: String,
 ) -> session.UtilityRunner {
-  fn(_endpoint, tr, _cancel) {
+  fn(_endpoint, tr, _cancel, _allow_pass) {
     process.send(events, UtilCalled(transcript.length(tr)))
-    Ok(title)
+    Ok(utility.Title(title))
+  }
+}
+
+/// The greeting-session model: it PASSes every attempt that offers the
+/// sentinel. Paired with the apply seam it lets tests pin both halves of
+/// the one-pass policy — the re-armed attempt must arrive forced
+/// (`UtilForcedAttempt`), and a PASS under the forced instruction must
+/// consume the attempt like any failure.
+fn passing_utility(
+  events: process.Subject(UtilityEvent),
+) -> session.UtilityRunner {
+  fn(_endpoint, tr, _cancel, allow_pass) {
+    process.send(events, UtilCalled(transcript.length(tr)))
+    case allow_pass {
+      True -> Ok(utility.Pass)
+      False -> {
+        process.send(events, UtilForcedAttempt)
+        Ok(utility.Pass)
+      }
+    }
+  }
+}
+
+/// Like `passing_utility`, but the forced attempt produces a real title —
+/// the converging session: pass once, then the forced instruction lands
+/// the title.
+fn pass_once_then_title_utility(
+  events: process.Subject(UtilityEvent),
+) -> session.UtilityRunner {
+  fn(_endpoint, tr, _cancel, allow_pass) {
+    process.send(events, UtilCalled(transcript.length(tr)))
+    case allow_pass {
+      True -> Ok(utility.Pass)
+      False -> {
+        process.send(events, UtilForcedAttempt)
+        Ok(utility.Title("Model Title"))
+      }
+    }
   }
 }
 
@@ -876,7 +922,7 @@ fn blocking_utility(
   events: process.Subject(UtilityEvent),
   ready: process.Subject(AttemptHandles),
 ) -> session.UtilityRunner {
-  fn(_endpoint, tr, cancel) {
+  fn(_endpoint, tr, cancel, _allow_pass) {
     process.send(events, UtilCalled(transcript.length(tr)))
     let handles =
       AttemptHandles(
@@ -896,7 +942,7 @@ fn blocking_utility(
       }
       Ok(UtilReleased) -> {
         process.send(events, UtilReleased)
-        Ok("Model Title")
+        Ok(utility.Title("Model Title"))
       }
       // UtilCalled never rides this selector, but the event type is
       // shared with the test's recording subject — cover it.
@@ -1000,8 +1046,105 @@ pub fn utility_fires_once_after_first_exchange_test() {
   let opts = transcript.Options(..transcript.default_options(), stream: True)
   should.be_false(string.contains(
     transcript.request_body(tr, opts),
-    utility.instruction(),
+    utility.instruction(True),
   ))
+}
+
+/// A greeting-session model that PASSes: the pass does NOT consume the
+/// once-per-session attempt (no apply, no MetaUpdated), the next
+/// turn-commit point re-arms, and the re-armed attempt arrives FORCED
+/// (`allow_pass = False`) — its title applies, and only then is the flag
+/// spent: the third exchange never re-arms.
+pub fn utility_pass_postpones_once_then_forced_title_applies_test() {
+  let events = process.new_subject()
+  let sess =
+    start_with_utility(
+      utility_config(20),
+      happy_runner,
+      pass_once_then_title_utility(events),
+      ok_apply(events, "Model Title"),
+    )
+  let sub = join(sess)
+  let _ = expect_event(sub)
+
+  should.equal(session.send_message(sess, "hi"), session.Sent)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  UtilCalled(3) |> should.equal(expect_utility(events))
+  // The pass: no apply attempt, no sidebar refresh, flag untouched.
+  expect_no_utility(events, 400)
+  expect_no_event(sub, 400)
+
+  // The second exchange re-arms the attempt — FORCED this time — and its
+  // title applies.
+  should.equal(session.send_message(sess, "a real question"), session.Sent)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  UtilCalled(5) |> should.equal(expect_utility(events))
+  UtilForcedAttempt |> should.equal(expect_utility(events))
+  UtilAppliedNote("Model Title") |> should.equal(expect_utility(events))
+  expect_event(sub)
+  |> should.equal(session.MetaUpdated(Some("Model Title"), ["auto-tag"]))
+
+  // The forced attempt COMPLETED: the once-flag is spent now.
+  should.equal(session.send_message(sess, "third"), session.Sent)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  expect_no_utility(events, 400)
+  expect_no_event(sub, 400)
+}
+
+/// A model that PASSes even under the forced instruction: that reply is
+/// an unusable title, not a postpone — it consumes the attempt like any
+/// failure, so the session cannot defer twice (it keeps its heuristic
+/// placeholder) instead of re-arming forever.
+pub fn utility_pass_on_forced_attempt_consumes_test() {
+  let events = process.new_subject()
+  let sess =
+    start_with_utility(
+      utility_config(20),
+      happy_runner,
+      passing_utility(events),
+      ok_apply(events, "Model Title"),
+    )
+  let sub = join(sess)
+  let _ = expect_event(sub)
+
+  should.equal(session.send_message(sess, "hi"), session.Sent)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  UtilCalled(3) |> should.equal(expect_utility(events))
+  expect_no_utility(events, 400)
+  expect_no_event(sub, 400)
+
+  // Forced attempt: arrives with allow_pass = False, PASSes anyway, and
+  // the once-flag is spent.
+  should.equal(session.send_message(sess, "still here"), session.Sent)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  UtilCalled(5) |> should.equal(expect_utility(events))
+  UtilForcedAttempt |> should.equal(expect_utility(events))
+  expect_no_utility(events, 400)
+  expect_no_event(sub, 400)
+
+  // No third attempt, ever.
+  should.equal(session.send_message(sess, "third"), session.Sent)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  expect_no_utility(events, 400)
+  expect_no_event(sub, 400)
 }
 
 /// A FAILED turn commits nothing — the trigger never arms for it.
