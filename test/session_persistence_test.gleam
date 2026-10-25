@@ -709,3 +709,151 @@ pub fn tool_call_reasoning_rides_first_row_of_run_test() {
     store.ToolResultRow("c2", "echo", True, "r2"),
   ])
 }
+
+// ---------------------------------------------------------------------------
+// Utility-titles P3: auto_title_upgrade guard semantics (plan §4.4/§6) —
+// the store-side twin of the registry's UpgradeAutoTitle guard.
+// ---------------------------------------------------------------------------
+
+/// A stored summary like the heuristic title leaves behind: still
+/// auto-generated, already carrying the placeholder text.
+fn auto_stored(id: String, title: String) -> store.StoredSummary {
+  store.StoredSummary(
+    ..stored(id),
+    title: title,
+    title_source: session.AutoTitle,
+  )
+}
+
+/// `title_source = 'auto'`: the upgrade APPLIES and REPLACES — first the
+/// heuristic placeholder, then even a previously upgraded title (the
+/// guard is provenance only, never "empty title only").
+pub fn auto_title_upgrade_replaces_auto_title_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  store_mock.ensure_fixture_provider(seam)
+  let assert Ok(_) = seam.insert_session(auto_stored("s1", "heuristic"), "sys")
+
+  should.equal(seam.auto_title_upgrade("s1", "Model Title"), Ok(True))
+  let assert Ok(stored) = seam.get_session("s1")
+  should.equal(stored.summary.title, "Model Title")
+  should.equal(stored.summary.title_source, session.AutoTitle)
+
+  // An upgraded title is still auto-generated: it may be replaced again.
+  should.equal(seam.auto_title_upgrade("s1", "Better Title"), Ok(True))
+  let assert Ok(stored) = seam.get_session("s1")
+  should.equal(stored.summary.title, "Better Title")
+}
+
+/// `title_source = 'manual'`: the upgrade is REFUSED and replies False —
+/// a rename wins forever, in the store exactly as in memory. An unknown
+/// id is an error, like the real store.
+pub fn auto_title_upgrade_refuses_manual_title_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  store_mock.ensure_fixture_provider(seam)
+  let assert Ok(_) = seam.insert_session(auto_stored("s2", "heuristic"), "sys")
+
+  should.equal(seam.set_title("s2", "renamed"), Ok(Nil))
+  should.equal(seam.auto_title_upgrade("s2", "Sneaky"), Ok(False))
+  let assert Ok(stored) = seam.get_session("s2")
+  should.equal(stored.summary.title, "renamed")
+  should.equal(stored.summary.title_source, session.ManualTitle)
+
+  should.be_error(seam.auto_title_upgrade("nope", "X"))
+}
+
+/// The registry's UpgradeAutoTitle — what the utility worker's apply step
+/// calls — applies for a LIVE session with an auto title, writes through
+/// to the store, and refuses (without touching the store) once a manual
+/// rename landed. Across a restart the store's answer stands.
+pub fn upgrade_auto_title_writes_through_and_survives_restart_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  let booted = boot(seam)
+  let record = create(booted.registry, "alias-1", happy_runner)
+  should.be_true(session_registry.auto_title(
+    booted.registry,
+    record.id,
+    "first msg",
+  ))
+
+  // The utility worker's apply step: the heuristic placeholder is
+  // upgraded to the model title, in memory and in the store.
+  should.equal(
+    session_registry.upgrade_auto_title(
+      booted.registry,
+      record.id,
+      "Model Title",
+    ),
+    session_registry.UpgradeApplied("Model Title", []),
+  )
+  let assert Ok(summary) =
+    session_registry.list_sessions(booted.registry)
+    |> list.find(fn(summary) { summary.id == record.id })
+  should.equal(summary.title, "Model Title")
+  should.equal(summary.title_source, session.AutoTitle)
+  should.equal(
+    store_mock.events(mock)
+      |> list.filter(fn(event) {
+        case event {
+          store_mock.EvAutoTitleUpgrade(id, _title) -> id == record.id
+          _ -> False
+        }
+      }),
+    [store_mock.EvAutoTitleUpgrade(record.id, "Model Title")],
+  )
+
+  // A manual rename wins forever: refused, and the store is never asked.
+  should.be_true(session_registry.set_title(
+    booted.registry,
+    record.id,
+    "renamed",
+  ))
+  should.equal(
+    session_registry.upgrade_auto_title(booted.registry, record.id, "Sneaky"),
+    session_registry.UpgradeRefused,
+  )
+  should.equal(
+    store_mock.events(mock)
+      |> list.filter(fn(event) {
+        case event {
+          store_mock.EvAutoTitleUpgrade(_, "Sneaky") -> True
+          _ -> False
+        }
+      }),
+    [],
+  )
+
+  // The restart reads the stored row: the upgrade survived, and the
+  // manual rename after it stands.
+  restart_vm(booted)
+  let booted2 = boot(store_mock.seam(mock))
+  let assert Ok(summary) =
+    session_registry.list_sessions(booted2.registry)
+    |> list.find(fn(summary) { summary.id == record.id })
+  should.equal(summary.title, "renamed")
+  should.equal(summary.title_source, session.ManualTitle)
+}
+
+/// The upgrade also reaches a DORMANT (stored-but-not-live) session —
+/// the registry branch for ids with no live actor.
+pub fn upgrade_auto_title_on_dormant_session_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  store_mock.ensure_fixture_provider(seam)
+  let assert Ok(_) = seam.insert_session(auto_stored("s9", "heuristic"), "sys")
+  let booted = boot(seam)
+
+  should.equal(
+    session_registry.upgrade_auto_title(booted.registry, "s9", "Model Title"),
+    session_registry.UpgradeApplied("Model Title", []),
+  )
+  restart_vm(booted)
+  let booted2 = boot(store_mock.seam(mock))
+  let assert Ok(summary) =
+    session_registry.list_sessions(booted2.registry)
+    |> list.find(fn(summary) { summary.id == "s9" })
+  should.equal(summary.title, "Model Title")
+  should.equal(summary.title_source, session.AutoTitle)
+}

@@ -11,6 +11,7 @@ import nexus/loop
 import nexus/openai
 import nexus/session
 import nexus/transcript
+import nexus/utility
 
 fn test_config() -> config.Config {
   config.Config(
@@ -784,4 +785,335 @@ pub fn reasoning_streams_live_and_replays_on_rejoin_test() {
   expect_event(sub2) |> should.equal(session.UserEcho("think"))
   expect_event(sub2) |> should.equal(session.ReasoningFull("pondering deeply"))
   expect_event(sub2) |> should.equal(session.AssistantFull("answer"))
+}
+
+// ---------------------------------------------------------------------------
+// Utility side-call (utility-titles plan §4.2/§6): trigger, cancel, result
+// ---------------------------------------------------------------------------
+
+/// What the fake utility runner / apply seam reports back to the test.
+type UtilityEvent {
+  /// The runner was invoked, with the committed snapshot's message count.
+  UtilCalled(messages: Int)
+  /// The runner observed its cancel subject fire.
+  UtilCancelled
+  /// The runner observed the test's release signal.
+  UtilReleased
+  /// The apply seam was reached with the parsed title.
+  UtilAppliedNote(title: String)
+}
+
+fn expect_utility(events: process.Subject(UtilityEvent)) -> UtilityEvent {
+  let assert Ok(event) = process.receive(events, 2000)
+  event
+}
+
+/// Like `expect_utility`, but the wait names itself — a timeout panic
+/// points at the step that never happened.
+fn expect_utility_step(
+  events: process.Subject(UtilityEvent),
+  step: String,
+) -> UtilityEvent {
+  case process.receive(events, 2000) {
+    Ok(event) -> event
+    Error(_) -> panic as { "timed out waiting for: " <> step }
+  }
+}
+
+/// No utility (or apply) activity within `ms` — the negative half of the
+/// trigger rules (failed turns, disabled config, once-per-session).
+fn expect_no_utility(events: process.Subject(UtilityEvent), ms: Int) -> Nil {
+  let assert Error(_) = process.receive(events, ms)
+  Nil
+}
+
+fn expect_no_event(sub: process.Subject(session.SessionEvent), ms: Int) -> Nil {
+  let assert Error(_) = process.receive(sub, ms)
+  Nil
+}
+
+/// The session config with the side-call knob turned up for fast tests.
+fn utility_config(delay_ms: Int) -> config.Config {
+  config.Config(
+    ..test_config(),
+    utility_enabled: True,
+    utility_delay_ms: delay_ms,
+  )
+}
+
+/// A runner that completes immediately with `title`, recording the
+/// snapshot size it was handed (the committed exchange it forked from).
+fn ok_utility(
+  events: process.Subject(UtilityEvent),
+  title: String,
+) -> session.UtilityRunner {
+  fn(_endpoint, tr, _cancel) {
+    process.send(events, UtilCalled(transcript.length(tr)))
+    Ok(title)
+  }
+}
+
+/// A runner that blocks until its cancel subject fires (a `Send` racing
+/// the side call) or the test releases it. On cancel it lingers briefly
+/// before reporting, so the racing turn's WorkerDone is processed FIRST —
+/// the arm-while-unreported order the re-arm rule must survive. The
+/// release signal arrives on a subject this WORKER owns (only a
+/// subject's owner can receive from it): the runner creates it and hands
+/// it to the test through `ready` on first invocation.
+fn blocking_utility(
+  events: process.Subject(UtilityEvent),
+  ready: process.Subject(process.Subject(Nil)),
+) -> session.UtilityRunner {
+  fn(_endpoint, tr, cancel) {
+    process.send(events, UtilCalled(transcript.length(tr)))
+    let release = process.new_subject()
+    process.send(ready, release)
+    let selector =
+      process.new_selector()
+      |> process.select_map(cancel, fn(_) { UtilCancelled })
+      |> process.select_map(release, fn(_) { UtilReleased })
+    case process.selector_receive(selector, 5000) {
+      Ok(UtilCancelled) -> {
+        // Record the cancellation, then linger before reporting the
+        // outcome: the racing turn's WorkerDone is processed FIRST, so
+        // the commit-point arm runs while the worker is unreported.
+        process.send(events, UtilCancelled)
+        process.sleep(50)
+        Error("cancelled mid-flight")
+      }
+      Ok(UtilReleased) -> {
+        process.send(events, UtilReleased)
+        Ok("Model Title")
+      }
+      // UtilCalled never rides this selector, but the event type is
+      // shared with the test's recording subject — cover it.
+      Ok(_) -> Error("unexpected event on the utility selector")
+      Error(_) -> Error("utility runner timed out")
+    }
+  }
+}
+
+/// The registry guard APPLIED the title: records the call and carries the
+/// fresh display metadata the MetaUpdated broadcast must use.
+fn ok_apply(
+  events: process.Subject(UtilityEvent),
+  title: String,
+) -> session.UtilityApply {
+  fn(t) {
+    process.send(events, UtilAppliedNote(t))
+    case t == title {
+      True -> Ok(session.UtilityMeta(title, ["auto-tag"]))
+      False -> Ok(session.UtilityMeta(t, []))
+    }
+  }
+}
+
+/// The registry guard REFUSED (a manual rename wins forever).
+fn refusing_apply(_title: String) -> Result(session.UtilityMeta, Nil) {
+  Error(Nil)
+}
+
+fn start_with_utility(
+  cfg: config.Config,
+  runner: session.TurnRunner,
+  u_runner: session.UtilityRunner,
+  u_apply: session.UtilityApply,
+) -> process.Subject(session.Msg) {
+  let assert Ok(started) =
+    session.start_with_spec(session.SessionSpec(
+      cfg: cfg,
+      model: "test-alias",
+      endpoint: test_endpoint(),
+      runner: runner,
+      commit_hook: fn(_) { Nil },
+      hydrate: None,
+      utility_runner: u_runner,
+      utility_apply: u_apply,
+    ))
+  started.data
+}
+
+/// Fires ONCE, after the FIRST COMMITTED exchange: the runner receives
+/// the 3-message snapshot (system + user + assistant), the applied title
+/// broadcasts MetaUpdated, and the second exchange never re-arms. The
+/// branch (Y and the reply) never enters the session's transcript.
+pub fn utility_fires_once_after_first_exchange_test() {
+  let events = process.new_subject()
+  let sess =
+    start_with_utility(
+      utility_config(20),
+      happy_runner,
+      ok_utility(events, "Model Title"),
+      ok_apply(events, "Model Title"),
+    )
+  let sub = join(sess)
+  let _ = expect_event(sub)
+
+  should.equal(session.send_message(sess, "first"), session.Sent)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+
+  // The branch forked off the COMMITTED exchange: a 3-message snapshot —
+  // the transcript as of the turn commit, never the in-flight state.
+  UtilCalled(3) |> should.equal(expect_utility(events))
+  // The worker applied the title through the guard, and the actor
+  // broadcast the fresh metadata to subscribers.
+  UtilAppliedNote("Model Title") |> should.equal(expect_utility(events))
+  expect_event(sub)
+  |> should.equal(session.MetaUpdated(Some("Model Title"), ["auto-tag"]))
+
+  // The second exchange does not re-arm: once per session.
+  should.equal(session.send_message(sess, "second"), session.Sent)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  expect_no_utility(events, 400)
+  expect_no_event(sub, 400)
+
+  // The throwaway branch is structurally unable to change a request
+  // byte: Y never entered the session's transcript.
+  let tr = session.snapshot(sess)
+  transcript.length(tr) |> should.equal(5)
+  let opts = transcript.Options(..transcript.default_options(), stream: True)
+  should.be_false(string.contains(
+    transcript.request_body(tr, opts),
+    utility.instruction(),
+  ))
+}
+
+/// A FAILED turn commits nothing — the trigger never arms for it.
+pub fn utility_not_fired_on_failed_turn_test() {
+  let events = process.new_subject()
+  let sess =
+    start_with_utility(
+      utility_config(20),
+      failing_runner,
+      ok_utility(events, "Model Title"),
+      ok_apply(events, "Model Title"),
+    )
+  let sub = join(sess)
+  let _ = expect_event(sub)
+
+  should.equal(session.send_message(sess, "will fail"), session.Sent)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+
+  expect_no_utility(events, 400)
+  expect_no_event(sub, 400)
+}
+
+/// A utility side call in flight is invisible to callers: the session is
+/// never Busy because of it (fairness on serialized backends), a `Send`
+/// cancels it instead, and the cancelled attempt does NOT consume the
+/// once-per-session flag — the debounce re-arms at the next commit point
+/// and the title still lands.
+pub fn utility_cancels_on_send_and_rearms_test() {
+  let events = process.new_subject()
+  let ready = process.new_subject()
+  let sess =
+    start_with_utility(
+      utility_config(20),
+      happy_runner,
+      blocking_utility(events, ready),
+      ok_apply(events, "Model Title"),
+    )
+  let sub = join(sess)
+  let _ = expect_event(sub)
+
+  should.equal(session.send_message(sess, "first"), session.Sent)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  UtilCalled(3) |> should.equal(expect_utility(events))
+  // Each attempt hands over its own release subject (owner = the worker).
+  // Consume the first attempt's here: it is about to be cancelled, and
+  // its subject dies with it — the second attempt's is the live one.
+  let assert Ok(_cancelled_release) = process.receive(ready, 2000)
+
+  // The side call runs BESIDE the turn machinery: not streaming, not busy.
+  session.describe(sess).streaming |> should.be_false
+  should.equal(session.send_message(sess, "second"), session.Sent)
+
+  // The in-flight attempt was cancelled by the send…
+  UtilCancelled |> should.equal(expect_utility(events))
+  // …whose commits then land…
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  // …and the once-flag is intact: the next commit point re-armed the
+  // debounce, so the session's ONLY attempt runs again — even though the
+  // racing turn's commit was processed while the cancelled worker was
+  // still unreported.
+  UtilCalled(5)
+  |> should.equal(expect_utility_step(events, "re-armed second attempt"))
+
+  // This time it completes: applied → broadcast, and the attempt is spent.
+  // The release subject is the worker's own — it handed it over when the
+  // attempt started.
+  let assert Ok(release) = process.receive(ready, 2000)
+  process.send(release, Nil)
+  UtilReleased |> should.equal(expect_utility_step(events, "released"))
+  UtilAppliedNote("Model Title")
+  |> should.equal(expect_utility_step(events, "applied"))
+  expect_event(sub)
+  |> should.equal(session.MetaUpdated(Some("Model Title"), ["auto-tag"]))
+  expect_no_utility(events, 400)
+}
+
+/// MetaUpdated is broadcast ONLY when the registry guard applied — a
+/// refused upgrade (a manual rename wins forever) keeps every subscriber
+/// silent.
+pub fn utility_no_broadcast_when_guard_refuses_test() {
+  let events = process.new_subject()
+  let sess =
+    start_with_utility(
+      utility_config(20),
+      happy_runner,
+      ok_utility(events, "Model Title"),
+      refusing_apply,
+    )
+  let sub = join(sess)
+  let _ = expect_event(sub)
+
+  should.equal(session.send_message(sess, "first"), session.Sent)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+
+  // The runner produced a title, the guard refused it — and nothing was
+  // broadcast (nor applied, but the apply seam IS reached, best-effort).
+  UtilCalled(3) |> should.equal(expect_utility(events))
+  expect_no_event(sub, 400)
+  // The attempt completed on its own (not cancelled), so it is spent.
+  expect_no_utility(events, 400)
+}
+
+/// `NEXUS_UTILITY_ENABLED=false` disables the side call entirely.
+pub fn utility_disabled_never_runs_test() {
+  let events = process.new_subject()
+  let sess =
+    start_with_utility(
+      config.Config(..test_config(), utility_enabled: False),
+      happy_runner,
+      ok_utility(events, "Model Title"),
+      ok_apply(events, "Model Title"),
+    )
+  let sub = join(sess)
+  let _ = expect_event(sub)
+
+  should.equal(session.send_message(sess, "first"), session.Sent)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+
+  expect_no_utility(events, 400)
+  expect_no_event(sub, 400)
 }

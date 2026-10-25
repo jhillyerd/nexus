@@ -3,15 +3,25 @@
 //// and view rendering (element/text APIs only, no innerHTML).
 
 import gleam/erlang/process
+import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/otp/factory_supervisor
 import gleam/string
 import gleeunit/should
+import lustre
 import lustre/element
+import lustre/server_component
+import nexus/config
+import nexus/openai
 import nexus/provider
+import nexus/provider_registry
 import nexus/session
+import nexus/session_registry
 import nexus/ui
+import nexus/ui_runtime
 import nexus/ui_settings
+import store_mock
 
 fn new_model() -> ui.Model {
   let #(model, _effect) =
@@ -1674,4 +1684,175 @@ pub fn from_session_event_maps_reasoning_test() {
   |> should.equal(ui.Reasoning("bit"))
   ui.from_session_event(session.ReasoningFull("whole"))
   |> should.equal(ui.ReasoningFull("whole"))
+}
+
+// ---------------------------------------------------------------------------
+// Utility-titles P3 (§6): MetaUpdated → sidebar refresh, hostile title inert
+// ---------------------------------------------------------------------------
+
+/// A model-generated title is hostile model output: it renders as a
+/// Lustre TEXT node in the sidebar row — escaped, never markup.
+pub fn view_escapes_hostile_title_test() {
+  let hostile =
+    session.SessionSummary(
+      ..summary("s-1", False),
+      title: "<script>alert(1)</script>",
+    )
+  let html =
+    new_model()
+    |> step(ui.SessionsLoaded([hostile]))
+    |> view_string
+  should_contain(html, "&lt;script&gt;")
+  should_not_contain(html, "<script>alert")
+  // The payload reaches the DOM as inert data — the full escaped text.
+  should_contain(html, "&lt;script&gt;alert(1)&lt;/script&gt;")
+}
+
+/// `MetaUpdated` nudges the sidebar through the SAME sessions_effect a
+/// `TurnDone` uses — asserted against a REAL Lustre server-component
+/// runtime over REAL (offline) registries: after the nudge, a reconcile
+/// carrying the registry's CURRENT title reaches the socket. The event's
+/// own payload is deliberately NOT the real title — the refresh must
+/// re-read the registry, never trust the broadcast.
+pub fn meta_updated_refreshes_sidebar_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  store_mock.ensure_fixture_provider(seam)
+
+  // Real registries over the offline seams — the refresh effect calls
+  // both, so a dead subject would crash the runtime's actor.
+  let assert Ok(started_providers) =
+    provider_registry.start_with_model_fetcher(
+      test_config(),
+      seam,
+      process.new_name("nexus_ui_providers"),
+      fn(_endpoint) { Error(openai.Transport("offline test")) },
+    )
+  let providers = started_providers.data
+  let factory_name = process.new_name("nexus_ui_factory")
+  let assert Ok(_factory) =
+    factory_supervisor.start(session_registry.factory_builder(factory_name))
+  let assert Ok(started_registry) =
+    session_registry.start_with_runner(
+      test_config(),
+      factory_supervisor.get_by_name(factory_name),
+      process.new_name("nexus_ui_registry"),
+      seam,
+      unused_turn_runner,
+      fn(_endpoint, _tr, _cancel) { Error("no utility call in this test") },
+      fixture_resolver(),
+    )
+  let registry = started_registry.data
+
+  // A titled session, so the sidebar has something to refresh.
+  let assert Ok(record) =
+    session_registry.create_with_runner(
+      registry,
+      store_mock.fixture_provider_id,
+      "alias-1",
+      unused_turn_runner,
+    )
+  should.be_true(session_registry.auto_title(registry, record.id, "Before"))
+
+  // One per-connection runtime, started exactly like the /ws socket
+  // handler does, with a test-owned client subject as the socket.
+  let assert Ok(runtime) =
+    lustre.start_server_component(
+      ui_runtime.app(),
+      ui.Flags(registry: registry, providers: providers, session: None),
+    )
+  let client = process.new_subject()
+  server_component.register_subject(client)
+  |> lustre.send(to: runtime)
+
+  // The sidebar first renders the current title (init's effects landed).
+  let _ = wait_for_patch(client, "Before", 40)
+
+  // The title changes server-side, BEHIND this client's back.
+  should.be_true(session_registry.set_title(registry, record.id, "After"))
+
+  lustre.send(
+    to: runtime,
+    message: lustre.dispatch(ui.MetaUpdated(Some("EVENT-PAYLOAD"), [])),
+  )
+
+  // A reconcile carrying the re-read title reaches the socket — and the
+  // event's payload never does.
+  let seen = wait_for_patch(client, "After", 40)
+  should.be_false(string.contains(seen, "EVENT-PAYLOAD"))
+}
+
+fn unused_turn_runner(
+  _endpoint,
+  _tr,
+  _cancel,
+  _on_event,
+) -> session.TurnOutcome {
+  session.StreamErrored("no turn expected in this test")
+}
+
+/// The offline stand-in for the boot resolver (same as the golden suite).
+fn fixture_resolver() -> session_registry.ResolveProvider {
+  fn(id) {
+    case id == store_mock.fixture_provider_id {
+      True ->
+        Ok(openai.Endpoint(
+          base_url: "https://provider.example/v1",
+          api_key: None,
+          sse_first_response_timeout_ms: 1000,
+          stream_idle_timeout_ms: 1000,
+        ))
+      False -> Error(session_registry.ProviderUnknown)
+    }
+  }
+}
+
+/// Config for the real registries: valid key material (the provider
+/// registry decrypt-validates at boot), otherwise test defaults.
+fn test_config() -> config.Config {
+  config.Config(
+    encryption_key: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+    sse_first_response_timeout_ms: 1000,
+    stream_idle_timeout_ms: 1000,
+    http_bind: "127.0.0.1",
+    http_port: 8080,
+    ui_token: None,
+    system_prompt: "test system prompt",
+    max_tool_iterations: 8,
+    http_fetch_max_bytes: 20_000,
+    http_fetch_timeout_ms: 2000,
+    http_fetch_allow_private: False,
+    searxng_base_url: None,
+    searxng_token: None,
+    pg_host: "127.0.0.1",
+    pg_port: 5433,
+    pg_database: "nexus",
+    pg_user: "nexus",
+    pg_password: None,
+    utility_enabled: True,
+    utility_delay_ms: 1500,
+  )
+}
+
+/// Receive client messages until one carries `needle`, returning its JSON.
+/// Panics after `attempts` × 200ms — a refresh that never reached the
+/// socket is the failure under test.
+fn wait_for_patch(
+  client: process.Subject(server_component.ClientMessage(ui.Msg)),
+  needle: String,
+  attempts: Int,
+) -> String {
+  case attempts {
+    0 -> panic as { "patch never arrived: " <> needle }
+    _ -> {
+      let assert Ok(message) = process.receive(client, 200)
+      let text =
+        server_component.client_message_to_json(message)
+        |> json.to_string
+      case string.contains(text, needle) {
+        True -> text
+        False -> wait_for_patch(client, needle, attempts - 1)
+      }
+    }
+  }
 }
