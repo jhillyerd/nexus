@@ -1102,8 +1102,8 @@ pub fn utility_pass_postpones_once_then_forced_title_applies_test() {
 
 /// A model that PASSes even under the forced instruction: that reply is
 /// an unusable title, not a postpone — it consumes the attempt like any
-/// failure, so the session converges (keeps its heuristic placeholder)
-/// instead of re-arming forever.
+/// failure, so the session cannot defer twice (it keeps its heuristic
+/// placeholder) instead of re-arming forever.
 pub fn utility_pass_on_forced_attempt_consumes_test() {
   let events = process.new_subject()
   let sess =

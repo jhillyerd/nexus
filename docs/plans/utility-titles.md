@@ -25,10 +25,10 @@ cache-capable backends and needs **no second model**.
 > (a greeting-only opener), so the model may reply exactly PASS and the
 > attempt re-arms at the next turn-commit point. Exactly ONE pass is
 > honored per session, then attempts run under a forced instruction with
-> no PASS option, so every session converges. Retrying is cheap here by
-> construction: the re-armed attempt reuses the still-warm cached prefix
-> (~Y + title tokens again), and cancel-on-send + debounce already bound
-> the latency harm on serialized backends.
+> no PASS option, so the forced attempt cannot defer again. Retrying is
+> cheap here by construction: the re-armed attempt reuses the still-warm
+> cached prefix (~Y + title tokens again), and cancel-on-send + debounce
+> already bound the latency harm on serialized backends.
 
 ## 1. Goal and non-goals
 
@@ -102,7 +102,8 @@ Pure request/parse helpers plus one runner — no actor of its own:
   cannot be steered into it. Tool use is forbidden in the prompt
   because the frozen `tools` array renders into the prompt and cannot
   be stripped without diverging the prefix.
-- `prepare(tr) -> Transcript` — `transcript.append_user(tr, instruction())`.
+- `prepare(tr, allow_pass) -> Transcript` —
+  `transcript.append_user(tr, instruction(allow_pass))`.
 - `options(base) -> Options` — the loop's Options with exactly one
   delta: `max_completion_tokens: Some(64)`. Generation-side params do
   not affect the tokenized prompt (llm-api skill §3.3), so the prefix
@@ -115,13 +116,16 @@ Pure request/parse helpers plus one runner — no actor of its own:
   reply, case-insensitively — a real title that merely contains the
   word ("Password Manager Setup") never postpones. Under the forced
   instruction a PASS reply is rejected as an unusable title (a
-  failure), not a postpone — the session must converge. (Title text is
-  display data: the UI renders it as a Lustre text node, so hostile
-  output is inert by the existing no-`innerHTML` contract.)
-- `run(endpoint, tr, base_opts, cancel) -> Result(String, String)` —
-  one non-loop stream via `openai.stream_with_cancel`, accumulating
-  text deltas; any assembled tool call, or a refusal, is a failure and
-  the result is discarded (best-effort: no retry in this pass).
+  failure), not a postpone — the forced attempt cannot defer again.
+  (Title text is display data: the UI renders it as a Lustre text
+  node, so hostile output is inert by the existing no-`innerHTML`
+  contract.)
+- `run(endpoint, tr, base_opts, cancel, allow_pass) ->
+  Result(Verdict, String)` — one non-loop stream via
+  `openai.stream_with_cancel`, accumulating text deltas; any assembled
+  tool call, or a refusal, is a failure, and a PASS (allowed attempts
+  only) comes back as `Ok(Pass)` for the actor's postpone policy — the
+  result is discarded on failure (best-effort: no retry in this pass).
 
 ### 4.2 Session actor (`src/nexus/session.gleam`)
 
@@ -336,8 +340,10 @@ request; until then Y stays title-only.
 - **Not enough signal in the first exchange** (greeting-only openers):
   resolved by the PASS postpone (see the 2026-10-25 decision above) —
   the model self-assesses and defers once, then the forced instruction
-  guarantees convergence. Bounded cost: one extra ~Y + title-token
-  side call per passing session on cache-capable backends.
+  removes the deferral option (a failed forced attempt still just
+  spends the attempt, leaving the heuristic placeholder). Bounded cost:
+  one extra ~Y + title-token side call per passing session on
+  cache-capable backends.
 - **Open**: exact Y wording and whether the title upgrade should also
   fire for sessions rehydrated from the store that already have a
   heuristic title but were created before this feature (proposal: no —

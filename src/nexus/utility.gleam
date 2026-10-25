@@ -12,9 +12,9 @@
 //// session actor treats it as "not yet" — the once-per-session attempt
 //// stays available and re-arms at the next turn-commit point. Exactly
 //// one pass is honored per session; after that the forced instruction
-//// (no PASS option) demands the best title available, so every session
-//// converges. A PASS under the forced instruction is an unusable title,
-//// not a postpone.
+//// (no PASS option) demands the best title available, so the forced
+//// attempt cannot defer again. A PASS under the forced instruction is an
+//// unusable title, not a postpone.
 ////
 //// Structure: pure request/parse helpers plus one blocking runner — no
 //// actor of its own. The runner executes inside the session's unlinked
@@ -115,7 +115,8 @@ pub type Verdict {
 /// insensitively — a real title that merely contains the word ("Password
 /// Manager Setup") never postpones. Under the forced instruction
 /// (`allow_pass = False`) a PASS reply is rejected as an unusable title:
-/// the session must converge, so it is a failure, not a postpone.
+/// the forced attempt cannot defer again, so it is a failure, not a
+/// postpone.
 pub fn parse(allow_pass: Bool, text: String) -> Result(Verdict, Nil) {
   case shape_title(strip_code_fences(text)) {
     "" -> Error(Nil)

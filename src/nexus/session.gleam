@@ -119,10 +119,13 @@ pub type TurnRunner =
 
 /// The utility side-call seam (utility-titles plan §4.2): ONE blocking
 /// model round-trip over a committed transcript snapshot — the title
-/// branch. Returns the parsed title, or `Error` for anything unusable
-/// (transport failure, cancellation, a tool-call answer, a refusal):
-/// best-effort, discarded, never retried. The endpoint is the session's
-/// frozen one; `cancel` must be owned by the calling process.
+/// branch. Returns `Ok(utility.Pass)` when the model defers (honored only
+/// while passes remain — the actor owns that policy), `Ok(utility.Title)`
+/// for a parsed title, or `Error` for anything unusable (transport
+/// failure, cancellation, a tool-call answer, a refusal, or a PASS under
+/// the forced instruction): best-effort, discarded, never retried. The
+/// endpoint is the session's frozen one; `cancel` must be owned by the
+/// calling process.
 pub type UtilityRunner =
   fn(openai.Endpoint, Transcript, Subject(Nil), Bool) ->
     Result(utility.Verdict, String)
@@ -151,7 +154,7 @@ pub type UtilityResult {
   /// debounce re-arms at the next turn-commit point. Exactly
   /// `max_utility_passes` passes are honored; later attempts run under
   /// the forced instruction, where a PASS reply arrives as
-  /// `UtilityFailed` instead (the session must converge).
+  /// `UtilityFailed` instead (the forced attempt cannot defer again).
   UtilityPassed
   /// Nothing applied: stream failed/cancelled, or the guard refused.
   UtilityFailed
@@ -902,11 +905,12 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
                 )
               {
                 // A PASS counts only on an attempt that offered it: under
-                // the forced instruction the session must converge, so a
-                // PASS reply is an unusable title — a failure that spends
-                // the once-flag. (The parser already rejects it; this
-                // guard pins the invariant at the actor boundary too, so
-                // no runner can smuggle an endless postpone through.)
+                // the forced instruction the attempt cannot defer again,
+                // so a PASS reply is an unusable title — a failure that
+                // spends the once-flag. (The parser already rejects it;
+                // this guard pins the invariant at the actor boundary
+                // too, so no runner can smuggle an endless postpone
+                // through.)
                 Ok(utility.Pass) ->
                   case allow_pass {
                     True -> UtilityPassed

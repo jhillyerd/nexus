@@ -357,7 +357,7 @@ pub fn parse_pass_requires_whole_string_match_test() {
 
 /// Under the forced instruction the model was never offered the sentinel:
 /// a PASS reply is an unusable title (a failure), not a postpone — the
-/// session must converge.
+/// session cannot defer twice.
 pub fn parse_pass_rejected_under_forced_instruction_test() {
   utility.parse(False, "PASS") |> should.equal(Error(Nil))
   utility.parse(False, "Real Title")
