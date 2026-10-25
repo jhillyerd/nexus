@@ -365,10 +365,13 @@ type State {
     /// Utility side-call state (utility-titles plan §4.2).
     utility: UtilityState,
     /// A debounce is OWED: `UtilityStart` fired while a turn was in flight
-    /// (the side call must not queue behind it), so the trigger is deferred
-    /// to the turn's end — committed or failed — instead of being dropped
-    /// or rescheduled (a timer-based re-arm would spin at delay 0). The
-    /// turn's own commit-point arm also consumes this.
+    /// (the side call must not queue behind it), or the turn-commit-point
+    /// arm ran while a side call was still unreported — the trigger is
+    /// deferred to the turn's end (committed or failed) or to the running
+    /// attempt's completion, instead of being dropped or rescheduled (a
+    /// timer-based re-arm would spin at delay 0). Whoever finds the
+    /// session idle consumes this: the commit-point arm and
+    /// `finish_utility` both deliver through `arm_utility`.
     utility_pending: Bool,
     /// The session's ONE title attempt (utility-titles plan §4.2). Flips
     /// only when an attempt COMPLETES (applied or failed) — never when one
@@ -1027,8 +1030,12 @@ fn arm_utility(state: State, committed: Bool) -> State {
       State(..state, utility_pending: False)
     }
     // The side call is still busy (e.g. a cancelled-but-unreported
-    // worker): keep the owed trigger for a later turn end.
-    True, False, True, _, _ -> state
+    // worker): record the trigger as OWED — finish_utility delivers it
+    // when this attempt completes. Dropping it here would silently spend
+    // the re-arm a cancelled attempt is entitled to (the once-flag is
+    // still unset, so the next commit point would arm again — but there
+    // may never be one).
+    True, False, True, _, _ -> State(..state, utility_pending: True)
     _, _, _, _, _ -> State(..state, utility_pending: False)
   }
 }
@@ -1065,6 +1072,15 @@ fn finish_utility(
         False -> state.utility_pending
       },
     )
+  // A CANCELLED attempt freed the side-call slot WITHOUT consuming the
+  // once-flag. If the turn-commit arm ran while this worker was still
+  // unreported, the trigger was recorded as owed — deliver it NOW: the
+  // slot is idle again and waiting for the next commit point could
+  // strand the session's only attempt when no further turn commits.
+  let state = case result, cancelled {
+    UtilityFailed, True -> arm_utility(state, False)
+    _, _ -> state
+  }
   case result {
     UtilityApplied(title, tags) -> {
       broadcast(state.subs, MetaUpdated(Some(title), tags))
