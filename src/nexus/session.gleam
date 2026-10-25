@@ -365,10 +365,13 @@ type State {
     /// Utility side-call state (utility-titles plan §4.2).
     utility: UtilityState,
     /// A debounce is OWED: `UtilityStart` fired while a turn was in flight
-    /// (the side call must not queue behind it), so the trigger is deferred
-    /// to the turn's end — committed or failed — instead of being dropped
-    /// or rescheduled (a timer-based re-arm would spin at delay 0). The
-    /// turn's own commit-point arm also consumes this.
+    /// (the side call must not queue behind it), or the turn-commit-point
+    /// arm ran while a side call was still unreported — the trigger is
+    /// deferred to the turn's end (committed or failed) or to the running
+    /// attempt's completion, instead of being dropped or rescheduled (a
+    /// timer-based re-arm would spin at delay 0). Whoever finds the
+    /// session idle consumes this: the commit-point arm and
+    /// `finish_utility` both deliver through `arm_utility`.
     utility_pending: Bool,
     /// The session's ONE title attempt (utility-titles plan §4.2). Flips
     /// only when an attempt COMPLETES (applied or failed) — never when one
@@ -941,12 +944,18 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       }
       // A crashed UTILITY worker is best-effort: reset the side-call state
       // WITHOUT consuming `utility_attempted` (a crash must not eat the
-      // session's only attempt) — the next turn-commit point re-arms.
+      // session's only attempt) — and deliver any trigger already recorded
+      // as owed right here: the slot is idle again, and waiting for the
+      // next turn-commit point would strand the retry when no further turn
+      // ever commits.
       case state.utility {
         UtilityStarting(pid, _, _)
           | UtilityRunning(pid, _, _, _)
           if pid == worker
-        -> actor.continue(State(..state, utility: UtilityIdle))
+        -> {
+          let state = State(..state, utility: UtilityIdle)
+          actor.continue(arm_utility(state, False))
+        }
         _ ->
           case is_current {
             False -> actor.continue(state)
@@ -1026,9 +1035,23 @@ fn arm_utility(state: State, committed: Bool) -> State {
       process.send_after(state.self, state.cfg.utility_delay_ms, UtilityStart)
       State(..state, utility_pending: False)
     }
+    // A FAILED turn with an attempt still in flight (necessarily one the
+    // turn's own Send cancelled): neither this turn nor the attempt has a
+    // delivery point, so record the trigger as owed — the attempt's
+    // cancelled completion must re-arm instead of stranding the session's
+    // only try. (With a COMMITTED turn this is branch one's delivery; the
+    // attempt's completion needs this only when the turn failed.)
+    False, False, True, UtilityStarting(..), True ->
+      State(..state, utility_pending: True)
+    False, False, True, UtilityRunning(..), True ->
+      State(..state, utility_pending: True)
     // The side call is still busy (e.g. a cancelled-but-unreported
-    // worker): keep the owed trigger for a later turn end.
-    True, False, True, _, _ -> state
+    // worker): record the trigger as OWED — finish_utility delivers it
+    // when this attempt completes. Dropping it here would silently spend
+    // the re-arm a cancelled attempt is entitled to (the once-flag is
+    // still unset, so the next commit point would arm again — but there
+    // may never be one).
+    True, False, True, _, _ -> State(..state, utility_pending: True)
     _, _, _, _, _ -> State(..state, utility_pending: False)
   }
 }
@@ -1065,6 +1088,15 @@ fn finish_utility(
         False -> state.utility_pending
       },
     )
+  // A CANCELLED attempt freed the side-call slot WITHOUT consuming the
+  // once-flag. If the turn-commit arm ran while this worker was still
+  // unreported, the trigger was recorded as owed — deliver it NOW: the
+  // slot is idle again and waiting for the next commit point could
+  // strand the session's only attempt when no further turn commits.
+  let state = case result, cancelled {
+    UtilityFailed, True -> arm_utility(state, False)
+    _, _ -> state
+  }
   case result {
     UtilityApplied(title, tags) -> {
       broadcast(state.subs, MetaUpdated(Some(title), tags))

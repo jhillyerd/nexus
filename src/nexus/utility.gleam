@@ -100,10 +100,15 @@ fn strip_code_fences(text: String) -> String {
     False -> trimmed
     True -> {
       let body = case string.split_once(trimmed, "\n") {
-        Ok(#(_opening_fence_line, rest)) -> rest
-        Error(Nil) -> ""
+        Ok(#(_opening_fence_line, rest)) -> string.trim(rest)
+        // A single-line fence (` ```title``` `, optionally tagged) has no
+        // newline to split on: strip the surrounding ticks instead.
+        Error(Nil) ->
+          trimmed
+          |> string.drop_start(3)
+          |> string.drop_end(3)
+          |> string.trim
       }
-      let body = string.trim(body)
       case string.ends_with(body, "```") {
         True -> string.trim(string.drop_end(body, 3))
         False -> body
