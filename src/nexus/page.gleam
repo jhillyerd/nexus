@@ -34,11 +34,26 @@ pub fn runtime_src(token: Option(String)) -> String {
   }
 }
 
+/// `href` for the vendored Pico stylesheet. Like the runtime asset, a plain
+/// `<link>` cannot send an Authorization header, so the token rides the
+/// query string. The stylesheet sits before the inline `<style>` in the
+/// head: the client runtime adopts document stylesheets in document order
+/// into the shadow root, so Pico is the baseline and `css()` overrides it.
+pub fn pico_href(token: Option(String)) -> String {
+  case token {
+    None -> "/css/pico.min.css"
+    Some(t) -> "/css/pico.min.css?token=" <> uri.percent_encode(t)
+  }
+}
+
 pub fn html(token: Option(String)) -> String {
   string.concat([
     "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
       <> "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
-      <> "<title>nexus</title>\n<style>\n",
+      <> "<title>nexus</title>\n"
+      <> "<link rel=\"stylesheet\" href=\""
+      <> pico_href(token),
+    "\">\n<style>\n",
     css(),
     "</style>\n<script type=\"module\" src=\"",
     runtime_src(token),
