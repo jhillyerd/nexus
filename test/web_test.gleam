@@ -361,7 +361,10 @@ pub fn m3_page_hosts_server_component_test() {
   should.be_true(string.contains(html, "/lustre/runtime.mjs"))
   should.be_true(string.contains(html, "type=\"module\""))
   // Styling is the vendored, self-hosted Pico baseline (never a CDN link).
-  should.be_true(string.contains(html, "<link rel=\"stylesheet\" href=\"/css/pico.min.css\">"))
+  should.be_true(string.contains(
+    html,
+    "<link rel=\"stylesheet\" href=\"/css/pico.min.css\">",
+  ))
   // The stylesheet precedes the inline overrides in the head: the client
   // runtime adopts document stylesheets in document order into the shadow
   // root, so Pico is the baseline and css() overrides it.
@@ -416,10 +419,7 @@ pub fn m3_page_tokenizes_runtime_src_test() {
   ))
   should.be_true(string.contains(html, "route=\"/ws?token=s3cret%20token\""))
   // The vendored stylesheet link carries the token like the runtime src.
-  should.be_true(string.contains(
-    html,
-    "/css/pico.min.css?token=s3cret%20token",
-  ))
+  should.be_true(string.contains(html, "/css/pico.min.css?token=s3cret%20token"))
   // The inline indicator script is static: the token never enters it.
   should.be_false(string.contains(html, "Bearer"))
 }
