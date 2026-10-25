@@ -304,6 +304,13 @@ function bodyParts(body) {
   return { messages: body.slice(0, idx), envelope: body.slice(idx) };
 }
 
+/// The one documented, generation-side envelope delta carried by
+/// utility-title branch requests (utility.gleam `utility_token_cap`, plan
+/// §4.1): it caps the completion and never tokenizes into the prompt, so
+/// the prompt-cache prefix is untouched — but it IS an envelope byte
+/// change, so the strict suffix-only rule below does not apply to it.
+const UTILITY_DELTA = ',"max_completion_tokens":512';
+
 function extendsRequest(prevBody, nextBody) {
   const prev = bodyParts(prevBody);
   const next = bodyParts(nextBody);
@@ -872,11 +879,17 @@ async function main() {
         new URL("./requests.json", import.meta.url),
         JSON.stringify(chats.map((c) => c.body), null, 2),
       );
+      // Utility-title branches (utility-titles plan §4.1) reuse the
+      // session's frozen envelope plus exactly the UTILITY_DELTA above, so
+      // they are not suffix-growths of the chat chain; they are judged by
+      // their own contract after the chain scan, not lumped into it.
+      const isUtility = (chat) => chat.body.includes(UTILITY_DELTA);
+      const turnChats = chats.filter((c) => !isUtility(c));
       // Requests from the two nexus instances interleave in one log; a
       // request that does not extend the previous one starts a new chain
       // (one chain per session). Every chain must grow by suffix only.
       const chains = [];
-      for (const chat of chats) {
+      for (const chat of turnChats) {
         const last = chains[chains.length - 1];
         if (last && extendsRequest(last[last.length - 1].body, chat.body)) {
           last.push(chat);
@@ -893,6 +906,30 @@ async function main() {
             `chain ${i}: request ${j} does not extend ${j - 1} by suffix`,
           );
         }
+      }
+      // Each utility branch must extend its session's committed transcript
+      // byte-for-byte (the branch point is the last committed turn), and
+      // its envelope must be the frozen one with exactly the documented
+      // delta at exactly the documented spot — no other byte may move.
+      for (const utility of chats.filter(isUtility)) {
+        const branchBase = [...chats.slice(0, chats.indexOf(utility))]
+          .reverse()
+          .find((c) => !isUtility(c));
+        assert(branchBase, "utility branch has a preceding chat request");
+        const base = bodyParts(branchBase.body);
+        const next = bodyParts(utility.body);
+        assert(
+          next.messages.startsWith(base.messages.slice(0, -1)),
+          "utility branch extends the committed transcript prefix",
+        );
+        assert(
+          next.envelope ===
+            base.envelope.replace(
+              ',"stream":true',
+              `,"stream":true${UTILITY_DELTA}`,
+            ),
+          "utility envelope differs by exactly the max_completion_tokens delta",
+        );
       }
     });
 
