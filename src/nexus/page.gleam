@@ -352,11 +352,13 @@ fn css() -> String {
 :root { color-scheme: light dark; }
 /* Pico tokens tuned to the pre-Pico look: 15px base, 1.45 leading, 8px
    radii, selection blue as primary, compact form fields. This is the
-   Pico-first surface (AGENTS.md): prefer a token over a new rule. The
-   dark mirror restates them at Pico's own dark-mode specificity (its
-   :root:not([data-theme=light]) block outranks plain :root), so light
-   and dark agree instead of drifting back to Pico defaults. */
-:root, :host {
+   Pico-first surface (AGENTS.md): prefer a token over a new rule. Both
+   token blocks restate at Pico's own theme-rule specificity: its light
+   rule is :root:not([data-theme=dark]) and its dark rule is
+   :root:not([data-theme=light]), both (0,2,0) — a plain :root block
+   (0,1,0) silently loses and the primary falls back to Pico blue in
+   light mode. */
+:root:not([data-theme=dark]), :host(:not([data-theme=dark])) {
   --pico-font-size: 15px;
   --pico-line-height: 1.45;
   --pico-border-radius: 8px;
