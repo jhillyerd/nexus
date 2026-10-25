@@ -309,6 +309,10 @@ pub fn parse_strips_code_fences_test() {
   // A tagged fence loses its language line too.
   utility.parse("```text\nCache Warmup\n```")
   |> should.equal(Ok("Cache Warmup"))
+  // A single-line fence has no newline to split on — the ticks come off
+  // anyway instead of discarding the reply.
+  utility.parse("```Cache Warmup```")
+  |> should.equal(Ok("Cache Warmup"))
   // Interior fences are left alone; only a surrounding fence is stripped.
   utility.parse("Look: ```code```")
   |> should.equal(Ok("Look: ```code```"))

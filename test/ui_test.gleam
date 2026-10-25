@@ -1835,8 +1835,8 @@ fn test_config() -> config.Config {
 }
 
 /// Receive client messages until one carries `needle`, returning its JSON.
-/// Panics after `attempts` × 200ms — a refresh that never reached the
-/// socket is the failure under test.
+/// A quiet 200 ms interval retries — renders land asynchronously — and
+/// only `attempts` exhausted quiet intervals is the failure under test.
 fn wait_for_patch(
   client: process.Subject(server_component.ClientMessage(ui.Msg)),
   needle: String,
@@ -1844,15 +1844,18 @@ fn wait_for_patch(
 ) -> String {
   case attempts {
     0 -> panic as { "patch never arrived: " <> needle }
-    _ -> {
-      let assert Ok(message) = process.receive(client, 200)
-      let text =
-        server_component.client_message_to_json(message)
-        |> json.to_string
-      case string.contains(text, needle) {
-        True -> text
-        False -> wait_for_patch(client, needle, attempts - 1)
+    _ ->
+      case process.receive(client, 200) {
+        Error(_) -> wait_for_patch(client, needle, attempts - 1)
+        Ok(message) -> {
+          let text =
+            server_component.client_message_to_json(message)
+            |> json.to_string
+          case string.contains(text, needle) {
+            True -> text
+            False -> wait_for_patch(client, needle, attempts - 1)
+          }
+        }
       }
-    }
   }
 }

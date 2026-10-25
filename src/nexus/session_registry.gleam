@@ -706,46 +706,78 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
           case dict.get(state.sessions, id) {
             Ok(record) ->
               case record.title_source {
-                session.AutoTitle -> {
-                  write_through_or_log(id, fn() {
-                    state.store.auto_title_upgrade(id, title)
-                    |> result.map(fn(_) { Nil })
-                  })
-                  #(
-                    State(
-                      ..state,
-                      sessions: dict.insert(
-                        state.sessions,
-                        id,
-                        Record(..record, title: title),
+                session.AutoTitle ->
+                  // The store guard has the final word (twin-invariant):
+                  // `Ok(False)` means a concurrent write changed the row's
+                  // provenance behind this instance's back — refuse and
+                  // leave the in-memory record untouched. An unreachable
+                  // store keeps the documented degrade mode: log, and
+                  // keep the in-memory write so the UI stays consistent.
+                  case state.store.auto_title_upgrade(id, title) {
+                    Ok(True) -> #(
+                      State(
+                        ..state,
+                        sessions: dict.insert(
+                          state.sessions,
+                          id,
+                          Record(..record, title: title),
+                        ),
                       ),
-                    ),
-                    UpgradeApplied(title, record.tags),
-                  )
-                }
+                      UpgradeApplied(title, record.tags),
+                    )
+                    Ok(False) -> #(state, UpgradeRefused)
+                    Error(error) -> {
+                      log_store_error("write-through " <> id, error)
+                      #(
+                        State(
+                          ..state,
+                          sessions: dict.insert(
+                            state.sessions,
+                            id,
+                            Record(..record, title: title),
+                          ),
+                        ),
+                        UpgradeApplied(title, record.tags),
+                      )
+                    }
+                  }
                 session.ManualTitle -> #(state, UpgradeRefused)
               }
             Error(_) ->
               case dict.get(state.dormant, id) {
                 Ok(summary) ->
                   case summary.title_source {
-                    session.AutoTitle -> {
-                      write_through_or_log(id, fn() {
-                        state.store.auto_title_upgrade(id, title)
-                        |> result.map(fn(_) { Nil })
-                      })
-                      #(
-                        State(
-                          ..state,
-                          dormant: dict.insert(
-                            state.dormant,
-                            id,
-                            store.StoredSummary(..summary, title: title),
+                    session.AutoTitle ->
+                      // Same twin-invariant: the stored row is a dormant
+                      // session's ONLY state, so its refusal is final.
+                      case state.store.auto_title_upgrade(id, title) {
+                        Ok(True) -> #(
+                          State(
+                            ..state,
+                            dormant: dict.insert(
+                              state.dormant,
+                              id,
+                              store.StoredSummary(..summary, title: title),
+                            ),
                           ),
-                        ),
-                        UpgradeApplied(title, summary.tags),
-                      )
-                    }
+                          UpgradeApplied(title, summary.tags),
+                        )
+                        Ok(False) -> #(state, UpgradeRefused)
+                        Error(error) -> {
+                          log_store_error("write-through " <> id, error)
+                          #(
+                            State(
+                              ..state,
+                              dormant: dict.insert(
+                                state.dormant,
+                                id,
+                                store.StoredSummary(..summary, title: title),
+                              ),
+                            ),
+                            UpgradeApplied(title, summary.tags),
+                          )
+                        }
+                      }
                     session.ManualTitle -> #(state, UpgradeRefused)
                   }
                 Error(_) -> #(state, UpgradeRefused)

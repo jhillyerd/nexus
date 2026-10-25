@@ -944,12 +944,18 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       }
       // A crashed UTILITY worker is best-effort: reset the side-call state
       // WITHOUT consuming `utility_attempted` (a crash must not eat the
-      // session's only attempt) — the next turn-commit point re-arms.
+      // session's only attempt) — and deliver any trigger already recorded
+      // as owed right here: the slot is idle again, and waiting for the
+      // next turn-commit point would strand the retry when no further turn
+      // ever commits.
       case state.utility {
         UtilityStarting(pid, _, _)
           | UtilityRunning(pid, _, _, _)
           if pid == worker
-        -> actor.continue(State(..state, utility: UtilityIdle))
+        -> {
+          let state = State(..state, utility: UtilityIdle)
+          actor.continue(arm_utility(state, False))
+        }
         _ ->
           case is_current {
             False -> actor.continue(state)
@@ -1029,6 +1035,16 @@ fn arm_utility(state: State, committed: Bool) -> State {
       process.send_after(state.self, state.cfg.utility_delay_ms, UtilityStart)
       State(..state, utility_pending: False)
     }
+    // A FAILED turn with an attempt still in flight (necessarily one the
+    // turn's own Send cancelled): neither this turn nor the attempt has a
+    // delivery point, so record the trigger as owed — the attempt's
+    // cancelled completion must re-arm instead of stranding the session's
+    // only try. (With a COMMITTED turn this is branch one's delivery; the
+    // attempt's completion needs this only when the turn failed.)
+    False, False, True, UtilityStarting(..), True ->
+      State(..state, utility_pending: True)
+    False, False, True, UtilityRunning(..), True ->
+      State(..state, utility_pending: True)
     // The side call is still busy (e.g. a cancelled-but-unreported
     // worker): record the trigger as OWED — finish_utility delivers it
     // when this attempt completes. Dropping it here would silently spend

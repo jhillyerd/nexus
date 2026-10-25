@@ -836,6 +836,53 @@ pub fn upgrade_auto_title_writes_through_and_survives_restart_test() {
   should.equal(summary.title_source, session.ManualTitle)
 }
 
+/// The store guard has the final word (twin-invariant): a concurrent
+/// manual rename can land in the store while a registry instance still
+/// holds `AutoTitle` in memory. The registry then REFUSES — no local
+/// mutation, no `UpgradeApplied` — instead of clobbering the rename with
+/// a title its own guard would have rejected.
+pub fn upgrade_auto_title_honors_store_refusal_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  let booted = boot(seam)
+  let record = create(booted.registry, "alias-1", happy_runner)
+  should.be_true(session_registry.auto_title(
+    booted.registry,
+    record.id,
+    "first msg",
+  ))
+
+  // A concurrent rename lands in the store BEHIND the registry's back
+  // (direct seam write, bypassing the registry's in-memory record).
+  should.equal(seam.set_title(record.id, "concurrent rename"), Ok(Nil))
+
+  // The registry's memory still says AutoTitle, but the store refuses —
+  // and the registry honors it: nothing applied, nothing changed.
+  should.equal(
+    session_registry.upgrade_auto_title(
+      booted.registry,
+      record.id,
+      "Model Title",
+    ),
+    session_registry.UpgradeRefused,
+  )
+  let assert Ok(summary) =
+    session_registry.list_sessions(booted.registry)
+    |> list.find(fn(summary) { summary.id == record.id })
+  should.equal(summary.title, "first msg")
+  should.equal(summary.title_source, session.AutoTitle)
+  should.equal(
+    store_mock.events(mock)
+      |> list.filter(fn(event) {
+        case event {
+          store_mock.EvAutoTitleUpgrade(_, _) -> True
+          _ -> False
+        }
+      }),
+    [],
+  )
+}
+
 /// The upgrade also reaches a DORMANT (stored-but-not-live) session —
 /// the registry branch for ids with no live actor.
 pub fn upgrade_auto_title_on_dormant_session_test() {

@@ -801,6 +801,16 @@ type UtilityEvent {
   UtilReleased
   /// The apply seam was reached with the parsed title.
   UtilAppliedNote(title: String)
+  /// The apply seam was REFUSED (guard declined); still records the call.
+  UtilRefusedNote(title: String)
+}
+
+/// The per-attempt handles a blocking fake hands to the test: `release`
+/// completes the attempt with a title, `resume` lets a CANCELLED attempt
+/// finally report (the test holds it until the racing turn's commit has
+/// been observed, pinning the arm-while-unreported order).
+type AttemptHandles {
+  AttemptHandles(release: process.Subject(Nil), resume: process.Subject(Nil))
 }
 
 fn expect_utility(events: process.Subject(UtilityEvent)) -> UtilityEvent {
@@ -854,31 +864,34 @@ fn ok_utility(
 }
 
 /// A runner that blocks until its cancel subject fires (a `Send` racing
-/// the side call) or the test releases it. On cancel it lingers briefly
-/// before reporting, so the racing turn's WorkerDone is processed FIRST —
-/// the arm-while-unreported order the re-arm rule must survive. The
-/// release signal arrives on a subject this WORKER owns (only a
-/// subject's owner can receive from it): the runner creates it and hands
-/// it to the test through `ready` on first invocation.
+/// the side call) or the test releases it. A CANCELLED attempt stays held
+/// on its `resume` subject: the test observes the racing turn's TurnDone
+/// FIRST and only then lets the attempt report, so `UtilityDone` is
+/// processed strictly after the turn's commit — the arm-while-unreported
+/// order the re-arm rule must survive, deterministically rather than by
+/// sleep racing. Each attempt hands its own subjects over via `ready`
+/// (subjects are receivable only by their owner, so the worker mints
+/// them).
 fn blocking_utility(
   events: process.Subject(UtilityEvent),
-  ready: process.Subject(process.Subject(Nil)),
+  ready: process.Subject(AttemptHandles),
 ) -> session.UtilityRunner {
   fn(_endpoint, tr, cancel) {
     process.send(events, UtilCalled(transcript.length(tr)))
-    let release = process.new_subject()
-    process.send(ready, release)
+    let handles =
+      AttemptHandles(
+        release: process.new_subject(),
+        resume: process.new_subject(),
+      )
+    process.send(ready, handles)
     let selector =
       process.new_selector()
       |> process.select_map(cancel, fn(_) { UtilCancelled })
-      |> process.select_map(release, fn(_) { UtilReleased })
+      |> process.select_map(handles.release, fn(_) { UtilReleased })
     case process.selector_receive(selector, 5000) {
       Ok(UtilCancelled) -> {
-        // Record the cancellation, then linger before reporting the
-        // outcome: the racing turn's WorkerDone is processed FIRST, so
-        // the commit-point arm runs while the worker is unreported.
         process.send(events, UtilCancelled)
-        process.sleep(50)
+        let assert Ok(Nil) = process.receive(handles.resume, 5000)
         Error("cancelled mid-flight")
       }
       Ok(UtilReleased) -> {
@@ -908,9 +921,16 @@ fn ok_apply(
   }
 }
 
-/// The registry guard REFUSED (a manual rename wins forever).
-fn refusing_apply(_title: String) -> Result(session.UtilityMeta, Nil) {
-  Error(Nil)
+/// The registry guard REFUSED (a manual rename wins forever) — but the
+/// call itself is recorded, so the test can tell a refusal from a guard
+/// that was never reached.
+fn refusing_apply(
+  events: process.Subject(UtilityEvent),
+) -> session.UtilityApply {
+  fn(t) {
+    process.send(events, UtilRefusedNote(t))
+    Error(Nil)
+  }
 }
 
 fn start_with_utility(
@@ -1030,10 +1050,9 @@ pub fn utility_cancels_on_send_and_rearms_test() {
   let _ = expect_event(sub)
   let _ = expect_event(sub)
   UtilCalled(3) |> should.equal(expect_utility(events))
-  // Each attempt hands over its own release subject (owner = the worker).
-  // Consume the first attempt's here: it is about to be cancelled, and
-  // its subject dies with it — the second attempt's is the live one.
-  let assert Ok(_cancelled_release) = process.receive(ready, 2000)
+  // Each attempt hands over its own handle pair (owner = the worker).
+  // Consume the first attempt's here: it is about to be cancelled.
+  let assert Ok(cancelled_handles) = process.receive(ready, 2000)
 
   // The side call runs BESIDE the turn machinery: not streaming, not busy.
   session.describe(sess).streaming |> should.be_false
@@ -1041,24 +1060,25 @@ pub fn utility_cancels_on_send_and_rearms_test() {
 
   // The in-flight attempt was cancelled by the send…
   UtilCancelled |> should.equal(expect_utility(events))
-  // …whose commits then land…
+  // …whose commits then land — TurnDone observed, so the actor's
+  // commit-point arm has run while the attempt is still unreported…
   let _ = expect_event(sub)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
-  // …and the once-flag is intact: the next commit point re-armed the
-  // debounce, so the session's ONLY attempt runs again — even though the
-  // racing turn's commit was processed while the cancelled worker was
-  // still unreported.
+  // …and ONLY NOW does the held attempt report its cancellation: the
+  // arm-while-unreported order is deterministic. The once-flag is intact:
+  // the owed trigger is delivered and the session's ONLY attempt runs
+  // again.
+  process.send(cancelled_handles.resume, Nil)
   UtilCalled(5)
   |> should.equal(expect_utility_step(events, "re-armed second attempt"))
 
-  // This time it completes: applied → broadcast, and the attempt is spent.
-  // The release subject is the worker's own — it handed it over when the
-  // attempt started.
+  // This attempt completes: applied → broadcast, and the attempt is spent.
   let assert Ok(release) = process.receive(ready, 2000)
-  process.send(release, Nil)
-  UtilReleased |> should.equal(expect_utility_step(events, "released"))
+  process.send(release.release, Nil)
+  UtilReleased
+  |> should.equal(expect_utility_step(events, "released"))
   UtilAppliedNote("Model Title")
   |> should.equal(expect_utility_step(events, "applied"))
   expect_event(sub)
@@ -1076,7 +1096,7 @@ pub fn utility_no_broadcast_when_guard_refuses_test() {
       utility_config(20),
       happy_runner,
       ok_utility(events, "Model Title"),
-      refusing_apply,
+      refusing_apply(events),
     )
   let sub = join(sess)
   let _ = expect_event(sub)
@@ -1087,11 +1107,73 @@ pub fn utility_no_broadcast_when_guard_refuses_test() {
   let _ = expect_event(sub)
   let _ = expect_event(sub)
 
-  // The runner produced a title, the guard refused it — and nothing was
-  // broadcast (nor applied, but the apply seam IS reached, best-effort).
+  // The runner produced a title, the guard reached and refused it — and
+  // nothing was broadcast. The apply seam's call is asserted explicitly:
+  // a silent guard would otherwise be indistinguishable from a skipped
+  // one.
   UtilCalled(3) |> should.equal(expect_utility(events))
+  UtilRefusedNote("Model Title")
+  |> should.equal(expect_utility_step(events, "guard reached and refused"))
   expect_no_event(sub, 400)
   // The attempt completed on its own (not cancelled), so it is spent.
+  expect_no_utility(events, 400)
+}
+
+/// A FAILED follow-up turn must not strand the session's only attempt:
+/// the turn commits nothing, so its commit point delivers no trigger —
+/// the cancelled in-flight attempt's completion records the trigger as
+/// owed and re-arms, and the title still lands.
+pub fn utility_rearms_when_followup_turn_fails_test() {
+  let events = process.new_subject()
+  let ready = process.new_subject()
+  // The first turn succeeds, later turns fail (the existing flaky runner,
+  // serialised through its counter).
+  let counter = start_counter()
+  let sess =
+    start_with_utility(
+      utility_config(20),
+      flaky_runner(counter),
+      blocking_utility(events, ready),
+      ok_apply(events, "Model Title"),
+    )
+  let sub = join(sess)
+  let _ = expect_event(sub)
+
+  should.equal(session.send_message(sess, "first"), session.Sent)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  UtilCalled(3) |> should.equal(expect_utility(events))
+  let assert Ok(handles) = process.receive(ready, 2000)
+
+  // The follow-up send cancels the side call and its turn then FAILS
+  // (flaky's failing turn streams two tokens before erroring).
+  should.equal(session.send_message(sess, "second"), session.Sent)
+  UtilCancelled |> should.equal(expect_utility(events))
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  let assert session.TurnFailed(_) = expect_event(sub)
+
+  // Nothing has re-armed yet — a failed turn commits nothing. The held
+  // attempt now reports its cancellation: its completion records the
+  // trigger as owed and delivers it. (The re-armed snapshot carries the
+  // kept user message: sys + first exchange + the failed turn's user
+  // line = 4 messages.)
+  process.send(handles.resume, Nil)
+  UtilCalled(4)
+  |> should.equal(expect_utility_step(events, "re-armed after failed turn"))
+
+  // The retried attempt completes: applied → broadcast, attempt spent.
+  let assert Ok(release) = process.receive(ready, 2000)
+  process.send(release.release, Nil)
+  UtilReleased
+  |> should.equal(expect_utility_step(events, "released"))
+  UtilAppliedNote("Model Title")
+  |> should.equal(expect_utility_step(events, "applied"))
+  expect_event(sub)
+  |> should.equal(session.MetaUpdated(Some("Model Title"), ["auto-tag"]))
   expect_no_utility(events, 400)
 }
 
