@@ -124,7 +124,8 @@ pub type TurnRunner =
 /// best-effort, discarded, never retried. The endpoint is the session's
 /// frozen one; `cancel` must be owned by the calling process.
 pub type UtilityRunner =
-  fn(openai.Endpoint, Transcript, Subject(Nil)) -> Result(String, String)
+  fn(openai.Endpoint, Transcript, Subject(Nil), Bool) ->
+    Result(utility.Verdict, String)
 
 /// Fresh display metadata as the apply step reports it: what actually
 /// landed, carried to the `MetaUpdated` broadcast.
@@ -145,6 +146,13 @@ pub type UtilityApply =
 pub type UtilityResult {
   /// The guard applied the title; carries the fresh display metadata.
   UtilityApplied(title: String, tags: List(String))
+  /// The model replied PASS (honored only on an allow-pass attempt): no
+  /// title yet, and the once-per-session attempt is NOT consumed — the
+  /// debounce re-arms at the next turn-commit point. Exactly
+  /// `max_utility_passes` passes are honored; later attempts run under
+  /// the forced instruction, where a PASS reply arrives as
+  /// `UtilityFailed` instead (the session must converge).
+  UtilityPassed
   /// Nothing applied: stream failed/cancelled, or the guard refused.
   UtilityFailed
 }
@@ -157,7 +165,9 @@ pub type UtilityResult {
 /// registry the agent loop uses — never a per-session set.
 pub fn utility_runner(specs: List(tools.ToolSpec)) -> UtilityRunner {
   let base = loop.frozen_options(specs)
-  fn(endpoint, tr, cancel) { utility.run(endpoint, tr, base, cancel) }
+  fn(endpoint, tr, cancel, allow_pass) {
+    utility.run(endpoint, tr, base, cancel, allow_pass)
+  }
 }
 
 pub type SendResult {
@@ -346,6 +356,13 @@ type UtilityState {
 /// Newest-first cap on stored metric samples (M2 §4.2).
 const metrics_cap = 20
 
+/// How many PASS replies the session honors before the forced instruction
+/// takes over (utility-titles §4.2, PASS postpone): one. A postponed
+/// attempt is nearly free under the cached prefix (~Y + title tokens), but
+/// an uncapped pass-forever policy would re-arm a side call after every
+/// turn of a perpetual small-talk session and never converge to a title.
+const max_utility_passes = 1
+
 type State {
   State(
     cfg: Config,
@@ -378,6 +395,11 @@ type State {
     /// is armed or cancelled — so a fast follow-up can kill at most the
     /// in-flight try, never the session's only one.
     utility_attempted: Bool,
+    /// PASS replies honored so far. Gates the instruction variant handed
+    /// to the runner: below `max_utility_passes` the attempt may pass,
+    /// after it the forced instruction applies and a PASS reply counts as
+    /// a failure. Bumped only when a `UtilityPassed` completes.
+    utility_passes: Int,
     /// The injected side-call seams (see `SessionSpec`): the LLM branch
     /// and the guarded title application, both run by the unlinked worker.
     utility_runner: UtilityRunner,
@@ -469,6 +491,9 @@ fn start_builder(spec: SessionSpec) {
         Some(_) -> True
         None -> False
       },
+      // A hydrated session never attempts anyway (above), so the pass
+      // count starts at zero in both cases and never moves.
+      utility_passes: 0,
       self: self,
       metrics: [],
       last_commit_s: 0,
@@ -859,15 +884,35 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           // WORKER applies the title through the registry ask (the actor
           // never blocks), then reports the outcome.
           let snapshot = state.transcript
+          // The instruction variant is fixed at spawn time: below the
+          // pass cap the model may reply PASS; after it the forced
+          // instruction applies and a PASS reply comes back as a failure.
+          let allow_pass = state.utility_passes < max_utility_passes
           let worker =
             process.spawn_unlinked(fn() {
               let cancel = process.new_subject()
               let pid = process.self()
               process.send(state.self, UtilityStarted(pid, cancel))
               let result = case
-                state.utility_runner(state.endpoint, snapshot, cancel)
+                state.utility_runner(
+                  state.endpoint,
+                  snapshot,
+                  cancel,
+                  allow_pass,
+                )
               {
-                Ok(title) ->
+                // A PASS counts only on an attempt that offered it: under
+                // the forced instruction the session must converge, so a
+                // PASS reply is an unusable title — a failure that spends
+                // the once-flag. (The parser already rejects it; this
+                // guard pins the invariant at the actor boundary too, so
+                // no runner can smuggle an endless postpone through.)
+                Ok(utility.Pass) ->
+                  case allow_pass {
+                    True -> UtilityPassed
+                    False -> UtilityFailed
+                  }
+                Ok(utility.Title(title)) ->
                   case state.utility_apply(title) {
                     Ok(meta) -> UtilityApplied(meta.title, meta.tags)
                     Error(Nil) -> UtilityFailed
@@ -1071,9 +1116,12 @@ fn finish_utility(
   // cancellation raced it — the registry applied, so a second request would
   // be pure waste. A FAILED attempt consumes it only when it actually
   // completed on its own; a cancelled one is re-armed by the next
-  // turn-commit point.
+  // turn-commit point. A PASS never consumes it: the model said "not
+  // enough signal yet" — the attempt stays available and re-arms (the
+  // forced instruction takes over once `max_utility_passes` is spent).
   let utility_attempted = case result, cancelled {
     UtilityApplied(..), _ -> True
+    UtilityPassed, _ -> state.utility_attempted
     UtilityFailed, True -> state.utility_attempted
     UtilityFailed, False -> True
   }
@@ -1082,6 +1130,10 @@ fn finish_utility(
       ..state,
       utility: UtilityIdle,
       utility_attempted: utility_attempted,
+      utility_passes: case result {
+        UtilityPassed -> state.utility_passes + 1
+        _ -> state.utility_passes
+      },
       // The once-flag is spent: an owed trigger could never fire again.
       utility_pending: case utility_attempted {
         True -> False
@@ -1092,9 +1144,12 @@ fn finish_utility(
   // once-flag. If the turn-commit arm ran while this worker was still
   // unreported, the trigger was recorded as owed — deliver it NOW: the
   // slot is idle again and waiting for the next commit point could
-  // strand the session's only attempt when no further turn commits.
+  // strand the session's only attempt when no further turn commits. A
+  // PASS that raced a Send behaves the same: nothing was consumed, so
+  // the owed trigger is still deliverable.
   let state = case result, cancelled {
     UtilityFailed, True -> arm_utility(state, False)
+    UtilityPassed, True -> arm_utility(state, False)
     _, _ -> state
   }
   case result {
@@ -1102,7 +1157,7 @@ fn finish_utility(
       broadcast(state.subs, MetaUpdated(Some(title), tags))
       actor.continue(state)
     }
-    UtilityFailed -> actor.continue(state)
+    UtilityFailed | UtilityPassed -> actor.continue(state)
   }
 }
 

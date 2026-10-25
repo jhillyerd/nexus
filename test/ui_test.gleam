@@ -1739,7 +1739,9 @@ pub fn meta_updated_refreshes_sidebar_test() {
       process.new_name("nexus_ui_registry"),
       seam,
       unused_turn_runner,
-      fn(_endpoint, _tr, _cancel) { Error("no utility call in this test") },
+      fn(_endpoint, _tr, _cancel, _allow_pass) {
+        Error("no utility call in this test")
+      },
       fixture_resolver(),
     )
   let registry = started_registry.data
