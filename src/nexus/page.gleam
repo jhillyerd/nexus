@@ -354,10 +354,14 @@ fn css() -> String {
    radii, selection blue as primary, compact form fields. This is the
    Pico-first surface (AGENTS.md): prefer a token over a new rule. Both
    token blocks restate at Pico's own theme-rule specificity: its light
-   rule is :root:not([data-theme=dark]) and its dark rule is
-   :root:not([data-theme=light]), both (0,2,0) — a plain :root block
-   (0,1,0) silently loses and the primary falls back to Pico blue in
-   light mode. */
+   rule is :root:not([data-theme=dark]) and its dark rule (inside the
+   prefers-color-scheme media block) is :root:not([data-theme]), both
+   (0,2,0) — a plain :root block (0,1,0) silently loses and the primary
+   falls back to Pico blue in light mode. The dark mirror below uses
+   :not([data-theme=light]) rather than Pico's :not([data-theme]) so an
+   explicit data-theme=dark stays on the app blues too; without the
+   attribute the two are equivalent, and ours is the later sheet either
+   way. */
 :root:not([data-theme=dark]), :host(:not([data-theme=dark])) {
   --pico-font-size: 15px;
   --pico-line-height: 1.45;
