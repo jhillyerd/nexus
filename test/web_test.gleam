@@ -460,18 +460,21 @@ pub fn pico_asset_served_from_priv_test() {
 /// No-CDN guard: the UI must render fully offline, so the shell may not
 /// reference any absolute or protocol-relative external URL — every asset
 /// it loads is vendored in-repo and served by nexus itself (runtime.mjs,
-/// pico.min.css). One sweep covers src=, href=, and url(...) positions;
+/// pico.min.css). One sweep covers src=, href=, and CSS url() positions;
 /// both shell variants (plain and tokenized) are scanned.
 pub fn m3_page_no_cdn_urls_test() {
-  let plain = nexus_page.html(None)
-  should.be_false(string.contains(plain, "http://"))
-  should.be_false(string.contains(plain, "https://"))
-  // Protocol-relative URLs are CDN references in disguise.
-  should.be_false(string.contains(plain, "src=\"//"))
-  should.be_false(string.contains(plain, "href=\"//"))
-  let authed = nexus_page.html(Some("s3cret token"))
-  should.be_false(string.contains(authed, "http://"))
-  should.be_false(string.contains(authed, "https://"))
-  should.be_false(string.contains(authed, "src=\"//"))
-  should.be_false(string.contains(authed, "href=\"//"))
+  assert_no_external_urls(nexus_page.html(None))
+  assert_no_external_urls(nexus_page.html(Some("s3cret token")))
+}
+
+fn assert_no_external_urls(html: String) {
+  should.be_false(string.contains(html, "http://"))
+  should.be_false(string.contains(html, "https://"))
+  // Protocol-relative URLs are CDN references in disguise: attribute
+  // positions (src/href) and CSS url() positions, quoted or unquoted.
+  should.be_false(string.contains(html, "src=\"//"))
+  should.be_false(string.contains(html, "href=\"//"))
+  should.be_false(string.contains(html, "url(//"))
+  should.be_false(string.contains(html, "url(\"//"))
+  should.be_false(string.contains(html, "url('//"))
 }
