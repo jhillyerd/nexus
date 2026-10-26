@@ -111,6 +111,39 @@ Pinned by the M3 browser suite (`docs/plans/completed/m3-verification.md`);
   reintroduce shared UI state across connections — the settings surface
   builds on per-client state.
 
+## UI styling and static assets
+
+Pico CSS is the default styling layer (vendored at `priv/pico.min.css`,
+served from `/css/pico.min.css`). Adopting it changed none of the UI hard
+invariants above — hostile text stays Lustre text nodes, the shadow root
+stays open, one runtime per connection.
+
+- **Style Pico-first.** Reach for Pico's semantic elements, classes, and
+  `--pico-*` tokens before writing new CSS — bare semantics get styled
+  with zero classes, which is why upcoming markdown rendering will need
+  no styling work. Hand-written CSS in `page.gleam`'s `css()` is the
+  escape hatch: app-shell grid, chat chrome, and overrides — not a
+  parallel design system. Adapt the look via the `:root, :host` token
+  block (font size, radii, primary colors), not via more rules.
+- **Two cascade traps when overriding Pico** (both bit during adoption;
+  the comments in `css()` carry the details): token overrides must be
+  restated at Pico's theme-rule specificity (`:root:not([data-theme=…])`)
+  or dark mode silently reverts to Pico defaults; bare-element overrides
+  must be `#app`-prefixed, because Pico matches `button`/`input` twice
+  (element *and* `[type=…]` attribute selectors at 0,1,0) and an
+  unprefixed reset loses the cascade.
+- **Self-hosted assets only — no public CDNs, ever.** Everything the UI
+  loads is vendored in-repo and served by nexus itself, so the UI works
+  fully offline. New static assets follow the `runtime.mjs` /
+  `pico.min.css` pattern: file under `priv/`, authed route in `web.gleam`
+  (router **and** `requires_auth`), token on the query string,
+  cache-friendly headers. `m3_page_no_cdn_urls_test` guards the shell
+  against absolute and protocol-relative external URLs.
+- **Upgrading Pico** = replace `priv/pico.min.css` (keep the provenance
+  header: version, source URL, MIT), verify token names against the new
+  file, and re-run the e2e browser suite — the offline suite cannot see
+  visual regressions.
+
 ## Changing the transcript / request-encoding path
 
 `test/m3_prefix_test.gleam` is the offline golden: it replays the archived

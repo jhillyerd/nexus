@@ -456,3 +456,25 @@ pub fn pico_asset_served_from_priv_test() {
   response.get_header(res, "cache-control")
   |> should.equal(Ok("private, max-age=86400"))
 }
+
+/// No-CDN guard: the UI must render fully offline, so the shell may not
+/// reference any absolute or protocol-relative external URL — every asset
+/// it loads is vendored in-repo and served by nexus itself (runtime.mjs,
+/// pico.min.css). One sweep covers src=, href=, and CSS url() positions;
+/// both shell variants (plain and tokenized) are scanned.
+pub fn m3_page_no_cdn_urls_test() {
+  assert_no_external_urls(nexus_page.html(None))
+  assert_no_external_urls(nexus_page.html(Some("s3cret token")))
+}
+
+fn assert_no_external_urls(html: String) {
+  should.be_false(string.contains(html, "http://"))
+  should.be_false(string.contains(html, "https://"))
+  // Protocol-relative URLs are CDN references in disguise: attribute
+  // positions (src/href) and CSS url() positions, quoted or unquoted.
+  should.be_false(string.contains(html, "src=\"//"))
+  should.be_false(string.contains(html, "href=\"//"))
+  should.be_false(string.contains(html, "url(//"))
+  should.be_false(string.contains(html, "url(\"//"))
+  should.be_false(string.contains(html, "url('//"))
+}
