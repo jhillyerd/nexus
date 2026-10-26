@@ -34,11 +34,26 @@ pub fn runtime_src(token: Option(String)) -> String {
   }
 }
 
+/// `href` for the vendored Pico stylesheet. Like the runtime asset, a plain
+/// `<link>` cannot send an Authorization header, so the token rides the
+/// query string. The stylesheet sits before the inline `<style>` in the
+/// head: the client runtime adopts document stylesheets in document order
+/// into the shadow root, so Pico is the baseline and `css()` overrides it.
+pub fn pico_href(token: Option(String)) -> String {
+  case token {
+    None -> "/css/pico.min.css"
+    Some(t) -> "/css/pico.min.css?token=" <> uri.percent_encode(t)
+  }
+}
+
 pub fn html(token: Option(String)) -> String {
   string.concat([
     "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
       <> "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
-      <> "<title>nexus</title>\n<style>\n",
+      <> "<title>nexus</title>\n"
+      <> "<link rel=\"stylesheet\" href=\""
+      <> pico_href(token),
+    "\">\n<style>\n",
     css(),
     "</style>\n<script type=\"module\" src=\"",
     runtime_src(token),
@@ -335,15 +350,54 @@ fn autoscroll_js() -> String {
 fn css() -> String {
   "
 :root { color-scheme: light dark; }
+/* Pico tokens tuned to the pre-Pico look: 15px base, 1.45 leading, 8px
+   radii, selection blue as primary, compact form fields. This is the
+   Pico-first surface (AGENTS.md): prefer a token over a new rule. Both
+   token blocks restate at Pico's own theme-rule specificity: its light
+   rule is :root:not([data-theme=dark]) and its dark rule (inside the
+   prefers-color-scheme media block) is :root:not([data-theme]), both
+   (0,2,0) — a plain :root block (0,1,0) silently loses and the primary
+   falls back to Pico blue in light mode. The dark mirror below uses
+   :not([data-theme=light]) rather than Pico's :not([data-theme]) so an
+   explicit data-theme=dark stays on the app blues too; without the
+   attribute the two are equivalent, and ours is the later sheet either
+   way. */
+:root:not([data-theme=dark]), :host(:not([data-theme=dark])) {
+  --pico-font-size: 15px;
+  --pico-line-height: 1.45;
+  --pico-border-radius: 8px;
+  --pico-form-element-spacing-vertical: .3rem;
+  --pico-form-element-spacing-horizontal: .6rem;
+  --pico-primary: #3b82f6;
+  --pico-primary-background: #3b82f6;
+  --pico-primary-border: #3b82f6;
+  --pico-primary-hover: #60a5fa;
+  --pico-primary-hover-background: #2563eb;
+  --pico-primary-hover-border: #2563eb;
+  --pico-primary-focus: color-mix(in srgb, #3b82f6 35%, transparent);
+}
+@media only screen and (prefers-color-scheme: dark) {
+  :root:not([data-theme=light]), :host(:not([data-theme=light])) {
+    --pico-primary: #60a5fa;
+    --pico-primary-background: #2563eb;
+    --pico-primary-border: #2563eb;
+    --pico-primary-hover: #93c5fd;
+    --pico-primary-hover-background: #3b82f6;
+    --pico-primary-hover-border: #3b82f6;
+    --pico-primary-focus: color-mix(in srgb, #60a5fa 40%, transparent);
+  }
+}
 * { box-sizing: border-box; }
 html, body { height: 100%; }
-body { margin: 0; font: 15px/1.45 system-ui, sans-serif; display: flex; }
+/* Font comes from Pico's tokens (--pico-font-size/-line-height/-font-family);
+   only the app-shell layout is ours. */
+body { margin: 0; display: flex; }
 lustre-server-component { display: contents; }
 #app { min-width: 100%; height: 100dvh; display: flex; flex-direction: column; }
 header { display: flex; align-items: baseline; gap: .75rem; padding: .6rem 1rem;
   border-bottom: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
 header h1 { font-size: 1.05rem; margin: 0; }
-header button { font-size: .8rem; padding: .28rem .7rem; }
+#app header button { font-size: .8rem; padding: .28rem .7rem; }
 .muted { opacity: .6; font-size: .85rem; }
 .dot { margin-left: auto; font-size: 1.2rem; }
 .dot.live { color: #2e9e5b; }
@@ -425,8 +479,12 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
 .provider-form input { min-width: 0; }
 .provider-form-buttons { display: flex; gap: .3rem; }
 .provider-form-buttons button { font-size: .75rem; padding: .25rem .6rem; }
-select, textarea, input { font: inherit; color: inherit; background: transparent; border-radius: 8px;
-  border: 1px solid color-mix(in srgb, currentColor 25%, transparent); padding: .45rem .6rem; }
+/* Form visuals (borders, focus rings, filled backgrounds, dark mode) are
+   Pico's, driven by the tokens above. Only the layout leftovers are
+   patched: every form here is a flex row/column with explicit gaps, so
+   Pico's stacked-form margins (fields and labels) are noise, and form
+   elements must keep inheriting the 15px base. */
+#app select, #app textarea, #app input, #app label { margin: 0; font: inherit; }
 #chat { min-width: 0; display: flex; flex-direction: column; }
 #log-wrap { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; }
 #log { flex: 1; min-height: 0; overflow-y: auto; padding: 1rem; display: flex; flex-direction: column; gap: .8rem; }
@@ -470,10 +528,20 @@ details.turn.reasoning.live > summary { color: color-mix(in srgb, currentColor 8
   color-mix(in srgb, currentColor 15%, transparent); }
 textarea { flex: 1; resize: none; }
 .buttons { display: flex; flex-direction: column; gap: .35rem; }
-button { font: inherit; padding: .42rem .8rem; border-radius: 8px; cursor: pointer;
-  border: 1px solid color-mix(in srgb, currentColor 25%, transparent); background: transparent; color: inherit; }
-button#send, button#create-session { background: #3b82f6; border-color: #3b82f6; color: #fff; }
-button:disabled { opacity: .45; cursor: default; }
+/* Bare-element overrides are #app-prefixed on purpose: Pico matches
+   buttons/inputs twice (e.g. `button` AND `[type=button]`/`[type=text]`,
+   the attribute selectors at 0,1,0), so a bare `button` reset loses the
+   cascade. #app gives (1,0,x): it wins outright, matches inside the
+   shadow root (everything renders under #app), and stays inert in the
+   light DOM. */
+#app button { font: inherit; padding: .42rem .8rem; border-radius: var(--pico-border-radius); cursor: pointer;
+  border: 1px solid color-mix(in srgb, currentColor 25%, transparent); background: transparent; color: inherit;
+  /* Pico's button defaults are for full-width form CTAs; the shell's
+     chrome buttons are inline-sized, self-spaced, and flat. */
+  width: auto; margin: 0; }
+button#send, button#create-session { background: var(--pico-primary-background);
+  border-color: var(--pico-primary-border); color: #fff; }
+#app button:disabled { opacity: .45; cursor: default; }
 .metrics-list { display: flex; flex-direction: column; gap: .45rem; }
 .metric { padding: .5rem; font-size: .75rem; border-radius: 8px;
   background: color-mix(in srgb, currentColor 7%, transparent); overflow-wrap: anywhere; }

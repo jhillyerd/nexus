@@ -4,6 +4,7 @@
 import gleam/http.{Delete, Get, Patch, Post}
 
 import gleam/http/request
+import gleam/http/response
 import gleam/json
 import gleam/list
 import gleam/option.{None, Some}
@@ -14,6 +15,7 @@ import nexus/provider
 import nexus/provider_registry
 import nexus/session
 import nexus/session_registry
+import nexus/ui_runtime
 import nexus/web
 
 fn req_with_token_query() -> request.Request(String) {
@@ -335,6 +337,9 @@ pub fn protected_route_matrix_test() {
     // behind the same token gate as the page itself.
     #(Get, ["lustre", "runtime.mjs"]),
     #(Get, ["ws"]),
+    // Pico: the vendored stylesheet is served by us (never a CDN) and sits
+    // behind the same token gate as the rest of the UI's assets.
+    #(Get, ["css", "pico.min.css"]),
   ]
   |> list.each(fn(route) {
     let #(method, segments) = route
@@ -355,6 +360,15 @@ pub fn m3_page_hosts_server_component_test() {
   should.be_true(string.contains(html, "route=\"/ws\""))
   should.be_true(string.contains(html, "/lustre/runtime.mjs"))
   should.be_true(string.contains(html, "type=\"module\""))
+  // Styling is the vendored, self-hosted Pico baseline (never a CDN link).
+  should.be_true(string.contains(
+    html,
+    "<link rel=\"stylesheet\" href=\"/css/pico.min.css\">",
+  ))
+  // The stylesheet precedes the inline overrides in the head: the client
+  // runtime adopts document stylesheets in document order into the shadow
+  // root, so Pico is the baseline and css() overrides it.
+  should.be_true(string.contains(html, "/css/pico.min.css\">\n<style>"))
   // The token never enters JavaScript: no inline script beyond the module.
   should.be_false(string.contains(html, "Bearer"))
 }
@@ -404,6 +418,8 @@ pub fn m3_page_tokenizes_runtime_src_test() {
     "/lustre/runtime.mjs?token=s3cret%20token",
   ))
   should.be_true(string.contains(html, "route=\"/ws?token=s3cret%20token\""))
+  // The vendored stylesheet link carries the token like the runtime src.
+  should.be_true(string.contains(html, "/css/pico.min.css?token=s3cret%20token"))
   // The inline indicator script is static: the token never enters it.
   should.be_false(string.contains(html, "Bearer"))
 }
@@ -411,15 +427,32 @@ pub fn m3_page_tokenizes_runtime_src_test() {
 pub fn m3_page_route_carries_token_test() {
   let html = nexus_page.html(Some("sekrit"))
   should.be_true(string.contains(html, "route=\"/ws?token=sekrit\""))
-  // Exactly two token occurrences (runtime src + ws route): never a third
-  // hiding in the inline indicator script.
+  // Exactly three token occurrences (runtime src + ws route + stylesheet
+  // link): never a fourth hiding in the inline indicator script.
   string.split(html, "sekrit")
   |> list.length
-  |> should.equal(3)
+  |> should.equal(4)
 }
 
 pub fn ws_route_token_encoding_test() {
   nexus_page.ws_route(None) |> should.equal("/ws")
   nexus_page.ws_route(Some("a b&c"))
   |> should.equal("/ws?token=a%20b%26c")
+}
+
+pub fn pico_href_token_encoding_test() {
+  nexus_page.pico_href(None) |> should.equal("/css/pico.min.css")
+  nexus_page.pico_href(Some("a b&c"))
+  |> should.equal("/css/pico.min.css?token=a%20b%26c")
+}
+
+/// The vendored Pico stylesheet must actually resolve from this package's
+/// priv directory (no silent fallback to a CDN, no 404 styling baseline).
+pub fn pico_asset_served_from_priv_test() {
+  let assert Ok(res) = ui_runtime.pico_asset_response()
+  res.status |> should.equal(200)
+  response.get_header(res, "content-type")
+  |> should.equal(Ok("text/css; charset=utf-8"))
+  response.get_header(res, "cache-control")
+  |> should.equal(Ok("private, max-age=86400"))
 }

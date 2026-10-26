@@ -178,3 +178,30 @@ pub fn runtime_asset_response() -> Result(Response(mist.ResponseData), Nil) {
     }
   }
 }
+
+/// The vendored Pico stylesheet (`priv/pico.min.css`), the UI's default
+/// styling baseline. Served exactly like the runtime asset: from this
+/// package's own priv directory, behind the token gate — never a public
+/// CDN, so the UI works with no internet access. The client runtime
+/// awaits pending stylesheet loads before adopting them into the shadow
+/// root, so the `<link>` in the page shell cannot flash unstyled content.
+pub fn pico_asset_response() -> Result(Response(mist.ResponseData), Nil) {
+  case application.priv_directory("nexus") {
+    Error(_) -> Error(Nil)
+    Ok(priv) -> {
+      let file = priv <> "/pico.min.css"
+      case mist.send_file(file, offset: 0, limit: None) {
+        Ok(sent) ->
+          response.new(200)
+          |> response.prepend_header("content-type", "text/css; charset=utf-8")
+          // The file changes only when the vendored copy is replaced, so a
+          // day of client caching is safe; `private` because the URL is
+          // token-gated per user.
+          |> response.prepend_header("cache-control", "private, max-age=86400")
+          |> response.set_body(sent)
+          |> Ok
+        Error(_) -> Error(Nil)
+      }
+    }
+  }
+}

@@ -80,6 +80,8 @@ pub fn handler(
         json_response(200, json.object([#("ok", json.bool(True))]))
       Get, ["lustre", "runtime.mjs"] ->
         protected(cfg, req, fn() { runtime_asset_response() })
+      Get, ["css", "pico.min.css"] ->
+        protected(cfg, req, fn() { pico_asset_response() })
       Get, ["ws"] ->
         protected(cfg, req, fn() {
           ui_runtime.websocket(req, registry, providers)
@@ -114,6 +116,13 @@ fn runtime_asset_response() -> Response(mist.ResponseData) {
   case ui_runtime.runtime_asset_response() {
     Ok(res) -> res
     Error(_) -> json_response(404, err_json("runtime asset unavailable"))
+  }
+}
+
+fn pico_asset_response() -> Response(mist.ResponseData) {
+  case ui_runtime.pico_asset_response() {
+    Ok(res) -> res
+    Error(_) -> json_response(404, err_json("stylesheet asset unavailable"))
   }
 }
 
@@ -953,6 +962,7 @@ pub fn requires_auth(method: Method, segments: List(String)) -> Bool {
     | Get, ["providers"]
     | Get, ["providers", _, "models"]
     | Get, ["lustre", "runtime.mjs"]
+    | Get, ["css", "pico.min.css"]
     | Get, ["ws"]
     -> True
     Post, ["sessions"]
