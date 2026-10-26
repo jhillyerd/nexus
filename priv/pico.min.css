@@ -4,7 +4,7 @@
  * Source:   https://registry.npmjs.org/@picocss/pico/-/pico-2.1.1.tgz
  * License:  MIT (https://github.com/picocss/pico/blob/v2.1.1/LICENSE.md)
  * Vendored 2026-10-25 so the UI is fully self-hosted: no public CDNs, the
- * UI must work with no internet access (AGENTS.md "UI styling and assets").
+ * UI must work with no internet access (AGENTS.md "UI styling and static assets").
  * Upgrade = replace this file, then re-run the e2e suite.
  *//*!
  * Pico CSS ✨ v2.1.1 (https://picocss.com)
