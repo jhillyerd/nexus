@@ -1,9 +1,8 @@
 # AGENTS.md
 
-Repo guidance for coding agents working on nexus. Sources of truth for the
-"why" behind these rules: `docs/plans/p2-verification.md` (schema) and
-`docs/plans/completed/m3-verification.md` (UI, agent loop, KV-cache
-verification).
+Repo guidance for coding agents working on nexus. The schema rules below
+carry their own rationale; the "why" behind the UI, agent loop, and
+KV-cache verification lives in `docs/plans/completed/m3-verification.md`.
 
 ## Database schema naming (decided, follow it)
 
@@ -38,7 +37,7 @@ The persistence layer lives in `sql/schema.sql` + `src/nexus/store/sql/`.
   (epoch seconds, the Phase 1 wire format), write via `to_timestamp($1)`
   or server-side `now()`. Never introduce naive `timestamp` columns —
   `now()` into one shifts by the session timezone under config drift
-  (measured +9h; see `spikes/d_pg_roundtrip`).
+  (measured +9h in the Phase 2 round-trip spike).
 - **`session.message_count` counts messages including the system prompt**
   (Phase 1 `SessionSummary` semantics) and doubles as the write-behind
   watermark: an assistant message with N tool calls is ONE message but N

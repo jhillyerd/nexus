@@ -10,8 +10,9 @@
 -- plus the multi-provider link `provider_id`
 -- (docs/plans/multi-provider.md).
 --
--- Timestamps are `timestamptz` (see docs/plans/p2-verification.md for the
--- spike outcome): the app reads them as epoch seconds via
+-- Timestamps are `timestamptz` (the Phase 2 round-trip spike measured a
+-- naive `timestamp` column shifting +9h when `now()` was cast under a
+-- non-UTC session timezone): the app reads them as epoch seconds via
 -- `extract(epoch from x)::int8` (matching Phase 1's wire format) and writes
 -- them through server-side `now()`; explicit params are rare and cast
 -- `$1::timestamptz` from text.
@@ -79,7 +80,7 @@ CREATE TABLE IF NOT EXISTS session_message (
   content      text NOT NULL,                  -- exact transcript content, never mutated
   tool_call_id text,
   tool_name    text,
-  tool_args    text,                           -- raw argument JSON as the model emitted it. NOTE: deliberately text, not jsonb: jsonb normalizes (sorts keys, strips whitespace, dedupes), which would break the byte-identical hydration contract for tool-call arguments that sit above the request tail (see docs/plans/p2-verification.md)
+  tool_args    text,                           -- raw argument JSON as the model emitted it. NOTE: deliberately text, not jsonb: jsonb normalizes (sorts keys, strips whitespace, dedupes), which would break the byte-identical hydration contract for tool-call arguments that sit above the request tail (see the `tool_args` invariant in AGENTS.md)
   tool_ok      boolean,
   reasoning    text,                           -- display-only chain-of-thought emitted before an assistant message; NULL for user/tool rows and reasoning-free messages. Plain text for the same byte-stability rationale as tool_args. Never sent back to the model.
   UNIQUE (session_id, seq)

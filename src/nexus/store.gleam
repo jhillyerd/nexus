@@ -119,7 +119,8 @@ pub type MessageRow {
     call_id: String,
     name: String,
     /// Raw model-emitted argument JSON, byte-stable (a `text` column on
-    /// purpose: jsonb would normalize it — see docs/plans/p2-verification.md).
+    /// purpose: jsonb would normalize it — see the `tool_args` invariant
+    /// in AGENTS.md).
     arguments: String,
     /// The message's reasoning — set on the FIRST row of a run only,
     /// exactly like `content`.
