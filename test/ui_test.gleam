@@ -1138,14 +1138,7 @@ pub fn providers_loaded_notes_only_when_load_concludes_empty_test() {
   let empty =
     new_model()
     |> step(ui.ProvidersLoaded([]))
-  empty.log
-  |> list.any(fn(line) {
-    case line {
-      ui.NoteLine(_, text) -> string.contains(text, "no provider configured")
-      _ -> False
-    }
-  })
-  |> should.be_true
+  note_count(empty.log) |> should.equal(1)
 
   // A load with an enabled provider — the fresh-start path that used to
   // be defamed by the bug — notes nothing.
@@ -1159,14 +1152,38 @@ pub fn providers_loaded_notes_only_when_load_concludes_empty_test() {
     new_model()
     |> step(ui.ProvidersLoaded([prov("p1", "bifrost", False, True)]))
   disabled.provider |> should.equal(None)
-  disabled.log
-  |> list.any(fn(line) {
+  note_count(disabled.log) |> should.equal(1)
+
+  // Repeated refreshes that STAY empty add nothing: the note fires on
+  // the first load and on transitions, never per refresh — ordinary
+  // Settings reloads while nothing is enabled must not stack duplicate
+  // notes in the log.
+  let refreshed =
+    new_model()
+    |> step(ui.ProvidersLoaded([]))
+    |> step(ui.ProvidersLoaded([]))
+    |> step(ui.ProvidersLoaded([]))
+  note_count(refreshed.log) |> should.equal(1)
+
+  // Losing the last enabled provider mid-session still notes: the
+  // Some -> None transition is new information, not a repeat.
+  let lost =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(ui.ProvidersLoaded([]))
+  note_count(lost.log) |> should.equal(1)
+}
+
+/// How many "no provider configured" note lines the log carries.
+fn note_count(log: List(ui.Line)) -> Int {
+  log
+  |> list.filter(fn(line) {
     case line {
       ui.NoteLine(_, text) -> string.contains(text, "no provider configured")
       _ -> False
     }
   })
-  |> should.be_true
+  |> list.length
 }
 
 pub fn providers_loaded_clears_stale_aliases_on_fallback_test() {
@@ -1881,7 +1898,7 @@ pub fn connect_with_configured_provider_never_notes_no_provider_test() {
   // provider select is rendered (hidden) in every chat view, so the
   // fixture row in the SAME stream proves `ProvidersLoaded` landed —
   // the note's absence is a verdict, not a stall.
-  let seen = collect_until_quiet(client, 10, "")
+  let seen = collect_until_quiet(client, 10, 10, "")
 
   // The configured provider is offered…
   // The configured provider is offered…
@@ -1942,28 +1959,31 @@ fn test_config() -> config.Config {
   )
 }
 
-/// Receive client messages until `quiet` consecutive 200 ms quiet
-/// intervals pass, returning the concatenated JSON — for NEGATIVE
-/// assertions ("this string never reaches the client"): unlike
-/// `wait_for_patch`, which stops at the first match, this keeps every
-/// patch so an assertion can rule a string out across the whole
-/// stream.
+/// Receive client messages until `limit` consecutive 200 ms quiet
+/// intervals pass with no traffic, returning the concatenated JSON —
+/// for NEGATIVE assertions ("this string never reaches the client"):
+/// unlike `wait_for_patch`, which stops at the first match, this keeps
+/// every patch so an assertion can rule a string out across the whole
+/// stream. Every received patch RESETS the quiet budget to `limit`:
+/// quiet gaps between a cascade's patches must not erode the budget,
+/// or collection could stop while the cascade is still producing.
 fn collect_until_quiet(
   client: process.Subject(server_component.ClientMessage(ui.Msg)),
-  quiet: Int,
+  limit: Int,
+  remaining: Int,
   acc: String,
 ) -> String {
   case process.receive(client, 200) {
     Error(_) ->
-      case quiet {
+      case remaining {
         0 -> acc
-        _ -> collect_until_quiet(client, quiet - 1, acc)
+        _ -> collect_until_quiet(client, limit, remaining - 1, acc)
       }
     Ok(message) -> {
       let text =
         server_component.client_message_to_json(message)
         |> json.to_string
-      collect_until_quiet(client, quiet, acc <> text)
+      collect_until_quiet(client, limit, limit, acc <> text)
     }
   }
 }

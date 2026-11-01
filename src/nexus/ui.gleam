@@ -491,16 +491,25 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       // chat log — only here, where "none exist" is actually known
       // (the picker placeholder carries the same message in the create
       // panel, and the first-load auto-open rule puts the user on the
-      // Settings page). The clearing the old `NoProviders` message did
-      // is already covered above: `selected` is None and a changed
-      // selection wiped `aliases`/`picker`.
-      let model = case selected {
-        None ->
+      // Settings page). The note fires on the connection's first load
+      // and on the TRANSITION from an enabled provider to none — never
+      // per refresh, so ordinary Settings reloads while nothing is
+      // enabled cannot stack duplicates in the log (the auto-open
+      // rule's `providers_seen` idiom). The clearing the old
+      // `NoProviders` message did is already covered above: `selected`
+      // is None and a changed selection wiped `aliases`/`picker`.
+      let model = case selected, model.providers_seen, previous {
+        None, False, _ ->
           Model(..model, log: [
             NoteLine(True, "no provider configured — add one in Settings"),
             ..model.log
           ])
-        Some(_) -> model
+        None, True, Some(_) ->
+          Model(..model, log: [
+            NoteLine(True, "no provider configured — add one in Settings"),
+            ..model.log
+          ])
+        _, _, _ -> model
       }
       // First run: the connection's FIRST provider load arriving empty
       // auto-opens the Settings view (the guided path the always-visible
