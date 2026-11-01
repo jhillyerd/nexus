@@ -2200,8 +2200,10 @@ fn tool_card(line: Line) -> Element(Msg) {
       attr.open(status == ToolRunning),
     ],
     [
+      // Phrasing content only (summary admits no flow content); the
+      // .tool-head span keeps its flex layout from the stylesheet.
       html.summary([], [
-        html.div([attr.class("tool-head")], [
+        html.span([attr.class("tool-head")], [
           html.strong([attr.class("tool-name")], [html.text(name)]),
           html.span([attr.class("call-id")], [html.text(id)]),
           html.span([attr.class("tool-status")], [html.text(status_label)]),
@@ -2233,7 +2235,7 @@ fn pending_card(call: PendingCall) -> Element(Msg) {
     ],
     [
       html.summary([], [
-        html.div([attr.class("tool-head")], [
+        html.span([attr.class("tool-head")], [
           html.strong([attr.class("tool-name")], [html.text(name)]),
           html.span([attr.class("call-id")], [html.text(id)]),
           html.span([attr.class("tool-status")], [html.text("running")]),

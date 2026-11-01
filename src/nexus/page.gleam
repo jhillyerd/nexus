@@ -504,10 +504,15 @@ details.turn.reasoning > summary { cursor: pointer; font-style: italic; opacity:
 details.turn.reasoning.live > summary { color: color-mix(in srgb, currentColor 85%, #b8860b); opacity: 1; }
 .reasoning-body { white-space: pre-wrap; overflow-wrap: anywhere; padding: .3rem 0 .1rem;
   max-height: 40vh; overflow-y: auto; }
-details.turn.tool { align-self: flex-start; font-size: .78rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+/* Not details-prefixed on purpose: at (0,2,0) this ties with the later
+   .tool.running/.done/.failed border-color rules and loses to them in
+   source order; a details.turn.tool prefix would outrank them (0,2,1) and
+   the state tints would never render. */
+.turn.tool { align-self: flex-start; font-size: .78rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   padding: .45rem .6rem; margin: 0; border: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
-/* Summary keeps its list-item display so the restored marker renders;
-   the flex head row lives one level in (display:flex would eat the marker). */
+/* Summary keeps its list-item display so the restored marker renders; the
+   flex head row lives one level in as a span — display:flex would eat the
+   marker on the summary itself, and summary admits phrasing content only. */
 details.turn.tool > summary { cursor: pointer; list-style: revert; }
 .tool-head { display: flex; align-items: baseline; gap: .5rem; min-width: 0; flex-wrap: wrap; }
 .tool-name { overflow-wrap: anywhere; }
