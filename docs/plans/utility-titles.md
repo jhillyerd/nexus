@@ -2,7 +2,7 @@
 title: Nexus — model-generated session titles via prefix-cache piggybacking
 status: draft
 tags: [nexus, titles, kv-cache, utility]
-updated: 2026-10-25
+updated: 2026-11-01
 ---
 
 # Nexus: model-generated session titles via prefix-cache piggybacking
@@ -296,6 +296,11 @@ pre-utility prefix.
 
 ## 7. Deferred: tags (design now, implement later)
 
+> **2026-11-01**: the tags pass is now fully designed in
+> `docs/plans/utility-tags.md` (two-line reply, `title_source='auto'`
+> merge guard, in-memory `TagCorpus`, `tags_manual` provenance column).
+> The sketch below is the historical record of the planning decision.
+
 Policy (planning decision): **merge** — model tags are unioned into
 manual tags, so manual tags are never clobbered. Provenance is
 required; sketch: keep `tags text[]` as the display set and add
@@ -357,5 +362,5 @@ request; until then Y stays title-only.
   `UpgradeAutoTitle`; `auto_title_upgrade.sql` + store wiring;
   `MetaUpdated` event + UI refresh; config knobs.
 - **P3**: offline verification suite (§6).
-- **P4** (later): tags per §7.
+- **P4** (later): tags per §7 — designed in `docs/plans/utility-tags.md`.
 - **P5** (later): e2e cache-branch scenario on the llama.cpp alias.
