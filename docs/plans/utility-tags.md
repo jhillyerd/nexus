@@ -26,10 +26,14 @@ skill.
 >   comma-separated tags. No JSON — parsing stays string-shaping like the
 >   title parser, which small local models fumble less than structured
 >   output.
-> - **Merge guard: only while `title_source = 'auto'`** — mirrors the title
->   guard. A manual rename stops auto-tagging too: any manual metadata
->   intent freezes auto metadata. One guard, applied to both writes in one
->   ask.
+> - **Merge guard: provenance-gated, per side** — mirrors the title guard
+>   with a sibling `tags_source` column. A manual rename stops
+>   auto-titling; a manual tag edit stops auto-tagging; either way the
+>   store guard is atomic, so an in-flight utility apply cannot land
+>   after a manual save. One ask applies both writes, guarded by both
+>   provenance columns. *(Refined in the 2026-11-01 review round: the
+>   original sketch reused `title_source` alone, which left a manual tag
+>   save open to a racing model merge.)*
 > - **Chips indistinguishable** in the UI — one style; provenance stays
 >   schema-only.
 > - **§7 controls as recommended there: (1) + (2) now, (3) later.**
@@ -40,12 +44,15 @@ skill.
 
 **Goal.** The utility branch's instruction asks for a title AND a handful of
 tags in one reply. Tags are normalized, capped, and unioned into the
-session's display set while `title_source = 'auto'`; manual tag edits write
-the user's exact set and, like a manual rename, end the auto path. The
-global tag vocabulary stays bounded by reuse-first generation: the
-instruction carries the existing tag corpus, the parser structurally caps
-how many new tags one attempt may introduce, and per-session tag counts are
-capped.
+session's display set while both provenance guards are `'auto'`; manual tag
+edits write the user's exact set and, like a manual rename, end the auto
+path — atomically, at the store guard, so even an in-flight utility apply
+cannot land model tags after a manual save. Growth is bounded per session
+(≤ 2 new tags per attempt, ≤ 5 tags per session) and steered toward reuse
+by corpus-constrained generation. The GLOBAL vocabulary is shaped, not
+hard-bounded, by these rules — every session may still introduce new
+tags; the deferred prune sweep (§7 control 3) is the cleanup if real
+drift appears.
 
 **Non-goals (this plan).**
 
@@ -90,9 +97,11 @@ login, bug, auth
 - A leading `Title:` / `Tags:` label on either line is stripped (models
   like echoing the schema).
 - Normalization per tag: trim, lowercase, collapse internal whitespace runs
-  to `-` (kebab-case), drop empties and duplicates (first wins). This
-  EXTENDS `normalize_tags` in `session_registry.gleam` so manual and auto
-  tags share one rule.
+  to `-` (kebab-case), drop empties and duplicates (first wins), and
+  truncate at 24 characters (mirroring the title cap's semantics — a cap
+  here also bounds the corpus's contribution to Y: 30 entries × 24 chars
+  is a hard ceiling). This EXTENDS `normalize_tags` in
+  `session_registry.gleam` so manual and auto tags share one rule.
 - Vocabulary caps are enforced STRUCTURALLY in the parser, not just
   prompted:
   - at most `K = 2` tags not present in the supplied corpus survive the
@@ -124,51 +133,77 @@ at boot, live records after), keeps tags used by ≥ 2 sessions (frequency
 floor: a singleton tag is not yet vocabulary), and returns the top 30 by
 count, ties broken alphabetically — deterministic output for a given state.
 
-The real runner closure fetches the corpus inside the utility WORKER via
-`actor.call` (exactly the `utility_apply_for` pattern), so the
-`UtilityRunner` seam signature
-`fn(Endpoint, Transcript, Options, Subject(Nil), Bool)` is UNCHANGED — the
-session actor and the test fakes never see corpus plumbing.
+The real runner is built by the registry's `start`, which already holds the
+registry's `process.Name(Msg)`: `session.utility_runner(specs, corpus)`
+where `corpus` is a closure over that NAME (no subject capture needed at
+build time) performing the `TagCorpus` ask from inside the utility WORKER
+via the named subject — exactly the `utility_apply_for` ask pattern. The
+`UtilityRunner` TYPE — what `SessionSpec` carries and what test fakes
+implement — is UNCHANGED; only the registry-side builder gains the
+corpus argument (`start_with_runner`'s test seam gains it too), so the
+session actor and existing fakes are untouched by corpus plumbing.
 
 ### 3.4 Schema: provenance column
 
 - `session.tags_manual text[] NOT NULL DEFAULT '{}'`, added by a
   `do $$ … $$` block that first checks `pg_attribute` for the column and,
-  only when adding it, backfills `update session set tags_manual = tags` —
-  every pre-existing tag is manual. The migrate runner's splitter already
-  understands `$$`-quoted DO blocks (`test/migrate_test.gleam`), and the
-  block keeps the schema idempotent (re-runs are no-ops).
+  only when adding it, backfills `update session set tags_manual = tags`
+  verbatim — every pre-existing tag is manual, and the union rule below
+  never rewrites existing display entries, so verbatim spellings cannot
+  skew the display − manual bookkeeping. The migrate runner's splitter
+  already understands `$$`-quoted DO blocks (`test/migrate_test.gleam`),
+  and the block keeps the schema idempotent (re-runs are no-ops).
+- `session.tags_source text NOT NULL DEFAULT 'auto'` (values `'auto'` /
+  `'manual'`, mirroring `title_source`), added and backfilled
+  `'manual'` for every pre-existing row by the same DO block — which also
+  codifies §1's no-retro-tagging decision: sessions that predate this
+  feature can never be auto-tagged, exactly as their spent title attempts
+  already prevent re-titling. New inserts default `'auto'`; the first
+  `SetTags` flips the row to `'manual'` forever.
 - `tags` remains the DISPLAY set (the union); `tags_manual` is the user's
-  exact set. `display − manual` is the auto contribution, recomputed on
-  write — the §7 sketch, made concrete.
-- `tags_manual` is also the column a future refresh policy needs for
-  suppression (a user-deleted auto tag must not resurrect); carrying it
-  now is how this pass "designs for re-arm later" without implementing it.
+  exact set. `display − manual` is the auto contribution — display
+  bookkeeping, recomputed on write, per the §7 sketch.
+- `tags_source` — not the display − manual difference — is the seam a
+  future refresh policy needs: refresh may only ever apply where
+  `tags_source = 'auto'`, and the first manual tag edit flips it to
+  `'manual'` permanently, so a user-deleted auto tag can never resurrect
+  (no tombstone set needed; the guard IS the tombstone). Carrying both
+  columns now is how this pass "designs for re-arm later" without
+  implementing it.
 
 ### 3.5 Registry: one ask, one guard, both writes
 
 - `UpgradeAutoTitle` gains a `tags: List(String)` field. The handler (both
   the active-record and dormant-summary branches, keeping the
   twin-invariant degrade-mode pattern of the title-only version):
-  - computes the union `normalize(existing_display + new_tags)` capped at
-    5, in memory;
+  - computes the union in memory: existing display entries pass through
+    VERBATIM (never re-canonicalized — a legacy `Work Notes` stays
+    `Work Notes`, so display − manual bookkeeping cannot manufacture a
+    phantom auto tag), new model tags are normalized and appended when
+    not already present (presence check case-insensitive, so `Work
+    Notes` and `work-notes` do not duplicate), then truncated to 5;
   - persists title + display tags through ONE store call
-    (`auto_meta_upgrade`, below) guarded `title_source = 'auto'` — the
-    same guard for both writes, per the planning decision;
+    (`auto_meta_upgrade`, below) guarded by BOTH provenance columns
+    being `'auto'` — the same guard for both writes, per the planning
+    decision, and the store guard is the final word: a manual tag save
+    that raced the in-flight worker flips `tags_source` to `'manual'`
+    first, and the worker's write-through is refused atomically;
   - refuses everything when the guard fails; on store error keeps the
     in-memory write (the documented degrade mode);
   - replies `UpgradeApplied(title, tags)` with the fresh display set —
     the payload it already carries today.
-- `SetTags`: the user's exact set becomes BOTH columns (`set_tags.sql`
-  writes `tags = $1, tags_manual = $1`). Manual edit freezes the display
-  set as the user wrote it; since the attempt is once-per-session, no
-  later merge can resurrect anything.
-- `Record` and `StoredSummary` gain `tags_manual`; `get_session.sql`
-  selects it so rehydration restores provenance. `list_summaries.sql`
-  does NOT — summaries don't need it, keeping the UI summary type
-  unchanged.
-- `insert_session.sql`: add `tags_manual` (`'{}'` — a new session has no
-  tags).
+- `SetTags`: the user's exact set becomes the display set AND the manual
+  set, and the row's auto path closes — `set_tags.sql` writes
+  `tags = $1, tags_manual = $1, tags_source = 'manual'` in one
+  statement. A manual tag edit freezes the display set as the user wrote
+  it; no later merge can alter it, in flight or otherwise.
+- `Record` and `StoredSummary` gain `tags_manual` and `tags_source`,
+  selected by BOTH `get_session.sql` (rehydration) and
+  `list_summaries.sql` (boot load) so no state — active or dormant —
+  ever lacks provenance. The UI-facing `session.SessionSummary` is
+  unchanged: it simply does not carry the new fields.
+- `insert_session.sql`: add `tags_manual` and default `tags_source`
+  (`'{}'` / `'auto'` — a new session has no tags and an open auto path).
 
 ### 3.6 Store
 
@@ -176,12 +211,18 @@ session actor and the test fakes never see corpus plumbing.
 
   ```sql
   update session set title = $1, tags = $3
-  where id = $2 and title_source = 'auto'
+  where id = $2
+    and title_source = 'auto'
+    and tags_source = 'auto'
   ```
 
-  Rowcount is the guard outcome — the same shape as today. The registry
-  computed the union, so the SQL stores exactly what the memory holds
+  Rowcount is the guard outcome — the same shape as today, now guarding
+  both provenance columns so a manual tag edit closes the tag side of the
+  auto path even while the title side stays open. The registry computed
+  the union, so the SQL stores exactly what the memory holds
   (twin-invariant).
+- `set_tags.sql` writes all three fields in one statement:
+  `set tags = $1, tags_manual = $1, tags_source = 'manual'`.
 - Seam: `store.auto_title_upgrade: fn(String, String)` widens to
   `auto_meta_upgrade: fn(String, String, List(String))`; implementation in
   `store/persist.gleam`, mock in `test/store_mock.gleam`; regenerate with
@@ -221,7 +262,7 @@ sequenceDiagram
   W->>P: Request X+A+Y - title and tags instruction, same envelope, token cap only
   P-->>W: Two-line reply B
   W->>W: Parse - shape title, normalize and cap tags vs corpus
-  W->>R: UpgradeAutoTitle id, title, tags - guard checks title_source is auto
+  W->>R: UpgradeAutoTitle id, title, tags - guard checks both sources are auto
   R-->>W: UpgradeApplied with fresh title and display tags
   W->>S: UtilityDone - broadcast MetaUpdated with title and tags
   Note over P: Cache keeps X+A. Dead Y+B branch evicts normally. The next user turn branches off X+A untouched.
@@ -255,18 +296,22 @@ carry everything.
     reply (no line 2), PASS whole-reply matching, "Password Manager
     Setup" is a title not a pass, hostile `<script>` tag payloads pass
     through inert and normalized, more-than-K new tags truncated to K,
-    union with existing tags capped at 5 with order preserved, empty
-    tags line → zero tags.
+    union with existing tags capped at 5 with order preserved, per-tag
+    24-character truncation, empty tags line → zero tags.
   - *Prefix property*: re-run the request-body assertion with the longer
     corpus-carrying Y — messages-suffix-only growth, envelope delta
     exactly `max_completion_tokens`.
-- **`test/session_registry_test.gleam`** (extend): merge applies under the
-  auto guard and is refused under manual; union order and cap; `SetTags`
-  writes both columns; `TagCorpus` determinism (frequency floor, count
-  order, alphabetical tie-break).
+- **`test/session_registry_test.gleam`** (extend): merge applies under
+  both-auto guards and is refused under manual (title rename AND manual
+  tag edit each close their side); union order, verbatim-passthrough, and
+  cap; a manual `SetTags` racing an in-flight apply refuses the apply
+  (the P1 the review caught); `SetTags` writes display + manual + source;
+  `TagCorpus` determinism (frequency floor, count order, alphabetical
+  tie-break).
 - **`test/session_persistence_test.gleam`** + `test/store_mock.gleam`:
-  `auto_meta_upgrade` guard semantics (applies on auto, refuses on
-  manual; the mock records the tags write).
+  `auto_meta_upgrade` guard semantics (applies while both sources are
+  auto; refuses after a title rename OR a manual tag save; the mock
+  records the tags write).
 - **`test/session_test.gleam`**: fake `utility_runner` signature
   unchanged; `MetaUpdated` carries model tags when the apply succeeds.
 - **`test/ui_test.gleam`**: hostile model tag rendered inert in chips
@@ -287,8 +332,9 @@ byte-exact.
   existing manual tags normalize differently on next save; tag filtering
   is already case-insensitive and chips are display-only. Tests pin the
   new rule.
-- **Instruction growth**: Y grows by the tags ask + up to ~30 corpus tags
-  (~a few hundred tokens) — Y+B cost only, prefix untouched.
+- **Instruction growth**: Y grows by the tags ask + up to ~30 corpus tags,
+  bounded by the 24-char per-tag cap (~a kilobyte worst case) — Y+B cost
+  only, prefix untouched.
 - **Model misformats line 2** → tags are best-effort (zero tags, title
   still applies); a failed TITLE line still spends the attempt (existing
   semantics — no silent retry).
@@ -298,19 +344,26 @@ byte-exact.
   reasoning plus two short lines — already generous; tags add ~10 tokens.
 - **Backends without prefix caching** pay one full prefill — unchanged
   from the title pass, bounded by the once-per-session trigger.
+- **Vocabulary growth is shaped, not bounded**: per-attempt (≤ 2 new) and
+  per-session (≤ 5) caps bound each session, but N sessions can still
+  mint N new singletons. The frequency floor keeps singletons out of the
+  corpus (so they don't get promoted to reuse candidates), and the prune
+  sweep remains the deferred global cleanup — noted here so the claim is
+  honest.
 - **Open**: exact instruction wording (finalized in the utility-module
-  pass with parser tests as the pin); whether the frequency floor (≥ 2)
-  and corpus cap (30) want config knobs — consts first, knobs only if
-  real deployments ask.
+  pass with parser tests as the pin); whether the frequency floor (≥ 2),
+  corpus cap (30), and per-tag cap (24) want config knobs — consts first,
+  knobs only if real deployments ask.
 
 ## 7. Roadmap
 
 - **P1 (this pass)**: this design doc.
-- **P2**: schema (`tags_manual` + DO block) and store (queries, seam,
-  `squirrel` regen).
-- **P3**: registry (`UpgradeAutoTitle` + tags merge, `SetTags` twin-write,
-  `TagCorpus`, `normalize_tags` extension), utility module (two-line
-  instruction/parse, corpus), session actor (`UtilityApply` arity).
+- **P2**: schema (`tags_manual` + `tags_source` + DO block) and store
+  (queries, seam, `squirrel` regen).
+- **P3**: registry (`UpgradeAutoTitle` + tags merge under the two-column
+  guard, `SetTags` triple-write, `TagCorpus`, `normalize_tags`
+  extension), utility module (two-line instruction/parse, corpus),
+  session actor (`UtilityApply` arity).
 - **P4**: offline verification suite (§5).
 - **P5**: e2e browser fake two-line reply; `utility-titles.md` §7/§9
   updated to record the landed shape.

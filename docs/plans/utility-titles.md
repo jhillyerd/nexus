@@ -2,7 +2,7 @@
 title: Nexus — model-generated session titles via prefix-cache piggybacking
 status: draft
 tags: [nexus, titles, kv-cache, utility]
-updated: 2026-10-25
+updated: 2026-11-01
 ---
 
 # Nexus: model-generated session titles via prefix-cache piggybacking
