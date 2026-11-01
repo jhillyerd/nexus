@@ -8,9 +8,9 @@ preview), loop/iteration state, the bounded `http_fetch` + `web_search`
 agent loop, and durable session storage in external Postgres (a `session`
 table plus append-only `session_message` rows;
 hydrate-on-boot, lazy start, write-behind commits). See
-`docs/plans/mvp-requirements.md`, `docs/plans/tech-stack.md`,
-`docs/plans/completed/m3-verification.md`, and
-`docs/plans/p2-verification.md`.
+`docs/plans/mvp-requirements.md`, `docs/plans/tech-stack.md`, and
+`docs/plans/completed/m3-verification.md`. Schema naming and the schema
+invariants are in `AGENTS.md`.
 The multi-provider rollout is documented in
 `docs/plans/completed/multi-provider.md`.
 
