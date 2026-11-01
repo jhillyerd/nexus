@@ -58,8 +58,10 @@ drift appears.
 
 - Refreshing tags as the conversation evolves (every N turns, on topic
   drift). The once-per-session trigger is unchanged; the schema
-  (`tags_manual`) and the idempotent merge are shaped so a later refresh
-  policy needs no migration, but nothing here re-arms the branch.
+  (`tags_manual` + `tags_source`) and the idempotent merge are shaped so
+  a later refresh policy needs no migration — but refresh additionally
+  requires upgrading `SetTags` to a durable write first (§3.5, §6), and
+  nothing here re-arms the branch.
 - The prune sweep (§7 control 3).
 - Re-tagging sessions that already spent their title attempt before this
   pass — consistent with utility-titles §8's no-retro-trigger decision.
@@ -133,6 +135,14 @@ at boot, live records after), keeps tags used by ≥ 2 sessions (frequency
 floor: a singleton tag is not yet vocabulary), and returns the top 30 by
 count, ties broken alphabetically — deterministic output for a given state.
 
+Every candidate is passed through the SAME `normalize_tags` rule (trim,
+lowercase, kebab-case, 24-char truncation, empties dropped) BEFORE
+counting, and counting pools case-insensitively — a legacy `Work Notes`
+and a canonical `work-notes` are one entry. The corpus therefore cannot
+leak arbitrary legacy text into Y: every embedded value is a bounded,
+whitespace-free kebab string, so the 30 × 24 bound holds by construction
+regardless of what older rows contain.
+
 The real runner is built by the registry's `start`, which already holds the
 registry's `process.Name(Msg)`: `session.utility_runner(specs, corpus)`
 where `corpus` is a closure over that NAME (no subject capture needed at
@@ -194,9 +204,24 @@ session actor and existing fakes are untouched by corpus plumbing.
     the payload it already carries today.
 - `SetTags`: the user's exact set becomes the display set AND the manual
   set, and the row's auto path closes — `set_tags.sql` writes
-  `tags = $1, tags_manual = $1, tags_source = 'manual'` in one
-  statement. A manual tag edit freezes the display set as the user wrote
-  it; no later merge can alter it, in flight or otherwise.
+  `tags = $1, tags_manual = $1, tags_source = 'manual'` in ONE statement,
+  so the freeze itself is atomic (all three fields or nothing). A manual
+  tag edit freezes the display set as the user wrote it; no later merge
+  can alter it, in flight or otherwise.
+- **`SetTags` write-through failure.** On a store error, `SetTags` keeps
+  the existing manual-metadata degrade mode (`apply_meta` logs the
+  failure and keeps the in-memory write — the same convention as every
+  manual metadata edit today): the actor's record says `manual`, the
+  persisted row may still say `auto`. That stale row is harmless in THIS
+  pass, twice over: a racing utility apply is refused by the in-memory
+  twin check before the store is ever consulted, and the only writer of
+  auto tags — the once-per-session attempt — never fires for a
+  rehydrated session (`utility_attempted` hydrates as spent), so a
+  restart cannot resurrect auto-tagging from the stale row; the next
+  manual save re-attempts the triple-write and heals it. A future
+  refresh policy, which WOULD read the row as permission, must first
+  upgrade `SetTags` to reject-on-failure or durably retry — recorded as
+  a gate in §7.
 - `Record` and `StoredSummary` gain `tags_manual` and `tags_source`,
   selected by BOTH `get_session.sql` (rehydration) and
   `list_summaries.sql` (boot load) so no state — active or dormant —
@@ -305,9 +330,12 @@ carry everything.
   both-auto guards and is refused under manual (title rename AND manual
   tag edit each close their side); union order, verbatim-passthrough, and
   cap; a manual `SetTags` racing an in-flight apply refuses the apply
-  (the P1 the review caught); `SetTags` writes display + manual + source;
-  `TagCorpus` determinism (frequency floor, count order, alphabetical
-  tie-break).
+  (the P1 the review caught); `SetTags` writes display + manual + source,
+  and on a failing store write keeps the in-memory freeze (degrade mode)
+  while a later apply is still refused; `TagCorpus` determinism
+  (frequency floor, count order, alphabetical tie-break),
+  normalize-before-counting, and the 30 × 24 embedding bound (a 10 KB
+  legacy tag enters the corpus truncated, pooled case-insensitively).
 - **`test/session_persistence_test.gleam`** + `test/store_mock.gleam`:
   `auto_meta_upgrade` guard semantics (applies while both sources are
   auto; refuses after a title rename OR a manual tag save; the mock
@@ -335,6 +363,10 @@ byte-exact.
 - **Instruction growth**: Y grows by the tags ask + up to ~30 corpus tags,
   bounded by the 24-char per-tag cap (~a kilobyte worst case) — Y+B cost
   only, prefix untouched.
+- **Store write-through failure on `SetTags`** (§3.5): the persisted
+  `tags_source` can lag the in-memory freeze. Void this pass (twin check
+  + spent rehydration attempts), but a hard requirement on the future
+  refresh policy — it must not ship before `SetTags` is durable.
 - **Model misformats line 2** → tags are best-effort (zero tags, title
   still applies); a failed TITLE line still spends the attempt (existing
   semantics — no silent retry).
@@ -367,3 +399,7 @@ byte-exact.
 - **P4**: offline verification suite (§5).
 - **P5**: e2e browser fake two-line reply; `utility-titles.md` §7/§9
   updated to record the landed shape.
+- **P6 (future, gated)**: refresh policy per §1 — requires no schema
+  migration, but is BLOCKED on `SetTags` becoming a durable write
+  (reject-on-failure or retry) so `tags_source = 'manual'` can never lag
+  the row a refresh would read.
