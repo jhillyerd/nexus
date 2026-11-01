@@ -574,10 +574,21 @@ pub fn view_renders_tool_card_test() {
       "[{\"title\":\"cats\"}]",
     ))
   let html = view_string(model)
-  should.be_true(string.contains(html, "turn tool done"))
+  // Committed card collapses exactly like a committed reasoning block:
+  // a <details> with no open attribute.
+  should_contain(html, "<details class=\"turn tool done\"")
+  should_not_contain(html, " open>")
   should.be_true(string.contains(html, "data-call-id=\"call_1\""))
   should.be_true(string.contains(html, "data-tool=\"web_search\""))
   should.be_true(string.contains(html, ">web_search</strong>"))
+  // The collapsed chip is the tool name alone — one short line; call id
+  // and status moved into the body's meta row, with the status repeated
+  // as an aria-label so the collapsed state is never color-only.
+  should_contain(
+    html,
+    "<summary aria-label=\"web_search (completed)\"><strong class=\"tool-name\">web_search</strong></summary>",
+  )
+  should_contain(html, "<div class=\"tool-meta\">")
   should.be_true(string.contains(html, ">completed</span>"))
   // Lustre escapes quotes in text nodes.
   should.be_true(string.contains(html, "{&quot;query&quot;:&quot;cats&quot;}"))
@@ -588,6 +599,8 @@ pub fn view_renders_running_and_failed_states_test() {
   let running =
     new_model() |> step(ui.ToolCallAssembled("call_1", "http_fetch", "{}"))
   running |> view_string |> should_contain("turn tool running")
+  // A running call stays open — the live twin of the thinking block.
+  running |> view_string |> should_contain("data-tool=\"http_fetch\" open>")
   running |> view_string |> should_contain(">running</span>")
   let failed =
     new_model()
@@ -595,6 +608,7 @@ pub fn view_renders_running_and_failed_states_test() {
     |> step(ui.ToolResult("call_2", "http_fetch", False, "{\"error\":\"no\"}"))
   failed |> view_string |> should_contain("turn tool failed")
   failed |> view_string |> should_contain(">failed</span>")
+  failed |> view_string |> should_not_contain(" open>")
 }
 
 pub fn view_truncates_tool_previews_test() {
@@ -618,8 +632,15 @@ pub fn view_renders_pending_card_test() {
     |> step(ui.ToolCallDelta(0, Some("call_1"), Some("web_search"), "{\"que"))
   let html = view_string(model)
   should.be_true(string.contains(html, "turn tool running pending"))
+  // Pending calls stream open, like the live thinking block.
+  should_contain(html, "<details class=\"turn tool running pending\"")
+  should_contain(html, "data-call-index=\"0\" open>")
   should.be_true(string.contains(html, "data-call-index=\"0\""))
   should.be_true(string.contains(html, ">web_search</strong>"))
+  should_contain(
+    html,
+    "<summary aria-label=\"web_search (running)\"><strong class=\"tool-name\">web_search</strong></summary>",
+  )
   should.be_true(string.contains(html, "{&quot;que"))
 }
 

@@ -504,9 +504,18 @@ details.turn.reasoning > summary { cursor: pointer; font-style: italic; opacity:
 details.turn.reasoning.live > summary { color: color-mix(in srgb, currentColor 85%, #b8860b); opacity: 1; }
 .reasoning-body { white-space: pre-wrap; overflow-wrap: anywhere; padding: .3rem 0 .1rem;
   max-height: 40vh; overflow-y: auto; }
+/* Not details-prefixed on purpose: at (0,2,0) this ties with the later
+   .tool.running/.done/.failed border-color rules and loses to them in
+   source order; a details.turn.tool prefix would outrank them (0,2,1) and
+   the state tints would never render. */
 .turn.tool { align-self: flex-start; font-size: .78rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  padding: .45rem .6rem; gap: .25rem; }
-.tool-head { display: flex; align-items: baseline; gap: .5rem; min-width: 0; flex-wrap: wrap; }
+  padding: .45rem .6rem; margin: 0; border: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
+/* Summary is just the tool name (phrasing content, valid inside summary)
+   so the collapsed chip is one short line; the marker needs the summary's
+   native list-item display, which display:flex would eat. Call id and
+   status sit in the .tool-meta body row instead. */
+details.turn.tool > summary { cursor: pointer; list-style: revert; }
+.tool-meta { display: flex; align-items: baseline; gap: .5rem; min-width: 0; flex-wrap: wrap; }
 .tool-name { overflow-wrap: anywhere; }
 .call-id { opacity: .55; font-size: .7rem; overflow-wrap: anywhere; }
 .tool-status { margin-left: auto; font-size: .68rem; text-transform: uppercase; letter-spacing: .05em; opacity: .8; }

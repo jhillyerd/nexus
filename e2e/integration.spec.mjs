@@ -434,7 +434,9 @@ async function main() {
             .locator(".turn.tool[data-tool='http_fetch']")
             .first()
             .locator(".tool-result")
-            .waitFor({ timeout: 500 })
+            // Replayed cards collapse (details, no open) — the body has no
+            // box, so wait for attachment, not visibility.
+            .waitFor({ state: "attached", timeout: 500 })
             .then(() => true)
             .catch(() => false),
         { timeout: 60_000, message: "http_fetch card replayed with result" },
@@ -450,7 +452,7 @@ async function main() {
             .locator(".turn.tool[data-tool='web_search']")
             .first()
             .locator(".tool-result")
-            .waitFor({ timeout: 500 })
+            .waitFor({ state: "attached", timeout: 500 })
             .then(() => true)
             .catch(() => false),
         { timeout: 60_000, message: "web_search card replayed with result" },
