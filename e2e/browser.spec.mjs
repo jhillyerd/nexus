@@ -755,9 +755,12 @@ async function main() {
         status: el.querySelector(".tool-status").textContent,
         args: el.querySelector(".tool-args").textContent,
         result: el.querySelector(".tool-result")?.textContent ?? null,
+        open: el.open,
       }));
       eq(info.tool, "http_fetch", "tool name");
       eq(info.status, "completed", "terminal status");
+      // Completed cards collapse like committed reasoning blocks.
+      assert(!info.open, `completed card collapsed: ${JSON.stringify(info)}`);
       assert(info.args.includes(`/doc.json`), `argument preview: ${info.args}`);
       assert(info.result.includes("nexus-e2e-doc"), `result preview: ${info.result}`);
       assert(info.result.includes("<script>alert"), "result preview shows markup as text");
@@ -820,6 +823,7 @@ async function main() {
           tool: el.getAttribute("data-tool"),
           status: el.querySelector(".tool-status").textContent,
           hasResult: Boolean(el.querySelector(".tool-result")),
+          open: el.open,
         })),
       );
       const fetchCards = cards.filter((c) => c.tool === "http_fetch");
@@ -827,6 +831,8 @@ async function main() {
       assert(fetchCards.length === 2, `two fetch cards replayed: ${JSON.stringify(cards)}`);
       eq(searchCards.length, 1, "one search card replayed");
       assert(cards.every((c) => c.status === "completed" && c.hasResult), "all replayed cards completed with results");
+      // Replay renders completed cards collapsed, like reasoning on reload.
+      assert(cards.every((c) => !c.open), `replayed cards collapsed: ${JSON.stringify(cards)}`);
       assert(cards.every((c) => c.id.startsWith("call_")), "stable call ids preserved");
       // Tool events must never render as model text.
       const assistantText = await page.$$eval(".turn.assistant", (els) => els.map((e) => e.textContent));

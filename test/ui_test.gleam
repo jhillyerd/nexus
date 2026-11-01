@@ -574,7 +574,10 @@ pub fn view_renders_tool_card_test() {
       "[{\"title\":\"cats\"}]",
     ))
   let html = view_string(model)
-  should.be_true(string.contains(html, "turn tool done"))
+  // Committed card collapses exactly like a committed reasoning block:
+  // a <details> with no open attribute.
+  should_contain(html, "<details class=\"turn tool done\"")
+  should_not_contain(html, " open>")
   should.be_true(string.contains(html, "data-call-id=\"call_1\""))
   should.be_true(string.contains(html, "data-tool=\"web_search\""))
   should.be_true(string.contains(html, ">web_search</strong>"))
@@ -588,6 +591,8 @@ pub fn view_renders_running_and_failed_states_test() {
   let running =
     new_model() |> step(ui.ToolCallAssembled("call_1", "http_fetch", "{}"))
   running |> view_string |> should_contain("turn tool running")
+  // A running call stays open — the live twin of the thinking block.
+  running |> view_string |> should_contain("data-tool=\"http_fetch\" open>")
   running |> view_string |> should_contain(">running</span>")
   let failed =
     new_model()
@@ -595,6 +600,7 @@ pub fn view_renders_running_and_failed_states_test() {
     |> step(ui.ToolResult("call_2", "http_fetch", False, "{\"error\":\"no\"}"))
   failed |> view_string |> should_contain("turn tool failed")
   failed |> view_string |> should_contain(">failed</span>")
+  failed |> view_string |> should_not_contain(" open>")
 }
 
 pub fn view_truncates_tool_previews_test() {
@@ -618,6 +624,9 @@ pub fn view_renders_pending_card_test() {
     |> step(ui.ToolCallDelta(0, Some("call_1"), Some("web_search"), "{\"que"))
   let html = view_string(model)
   should.be_true(string.contains(html, "turn tool running pending"))
+  // Pending calls stream open, like the live thinking block.
+  should_contain(html, "<details class=\"turn tool running pending\"")
+  should_contain(html, "data-call-index=\"0\" open>")
   should.be_true(string.contains(html, "data-call-index=\"0\""))
   should.be_true(string.contains(html, ">web_search</strong>"))
   should.be_true(string.contains(html, "{&quot;que"))

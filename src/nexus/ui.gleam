@@ -9,7 +9,9 @@
 //// picker, session sidebar, streaming log with a single in-flight assistant
 //// bubble, **typed tool-call cards** (name, stable call id, argument
 //// preview, running/completed/failed status, compact inert result
-//// preview), loop/iteration status, the model's streamed **reasoning**
+//// preview) rendered as collapsible `<details>` blocks in the same shape
+//// as reasoning: open while the call streams/runs, collapsed to a single
+//// head line once it completes, loop/iteration status, the model's streamed **reasoning**
 //// (chain of thought, as an inert collapsible block whose commit/rollback
 //// mirrors the server's), and the per-session metrics panel. Log
 //// auto-follow and the jump-to-latest control are browser-only behaviour
@@ -2175,9 +2177,14 @@ fn reasoning_block(text: String, live: Bool) -> Element(Msg) {
   )
 }
 
-/// One assistant tool call as a compact card: head (name, stable call id,
-/// status) plus truncated argument and result previews. Everything is a
-/// text node — previews are inert by construction.
+/// One assistant tool call as a collapsible block in the same shape as
+/// the reasoning block: a native `<details>` whose summary is the head
+/// (name, stable call id, status) and whose body is the truncated
+/// argument and result previews. Open while the call runs — the
+/// tool-phase twin of the live "thinking…" block — and collapsed once
+/// it completes, so finished rounds read as one compact line. No script,
+/// and every preview is a Lustre text node, so hostile tool output is
+/// inert by construction.
 fn tool_card(line: Line) -> Element(Msg) {
   let assert ToolLine(id, name, arguments, status, result) = line
   let #(status_label, state_class) = case status {
@@ -2185,17 +2192,20 @@ fn tool_card(line: Line) -> Element(Msg) {
     ToolDone(True) -> #("completed", "done")
     ToolDone(False) -> #("failed", "failed")
   }
-  html.div(
+  html.details(
     [
       attr.class("turn tool " <> state_class),
       attr.data("call-id", id),
       attr.data("tool", name),
+      attr.open(status == ToolRunning),
     ],
     [
-      html.div([attr.class("tool-head")], [
-        html.strong([attr.class("tool-name")], [html.text(name)]),
-        html.span([attr.class("call-id")], [html.text(id)]),
-        html.span([attr.class("tool-status")], [html.text(status_label)]),
+      html.summary([], [
+        html.div([attr.class("tool-head")], [
+          html.strong([attr.class("tool-name")], [html.text(name)]),
+          html.span([attr.class("call-id")], [html.text(id)]),
+          html.span([attr.class("tool-status")], [html.text(status_label)]),
+        ]),
       ]),
       html.div([attr.class("tool-args")], [html.text(preview(arguments, 120))]),
       case result {
@@ -2210,20 +2220,24 @@ fn tool_card(line: Line) -> Element(Msg) {
 }
 
 /// A tool call still streaming its arguments: name/id when the backend sent
-/// them, plus the arguments accumulated so far.
+/// them, plus the arguments accumulated so far. Open, like the live
+/// thinking block — it collapses when the call assembles and completes.
 fn pending_card(call: PendingCall) -> Element(Msg) {
   let name = option.unwrap(call.name, "…")
   let id = option.unwrap(call.id, "…")
-  html.div(
+  html.details(
     [
       attr.class("turn tool running pending"),
       attr.data("call-index", int.to_string(call.index)),
+      attr.open(True),
     ],
     [
-      html.div([attr.class("tool-head")], [
-        html.strong([attr.class("tool-name")], [html.text(name)]),
-        html.span([attr.class("call-id")], [html.text(id)]),
-        html.span([attr.class("tool-status")], [html.text("running")]),
+      html.summary([], [
+        html.div([attr.class("tool-head")], [
+          html.strong([attr.class("tool-name")], [html.text(name)]),
+          html.span([attr.class("call-id")], [html.text(id)]),
+          html.span([attr.class("tool-status")], [html.text("running")]),
+        ]),
       ]),
       html.div([attr.class("tool-args")], [html.text(preview(call.args, 120))]),
     ],

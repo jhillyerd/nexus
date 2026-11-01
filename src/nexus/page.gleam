@@ -504,8 +504,11 @@ details.turn.reasoning > summary { cursor: pointer; font-style: italic; opacity:
 details.turn.reasoning.live > summary { color: color-mix(in srgb, currentColor 85%, #b8860b); opacity: 1; }
 .reasoning-body { white-space: pre-wrap; overflow-wrap: anywhere; padding: .3rem 0 .1rem;
   max-height: 40vh; overflow-y: auto; }
-.turn.tool { align-self: flex-start; font-size: .78rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  padding: .45rem .6rem; gap: .25rem; }
+details.turn.tool { align-self: flex-start; font-size: .78rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  padding: .45rem .6rem; margin: 0; border: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
+/* Summary keeps its list-item display so the restored marker renders;
+   the flex head row lives one level in (display:flex would eat the marker). */
+details.turn.tool > summary { cursor: pointer; list-style: revert; }
 .tool-head { display: flex; align-items: baseline; gap: .5rem; min-width: 0; flex-wrap: wrap; }
 .tool-name { overflow-wrap: anywhere; }
 .call-id { opacity: .55; font-size: .7rem; overflow-wrap: anywhere; }
