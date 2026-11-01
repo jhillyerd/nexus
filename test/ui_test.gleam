@@ -582,10 +582,11 @@ pub fn view_renders_tool_card_test() {
   should.be_true(string.contains(html, "data-tool=\"web_search\""))
   should.be_true(string.contains(html, ">web_search</strong>"))
   // The collapsed chip is the tool name alone — one short line; call id
-  // and status moved into the body's meta row.
+  // and status moved into the body's meta row, with the status repeated
+  // as an aria-label so the collapsed state is never color-only.
   should_contain(
     html,
-    "<summary><strong class=\"tool-name\">web_search</strong></summary>",
+    "<summary aria-label=\"web_search (completed)\"><strong class=\"tool-name\">web_search</strong></summary>",
   )
   should_contain(html, "<div class=\"tool-meta\">")
   should.be_true(string.contains(html, ">completed</span>"))
@@ -638,7 +639,7 @@ pub fn view_renders_pending_card_test() {
   should.be_true(string.contains(html, ">web_search</strong>"))
   should_contain(
     html,
-    "<summary><strong class=\"tool-name\">web_search</strong></summary>",
+    "<summary aria-label=\"web_search (running)\"><strong class=\"tool-name\">web_search</strong></summary>",
   )
   should.be_true(string.contains(html, "{&quot;que"))
 }

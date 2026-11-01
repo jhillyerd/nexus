@@ -2202,10 +2202,13 @@ fn tool_card(line: Line) -> Element(Msg) {
     [
       // The collapsed chip reads as one word: the tool name. Call id and
       // status live in the body — visible while running (open) and on
-      // expand, hidden once the tinted border tells the story alone.
-      html.summary([], [
-        html.strong([attr.class("tool-name")], [html.text(name)]),
-      ]),
+      // expand, hidden once the tinted border tells the story alone. The
+      // aria-label carries the status to assistive tech so the collapsed
+      // state is never color-only.
+      html.summary(
+        [attr.attribute("aria-label", name <> " (" <> status_label <> ")")],
+        [html.strong([attr.class("tool-name")], [html.text(name)])],
+      ),
       html.div([attr.class("tool-meta")], [
         html.span([attr.class("call-id")], [html.text(id)]),
         html.span([attr.class("tool-status")], [html.text(status_label)]),
@@ -2228,6 +2231,10 @@ fn tool_card(line: Line) -> Element(Msg) {
 fn pending_card(call: PendingCall) -> Element(Msg) {
   let name = option.unwrap(call.name, "…")
   let id = option.unwrap(call.id, "…")
+  let aria_name = case call.name {
+    Some(name) -> name
+    None -> "tool call"
+  }
   html.details(
     [
       attr.class("turn tool running pending"),
@@ -2235,7 +2242,7 @@ fn pending_card(call: PendingCall) -> Element(Msg) {
       attr.open(True),
     ],
     [
-      html.summary([], [
+      html.summary([attr.attribute("aria-label", aria_name <> " (running)")], [
         html.strong([attr.class("tool-name")], [html.text(name)]),
       ]),
       html.div([attr.class("tool-meta")], [
