@@ -510,11 +510,12 @@ details.turn.reasoning.live > summary { color: color-mix(in srgb, currentColor 8
    the state tints would never render. */
 .turn.tool { align-self: flex-start; font-size: .78rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   padding: .45rem .6rem; margin: 0; border: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
-/* Summary keeps its list-item display so the restored marker renders; the
-   flex head row lives one level in as a span — display:flex would eat the
-   marker on the summary itself, and summary admits phrasing content only. */
+/* Summary is just the tool name (phrasing content, valid inside summary)
+   so the collapsed chip is one short line; the marker needs the summary's
+   native list-item display, which display:flex would eat. Call id and
+   status sit in the .tool-meta body row instead. */
 details.turn.tool > summary { cursor: pointer; list-style: revert; }
-.tool-head { display: flex; align-items: baseline; gap: .5rem; min-width: 0; flex-wrap: wrap; }
+.tool-meta { display: flex; align-items: baseline; gap: .5rem; min-width: 0; flex-wrap: wrap; }
 .tool-name { overflow-wrap: anywhere; }
 .call-id { opacity: .55; font-size: .7rem; overflow-wrap: anywhere; }
 .tool-status { margin-left: auto; font-size: .68rem; text-transform: uppercase; letter-spacing: .05em; opacity: .8; }

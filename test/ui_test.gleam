@@ -581,6 +581,13 @@ pub fn view_renders_tool_card_test() {
   should.be_true(string.contains(html, "data-call-id=\"call_1\""))
   should.be_true(string.contains(html, "data-tool=\"web_search\""))
   should.be_true(string.contains(html, ">web_search</strong>"))
+  // The collapsed chip is the tool name alone — one short line; call id
+  // and status moved into the body's meta row.
+  should_contain(
+    html,
+    "<summary><strong class=\"tool-name\">web_search</strong></summary>",
+  )
+  should_contain(html, "<div class=\"tool-meta\">")
   should.be_true(string.contains(html, ">completed</span>"))
   // Lustre escapes quotes in text nodes.
   should.be_true(string.contains(html, "{&quot;query&quot;:&quot;cats&quot;}"))
@@ -629,6 +636,10 @@ pub fn view_renders_pending_card_test() {
   should_contain(html, "data-call-index=\"0\" open>")
   should.be_true(string.contains(html, "data-call-index=\"0\""))
   should.be_true(string.contains(html, ">web_search</strong>"))
+  should_contain(
+    html,
+    "<summary><strong class=\"tool-name\">web_search</strong></summary>",
+  )
   should.be_true(string.contains(html, "{&quot;que"))
 }
 

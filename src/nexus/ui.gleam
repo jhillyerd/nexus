@@ -2178,13 +2178,13 @@ fn reasoning_block(text: String, live: Bool) -> Element(Msg) {
 }
 
 /// One assistant tool call as a collapsible block in the same shape as
-/// the reasoning block: a native `<details>` whose summary is the head
-/// (name, stable call id, status) and whose body is the truncated
-/// argument and result previews. Open while the call runs — the
-/// tool-phase twin of the live "thinking…" block — and collapsed once
-/// it completes, so finished rounds read as one compact line. No script,
-/// and every preview is a Lustre text node, so hostile tool output is
-/// inert by construction.
+/// the reasoning block: a native `<details>` whose collapsed summary is
+/// just the tool name — one compact chip, with the call state riding the
+/// border tint — and whose body carries the stable call id, status, and
+/// truncated argument and result previews. Open while the call runs —
+/// the tool-phase twin of the live "thinking…" block — and collapsed
+/// once it completes. No script, and every preview is a Lustre text node,
+/// so hostile tool output is inert by construction.
 fn tool_card(line: Line) -> Element(Msg) {
   let assert ToolLine(id, name, arguments, status, result) = line
   let #(status_label, state_class) = case status {
@@ -2200,14 +2200,15 @@ fn tool_card(line: Line) -> Element(Msg) {
       attr.open(status == ToolRunning),
     ],
     [
-      // Phrasing content only (summary admits no flow content); the
-      // .tool-head span keeps its flex layout from the stylesheet.
+      // The collapsed chip reads as one word: the tool name. Call id and
+      // status live in the body — visible while running (open) and on
+      // expand, hidden once the tinted border tells the story alone.
       html.summary([], [
-        html.span([attr.class("tool-head")], [
-          html.strong([attr.class("tool-name")], [html.text(name)]),
-          html.span([attr.class("call-id")], [html.text(id)]),
-          html.span([attr.class("tool-status")], [html.text(status_label)]),
-        ]),
+        html.strong([attr.class("tool-name")], [html.text(name)]),
+      ]),
+      html.div([attr.class("tool-meta")], [
+        html.span([attr.class("call-id")], [html.text(id)]),
+        html.span([attr.class("tool-status")], [html.text(status_label)]),
       ]),
       html.div([attr.class("tool-args")], [html.text(preview(arguments, 120))]),
       case result {
@@ -2235,11 +2236,11 @@ fn pending_card(call: PendingCall) -> Element(Msg) {
     ],
     [
       html.summary([], [
-        html.span([attr.class("tool-head")], [
-          html.strong([attr.class("tool-name")], [html.text(name)]),
-          html.span([attr.class("call-id")], [html.text(id)]),
-          html.span([attr.class("tool-status")], [html.text("running")]),
-        ]),
+        html.strong([attr.class("tool-name")], [html.text(name)]),
+      ]),
+      html.div([attr.class("tool-meta")], [
+        html.span([attr.class("call-id")], [html.text(id)]),
+        html.span([attr.class("tool-status")], [html.text("running")]),
       ]),
       html.div([attr.class("tool-args")], [html.text(preview(call.args, 120))]),
     ],

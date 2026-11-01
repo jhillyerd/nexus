@@ -784,10 +784,9 @@ async function main() {
       await sendAndWaitIdle(page, "case:search look it up");
       const card = page.locator(".turn.tool[data-tool='web_search']");
       await card.first().waitFor({ timeout: 30_000 });
-      await card
+      await page
+        .locator("details.turn.tool.done[data-tool='web_search']")
         .first()
-        .locator(".tool-status")
-        .filter({ hasText: "completed" })
         .waitFor({ timeout: 30_000 });
       const result = await card.first().locator(".tool-result").textContent();
       assert(result.includes("nexus-e2e stub title"), `searxng stub result: ${result}`);
