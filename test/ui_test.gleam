@@ -1129,6 +1129,46 @@ pub fn providers_loaded_falls_back_when_disabled_test() {
   model.provider |> should.equal(None)
 }
 
+pub fn providers_loaded_notes_only_when_load_concludes_empty_test() {
+  // The "no provider configured" note fires only when a provider LOAD
+  // concludes no enabled provider exists — never from a mere "nothing
+  // selected yet" (the pre-load state of every fresh connection, which
+  // the old connect-time alias effect misread as "none exist" and
+  // logged the bogus note for).
+  let empty =
+    new_model()
+    |> step(ui.ProvidersLoaded([]))
+  empty.log
+  |> list.any(fn(line) {
+    case line {
+      ui.NoteLine(_, text) -> string.contains(text, "no provider configured")
+      _ -> False
+    }
+  })
+  |> should.be_true
+
+  // A load with an enabled provider — the fresh-start path that used to
+  // be defamed by the bug — notes nothing.
+  let offered =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+  offered.log |> should.equal([])
+
+  // All-disabled is "none exist" too: same note, plus the cleared picker.
+  let disabled =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", False, True)]))
+  disabled.provider |> should.equal(None)
+  disabled.log
+  |> list.any(fn(line) {
+    case line {
+      ui.NoteLine(_, text) -> string.contains(text, "no provider configured")
+      _ -> False
+    }
+  })
+  |> should.be_true
+}
+
 pub fn providers_loaded_clears_stale_aliases_on_fallback_test() {
   // The fallback (selection disabled or gone) must not leave the old
   // provider's models offerable: Create stays disabled until the
@@ -1784,6 +1824,72 @@ pub fn meta_updated_refreshes_sidebar_test() {
   should.be_false(string.contains(seen, "EVENT-PAYLOAD"))
 }
 
+/// Regression (bogus "no provider configured" note): the connect-time
+/// alias effect used to dispatch `NoProviders` whenever the model had no
+/// *selected* provider — always true before the first provider load
+/// lands — so EVERY fresh connection logged "no provider configured —
+/// add one in Settings" even with a provider configured, and nothing
+/// ever removed the line. The note must fire only when a provider LOAD
+/// concludes no enabled provider exists. Asserted against a REAL
+/// per-connection runtime over REAL (offline) registries, so the whole
+/// connect cascade runs: the create panel must offer the fixture
+/// provider, and the note must never reach the client.
+pub fn connect_with_configured_provider_never_notes_no_provider_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  store_mock.ensure_fixture_provider(seam)
+
+  let assert Ok(started_providers) =
+    provider_registry.start_with_model_fetcher(
+      test_config(),
+      seam,
+      process.new_name("nexus_ui_providers"),
+      fn(_endpoint) { Error(openai.Transport("offline test")) },
+    )
+  let providers = started_providers.data
+  let factory_name = process.new_name("nexus_ui_factory")
+  let assert Ok(_factory) =
+    factory_supervisor.start(session_registry.factory_builder(factory_name))
+  let assert Ok(started_registry) =
+    session_registry.start_with_runner(
+      test_config(),
+      factory_supervisor.get_by_name(factory_name),
+      process.new_name("nexus_ui_registry"),
+      seam,
+      unused_turn_runner,
+      fn(_endpoint, _tr, _cancel, _allow_pass) {
+        Error("no utility call in this test")
+      },
+      fixture_resolver(),
+    )
+  let registry = started_registry.data
+
+  // One per-connection runtime, started exactly like the /ws socket
+  // handler does: the connect-time effect batch runs for real against
+  // the registries above.
+  let assert Ok(runtime) =
+    lustre.start_server_component(
+      ui_runtime.app(),
+      ui.Flags(registry: registry, providers: providers, session: None),
+    )
+  let client = process.new_subject()
+  server_component.register_subject(client)
+  |> lustre.send(to: runtime)
+
+  // The whole connect cascade (provider load, session load, alias
+  // fetch) settles before anything is asserted. The create panel's
+  // provider select is rendered (hidden) in every chat view, so the
+  // fixture row in the SAME stream proves `ProvidersLoaded` landed —
+  // the note's absence is a verdict, not a stall.
+  let seen = collect_until_quiet(client, 10, "")
+
+  // The configured provider is offered…
+  // The configured provider is offered…
+  should.be_true(string.contains(seen, "fixture (keyless)"))
+  // …and the bogus note never reached the client.
+  should.be_false(string.contains(seen, "no provider configured"))
+}
+
 fn unused_turn_runner(
   _endpoint,
   _tr,
@@ -1834,6 +1940,32 @@ fn test_config() -> config.Config {
     utility_enabled: True,
     utility_delay_ms: 1500,
   )
+}
+
+/// Receive client messages until `quiet` consecutive 200 ms quiet
+/// intervals pass, returning the concatenated JSON — for NEGATIVE
+/// assertions ("this string never reaches the client"): unlike
+/// `wait_for_patch`, which stops at the first match, this keeps every
+/// patch so an assertion can rule a string out across the whole
+/// stream.
+fn collect_until_quiet(
+  client: process.Subject(server_component.ClientMessage(ui.Msg)),
+  quiet: Int,
+  acc: String,
+) -> String {
+  case process.receive(client, 200) {
+    Error(_) ->
+      case quiet {
+        0 -> acc
+        _ -> collect_until_quiet(client, quiet - 1, acc)
+      }
+    Ok(message) -> {
+      let text =
+        server_component.client_message_to_json(message)
+        |> json.to_string
+      collect_until_quiet(client, quiet, acc <> text)
+    }
+  }
 }
 
 /// Receive client messages until one carries `needle`, returning its JSON.
