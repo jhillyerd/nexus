@@ -271,9 +271,6 @@ pub type Msg {
   Settings(ui_settings.Msg)
   AliasesLoaded(provider: String, aliases: List(String))
   AliasesFailed
-  /// No enabled provider exists: the create panel has nothing to offer
-  /// until an operator adds one on the Settings page.
-  NoProviders
   SessionsLoaded(List(session.SessionSummary))
   SessionsFailed(String)
   Select(String)
@@ -431,22 +428,29 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       // session — Hello + replay is idempotent). This is the old
       // ClientConnected arm minus the stale-view clearing a fresh model
       // makes unnecessary.
+      //
+      // No alias load fires here: the fresh model has no provider
+      // selection yet (that is what `ProvidersLoaded` establishes), so
+      // "no provider selected" means NOT LOADED, not "none exist" —
+      // the connect-time alias effect that used to run here read it as
+      // the latter and logged a bogus "no provider configured" note on
+      // every fresh connection. Alias loads key off the provider load:
+      // the first `ProvidersLoaded` re-aims the picker (None → some
+      // enabled row) and fetches that row's models, so a transient
+      // registry/model-list failure still refreshes on every reconnect.
       let model = Model(..model, events: Some(subject))
       let eff = case model.selected {
         Some(id) ->
           effect.batch([
             join_effect(model, id),
-            // Provider metadata + aliases refresh here too: a transient
-            // registry/model-list failure must not leave the panel stale
-            // for the lifetime of the connection.
+            // Provider metadata refreshes here: the load re-aims the
+            // picker and pulls the selected provider's models with it.
             providers_effect(model),
-            aliases_effect(model),
             sessions_effect(model),
           ])
         None ->
           effect.batch([
             providers_effect(model),
-            aliases_effect(model),
             sessions_effect(model),
           ])
       }
@@ -482,6 +486,30 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       let eff = case selected, changed {
         Some(id), True -> aliases_for(model, id)
         _, _ -> effect.none()
+      }
+      // A load that concludes there is no enabled provider notes the
+      // chat log — only here, where "none exist" is actually known
+      // (the picker placeholder carries the same message in the create
+      // panel, and the first-load auto-open rule puts the user on the
+      // Settings page). The note fires on the connection's first load
+      // and on the TRANSITION from an enabled provider to none — never
+      // per refresh, so ordinary Settings reloads while nothing is
+      // enabled cannot stack duplicates in the log (the auto-open
+      // rule's `providers_seen` idiom). The clearing the old
+      // `NoProviders` message did is already covered above: `selected`
+      // is None and a changed selection wiped `aliases`/`picker`.
+      let model = case selected, model.providers_seen, previous {
+        None, False, _ ->
+          Model(..model, log: [
+            NoteLine(True, "no provider configured — add one in Settings"),
+            ..model.log
+          ])
+        None, True, Some(_) ->
+          Model(..model, log: [
+            NoteLine(True, "no provider configured — add one in Settings"),
+            ..model.log
+          ])
+        _, _, _ -> model
       }
       // First run: the connection's FIRST provider load arriving empty
       // auto-opens the Settings view (the guided path the always-visible
@@ -600,14 +628,6 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     AliasesFailed -> #(
       Model(..model, log: [
         NoteLine(True, "could not load model aliases"),
-        ..model.log
-      ]),
-      effect.none(),
-    )
-
-    NoProviders -> #(
-      Model(..model, provider: None, aliases: [], log: [
-        NoteLine(True, "no provider configured — add one in Settings"),
         ..model.log
       ]),
       effect.none(),
@@ -1275,16 +1295,6 @@ fn metrics_for(
 // ---------------------------------------------------------------------------
 // Effects (registry / session / model API glue)
 // ---------------------------------------------------------------------------
-
-fn aliases_effect(model: Model) -> Effect(Msg) {
-  // The create panel's picker follows the selected provider; with no
-  // enabled provider there is nothing to offer — the note points at the
-  // Settings page that creates one.
-  case model.provider {
-    Some(id) -> aliases_for(model, id)
-    None -> effect.from(fn(dispatch) { dispatch(NoProviders) })
-  }
-}
 
 /// Fetch the selected provider's live model list (multi-provider §12:
 /// the picker is provider-scoped). Generous actor-call timeout: the
