@@ -249,6 +249,9 @@ fn boot(seam: store.Store) -> Boot {
       fn(_endpoint, _tr, _cancel, _allow_pass) {
         Error("no utility call in this test")
       },
+      // The corpus seam: never asked in these tests (the fake runner
+      // above refuses before any request), pure to stay offline.
+      fn() { [] },
       fixture_resolver(),
     )
   Boot(
@@ -527,6 +530,8 @@ fn stored(id: String) -> store.StoredSummary {
     pinned: False,
     archived: False,
     tags: [],
+    tags_manual: [],
+    tags_source: session.AutoTags,
     created_at: timing.wall_now_s(),
     last_active_at: timing.wall_now_s(),
     message_count: 1,
@@ -789,6 +794,7 @@ pub fn upgrade_auto_title_writes_through_and_survives_restart_test() {
       booted.registry,
       record.id,
       "Model Title",
+      [],
     ),
     session_registry.UpgradeApplied("Model Title", []),
   )
@@ -815,7 +821,7 @@ pub fn upgrade_auto_title_writes_through_and_survives_restart_test() {
     "renamed",
   ))
   should.equal(
-    session_registry.upgrade_auto_title(booted.registry, record.id, "Sneaky"),
+    session_registry.upgrade_auto_title(booted.registry, record.id, "Sneaky", []),
     session_registry.UpgradeRefused,
   )
   should.equal(
@@ -867,6 +873,7 @@ pub fn upgrade_auto_title_honors_store_refusal_test() {
       booted.registry,
       record.id,
       "Model Title",
+      [],
     ),
     session_registry.UpgradeRefused,
   )
@@ -897,7 +904,7 @@ pub fn upgrade_auto_title_on_dormant_session_test() {
   let booted = boot(seam)
 
   should.equal(
-    session_registry.upgrade_auto_title(booted.registry, "s9", "Model Title"),
+    session_registry.upgrade_auto_title(booted.registry, "s9", "Model Title", []),
     session_registry.UpgradeApplied("Model Title", []),
   )
   restart_vm(booted)

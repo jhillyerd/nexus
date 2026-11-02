@@ -1820,6 +1820,9 @@ pub fn meta_updated_refreshes_sidebar_test() {
       fn(_endpoint, _tr, _cancel, _allow_pass) {
         Error("no utility call in this test")
       },
+      // The corpus seam: never asked here (the fake runner refuses), pure
+      // so the boot stays offline.
+      fn() { [] },
       fixture_resolver(),
     )
   let registry = started_registry.data
@@ -1898,6 +1901,9 @@ pub fn connect_with_configured_provider_never_notes_no_provider_test() {
       fn(_endpoint, _tr, _cancel, _allow_pass) {
         Error("no utility call in this test")
       },
+      // The corpus seam: never asked here (the fake runner refuses), pure
+      // so the boot stays offline.
+      fn() { [] },
       fixture_resolver(),
     )
   let registry = started_registry.data

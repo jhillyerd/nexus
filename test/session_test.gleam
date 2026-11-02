@@ -209,7 +209,10 @@ fn no_utility_runner(
   Error("no utility call expected in this test")
 }
 
-fn no_utility_apply(_title: String) -> Result(session.UtilityMeta, Nil) {
+fn no_utility_apply(
+  _title: String,
+  _tags: List(String),
+) -> Result(session.UtilityMeta, Nil) {
   Error(Nil)
 }
 
@@ -867,7 +870,7 @@ fn ok_utility(
 ) -> session.UtilityRunner {
   fn(_endpoint, tr, _cancel, _allow_pass) {
     process.send(events, UtilCalled(transcript.length(tr)))
-    Ok(utility.Title(title))
+    Ok(utility.Title(title: title, tags: []))
   }
 }
 
@@ -903,7 +906,7 @@ fn pass_once_then_title_utility(
       True -> Ok(utility.Pass)
       False -> {
         process.send(events, UtilForcedAttempt)
-        Ok(utility.Title("Model Title"))
+        Ok(utility.Title(title: "Model Title", tags: []))
       }
     }
   }
@@ -942,7 +945,7 @@ fn blocking_utility(
       }
       Ok(UtilReleased) -> {
         process.send(events, UtilReleased)
-        Ok(utility.Title("Model Title"))
+        Ok(utility.Title(title: "Model Title", tags: []))
       }
       // UtilCalled never rides this selector, but the event type is
       // shared with the test's recording subject — cover it.
@@ -958,7 +961,7 @@ fn ok_apply(
   events: process.Subject(UtilityEvent),
   title: String,
 ) -> session.UtilityApply {
-  fn(t) {
+  fn(t, _tags) {
     process.send(events, UtilAppliedNote(t))
     case t == title {
       True -> Ok(session.UtilityMeta(title, ["auto-tag"]))
@@ -973,7 +976,7 @@ fn ok_apply(
 fn refusing_apply(
   events: process.Subject(UtilityEvent),
 ) -> session.UtilityApply {
-  fn(t) {
+  fn(t, _tags) {
     process.send(events, UtilRefusedNote(t))
     Error(Nil)
   }
@@ -1046,7 +1049,7 @@ pub fn utility_fires_once_after_first_exchange_test() {
   let opts = transcript.Options(..transcript.default_options(), stream: True)
   should.be_false(string.contains(
     transcript.request_body(tr, opts),
-    utility.instruction(True),
+    utility.instruction(True, []),
   ))
 }
 

@@ -228,7 +228,10 @@ pub fn utility_branch_is_messages_suffix_only_test() {
   let base = loop_options()
   let base_body = transcript.request_body(tr, base)
   let branch_body =
-    transcript.request_body(utility.prepare(tr, True), utility.options(base))
+    transcript.request_body(
+      utility.prepare(tr, True, []),
+      utility.options(base),
+    )
 
   // The messages array grew by appending ONE message before the closing
   // `]` — every byte above it is identical.
@@ -242,7 +245,7 @@ pub fn utility_branch_is_messages_suffix_only_test() {
   should.equal(
     appended,
     ",{\"role\":\"user\",\"content\":"
-      <> json.to_string(json.string(utility.instruction(True)))
+      <> json.to_string(json.string(utility.instruction(True, [])))
       <> "}]",
   )
 }
@@ -254,7 +257,10 @@ pub fn utility_envelope_delta_is_only_the_token_cap_test() {
   let tr = first_exchange()
   let base = loop_options()
   let branch_body =
-    transcript.request_body(utility.prepare(tr, True), utility.options(base))
+    transcript.request_body(
+      utility.prepare(tr, True, []),
+      utility.options(base),
+    )
 
   let #(_, base_envelope) = body_parts(transcript.request_body(tr, base))
   let #(_, branch_envelope) = body_parts(branch_body)
@@ -295,8 +301,10 @@ pub fn utility_envelope_delta_is_only_the_token_cap_test() {
 pub fn utility_request_is_deterministic_test() {
   let tr = first_exchange()
   let opts = utility.options(loop_options())
-  transcript.request_body(utility.prepare(tr, True), opts)
-  |> should.equal(transcript.request_body(utility.prepare(tr, True), opts))
+  transcript.request_body(utility.prepare(tr, True, []), opts)
+  |> should.equal(
+    transcript.request_body(utility.prepare(tr, True, []), opts),
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -304,64 +312,83 @@ pub fn utility_request_is_deterministic_test() {
 // ---------------------------------------------------------------------------
 
 pub fn parse_strips_code_fences_test() {
-  utility.parse(True, "```\nGuarded Migration\n```")
-  |> should.equal(Ok(utility.Title("Guarded Migration")))
+  utility.parse(True, [], "```\nGuarded Migration\n```")
+  |> should.equal(Ok(utility.Title("Guarded Migration", [])))
   // A tagged fence loses its language line too.
-  utility.parse(True, "```text\nCache Warmup\n```")
-  |> should.equal(Ok(utility.Title("Cache Warmup")))
+  utility.parse(True, [], "```text\nCache Warmup\n```")
+  |> should.equal(Ok(utility.Title("Cache Warmup", [])))
   // A single-line fence has no newline to split on — the ticks come off
   // anyway instead of discarding the reply.
-  utility.parse(True, "```Cache Warmup```")
-  |> should.equal(Ok(utility.Title("Cache Warmup")))
+  utility.parse(True, [], "```Cache Warmup```")
+  |> should.equal(Ok(utility.Title("Cache Warmup", [])))
   // Interior fences are left alone; only a surrounding fence is stripped.
-  utility.parse(True, "Look: ```code```")
-  |> should.equal(Ok(utility.Title("Look: ```code```")))
+  utility.parse(True, [], "Look: ```code```")
+  |> should.equal(Ok(utility.Title("Look: ```code```", [])))
 }
 
-pub fn parse_collapses_multiline_replies_test() {
-  utility.parse(True, "Prefix Cache\nBasics")
-  |> should.equal(Ok(utility.Title("Prefix Cache Basics")))
-  utility.parse(True, "KV  Reuse\r\nand\tWarming")
-  |> should.equal(Ok(utility.Title("KV Reuse and Warming")))
+/// The two-line protocol (utility-tags plan §3.1): line 1 shapes the
+/// title (whitespace collapsed WITHIN the line), line 2 is the tags line
+/// (best-effort — here one tag each, normalized to kebab-case).
+pub fn parse_two_line_reply_test() {
+  // With an empty corpus every tag is NEW, so the structural K cap keeps
+  // only the first two — the third ("auth") is dropped, in reply order.
+  utility.parse(True, [], "Fix login redirect loop\nlogin, bug, auth")
+  |> should.equal(Ok(utility.Title("Fix login redirect loop", [
+    "login", "bug",
+  ])))
+  // Line 1 collapses internal whitespace runs; CRLF is a line break, and
+  // the tags line's internal whitespace collapses to kebab-case.
+  utility.parse(True, [], "KV  Reuse\r\nand\tWarming")
+  |> should.equal(Ok(utility.Title("KV Reuse", ["and-warming"])))
+  // A trailing newline is not a tags line: the title still applies.
+  utility.parse(True, [], "Title Only\n")
+  |> should.equal(Ok(utility.Title("Title Only", [])))
 }
 
-/// Leading prose is not the title, but the parser is deliberately
-/// mechanical (best-effort, no retry): it passes through whitespace-
-/// collapsed and length-capped. Display-only text rendered as a Lustre
-/// text node — never interpreted.
-pub fn parse_keeps_leading_prose_collapsed_test() {
-  utility.parse(True, "Title: Prefix Cache Basics")
-  |> should.equal(Ok(utility.Title("Title: Prefix Cache Basics")))
+/// A leading `Title:` / `Tags:` label on either line is stripped
+/// (models like echoing the schema) — case-insensitive, and only with
+/// the colon, so a word that merely starts like the label survives.
+pub fn parse_strips_leading_labels_test() {
+  utility.parse(True, [], "Title: Prefix Cache Basics")
+  |> should.equal(Ok(utility.Title("Prefix Cache Basics", [])))
+  utility.parse(True, [], "title: lowercased label")
+  |> should.equal(Ok(utility.Title("lowercased label", [])))
+  utility.parse(True, [], "Tags Demo\nTags: cache, retry")
+  |> should.equal(Ok(utility.Title("Tags Demo", ["cache", "retry"])))
+  // No colon, no strip: "Titleist" is a word, not a label.
+  utility.parse(True, [], "Titleist Golf Clubs")
+  |> should.equal(Ok(utility.Title("Titleist Golf Clubs", [])))
 }
 
 /// The PASS postpone sentinel (utility-titles §4.2): a whole-reply PASS —
 /// case-insensitive, optionally fenced or padded — postpones when the
 /// attempt allows it.
 pub fn parse_pass_sentinel_postpones_when_allowed_test() {
-  utility.parse(True, "PASS") |> should.equal(Ok(utility.Pass))
-  utility.parse(True, "pass") |> should.equal(Ok(utility.Pass))
-  utility.parse(True, "  Pass \n") |> should.equal(Ok(utility.Pass))
-  utility.parse(True, "```\nPASS\n```") |> should.equal(Ok(utility.Pass))
+  utility.parse(True, [], "PASS") |> should.equal(Ok(utility.Pass))
+  utility.parse(True, [], "pass") |> should.equal(Ok(utility.Pass))
+  utility.parse(True, [], "  Pass \n") |> should.equal(Ok(utility.Pass))
+  utility.parse(True, [], "```\nPASS\n```") |> should.equal(Ok(utility.Pass))
 }
 
 /// …but only a WHOLE-reply PASS: a real title that merely contains the
 /// word never postpones, and neither does trailing punctuation — the
 /// instruction says exactly PASS.
 pub fn parse_pass_requires_whole_string_match_test() {
-  utility.parse(True, "Password Manager Setup")
-  |> should.equal(Ok(utility.Title("Password Manager Setup")))
-  utility.parse(True, "Passing Arguments in Gleam")
-  |> should.equal(Ok(utility.Title("Passing Arguments in Gleam")))
-  utility.parse(True, "PASS.") |> should.equal(Ok(utility.Title("PASS.")))
+  utility.parse(True, [], "Password Manager Setup")
+  |> should.equal(Ok(utility.Title("Password Manager Setup", [])))
+  utility.parse(True, [], "Passing Arguments in Gleam")
+  |> should.equal(Ok(utility.Title("Passing Arguments in Gleam", [])))
+  utility.parse(True, [], "PASS.")
+  |> should.equal(Ok(utility.Title("PASS.", [])))
 }
 
 /// Under the forced instruction the model was never offered the sentinel:
 /// a PASS reply is an unusable title (a failure), not a postpone — the
 /// session cannot defer twice.
 pub fn parse_pass_rejected_under_forced_instruction_test() {
-  utility.parse(False, "PASS") |> should.equal(Error(Nil))
-  utility.parse(False, "Real Title")
-  |> should.equal(Ok(utility.Title("Real Title")))
+  utility.parse(False, [], "PASS") |> should.equal(Error(Nil))
+  utility.parse(False, [], "Real Title")
+  |> should.equal(Ok(utility.Title("Real Title", [])))
 }
 
 /// Hostile model output must pass through INERT (the UI renders it as a
@@ -370,13 +397,13 @@ pub fn parse_pass_rejected_under_forced_instruction_test() {
 pub fn parse_passes_hostile_payload_inert_and_capped_test() {
   let hostile = "<script>alert('xss')</script>"
   // Short enough to fit: it passes through verbatim — inert data.
-  utility.parse(True, hostile)
-  |> should.equal(Ok(utility.Title(hostile)))
+  utility.parse(True, [], hostile)
+  |> should.equal(Ok(utility.Title(hostile, [])))
 
   // A long payload hits the same 60-character cap (plus ellipsis) as any
   // title — never truncated mid-tag into executable markup, just data.
   let flood = string.repeat("<script>x</script>", 10)
-  let assert Ok(utility.Title(capped)) = utility.parse(True, flood)
+  let assert Ok(utility.Title(capped, _tags)) = utility.parse(True, [], flood)
   should.equal(string.length(capped), 61)
   should.be_true(string.ends_with(capped, "…"))
   should.equal(capped, string.slice(flood, 0, 60) <> "…")
@@ -384,10 +411,13 @@ pub fn parse_passes_hostile_payload_inert_and_capped_test() {
 
 pub fn parse_rejects_empty_and_refusal_test() {
   // A refusal arrives as no content — the same empty reply.
-  utility.parse(True, "") |> should.equal(Error(Nil))
-  // Whitespace-only and fence-only replies carry no title either.
-  utility.parse(True, "  \n\t ") |> should.equal(Error(Nil))
-  utility.parse(True, "```\n```") |> should.equal(Error(Nil))
+  utility.parse(True, [], "") |> should.equal(Error(Nil))
+  // Whitespace-only and fence-only replies carry no title either. A
+  // label-only title line is empty after the strip: line 1 is required,
+  // and a tags line cannot save it.
+  utility.parse(True, [], "  \n\t ") |> should.equal(Error(Nil))
+  utility.parse(True, [], "```\n```") |> should.equal(Error(Nil))
+  utility.parse(True, [], "Title:\nlogin, bug") |> should.equal(Error(Nil))
 }
 
 /// The shaping rule is the ONE implementation behind both title paths
@@ -408,11 +438,11 @@ pub fn instruction_forbids_tool_calls_test() {
   // stripped without diverging the prefix — the instruction must carry
   // the prohibition instead. BOTH variants.
   should.be_true(string.contains(
-    utility.instruction(True),
+    utility.instruction(True, []),
     "Do not call any tools",
   ))
   should.be_true(string.contains(
-    utility.instruction(False),
+    utility.instruction(False, []),
     "Do not call any tools",
   ))
 }
@@ -421,9 +451,12 @@ pub fn instruction_forbids_tool_calls_test() {
 /// instruction must not mention the sentinel at all, so a model that
 /// never saw the option cannot be steered into it.
 pub fn instruction_pass_escape_hatch_variant_test() {
-  should.be_true(string.contains(utility.instruction(True), "exactly PASS"))
+  should.be_true(string.contains(
+    utility.instruction(True, []),
+    "exactly PASS",
+  ))
   should.be_false(string.contains(
-    string.lowercase(utility.instruction(False)),
+    string.lowercase(utility.instruction(False, [])),
     "pass",
   ))
 }
@@ -433,7 +466,7 @@ pub fn prepare_appends_exactly_one_user_message_test() {
     transcript.new("test-alias", "system prompt")
     |> transcript.append_user("hi")
     |> transcript.append_assistant("hello")
-  let branch = utility.prepare(tr, True)
+  let branch = utility.prepare(tr, True, [])
   transcript.length(branch) |> should.equal(4)
 
   // The branch adds exactly ONE message: the instruction, as a user
@@ -443,5 +476,5 @@ pub fn prepare_appends_exactly_one_user_message_test() {
   list.take(messages, 3) |> should.equal(transcript.messages(tr))
   let assert [chat.UserMessage(content: chat.UserTextContent(text), ..)] =
     list.drop(messages, 3)
-  text |> should.equal(utility.instruction(True))
+  text |> should.equal(utility.instruction(True, []))
 }

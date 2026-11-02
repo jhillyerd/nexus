@@ -105,19 +105,7 @@ type Stored {
     /// an assistant message with N tool calls is one message but N rows
     /// (mirrors sessions.message_count in the real schema).
     messages: Int,
-    /// `session.tags_source` (utility-tags plan §3.4): 'auto' from
-    /// insert_session, flipped to 'manual' FOREVER by the first SetTags
-    /// (the triple-write) — the column `auto_meta_upgrade.sql` guards
-    /// on. Mock-local until the StoredSummary widening (P3) carries
-    /// provenance through the seam.
-    tags_source: TagsSource,
   )
-}
-
-/// Mirror of the schema's `tags_source` ('auto' | 'manual').
-type TagsSource {
-  TagsAuto
-  TagsManual
 }
 
 type State {
@@ -349,14 +337,19 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
               sessions: dict.insert(
                 state.sessions,
                 summary.id,
-                // insert_session.sql: tags_manual '{}' + tags_source
-                // DEFAULT 'auto' — a new row's auto path is open.
+                // insert_session.sql: tags_manual '{}' literally and
+                // tags_source DEFAULT 'auto' — a new row's auto path is
+                // open, regardless of what the passed summary carried
+                // (a fresh insert never inherits provenance).
                 Stored(
-                  summary,
+                  store.StoredSummary(
+                    ..summary,
+                    tags_manual: [],
+                    tags_source: session.AutoTags,
+                  ),
                   system_prompt,
                   [],
                   summary.message_count,
-                  TagsAuto,
                 ),
               ),
               events: [EvInsertSession(summary.id), ..state.events],
@@ -455,8 +448,8 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
           actor.continue(state)
         }
         Ok(stored) ->
-          case stored.summary.title_source, stored.tags_source {
-            session.AutoTitle, TagsAuto -> {
+          case stored.summary.title_source, stored.summary.tags_source {
+            session.AutoTitle, session.AutoTags -> {
               process.send(reply, Ok(True))
               actor.continue(
                 State(
@@ -476,18 +469,21 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
 
     SetTags(id, tags, reply) -> {
       // Mirrors `set_tags.sql` (utility-tags plan §3.5): one atomic
-      // triple-write — display set, manual set, and
+      // triple-write — the display set, the manual set, and
       // `tags_source = 'manual'` (the freeze `auto_meta_upgrade` guards
-      // on). `tags_manual` itself rides the row until the P3 seam
-      // widening; the display write is what tests observe.
+      // on). All three fields or nothing.
       process.send(reply, Ok(Nil))
       actor.continue(
         State(
           ..update_stored(state, id, fn(stored) {
             Stored(
               ..stored,
-              tags_source: TagsManual,
-              summary: store.StoredSummary(..stored.summary, tags: tags),
+              summary: store.StoredSummary(
+                ..stored.summary,
+                tags: tags,
+                tags_manual: tags,
+                tags_source: session.ManualTags,
+              ),
             )
           }),
           events: [EvSetTags(id, tags), ..state.events],

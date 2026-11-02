@@ -112,10 +112,11 @@ pub type ResolveProvider =
 /// the fresh display metadata on success so the session actor can broadcast
 /// `MetaUpdated` truthfully without a second round-trip.
 pub type UpgradeOutcome {
-  /// Applied: the session's fresh title + tags.
+  /// Applied: the session's fresh title + merged display tags.
   UpgradeApplied(title: String, tags: List(String))
-  /// Refused: `title_source` is manual (a rename wins forever), the id is
-  /// unknown, or the title was empty.
+  /// Refused: `title_source` OR `tags_source` is manual (a rename or a
+  /// manual tag edit each win forever), the id is unknown, or the title
+  /// was empty.
   UpgradeRefused
 }
 
@@ -150,12 +151,27 @@ pub type Msg {
   /// only while the title is still the untouched auto default, so a manual
   /// rename is never overwritten. Keeps `title_source` auto.
   AutoTitle(id: String, title: String, reply: Subject(Bool))
-  /// Model-generated title upgrade (utility-titles plan §4.3): replaces
-  /// the heuristic placeholder while `title_source = 'auto'` — a manual
-  /// rename wins forever. The reply says what happened (and carries the
-  /// fresh metadata); the store write-through carries the same guard, so
-  /// the twin invariant of the `AutoTitle` pair holds.
-  UpgradeAutoTitle(id: String, title: String, reply: Subject(UpgradeOutcome))
+  /// Model-generated metadata upgrade (utility-titles plan §4.3 +
+  /// utility-tags plan §3.5): replaces the heuristic placeholder title
+  /// AND merges the model's tags into the display set while
+  /// `title_source = 'auto'` AND `tags_source = 'auto'` — a manual rename
+  /// or a manual tag edit each close their side forever, refusing the
+  /// whole ask. The reply says what happened (and carries the fresh
+  /// metadata); the store write-through carries the same guard, so the
+  /// twin invariant of the `AutoTitle` pair holds on both provenance
+  /// columns.
+  UpgradeAutoTitle(
+    id: String,
+    title: String,
+    tags: List(String),
+    reply: Subject(UpgradeOutcome),
+  )
+  /// The reuse-vocabulary ask (utility-tags plan §3.3): the top tags
+  /// across every session the registry knows (active + dormant),
+  /// normalized before counting, frequency-floored, count-ordered with
+  /// alphabetical tie-break. Asked by the utility WORKER through the
+  /// real runner's corpus closure — never by the registry's own process.
+  TagCorpus(reply: Subject(List(String)))
   SetPinned(id: String, pinned: Bool, reply: Subject(Bool))
   SetTags(id: String, tags: List(String), reply: Subject(Bool))
   SetArchived(id: String, archived: Bool, reply: Subject(Bool))
@@ -192,8 +208,18 @@ type Record {
     /// manual rename pins the title forever.
     title_source: session.TitleSource,
     pinned: Bool,
-    /// Normalized on write: trimmed, non-empty, de-duplicated.
+    /// Normalized on write through the ONE shared rule
+    /// (`utility.normalize_tags`): trimmed, lowercased, kebab-cased,
+    /// empties and duplicates dropped, each tag capped at 24 characters.
     tags: List(String),
+    /// The user's exact (normalized) set — the manual half of the display
+    /// union (utility-tags plan §3.4); `tags − tags_manual` is the auto
+    /// contribution.
+    tags_manual: List(String),
+    /// Auto: model tags may still merge into the display set. Manual: a
+    /// manual tag edit froze the set forever — the in-memory half of the
+    /// twin invariant (the store's `tags_source` column is the other).
+    tags_source: session.TagsSource,
     /// Soft-hide flag: archived sessions stay restorable until deleted.
     archived: Bool,
     /// Wall-clock epoch seconds at creation (display ordering only).
@@ -300,15 +326,21 @@ pub fn start(
   // any session exists — so every request any session of this VM ever
   // sends carries the identical (byte-stable) tool schema. The SAME specs
   // build the utility side-call runner, so the title branch's envelope is
-  // the turn envelope by construction (KV-cache contract).
+  // the turn envelope by construction (KV-cache contract). The runner's
+  // corpus closure asks THIS registry (by name) for the reuse vocabulary
+  // from inside the utility worker — Y is the tail message,
+  // generation-side only, so the dynamic corpus can never touch the
+  // cached prefix (utility-tags plan §3.3).
   let specs = tools.default(cfg)
+  let corpus = tag_corpus_for(name)
   start_with_runner(
     cfg,
     factory,
     name,
     persistence,
     session.agent_runner(cfg.max_tool_iterations, specs),
-    session.utility_runner(specs),
+    session.utility_runner(specs, corpus),
+    corpus,
     resolve_provider,
   )
 }
@@ -316,7 +348,11 @@ pub fn start(
 /// Test seam: the same registry with injected turn + utility runners —
 /// hydration (boot, lazy start, restart recovery) then uses them for every
 /// session it starts, exactly like production uses the frozen boot-built
-/// runners.
+/// runners. `_corpus` is the TagCorpus seam the real utility runner asks
+/// (§3.3): accepted beside the runners so the seam mirrors `start`'s
+/// plumbing (a test booting the real runner closes over its corpus the
+/// same way), and deliberately unused here — whether a corpus is asked
+/// at all is the injected runner's business, and fakes never ask.
 pub fn start_with_runner(
   cfg: Config,
   factory: Factory,
@@ -324,6 +360,7 @@ pub fn start_with_runner(
   persistence: Store,
   runner: session.TurnRunner,
   utility_runner: session.UtilityRunner,
+  _corpus: fn() -> List(String),
   resolve_provider: ResolveProvider,
 ) -> actor.StartResult(Subject(Msg)) {
   let builder =
@@ -507,6 +544,11 @@ fn handle_create(
                     pinned: False,
                     archived: False,
                     tags: [],
+                    // insert_session.sql: tags_manual '{}' literally and
+                    // tags_source left to its column default 'auto' — a
+                    // new session has no tags and an open auto path.
+                    tags_manual: [],
+                    tags_source: session.AutoTags,
                     created_at: created_at,
                     last_active_at: created_at,
                     // 1 = the system prompt (Phase 1 message_count).
@@ -536,6 +578,8 @@ fn handle_create(
                   title_source: session.AutoTitle,
                   pinned: False,
                   tags: [],
+                  tags_manual: [],
+                  tags_source: session.AutoTags,
                   archived: False,
                   created_at: created_at,
                   persisted: persisted,
@@ -689,49 +733,54 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
         },
       )
 
-    UpgradeAutoTitle(id, title, reply) -> {
-      // Model-title upgrade (utility-titles plan §4.3): the guard is
-      // `title_source = 'auto'` ONLY — the heuristic placeholder may be
-      // upgraded, a manual rename wins forever. The in-memory update and
-      // the store write-through carry the same guard (twin-invariant
-      // pattern of the AutoTitle pair: the SQL refuses what the memory
-      // would have refused, so a write-through cannot resurrect a clobbered
-      // title). Unlike AutoTitle there is no empty-title precondition: an
-      // auto title may be REPLACED. The outcome carries the fresh metadata
-      // so the caller can broadcast it.
+    UpgradeAutoTitle(id, title, tags, reply) -> {
+      // Model-metadata upgrade (utility-titles plan §4.3, extended by
+      // utility-tags plan §3.5): the guard is provenance ONLY, on BOTH
+      // sides — the title may upgrade while `title_source = 'auto'`, the
+      // display tags may be written while `tags_source = 'auto'`; a
+      // manual rename OR a manual tag edit refuses the whole ask (one
+      // request, one guard, both writes — the review-caught P1). The
+      // in-memory update and the store write-through carry the same guard
+      // (twin-invariant pattern of the AutoTitle pair: the SQL refuses
+      // what the memory would have refused, so a write-through cannot
+      // resurrect a clobbered title or a frozen tag set). Unlike AutoTitle
+      // there is no empty-title precondition: an auto title may be
+      // REPLACED.
       //
-      // P2 of utility-tags: the store call is the widened
-      // `auto_meta_upgrade` (title AND display tags, guarded by BOTH
-      // provenance columns); the merge that would compute new model tags
-      // is P3, so the session's EXISTING display tags pass through
-      // unchanged — the row's tags are rewritten as what memory already
-      // holds.
+      // Tags are MERGED, never clobbered: existing display entries pass
+      // through VERBATIM (never re-canonicalized — a legacy `Work Notes`
+      // stays `Work Notes`), the model's tags are normalized and appended
+      // when not already present (case-insensitive, so `Work Notes` and
+      // `work-notes` do not duplicate), and the union preserves existing
+      // order, appends the new, then truncates at 5 — `utility.merge_tags`,
+      // the one merge rule. The outcome carries the fresh display set so
+      // the caller can broadcast it truthfully.
       let title = string.trim(title)
       let #(state, outcome) = case title {
         "" -> #(state, UpgradeRefused)
         _ ->
           case dict.get(state.sessions, id) {
             Ok(record) ->
-              case record.title_source {
-                session.AutoTitle ->
+              case record.title_source, record.tags_source {
+                session.AutoTitle, session.AutoTags -> {
+                  let merged = utility.merge_tags(record.tags, tags)
                   // The store guard has the final word (twin-invariant):
                   // `Ok(False)` means a concurrent write changed the row's
                   // provenance behind this instance's back — refuse and
                   // leave the in-memory record untouched. An unreachable
-                  // store keeps the documented degrade mode: log, and
-                  // keep the in-memory write so the UI stays consistent.
-                  // Tags pass through unchanged (P2; see above).
-                  case state.store.auto_meta_upgrade(id, title, record.tags) {
+                  // store keeps the documented degrade mode: log, and keep
+                  // the in-memory write so the UI stays consistent.
+                  case state.store.auto_meta_upgrade(id, title, merged) {
                     Ok(True) -> #(
                       State(
                         ..state,
                         sessions: dict.insert(
                           state.sessions,
                           id,
-                          Record(..record, title: title),
+                          Record(..record, title: title, tags: merged),
                         ),
                       ),
-                      UpgradeApplied(title, record.tags),
+                      UpgradeApplied(title, merged),
                     )
                     Ok(False) -> #(state, UpgradeRefused)
                     Error(error) -> {
@@ -742,35 +791,41 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
                           sessions: dict.insert(
                             state.sessions,
                             id,
-                            Record(..record, title: title),
+                            Record(..record, title: title, tags: merged),
                           ),
                         ),
-                        UpgradeApplied(title, record.tags),
+                        UpgradeApplied(title, merged),
                       )
                     }
                   }
-                session.ManualTitle -> #(state, UpgradeRefused)
+                }
+                // A manual rename OR a manual tag edit wins forever:
+                // refuse the whole ask, touch nothing.
+                _, _ -> #(state, UpgradeRefused)
               }
             Error(_) ->
               case dict.get(state.dormant, id) {
                 Ok(summary) ->
-                  case summary.title_source {
-                    session.AutoTitle ->
+                  case summary.title_source, summary.tags_source {
+                    session.AutoTitle, session.AutoTags -> {
                       // Same twin-invariant: the stored row is a dormant
                       // session's ONLY state, so its refusal is final.
-                      case
-                        state.store.auto_meta_upgrade(id, title, summary.tags)
-                      {
+                      let merged = utility.merge_tags(summary.tags, tags)
+                      case state.store.auto_meta_upgrade(id, title, merged) {
                         Ok(True) -> #(
                           State(
                             ..state,
                             dormant: dict.insert(
                               state.dormant,
                               id,
-                              store.StoredSummary(..summary, title: title),
+                              store.StoredSummary(
+                                ..summary,
+                                title: title,
+                                tags: merged,
+                              ),
                             ),
                           ),
-                          UpgradeApplied(title, summary.tags),
+                          UpgradeApplied(title, merged),
                         )
                         Ok(False) -> #(state, UpgradeRefused)
                         Error(error) -> {
@@ -781,14 +836,19 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
                               dormant: dict.insert(
                                 state.dormant,
                                 id,
-                                store.StoredSummary(..summary, title: title),
+                                store.StoredSummary(
+                                  ..summary,
+                                  title: title,
+                                  tags: merged,
+                                ),
                               ),
                             ),
-                            UpgradeApplied(title, summary.tags),
+                            UpgradeApplied(title, merged),
                           )
                         }
                       }
-                    session.ManualTitle -> #(state, UpgradeRefused)
+                    }
+                    _, _ -> #(state, UpgradeRefused)
                   }
                 Error(_) -> #(state, UpgradeRefused)
               }
@@ -835,17 +895,42 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
         },
       )
 
-    SetTags(id, tags, reply) ->
+    SetTags(id, tags, reply) -> {
+      // The manual tags save (utility-tags plan §3.5): the user's exact
+      // (normalized) set becomes the display set AND the manual set, and
+      // the row's auto path closes — `set_tags.sql` writes
+      // `tags = $1, tags_manual = $1, tags_source = 'manual'` in ONE
+      // statement, so the freeze itself is atomic (all three fields or
+      // nothing). A manual edit freezes the display set as the user wrote
+      // it: no later merge can alter it, in flight or otherwise — the
+      // in-memory twin check refuses a racing utility apply before the
+      // store is ever consulted. On a store error the in-memory freeze
+      // stands (the apply_meta degrade mode): the persisted row may lag,
+      // the next manual save re-attempts the triple-write and heals it.
+      let normalized = normalize_tags(tags)
       apply_meta(
         state,
         id,
         reply,
-        fn(record) { Record(..record, tags: normalize_tags(tags)) },
-        fn(summary) {
-          store.StoredSummary(..summary, tags: normalize_tags(tags))
+        fn(record) {
+          Record(
+            ..record,
+            tags: normalized,
+            tags_manual: normalized,
+            tags_source: session.ManualTags,
+          )
         },
-        fn() { state.store.set_tags(id, normalize_tags(tags)) },
+        fn(summary) {
+          store.StoredSummary(
+            ..summary,
+            tags: normalized,
+            tags_manual: normalized,
+            tags_source: session.ManualTags,
+          )
+        },
+        fn() { state.store.set_tags(id, normalized) },
       )
+    }
 
     SetArchived(id, archived, reply) ->
       apply_meta(
@@ -979,6 +1064,14 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
       }
     }
 
+    TagCorpus(reply) -> {
+      // The reuse-vocabulary ask (§3.3): answered from registry state
+      // alone — the registry never calls into a session, so the worker's
+      // ask cannot deadlock.
+      process.send(reply, compute_tag_corpus(state.sessions, state.dormant))
+      actor.continue(state)
+    }
+
     MonitorNoise -> actor.continue(state)
 
     // Create cases are handled in `handle` before delegating here.
@@ -1000,17 +1093,18 @@ fn commit_hook_for(persistence: Store, id: String) -> fn(Transcript) -> Nil {
 
 /// The utility apply seam for one session — the injected `UtilityApply`.
 /// A closure over this actor's subject and the id (exactly like the
-/// commit hook), performing the `UpgradeAutoTitle` ask. It runs inside the
-/// unlinked utility WORKER process — never the session actor — so the ask
-/// cannot deadlock: the registry answers it without ever calling back into
-/// a session. The outcome's fresh metadata feeds the session's
+/// commit hook), performing the `UpgradeAutoTitle` ask with the parsed
+/// title AND tags. It runs inside the unlinked utility WORKER process —
+/// never the session actor — so the ask cannot deadlock: the registry
+/// answers it without ever calling back into a session. The outcome's
+/// fresh metadata (title + the merged display set) feeds the session's
 /// `MetaUpdated` broadcast.
 fn utility_apply_for(
   registry: Subject(Msg),
   id: String,
-) -> fn(String) -> Result(session.UtilityMeta, Nil) {
-  fn(title) {
-    case upgrade_auto_title(registry, id, title) {
+) -> fn(String, List(String)) -> Result(session.UtilityMeta, Nil) {
+  fn(title, tags) {
+    case upgrade_auto_title(registry, id, title, tags) {
       UpgradeApplied(title, tags) -> Ok(session.UtilityMeta(title, tags))
       UpgradeRefused -> Error(Nil)
     }
@@ -1096,6 +1190,8 @@ fn lazy_start(state: State, summary: StoredSummary) -> Resolved {
                   title_source: summary.title_source,
                   pinned: summary.pinned,
                   tags: summary.tags,
+                  tags_manual: summary.tags_manual,
+                  tags_source: summary.tags_source,
                   archived: summary.archived,
                   created_at: summary.created_at,
                   persisted: True,
@@ -1250,13 +1346,85 @@ fn log_store_error(context: String, error: String) -> Nil {
   io.println("nexus registry: store " <> context <> " failed: " <> error)
 }
 
-/// Tags are normalized on write: trimmed, empties dropped, duplicates
-/// removed (first occurrence wins — insertion order is display order).
+/// Tags are normalized on write through the ONE shared rule
+/// (`nexus/utility.normalize_tags`, utility-tags plan §3.1): trimmed,
+/// lowercased, internal whitespace collapsed to kebab-case, empties
+/// dropped, duplicates removed (first occurrence wins — insertion order
+/// is display order), each tag truncated at 24 characters. Manual saves
+/// and model tags share this rule, so the two can never drift apart.
 fn normalize_tags(tags: List(String)) -> List(String) {
-  tags
-  |> list.map(string.trim)
-  |> list.filter(fn(tag) { tag != "" })
-  |> list.unique
+  utility.normalize_tags(tags)
+}
+
+// ---------------------------------------------------------------------------
+// Tag corpus (utility-tags plan §3.3)
+// ---------------------------------------------------------------------------
+
+/// The frequency floor: a tag becomes reuse vocabulary once at least 2
+/// sessions carry it. A singleton tag is not yet vocabulary — it stays
+/// out of Y, so one session's fresh tag does not immediately promote
+/// itself to a reuse candidate for the next.
+const corpus_floor = 2
+
+/// The corpus cap: top entries by session count, ties broken
+/// alphabetically — deterministic for a given registry state. With the
+/// per-tag cap in `nexus/utility` this bounds Y's corpus share at
+/// 30 × 24 characters, whatever older rows contain.
+const corpus_size = 30
+
+/// The reuse vocabulary across every session the registry knows — active
+/// records plus dormant summaries (both hold their sessions' display
+/// tags in memory). Every candidate is normalized with the SAME rule as
+/// manual and model tags BEFORE counting — `utility.normalize_tags` also
+/// dedupes within a session, so the floor counts SESSIONS, not mentions —
+/// and counting pools case-insensitively (after normalization a legacy
+/// `Work Notes` and a canonical `work-notes` are one entry; the display
+/// sets themselves are never rewritten). Tags used by ≥ `corpus_floor`
+/// sessions survive, ordered by count descending, alphabetical tie-break,
+/// capped at `corpus_size`.
+fn compute_tag_corpus(
+  sessions: Dict(String, Record),
+  dormant: Dict(String, StoredSummary),
+) -> List(String) {
+  let per_session =
+    list.append(
+      list.map(dict.values(sessions), fn(record) {
+        utility.normalize_tags(record.tags)
+      }),
+      list.map(dict.values(dormant), fn(summary) {
+        utility.normalize_tags(summary.tags)
+      }),
+    )
+  let counts =
+    list.fold(per_session, dict.new(), fn(counts, tags) {
+      list.fold(tags, counts, fn(counts, tag) {
+        let count = case dict.get(counts, tag) {
+          Ok(n) -> n + 1
+          Error(_) -> 1
+        }
+        dict.insert(counts, tag, count)
+      })
+    })
+  counts
+  |> dict.to_list
+  |> list.filter(fn(entry) { entry.1 >= corpus_floor })
+  |> list.sort(fn(a, b) {
+    case int.compare(b.1, a.1) {
+      order.Eq -> string.compare(a.0, b.0)
+      ord -> ord
+    }
+  })
+  |> list.map(fn(entry) { entry.0 })
+  |> list.take(corpus_size)
+}
+
+/// The corpus closure the real utility runner asks (§3.3): built from the
+/// registry's NAME — it exists before the actor starts, so no subject
+/// capture is needed at build time — and resolved to a subject at ask
+/// time, from inside the utility WORKER. Exactly the `utility_apply_for`
+/// ask pattern: the registry never blocks on itself.
+fn tag_corpus_for(name: process.Name(Msg)) -> fn() -> List(String) {
+  fn() { tag_corpus(process.named_subject(name)) }
 }
 
 /// Sidebar title from a first user message: collapse whitespace runs to
@@ -1427,15 +1595,28 @@ pub fn auto_title(registry: Subject(Msg), id: String, title: String) -> Bool {
   actor.call(registry, 5000, fn(reply) { AutoTitle(id:, title:, reply:) })
 }
 
-/// The model-title upgrade (the utility worker's apply step). Applies only
-/// while `title_source = 'auto'` — a manual rename wins forever. The reply
-/// carries the fresh metadata when it applied.
+/// The model-metadata upgrade (the utility worker's apply step): title
+/// AND tags from the same completion. Applies only while BOTH provenance
+/// columns are 'auto' — a manual rename or a manual tag edit wins forever
+/// — and merges the tags into the display set. The reply carries the
+/// fresh metadata when it applied.
 pub fn upgrade_auto_title(
   registry: Subject(Msg),
   id: String,
   title: String,
+  tags: List(String),
 ) -> UpgradeOutcome {
-  actor.call(registry, 5000, fn(reply) { UpgradeAutoTitle(id:, title:, reply:) })
+  actor.call(registry, 5000, fn(reply) {
+    UpgradeAutoTitle(id:, title:, tags:, reply:)
+  })
+}
+
+/// The reuse-vocabulary ask (§3.3): the top tags across every session
+/// the registry knows. In production this is called from inside the
+/// utility worker (the real runner's corpus closure); tests call it
+/// directly against a booted registry.
+pub fn tag_corpus(registry: Subject(Msg)) -> List(String) {
+  actor.call(registry, 5000, TagCorpus)
 }
 
 pub fn set_pinned(registry: Subject(Msg), id: String, pinned: Bool) -> Bool {

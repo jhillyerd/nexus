@@ -56,6 +56,15 @@ pub type StoredSummary {
     pinned: Bool,
     archived: Bool,
     tags: List(String),
+    /// The user's exact (normalized) set — the manual half of the display
+    /// union (utility-tags plan §3.4): `tags − tags_manual` is the auto
+    /// contribution. Written verbatim by `set_tags`, never by a merge.
+    tags_manual: List(String),
+    /// Whether model tags may still merge (`AutoTags`) or a manual tag
+    /// edit froze the set forever (`ManualTags`). The seam's
+    /// `auto_meta_upgrade` refuses on `ManualTags` — the store-side twin
+    /// of the registry's in-memory guard.
+    tags_source: session.TagsSource,
     /// Epoch seconds (Phase 1 wire format).
     created_at: Int,
     /// Epoch seconds; bumped on turn commit.

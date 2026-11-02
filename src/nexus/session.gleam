@@ -136,14 +136,18 @@ pub type UtilityMeta {
   UtilityMeta(title: String, tags: List(String))
 }
 
-/// The apply seam: guarded title application — in production the registry
-/// `UpgradeAutoTitle` ask (guard `title_source = 'auto'` only), injected
-/// exactly like the turn runner so this module never depends on the
-/// registry (dependency direction stays registry → session, and the
-/// session actor never blocks on an ask). `Error` when the guard refused
-/// (a manual rename wins forever, unknown id, empty title).
+/// The apply seam: guarded title + tags application — in production the
+/// registry `UpgradeAutoTitle` ask (guard: `title_source = 'auto'` AND
+/// `tags_source = 'auto'`, utility-tags plan §3.5), injected exactly like
+/// the turn runner so this module never depends on the registry
+/// (dependency direction stays registry → session, and the session actor
+/// never blocks on an ask). `Error` when the guard refused (a manual
+/// rename or a manual tag edit wins forever, unknown id, empty title).
+/// The title argument is line 1 of the utility reply; the tags argument
+/// is the parsed, normalized, corpus-capped line 2 (zero tags when the
+/// reply had none — best-effort).
 pub type UtilityApply =
-  fn(String) -> Result(UtilityMeta, Nil)
+  fn(String, List(String)) -> Result(UtilityMeta, Nil)
 
 /// What a completed utility attempt reports to the actor.
 pub type UtilityResult {
@@ -160,16 +164,27 @@ pub type UtilityResult {
   UtilityFailed
 }
 
-/// The real utility runner (utility-titles plan §4.2), built ONCE at boot
-/// beside `agent_runner`: closes over the shared frozen envelope
-/// (`loop.frozen_options` — byte-identical to every turn request by
-/// construction), so the only per-call delta is the generation-side token
-/// cap applied inside `utility.run`. `specs` is the same boot-frozen tool
-/// registry the agent loop uses — never a per-session set.
-pub fn utility_runner(specs: List(tools.ToolSpec)) -> UtilityRunner {
+/// The real utility runner (utility-titles plan §4.2, extended by the
+/// utility-tags plan §3.3), built ONCE at boot beside `agent_runner`:
+/// closes over the shared frozen envelope (`loop.frozen_options` —
+/// byte-identical to every turn request by construction), so the only
+/// per-call delta is the generation-side token cap applied inside
+/// `utility.run`. `specs` is the same boot-frozen tool registry the agent
+/// loop uses — never a per-session set.
+///
+/// `corpus` supplies the reuse vocabulary for the instruction (Y): a
+/// closure asked from INSIDE the utility worker right before the one
+/// request — in production the registry's `TagCorpus` ask over its
+/// registered name, exactly the `utility_apply_for` ask pattern. Y is the
+/// tail message (generation-side, never committed), so a dynamic corpus
+/// cannot touch the cached prefix.
+pub fn utility_runner(
+  specs: List(tools.ToolSpec),
+  corpus: fn() -> List(String),
+) -> UtilityRunner {
   let base = loop.frozen_options(specs)
   fn(endpoint, tr, cancel, allow_pass) {
-    utility.run(endpoint, tr, base, cancel, allow_pass)
+    utility.run(endpoint, tr, base, cancel, allow_pass, corpus())
   }
 }
 
@@ -205,8 +220,9 @@ pub type SendResult {
 /// - `utility_runner` performs the one side-call (title branch) over a
 ///   committed transcript snapshot; the real one is `utility_runner`
 ///   below, tests inject fakes.
-/// - `utility_apply` lands the parsed title behind the registry's
-///   `title_source = 'auto'` guard (a manual rename wins forever).
+/// - `utility_apply` lands the parsed title + tags behind the registry's
+///   provenance guards (`title_source` AND `tags_source` both 'auto'; a
+///   manual rename or manual tag edit wins forever).
 pub type SessionSpec {
   SessionSpec(
     cfg: Config,
@@ -253,6 +269,18 @@ pub type MetricSample {
 pub type TitleSource {
   AutoTitle
   ManualTitle
+}
+
+/// How a session's tag set is governed (utility-tags plan §3.4):
+/// `AutoTags` — model tags may still merge into the display set;
+/// `ManualTags` — a manual tag edit froze the set forever (the guard IS
+/// the tombstone: a user-deleted auto tag can never resurrect). Mirrors
+/// `tags_source` in the schema ('auto' | 'manual'). Organizational
+/// metadata beside the transcript; the UI-facing `SessionSummary`
+/// deliberately does not carry it — chips are provenance-indistinguishable.
+pub type TagsSource {
+  AutoTags
+  ManualTags
 }
 
 /// What a session reports about itself; the registry fills in the
@@ -916,8 +944,8 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
                     True -> UtilityPassed
                     False -> UtilityFailed
                   }
-                Ok(utility.Title(title)) ->
-                  case state.utility_apply(title) {
+                Ok(utility.Title(title, tags)) ->
+                  case state.utility_apply(title, tags) {
                     Ok(meta) -> UtilityApplied(meta.title, meta.tags)
                     Error(Nil) -> UtilityFailed
                   }

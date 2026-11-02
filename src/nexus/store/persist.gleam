@@ -274,9 +274,6 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
         Ok(pog.Returned(_, rows)) ->
           case rows {
             [row] ->
-              // `tags_manual` / `tags_source` ride the row until the
-              // StoredSummary widening (utility-tags plan §3.5, P3):
-              // the seam type does not carry them yet.
               Ok(store.StoredSession(
                 summary: store.StoredSummary(
                   id: row.id,
@@ -287,6 +284,8 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
                   pinned: row.pinned,
                   archived: row.archived,
                   tags: row.tags,
+                  tags_manual: row.tags_manual,
+                  tags_source: tags_source(row.tags_source),
                   created_at: row.created_s,
                   last_active_at: row.last_active_s,
                   // The column already counts the system prompt
@@ -688,9 +687,6 @@ fn query_error(error: pog.QueryError) -> String {
 }
 
 fn stored_summary_from_row(row: sql.ListSummariesRow) -> store.StoredSummary {
-  // `tags_manual` / `tags_source` ride the row until the StoredSummary
-  // widening (utility-tags plan §3.5, P3): the seam type does not carry
-  // them yet.
   store.StoredSummary(
     id: row.id,
     provider_id: row.provider_id,
@@ -700,6 +696,8 @@ fn stored_summary_from_row(row: sql.ListSummariesRow) -> store.StoredSummary {
     pinned: row.pinned,
     archived: row.archived,
     tags: row.tags,
+    tags_manual: row.tags_manual,
+    tags_source: tags_source(row.tags_source),
     created_at: row.created_s,
     last_active_at: row.last_active_s,
     // The column already counts the system prompt (Phase 1 semantics).
@@ -787,5 +785,17 @@ fn title_source_text(source: session.TitleSource) -> String {
   case source {
     session.ManualTitle -> "manual"
     session.AutoTitle -> "auto"
+  }
+}
+
+/// `session.tags_source` ⇄ the schema's text values ('auto' | 'manual',
+/// mirroring `title_source`). The column is written exclusively as the
+/// DEFAULT 'auto' (insert) or 'manual' (`set_tags.sql`); anything
+/// unexpected reads as `AutoTags` — the same defensive default as
+/// `title_source`.
+fn tags_source(text: String) -> session.TagsSource {
+  case text {
+    "manual" -> session.ManualTags
+    _ -> session.AutoTags
   }
 }

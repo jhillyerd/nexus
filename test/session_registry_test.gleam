@@ -605,6 +605,8 @@ fn seed_at(
         pinned: pinned,
         archived: archived,
         tags: [],
+        tags_manual: [],
+        tags_source: session.AutoTags,
         created_at: last_active_at,
         last_active_at: last_active_at,
         message_count: message_count,
