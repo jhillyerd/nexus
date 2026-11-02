@@ -56,9 +56,10 @@ pub type Msg {
   Commit(id: String, transcript: Transcript)
   SetTitle(id: String, title: String, reply: Subject(Result(Nil, String)))
   AutoTitle(id: String, title: String, reply: Subject(Result(Bool, String)))
-  AutoTitleUpgrade(
+  AutoMetaUpgrade(
     id: String,
     title: String,
+    tags: List(String),
     reply: Subject(Result(Bool, String)),
   )
   SetTags(id: String, tags: List(String), reply: Subject(Result(Nil, String)))
@@ -192,9 +193,9 @@ pub fn seam(store_actor: Subject(Msg)) -> store.Store {
         AutoTitle(id, title, reply)
       })
     },
-    auto_title_upgrade: fn(id, title) {
+    auto_meta_upgrade: fn(id, title, tags) {
       actor.call(store_actor, call_timeout_ms, fn(reply) {
-        AutoTitleUpgrade(id, title, reply)
+        AutoMetaUpgrade(id, title, tags, reply)
       })
     },
     set_tags: fn(id, tags) {
@@ -273,6 +274,9 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
         Ok(pog.Returned(_, rows)) ->
           case rows {
             [row] ->
+              // `tags_manual` / `tags_source` ride the row until the
+              // StoredSummary widening (utility-tags plan §3.5, P3):
+              // the seam type does not carry them yet.
               Ok(store.StoredSession(
                 summary: store.StoredSummary(
                   id: row.id,
@@ -379,12 +383,13 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       actor.continue(state)
     }
 
-    AutoTitleUpgrade(id, title, reply) -> {
-      // Same guard semantics as the registry's UpgradeAutoTitle: provenance
-      // only — the SQL refuses a manual title, and the affected-row count
-      // says whether it applied.
+    AutoMetaUpgrade(id, title, tags, reply) -> {
+      // Same guard semantics as the registry's UpgradeAutoTitle:
+      // provenance only, on both columns — the SQL refuses a manual title
+      // OR a manual tag set, and the affected-row count says whether it
+      // applied.
       let result =
-        sql.auto_title_upgrade(state.db, title, id)
+        sql.auto_meta_upgrade(state.db, title, id, tags)
         |> result.map(fn(returned) { returned.count > 0 })
         |> result.map_error(query_error)
       process.send(reply, result)
@@ -683,6 +688,9 @@ fn query_error(error: pog.QueryError) -> String {
 }
 
 fn stored_summary_from_row(row: sql.ListSummariesRow) -> store.StoredSummary {
+  // `tags_manual` / `tags_source` ride the row until the StoredSummary
+  // widening (utility-tags plan §3.5, P3): the seam type does not carry
+  // them yet.
   store.StoredSummary(
     id: row.id,
     provider_id: row.provider_id,

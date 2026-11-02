@@ -699,6 +699,13 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
       // title). Unlike AutoTitle there is no empty-title precondition: an
       // auto title may be REPLACED. The outcome carries the fresh metadata
       // so the caller can broadcast it.
+      //
+      // P2 of utility-tags: the store call is the widened
+      // `auto_meta_upgrade` (title AND display tags, guarded by BOTH
+      // provenance columns); the merge that would compute new model tags
+      // is P3, so the session's EXISTING display tags pass through
+      // unchanged — the row's tags are rewritten as what memory already
+      // holds.
       let title = string.trim(title)
       let #(state, outcome) = case title {
         "" -> #(state, UpgradeRefused)
@@ -713,7 +720,8 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
                   // leave the in-memory record untouched. An unreachable
                   // store keeps the documented degrade mode: log, and
                   // keep the in-memory write so the UI stays consistent.
-                  case state.store.auto_title_upgrade(id, title) {
+                  // Tags pass through unchanged (P2; see above).
+                  case state.store.auto_meta_upgrade(id, title, record.tags) {
                     Ok(True) -> #(
                       State(
                         ..state,
@@ -750,7 +758,9 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
                     session.AutoTitle ->
                       // Same twin-invariant: the stored row is a dormant
                       // session's ONLY state, so its refusal is final.
-                      case state.store.auto_title_upgrade(id, title) {
+                      case
+                        state.store.auto_meta_upgrade(id, title, summary.tags)
+                      {
                         Ok(True) -> #(
                           State(
                             ..state,

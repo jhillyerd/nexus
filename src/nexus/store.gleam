@@ -158,12 +158,18 @@ pub type Store {
     /// Guarded like the registry: applies only while the stored title is
     /// the untouched auto default. `Ok(True)` when it applied.
     auto_title: fn(String, String) -> Result(Bool, StoreError),
-    /// Guarded by provenance ONLY (utility-titles plan §4.4): replaces the
-    /// stored title while `title_source = 'auto'` — the model title may
-    /// upgrade the heuristic placeholder; a manual rename wins forever.
-    /// Twin of the registry's UpgradeAutoTitle in-memory guard.
-    /// `Ok(True)` when it applied.
-    auto_title_upgrade: fn(String, String) -> Result(Bool, StoreError),
+    /// Guarded by provenance ONLY on BOTH sides (utility-tags plan §3.6):
+    /// replaces the stored title AND display tags in one statement while
+    /// `title_source = 'auto'` and `tags_source = 'auto'` — the model title
+    /// may upgrade the heuristic placeholder; a manual rename or a manual
+    /// tag edit each close their side forever, atomically. Twin of the
+    /// registry's UpgradeAutoTitle in-memory guard. `Ok(True)` when it
+    /// applied.
+    auto_meta_upgrade: fn(String, String, List(String)) ->
+      Result(Bool, StoreError),
+    /// The manual tags save: one atomic triple-write of the display set,
+    /// the manual set, and `tags_source = 'manual'` (utility-tags plan
+    /// §3.5) — the freeze closes the row's auto-tag path forever.
     set_tags: fn(String, List(String)) -> Result(Nil, StoreError),
     set_pinned: fn(String, Bool) -> Result(Nil, StoreError),
     /// Archiving clears the pin (Phase 1 invariant, enforced in SQL too).

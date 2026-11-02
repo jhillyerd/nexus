@@ -713,8 +713,10 @@ pub fn tool_call_reasoning_rides_first_row_of_run_test() {
 }
 
 // ---------------------------------------------------------------------------
-// Utility-titles P3: auto_title_upgrade guard semantics (plan §4.4/§6) —
-// the store-side twin of the registry's UpgradeAutoTitle guard.
+// Utility-titles/tags: auto_meta_upgrade guard semantics (utility-titles
+// plan §4.4, utility-tags plan §3.6) — the store-side twin of the
+// registry's UpgradeAutoTitle guard. The title-side refusal is pinned
+// here; the tags-side (refused after a manual tag save) is P4 coverage.
 // ---------------------------------------------------------------------------
 
 /// A stored summary like the heuristic title leaves behind: still
@@ -730,19 +732,19 @@ fn auto_stored(id: String, title: String) -> store.StoredSummary {
 /// `title_source = 'auto'`: the upgrade APPLIES and REPLACES — first the
 /// heuristic placeholder, then even a previously upgraded title (the
 /// guard is provenance only, never "empty title only").
-pub fn auto_title_upgrade_replaces_auto_title_test() {
+pub fn auto_meta_upgrade_replaces_auto_title_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
   store_mock.ensure_fixture_provider(seam)
   let assert Ok(_) = seam.insert_session(auto_stored("s1", "heuristic"), "sys")
 
-  should.equal(seam.auto_title_upgrade("s1", "Model Title"), Ok(True))
+  should.equal(seam.auto_meta_upgrade("s1", "Model Title", []), Ok(True))
   let assert Ok(stored) = seam.get_session("s1")
   should.equal(stored.summary.title, "Model Title")
   should.equal(stored.summary.title_source, session.AutoTitle)
 
   // An upgraded title is still auto-generated: it may be replaced again.
-  should.equal(seam.auto_title_upgrade("s1", "Better Title"), Ok(True))
+  should.equal(seam.auto_meta_upgrade("s1", "Better Title", []), Ok(True))
   let assert Ok(stored) = seam.get_session("s1")
   should.equal(stored.summary.title, "Better Title")
 }
@@ -750,19 +752,19 @@ pub fn auto_title_upgrade_replaces_auto_title_test() {
 /// `title_source = 'manual'`: the upgrade is REFUSED and replies False —
 /// a rename wins forever, in the store exactly as in memory. An unknown
 /// id is an error, like the real store.
-pub fn auto_title_upgrade_refuses_manual_title_test() {
+pub fn auto_meta_upgrade_refuses_manual_title_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
   store_mock.ensure_fixture_provider(seam)
   let assert Ok(_) = seam.insert_session(auto_stored("s2", "heuristic"), "sys")
 
   should.equal(seam.set_title("s2", "renamed"), Ok(Nil))
-  should.equal(seam.auto_title_upgrade("s2", "Sneaky"), Ok(False))
+  should.equal(seam.auto_meta_upgrade("s2", "Sneaky", []), Ok(False))
   let assert Ok(stored) = seam.get_session("s2")
   should.equal(stored.summary.title, "renamed")
   should.equal(stored.summary.title_source, session.ManualTitle)
 
-  should.be_error(seam.auto_title_upgrade("nope", "X"))
+  should.be_error(seam.auto_meta_upgrade("nope", "X", []))
 }
 
 /// The registry's UpgradeAutoTitle — what the utility worker's apply step
@@ -799,11 +801,11 @@ pub fn upgrade_auto_title_writes_through_and_survives_restart_test() {
     store_mock.events(mock)
       |> list.filter(fn(event) {
         case event {
-          store_mock.EvAutoTitleUpgrade(id, _title) -> id == record.id
+          store_mock.EvAutoMetaUpgrade(id, _title, _tags) -> id == record.id
           _ -> False
         }
       }),
-    [store_mock.EvAutoTitleUpgrade(record.id, "Model Title")],
+    [store_mock.EvAutoMetaUpgrade(record.id, "Model Title", [])],
   )
 
   // A manual rename wins forever: refused, and the store is never asked.
@@ -820,7 +822,7 @@ pub fn upgrade_auto_title_writes_through_and_survives_restart_test() {
     store_mock.events(mock)
       |> list.filter(fn(event) {
         case event {
-          store_mock.EvAutoTitleUpgrade(_, "Sneaky") -> True
+          store_mock.EvAutoMetaUpgrade(_, "Sneaky", _) -> True
           _ -> False
         }
       }),
@@ -877,7 +879,7 @@ pub fn upgrade_auto_title_honors_store_refusal_test() {
     store_mock.events(mock)
       |> list.filter(fn(event) {
         case event {
-          store_mock.EvAutoTitleUpgrade(_, _) -> True
+          store_mock.EvAutoMetaUpgrade(_, _, _) -> True
           _ -> False
         }
       }),
