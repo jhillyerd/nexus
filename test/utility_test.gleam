@@ -302,8 +302,51 @@ pub fn utility_request_is_deterministic_test() {
   let tr = first_exchange()
   let opts = utility.options(loop_options())
   transcript.request_body(utility.prepare(tr, True, []), opts)
-  |> should.equal(
-    transcript.request_body(utility.prepare(tr, True, []), opts),
+  |> should.equal(transcript.request_body(utility.prepare(tr, True, []), opts))
+}
+
+/// The corpus makes Y LONGER (utility-tags plan §4/§5): re-run the
+/// request-body assertion with a corpus-carrying instruction — the
+/// branch is still messages-suffix-only over the turn body, and the
+/// envelope still differs by exactly `max_completion_tokens`. The
+/// corpus is tail-message content (generation-side, never committed),
+/// so the longer Y cannot touch the cached prefix — this pins that by
+/// construction, not by wording.
+pub fn utility_branch_with_corpus_is_messages_suffix_only_test() {
+  let tr = first_exchange()
+  let base = loop_options()
+  let corpus = ["cache", "login", "auth", "work-notes", "kv-reuse"]
+  let branch_body =
+    transcript.request_body(
+      utility.prepare(tr, True, corpus),
+      utility.options(base),
+    )
+
+  // Messages: the turn body plus exactly ONE appended user message —
+  // the corpus-carrying instruction, and nothing else moved.
+  let #(base_messages, base_envelope) =
+    body_parts(transcript.request_body(tr, base))
+  let #(branch_messages, branch_envelope) = body_parts(branch_body)
+  let prefix = string.drop_end(base_messages, 1)
+  should.be_true(string.starts_with(branch_messages, prefix))
+  should.equal(
+    string.drop_start(branch_messages, string.length(prefix)),
+    ",{\"role\":\"user\",\"content\":"
+      <> json.to_string(json.string(utility.instruction(True, corpus)))
+      <> "}]",
+  )
+
+  // Envelope: exactly ONE delta — the generation-side token cap. Strip
+  // its field and the turn envelope returns byte-for-byte; the Options
+  // record differs by exactly that field.
+  let assert Ok(#(before_cap, cap_rest)) =
+    string.split_once(branch_envelope, ",\"max_completion_tokens\":")
+  let assert Ok(#(cap_text, after_cap)) = string.split_once(cap_rest, ",")
+  let assert Ok(cap) = int.parse(cap_text)
+  should.equal(before_cap <> "," <> after_cap, base_envelope)
+  should.equal(
+    utility.options(base),
+    transcript.Options(..base, max_completion_tokens: Some(cap)),
   )
 }
 
@@ -333,15 +376,31 @@ pub fn parse_two_line_reply_test() {
   // With an empty corpus every tag is NEW, so the structural K cap keeps
   // only the first two — the third ("auth") is dropped, in reply order.
   utility.parse(True, [], "Fix login redirect loop\nlogin, bug, auth")
-  |> should.equal(Ok(utility.Title("Fix login redirect loop", [
-    "login", "bug",
-  ])))
+  |> should.equal(
+    Ok(utility.Title("Fix login redirect loop", ["login", "bug"])),
+  )
   // Line 1 collapses internal whitespace runs; CRLF is a line break, and
   // the tags line's internal whitespace collapses to kebab-case.
   utility.parse(True, [], "KV  Reuse\r\nand\tWarming")
   |> should.equal(Ok(utility.Title("KV Reuse", ["and-warming"])))
   // A trailing newline is not a tags line: the title still applies.
   utility.parse(True, [], "Title Only\n")
+  |> should.equal(Ok(utility.Title("Title Only", [])))
+}
+
+/// Tags are best-effort (§3.1): a title-only reply (no line 2 at all),
+/// an EMPTY tags line, or a malformed one all mean zero tags — and the
+/// title still applies in every case.
+pub fn parse_title_only_reply_and_empty_tags_line_test() {
+  utility.parse(True, [], "Just a title")
+  |> should.equal(Ok(utility.Title("Just a title", [])))
+  // Trailing blank lines are not tags lines either.
+  utility.parse(True, [], "Title Only\n   \n")
+  |> should.equal(Ok(utility.Title("Title Only", [])))
+  // An explicit but empty tags line: commas only, or a bare label.
+  utility.parse(True, [], "Title Only\n, ,")
+  |> should.equal(Ok(utility.Title("Title Only", [])))
+  utility.parse(True, [], "Title Only\nTags:")
   |> should.equal(Ok(utility.Title("Title Only", [])))
 }
 
@@ -358,6 +417,29 @@ pub fn parse_strips_leading_labels_test() {
   // No colon, no strip: "Titleist" is a word, not a label.
   utility.parse(True, [], "Titleist Golf Clubs")
   |> should.equal(Ok(utility.Title("Titleist Golf Clubs", [])))
+}
+
+/// The structural K cap (§3.1): at most `max_new_tags` (2) tags ABSENT
+/// from the supplied corpus survive, in reply order — and corpus tags
+/// are reuse, not growth: they survive freely beside the allowance,
+/// wherever they sit in the reply.
+pub fn parse_caps_new_tags_at_two_corpus_reuse_free_test() {
+  // Empty corpus: every tag is new — only the first two survive.
+  utility.parse(True, [], "Wide Fix\nalpha, beta, gamma, delta")
+  |> should.equal(Ok(utility.Title("Wide Fix", ["alpha", "beta"])))
+  // Pure reuse: corpus members never count against the allowance.
+  utility.parse(True, ["cache", "retry"], "Wide Fix\ncache, retry")
+  |> should.equal(Ok(utility.Title("Wide Fix", ["cache", "retry"])))
+  // …so the two new slots keep their places beside any number of
+  // reuses; the third new tag ("new-three") is the one dropped.
+  utility.parse(
+    True,
+    ["cache", "retry"],
+    "Wide Fix\nnew-one, cache, new-two, retry, new-three",
+  )
+  |> should.equal(
+    Ok(utility.Title("Wide Fix", ["new-one", "cache", "new-two", "retry"])),
+  )
 }
 
 /// The PASS postpone sentinel (utility-titles §4.2): a whole-reply PASS —
@@ -409,6 +491,25 @@ pub fn parse_passes_hostile_payload_inert_and_capped_test() {
   should.equal(capped, string.slice(flood, 0, 60) <> "…")
 }
 
+/// Hostile model output on the TAGS line too (§5): every tag passes
+/// through INERT — normalized data (lowercase, kebab-case, 24-char cap),
+/// never markup — exactly like titles. What the UI renders is a Lustre
+/// text node; these are plain strings by the time they leave the parser.
+pub fn parse_passes_hostile_tag_payloads_inert_and_normalized_test() {
+  // Short payloads pass through whole, lowercased, whitespace kebab'd:
+  // inert data.
+  utility.parse(True, [], "Fix login\n<SCRIPT>x</SCRIPT>, <img src=q>")
+  |> should.equal(
+    Ok(utility.Title("Fix login", ["<script>x</script>", "<img-src=q>"])),
+  )
+  // A longer payload hits the same 24-character cap as any tag —
+  // truncated as data, never into executable markup.
+  let long = "<script>alert('xss')</script>"
+  let assert Ok(utility.Title(_, [tag, ..])) =
+    utility.parse(True, [], "Fix login\n" <> long)
+  should.equal(tag, string.slice(string.lowercase(long), 0, 24))
+}
+
 pub fn parse_rejects_empty_and_refusal_test() {
   // A refusal arrives as no content — the same empty reply.
   utility.parse(True, [], "") |> should.equal(Error(Nil))
@@ -427,6 +528,51 @@ pub fn shape_title_caps_at_sixty_chars_test() {
   let long = string.repeat("x", 80)
   utility.shape_title(long)
   |> should.equal(string.repeat("x", 60) <> "…")
+}
+
+/// Per-tag 24-character truncation (§3.1 — the other half of the
+/// 30 × 24 corpus embedding bound): internal whitespace collapses to
+/// kebab-case BEFORE the cap bites, and the cap has no ellipsis — a tag
+/// is filtering vocabulary, not display prose.
+pub fn parse_truncates_each_tag_at_twenty_four_chars_test() {
+  let thirty = string.repeat("a", 30)
+  utility.parse_tags([], thirty <> ", ok")
+  |> should.equal([string.repeat("a", 24), "ok"])
+  // Kebab collapse first: the 27-char kebab string truncates to 24.
+  utility.parse_tags([], "aaa bbb ccc ddd eee fff ggg")
+  |> should.equal(["aaa-bbb-ccc-ddd-eee-fff-"])
+  // Through the whole reply too (line 2 of the protocol).
+  let assert Ok(utility.Title(_, tags)) =
+    utility.parse(True, [], "Wide Fix\n" <> thirty)
+  should.equal(tags, [string.repeat("a", 24)])
+}
+
+/// The union the registry applies (`UpgradeAutoTitle` → `merge_tags`,
+/// §3.5): existing display entries keep their order VERBATIM, the
+/// attempt's tags append normalized after them, duplicates through the
+/// SHARED normalization never append, and the union caps at 5 per
+/// session.
+pub fn merge_tags_unions_preserve_order_verbatim_and_cap_test() {
+  utility.merge_tags([], ["login", "auth"])
+  |> should.equal(["login", "auth"])
+  // Existing order first; new tags append in reply order.
+  utility.merge_tags(["work", "notes"], ["notes", "login", "auth"])
+  |> should.equal(["work", "notes", "login", "auth"])
+  // Cap at 5: the union truncates past the fifth entry.
+  utility.merge_tags(["work", "notes"], [
+    "login", "auth", "cache", "ops", "extra",
+  ])
+  |> should.equal(["work", "notes", "login", "auth", "cache"])
+  // A legacy spelling never re-canonicalizes in the display set — and
+  // never duplicates its canonical twin: the presence check compares
+  // through the same kebab normalization (the §5 union test caught the
+  // bare-lowercase version of this check duplicating `Work Notes` as
+  // `work-notes`).
+  utility.merge_tags(["Work Notes"], ["work-notes", "WORK NOTES", "login"])
+  |> should.equal(["Work Notes", "login"])
+  // New tags normalize before joining the union.
+  utility.merge_tags(["work"], ["Login Page "])
+  |> should.equal(["work", "login-page"])
 }
 
 // ---------------------------------------------------------------------------
@@ -451,14 +597,58 @@ pub fn instruction_forbids_tool_calls_test() {
 /// instruction must not mention the sentinel at all, so a model that
 /// never saw the option cannot be steered into it.
 pub fn instruction_pass_escape_hatch_variant_test() {
-  should.be_true(string.contains(
-    utility.instruction(True, []),
-    "exactly PASS",
-  ))
+  should.be_true(string.contains(utility.instruction(True, []), "exactly PASS"))
   should.be_false(string.contains(
     string.lowercase(utility.instruction(False, [])),
     "pass",
   ))
+}
+
+/// BOTH variants ask for the two-line reply (utility-tags plan §3.2):
+/// line 1 the title, line 2 the comma-separated tag list.
+pub fn instruction_asks_for_the_two_line_form_test() {
+  [True, False]
+  |> list.each(fn(allow_pass) {
+    let y = utility.instruction(allow_pass, [])
+    should.be_true(string.contains(y, "exactly two lines"))
+    should.be_true(string.contains(y, "Line 1"))
+    should.be_true(string.contains(y, "Line 2"))
+    should.be_true(string.contains(y, "comma-separated"))
+  })
+}
+
+/// The reuse corpus rides Y only when non-empty (§3.2): listed
+/// (comma-joined) with the new-tag allowance when present, entirely
+/// absent when empty — in BOTH variants. Y is the tail message,
+/// generation-side, so the dynamic wording cannot touch the cached
+/// prefix.
+pub fn instruction_lists_corpus_only_when_non_empty_test() {
+  let listed = utility.instruction(True, ["cache", "login", "auth"])
+  should.be_true(string.contains(
+    listed,
+    "Prefer reusing a tag from this list when one fits: cache, login, auth",
+  ))
+  should.be_true(string.contains(listed, "at most 2 new tags"))
+  // The forced variant carries the corpus too.
+  should.be_true(string.contains(
+    utility.instruction(False, ["cache"]),
+    "one fits: cache",
+  ))
+  // Empty corpus: no reuse clause at all.
+  should.be_false(string.contains(
+    utility.instruction(True, []),
+    "Prefer reusing",
+  ))
+  should.be_false(string.contains(
+    utility.instruction(False, []),
+    "at most 2 new tags",
+  ))
+  // And a corpus makes Y strictly longer — the premise of the
+  // corpus-carrying prefix property above.
+  should.be_true(
+    string.length(utility.instruction(True, ["cache"]))
+    > string.length(utility.instruction(True, [])),
+  )
 }
 
 pub fn prepare_appends_exactly_one_user_message_test() {

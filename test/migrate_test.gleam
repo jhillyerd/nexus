@@ -161,3 +161,78 @@ pub fn uescape_string_test() {
   migrate.statements("select U&'d\\0061t\\'s;ok';select 2;")
   |> should.equal(["select U&'d\\0061t\\'s;ok'", "select 2"])
 }
+
+/// The utility-tags schema shape (§3.4): the two provenance columns
+/// land in ONE `do $$ … $$` block whose `pg_attribute` existence checks
+/// make re-runs no-ops. This is the exact statement shape of
+/// `sql/schema.sql` — single-quoted literals (`'session'`, `'{}'`,
+/// `'auto'`), `::regclass` casts, `text[]` defaults, nested `if not
+/// exists` — and it must survive the splitter as ONE statement so the
+/// inner `;` never split it.
+pub fn tags_provenance_do_block_is_one_statement_test() {
+  migrate.statements(
+    "do $$
+begin
+  if not exists (
+    select 1 from pg_attribute
+    where attrelid = 'session'::regclass
+      and attname = 'tags_manual'
+      and not attisdropped
+  ) then
+    alter table session add column tags_manual text[] not null default '{}';
+    update session set tags_manual = tags;
+  end if;
+  if not exists (
+    select 1 from pg_attribute
+    where attrelid = 'session'::regclass
+      and attname = 'tags_source'
+      and not attisdropped
+  ) then
+    alter table session add column tags_source text not null default 'auto';
+    update session set tags_source = 'manual';
+  end if;
+end
+$$;
+select 2;",
+  )
+  |> should.equal([
+    "do $$
+begin
+  if not exists (
+    select 1 from pg_attribute
+    where attrelid = 'session'::regclass
+      and attname = 'tags_manual'
+      and not attisdropped
+  ) then
+    alter table session add column tags_manual text[] not null default '{}';
+    update session set tags_manual = tags;
+  end if;
+  if not exists (
+    select 1 from pg_attribute
+    where attrelid = 'session'::regclass
+      and attname = 'tags_source'
+      and not attisdropped
+  ) then
+    alter table session add column tags_source text not null default 'auto';
+    update session set tags_source = 'manual';
+  end if;
+end
+$$",
+    "select 2",
+  ])
+}
+
+/// …and the one trap that shape adds beyond the existing `$$` coverage:
+/// a `;` inside a single-quoted literal INSIDE a dollar-quoted body (a
+/// future column default like `';'::text`, say) must stay inside the
+/// statement — quote tracking inside `$$` may not flip on the inner
+/// quotes.
+pub fn semicolon_in_literal_inside_dollar_quote_test() {
+  migrate.statements(
+    "do $$ begin alter table t add c text default 'a;b'; end $$;select 2;",
+  )
+  |> should.equal([
+    "do $$ begin alter table t add c text default 'a;b'; end $$",
+    "select 2",
+  ])
+}

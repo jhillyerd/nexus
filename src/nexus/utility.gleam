@@ -206,13 +206,12 @@ pub fn parse(
           case shape_title(strip_label("title:", title_line)) {
             "" -> Error(Nil)
             title ->
-              Ok(Title(
-                title: title,
-                tags: case rest {
+              Ok(
+                Title(title: title, tags: case rest {
                   [tags_line, ..] -> parse_tags(corpus, tags_line)
                   [] -> []
-                },
-              ))
+                }),
+              )
           }
       }
   }
@@ -313,18 +312,23 @@ fn normalize_tag(tag: String) -> String {
 /// legacy `Work Notes` stays `Work Notes`, so display − manual
 /// bookkeeping cannot manufacture a phantom auto tag); new model tags
 /// are normalized and appended when not already present (the presence
-/// check is case-insensitive, so `Work Notes` and `work-notes` do not
-/// duplicate); the union preserves existing order, appends the new, then
-/// truncates at `tags_per_session`.
+/// check compares through the SAME normalization — the kebab shape —
+/// not bare lowercasing, so `Work Notes` and `work-notes` are one tag
+/// and do not duplicate); the union preserves existing order, appends
+/// the new, then truncates at `tags_per_session`.
 pub fn merge_tags(existing: List(String), new: List(String)) -> List(String) {
+  // The presence key is the full shared normalization (`normalize_tag`,
+  // below) — never the raw display spelling: only the comparison is
+  // canonicalized, so verbatim passthrough and no-duplicates hold
+  // together. New tags arrive already normalized, so they are their own
+  // keys.
   let #(appended, _present) =
     normalize_tags(new)
-    |> list.fold(#([], list.map(existing, string.lowercase)), fn(acc, tag) {
+    |> list.fold(#([], list.map(existing, normalize_tag)), fn(acc, tag) {
       let #(appended, present) = acc
-      let key = string.lowercase(tag)
-      case list.contains(present, key) {
+      case list.contains(present, tag) {
         True -> acc
-        False -> #([tag, ..appended], [key, ..present])
+        False -> #([tag, ..appended], [tag, ..present])
       }
     })
   // Existing entries keep their order VERBATIM; the appended arrive in
