@@ -56,9 +56,10 @@ pub type Msg {
   Commit(id: String, transcript: Transcript)
   SetTitle(id: String, title: String, reply: Subject(Result(Nil, String)))
   AutoTitle(id: String, title: String, reply: Subject(Result(Bool, String)))
-  AutoTitleUpgrade(
+  AutoMetaUpgrade(
     id: String,
     title: String,
+    tags: List(String),
     reply: Subject(Result(Bool, String)),
   )
   SetTags(id: String, tags: List(String), reply: Subject(Result(Nil, String)))
@@ -192,9 +193,9 @@ pub fn seam(store_actor: Subject(Msg)) -> store.Store {
         AutoTitle(id, title, reply)
       })
     },
-    auto_title_upgrade: fn(id, title) {
+    auto_meta_upgrade: fn(id, title, tags) {
       actor.call(store_actor, call_timeout_ms, fn(reply) {
-        AutoTitleUpgrade(id, title, reply)
+        AutoMetaUpgrade(id, title, tags, reply)
       })
     },
     set_tags: fn(id, tags) {
@@ -283,6 +284,8 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
                   pinned: row.pinned,
                   archived: row.archived,
                   tags: row.tags,
+                  tags_manual: row.tags_manual,
+                  tags_source: tags_source(row.tags_source),
                   created_at: row.created_s,
                   last_active_at: row.last_active_s,
                   // The column already counts the system prompt
@@ -379,12 +382,13 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       actor.continue(state)
     }
 
-    AutoTitleUpgrade(id, title, reply) -> {
-      // Same guard semantics as the registry's UpgradeAutoTitle: provenance
-      // only — the SQL refuses a manual title, and the affected-row count
-      // says whether it applied.
+    AutoMetaUpgrade(id, title, tags, reply) -> {
+      // Same guard semantics as the registry's UpgradeAutoTitle:
+      // provenance only, on both columns — the SQL refuses a manual title
+      // OR a manual tag set, and the affected-row count says whether it
+      // applied.
       let result =
-        sql.auto_title_upgrade(state.db, title, id)
+        sql.auto_meta_upgrade(state.db, title, id, tags)
         |> result.map(fn(returned) { returned.count > 0 })
         |> result.map_error(query_error)
       process.send(reply, result)
@@ -692,6 +696,8 @@ fn stored_summary_from_row(row: sql.ListSummariesRow) -> store.StoredSummary {
     pinned: row.pinned,
     archived: row.archived,
     tags: row.tags,
+    tags_manual: row.tags_manual,
+    tags_source: tags_source(row.tags_source),
     created_at: row.created_s,
     last_active_at: row.last_active_s,
     // The column already counts the system prompt (Phase 1 semantics).
@@ -779,5 +785,17 @@ fn title_source_text(source: session.TitleSource) -> String {
   case source {
     session.ManualTitle -> "manual"
     session.AutoTitle -> "auto"
+  }
+}
+
+/// `session.tags_source` ⇄ the schema's text values ('auto' | 'manual',
+/// mirroring `title_source`). The column is written exclusively as the
+/// DEFAULT 'auto' (insert) or 'manual' (`set_tags.sql`); anything
+/// unexpected reads as `AutoTags` — the same defensive default as
+/// `title_source`.
+fn tags_source(text: String) -> session.TagsSource {
+  case text {
+    "manual" -> session.ManualTags
+    _ -> session.AutoTags
   }
 }

@@ -1786,6 +1786,36 @@ pub fn view_escapes_hostile_title_test() {
   should_contain(html, "&lt;script&gt;alert(1)&lt;/script&gt;")
 }
 
+/// A model-generated TAG is hostile model output too (utility-tags
+/// plan §5): chips render it as a Lustre TEXT node — escaped, inert,
+/// never markup — in both the button label and its `title` attribute.
+/// The `MetaUpdated` payload itself never reaches the DOM at all: the
+/// refresh re-reads the registry, so the summary's tags are what render.
+pub fn view_escapes_hostile_model_tags_in_chips_test() {
+  let hostile =
+    session.SessionSummary(..summary("s-1", False), title: "ok title", tags: [
+      "<script>alert(1)</script>",
+      "work",
+    ])
+  let html =
+    new_model()
+    |> step(ui.SessionsLoaded([hostile]))
+    |> step(
+      ui.MetaUpdated(Some("<b>ignored</b>"), ["<script>payload</script>"]),
+    )
+    |> view_string
+  // The chip payload reaches the DOM as inert data — the full escaped
+  // text, in the label and the escaped `title` attribute both.
+  should_contain(html, "&lt;script&gt;alert(1)&lt;/script&gt;")
+  should_contain(html, "Filter by &lt;script&gt;")
+  should_not_contain(html, "<script>alert")
+  // The MetaUpdated event's own payload never renders anywhere.
+  should_not_contain(html, "ignored")
+  should_not_contain(html, "payload")
+  // A benign chip renders beside the hostile one, unharmed.
+  should_contain(html, "Filter by work")
+}
+
 /// `MetaUpdated` nudges the sidebar through the SAME sessions_effect a
 /// `TurnDone` uses — asserted against a REAL Lustre server-component
 /// runtime over REAL (offline) registries: after the nudge, a reconcile
@@ -1820,6 +1850,9 @@ pub fn meta_updated_refreshes_sidebar_test() {
       fn(_endpoint, _tr, _cancel, _allow_pass) {
         Error("no utility call in this test")
       },
+      // The corpus seam: never asked here (the fake runner refuses), pure
+      // so the boot stays offline.
+      fn() { [] },
       fixture_resolver(),
     )
   let registry = started_registry.data
@@ -1898,6 +1931,9 @@ pub fn connect_with_configured_provider_never_notes_no_provider_test() {
       fn(_endpoint, _tr, _cancel, _allow_pass) {
         Error("no utility call in this test")
       },
+      // The corpus seam: never asked here (the fake runner refuses), pure
+      // so the boot stays offline.
+      fn() { [] },
       fixture_resolver(),
     )
   let registry = started_registry.data

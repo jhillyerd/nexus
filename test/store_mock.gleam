@@ -1,10 +1,11 @@
 //// A fully functional **in-memory** implementation of the `nexus/store`
 //// seam for offline tests: no database, no network, but the real
 //// semantics — idempotent write-behind commits (an unchanged or older
-//// transcript is a no-op), guarded auto-title, archive-clears-pin,
-//// cascade delete, recency bumps. The persistence tests use it as the
-//// "external Postgres" that survives a registry teardown, which makes
-//// the whole hydrate/restart cycle testable inside plain `gleam test`.
+//// transcript is a no-op), guarded auto-title / auto metadata upgrade,
+//// archive-clears-pin, cascade delete, recency bumps. The persistence
+//// tests use it as the "external Postgres" that survives a registry
+//// teardown, which makes the whole hydrate/restart cycle testable
+//// inside plain `gleam test`.
 
 import gleam/dict.{type Dict}
 import gleam/erlang/process.{type Subject}
@@ -24,7 +25,7 @@ pub type Event {
   EvCommit(id: String, messages: Int)
   EvSetTitle(id: String, title: String)
   EvAutoTitle(id: String, title: String)
-  EvAutoTitleUpgrade(id: String, title: String)
+  EvAutoMetaUpgrade(id: String, title: String, tags: List(String))
   EvSetTags(id: String, tags: List(String))
   EvSetPinned(id: String, pinned: Bool)
   EvArchive(id: String)
@@ -56,9 +57,10 @@ pub type MockMsg {
   Commit(id: String, transcript: Transcript)
   SetTitle(id: String, title: String, reply: Subject(Result(Nil, String)))
   AutoTitle(id: String, title: String, reply: Subject(Result(Bool, String)))
-  AutoTitleUpgrade(
+  AutoMetaUpgrade(
     id: String,
     title: String,
+    tags: List(String),
     reply: Subject(Result(Bool, String)),
   )
   SetTags(id: String, tags: List(String), reply: Subject(Result(Nil, String)))
@@ -180,8 +182,8 @@ pub fn seam(mock: Subject(MockMsg)) -> Store {
     auto_title: fn(id, title) {
       call(mock, 5000, fn(r) { AutoTitle(id, title, r) })
     },
-    auto_title_upgrade: fn(id, title) {
-      call(mock, 5000, fn(r) { AutoTitleUpgrade(id, title, r) })
+    auto_meta_upgrade: fn(id, title, tags) {
+      call(mock, 5000, fn(r) { AutoMetaUpgrade(id, title, tags, r) })
     },
     set_tags: fn(id, tags) { call(mock, 5000, fn(r) { SetTags(id, tags, r) }) },
     set_pinned: fn(id, pinned) {
@@ -335,7 +337,20 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
               sessions: dict.insert(
                 state.sessions,
                 summary.id,
-                Stored(summary, system_prompt, [], summary.message_count),
+                // insert_session.sql: tags_manual '{}' literally and
+                // tags_source DEFAULT 'auto' — a new row's auto path is
+                // open, regardless of what the passed summary carried
+                // (a fresh insert never inherits provenance).
+                Stored(
+                  store.StoredSummary(
+                    ..summary,
+                    tags_manual: [],
+                    tags_source: session.AutoTags,
+                  ),
+                  system_prompt,
+                  [],
+                  summary.message_count,
+                ),
               ),
               events: [EvInsertSession(summary.id), ..state.events],
             ),
@@ -421,30 +436,31 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
           }
       }
 
-    AutoTitleUpgrade(id, title, reply) ->
-      // Mirrors `auto_title_upgrade.sql` (utility-titles plan §4.4): the
-      // guard is provenance ONLY — an auto title (even the heuristic
-      // placeholder, even a previously upgraded one) may be replaced; a
-      // manual rename wins forever.
+    AutoMetaUpgrade(id, title, tags, reply) ->
+      // Mirrors `auto_meta_upgrade.sql` (utility-tags plan §3.6): the
+      // guard is provenance ONLY, on BOTH columns — an auto title may be
+      // replaced and the display tags written while `title_source` AND
+      // `tags_source` are 'auto'; a manual rename OR a manual tag save
+      // refuses the whole write, atomically.
       case dict.get(state.sessions, id) {
         Error(_) -> {
           process.send(reply, Error("no stored session " <> id))
           actor.continue(state)
         }
         Ok(stored) ->
-          case stored.summary.title_source {
-            session.AutoTitle -> {
+          case stored.summary.title_source, stored.summary.tags_source {
+            session.AutoTitle, session.AutoTags -> {
               process.send(reply, Ok(True))
               actor.continue(
                 State(
                   ..update(state, id, fn(summary) {
-                    store.StoredSummary(..summary, title: title)
+                    store.StoredSummary(..summary, title: title, tags: tags)
                   }),
-                  events: [EvAutoTitleUpgrade(id, title), ..state.events],
+                  events: [EvAutoMetaUpgrade(id, title, tags), ..state.events],
                 ),
               )
             }
-            _ -> {
+            _, _ -> {
               process.send(reply, Ok(False))
               actor.continue(state)
             }
@@ -452,11 +468,23 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
       }
 
     SetTags(id, tags, reply) -> {
+      // Mirrors `set_tags.sql` (utility-tags plan §3.5): one atomic
+      // triple-write — the display set, the manual set, and
+      // `tags_source = 'manual'` (the freeze `auto_meta_upgrade` guards
+      // on). All three fields or nothing.
       process.send(reply, Ok(Nil))
       actor.continue(
         State(
-          ..update(state, id, fn(summary) {
-            store.StoredSummary(..summary, tags: tags)
+          ..update_stored(state, id, fn(stored) {
+            Stored(
+              ..stored,
+              summary: store.StoredSummary(
+                ..stored.summary,
+                tags: tags,
+                tags_manual: tags,
+                tags_source: session.ManualTags,
+              ),
+            )
           }),
           events: [EvSetTags(id, tags), ..state.events],
         ),

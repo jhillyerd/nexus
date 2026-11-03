@@ -209,7 +209,10 @@ fn no_utility_runner(
   Error("no utility call expected in this test")
 }
 
-fn no_utility_apply(_title: String) -> Result(session.UtilityMeta, Nil) {
+fn no_utility_apply(
+  _title: String,
+  _tags: List(String),
+) -> Result(session.UtilityMeta, Nil) {
   Error(Nil)
 }
 
@@ -809,6 +812,10 @@ type UtilityEvent {
   UtilReleased
   /// The apply seam was reached with the parsed title.
   UtilAppliedNote(title: String)
+  /// The apply seam was reached, and these are the PARSED tags the
+  /// worker passed beside the title (utility-tags plan §3.7: the
+  /// widened `Ok(utility.Title(...))` branch forwards both).
+  UtilAppliedTags(tags: List(String))
   /// The apply seam was REFUSED (guard declined); still records the call.
   UtilRefusedNote(title: String)
 }
@@ -867,7 +874,7 @@ fn ok_utility(
 ) -> session.UtilityRunner {
   fn(_endpoint, tr, _cancel, _allow_pass) {
     process.send(events, UtilCalled(transcript.length(tr)))
-    Ok(utility.Title(title))
+    Ok(utility.Title(title: title, tags: []))
   }
 }
 
@@ -903,7 +910,7 @@ fn pass_once_then_title_utility(
       True -> Ok(utility.Pass)
       False -> {
         process.send(events, UtilForcedAttempt)
-        Ok(utility.Title("Model Title"))
+        Ok(utility.Title(title: "Model Title", tags: []))
       }
     }
   }
@@ -942,7 +949,7 @@ fn blocking_utility(
       }
       Ok(UtilReleased) -> {
         process.send(events, UtilReleased)
-        Ok(utility.Title("Model Title"))
+        Ok(utility.Title(title: "Model Title", tags: []))
       }
       // UtilCalled never rides this selector, but the event type is
       // shared with the test's recording subject — cover it.
@@ -958,7 +965,7 @@ fn ok_apply(
   events: process.Subject(UtilityEvent),
   title: String,
 ) -> session.UtilityApply {
-  fn(t) {
+  fn(t, _tags) {
     process.send(events, UtilAppliedNote(t))
     case t == title {
       True -> Ok(session.UtilityMeta(title, ["auto-tag"]))
@@ -973,7 +980,7 @@ fn ok_apply(
 fn refusing_apply(
   events: process.Subject(UtilityEvent),
 ) -> session.UtilityApply {
-  fn(t) {
+  fn(t, _tags) {
     process.send(events, UtilRefusedNote(t))
     Error(Nil)
   }
@@ -1046,8 +1053,54 @@ pub fn utility_fires_once_after_first_exchange_test() {
   let opts = transcript.Options(..transcript.default_options(), stream: True)
   should.be_false(string.contains(
     transcript.request_body(tr, opts),
-    utility.instruction(True),
+    utility.instruction(True, []),
   ))
+}
+
+/// The two-line wiring (utility-tags plan §3.7): the runner's parsed
+/// line-2 tags ride the widened apply seam BESIDE the title, and the
+/// apply's fresh display tags ride the `MetaUpdated` broadcast. The
+/// fake runner's signature is the UNCHANGED 4-arg `UtilityRunner` —
+/// corpus plumbing lives registry-side only (§3.3), so session-actor
+/// fakes were never touched by it.
+pub fn utility_apply_receives_parsed_tags_test() {
+  let events = process.new_subject()
+  let sess =
+    start_with_utility(
+      utility_config(20),
+      happy_runner,
+      fn(_endpoint, _tr, _cancel, _allow_pass) {
+        Ok(utility.Title(title: "Model Title", tags: ["Login Bug", "auth"]))
+      },
+      fn(title, tags) {
+        // The registry-shaped apply: replies with the fresh display set —
+        // the incoming tags normalized, as the real merge would deliver.
+        process.send(events, UtilAppliedTags(tags))
+        Ok(session.UtilityMeta(title, utility.normalize_tags(tags)))
+      },
+    )
+  let sub = join(sess)
+  let _ = expect_event(sub)
+
+  should.equal(session.send_message(sess, "first"), session.Sent)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+  let _ = expect_event(sub)
+
+  // The worker forwarded the parsed tags beside the title, verbatim
+  // through the seam (normalization/merge is the registry's business)…
+  expect_utility(events)
+  |> should.equal(UtilAppliedTags(["Login Bug", "auth"]))
+  // …and the broadcast carries the apply's fresh display set.
+  expect_event(sub)
+  |> should.equal(
+    session.MetaUpdated(Some("Model Title"), ["login-bug", "auth"]),
+  )
+
+  // The branch never entered the transcript: one committed exchange —
+  // system + user + assistant — and nothing else.
+  transcript.length(session.snapshot(sess)) |> should.equal(3)
 }
 
 /// A greeting-session model that PASSes: the pass does NOT consume the

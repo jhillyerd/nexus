@@ -249,6 +249,9 @@ fn boot(seam: store.Store) -> Boot {
       fn(_endpoint, _tr, _cancel, _allow_pass) {
         Error("no utility call in this test")
       },
+      // The corpus seam: never asked in these tests (the fake runner
+      // above refuses before any request), pure to stay offline.
+      fn() { [] },
       fixture_resolver(),
     )
   Boot(
@@ -527,6 +530,8 @@ fn stored(id: String) -> store.StoredSummary {
     pinned: False,
     archived: False,
     tags: [],
+    tags_manual: [],
+    tags_source: session.AutoTags,
     created_at: timing.wall_now_s(),
     last_active_at: timing.wall_now_s(),
     message_count: 1,
@@ -713,8 +718,11 @@ pub fn tool_call_reasoning_rides_first_row_of_run_test() {
 }
 
 // ---------------------------------------------------------------------------
-// Utility-titles P3: auto_title_upgrade guard semantics (plan §4.4/§6) —
-// the store-side twin of the registry's UpgradeAutoTitle guard.
+// Utility-titles/tags: auto_meta_upgrade guard semantics (utility-titles
+// plan §4.4, utility-tags plan §3.6) — the store-side twin of the
+// registry's UpgradeAutoTitle guard: applies while BOTH provenance
+// columns are 'auto', refused after a manual title rename OR a manual
+// tag save, and the mock records the tags writes.
 // ---------------------------------------------------------------------------
 
 /// A stored summary like the heuristic title leaves behind: still
@@ -730,19 +738,19 @@ fn auto_stored(id: String, title: String) -> store.StoredSummary {
 /// `title_source = 'auto'`: the upgrade APPLIES and REPLACES — first the
 /// heuristic placeholder, then even a previously upgraded title (the
 /// guard is provenance only, never "empty title only").
-pub fn auto_title_upgrade_replaces_auto_title_test() {
+pub fn auto_meta_upgrade_replaces_auto_title_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
   store_mock.ensure_fixture_provider(seam)
   let assert Ok(_) = seam.insert_session(auto_stored("s1", "heuristic"), "sys")
 
-  should.equal(seam.auto_title_upgrade("s1", "Model Title"), Ok(True))
+  should.equal(seam.auto_meta_upgrade("s1", "Model Title", []), Ok(True))
   let assert Ok(stored) = seam.get_session("s1")
   should.equal(stored.summary.title, "Model Title")
   should.equal(stored.summary.title_source, session.AutoTitle)
 
   // An upgraded title is still auto-generated: it may be replaced again.
-  should.equal(seam.auto_title_upgrade("s1", "Better Title"), Ok(True))
+  should.equal(seam.auto_meta_upgrade("s1", "Better Title", []), Ok(True))
   let assert Ok(stored) = seam.get_session("s1")
   should.equal(stored.summary.title, "Better Title")
 }
@@ -750,19 +758,83 @@ pub fn auto_title_upgrade_replaces_auto_title_test() {
 /// `title_source = 'manual'`: the upgrade is REFUSED and replies False —
 /// a rename wins forever, in the store exactly as in memory. An unknown
 /// id is an error, like the real store.
-pub fn auto_title_upgrade_refuses_manual_title_test() {
+pub fn auto_meta_upgrade_refuses_manual_title_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
   store_mock.ensure_fixture_provider(seam)
   let assert Ok(_) = seam.insert_session(auto_stored("s2", "heuristic"), "sys")
 
   should.equal(seam.set_title("s2", "renamed"), Ok(Nil))
-  should.equal(seam.auto_title_upgrade("s2", "Sneaky"), Ok(False))
+  should.equal(seam.auto_meta_upgrade("s2", "Sneaky", []), Ok(False))
   let assert Ok(stored) = seam.get_session("s2")
   should.equal(stored.summary.title, "renamed")
   should.equal(stored.summary.title_source, session.ManualTitle)
 
-  should.be_error(seam.auto_title_upgrade("nope", "X"))
+  should.be_error(seam.auto_meta_upgrade("nope", "X", []))
+}
+
+/// The tags side of the same guard: a manual tag save (`set_tags.sql`'s
+/// atomic triple-write) flips `tags_source` to 'manual' FIRST, so a
+/// racing in-flight apply's write-through is refused — the whole write,
+/// not just the tags half. The row keeps the user's exact set.
+pub fn auto_meta_upgrade_refuses_after_manual_tag_save_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  store_mock.ensure_fixture_provider(seam)
+  let assert Ok(_) = seam.insert_session(auto_stored("s3", "heuristic"), "sys")
+
+  should.equal(seam.set_tags("s3", ["mine"]), Ok(Nil))
+  should.equal(
+    seam.auto_meta_upgrade("s3", "Model Title", ["model-tag"]),
+    Ok(False),
+  )
+  let assert Ok(stored) = seam.get_session("s3")
+  // Refused WHOLE: the title stays untouched too, not just the tags.
+  should.equal(stored.summary.title, "heuristic")
+  should.equal(stored.summary.tags, ["mine"])
+  should.equal(stored.summary.tags_manual, ["mine"])
+  should.equal(stored.summary.tags_source, session.ManualTags)
+
+  // The mock recorded the manual save; no upgrade was written.
+  store_mock.events(mock)
+  |> list.filter(fn(event) {
+    case event {
+      store_mock.EvSetTags(_, _) | store_mock.EvAutoMetaUpgrade(_, _, _) -> True
+      _ -> False
+    }
+  })
+  |> should.equal([store_mock.EvSetTags("s3", ["mine"])])
+}
+
+/// The applying side records the TAGS write (§5): while both sources
+/// are auto the upgrade lands title AND display tags in one guarded
+/// statement, and the mock's event log carries the exact payload.
+pub fn auto_meta_upgrade_applies_and_records_tags_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  store_mock.ensure_fixture_provider(seam)
+  let assert Ok(_) = seam.insert_session(auto_stored("s4", "heuristic"), "sys")
+
+  should.equal(
+    seam.auto_meta_upgrade("s4", "Model Title", ["login", "auth"]),
+    Ok(True),
+  )
+  let assert Ok(stored) = seam.get_session("s4")
+  should.equal(stored.summary.title, "Model Title")
+  should.equal(stored.summary.tags, ["login", "auth"])
+  // Both provenance columns stay 'auto': a later attempt may merge again.
+  should.equal(stored.summary.title_source, session.AutoTitle)
+  should.equal(stored.summary.tags_source, session.AutoTags)
+  store_mock.events(mock)
+  |> list.filter(fn(event) {
+    case event {
+      store_mock.EvAutoMetaUpgrade(_, _, _) -> True
+      _ -> False
+    }
+  })
+  |> should.equal([
+    store_mock.EvAutoMetaUpgrade("s4", "Model Title", ["login", "auth"]),
+  ])
 }
 
 /// The registry's UpgradeAutoTitle — what the utility worker's apply step
@@ -787,6 +859,7 @@ pub fn upgrade_auto_title_writes_through_and_survives_restart_test() {
       booted.registry,
       record.id,
       "Model Title",
+      [],
     ),
     session_registry.UpgradeApplied("Model Title", []),
   )
@@ -799,11 +872,11 @@ pub fn upgrade_auto_title_writes_through_and_survives_restart_test() {
     store_mock.events(mock)
       |> list.filter(fn(event) {
         case event {
-          store_mock.EvAutoTitleUpgrade(id, _title) -> id == record.id
+          store_mock.EvAutoMetaUpgrade(id, _title, _tags) -> id == record.id
           _ -> False
         }
       }),
-    [store_mock.EvAutoTitleUpgrade(record.id, "Model Title")],
+    [store_mock.EvAutoMetaUpgrade(record.id, "Model Title", [])],
   )
 
   // A manual rename wins forever: refused, and the store is never asked.
@@ -813,14 +886,19 @@ pub fn upgrade_auto_title_writes_through_and_survives_restart_test() {
     "renamed",
   ))
   should.equal(
-    session_registry.upgrade_auto_title(booted.registry, record.id, "Sneaky"),
+    session_registry.upgrade_auto_title(
+      booted.registry,
+      record.id,
+      "Sneaky",
+      [],
+    ),
     session_registry.UpgradeRefused,
   )
   should.equal(
     store_mock.events(mock)
       |> list.filter(fn(event) {
         case event {
-          store_mock.EvAutoTitleUpgrade(_, "Sneaky") -> True
+          store_mock.EvAutoMetaUpgrade(_, "Sneaky", _) -> True
           _ -> False
         }
       }),
@@ -865,6 +943,7 @@ pub fn upgrade_auto_title_honors_store_refusal_test() {
       booted.registry,
       record.id,
       "Model Title",
+      [],
     ),
     session_registry.UpgradeRefused,
   )
@@ -877,7 +956,7 @@ pub fn upgrade_auto_title_honors_store_refusal_test() {
     store_mock.events(mock)
       |> list.filter(fn(event) {
         case event {
-          store_mock.EvAutoTitleUpgrade(_, _) -> True
+          store_mock.EvAutoMetaUpgrade(_, _, _) -> True
           _ -> False
         }
       }),
@@ -895,7 +974,12 @@ pub fn upgrade_auto_title_on_dormant_session_test() {
   let booted = boot(seam)
 
   should.equal(
-    session_registry.upgrade_auto_title(booted.registry, "s9", "Model Title"),
+    session_registry.upgrade_auto_title(
+      booted.registry,
+      "s9",
+      "Model Title",
+      [],
+    ),
     session_registry.UpgradeApplied("Model Title", []),
   )
   restart_vm(booted)
@@ -905,4 +989,51 @@ pub fn upgrade_auto_title_on_dormant_session_test() {
     |> list.find(fn(summary) { summary.id == "s9" })
   should.equal(summary.title, "Model Title")
   should.equal(summary.title_source, session.AutoTitle)
+}
+
+/// The tags ride the SAME write as the title (§5): the registry's
+/// upgrade merges the attempt's tags into the display set, writes them
+/// through in one guarded statement (the mock records the payload),
+/// and a restart reads the merged set back from the stored row.
+pub fn upgrade_auto_title_merges_tags_and_survives_restart_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  let booted = boot(seam)
+  let record = create(booted.registry, "alias-1", happy_runner)
+  should.be_true(session_registry.auto_title(
+    booted.registry,
+    record.id,
+    "first msg",
+  ))
+
+  session_registry.upgrade_auto_title(
+    booted.registry,
+    record.id,
+    "Model Title",
+    [
+      "Login Bug",
+      "auth",
+    ],
+  )
+  |> should.equal(
+    session_registry.UpgradeApplied("Model Title", ["login-bug", "auth"]),
+  )
+  store_mock.events(mock)
+  |> list.filter(fn(event) {
+    case event {
+      store_mock.EvAutoMetaUpgrade(id, _, _) -> id == record.id
+      _ -> False
+    }
+  })
+  |> should.equal([
+    store_mock.EvAutoMetaUpgrade(record.id, "Model Title", ["login-bug", "auth"]),
+  ])
+
+  restart_vm(booted)
+  let booted2 = boot(store_mock.seam(mock))
+  let assert Ok(summary) =
+    session_registry.list_sessions(booted2.registry)
+    |> list.find(fn(summary) { summary.id == record.id })
+  should.equal(summary.title, "Model Title")
+  should.equal(summary.tags, ["login-bug", "auth"])
 }

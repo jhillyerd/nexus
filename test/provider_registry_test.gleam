@@ -110,6 +110,8 @@ fn pinned_session(id: String, provider_id: String) -> store.StoredSummary {
     pinned: False,
     archived: False,
     tags: [],
+    tags_manual: [],
+    tags_source: session.AutoTags,
     created_at: 1_700_000_000,
     last_active_at: 1_700_000_000,
     message_count: 1,

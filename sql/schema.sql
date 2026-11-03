@@ -89,3 +89,46 @@ CREATE TABLE IF NOT EXISTS session_message (
 -- Reasoning column for databases created before it existed (the CREATE
 -- TABLE above already includes it for fresh ones; both are idempotent).
 ALTER TABLE session_message ADD COLUMN IF NOT EXISTS reasoning text;
+
+-- Tags provenance columns (docs/plans/utility-tags.md §3.4), added for
+-- databases created before they existed. Both live in ONE DO block whose
+-- pg_attribute checks make re-runs no-ops (the migrate runner's splitter
+-- understands $$-quoted bodies, so the inner `;` stay inside the
+-- statement):
+--
+-- - `tags_manual text[] NOT NULL DEFAULT '{}'` — the user's exact set.
+--   `tags` stays the DISPLAY set (the union); `display − manual` is the
+--   auto contribution, recomputed on write. Backfill: `tags_manual =
+--   tags` VERBATIM — every pre-existing tag is manual, and the union
+--   rule never rewrites existing display entries, so verbatim spellings
+--   cannot skew the bookkeeping.
+-- - `tags_source text NOT NULL DEFAULT 'auto'` ('auto' | 'manual',
+--   mirroring `title_source`) — the per-side provenance guard. Backfill
+--   `'manual'` for every pre-existing row, codifying the no-retro-
+--   tagging decision (§1): sessions that predate this feature can never
+--   be auto-tagged, exactly as their spent title attempts already
+--   prevent re-titling. New inserts default 'auto'; the first manual
+--   tag save (`set_tags.sql`) flips the row to 'manual' forever — the
+--   guard IS the tombstone a future refresh policy reads.
+do $$
+begin
+  if not exists (
+    select 1 from pg_attribute
+    where attrelid = 'session'::regclass
+      and attname = 'tags_manual'
+      and not attisdropped
+  ) then
+    alter table session add column tags_manual text[] not null default '{}';
+    update session set tags_manual = tags;
+  end if;
+  if not exists (
+    select 1 from pg_attribute
+    where attrelid = 'session'::regclass
+      and attname = 'tags_source'
+      and not attisdropped
+  ) then
+    alter table session add column tags_source text not null default 'auto';
+    update session set tags_source = 'manual';
+  end if;
+end
+$$;

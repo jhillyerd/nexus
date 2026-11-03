@@ -3,6 +3,7 @@
 //// dies. No network, no Bifrost.
 
 import gleam/erlang/process.{type Monitor}
+import gleam/int
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/otp/actor
@@ -531,6 +532,308 @@ fn blocking_runner(_cfg, tr, cancel, _on_event) -> session.TurnOutcome {
 }
 
 // ---------------------------------------------------------------------------
+// Utility-tags P4 (§5): model-tag merge, provenance guards, TagCorpus
+// ---------------------------------------------------------------------------
+
+/// Seed one stored (dormant) session row carrying display tags — what
+/// the corpus and merge tests fork from. `message_count` 3 keeps the
+/// row out of the boot sweep (a used session), and the row lands with
+/// its auto path open (insert_session defaults `tags_source` 'auto'),
+/// exactly like a stored row this feature's era created.
+fn seed_with_tags(seam: store.Store, id: String, tags: List(String)) -> Nil {
+  store_mock.ensure_fixture_provider(seam)
+  let assert Ok(Nil) =
+    seam.insert_session(
+      store.StoredSummary(
+        id: id,
+        provider_id: store_mock.fixture_provider_id,
+        title: "stored " <> id,
+        title_source: session.AutoTitle,
+        model: "alpha",
+        pinned: False,
+        archived: False,
+        tags: tags,
+        tags_manual: [],
+        tags_source: session.AutoTags,
+        created_at: 1_700_000_000,
+        last_active_at: 1_700_000_000,
+        message_count: 3,
+      ),
+      "test system prompt",
+    )
+  Nil
+}
+
+/// The model-metadata upgrade (§3.5): applies while BOTH provenance
+/// columns are 'auto' — the title replaces the placeholder and the
+/// attempt's tags land as the display set — and is refused WHOLE under
+/// a manual title rename OR a manual tag edit: each closes its side
+/// forever, and neither write of the one ask survives alone.
+pub fn upgrade_applies_under_both_auto_guards_test() {
+  let registry = start_registry()
+  let a = create(registry, "alpha", happy_runner)
+
+  // Both-auto: applied, fresh metadata in the reply.
+  session_registry.upgrade_auto_title(registry, a.id, "Model Title", [
+    "login", "auth",
+  ])
+  |> should.equal(
+    session_registry.UpgradeApplied("Model Title", ["login", "auth"]),
+  )
+  let summary = find_summary(registry, a.id)
+  should.equal(summary.title, "Model Title")
+  should.equal(summary.title_source, session.AutoTitle)
+  should.equal(summary.tags, ["login", "auth"])
+
+  // A manual title rename closes the title side: whole ask refused.
+  let b = create(registry, "beta", happy_runner)
+  should.be_true(session_registry.set_title(registry, b.id, "renamed"))
+  session_registry.upgrade_auto_title(registry, b.id, "Sneaky", ["x"])
+  |> should.equal(session_registry.UpgradeRefused)
+  let summary = find_summary(registry, b.id)
+  should.equal(summary.title, "renamed")
+  should.equal(summary.tags, [])
+
+  // A manual tag edit closes the tags side: same refusal, even though
+  // the title side is still auto.
+  let c = create(registry, "gamma", happy_runner)
+  should.be_true(session_registry.set_tags(registry, c.id, ["mine"]))
+  session_registry.upgrade_auto_title(registry, c.id, "Sneaky", ["x"])
+  |> should.equal(session_registry.UpgradeRefused)
+  let summary = find_summary(registry, c.id)
+  should.equal(summary.title, "")
+  should.equal(summary.tags, ["mine"])
+}
+
+/// The merge itself (§3.5), on a dormant row carrying LEGACY spellings:
+/// existing display entries pass through VERBATIM in order, a canonical
+/// twin of a legacy spelling is not a duplicate (the presence check
+/// compares through the shared normalization), new tags append
+/// normalized, and the union caps at 5 per session.
+pub fn upgrade_union_order_verbatim_and_cap_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  seed_with_tags(seam, "s1", ["Work Notes", "login"])
+  let registry = start_registry_over(seam)
+
+  session_registry.upgrade_auto_title(registry, "s1", "Model Title", [
+    "work-notes", "AUTH", "cache", "ops",
+  ])
+  |> should.equal(
+    session_registry.UpgradeApplied("Model Title", [
+      "Work Notes", "login", "auth", "cache", "ops",
+    ]),
+  )
+  // The cap: a later attempt's further tag cannot grow past five — the
+  // existing order wins, the newcomer falls off.
+  session_registry.upgrade_auto_title(registry, "s1", "Retitled", ["extra"])
+  |> should.equal(
+    session_registry.UpgradeApplied("Retitled", [
+      "Work Notes", "login", "auth", "cache", "ops",
+    ]),
+  )
+  find_summary(registry, "s1").tags
+  |> should.equal(["Work Notes", "login", "auth", "cache", "ops"])
+}
+
+/// The review-caught P1 (§3.5): a manual `SetTags` racing an in-flight
+/// apply refuses the apply. The worker forked while the row was
+/// both-auto; the manual save lands FIRST (directly in the store,
+/// behind the registry's memory); the worker's guarded write-through —
+/// `tags_source` checked atomically by the SQL — is refused, and the
+/// registry honors the refusal without mutating anything.
+pub fn manual_tag_save_racing_in_flight_apply_refuses_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  let registry = start_registry_over(seam)
+  let a = create(registry, "alpha", happy_runner)
+
+  // The manual save lands in the store behind the registry's back; its
+  // in-memory record still says both-auto, exactly like an in-flight
+  // worker that forked before the save.
+  should.equal(seam.set_tags(a.id, ["mine"]), Ok(Nil))
+
+  session_registry.upgrade_auto_title(registry, a.id, "Model Title", [
+    "model-tag",
+  ])
+  |> should.equal(session_registry.UpgradeRefused)
+  let summary = find_summary(registry, a.id)
+  should.equal(summary.title, "")
+  should.equal(summary.tags, [])
+  // The store recorded the manual save and never an upgrade.
+  store_mock.events(mock)
+  |> list.filter(fn(event) {
+    case event {
+      store_mock.EvSetTags(id, _) -> id == a.id
+      store_mock.EvAutoMetaUpgrade(_, _, _) -> True
+      _ -> False
+    }
+  })
+  |> should.equal([store_mock.EvSetTags(a.id, ["mine"])])
+}
+
+/// `SetTags` writes all three fields through (§3.5): the user's
+/// (normalized) set becomes the display set AND the manual set, and the
+/// row's auto path closes — `tags_source = 'manual'` — in one atomic
+/// statement.
+pub fn set_tags_writes_display_manual_and_source_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  let registry = start_registry_over(seam)
+  let a = create(registry, "alpha", happy_runner)
+
+  should.be_true(
+    session_registry.set_tags(registry, a.id, [" Work ", "notes", "work"]),
+  )
+  find_summary(registry, a.id).tags |> should.equal(["work", "notes"])
+
+  let assert Ok(stored) = seam.get_session(a.id)
+  should.equal(stored.summary.tags, ["work", "notes"])
+  should.equal(stored.summary.tags_manual, ["work", "notes"])
+  should.equal(stored.summary.tags_source, session.ManualTags)
+  // The mock recorded exactly the normalized tags write.
+  store_mock.events(mock)
+  |> list.filter(fn(event) {
+    case event {
+      store_mock.EvSetTags(_, _) -> True
+      _ -> False
+    }
+  })
+  |> should.equal([store_mock.EvSetTags(a.id, ["work", "notes"])])
+}
+
+/// `SetTags` on a FAILING store write keeps the in-memory freeze (the
+/// documented degrade mode, §3.5): the record says manual, the reply
+/// says applied, and a later utility apply is still refused by the
+/// in-memory twin check — the store is never consulted again. The
+/// stale persisted row is harmless in this pass; the next manual save
+/// re-attempts the triple-write and heals it.
+pub fn set_tags_store_failure_keeps_in_memory_freeze_test() {
+  let mock = store_mock.start()
+  let seam =
+    store.Store(..store_mock.seam(mock), set_tags: fn(_id, _tags) {
+      Error("disk full")
+    })
+  let registry = start_registry_over(seam)
+  let a = create(registry, "alpha", happy_runner)
+
+  should.be_true(session_registry.set_tags(registry, a.id, ["work"]))
+  find_summary(registry, a.id).tags |> should.equal(["work"])
+
+  // The freeze stands in memory: a later apply is refused without the
+  // store being asked.
+  session_registry.upgrade_auto_title(registry, a.id, "Model Title", ["x"])
+  |> should.equal(session_registry.UpgradeRefused)
+  // The mock saw neither the failed save nor any upgrade.
+  store_mock.events(mock)
+  |> list.filter(fn(event) {
+    case event {
+      store_mock.EvSetTags(_, _) | store_mock.EvAutoMetaUpgrade(_, _, _) -> True
+      _ -> False
+    }
+  })
+  |> should.equal([])
+}
+
+/// `TagCorpus` (§3.3) is deterministic for a given registry state:
+/// normalize-BEFORE-counting pools `Work Notes` / `work notes` /
+/// `WORK-NOTES` into one entry; the frequency floor (≥ 2 sessions)
+/// keeps singletons out of Y; ordering is count descending with an
+/// alphabetical tie-break.
+pub fn tag_corpus_floor_order_and_tiebreak_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  seed_with_tags(seam, "s1", ["cache", "login", "Work Notes"])
+  seed_with_tags(seam, "s2", ["cache", "auth", "work notes"])
+  seed_with_tags(seam, "s3", ["auth", "WORK-NOTES", "singleton"])
+  let registry = start_registry_over(seam)
+
+  // work-notes: 3 sessions pooled across spellings, so it leads; auth
+  // and cache tie at 2 — alphabetical; login and singleton sit below
+  // the floor and never reach Y.
+  session_registry.tag_corpus(registry)
+  |> should.equal(["work-notes", "auth", "cache"])
+}
+
+/// The corpus counts EVERY session the registry knows — active records
+/// plus dormant summaries — and the floor counts SESSIONS, not mentions
+/// (`normalize_tags` dedupes within one session before counting).
+pub fn tag_corpus_counts_active_and_dormant_by_session_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  seed_with_tags(seam, "s1", ["shared", "dormant-only"])
+  let registry = start_registry_over(seam)
+  let a = create(registry, "alpha", happy_runner)
+  should.be_true(
+    session_registry.set_tags(registry, a.id, [
+      "shared",
+      "active-only",
+      "shared",
+    ]),
+  )
+
+  // "shared" reaches the floor across one dormant + one active
+  // session; the singletons do not; the repeated mention in one save
+  // still counts once.
+  session_registry.tag_corpus(registry)
+  |> should.equal(["shared"])
+}
+
+/// The 30-entry cap: with more qualifying tags than the cap, the corpus
+/// keeps thirty (all tied here) in the deterministic tie-break order —
+/// 31 and beyond never reach Y.
+fn tag_names(n: Int, acc: List(Int)) -> List(Int) {
+  case n {
+    0 -> list.reverse(acc)
+    _ -> tag_names(n - 1, [n, ..acc])
+  }
+}
+
+pub fn tag_corpus_caps_at_thirty_entries_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  // "tag-01" … "tag-35", zero-padded so the alphabetical tie-break is
+  // also the numeric order.
+  let tags =
+    tag_names(35, [])
+    |> list.map(fn(n) { "tag-" <> string.pad_start(int.to_string(n), 2, "0") })
+  seed_with_tags(seam, "s1", tags)
+  seed_with_tags(seam, "s2", tags)
+  let registry = start_registry_over(seam)
+
+  let corpus = session_registry.tag_corpus(registry)
+  list.length(corpus) |> should.equal(30)
+  // The alphabetical tie-break fills the cap: tag-01 … tag-30 survive,
+  // tag-31 … tag-35 fall off.
+  should.be_true(list.contains(corpus, "tag-30"))
+  should.be_false(list.contains(corpus, "tag-31"))
+  case list.first(corpus) {
+    Ok(first) -> should.equal(first, "tag-01")
+    Error(_) -> panic as "expected a corpus"
+  }
+}
+
+/// The 30 × 24 embedding bound holds BY CONSTRUCTION (§3.3): a 10 KB
+/// legacy tag enters the corpus truncated at 24 kebab characters, and
+/// case-insensitive pooling folds its spellings into the one bounded
+/// entry — whatever older rows contain, Y's corpus share is bounded.
+pub fn tag_corpus_truncates_and_pools_legacy_tags_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  // ~10 KB, mixed case and spacing: hostile to the bound, benign after
+  // normalization.
+  let flood = string.repeat("Ab Cd ", 1700)
+  seed_with_tags(seam, "s1", [flood])
+  seed_with_tags(seam, "s2", [string.lowercase(flood)])
+  let registry = start_registry_over(seam)
+
+  let corpus = session_registry.tag_corpus(registry)
+  should.equal(corpus, ["ab-cd-ab-cd-ab-cd-ab-cd-"])
+  // Every entry obeys the per-tag cap: 30 × 24 is the hard ceiling.
+  list.each(corpus, fn(tag) { should.be_true(string.length(tag) <= 24) })
+}
+
+// ---------------------------------------------------------------------------
 // Boot sweep of never-used sessions
 // ---------------------------------------------------------------------------
 
@@ -605,6 +908,8 @@ fn seed_at(
         pinned: pinned,
         archived: archived,
         tags: [],
+        tags_manual: [],
+        tags_source: session.AutoTags,
         created_at: last_active_at,
         last_active_at: last_active_at,
         message_count: message_count,

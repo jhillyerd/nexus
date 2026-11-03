@@ -1,10 +1,33 @@
-//// Prefix-cache piggybacking (utility-titles plan §4.1): after a session's
-//// first committed exchange, one background completion — branched off the
-//// committed transcript's cached prefix — proposes a session title. The
+//// Prefix-cache piggybacking (utility-titles plan §4.1, extended by
+//// the utility-tags plan): after a session's first committed exchange,
+//// one background completion — branched off the committed transcript's
+//// cached prefix — proposes a session title AND a handful of tags. The
 //// request reuses the session's frozen envelope (same model, system
 //// prompt, tool schemas) so cache-capable backends reprocess only the
-//// instruction message; the reply becomes the title while
-//// `title_source = 'auto'` and is otherwise discarded (best-effort).
+//// instruction message; the reply becomes the session's organizational
+//// metadata while both provenance columns are 'auto' and is otherwise
+//// discarded (best-effort).
+////
+//// Reply protocol (utility-tags plan §3.1) — two lines of plain text:
+//// line 1 is the title (required: unusable/empty fails the attempt,
+//// exactly the title-only semantics), line 2 is a comma-separated tag
+//// list (best-effort: absent or malformed means zero tags, and the
+//// title still applies). No JSON — parsing stays string-shaping, which
+//// small local models fumble less than structured output. A leading
+//// `Title:` / `Tags:` label on either line is stripped (models like
+//// echoing the schema). No JSON — parsing stays string-shaping, which
+//// small local models fumble less than structured output; a tags line
+//// that opens like JSON (`[`, `{`, `"`) is malformed and yields zero
+//// tags. Blank lines are not protocol lines: the title and the tags
+//// are the first two MEANINGFUL lines, however the model padded them.
+////
+//// Tag vocabulary is shaped structurally, not just prompted: at most
+//// `max_new_tags` tags absent from the supplied corpus survive the
+//// parse (reuse dominates; growth is bounded per attempt), and the
+//// union with a session's existing display set is capped at
+//// `tags_per_session` entries (`merge_tags` — what the registry applies).
+//// Every tag — manual or model — passes through the ONE normalization
+//// rule below, so the two paths can never drift apart.
 ////
 //// PASS postpone: when the first exchange gives the model too little to
 //// title specifically (a greeting-only opener, say), it may reply
@@ -14,7 +37,7 @@
 //// one pass is honored per session; after that the forced instruction
 //// (no PASS option) demands the best title available, so the forced
 //// attempt cannot defer again. A PASS under the forced instruction is an
-//// unusable title, not a postpone.
+//// unusable title, not a postpone — it defers title AND tags together.
 ////
 //// Structure: pure request/parse helpers plus one blocking runner — no
 //// actor of its own. The runner executes inside the session's unlinked
@@ -47,6 +70,24 @@ import nexus/transcript.{type Options, type Transcript}
 /// truncate (with an ellipsis) at 60 characters.
 const title_limit = 60
 
+/// Per-tag character cap (utility-tags plan §3.1): truncate each tag at
+/// 24 characters — no ellipsis, unlike the title cap, because a tag is a
+/// kebab-word (filtering vocabulary), not display prose. Together with
+/// the corpus cap this bounds the corpus's contribution to Y: 30 entries
+/// × 24 chars is a hard ceiling.
+const tag_limit = 24
+
+/// Maximum tags one session may carry (§3.1): the union of existing
+/// display tags and one attempt's new tags preserves existing order,
+/// appends the new, then truncates here.
+const tags_per_session = 5
+
+/// Maximum NEW tags one attempt may introduce (§3.1, the K cap): tags
+/// already present in the supplied corpus survive freely — reuse
+/// dominates, growth is bounded per attempt. Enforced structurally in
+/// `parse_tags`, not just prompted.
+const max_new_tags = 2
+
 /// Bounds the side call's cost and rambling. Generation-side params do not
 /// affect the tokenized prompt (utility-titles plan §4.1), so the prefix is
 /// untouched. Deliberately generous headroom over the one-line title:
@@ -60,25 +101,46 @@ const utility_token_cap = 512
 /// in the prompt because the frozen `tools` array renders into the prompt
 /// and cannot be stripped without diverging the cached prefix.
 ///
+/// The reply is two lines (utility-tags plan §3.2): line 1 the title,
+/// line 2 a comma-separated tag list of zero to three tags. When
+/// `corpus` is non-empty it is listed — corpus-constrained generation
+/// steers the model toward reuse — and the new-tag allowance matches the
+/// parser's structural cap (`max_new_tags`). The corpus makes Y dynamic;
+/// that is safe by construction because Y is the tail message —
+/// generation-side, never committed — so the conversation prefix is
+/// untouched no matter what the corpus contains.
+///
 /// `allow_pass` picks the variant: the first (unpassed) attempt offers
 /// the PASS escape hatch — the model judges whether the conversation has
 /// enough signal for a specific title — while a re-armed attempt after a
 /// pass uses the forced variant, which must not mention the sentinel at
 /// all (a model that never saw the option cannot be steered into it).
-pub fn instruction(allow_pass: Bool) -> String {
+pub fn instruction(allow_pass: Bool, corpus: List(String)) -> String {
   let base =
     "You are being asked a housekeeping question about the conversation above. "
-    <> "In one line, give this conversation a concise sentence-case title of "
-    <> "3–7 words."
-  let tail = " Do not call any tools. Reply with the title only."
+    <> "Reply with exactly two lines. Line 1: give this conversation a "
+    <> "concise sentence-case title of 3–7 words. Line 2: list zero to "
+    <> "three short tags for its topic, comma-separated."
+  let reuse = case corpus {
+    [] -> ""
+    _ ->
+      " Prefer reusing a tag from this list when one fits: "
+      <> string.join(corpus, ", ")
+      <> " — you may introduce at most "
+      <> int.to_string(max_new_tags)
+      <> " new tags."
+  }
+  let tail = " Do not call any tools. Reply with the title and tags only."
   case allow_pass {
     True ->
       base
+      <> reuse
       <> " If the conversation so far does not yet give you enough to write "
       <> "a specific title, reply with exactly PASS instead."
       <> tail
     False ->
       base
+      <> reuse
       <> " Even if the conversation is still slight, reply with the best "
       <> "title you can — do not defer."
       <> tail
@@ -87,8 +149,12 @@ pub fn instruction(allow_pass: Bool) -> String {
 
 /// The utility transcript: the committed snapshot plus the instruction as
 /// one user message (Y). Never committed back into the session.
-pub fn prepare(tr: Transcript, allow_pass: Bool) -> Transcript {
-  transcript.append_user(tr, instruction(allow_pass))
+pub fn prepare(
+  tr: Transcript,
+  allow_pass: Bool,
+  corpus: List(String),
+) -> Transcript {
+  transcript.append_user(tr, instruction(allow_pass, corpus))
 }
 
 /// The loop's frozen envelope with exactly one delta: the generation-side
@@ -98,38 +164,211 @@ pub fn options(base: Options) -> Options {
   transcript.Options(..base, max_completion_tokens: Some(utility_token_cap))
 }
 
-/// A parsed utility reply: a display title, or the model's PASS — its
-/// "not enough signal yet" verdict, honored once per session (the session
-/// actor owns that policy; this module only reports it).
+/// A parsed utility reply: a display title plus its attempt's surviving
+/// tags (already normalized and corpus-capped; the registry merges them
+/// into the session's display set), or the model's PASS — its "not enough
+/// signal yet" verdict, honored once per session (the session actor owns
+/// that policy; this module only reports it). A PASS defers title AND
+/// tags together.
 pub type Verdict {
-  Title(String)
+  Title(title: String, tags: List(String))
   Pass
 }
 
-/// Parse a utility reply into a verdict: trim, strip Markdown code fences,
-/// collapse whitespace, cap length with the same rule as
-/// `title_from_first_message`, and reject empty (a refusal arrives as no
-/// content, so it fails here too).
+/// Parse a utility reply into a verdict (utility-tags plan §3.1):
 ///
-/// The PASS sentinel matches only a whole (shaped) reply, case-
-/// insensitively — a real title that merely contains the word ("Password
-/// Manager Setup") never postpones. Under the forced instruction
-/// (`allow_pass = False`) a PASS reply is rejected as an unusable title:
-/// the forced attempt cannot defer again, so it is a failure, not a
-/// postpone.
-pub fn parse(allow_pass: Bool, text: String) -> Result(Verdict, Nil) {
-  case shape_title(strip_code_fences(text)) {
-    "" -> Error(Nil)
-    shaped ->
-      case is_pass(shaped) {
-        False -> Ok(Title(shaped))
-        True ->
-          case allow_pass {
-            True -> Ok(Pass)
-            False -> Error(Nil)
+/// - PASS matches only the WHOLE shaped reply (whitespace-collapsed,
+///   case-folded) and defers title + tags together; a real title that
+///   merely contains the word ("Password Manager Setup") never
+///   postpones. Under the forced instruction (`allow_pass = False`) a
+///   PASS reply is an unusable title: the forced attempt cannot defer
+///   again, so it is a failure, not a postpone.
+/// - Line 1 is the title: strip a leading `Title:` label, collapse
+///   whitespace, cap length with the same rule as
+///   `title_from_first_message`, and reject empty (a refusal arrives as
+///   no content, so it fails here too).
+/// - Line 2 is best-effort tags: absent or malformed (a JSON-shaped
+///   echo, say) means zero tags, and the title still applies. Blank
+///   lines are skipped first — line 2 is the second meaningful line.
+///   Tags are normalized (the shared rule) and structurally capped —
+///   at most `max_new_tags` tags absent from `corpus` survive.
+pub fn parse(
+  allow_pass: Bool,
+  corpus: List(String),
+  text: String,
+) -> Result(Verdict, Nil) {
+  let stripped = strip_code_fences(text)
+  case is_pass(collapse_whitespace(stripped)) {
+    True ->
+      case allow_pass {
+        True -> Ok(Pass)
+        False -> Error(Nil)
+      }
+    False ->
+      case reply_lines(stripped) {
+        [] -> Error(Nil)
+        [title_line, ..rest] ->
+          case shape_title(strip_label("title:", title_line)) {
+            "" -> Error(Nil)
+            title ->
+              Ok(
+                Title(title: title, tags: case rest {
+                  [tags_line, ..] -> parse_tags(corpus, tags_line)
+                  [] -> []
+                }),
+              )
           }
       }
   }
+}
+
+/// Split a reply into its meaningful lines: newlines normalized (the
+/// CRLF pair first — Erlang's `string:replace` does not match a lone
+/// "\r" inside "\r\n"), blank lines dropped EVERYWHERE (a blank line
+/// is not a protocol line: a model that pads one between the title and
+/// its tags still gets its tags parsed, and a trailing "\n" is not a
+/// tags line), then at most the first TWO lines — line 1 the title,
+/// line 2 the tags. Anything after line 2 is ignored (the protocol is
+/// two lines; extra prose is malformed, and tags are best-effort).
+fn reply_lines(text: String) -> List(String) {
+  text
+  |> string.replace("\r\n", "\n")
+  |> string.replace("\r", "\n")
+  |> string.split("\n")
+  // Blank lines are padding, not protocol — drop them wherever they
+  // sit, so the first two lines left are the title and the tags.
+  |> list.filter(fn(line) { string.trim(line) != "" })
+  |> list.take(2)
+}
+
+/// Strip a leading `Title:` / `Tags:` label (case-insensitive, optional
+/// whitespace after the colon) from one line — models like echoing the
+/// schema. Anything else passes through; a word that merely starts like
+/// the label without the colon ("Titleist clubs") is left alone.
+fn strip_label(label: String, line: String) -> String {
+  let line = string.trim(line)
+  let lowered = string.lowercase(line)
+  case string.starts_with(lowered, label) {
+    True ->
+      line
+      |> string.drop_start(string.length(label))
+      |> string.trim
+    False -> line
+  }
+}
+
+/// Parse the tags line (line 2) into the attempt's surviving tags:
+/// strip a leading `Tags:` label; a line that then opens like JSON
+/// (`[`, `{`, or `"`) is malformed and yields ZERO tags — the
+/// instruction demands plain text (§3.1: "No JSON"), and splitting a
+/// `["login", "bug"]` echo on commas would store bracketed, quoted
+/// fragments as display tags; otherwise split on commas, normalize
+/// each tag through the shared rule, drop empties and duplicates
+/// (first wins), then enforce the structural K cap — at most
+/// `max_new_tags` tags NOT present in `corpus` survive, in reply
+/// order. The per-session cap is NOT applied here: it governs the
+/// union with the existing display set (`merge_tags`), which only the
+/// registry can compute.
+pub fn parse_tags(corpus: List(String), line: String) -> List(String) {
+  let bare = string.trim(strip_label("tags:", line))
+  case opens_like_json(bare) {
+    True -> []
+    False -> parse_comma_tags(corpus, bare)
+  }
+}
+
+/// The plain-text branch of `parse_tags` (the line is known not to be
+/// JSON-shaped): split on commas, normalize each tag through the
+/// shared rule, drop empties and duplicates (first wins), then enforce
+/// the structural K cap — at most `max_new_tags` tags NOT present in
+/// `corpus` survive, in reply order.
+fn parse_comma_tags(corpus: List(String), bare: String) -> List(String) {
+  let corpus_keys = list.map(corpus, string.lowercase)
+  let #(kept, _new_count) =
+    normalize_tags(string.split(bare, ","))
+    |> list.fold(#([], 0), fn(acc, tag) {
+      let #(kept, new_count) = acc
+      case list.contains(corpus_keys, string.lowercase(tag)) {
+        // A corpus tag is reuse, not growth: always welcome.
+        True -> #([tag, ..kept], new_count)
+        False ->
+          case new_count < max_new_tags {
+            True -> #([tag, ..kept], new_count + 1)
+            False -> acc
+          }
+      }
+    })
+  list.reverse(kept)
+}
+
+/// A tags line that opens like JSON — `[`, `{`, or `"` after label
+/// strip and trim. The instruction demands plain text (§3.1: "No
+/// JSON"), so a structured echo is malformed, not vocabulary: the
+/// whole tags attempt yields zero tags, and the title still applies.
+fn opens_like_json(bare: String) -> Bool {
+  case bare {
+    "[" <> _ | "{" <> _ | "\"" <> _ -> True
+    _ -> False
+  }
+}
+
+/// The ONE tag normalization rule (utility-tags plan §3.1), shared by
+/// manual tag saves (`session_registry` delegates here) and model tags:
+/// trim, lowercase, collapse internal whitespace runs to a single `-`
+/// (kebab-case), drop empties and duplicates (first occurrence wins —
+/// insertion order is display order), truncate each tag at `tag_limit`.
+/// Normalized tags are therefore bounded, whitespace-free kebab strings
+/// — which is what keeps a corpus embedding in Y bounded by
+/// construction.
+pub fn normalize_tags(tags: List(String)) -> List(String) {
+  tags
+  |> list.map(normalize_tag)
+  |> list.filter(fn(tag) { tag != "" })
+  |> list.unique
+}
+
+fn normalize_tag(tag: String) -> String {
+  let kebab =
+    tag
+    |> string.trim
+    |> string.lowercase
+    |> collapse_whitespace
+    |> string.replace(" ", "-")
+  case string.length(kebab) > tag_limit {
+    True -> string.slice(kebab, 0, tag_limit)
+    False -> kebab
+  }
+}
+
+/// The model-tags merge into a session's display set (utility-tags plan
+/// §3.5 — what the registry's UpgradeAutoTitle applies): existing
+/// display entries pass through VERBATIM, never re-canonicalized (a
+/// legacy `Work Notes` stays `Work Notes`, so display − manual
+/// bookkeeping cannot manufacture a phantom auto tag); new model tags
+/// are normalized and appended when not already present (the presence
+/// check compares through the SAME normalization — the kebab shape —
+/// not bare lowercasing, so `Work Notes` and `work-notes` are one tag
+/// and do not duplicate); the union preserves existing order, appends
+/// the new, then truncates at `tags_per_session`.
+pub fn merge_tags(existing: List(String), new: List(String)) -> List(String) {
+  // The presence key is the full shared normalization (`normalize_tag`,
+  // below) — never the raw display spelling: only the comparison is
+  // canonicalized, so verbatim passthrough and no-duplicates hold
+  // together. New tags arrive already normalized, so they are their own
+  // keys.
+  let #(appended, _present) =
+    normalize_tags(new)
+    |> list.fold(#([], list.map(existing, normalize_tag)), fn(acc, tag) {
+      let #(appended, present) = acc
+      case list.contains(present, tag) {
+        True -> acc
+        False -> #([tag, ..appended], [tag, ..present])
+      }
+    })
+  // Existing entries keep their order VERBATIM; the appended arrive in
+  // reply order (the fold prepended, so reverse them); the union caps.
+  list.append(existing, list.reverse(appended))
+  |> list.take(tags_per_session)
 }
 
 /// The PASS sentinel test: exact match on the shaped reply, case
@@ -213,6 +452,7 @@ pub fn run(
   base_opts: Options,
   cancel: Subject(Nil),
   allow_pass: Bool,
+  corpus: List(String),
 ) -> Result(Verdict, String) {
   // The stream feed runs synchronously in THIS process, so fragments land
   // in this subject's mailbox and are drained after the call returns.
@@ -220,7 +460,7 @@ pub fn run(
   let outcome =
     openai.stream_with_cancel(
       endpoint,
-      prepare(tr, allow_pass),
+      prepare(tr, allow_pass, corpus),
       options(base_opts),
       fn(event) {
         case event {
@@ -247,7 +487,7 @@ pub fn run(
               }
             })
             |> string.concat
-            |> parse(allow_pass, _)
+            |> parse(allow_pass, corpus, _)
           {
             Ok(verdict) -> Ok(verdict)
             Error(Nil) -> Error("no usable title in utility reply")

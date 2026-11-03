@@ -139,6 +139,47 @@ where id = $1
   |> pog.execute(db)
 }
 
+/// Model metadata upgrade (utility-tags plan §3.6): ONE update guarded
+/// by BOTH provenance columns — it lands only while title_source AND
+/// tags_source are 'auto' together. The refusal is whole-update, not
+/// per-side: a manual rename OR a manual tag edit each closes the
+/// ENTIRE auto path forever (neither column ever returns to 'auto'),
+/// and a manual save racing an in-flight apply is refused here
+/// atomically. Twin of the registry's in-memory UpgradeAutoTitle guard.
+/// Rowcount is the guard outcome.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn auto_meta_upgrade(
+  db: pog.Connection,
+  arg_1: String,
+  id: String,
+  tags: List(String),
+) -> Result(pog.Returned(Nil), pog.QueryError) {
+  let decoder = decode.map(decode.dynamic, fn(_) { Nil })
+
+  "-- Model metadata upgrade (utility-tags plan §3.6): ONE update guarded
+-- by BOTH provenance columns — it lands only while title_source AND
+-- tags_source are 'auto' together. The refusal is whole-update, not
+-- per-side: a manual rename OR a manual tag edit each closes the
+-- ENTIRE auto path forever (neither column ever returns to 'auto'),
+-- and a manual save racing an in-flight apply is refused here
+-- atomically. Twin of the registry's in-memory UpgradeAutoTitle guard.
+-- Rowcount is the guard outcome.
+update session set title = $1, tags = $3
+where id = $2
+  and title_source = 'auto'
+  and tags_source = 'auto'
+"
+  |> pog.query
+  |> pog.parameter(pog.text(arg_1))
+  |> pog.parameter(pog.text(id))
+  |> pog.parameter(pog.array(fn(value) { pog.text(value) }, tags))
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
 /// Auto-title only while the title is still the untouched auto default.
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
@@ -154,35 +195,6 @@ pub fn auto_title(
   "-- Auto-title only while the title is still the untouched auto default.
 update session set title = $1
 where id = $2 and title_source = 'auto' and title = ''
-"
-  |> pog.query
-  |> pog.parameter(pog.text(title))
-  |> pog.parameter(pog.text(id))
-  |> pog.returning(decoder)
-  |> pog.execute(db)
-}
-
-/// Model-title upgrade (utility-titles plan §4.4): the guard is provenance
-/// ONLY — the heuristic placeholder may be upgraded while the title is still
-/// auto-generated; a manual rename wins forever. Twin of the registry's
-/// in-memory UpgradeAutoTitle guard.
-///
-/// > 🐿️ This function was generated automatically using v4.7.0 of
-/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
-///
-pub fn auto_title_upgrade(
-  db: pog.Connection,
-  title: String,
-  id: String,
-) -> Result(pog.Returned(Nil), pog.QueryError) {
-  let decoder = decode.map(decode.dynamic, fn(_) { Nil })
-
-  "-- Model-title upgrade (utility-titles plan §4.4): the guard is provenance
--- ONLY — the heuristic placeholder may be upgraded while the title is still
--- auto-generated; a manual rename wins forever. Twin of the registry's
--- in-memory UpgradeAutoTitle guard.
-update session set title = $1
-where id = $2 and title_source = 'auto'
 "
   |> pog.query
   |> pog.parameter(pog.text(title))
@@ -390,13 +402,17 @@ pub type GetSessionRow {
     pinned: Bool,
     archived: Bool,
     tags: List(String),
+    tags_manual: List(String),
+    tags_source: String,
     created_s: Int,
     last_active_s: Int,
     message_count: Int,
   )
 }
 
-/// One stored session row (lazy hydration of a dormant session).
+/// One stored session row (lazy hydration of a dormant session). The
+/// provenance columns ride along (utility-tags plan §3.5): rehydration
+/// must never lack them.
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
@@ -415,9 +431,11 @@ pub fn get_session(
     use pinned <- decode.field(6, decode.bool)
     use archived <- decode.field(7, decode.bool)
     use tags <- decode.field(8, decode.list(decode.string))
-    use created_s <- decode.field(9, decode.int)
-    use last_active_s <- decode.field(10, decode.int)
-    use message_count <- decode.field(11, decode.int)
+    use tags_manual <- decode.field(9, decode.list(decode.string))
+    use tags_source <- decode.field(10, decode.string)
+    use created_s <- decode.field(11, decode.int)
+    use last_active_s <- decode.field(12, decode.int)
+    use message_count <- decode.field(13, decode.int)
     decode.success(GetSessionRow(
       id:,
       provider_id:,
@@ -428,13 +446,17 @@ pub fn get_session(
       pinned:,
       archived:,
       tags:,
+      tags_manual:,
+      tags_source:,
       created_s:,
       last_active_s:,
       message_count:,
     ))
   }
 
-  "-- One stored session row (lazy hydration of a dormant session).
+  "-- One stored session row (lazy hydration of a dormant session). The
+-- provenance columns ride along (utility-tags plan §3.5): rehydration
+-- must never lack them.
 select
   id,
   provider_id,
@@ -445,6 +467,8 @@ select
   pinned,
   (archived_at is not null) as archived,
   tags,
+  tags_manual,
+  tags_source,
   extract(epoch from created_at)::int8 as created_s,
   extract(epoch from last_active_at)::int8 as last_active_s,
   message_count
@@ -501,6 +525,9 @@ values ($1, $2, $3, nullif($4, ''::bytea), $5, $6, $7, to_timestamp($8), to_time
 /// A new session row: created/last_active from the registry's epoch
 /// seconds; message_count is the transcript length (1 = system prompt).
 /// provider_id is frozen at creation with the model (contract rule 2).
+/// tags_manual is '{}' literally and tags_source is left to its column
+/// default 'auto' (utility-tags plan §3.5): a new session has no tags and
+/// an open auto path.
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
@@ -523,8 +550,11 @@ pub fn insert_session(
   "-- A new session row: created/last_active from the registry's epoch
 -- seconds; message_count is the transcript length (1 = system prompt).
 -- provider_id is frozen at creation with the model (contract rule 2).
-insert into session (id, provider_id, title, title_source, model, system_prompt, pinned, tags, created_at, last_active_at, message_count)
-values ($1, $2, $3, $4, $5, $6, $7, $8, to_timestamp($9), to_timestamp($9), $10)
+-- tags_manual is '{}' literally and tags_source is left to its column
+-- default 'auto' (utility-tags plan §3.5): a new session has no tags and
+-- an open auto path.
+insert into session (id, provider_id, title, title_source, model, system_prompt, pinned, tags, tags_manual, created_at, last_active_at, message_count)
+values ($1, $2, $3, $4, $5, $6, $7, $8, '{}', to_timestamp($9), to_timestamp($9), $10)
 "
   |> pog.query
   |> pog.parameter(pog.text(arg_1))
@@ -631,6 +661,8 @@ pub type ListSummariesRow {
     pinned: Bool,
     archived: Bool,
     tags: List(String),
+    tags_manual: List(String),
+    tags_source: String,
     created_s: Int,
     last_active_s: Int,
     message_count: Int,
@@ -638,6 +670,8 @@ pub type ListSummariesRow {
 }
 
 /// All stored session summaries, ordered by id (the registry re-sorts).
+/// The provenance columns ride along (utility-tags plan §3.5): the boot
+/// load must never lack them.
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
@@ -654,9 +688,11 @@ pub fn list_summaries(
     use pinned <- decode.field(5, decode.bool)
     use archived <- decode.field(6, decode.bool)
     use tags <- decode.field(7, decode.list(decode.string))
-    use created_s <- decode.field(8, decode.int)
-    use last_active_s <- decode.field(9, decode.int)
-    use message_count <- decode.field(10, decode.int)
+    use tags_manual <- decode.field(8, decode.list(decode.string))
+    use tags_source <- decode.field(9, decode.string)
+    use created_s <- decode.field(10, decode.int)
+    use last_active_s <- decode.field(11, decode.int)
+    use message_count <- decode.field(12, decode.int)
     decode.success(ListSummariesRow(
       id:,
       provider_id:,
@@ -666,6 +702,8 @@ pub fn list_summaries(
       pinned:,
       archived:,
       tags:,
+      tags_manual:,
+      tags_source:,
       created_s:,
       last_active_s:,
       message_count:,
@@ -673,6 +711,8 @@ pub fn list_summaries(
   }
 
   "-- All stored session summaries, ordered by id (the registry re-sorts).
+-- The provenance columns ride along (utility-tags plan §3.5): the boot
+-- load must never lack them.
 select
   id,
   provider_id,
@@ -682,6 +722,8 @@ select
   pinned,
   (archived_at is not null) as archived,
   tags,
+  tags_manual,
+  tags_source,
   extract(epoch from created_at)::int8 as created_s,
   extract(epoch from last_active_at)::int8 as last_active_s,
   message_count
@@ -847,24 +889,32 @@ where id = $2
   |> pog.execute(db)
 }
 
-/// Runs the `set_tags` query
-/// defined in `./src/nexus/store/sql/set_tags.sql`.
+/// The manual tags save (utility-tags plan §3.5): the user's exact set
+/// becomes the display set AND the manual set, and the row's auto path
+/// closes — one statement, so the freeze itself is atomic (all three
+/// fields or nothing; the tags_source flip is what auto_meta_upgrade's
+/// guard reads).
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
 ///
 pub fn set_tags(
   db: pog.Connection,
-  tags: List(String),
+  arg_1: List(String),
   id: String,
 ) -> Result(pog.Returned(Nil), pog.QueryError) {
   let decoder = decode.map(decode.dynamic, fn(_) { Nil })
 
-  "update session set tags = $1
+  "-- The manual tags save (utility-tags plan §3.5): the user's exact set
+-- becomes the display set AND the manual set, and the row's auto path
+-- closes — one statement, so the freeze itself is atomic (all three
+-- fields or nothing; the tags_source flip is what auto_meta_upgrade's
+-- guard reads).
+update session set tags = $1, tags_manual = $1, tags_source = 'manual'
 where id = $2
 "
   |> pog.query
-  |> pog.parameter(pog.array(fn(value) { pog.text(value) }, tags))
+  |> pog.parameter(pog.array(fn(value) { pog.text(value) }, arg_1))
   |> pog.parameter(pog.text(id))
   |> pog.returning(decoder)
   |> pog.execute(db)
