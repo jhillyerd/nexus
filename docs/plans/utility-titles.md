@@ -105,9 +105,14 @@ Pure request/parse helpers plus one runner — no actor of its own:
 - `prepare(tr, allow_pass) -> Transcript` —
   `transcript.append_user(tr, instruction(allow_pass))`.
 - `options(base) -> Options` — the loop's Options with exactly one
-  delta: `max_completion_tokens: Some(64)`. Generation-side params do
-  not affect the tokenized prompt (llm-api skill §3.3), so the prefix
-  is untouched; the cap bounds cost and rambling.
+  delta: `max_completion_tokens`. Generation-side params do not
+  affect the tokenized prompt (llm-api skill §3.3), so the prefix is
+  untouched; the cap bounds cost and rambling. *(Designed as
+  `Some(64)`; shipped as `Some(512)` — `utility.utility_token_cap`,
+  raised with the tags pass: reasoning models emit their chain of
+  thought INSIDE the completion budget, so a tight cap lets a thinking
+  model exhaust it before any title text arrives, wasting the
+  session's only attempt.)*
 - `parse(allow_pass, text) -> Result(Verdict, Nil)` — trim, strip
   Markdown code fences, collapse whitespace, and cap length with the
   same rule as `title_from_first_message`; reject empty (a refusal
@@ -386,8 +391,9 @@ request; until then Y stays title-only.
   and since the tags pass also the two-line reply landing live (title
   upgrade, inert tag chips, manual-freeze beating a held in-flight
   apply). The llama.cpp-alias live branch scenario (utility request ≈
-  near-full `cached_tokens` hit) never became a separate check: the
-  integration smoke's cache gate (warm/cold TTFT median ratio ≤ 0.3)
-  covers the shared-prefix mechanics the branch relies on, and the
-  branch's byte contract is pinned offline by `test/m3_prefix_test.gleam`
-  and `test/utility_test.gleam`.
+  near-full `cached_tokens` hit) is **unverified**: the integration
+  smoke's cache gate never sends a utility request — it exercises the
+  shared-prefix mechanics the branch relies on via ordinary turns
+  (warm/cold TTFT median ratio ≤ 0.3) — so the branch's LIVE reuse
+  remains an open item, while its byte contract is pinned offline by
+  `test/m3_prefix_test.gleam` and `test/utility_test.gleam`.

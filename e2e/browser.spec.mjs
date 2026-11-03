@@ -117,11 +117,11 @@ function eq(actual, expected, message) {
   }
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 /// Poll a locator-based predicate. Raw `document.*` queries cannot pierce
 /// the component's shadow root; Playwright locators can — so every DOM
 /// predicate in this suite goes through locators.
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
 async function poll(fn, { timeout = 30_000, interval = 250, message = "poll" } = {}) {
   const deadline = Date.now() + timeout;
   let lastErr = null;
@@ -668,8 +668,39 @@ async function main() {
           ).length >= 1,
         { timeout: 15_000, message: "utility branch request recorded" },
       );
+      // The premise must be OBSERVED, not assumed: poll the API until
+      // both manual saves are visible (the tags save is the later one)
+      // and remember WHEN. That timestamp must beat the held reply's
+      // completion — proving the freeze was really in place while the
+      // apply was still in flight; if a run ever loses that race, fail
+      // here rather than passing vacuously afterwards.
+      const manualAt = await poll(
+        async () => {
+          const s = (
+            await (await page.request.get(`${base}/sessions`, { headers })).json()
+          ).sessions.find((x) => x.model === "smart");
+          return s &&
+            s.title_source === "manual" &&
+            s.title === "Renamed session" &&
+            s.tags.join(",") === "ops,infra"
+            ? Date.now()
+            : false;
+        },
+        {
+          timeout: 15_000,
+          message: "manual title + tags saved while the reply is held",
+        },
+      );
       // Outlast the held reply plus the worker's parse/apply.
       await sleep(UTILITY_REPLY_DELAY_MS + 2000);
+      const reply = services.utilityTimeline[0];
+      assert(reply?.completedAt, "held reply timeline recorded");
+      assert(
+        manualAt < reply.completedAt,
+        `manual save (${manualAt}) must precede the held reply's completion ` +
+          `(${reply.completedAt}) — this run did not stage the race; ` +
+          `increase UTILITY_REPLY_DELAY_MS`,
+      );
       const smart = (
         await (await page.request.get(`${base}/sessions`, { headers })).json()
       ).sessions.find((s) => s.model === "smart");

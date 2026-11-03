@@ -23,7 +23,7 @@ export const UTILITY_REPLY_DELAY_MS = 4000;
 
 export function startServices() {
   return new Promise((resolve, reject) => {
-    const state = { requests: [] };
+    const state = { requests: [], utilityTimeline: [] };
 
     const doc = createServer((req, res) => {
       const url = new URL(req.url, "http://127.0.0.1");
@@ -105,6 +105,7 @@ export function startServices() {
             searxPort: searx.address().port,
             bifrostPort: bifrost.address().port,
             requests: state.requests,
+            utilityTimeline: state.utilityTimeline,
             close: () =>
               Promise.all(
                 servers.map(
@@ -210,6 +211,12 @@ async function playScenario(res, request, state) {
   // manual tag set before the apply lands (the store guard must then
   // refuse it).
   if (request.max_completion_tokens === 512) {
+    // Timeline entry: when the branch request arrived and when its held
+    // reply finished streaming. The freeze test uses the pair to prove
+    // the manual tag save really preceded the apply (the premise of the
+    // race it stages) instead of assuming the ordering.
+    const timing = { requestedAt: Date.now(), completedAt: null };
+    state.utilityTimeline.push(timing);
     await sleep(UTILITY_REPLY_DELAY_MS);
     sse(res, chunk({ role: "assistant", content: "" }));
     await streamText("Fix login redirect loop");
@@ -217,6 +224,7 @@ async function playScenario(res, request, state) {
     await streamText("<script>alert('utility tag')</script>, login, bug, auth");
     sse(res, chunk({}, "stop"));
     finish();
+    timing.completedAt = Date.now();
     return;
   }
 

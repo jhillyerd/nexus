@@ -250,8 +250,11 @@ session actor and existing fakes are untouched by corpus plumbing.
   ```
 
   Rowcount is the guard outcome — the same shape as today, now guarding
-  both provenance columns so a manual tag edit closes the tag side of the
-  auto path even while the title side stays open. The registry computed
+  both provenance columns. The refusal is whole-update: ONE statement
+  applies title AND tags, so a manual rename OR a manual tag edit
+  refuses the entire apply — there is no per-side landing (the
+  2026-11-01 review round's clarification; the SQL comment and the
+  registry twin say the same). The registry computed
   the union, so the SQL stores exactly what the memory holds
   (twin-invariant).
 - `set_tags.sql` writes all three fields in one statement:
