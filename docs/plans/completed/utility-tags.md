@@ -1,11 +1,19 @@
 ---
 title: Nexus — model-generated session tags via the utility branch
-status: draft
+status: completed
 tags: [nexus, tags, kv-cache, utility]
-updated: 2026-11-01
+updated: 2026-11-03
 ---
 
 # Nexus: model-generated session tags via the utility branch
+
+> **Landed 2026-11-03** (P2–P5; see §7 for the phase record). Everything
+> below shipped as designed, including the offline suite and the e2e
+> browser coverage. The one deferred piece is **P6** (the refresh
+> policy), which stays gated on `SetTags` becoming a durable write
+> (reject-on-failure or retry) per §3.5/§6 — until then a persisted
+> `tags_source` can lag an in-memory manual freeze, which a refresh
+> policy would wrongly read as permission.
 
 Design for the deferred tags pass of `docs/plans/utility-titles.md` §7:
 model-generated tags ride the **same** once-per-session prefix-cache branch
@@ -242,8 +250,11 @@ session actor and existing fakes are untouched by corpus plumbing.
   ```
 
   Rowcount is the guard outcome — the same shape as today, now guarding
-  both provenance columns so a manual tag edit closes the tag side of the
-  auto path even while the title side stays open. The registry computed
+  both provenance columns. The refusal is whole-update: ONE statement
+  applies title AND tags, so a manual rename OR a manual tag edit
+  refuses the entire apply — there is no per-side landing (the
+  2026-11-01 review round's clarification; the SQL comment and the
+  registry twin say the same). The registry computed
   the union, so the SQL stores exactly what the memory holds
   (twin-invariant).
 - `set_tags.sql` writes all three fields in one statement:
@@ -350,9 +361,15 @@ carry everything.
 - **Migration idempotency, live**: run `gleam run -m nexus/store/migrate`
   twice against the dev DB — the second run must be a no-op.
 
-Live/e2e: `e2e/browser.spec.mjs` — the fake model's utility reply becomes
-two-line so chips appear; the utility-branch prefix assertions stay
-byte-exact.
+Live/e2e: `e2e/browser.spec.mjs` — the fake model's utility reply is
+**landed** as the two-line form (line 1 title, line 2 comma-separated
+tags, held in flight a few seconds so the suite can stage the manual
+freeze): the suite asserts the model tags land as sidebar chips —
+rendered as inert text nodes, `<script>` payload included — that a
+manual tags save freezes the set so the racing apply is refused, and
+that the utility-branch prefix assertions (suffix-only growth, envelope
+delta exactly `max_completion_tokens`) hold byte-exact against the
+corpus-carrying Y.
 
 ## 6. Risks and open questions
 
@@ -389,17 +406,17 @@ byte-exact.
 
 ## 7. Roadmap
 
-- **P1 (this pass)**: this design doc.
-- **P2**: schema (`tags_manual` + `tags_source` + DO block) and store
-  (queries, seam, `squirrel` regen).
-- **P3**: registry (`UpgradeAutoTitle` + tags merge under the two-column
-  guard, `SetTags` triple-write, `TagCorpus`, `normalize_tags`
-  extension), utility module (two-line instruction/parse, corpus),
-  session actor (`UtilityApply` arity).
-- **P4**: offline verification suite (§5).
-- **P5**: e2e browser fake two-line reply; `utility-titles.md` §7/§9
-  updated to record the landed shape.
-- **P6 (future, gated)**: refresh policy per §1 — requires no schema
-  migration, but is BLOCKED on `SetTags` becoming a durable write
-  (reject-on-failure or retry) so `tags_source = 'manual'` can never lag
-  the row a refresh would read.
+- **P1** (landed 2026-11-01): this design doc.
+- **P2** (landed 2026-11-02): schema (`tags_manual` + `tags_source` + DO
+  block) and store (queries, seam, `squirrel` regen).
+- **P3** (landed 2026-11-02): registry (`UpgradeAutoTitle` + tags merge
+  under the two-column guard, `SetTags` triple-write, `TagCorpus`,
+  `normalize_tags` extension), utility module (two-line
+  instruction/parse, corpus), session actor (`UtilityApply` arity).
+- **P4** (landed 2026-11-03): offline verification suite (§5).
+- **P5** (landed 2026-11-03): e2e browser fake two-line reply + manual
+  freeze; `utility-titles.md` §7/§9 updated to record the landed shape.
+- **P6 (future, gated — not implemented)**: refresh policy per §1 —
+  requires no schema migration, but is BLOCKED on `SetTags` becoming a
+  durable write (reject-on-failure or retry) so `tags_source = 'manual'`
+  can never lag the row a refresh would read (§3.5, §6).

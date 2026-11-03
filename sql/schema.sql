@@ -90,10 +90,11 @@ CREATE TABLE IF NOT EXISTS session_message (
 -- TABLE above already includes it for fresh ones; both are idempotent).
 ALTER TABLE session_message ADD COLUMN IF NOT EXISTS reasoning text;
 
--- Tags provenance columns (docs/plans/utility-tags.md §3.4), added for
--- databases created before they existed. Both live in ONE DO block whose
--- pg_attribute checks make re-runs no-ops (the migrate runner's splitter
--- understands $$-quoted bodies, so the inner `;` stay inside the
+-- Tags provenance columns (docs/plans/completed/utility-tags.md §3.4),
+-- added for databases created before they existed. Both live in ONE DO
+-- block whose pg_attribute checks make re-runs no-ops (the migrate
+-- runner's splitter understands $$-quoted bodies, so the inner `;` stay
+-- inside the
 -- statement):
 --
 -- - `tags_manual text[] NOT NULL DEFAULT '{}'` — the user's exact set.

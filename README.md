@@ -12,7 +12,10 @@ hydrate-on-boot, lazy start, write-behind commits). See
 `docs/plans/completed/m3-verification.md`. Schema naming and the schema
 invariants are in `AGENTS.md`.
 The multi-provider rollout is documented in
-`docs/plans/completed/multi-provider.md`.
+`docs/plans/completed/multi-provider.md`. Model-generated session
+titles and tags ride one prefix-cache "utility branch" — designed in
+`docs/plans/utility-titles.md`, with the tags pass landed per
+`docs/plans/completed/utility-tags.md`.
 
 ## Development
 

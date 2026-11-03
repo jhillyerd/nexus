@@ -14,9 +14,16 @@
 
 import { createServer } from "node:http";
 
+/// How long the fake holds a utility-branch reply before streaming it.
+/// The browser suite stages a manual tag save inside this window so the
+/// registry/store both-provenance guard must refuse the late model apply
+/// (the freeze test) — the plain happy path just applies after it. Well
+/// under the server's SSE idle timeout, so the held stream never trips it.
+export const UTILITY_REPLY_DELAY_MS = 4000;
+
 export function startServices() {
   return new Promise((resolve, reject) => {
-    const state = { requests: [] };
+    const state = { requests: [], utilityTimeline: [] };
 
     const doc = createServer((req, res) => {
       const url = new URL(req.url, "http://127.0.0.1");
@@ -98,6 +105,7 @@ export function startServices() {
             searxPort: searx.address().port,
             bifrostPort: bifrost.address().port,
             requests: state.requests,
+            utilityTimeline: state.utilityTimeline,
             close: () =>
               Promise.all(
                 servers.map(
@@ -189,6 +197,36 @@ async function playScenario(res, request, state) {
     res.write("data: [DONE]\n\n");
     res.end();
   };
+
+  // Nexus's once-per-session utility branch (utility-titles plan §4.1,
+  // utility-tags plan §3.1): the request is a session's frozen turn
+  // envelope plus exactly one generation-side delta —
+  // max_completion_tokens: 512, browser.spec.mjs's UTILITY_DELTA — so
+  // that is how the fake recognizes it. The scripted reply speaks the
+  // two-line protocol: line 1 the title, line 2 a comma-separated tag
+  // list LED by a <script> payload tag so the suite can prove the UI
+  // renders model tags as inert text nodes (the parser keeps the first
+  // two corpus-absent tags — the K cap — so the payload must come first
+  // to land). Held for UTILITY_REPLY_DELAY_MS so the suite can save a
+  // manual tag set before the apply lands (the store guard must then
+  // refuse it).
+  if (request.max_completion_tokens === 512) {
+    // Timeline entry: when the branch request arrived and when its held
+    // reply finished streaming. The freeze test uses the pair to prove
+    // the manual tag save really preceded the apply (the premise of the
+    // race it stages) instead of assuming the ordering.
+    const timing = { requestedAt: Date.now(), completedAt: null };
+    state.utilityTimeline.push(timing);
+    await sleep(UTILITY_REPLY_DELAY_MS);
+    sse(res, chunk({ role: "assistant", content: "" }));
+    await streamText("Fix login redirect loop");
+    sse(res, chunk({ content: "\n" }));
+    await streamText("<script>alert('utility tag')</script>, login, bug, auth");
+    sse(res, chunk({}, "stop"));
+    finish();
+    timing.completedAt = Date.now();
+    return;
+  }
 
   switch (scenario) {
     case "text": {

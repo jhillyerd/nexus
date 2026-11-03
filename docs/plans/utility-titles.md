@@ -105,9 +105,14 @@ Pure request/parse helpers plus one runner — no actor of its own:
 - `prepare(tr, allow_pass) -> Transcript` —
   `transcript.append_user(tr, instruction(allow_pass))`.
 - `options(base) -> Options` — the loop's Options with exactly one
-  delta: `max_completion_tokens: Some(64)`. Generation-side params do
-  not affect the tokenized prompt (llm-api skill §3.3), so the prefix
-  is untouched; the cap bounds cost and rambling.
+  delta: `max_completion_tokens`. Generation-side params do not
+  affect the tokenized prompt (llm-api skill §3.3), so the prefix is
+  untouched; the cap bounds cost and rambling. *(Designed as
+  `Some(64)`; shipped as `Some(512)` — `utility.utility_token_cap`,
+  reasoning models emit their chain of thought INSIDE the completion budget, so a tight cap lets a thinking
+  thought INSIDE the completion budget, so a tight cap lets a thinking
+  model exhaust it before any title text arrives, wasting the
+  session's only attempt.)*
 - `parse(allow_pass, text) -> Result(Verdict, Nil)` — trim, strip
   Markdown code fences, collapse whitespace, and cap length with the
   same rule as `title_from_first_message`; reject empty (a refusal
@@ -294,12 +299,25 @@ cache gate with the branch scenario — utility request ≈ near-full
 `cached_tokens` hit; the post-branch user turn still hits the
 pre-utility prefix.
 
-## 7. Deferred: tags (design now, implement later)
+## 7. Tags (landed — see `docs/plans/completed/utility-tags.md`)
 
-> **2026-11-01**: the tags pass is now fully designed in
-> `docs/plans/utility-tags.md` (two-line reply, `title_source='auto'`
-> merge guard, in-memory `TagCorpus`, `tags_manual` provenance column).
-> The sketch below is the historical record of the planning decision.
+> **2026-11-03**: the tags pass landed (its P2–P5). Tags ride the SAME
+> utility branch as the title — one instruction Y, one request, one
+> branch — with the shape the utility-tags plan settled out of the
+> sketch below: a **two-line plain-text reply** (line 1 title, line 2
+> comma-separated tags; no JSON), a **merge-not-clobber** apply unioning
+> model tags into the display set behind TWO provenance columns
+> (`tags_manual` — the user's exact set — and `tags_source`, mirroring
+> `title_source`; one guarded store call, `auto_meta_upgrade`, applies
+> title + tags only while BOTH sources are `'auto'`, so a manual rename
+> or a manual tag edit atomically closes the auto path against a racing
+> apply), structural caps (≤ 2 corpus-absent new tags per attempt,
+> ≤ 5 tags per session, 24 chars per tag through the one shared
+> `normalize_tags` rule), and an in-memory **corpus** (top 30 tags by
+> session count, frequency floor ≥ 2 sessions, normalize-before-count,
+> no SQL) steering reuse. Still deferred: the refresh policy (that
+> plan's P6), gated on `SetTags` becoming a durable write. The sketch
+> below is the historical planning record.
 
 Policy (planning decision): **merge** — model tags are unioned into
 manual tags, so manual tags are never clobbered. Provenance is
@@ -362,5 +380,20 @@ request; until then Y stays title-only.
   `UpgradeAutoTitle`; `auto_title_upgrade.sql` + store wiring;
   `MetaUpdated` event + UI refresh; config knobs.
 - **P3**: offline verification suite (§6).
-- **P4** (later): tags per §7 — designed in `docs/plans/utility-tags.md`.
-- **P5** (later): e2e cache-branch scenario on the llama.cpp alias.
+- **P4** (landed 2026-11-03): tags per §7 — designed and implemented by
+  `docs/plans/completed/utility-tags.md` (schema + store, registry
+  merge under the two-column guard, utility module + corpus, offline
+  suite, e2e).
+- **P5** (landed, controlled half): the browser suite pins the branch
+  contract against the recording fake — every utility request extends
+  its session's committed transcript by suffix only, with an envelope
+  delta of exactly `max_completion_tokens: 512` at the documented spot —
+  and since the tags pass also the two-line reply landing live (title
+  upgrade, inert tag chips, manual-freeze beating a held in-flight
+  apply). The llama.cpp-alias live branch scenario (utility request ≈
+  near-full `cached_tokens` hit) is **unverified**: the integration
+  smoke's cache gate never sends a utility request — it exercises the
+  shared-prefix mechanics the branch relies on via ordinary turns
+  (warm/cold TTFT median ratio ≤ 0.3) — so the branch's LIVE reuse
+  remains an open item, while its byte contract is pinned offline by
+  `test/m3_prefix_test.gleam` and `test/utility_test.gleam`.

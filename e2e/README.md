@@ -26,7 +26,12 @@ text-only turn, stop mid-stream with partial commit, `http_fetch` and
 compact result preview, no script injection), iteration chip, reload →
 replay of the complete tool history as completed cards, iteration-guard
 terminal rendering, byte-identical request-prefix growth per session
-(including after title/tag/pin/archive mutations), a full
+(including after title/tag/pin/archive mutations) plus the utility
+branch's own contract (the once-per-session title+tags side call:
+suffix-only branch growth off the committed transcript, envelope delta
+exactly `max_completion_tokens`, the two-line reply landing as inert
+tag chips, and a manual tags save freezing the set against the racing
+model apply), a full
 session-organization pass (auto-title from the first message, manual rename,
 tag chips + filter, pin to the pinned section, archive/restore behind the
 toggle, two-step delete), the connection dot going red while the backend is
