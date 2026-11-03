@@ -3,8 +3,17 @@
 //// ignoring semicolons inside quotes and comments — the trap for future
 //// `DO $$ ... $$` blocks, `CREATE FUNCTION` bodies, and literals.
 
+import gleam/bit_array
+import gleam/list
+import gleam/string
 import gleeunit/should
 import nexus/store/migrate
+
+/// Same test-only file read the M3 golden prefix test uses (fixtures
+/// and repo files are read relative to the repo root, where `gleam
+/// test` runs).
+@external(erlang, "nexus_loop_test_ffi", "read_file")
+fn read_file(path: String) -> BitArray
 
 pub fn splits_top_level_semicolons_test() {
   migrate.statements("create table a (x int); create table b (y int);")
@@ -164,62 +173,23 @@ pub fn uescape_string_test() {
 
 /// The utility-tags schema shape (§3.4): the two provenance columns
 /// land in ONE `do $$ … $$` block whose `pg_attribute` existence checks
-/// make re-runs no-ops. This is the exact statement shape of
-/// `sql/schema.sql` — single-quoted literals (`'session'`, `'{}'`,
-/// `'auto'`), `::regclass` casts, `text[]` defaults, nested `if not
-/// exists` — and it must survive the splitter as ONE statement so the
-/// inner `;` never split it.
+/// make re-runs no-ops. The REAL `sql/schema.sql` runs through the
+/// splitter — not a pasted copy, which could drift from the schema
+/// without failing this test. The `attname = 'tags_manual'` probe is
+/// unique to the DO block; that one statement must also carry
+/// `tags_source` (the inner `;` never split it), and splitting must
+/// resume after the closing `$$` (the rest of the schema still arrives
+/// statement by statement).
 pub fn tags_provenance_do_block_is_one_statement_test() {
-  migrate.statements(
-    "do $$
-begin
-  if not exists (
-    select 1 from pg_attribute
-    where attrelid = 'session'::regclass
-      and attname = 'tags_manual'
-      and not attisdropped
-  ) then
-    alter table session add column tags_manual text[] not null default '{}';
-    update session set tags_manual = tags;
-  end if;
-  if not exists (
-    select 1 from pg_attribute
-    where attrelid = 'session'::regclass
-      and attname = 'tags_source'
-      and not attisdropped
-  ) then
-    alter table session add column tags_source text not null default 'auto';
-    update session set tags_source = 'manual';
-  end if;
-end
-$$;
-select 2;",
-  )
-  |> should.equal([
-    "do $$
-begin
-  if not exists (
-    select 1 from pg_attribute
-    where attrelid = 'session'::regclass
-      and attname = 'tags_manual'
-      and not attisdropped
-  ) then
-    alter table session add column tags_manual text[] not null default '{}';
-    update session set tags_manual = tags;
-  end if;
-  if not exists (
-    select 1 from pg_attribute
-    where attrelid = 'session'::regclass
-      and attname = 'tags_source'
-      and not attisdropped
-  ) then
-    alter table session add column tags_source text not null default 'auto';
-    update session set tags_source = 'manual';
-  end if;
-end
-$$",
-    "select 2",
-  ])
+  let assert Ok(schema) = read_file("sql/schema.sql") |> bit_array.to_string
+  let statements = migrate.statements(schema)
+  let assert [block] =
+    list.filter(statements, fn(stmt) {
+      string.contains(stmt, "attname = 'tags_manual'")
+    })
+  should.be_true(string.contains(block, "do $$"))
+  should.be_true(string.contains(block, "attname = 'tags_source'"))
+  should.be_true(list.length(statements) > 1)
 }
 
 /// …and the one trap that shape adds beyond the existing `$$` coverage:

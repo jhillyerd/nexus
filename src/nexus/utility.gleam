@@ -15,7 +15,11 @@
 //// title still applies). No JSON — parsing stays string-shaping, which
 //// small local models fumble less than structured output. A leading
 //// `Title:` / `Tags:` label on either line is stripped (models like
-//// echoing the schema).
+//// echoing the schema). No JSON — parsing stays string-shaping, which
+//// small local models fumble less than structured output; a tags line
+//// that opens like JSON (`[`, `{`, `"`) is malformed and yields zero
+//// tags. Blank lines are not protocol lines: the title and the tags
+//// are the first two MEANINGFUL lines, however the model padded them.
 ////
 //// Tag vocabulary is shaped structurally, not just prompted: at most
 //// `max_new_tags` tags absent from the supplied corpus survive the
@@ -183,10 +187,11 @@ pub type Verdict {
 ///   whitespace, cap length with the same rule as
 ///   `title_from_first_message`, and reject empty (a refusal arrives as
 ///   no content, so it fails here too).
-/// - Line 2 is best-effort tags: absent or malformed means zero tags, and
-///   the title still applies. Tags are normalized (the shared rule) and
-///   structurally capped — at most `max_new_tags` tags absent from
-///   `corpus` survive.
+/// - Line 2 is best-effort tags: absent or malformed (a JSON-shaped
+///   echo, say) means zero tags, and the title still applies. Blank
+///   lines are skipped first — line 2 is the second meaningful line.
+///   Tags are normalized (the shared rule) and structurally capped —
+///   at most `max_new_tags` tags absent from `corpus` survive.
 pub fn parse(
   allow_pass: Bool,
   corpus: List(String),
@@ -219,20 +224,20 @@ pub fn parse(
 
 /// Split a reply into its meaningful lines: newlines normalized (the
 /// CRLF pair first — Erlang's `string:replace` does not match a lone
-/// "\r" inside "\r\n"), trailing blank lines dropped (a trailing "\n" is
-/// not a tags line), then at most the first TWO lines — line 1 the
-/// title, line 2 the tags. Anything after line 2 is ignored (the
-/// protocol is two lines; extra prose is malformed, and tags are
-/// best-effort).
+/// "\r" inside "\r\n"), blank lines dropped EVERYWHERE (a blank line
+/// is not a protocol line: a model that pads one between the title and
+/// its tags still gets its tags parsed, and a trailing "\n" is not a
+/// tags line), then at most the first TWO lines — line 1 the title,
+/// line 2 the tags. Anything after line 2 is ignored (the protocol is
+/// two lines; extra prose is malformed, and tags are best-effort).
 fn reply_lines(text: String) -> List(String) {
   text
   |> string.replace("\r\n", "\n")
   |> string.replace("\r", "\n")
   |> string.split("\n")
-  // Drop trailing blank lines (a trailing "\n" is not a tags line).
-  |> list.reverse
-  |> list.drop_while(fn(line) { string.trim(line) == "" })
-  |> list.reverse
+  // Blank lines are padding, not protocol — drop them wherever they
+  // sit, so the first two lines left are the title and the tags.
+  |> list.filter(fn(line) { string.trim(line) != "" })
   |> list.take(2)
 }
 
@@ -253,16 +258,34 @@ fn strip_label(label: String, line: String) -> String {
 }
 
 /// Parse the tags line (line 2) into the attempt's surviving tags:
-/// strip a leading `Tags:` label, split on commas, normalize each tag
-/// through the shared rule, drop empties and duplicates (first wins),
-/// then enforce the structural K cap — at most `max_new_tags` tags NOT
-/// present in `corpus` survive, in reply order. The per-session cap is
-/// NOT applied here: it governs the union with the existing display set
-/// (`merge_tags`), which only the registry can compute.
+/// strip a leading `Tags:` label; a line that then opens like JSON
+/// (`[`, `{`, or `"`) is malformed and yields ZERO tags — the
+/// instruction demands plain text (§3.1: "No JSON"), and splitting a
+/// `["login", "bug"]` echo on commas would store bracketed, quoted
+/// fragments as display tags; otherwise split on commas, normalize
+/// each tag through the shared rule, drop empties and duplicates
+/// (first wins), then enforce the structural K cap — at most
+/// `max_new_tags` tags NOT present in `corpus` survive, in reply
+/// order. The per-session cap is NOT applied here: it governs the
+/// union with the existing display set (`merge_tags`), which only the
+/// registry can compute.
 pub fn parse_tags(corpus: List(String), line: String) -> List(String) {
+  let bare = string.trim(strip_label("tags:", line))
+  case opens_like_json(bare) {
+    True -> []
+    False -> parse_comma_tags(corpus, bare)
+  }
+}
+
+/// The plain-text branch of `parse_tags` (the line is known not to be
+/// JSON-shaped): split on commas, normalize each tag through the
+/// shared rule, drop empties and duplicates (first wins), then enforce
+/// the structural K cap — at most `max_new_tags` tags NOT present in
+/// `corpus` survive, in reply order.
+fn parse_comma_tags(corpus: List(String), bare: String) -> List(String) {
   let corpus_keys = list.map(corpus, string.lowercase)
   let #(kept, _new_count) =
-    normalize_tags(string.split(strip_label("tags:", line), ","))
+    normalize_tags(string.split(bare, ","))
     |> list.fold(#([], 0), fn(acc, tag) {
       let #(kept, new_count) = acc
       case list.contains(corpus_keys, string.lowercase(tag)) {
@@ -276,6 +299,17 @@ pub fn parse_tags(corpus: List(String), line: String) -> List(String) {
       }
     })
   list.reverse(kept)
+}
+
+/// A tags line that opens like JSON — `[`, `{`, or `"` after label
+/// strip and trim. The instruction demands plain text (§3.1: "No
+/// JSON"), so a structured echo is malformed, not vocabulary: the
+/// whole tags attempt yields zero tags, and the title still applies.
+fn opens_like_json(bare: String) -> Bool {
+  case bare {
+    "[" <> _ | "{" <> _ | "\"" <> _ -> True
+    _ -> False
+  }
 }
 
 /// The ONE tag normalization rule (utility-tags plan §3.1), shared by

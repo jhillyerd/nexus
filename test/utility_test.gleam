@@ -404,6 +404,35 @@ pub fn parse_title_only_reply_and_empty_tags_line_test() {
   |> should.equal(Ok(utility.Title("Title Only", [])))
 }
 
+/// Blank lines are not protocol lines: the title and the tags line are
+/// the first two MEANINGFUL lines, however the model padded them — a
+/// blank line between the two must not swallow the tags.
+pub fn parse_skips_blank_lines_test() {
+  utility.parse(True, [], "Fix Login\n\nlogin, bug")
+  |> should.equal(Ok(utility.Title("Fix Login", ["login", "bug"])))
+  // Leading padding too: the title is still the first content line.
+  utility.parse(True, [], "\n\nFix Login\nTags: cache")
+  |> should.equal(Ok(utility.Title("Fix Login", ["cache"])))
+}
+
+/// A tags line that opens like JSON (`[`, `{`, or `"` after label
+/// strip) is malformed plain text (§3.1: "No JSON"): splitting it on
+/// commas would store bracketed, quoted fragments as display tags, so
+/// the whole tags attempt yields zero tags — the title still applies.
+pub fn parse_json_shaped_tags_line_yields_no_tags_test() {
+  utility.parse(True, [], "Fix Login\n[\"login\", \"bug\"]")
+  |> should.equal(Ok(utility.Title("Fix Login", [])))
+  // After a `Tags:` label too.
+  utility.parse(True, [], "Fix Login\nTags: [\"login\", \"bug\"]")
+  |> should.equal(Ok(utility.Title("Fix Login", [])))
+  // Quotes without brackets are just as JSON-shaped.
+  utility.parse(True, [], "Fix Login\n\"login\", \"bug\"")
+  |> should.equal(Ok(utility.Title("Fix Login", [])))
+  // An object echo is malformed the same way.
+  utility.parse(True, [], "Fix Login\n{\"tags\": [\"login\"]}")
+  |> should.equal(Ok(utility.Title("Fix Login", [])))
+}
+
 /// A leading `Title:` / `Tags:` label on either line is stripped
 /// (models like echoing the schema) — case-insensitive, and only with
 /// the colon, so a word that merely starts like the label survives.
