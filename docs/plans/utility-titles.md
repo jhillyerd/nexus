@@ -109,7 +109,7 @@ Pure request/parse helpers plus one runner — no actor of its own:
   affect the tokenized prompt (llm-api skill §3.3), so the prefix is
   untouched; the cap bounds cost and rambling. *(Designed as
   `Some(64)`; shipped as `Some(512)` — `utility.utility_token_cap`,
-  raised with the tags pass: reasoning models emit their chain of
+  reasoning models emit their chain of thought INSIDE the completion budget, so a tight cap lets a thinking
   thought INSIDE the completion budget, so a tight cap lets a thinking
   model exhaust it before any title text arrives, wasting the
   session's only attempt.)*
