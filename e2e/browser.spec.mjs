@@ -23,13 +23,18 @@
 //      connection (live model aliases), pick it in the create panel
 //      (aliases reload per provider), pin a session to it, stream a turn,
 //      and hit the delete/disable guard rails
+//  13. utility branch (utility-titles §4.1 / utility-tags §3.1): the
+//      model's two-line reply (line 1 title, line 2 tags) lands through
+//      the auto path as sidebar chips — inert text nodes, <script>
+//      payloads included — while a manual tags save freezes the set so
+//      the racing model apply is refused by the both-provenance guard
 //
 // Usage: node e2e/browser.spec.mjs   (see e2e/README.md)
 
 import { spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { chromium } from "playwright";
-import { startServices } from "./services.mjs";
+import { startServices, UTILITY_REPLY_DELAY_MS } from "./services.mjs";
 
 const ROOT = new URL("..", import.meta.url).pathname;
 const TOKEN = "e2e-token";
@@ -115,6 +120,8 @@ function eq(actual, expected, message) {
 /// Poll a locator-based predicate. Raw `document.*` queries cannot pierce
 /// the component's shadow root; Playwright locators can — so every DOM
 /// predicate in this suite goes through locators.
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 async function poll(fn, { timeout = 30_000, interval = 250, message = "poll" } = {}) {
   const deadline = Date.now() + timeout;
   let lastErr = null;
@@ -638,6 +645,49 @@ async function main() {
       const after = await sessions();
       assert(!after.some((x) => x.id === fast.id), "deleted session gone from API");
       eq(after.length, 1, "only the smart session remains");
+    });
+
+    // -- 3c. utility tags: manual freeze refuses the racing apply --------
+    // The organize test's first exchange armed the smart session's
+    // once-per-session utility attempt; the branch request left at the
+    // debounce and the fake HOLDS its reply UTILITY_REPLY_DELAY_MS, so
+    // the manual rename + tags save above had already flipped both
+    // provenance columns to 'manual' while the apply was still in
+    // flight. Wait the held reply out: the store's both-column guard
+    // (auto_meta_upgrade) must refuse the late apply — title AND tags
+    // stay exactly the manual set (utility-tags plan §3.5).
+    await test("utility: manual tags freeze refuses the racing model apply", async () => {
+      const headers = { authorization: `Bearer ${TOKEN}` };
+      // The smart session's is the suite's FIRST utility request — its
+      // exchange is the first committed turn of the run (the guard and
+      // ui-made sessions have not sent one yet).
+      await poll(
+        async () =>
+          services.requests.filter(
+            (r) => r.url === "/v1/chat/completions" && r.body.includes(UTILITY_DELTA),
+          ).length >= 1,
+        { timeout: 15_000, message: "utility branch request recorded" },
+      );
+      // Outlast the held reply plus the worker's parse/apply.
+      await sleep(UTILITY_REPLY_DELAY_MS + 2000);
+      const smart = (
+        await (await page.request.get(`${base}/sessions`, { headers })).json()
+      ).sessions.find((s) => s.model === "smart");
+      eq(smart.title, "Renamed session", "manual title survived the utility apply");
+      eq(smart.title_source, "manual", "title still manual");
+      eq(smart.tags.join(","), "ops,infra", `manual tags survived the apply: ${smart.tags}`);
+      // The sidebar agrees: exactly the two manual chips — no model tag
+      // (hostile or plain) ever landed on the row.
+      const row = page.locator(`.session-row[data-session-id="${smart.id}"]`);
+      await poll(async () => (await row.locator(".tag-chip").count()) === 2, {
+        timeout: 10_000,
+        message: "exactly the two manual chips",
+      });
+      const chips = await row.locator(".tag-chip").allTextContents();
+      assert(
+        chips.includes("ops") && chips.includes("infra"),
+        `manual chips only: ${chips}`,
+      );
     });
 
     // -- 4. text-only turn ---------------------------------------------------
@@ -1269,6 +1319,61 @@ async function main() {
         async () => (await page.locator("#provider-picker option").count()) === 2,
         { timeout: 15_000, message: "re-enabled provider back in picker" },
       );
+    });
+
+    // -- 18. utility tags: model title + tags land as inert chips --------
+    // The ui-made session's first exchange (providers test, above) armed
+    // its utility attempt, and nothing manual ever touched that row, so
+    // the two-line reply applies through the open auto path: line 1
+    // upgrades the title, line 2 lands as tag chips — including a
+    // <script> payload tag, which must render as an inert TEXT node
+    // (hostile-text contract; utility-tags plan §3.8). The parser
+    // normalizes to kebab-case, truncates each tag at 24 chars, and
+    // keeps at most 2 corpus-absent tags (the K cap — every existing
+    // tag here is a singleton below the corpus frequency floor), so the
+    // landing set is exactly the truncated script payload plus "login".
+    await test("utility: model title and tags land as inert chips", async () => {
+      const headers = { authorization: `Bearer ${TOKEN}` };
+      const tagged = await poll(
+        async () => {
+          const sessions = (
+            await (await page.request.get(`${base}/sessions`, { headers })).json()
+          ).sessions;
+          return sessions.find((s) => s.title === "Fix login redirect loop") ?? false;
+        },
+        { timeout: 30_000, message: "utility title applied" },
+      );
+      eq(tagged.title_source, "auto", "model title applied through the auto path");
+      eq(
+        JSON.stringify(tagged.tags),
+        JSON.stringify(["<script>alert('utility-t", "login"]),
+        `model tags landed: ${tagged.tags}`,
+      );
+      // Chips render as text nodes: textContent carries the payload
+      // verbatim, innerHTML carries it ESCAPED (no markup was parsed),
+      // and no script element exists anywhere inside the component's
+      // shadow root — where rendered model output lives.
+      const row = page.locator(`.session-row[data-session-id="${tagged.id}"]`);
+      await poll(async () => (await row.locator(".tag-chip").count()) === 2, {
+        timeout: 10_000,
+        message: "model tag chips in sidebar",
+      });
+      const chips = await row.locator(".tag-chip").evaluateAll((els) =>
+        els.map((el) => ({ text: el.textContent, html: el.innerHTML })),
+      );
+      eq(chips[0].text, "<script>alert('utility-t", "hostile tag rendered as text");
+      assert(
+        chips[0].html.includes("&lt;script&gt;"),
+        `hostile tag escaped in innerHTML: ${chips[0].html}`,
+      );
+      eq(chips[1].text, "login", "plain tag chip");
+      const shadowScripts = await page.evaluate(
+        () =>
+          document
+            .querySelector("lustre-server-component")
+            ?.shadowRoot?.querySelectorAll("script").length ?? -1,
+      );
+      eq(shadowScripts, 0, "no script elements inside the component view");
     });
 
     // -- 19. no uncaught page errors ----------------------------------------
