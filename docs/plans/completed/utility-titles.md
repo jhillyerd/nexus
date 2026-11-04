@@ -1,11 +1,22 @@
 ---
 title: Nexus — model-generated session titles via prefix-cache piggybacking
-status: draft
+status: completed
 tags: [nexus, titles, kv-cache, utility]
-updated: 2026-11-01
+updated: 2026-11-04
 ---
 
 # Nexus: model-generated session titles via prefix-cache piggybacking
+
+> **Landed 2026-10-24 through 2026-11-03** (P2–P5; see §9 for the
+> per-phase record). Everything
+> below shipped as designed, including the offline suite and the e2e
+> browser coverage, with tags riding the same branch per
+> `utility-tags.md`. The one open item is the **live** cache-branch
+> verification (§9 P5): the integration smoke's cache gate never sends
+> a utility request, so the branch's real-backend prefix reuse is
+> unverified — its byte contract is pinned offline by
+> `test/m3_prefix_test.gleam` and `test/utility_test.gleam` and live in
+> the browser suite against the recording fake.
 
 Design for upgrading the instant first-message heuristic title into a
 model-generated title after the first committed exchange — using a
@@ -367,19 +378,25 @@ request; until then Y stays title-only.
   spends the attempt, leaving the heuristic placeholder). Bounded cost:
   one extra ~Y + title-token side call per passing session on
   cache-capable backends.
-- **Open**: exact Y wording and whether the title upgrade should also
-  fire for sessions rehydrated from the store that already have a
-  heuristic title but were created before this feature (proposal: no —
-  only sessions whose first exchange happens after the feature boots).
+- **Resolved on landing**: Y wording ships as the two `instruction`
+  variants (§4.1), and rehydrated sessions never re-arm the trigger —
+  a hydrated actor starts with `utility_attempted = True`, so only
+  sessions whose first exchange happens after the feature boots
+  attempt the upgrade (the proposal above, implemented in the session
+  actor's rehydration path).
 
 ## 9. Roadmap
 
-- **P1 (this pass)**: `.agents/skills/llm-api` skill + this design doc.
-- **P2**: `nexus/utility` module; shared Options extraction; session
-  actor seam (`utility_runner`, trigger/cancel/result); registry
-  `UpgradeAutoTitle`; `auto_title_upgrade.sql` + store wiring;
-  `MetaUpdated` event + UI refresh; config knobs.
-- **P3**: offline verification suite (§6).
+- **P1** (landed 2026-10-23): `.agents/skills/llm-api` skill + this design doc.
+- **P2** (landed 2026-10-24): `nexus/utility` module; shared Options
+  extraction; session actor seam (`utility_runner`, trigger/cancel/
+  result); registry `UpgradeAutoTitle`; `auto_title_upgrade.sql` +
+  store wiring; `MetaUpdated` event + UI refresh; config knobs. (The
+  tags pass later subsumed `auto_title_upgrade.sql` into
+  `auto_meta_upgrade.sql`.)
+- **P3** (landed 2026-10-25): offline verification suite (§6) — plus
+  the PASS postpone (the 2026-10-25 decision above) in the same day's
+  follow-up.
 - **P4** (landed 2026-11-03): tags per §7 — designed and implemented by
   `docs/plans/completed/utility-tags.md` (schema + store, registry
   merge under the two-column guard, utility module + corpus, offline
