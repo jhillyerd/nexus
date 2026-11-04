@@ -402,7 +402,7 @@ header h1 { font-size: 1.05rem; margin: 0; }
 .dot { margin-left: auto; font-size: 1.2rem; }
 .dot.live { color: #2e9e5b; }
 .dot.off { color: #c0392b; }
-#layout { flex: 1; min-height: 0; display: grid; grid-template-columns: 17rem minmax(0,1fr) 16rem;
+#layout { flex: 1; min-height: 0; display: grid; grid-template-columns: 17rem minmax(0,1fr);
   grid-template-rows: minmax(0,1fr); }
   /* ^ the explicit row is not cosmetic: without it the single implicit row
      is content-sized, so a long #log grows the row past the viewport and
@@ -413,8 +413,6 @@ header h1 { font-size: 1.05rem; margin: 0; }
 #layout.settings-mode { grid-template-columns: minmax(0,1fr); }
 #layout.settings-mode > aside, #layout.settings-mode > main { display: none; }
 aside { overflow-y: auto; padding: .8rem; border-right: 1px solid
-  color-mix(in srgb, currentColor 15%, transparent); }
-#metrics-panel { border-right: 0; border-left: 1px solid
   color-mix(in srgb, currentColor 15%, transparent); }
 aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; margin: 0; }
 .section-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: .6rem; }
@@ -551,15 +549,10 @@ textarea { flex: 1; resize: none; }
 button#send, button#create-session { background: var(--pico-primary-background);
   border-color: var(--pico-primary-border); color: #fff; }
 #app button:disabled { opacity: .45; cursor: default; }
-.metrics-list { display: flex; flex-direction: column; gap: .45rem; }
-.metric { padding: .5rem; font-size: .75rem; border-radius: 8px;
-  background: color-mix(in srgb, currentColor 7%, transparent); overflow-wrap: anywhere; }
-.metric strong { display: block; margin-bottom: .15rem; }
 @media (max-width: 900px) {
-  #layout { grid-template-columns: 1fr; grid-template-rows: auto minmax(0,1fr) auto; }
+  #layout { grid-template-columns: 1fr; grid-template-rows: auto minmax(0,1fr); }
   #layout.settings-mode { grid-template-rows: minmax(0,1fr); }
   aside { border: 0; border-bottom: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
-  #metrics-panel { border-bottom: 0; border-top: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
   .settings-page { padding: .8rem .8rem 2rem; }
 }
 "

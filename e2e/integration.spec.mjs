@@ -619,19 +619,6 @@ async function main() {
 
   // -- helpers needing closure state -----------------------------------
 
-  async function readMetrics() {
-    return page.$$eval("#metrics .metric", (els) =>
-      els
-        .map((el) => el.textContent)
-        .map((line) => ({
-          line,
-          outcome: line.split("TTFT")[0].trim(),
-          ttft: /TTFT (\d+)ms/.exec(line)?.[1] ? Number(/TTFT (\d+)ms/.exec(line)[1]) : null,
-          cached: /cached (\d+)\/(\d+)/.exec(line)?.slice(1).map(Number) ?? null,
-        })),
-    );
-  }
-
   function median(values) {
     const sorted = [...values].sort((a, b) => a - b);
     return sorted.length ? sorted[Math.floor((sorted.length - 1) / 2)] : null;

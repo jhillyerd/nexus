@@ -8,8 +8,8 @@
 //   1. bearer auth (401 without token, page with token)
 //   2. model list (picker) and session list
 //   3. create / switch sessions
-//   4. text-only turn (streaming → completed, metrics)
-//   5. stop during streaming (partial commit, stopped metric)
+//   4. text-only turn (streaming → completed)
+//   5. stop during streaming (partial commit)
 //   6. reconnect/replay: full tool history re-rendered after reload
 //   7. http_fetch + web_search loops with typed tool cards
 //   8. iteration-guard terminal rendering (max=2 instance)
@@ -722,15 +722,12 @@ async function main() {
     });
 
     // -- 4. text-only turn ---------------------------------------------------
-    await test("turn: text-only round streams and completes with metrics", async () => {
+    await test("turn: text-only round streams and completes", async () => {
       await sendAndWaitIdle(page, "case:text just answer");
       const user = await page.$$eval(".turn.user", (els) => els.map((e) => e.textContent));
       assert(user.some((t) => t.includes("case:text")), `user bubble: ${user}`);
       const assistant = await page.$$eval(".turn.assistant", (els) => els.map((e) => e.textContent));
       assert(assistant.some((t) => t.includes("Plain answer")), `assistant text: ${assistant}`);
-      const metrics = await page.$$eval("#metrics .metric", (els) => els.map((e) => e.textContent));
-      assert(metrics.some((m) => m.includes("completed")), `completed metric: ${metrics}`);
-      assert(metrics.some((m) => m.includes("cached 800/1000")), `cached tokens visible: ${metrics}`);
     });
 
     // -- 4b. reasoning (chain of thought) -------------------------------------
@@ -817,8 +814,6 @@ async function main() {
         timeout: 30_000,
         message: "send re-enabled after stop",
       });
-      const metrics = await page.$$eval("#metrics .metric", (els) => els.map((e) => e.textContent));
-      assert(metrics.some((m) => m.includes("stopped")), `stopped metric: ${metrics}`);
       const committed = await page.$$eval(".turn.assistant", (els) => els.map((e) => e.textContent));
       assert(committed.some((t) => t.startsWith(partial.trim().slice(0, 8))), `partial committed: ${committed}`);
     });

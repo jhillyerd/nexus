@@ -13,7 +13,7 @@
 //// as reasoning: open while the call streams/runs, collapsed to a single
 //// head line once it completes, loop/iteration status, the model's streamed **reasoning**
 //// (chain of thought, as an inert collapsible block whose commit/rollback
-//// mirrors the server's), and the per-session metrics panel. Log
+//// mirrors the server's). Log
 //// auto-follow and the jump-to-latest control are browser-only behaviour
 //// driven by the page shell's static autoscroll script. Tool and
 //// reasoning events are never rendered as model text, live or on Hello
@@ -199,7 +199,6 @@ pub type Model {
     providers_seen: Bool,
     aliases: List(String),
     sessions: List(session.SessionSummary),
-    metrics: List(session.MetricSample),
     selected: Option(String),
     picker: String,
     create_open: Bool,
@@ -287,7 +286,7 @@ pub type Msg {
   SendAccepted
   SendRejected(String)
   StopRequested
-  Hello(model: String, metrics: List(session.MetricSample))
+  Hello(model: String)
   UserEcho(String)
   AssistantFull(String)
   /// A committed assistant message's reasoning, replayed with history
@@ -341,7 +340,7 @@ pub type Msg {
 /// the same `update` as DOM events.
 pub fn from_session_event(event: SessionEvent) -> Msg {
   case event {
-    session.Hello(model, _messages, metrics) -> Hello(model, metrics)
+    session.Hello(model, _messages, _metrics) -> Hello(model)
     session.UserEcho(text) -> UserEcho(text)
     session.AssistantFull(text) -> AssistantFull(text)
     session.ReasoningFull(text) -> ReasoningFull(text)
@@ -380,7 +379,6 @@ pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
       providers_seen: False,
       aliases: [],
       sessions: [],
-      metrics: [],
       // A reload re-opens the client's last-selected session: the page
       // shell persists it and supplies it on the /ws route. If it has since
       // vanished, `after_sessions` drops it and the auto-selection rules
@@ -685,7 +683,6 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             loop: None,
             guard: False,
             turn_base: 0,
-            metrics: metrics_for(model.sessions, id),
             model_label: "connecting…",
           ),
           join_effect(model, id),
@@ -751,20 +748,15 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
 
     StopRequested -> #(model, stop_effect(model))
 
-    Hello(name, metrics) -> #(
-      Model(
-        ..model,
-        model_label: name,
-        metrics: metrics,
-        streaming: case model.selected {
-          Some(id) ->
-            case list.find(model.sessions, fn(s) { s.id == id }) {
-              Ok(summary) -> summary.streaming
-              Error(_) -> False
-            }
-          None -> False
-        },
-      ),
+    Hello(name) -> #(
+      Model(..model, model_label: name, streaming: case model.selected {
+        Some(id) ->
+          case list.find(model.sessions, fn(s) { s.id == id }) {
+            Ok(summary) -> summary.streaming
+            Error(_) -> False
+          }
+        None -> False
+      }),
       effect.none(),
     )
 
@@ -1218,10 +1210,6 @@ fn after_sessions(
     ..model,
     sessions: summaries,
     selected: selected,
-    metrics: case selected {
-      Some(id) -> metrics_for(summaries, id)
-      None -> []
-    },
     create_open: case active, selected {
       [], _ -> True
       _, None -> False
@@ -1281,16 +1269,6 @@ fn first_alias(model: Model, aliases: List(String)) -> String {
   case model.picker, aliases {
     "", [first, ..] -> first
     picker, _ -> picker
-  }
-}
-
-fn metrics_for(
-  summaries: List(session.SessionSummary),
-  id: String,
-) -> List(session.MetricSample) {
-  case list.find(summaries, fn(s) { s.id == id }) {
-    Ok(summary) -> summary.metrics
-    Error(_) -> []
   }
 }
 
@@ -1560,11 +1538,10 @@ pub fn view(model: Model) -> Element(Msg) {
       // appends/removes it, so the chat subtree's element identity
       // (including the keyed composer) survives both directions.
       case model.view {
-        ChatView -> [sidebar(model), chat(model), metrics_panel(model)]
+        ChatView -> [sidebar(model), chat(model)]
         SettingsView -> [
           sidebar(model),
           chat(model),
-          metrics_panel(model),
           element.map(
             ui_settings.view(model.settings, model.provider_list),
             Settings,
@@ -2260,72 +2237,6 @@ fn preview(text: String, max: Int) -> String {
   case string.length(text) > max {
     True -> string.slice(text, 0, max) <> "…"
     False -> text
-  }
-}
-
-fn metrics_panel(model: Model) -> Element(Msg) {
-  html.aside([attr.id("metrics-panel")], [
-    html.div([attr.class("section-head")], [html.h2([], [html.text("Metrics")])]),
-    html.div(
-      [attr.id("metrics"), attr.class("metrics-list")],
-      metric_blocks(model.metrics),
-    ),
-  ])
-}
-
-fn metric_blocks(samples: List(session.MetricSample)) -> List(Element(Msg)) {
-  case samples {
-    [] -> [html.p([attr.class("muted")], [html.text("No turns yet.")])]
-    _ ->
-      list.map(samples, fn(sample) {
-        html.div([attr.class("metric")], [
-          html.strong([], [html.text(outcome_name(sample.outcome))]),
-          html.div([], [html.text(metric_line(sample))]),
-        ])
-      })
-  }
-}
-
-fn outcome_name(outcome: session.MetricOutcome) -> String {
-  case outcome {
-    session.Completed -> "completed"
-    session.Stopped -> "stopped"
-    session.Failed -> "failed"
-  }
-}
-
-/// The same summary line the M2 client rendered, as plain text.
-pub fn metric_line(sample: session.MetricSample) -> String {
-  let ttft = case sample.ttft_ms {
-    Some(ms) -> int.to_string(ms) <> "ms"
-    None -> "–"
-  }
-  let line =
-    "TTFT "
-    <> ttft
-    <> " · "
-    <> int.to_string(sample.duration_ms)
-    <> "ms · "
-    <> int.to_string(sample.token_deltas)
-    <> " deltas"
-  let line = case sample.prompt_tokens {
-    Some(prompt) -> {
-      let cached = case sample.cached_tokens {
-        Some(c) -> int.to_string(c)
-        None -> "–"
-      }
-      line <> " · cached " <> cached <> "/" <> int.to_string(prompt)
-    }
-    None -> line
-  }
-  let line = case sample.outcome, sample.stopped_chars {
-    session.Stopped, Some(chars) ->
-      line <> " · stopped at " <> int.to_string(chars) <> " chars"
-    _, _ -> line
-  }
-  case sample.outcome, sample.failure_reason {
-    session.Failed, Some(reason) -> line <> " · " <> reason
-    _, _ -> line
   }
 }
 
