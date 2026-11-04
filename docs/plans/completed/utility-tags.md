@@ -15,7 +15,7 @@ updated: 2026-11-03
 > `tags_source` can lag an in-memory manual freeze, which a refresh
 > policy would wrongly read as permission.
 
-Design for the deferred tags pass of `docs/plans/utility-titles.md` §7:
+Design for the deferred tags pass of `docs/plans/completed/utility-titles.md` §7:
 model-generated tags ride the **same** once-per-session prefix-cache branch
 as the title — one instruction Y, one request, one branch — with a
 merge-not-clobber policy, a provenance column, and the vocabulary-growth

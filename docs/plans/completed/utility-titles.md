@@ -1,11 +1,21 @@
 ---
 title: Nexus — model-generated session titles via prefix-cache piggybacking
-status: draft
+status: completed
 tags: [nexus, titles, kv-cache, utility]
-updated: 2026-11-01
+updated: 2026-11-04
 ---
 
 # Nexus: model-generated session titles via prefix-cache piggybacking
+
+> **Landed 2026-11-03** (P2–P5; see §9 for the phase record). Everything
+> below shipped as designed, including the offline suite and the e2e
+> browser coverage, with tags riding the same branch per
+> `utility-tags.md`. The one open item is the **live** cache-branch
+> verification (§9 P5): the integration smoke's cache gate never sends
+> a utility request, so the branch's real-backend prefix reuse is
+> unverified — its byte contract is pinned offline by
+> `test/m3_prefix_test.gleam` and `test/utility_test.gleam` and live in
+> the browser suite against the recording fake.
 
 Design for upgrading the instant first-message heuristic title into a
 model-generated title after the first committed exchange — using a

@@ -14,7 +14,7 @@ invariants are in `AGENTS.md`.
 The multi-provider rollout is documented in
 `docs/plans/completed/multi-provider.md`. Model-generated session
 titles and tags ride one prefix-cache "utility branch" — designed in
-`docs/plans/utility-titles.md`, with the tags pass landed per
+`docs/plans/completed/utility-titles.md`, with the tags pass landed per
 `docs/plans/completed/utility-tags.md`.
 
 ## Development

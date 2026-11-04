@@ -26,7 +26,7 @@ which nexus's encode path already follows — keep it that way.
   the shared `X+A` span both times. The dead `Y+B` branch never
   invalidates anything; it is an eviction candidate like any other
   leaf, and *touching* `X+A` during the side request refreshes its
-  recency. This is the pattern behind `docs/plans/utility-titles.md`.
+  recency. This is the pattern behind `docs/plans/completed/utility-titles.md`.
 
 ## 2. Per-backend mechanics
 
@@ -108,5 +108,5 @@ Sources:
 - `sql/schema.sql` — `session_message.tool_args text` (never jsonb) and
   `session.system_prompt` frozen at creation for byte-identical
   hydration.
-- `docs/plans/utility-titles.md` — the branch-request pattern applied
+- `docs/plans/completed/utility-titles.md` — the branch-request pattern applied
   to background session titles.
