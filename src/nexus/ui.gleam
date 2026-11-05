@@ -2059,10 +2059,15 @@ fn composer(model: Model, has_session: Bool) -> Element(Msg) {
       #(
         "controls",
         html.div([attr.class("buttons")], [
+          // Stop mounts only during a turn — it used to sit permanently
+          // visible-and-disabled while idle (ui-polish F8). Pico's global
+          // `[hidden] { display: none !important }` does the hiding,
+          // mirroring `#loop-status`'s `hidden` handling.
           html.button(
             [
               attr.id("stop"),
               attr.type_("button"),
+              attr.hidden(!model.streaming),
               attr.disabled(!model.streaming),
               event.on_click(StopRequested),
             ],
@@ -2126,8 +2131,8 @@ fn turn(kind: String, text: String) -> Element(Msg) {
 }
 
 /// The model's reasoning (chain of thought) as an inert collapsible
-/// block: open with a "thinking…" label while it streams, collapsed with
-/// a "reasoning" label once committed. A native `<details>` — no script,
+/// block: one label, "thinking", in both states — the ellipsis rides only
+/// the live block as its streaming cue. A native `<details>` — no script,
 /// and the body is a Lustre text node, so hostile reasoning text is
 /// escaped like every other model output.
 fn reasoning_block(text: String, live: Bool) -> Element(Msg) {
@@ -2146,7 +2151,7 @@ fn reasoning_block(text: String, live: Bool) -> Element(Msg) {
       html.summary([attr.class("reasoning-label")], [
         html.text(case live {
           True -> "thinking…"
-          False -> "reasoning"
+          False -> "thinking"
         }),
       ]),
       html.div([attr.class("reasoning-body")], [html.text(text)]),

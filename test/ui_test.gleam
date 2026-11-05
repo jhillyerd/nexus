@@ -236,6 +236,18 @@ pub fn stop_keeps_state_until_terminal_event_test() {
   model.log |> should.equal([])
 }
 
+/// Stop mounts only while a turn streams — idle it is `hidden` (Pico's
+/// global `[hidden] { display: none !important }` hides it), so the
+/// composer no longer shows a permanently-disabled control (F8).
+pub fn stop_visible_only_while_streaming_test() {
+  let idle = new_model() |> view_string
+  // SSR sorts attributes; the bare `hidden` lands right before the id.
+  should_contain(idle, "hidden id=\"stop\"")
+  let streaming = new_model() |> step(ui.SendAccepted) |> view_string
+  should_contain(streaming, "id=\"stop\"")
+  should_not_contain(streaming, "hidden id=\"stop\"")
+}
+
 // ---------------------------------------------------------------------------
 // Per-client connect (the runtime break)
 // ---------------------------------------------------------------------------
@@ -1611,6 +1623,10 @@ pub fn first_token_commits_reasoning_above_text_test() {
   let html = model |> view_string
   let assert [before_assistant, ..] = string.split(html, "turn assistant")
   should_contain(before_assistant, "<details class=\"turn reasoning\">")
+  // One label in both states: the committed chip says "thinking" too
+  // (F8) — the chevrons around it are the summary marker and Pico's
+  // details::after, never authored text.
+  should_contain(before_assistant, "reasoning-label\">thinking</summary>")
 }
 
 pub fn reasoning_commits_before_tool_call_test() {
