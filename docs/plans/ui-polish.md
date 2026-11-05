@@ -103,11 +103,17 @@ directions. Pure `css()` change.
 
 ### F2 — Session rows are control soup
 
-Every row always renders 5 bordered buttons (Pin/Rename/Tags/Archive/
-Delete) plus tag-chip buttons; with three sessions the controls outweigh
-the content, and rows wrap to ~3 lines on mobile.
+Every **active** row renders 5 bordered buttons (Pin/Rename/Tags/
+Archive/Delete) plus tag-chip buttons — archived rows render 4, omitting
+Pin per the never-pin-archived invariant (the control does not exist
+there). With three active sessions the controls outweigh the content,
+and rows wrap to ~3 lines on mobile.
 
-**Fix.** CSS-only reveal: hide `.row-controls` until the row is hovered,
+**Fix.** CSS-only reveal, **scoped to session rows**: `.row-controls` is
+a shared class — the settings provider rows use it too
+(`ui_settings.gleam`), so a global reveal rule would hide Settings'
+Disable/Enable/Edit/Test/Delete. Hide `.session-row .row-controls` (or
+introduce a session-specific class) until the row is hovered,
 keyboard-focused, or selected (`:hover`, `:focus-within`, `.selected`),
 guarded by `@media (hover: hover)` so touch devices keep the controls on
 the selected row at minimum. After F1 the chips shrink; consider dropping
@@ -152,12 +158,16 @@ invariant.
 `.turn` caps at 46rem but `#log` doesn't, so user/assistant bubbles hug
 opposite edges of a ~1200px pane with dead space between (`01`–`02`).
 
-**Fix.** Center the conversation column: constrain the log's children
-(e.g. an inner `max-width: 52rem; margin-inline: auto; width: 100%`
-wrapper, or `#log { align-items: center }` with full-width `turn`
-containers so the existing `align-self` user/assistant placement keeps
-working). Verify the jump-to-latest anchor (`#log-wrap`, absolute) is
-unaffected — it must stay pane-relative, not column-relative.
+**Fix.** Center the conversation column with an inner
+`max-width: 52rem; margin-inline: auto; width: 100%` wrapper around the
+log's children — the existing per-turn `align-self` user-right/
+assistant-left placement then works unchanged inside the narrower
+column. (`#log { align-items: center }` is not an alternative:
+`.turn.user` / `.turn.assistant` override it per-child with `align-self`,
+so the bubbles stay edge-pinned, and making turns full-width to avoid
+that loses the bubble widths.) Verify the jump-to-latest anchor
+(`#log-wrap`, absolute) is unaffected — it must stay pane-relative, not
+column-relative.
 
 ### F7 — Settings page is unstructured
 
@@ -176,10 +186,13 @@ rule — prefer tokens/classes over new one-off rules.
 - **Stop is always visible and disabled** while idle — hide it when not
   streaming (mirrors `#loop-status`'s `hidden` handling) or swap
   Stop/Send in place during a turn.
-- **Reasoning chip wording**: collapsed committed chip reads
-  `▶ reasoning ▶` (native marker + trailing chevron) while the live
-  block says "thinking…" — pick one label ("thinking") and one chevron
-  affordance for both states.
+- **Reasoning chip label**: the committed chip's DOM is just the text
+  `reasoning` — the left marker is the native list-style restored by
+  `list-style: revert`, and the right chevron is Pico's
+  `details summary::after` (it rotates when open), so the chip *renders*
+  as `▶ reasoning ▶` without any authored glyph. The live block says
+  "thinking…" — pick one label ("thinking") for both states; no markup
+  change is needed for the chevrons.
 - **Header**: `nexus  smart` (the session's model alias) is cryptic
   without context; show the selected session's title instead (alias can
   move into the session subtitle it already has). Group a text
@@ -229,8 +242,10 @@ regressions the offline suite cannot see.
 - F3: is the 40dvh cap enough, or does the session list need a real
   collapse toggle? Decide during P3 against a realistic (20+ session)
   list.
-- F6: centered column interacts with the 46rem turn cap and the
-  reasoning/tool block widths — pick the exact mechanism (wrapper vs
-  `align-items`) while watching a long tool card at 1440.
+- F6: the centered column interacts with the 46rem turn cap and the
+  reasoning/tool block widths — settle the wrapper mechanics (single
+  inner wrapper vs per-turn max-width + auto margins) while watching a
+  long tool card at 1440. The `align-items: center` variant is ruled
+  out (see F6).
 - F8 header: session title vs "session title · model" — trivial, decide
   in P5.
