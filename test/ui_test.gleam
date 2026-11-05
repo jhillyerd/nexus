@@ -103,7 +103,7 @@ pub fn select_resets_log_and_streams_test() {
   let model =
     new_model()
     |> step(ui.SessionsLoaded([summary("s-1", False), summary("s-2", False)]))
-    |> step(ui.Hello("smart", []))
+    |> step(ui.Hello("smart"))
     |> step(ui.UserEcho("hi"))
     |> step(ui.Select("s-2"))
   model.selected |> should.equal(Some("s-2"))
@@ -124,7 +124,7 @@ pub fn vanished_selection_ends_session_test() {
   let model =
     new_model()
     |> step(ui.SessionsLoaded([summary("s-1", False)]))
-    |> step(ui.Hello("smart", []))
+    |> step(ui.Hello("smart"))
     |> step(ui.UserEcho("hi"))
     |> step(ui.Token("par"))
   let model = model |> step(ui.SessionsLoaded([]))
@@ -140,7 +140,7 @@ pub fn hello_sets_label_and_busy_state_test() {
   let model =
     new_model()
     |> step(ui.SessionsLoaded([summary("s-1", True)]))
-    |> step(ui.Hello("smart", []))
+    |> step(ui.Hello("smart"))
   model.model_label |> should.equal("smart")
   model.streaming |> should.be_true
 }
@@ -279,7 +279,7 @@ pub fn sessions_loaded_drops_stale_client_session_test() {
 pub fn sessions_loaded_reconciles_streaming_after_hello_test() {
   let model =
     new_model_with_session(Some("s1"))
-    |> step(ui.Hello("smart", []))
+    |> step(ui.Hello("smart"))
     |> step(ui.SessionsLoaded([summary("s1", True)]))
   model.streaming |> should.be_true
 }
@@ -289,7 +289,7 @@ pub fn sessions_loaded_reconciles_streaming_after_hello_test() {
 pub fn sessions_loaded_reconcile_skips_changed_selection_test() {
   let model =
     new_model_with_session(Some("gone"))
-    |> step(ui.Hello("smart", []))
+    |> step(ui.Hello("smart"))
     |> step(ui.SessionsLoaded([summary("s1", True)]))
   model.selected |> should.equal(Some("s1"))
   model.streaming |> should.be_false
@@ -301,7 +301,7 @@ pub fn sessions_loaded_reconcile_skips_changed_selection_test() {
 
 pub fn event_translation_test() {
   ui.from_session_event(session.Hello("smart", 3, []))
-  |> should.equal(ui.Hello("smart", []))
+  |> should.equal(ui.Hello("smart"))
   ui.from_session_event(session.UserEcho("hi"))
   |> should.equal(ui.UserEcho("hi"))
   ui.from_session_event(session.AssistantFull("full"))
@@ -531,7 +531,7 @@ pub fn guard_failure_keeps_committed_rounds_test() {
 pub fn replay_reconstructs_complete_tool_history_test() {
   let model =
     new_model()
-    |> step(ui.Hello("smart", []))
+    |> step(ui.Hello("smart"))
     |> step(ui.UserEcho("search for cats"))
     |> step(ui.AssistantFull("checking"))
     |> step(ui.ToolCallAssembled("call_1", "web_search", "{\"query\":\"cats\"}"))
@@ -718,7 +718,6 @@ pub fn view_renders_shell_and_sidebar_test() {
 pub fn view_renders_empty_states_test() {
   let html = new_model() |> view_string
   should.be_true(string.contains(html, "No sessions yet."))
-  should.be_true(string.contains(html, "No turns yet."))
   should.be_true(string.contains(html, "disabled"))
 }
 
@@ -763,51 +762,6 @@ pub fn view_renders_streaming_bubble_test() {
   let html = view_string(model)
   should.be_true(string.contains(html, "Hello"))
   should.be_true(string.contains(html, "turn assistant"))
-}
-
-pub fn view_renders_metrics_line_test() {
-  let sample =
-    session.MetricSample(
-      outcome: session.Completed,
-      ttft_ms: Some(12),
-      duration_ms: 345,
-      token_deltas: 2,
-      prompt_tokens: Some(100),
-      cached_tokens: Some(80),
-      stopped_chars: None,
-      failure_reason: None,
-    )
-  let model = new_model() |> step(ui.Hello("smart", [sample]))
-  let html = view_string(model)
-  should.be_true(string.contains(html, "completed"))
-  should.be_true(string.contains(html, "TTFT 12ms"))
-  should.be_true(string.contains(html, "cached 80/100"))
-}
-
-pub fn metric_line_variants_test() {
-  ui.metric_line(session.MetricSample(
-    outcome: session.Stopped,
-    ttft_ms: None,
-    duration_ms: 10,
-    token_deltas: 1,
-    prompt_tokens: None,
-    cached_tokens: None,
-    stopped_chars: Some(4),
-    failure_reason: None,
-  ))
-  |> should.equal("TTFT – · 10ms · 1 deltas · stopped at 4 chars")
-
-  ui.metric_line(session.MetricSample(
-    outcome: session.Failed,
-    ttft_ms: None,
-    duration_ms: 10,
-    token_deltas: 1,
-    prompt_tokens: None,
-    cached_tokens: None,
-    stopped_chars: None,
-    failure_reason: Some("upstream"),
-  ))
-  |> should.equal("TTFT – · 10ms · 1 deltas · upstream")
 }
 
 // ---------------------------------------------------------------------------
