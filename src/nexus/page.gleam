@@ -439,7 +439,11 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
   color-mix(in srgb, currentColor 6%, transparent); }
 .row-controls { display: flex; flex-wrap: wrap; gap: .25rem; }
 #app .ctl { font-size: .7rem; padding: .18rem .5rem; opacity: .75; }
-#app .ctl:hover { opacity: 1; }
+/* :not(:disabled) keeps the hover brighten from outranking the
+   #app button:disabled dim below ((1,2,0) would beat its (1,1,1) on
+   class count): a hovered disabled control — the provider Test button
+   mid-test — must stay dimmed, exactly like before the prefix went on. */
+#app .ctl:hover:not(:disabled) { opacity: 1; }
 #app .ctl.danger, #app button.danger { color: #c0392b; border-color: color-mix(in srgb, #c0392b 45%, transparent); }
 .inline-editor { display: flex; flex-wrap: wrap; gap: .3rem; }
 .inline-editor input { flex: 1; min-width: 0; }

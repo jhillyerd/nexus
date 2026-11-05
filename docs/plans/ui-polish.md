@@ -211,8 +211,11 @@ regressions the offline suite cannot see.
   **Landed 2026-11-05**: every compact button rule in `css()` carries the
   `#app` prefix (including `.ctl.danger, button.danger` and the
   `.toggle.on` / `.ctl:hover` state variants, which lost on the id count
-  too); Stop mounts only while `model.streaming` (Pico's global
-  `[hidden] { display: none !important }` hides it); both reasoning-chip
+  too; `.ctl:hover` also gained `:not(:disabled)` so the hover brighten
+  cannot outrank the `#app button:disabled` dim); Stop renders `hidden`
+  while idle — it stays mounted, and Pico's global
+  `[hidden] { display: none !important }` does the hiding — and is only
+  visible while `model.streaming`; both reasoning-chip
   states now say "thinking" (ellipsis stays on the live block as its
   streaming cue). The e2e committed-chip assertion followed the label
   rename; `ui_test` pins the hidden-Stop rule and the unified label.
