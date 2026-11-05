@@ -221,6 +221,23 @@ regressions the offline suite cannot see.
   rename; `ui_test` pins the hidden-Stop rule and the unified label.
 - **P2 — sidebar density (F2).** Hover-reveal controls + quiet chips;
   verify keyboard reachability (`:focus-within`) and the touch guard.
+  **Landed 2026-11-05**: CSS-only, scoped to `.session-row` (Settings'
+  provider rows share `.row-controls` and keep theirs always on, so the
+  reveal is *not* global). Controls render `display: none` and come back
+  on `.selected`, `:focus-within`, or `:hover` inside `@media (hover:
+  hover)` — the pointer half is off for touch, where the selected row is
+  the only reachable case (verified: `hasTouch` context reports
+  `(hover: hover)` false, and tapping a row selects it and shows its
+  controls). Keyboard reachability is structural, not hopeful: the row's
+  own `.session-main` button is its first tab stop, so tabbing in matches
+  `:focus-within`, and every later control lives inside the row, so it
+  stays revealed while you traverse it. `.tag-chip` lost its border
+  (outline returns on hover) for the quiet-chip look. Measured with the
+  always-on rule forced against the shipped CSS: 52px per unselected row
+  saved at 1440px, 26px at 390px. `web_test` pins the reveal rules and
+  their scope; the e2e organize pass drives every control through
+  `revealRowControls()` and asserts the hidden → hover → focus → hidden
+  cycle explicitly.
 - **P3 — layout (F3a cap, F4 create-panel reorder, F6 centered column).**
   Grid/markup changes in `page.gleam` + `sidebar()`; browser-suite
   selectors must keep working (`#create-panel`, `#layout`, session rows).

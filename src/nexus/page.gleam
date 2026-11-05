@@ -434,10 +434,31 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
 .session-title { overflow-wrap: anywhere; }
 .session-sub { font-size: .72rem; opacity: .6; overflow-wrap: anywhere; }
 .tag-chips { display: flex; flex-wrap: wrap; gap: .25rem; }
+/* Quiet chip (ui-polish F2): no border by default, so a tagged row reads
+   as content rather than as five more buttons; the outline returns on
+   hover so the chip is still recognizably clickable. */
 #app .tag-chip { font-size: .68rem; padding: .1rem .45rem; border-radius: 999px;
-  border-color: color-mix(in srgb, currentColor 35%, transparent); background:
+  border-color: transparent; background:
   color-mix(in srgb, currentColor 6%, transparent); }
+#app .tag-chip:hover { border-color: color-mix(in srgb, currentColor 35%, transparent); }
 .row-controls { display: flex; flex-wrap: wrap; gap: .25rem; }
+/* Session-row controls appear on demand (ui-polish F2) — five bordered
+   buttons per active row outweighed the title and subtitle, and wrapped
+   to three lines at 390px. Scoped to `.session-row` deliberately:
+   Settings' provider rows share `.row-controls` and must keep
+   Disable/Enable/Edit/Test/Delete visible at all times.
+   Keyboard reachability survives `display: none`: the row's own
+   `.session-main` button is the first tab stop inside the row, so
+   tabbing to a row matches `:focus-within`, reveals the controls, and
+   the next Tab presses step through them in DOM order. `:selected` is
+   the always-on case, which is also the touch story — a device with no
+   hover still shows the controls for the row you are in. */
+.session-row .row-controls { display: none; }
+.session-row.selected .row-controls,
+.session-row:focus-within .row-controls { display: flex; }
+@media (hover: hover) {
+  .session-row:hover .row-controls { display: flex; }
+}
 #app .ctl { font-size: .7rem; padding: .18rem .5rem; opacity: .75; }
 /* :not(:disabled) keeps the hover brighten from outranking the
    #app button:disabled dim below ((1,2,0) would beat its (1,1,1) on
