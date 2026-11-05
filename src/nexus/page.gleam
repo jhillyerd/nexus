@@ -418,10 +418,10 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
 .section-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: .6rem; }
 .filter-row { display: flex; gap: .35rem; align-items: center; margin-bottom: .45rem; }
 .filter-row input { flex: 1; min-width: 0; }
-#filter-clear { padding: .3rem .55rem; font-size: .85rem; }
+#app #filter-clear { padding: .3rem .55rem; font-size: .85rem; }
 .archive-toggle-row { margin-bottom: .6rem; }
-.toggle { font-size: .78rem; padding: .28rem .6rem; opacity: .8; }
-.toggle.on { opacity: 1; border-color: #3b82f6; color: #3b82f6; }
+#app .toggle { font-size: .78rem; padding: .28rem .6rem; opacity: .8; }
+#app .toggle.on { opacity: 1; border-color: #3b82f6; color: #3b82f6; }
 .session-list { display: flex; flex-direction: column; gap: .55rem; }
 .session-group { display: flex; flex-direction: column; gap: .3rem; }
 .group-label { font-size: .68rem; text-transform: uppercase; letter-spacing: .07em; opacity: .55;
@@ -434,20 +434,24 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
 .session-title { overflow-wrap: anywhere; }
 .session-sub { font-size: .72rem; opacity: .6; overflow-wrap: anywhere; }
 .tag-chips { display: flex; flex-wrap: wrap; gap: .25rem; }
-.tag-chip { font-size: .68rem; padding: .1rem .45rem; border-radius: 999px;
+#app .tag-chip { font-size: .68rem; padding: .1rem .45rem; border-radius: 999px;
   border-color: color-mix(in srgb, currentColor 35%, transparent); background:
   color-mix(in srgb, currentColor 6%, transparent); }
 .row-controls { display: flex; flex-wrap: wrap; gap: .25rem; }
-.ctl { font-size: .7rem; padding: .18rem .5rem; opacity: .75; }
-.ctl:hover { opacity: 1; }
-.ctl.danger, button.danger { color: #c0392b; border-color: color-mix(in srgb, #c0392b 45%, transparent); }
+#app .ctl { font-size: .7rem; padding: .18rem .5rem; opacity: .75; }
+/* :not(:disabled) keeps the hover brighten from outranking the
+   #app button:disabled dim below ((1,2,0) would beat its (1,1,1) on
+   class count): a hovered disabled control — the provider Test button
+   mid-test — must stay dimmed, exactly like before the prefix went on. */
+#app .ctl:hover:not(:disabled) { opacity: 1; }
+#app .ctl.danger, #app button.danger { color: #c0392b; border-color: color-mix(in srgb, #c0392b 45%, transparent); }
 .inline-editor { display: flex; flex-wrap: wrap; gap: .3rem; }
 .inline-editor input { flex: 1; min-width: 0; }
-.inline-editor button { font-size: .72rem; padding: .2rem .55rem; flex-shrink: 0; }
+#app .inline-editor button { font-size: .72rem; padding: .2rem .55rem; flex-shrink: 0; }
 .inline-editor[hidden], .confirm-delete[hidden] { display: none; }
 .confirm-delete { display: flex; flex-wrap: wrap; align-items: center; gap: .35rem; font-size: .74rem;
   color: #c0392b; }
-.confirm-delete button { font-size: .72rem; padding: .2rem .55rem; }
+#app .confirm-delete button { font-size: .72rem; padding: .2rem .55rem; }
 .session-item { display: block; width: 100%; text-align: left; overflow-wrap: anywhere; }
 .session-item[aria-current='true'] { border-color: #3b82f6; background: color-mix(in srgb, #3b82f6 16%, transparent); }
 #create-panel { margin-top: 1rem; padding-top: .8rem; border-top: 1px solid
@@ -476,7 +480,7 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
 .provider-form[hidden] { display: none; }
 .provider-form input { min-width: 0; }
 .provider-form-buttons { display: flex; gap: .3rem; }
-.provider-form-buttons button { font-size: .75rem; padding: .25rem .6rem; }
+#app .provider-form-buttons button { font-size: .75rem; padding: .25rem .6rem; }
 /* Form visuals (borders, focus rings, filled backgrounds, dark mode) are
    Pico's, driven by the tokens above. Only the layout leftovers are
    patched: every form here is a flex row/column with explicit gaps, so
@@ -486,10 +490,16 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
 #chat { min-width: 0; display: flex; flex-direction: column; }
 #log-wrap { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; }
 #log { flex: 1; min-height: 0; overflow-y: auto; padding: 1rem; display: flex; flex-direction: column; gap: .8rem; }
-#jump-latest { position: absolute; right: 1rem; bottom: .8rem; width: 2.2rem; height: 2.2rem;
+/* The prefix is load-bearing in BOTH directions: it lifts the bare-element
+   resets below above Pico, and every compact app-local button class must
+   carry it too — bare `.ctl`/`.tag-chip`/`#filter-clear` ((0,x,x) or a
+   lone id) lose to `#app button` (1,0,1) on the id count, which is how
+   the chrome rendered at full CTA size (ui-polish F1). New compact button
+   rules: prefix them. */
+#app #jump-latest { position: absolute; right: 1rem; bottom: .8rem; width: 2.2rem; height: 2.2rem;
   padding: 0; border-radius: 50%; font-size: 1.1rem; line-height: 1; opacity: .85; }
-#jump-latest:hover { opacity: 1; }
-#jump-latest[hidden] { display: none; }
+#app #jump-latest:hover { opacity: 1; }
+#app #jump-latest[hidden] { display: none; }
 .turn { max-width: 46rem; padding: .55rem .8rem; border-radius: 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .turn.user { align-self: flex-end; background: color-mix(in srgb, #3b82f6 18%, transparent); }
 .turn.assistant { align-self: flex-start; background: color-mix(in srgb, currentColor 8%, transparent); }
@@ -540,7 +550,8 @@ textarea { flex: 1; resize: none; }
    the attribute selectors at 0,1,0), so a bare `button` reset loses the
    cascade. #app gives (1,0,x): it wins outright, matches inside the
    shadow root (everything renders under #app), and stays inert in the
-   light DOM. */
+   light DOM. See the #jump-latest comment above for the other half of
+   the rule: app-local compact classes carry the prefix too. */
 #app button { font: inherit; padding: .42rem .8rem; border-radius: var(--pico-border-radius); cursor: pointer;
   border: 1px solid color-mix(in srgb, currentColor 25%, transparent); background: transparent; color: inherit;
   /* Pico's button defaults are for full-width form CTAs; the shell's

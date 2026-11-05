@@ -754,8 +754,8 @@ async function main() {
         timeout: 120_000,
         message: "send re-enabled after reasoning turn",
       });
-      // Committed: a CLOSED block labelled "reasoning", rendered above the
-      // assistant text it preceded.
+      // Committed: a CLOSED block also labelled "thinking" (one label for
+      // both states, F8), rendered above the assistant text it preceded.
       const committed = await page.$$eval("details.turn.reasoning", (els) =>
         els.map((e) => ({
           open: e.open,
@@ -765,7 +765,7 @@ async function main() {
       );
       assert(
         committed.some(
-          (b) => !b.open && b.label.includes("reasoning") && b.body.includes("carefully"),
+          (b) => !b.open && b.label.includes("thinking") && b.body.includes("carefully"),
         ),
         `committed reasoning block: ${JSON.stringify(committed)}`,
       );
