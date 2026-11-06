@@ -576,7 +576,7 @@ details.turn.reasoning { align-self: flex-start; max-width: 46rem; padding: .35r
   border: 1px dashed color-mix(in srgb, currentColor 22%, transparent);
   background: color-mix(in srgb, currentColor 4%, transparent); }
 details.turn.reasoning > summary { cursor: pointer; font-style: italic; opacity: .75; font-size: .72rem;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; list-style: revert; }
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 details.turn.reasoning.live > summary { color: color-mix(in srgb, currentColor 85%, #b8860b); opacity: 1; }
 .reasoning-body { white-space: pre-wrap; overflow-wrap: anywhere; padding: .3rem 0 .1rem;
   max-height: 40vh; overflow-y: auto; }
@@ -587,10 +587,11 @@ details.turn.reasoning.live > summary { color: color-mix(in srgb, currentColor 8
 .turn.tool { align-self: flex-start; font-size: .78rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   padding: .45rem .6rem; margin: 0; border: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
 /* Summary is just the tool name (phrasing content, valid inside summary)
-   so the collapsed chip is one short line; the marker needs the summary's
-   native list-item display, which display:flex would eat. Call id and
-   status sit in the .tool-meta body row instead. */
-details.turn.tool > summary { cursor: pointer; list-style: revert; }
+   so the collapsed chip is one short line; the collapse affordance is
+   Pico's trailing summary chevron — no list-style of our own, or the
+   native marker stacks a second arrow ahead of it. Call id and status
+   sit in the .tool-meta body row instead. */
+details.turn.tool > summary { cursor: pointer; }
 .tool-meta { display: flex; align-items: baseline; gap: .5rem; min-width: 0; flex-wrap: wrap; }
 .tool-name { overflow-wrap: anywhere; }
 .call-id { opacity: .55; font-size: .7rem; overflow-wrap: anywhere; }
