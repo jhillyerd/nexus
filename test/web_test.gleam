@@ -537,6 +537,44 @@ pub fn m3_layout_column_and_mobile_cap_css_test() {
   ))
 }
 
+/// Settings restyle contract (ui-polish P4 / F7): the page renders as one
+/// centered column, provider rows as bordered cards, and the add/edit
+/// forms as bordered cards. Pure CSS in `page.gleam`'s `css()`, pinned
+/// with the contiguous-fragment convention the F2/F3 tests above use.
+pub fn m3_settings_page_restyle_css_test() {
+  let css = nexus_page.html(None)
+  // The 46rem section is the column, centered like the chat lane (F6):
+  // without `margin-inline: auto` the header row's Add floats mid-page
+  // on the left-pinned column — the exact F7 screenshot.
+  should.be_true(string.contains(
+    css,
+    ".settings-page section { display: flex; flex-direction: column; gap: .7rem; width: 100%;\n  max-width: 46rem; margin-inline: auto; }",
+  ))
+  // Provider rows are cards: the visible hairline border (the .turn.tool
+  // recipe). The old transparent border would silently un-restyle the
+  // page while every other rule stays green.
+  should.be_true(string.contains(
+    css,
+    ".provider-row { display: flex; flex-direction: column; gap: .4rem; border: 1px solid\n  color-mix(in srgb, currentColor 15%, transparent);",
+  ))
+  should.be_false(string.contains(
+    css,
+    ".provider-row { display: flex; flex-direction: column; gap: .25rem; border: 1px solid transparent;",
+  ))
+  // The add/edit forms are cards too, and the [hidden] override is
+  // load-bearing: `display: flex` on the base rule outranks the UA's
+  // [hidden] { display: none }, so without this rule an unopened form
+  // would render permanently.
+  should.be_true(string.contains(
+    css,
+    ".provider-form { display: flex; flex-direction: column; gap: .45rem; border: 1px solid",
+  ))
+  should.be_true(string.contains(
+    css,
+    ".provider-form[hidden] { display: none; }",
+  ))
+}
+
 /// No-CDN guard: the UI must render fully offline, so the shell may not
 /// reference any absolute or protocol-relative external URL — every asset
 /// it loads is vendored in-repo and served by nexus itself (runtime.mjs,

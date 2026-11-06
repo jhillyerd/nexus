@@ -481,27 +481,49 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
 #create-panel { margin-bottom: 1rem; padding-bottom: .8rem; border-bottom: 1px solid
   color-mix(in srgb, currentColor 15%, transparent); display: flex; flex-direction: column; gap: .45rem; }
 #create-panel[hidden] { display: none; }
+/* ui-polish F7: the settings page reads as one structured column. The
+   46rem section is the column — centered like the chat lane (F6), so
+   the header row's title/Add ends stop pinning to opposite edges of a
+   wide pane ('Add' used to float mid-page on the left-pinned column).
+   Provider rows and the add/edit forms render as cards (the .turn.tool
+   hairline border recipe), with the heading language of the rest of
+   the shell. */
 .settings-page { overflow-y: auto; padding: 1.2rem 1.2rem 2.5rem; display: flex; flex-direction: column;
   gap: 1rem; }
-.settings-page section { display: flex; flex-direction: column; gap: .55rem; width: 100%;
-  max-width: 46rem; }
+.settings-page section { display: flex; flex-direction: column; gap: .7rem; width: 100%;
+  max-width: 46rem; margin-inline: auto; }
+#app .settings-page h2 { margin: 0; font-size: 1.15rem; }
 .models-status { font-size: .74rem; overflow-wrap: anywhere; }
 .models-status.loading { opacity: .6; }
 .models-status.ok { color: #2e9e5b; }
 .models-status.failed { color: #c0392b; }
 .settings-error { font-size: .78rem; color: #c0392b; overflow-wrap: anywhere; }
-.provider-list { display: flex; flex-direction: column; gap: .45rem; }
-.provider-row { display: flex; flex-direction: column; gap: .25rem; border: 1px solid transparent;
-  border-radius: 10px; padding: .3rem; }
-.provider-main { display: flex; flex-direction: column; gap: .1rem; }
+/* ui-polish F7: the row is a card — the visible hairline border is the
+   .turn.tool recipe; it used to be transparent (invisible), so rows
+   read as bare text plus a button row. */
+.provider-row { display: flex; flex-direction: column; gap: .4rem; border: 1px solid
+  color-mix(in srgb, currentColor 15%, transparent); border-radius: 10px; padding: .55rem .8rem; }
+.provider-main { display: flex; flex-direction: column; gap: .15rem; }
+/* The row head: name and badges on one line (F7), base URL below. */
+.provider-head { display: flex; align-items: center; gap: .4rem; flex-wrap: wrap; }
 .provider-name { overflow-wrap: anywhere; }
 .provider-sub { font-size: .72rem; opacity: .6; overflow-wrap: anywhere; }
-.badge { font-size: .68rem; padding: .05rem .4rem; border-radius: 999px; align-self: flex-start;
+/* Badges ride the .provider-head row now (F7): align-self center keeps
+   the pill vertically centered against the name instead of stretching
+   (default) or pinning to the row's top edge (flex-start). */
+.badge { font-size: .68rem; padding: .05rem .4rem; border-radius: 999px; align-self: center;
   border: 1px solid color-mix(in srgb, currentColor 35%, transparent); background:
   color-mix(in srgb, currentColor 6%, transparent); }
 .badge.off { color: #b8860b; border-color: color-mix(in srgb, #b8860b 45%, transparent); }
-.provider-form { display: flex; flex-direction: column; gap: .3rem; }
+/* The add/edit form is a bordered card with a heading (F7) — the add
+   form used to be three bare stacked inputs. The heading mirrors the
+   sidebar's label language (tiny caps) instead of Pico's h3 scale;
+   its spacing is the flex gap, hence margin: 0. */
+.provider-form { display: flex; flex-direction: column; gap: .45rem; border: 1px solid
+  color-mix(in srgb, currentColor 15%, transparent); border-radius: 10px; padding: .6rem .8rem; }
 .provider-form[hidden] { display: none; }
+#app .provider-form h3 { margin: 0; font-size: .7rem; font-weight: 600; text-transform: uppercase;
+  letter-spacing: .07em; opacity: .55; }
 .provider-form input { min-width: 0; }
 .provider-form-buttons { display: flex; gap: .3rem; }
 #app .provider-form-buttons button { font-size: .75rem; padding: .25rem .6rem; }

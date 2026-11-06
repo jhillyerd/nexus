@@ -1,6 +1,7 @@
 ---
 title: Nexus — UI polish pass (visual review follow-ups)
 status: planned
+
 tags: [nexus, ui, css, pico, responsive]
 updated: 2026-11-06
 ---
@@ -295,6 +296,37 @@ regressions the offline suite cannot see.
     21/21 green twice.
 - **P4 — settings restyle (F7).** `ui_settings.gleam` view + `.settings-page`
   CSS; `openSettings`/`backToChat` e2e helpers must stay green.
+  **Landed 2026-11-06**:
+  - The 46rem section is the centered column (`margin-inline: auto`, the
+    F6 shape), so the header row reads as title-left/Add-right on a wide
+    pane — "Add" used to float mid-page on the left-pinned column. The
+    section head drops the "Settings · " prefix (the header button's
+    Settings/Back-to-chat toggle is the page context; future categories
+    are sibling sections with their own heads).
+  - Provider rows are cards: the visible hairline border is the
+    `.turn.tool` recipe (`currentColor` 15%), padding `.55rem/.8rem`, and
+    the badges ride a `.provider-head` row beside the name (base URL
+    stays the second line) — they used to sit on their own line as loose
+    text. `.badge`'s `align-self` moved to `center` for that row. The
+    dead `.provider-list` rule (rows render straight into the section)
+    is removed.
+  - The add/edit forms are bordered cards with an `h3` heading ("Add
+    provider" / "Edit provider", tiny-caps like the sidebar's labels) —
+    the add form used to be three bare stacked inputs. The headings are
+    present while the form is `hidden`; `.provider-form[hidden] { display:
+    none }` is load-bearing (the base `display: flex` outranks the UA's
+    hidden rule) and is pinned.
+  - Controls stay always-visible on provider rows (the P2 scoping
+    decision); row cards wrap them fine at 390.
+  - `ui_test` pins the markup (section-head title, `provider-head` order
+    name → badge → base URL, both form headings); `web_test` pins the CSS
+    contract (centered-column fragment, the visible row border with the
+    old transparent shape forbidden, form card + `[hidden]` override);
+    e2e §13 gained a geometry check (column narrower than its pane AND
+    centered within 2px; row computed border `solid 1px`). Every id and
+    selector the suite drives is unchanged. Offline 418 green; browser
+    suite 21/21 green twice; screenshot sweep at 1440/860/390, light +
+    dark, clean (add/edit form states captured at 1440 light).
 - **P5 — empty state + header (F5, F8 header).** `log_lines` branch +
   header content; `ui_test` assertions for the new nodes (text-only).
 
