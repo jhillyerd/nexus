@@ -1333,6 +1333,47 @@ pub fn view_renders_providers_panel_test() {
   should.be_true(string.contains(empty, "No providers yet."))
 }
 
+pub fn view_settings_page_structured_test() {
+  // ui-polish F7 markup: one header row (title left, Add right), provider
+  // rows with the badge in a .provider-head next to the name, and form
+  // cards that carry a heading. (The card LOOK — borders, centering — is
+  // CSS pinned in web_test; this pins the markup that carries it.)
+  let html =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, False)]))
+    |> step(ui.SettingsToggled)
+    |> view_string
+  // Header row: the section head names only its category — the header
+  // button's Settings/Back-to-chat toggle is the page context.
+  should.be_true(string.contains(html, "section-head"))
+  should.be_true(string.contains(html, ">Providers<"))
+  should.be_false(string.contains(html, "Settings · Providers"))
+  // Badge lives in the row head beside the name, not on its own line.
+  let head_at = position_of(html, "provider-head")
+  let name_at = position_of(html, "provider-name")
+  let badge_at = position_of(html, ">keyless<")
+  // Presence first: position_of is -1 on a miss, and a -1 would make the
+  // ordering comparisons below pass vacuously.
+  should.be_true(head_at >= 0)
+  should.be_true(name_at >= 0)
+  should.be_true(badge_at >= 0)
+  should.be_true(head_at < name_at && name_at < badge_at)
+  let sub_at = position_of(html, "provider-sub")
+  // The base URL follows the head (the head wraps name + badges).
+  should.be_true(sub_at >= 0)
+  should.be_true(badge_at < sub_at)
+  // Both form cards carry a heading, present even while hidden.
+  should.be_true(string.contains(html, "<h3"))
+  should.be_true(string.contains(html, ">Add provider<"))
+  let editing =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, False)]))
+    |> step(ui.SettingsToggled)
+    |> step(ui.Settings(ui_settings.EditToggled("p1")))
+    |> view_string
+  should.be_true(string.contains(editing, ">Edit provider<"))
+}
+
 pub fn view_provider_forms_hidden_until_opened_test() {
   let base =
     new_model()

@@ -537,6 +537,50 @@ pub fn m3_layout_column_and_mobile_cap_css_test() {
   ))
 }
 
+/// Settings restyle contract (ui-polish P4 / F7): the page renders as one
+/// centered column, provider rows as bordered cards, and the add/edit
+/// forms as bordered cards. Pure CSS in `page.gleam`'s `css()`, pinned
+/// with the contiguous-fragment convention the F2/F3 tests above use.
+pub fn m3_settings_page_restyle_css_test() {
+  let css = nexus_page.html(None)
+  // The 46rem section is the column, centered like the chat lane (F6):
+  // without `margin-inline: auto` the header row's Add floats mid-page
+  // on the left-pinned column — the exact F7 screenshot.
+  should.be_true(string.contains(
+    css,
+    ".settings-page section { display: flex; flex-direction: column; gap: .7rem; width: 100%;\n  max-width: 46rem; margin-inline: auto; }",
+  ))
+  // Provider rows are cards: the visible hairline border (the .turn.tool
+  // recipe). The old transparent border would silently un-restyle the
+  // page while every other rule stays green.
+  should.be_true(string.contains(
+    css,
+    ".provider-row { display: flex; flex-direction: column; gap: .4rem; border: 1px solid\n  color-mix(in srgb, currentColor 15%, transparent);",
+  ))
+  should.be_false(string.contains(
+    css,
+    ".provider-row { display: flex; flex-direction: column; gap: .25rem; border: 1px solid transparent;",
+  ))
+  // The add/edit forms are cards too — the same FULL visible border
+  // recipe the row check pins above (stopping at `border: 1px solid`
+  // would let a `transparent` colour pass).
+  should.be_true(string.contains(
+    css,
+    ".provider-form { display: flex; flex-direction: column; gap: .45rem; border: 1px solid\n  color-mix(in srgb, currentColor 15%, transparent); border-radius: 10px; padding: .6rem .8rem; }",
+  ))
+  // The [hidden] guard is a redundant restatement, not the hider: Pico's
+  // global `[hidden],template { display: none !important }` — author-level
+  // and adopted into the shadow root with the rest of the sheet — already
+  // beats our `display: flex` (P1's Stop-button note leans on the same
+  // rule). The local rule keeps this hidden-able element uniform with its
+  // siblings (.inline-editor[hidden], .confirm-delete[hidden]); the pin
+  // asserts the restatement stays.
+  should.be_true(string.contains(
+    css,
+    ".provider-form[hidden] { display: none; }",
+  ))
+}
+
 /// No-CDN guard: the UI must render fully offline, so the shell may not
 /// reference any absolute or protocol-relative external URL — every asset
 /// it loads is vendored in-repo and served by nexus itself (runtime.mjs,

@@ -238,8 +238,12 @@ pub fn update(
 pub fn view(state: State, provider_list: List(Provider)) -> Element(Msg) {
   html.div([attr.id("settings-page"), attr.class("settings-page")], [
     html.section([attr.id("providers-panel")], [
+      // One header row: title left, Add right (ui-polish F7). The page
+      // itself is the settings surface the header button toggles, so the
+      // section head names only its category — future categories slot in
+      // as sibling sections with their own heads.
       html.div([attr.class("section-head")], [
-        html.h2([], [html.text("Settings · Providers")]),
+        html.h2([], [html.text("Providers")]),
         html.button(
           [
             attr.id("add-provider"),
@@ -291,6 +295,11 @@ fn add_provider_form(state: State) -> Element(Msg) {
       provider_submitted(),
     ],
     [
+      // Card heading (F7): the form renders as a bordered card, and the
+      // heading is what makes it read as a form rather than three bare
+      // stacked inputs. Present even while hidden — the form's visibility
+      // is the `hidden` attribute, not existence.
+      html.h3([], [html.text("Add provider")]),
       html.input([
         attr.type_("text"),
         attr.name("name"),
@@ -328,15 +337,20 @@ fn provider_row(state: State, p: Provider) -> Element(Msg) {
   let id = p.id
   html.div([attr.class("provider-row"), attr.data("provider-id", id)], [
     html.div([attr.class("provider-main")], [
-      html.strong([attr.class("provider-name")], [html.text(p.name)]),
-      case p.enabled {
-        True -> element.none()
-        False -> span_badge("off", "disabled")
-      },
-      case p.has_key {
-        True -> span_badge("", "key")
-        False -> span_badge("", "keyless")
-      },
+      // The row head: name and badges on one line, base URL under it —
+      // the session-row shape (title line, subtitle line). Badges used
+      // to sit on their own line, which read as loose text (F7).
+      html.div([attr.class("provider-head")], [
+        html.strong([attr.class("provider-name")], [html.text(p.name)]),
+        case p.enabled {
+          True -> element.none()
+          False -> span_badge("off", "disabled")
+        },
+        case p.has_key {
+          True -> span_badge("", "key")
+          False -> span_badge("", "keyless")
+        },
+      ]),
       html.span([attr.class("provider-sub")], [html.text(p.base_url)]),
     ]),
     html.div([attr.class("row-controls")], [
@@ -381,6 +395,9 @@ fn provider_row(state: State, p: Provider) -> Element(Msg) {
         provider_edit_submitted(id),
       ],
       [
+        // Card heading, same treatment as the add form — the editor opens
+        // INSIDE its row's card, so the heading marks where the form is.
+        html.h3([], [html.text("Edit provider")]),
         html.input([
           attr.type_("text"),
           attr.name("name"),

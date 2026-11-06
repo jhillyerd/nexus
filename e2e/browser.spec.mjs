@@ -1467,6 +1467,27 @@ async function main() {
       );
       assert((await seededRow.locator(".badge").textContent()) === "keyless", "keyless badge");
 
+      // F7 restyle geometry (which the offline suite cannot see): the
+      // settings section is a centered column (the F6 shape) and provider
+      // rows render as bordered cards.
+      {
+        const pane = await page.locator("#settings-page").boundingBox();
+        const section = await page.locator("#providers-panel").boundingBox();
+        assert(
+          section.width < pane.width - 100,
+          `settings column narrower than pane: ${section.width} vs ${pane.width}`,
+        );
+        const delta = Math.abs(
+          section.x + section.width / 2 - (pane.x + pane.width / 2),
+        );
+        assert(delta < 2, `settings column centered: delta ${delta}px`);
+        const border = await seededRow.evaluate(
+          (el) =>
+            `${getComputedStyle(el).borderTopStyle} ${getComputedStyle(el).borderTopWidth}`,
+        );
+        eq(border, "solid 1px", "provider row renders as a bordered card");
+      }
+
       // The Test control fetches the provider's live model list on
       // demand and renders the fake gateway's aliases.
       await seededRow.getByRole("button", { name: "Test", exact: true }).click();
