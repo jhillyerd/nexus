@@ -457,6 +457,33 @@ pub fn pico_asset_served_from_priv_test() {
   |> should.equal(Ok("private, max-age=86400"))
 }
 
+/// Sidebar-density contract (ui-polish F2): session-row controls are
+/// hidden until the row is hovered, keyboard-focused, or selected, and
+/// the rule must stay scoped to `.session-row` — Settings' provider rows
+/// share `.row-controls` and must never lose their controls. The touch
+/// guard (`@media (hover: hover)`) keeps the hover half off devices with
+/// no pointer, where `:focus-within`/`.selected` carry the reveal.
+pub fn m3_session_row_controls_reveal_css_test() {
+  let css = nexus_page.html(None)
+  // Hidden by default, revealed on the three reachable states. The whole
+  // block is asserted as ONE contiguous fragment: checking the media
+  // query and the hover selector separately stays green if the hover
+  // rule drifts out of the guard, which would re-expose hover on touch.
+  should.be_true(string.contains(
+    css,
+    ".session-row .row-controls { display: none; }\n"
+      <> ".session-row.selected .row-controls,\n"
+      <> ".session-row:focus-within .row-controls { display: flex; }\n"
+      <> "@media (hover: hover) {\n"
+      <> "  .session-row:hover .row-controls { display: flex; }\n"
+      <> "}",
+  ))
+  // Scoped: a bare `.row-controls` reveal would also hide the provider
+  // rows' Disable/Enable/Edit/Test/Delete. The rule may never appear at
+  // the start of a line without the `.session-row` prefix in front.
+  should.be_false(string.contains(css, "\n.row-controls { display: none; }"))
+}
+
 /// No-CDN guard: the UI must render fully offline, so the shell may not
 /// reference any absolute or protocol-relative external URL — every asset
 /// it loads is vendored in-repo and served by nexus itself (runtime.mjs,

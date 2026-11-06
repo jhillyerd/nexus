@@ -221,6 +221,44 @@ regressions the offline suite cannot see.
   rename; `ui_test` pins the hidden-Stop rule and the unified label.
 - **P2 — sidebar density (F2).** Hover-reveal controls + quiet chips;
   verify keyboard reachability (`:focus-within`) and the touch guard.
+  **Landed 2026-11-05**: CSS-only, scoped to `.session-row` (Settings'
+  provider rows share `.row-controls` and keep theirs always on, so the
+  reveal is *not* global). Controls render `display: none` and come back
+  on `.selected`, `:focus-within`, or `:hover` inside `@media (hover:
+  hover)` — the pointer half is off for touch, where the selected row is
+  the only reachable case (verified: `hasTouch` context reports
+  `(hover: hover)` false, and tapping a row selects it and shows its
+  controls). Keyboard reachability is structural, not hopeful: the row's
+  own `.session-main` button is its first tab stop, so tabbing in matches
+  `:focus-within`, and every later control lives inside the row, so it
+  stays revealed while you traverse it. `.tag-chip` lost its border
+  (outline returns on hover) for the quiet-chip look. Measured with the
+  always-on rule forced against the shipped CSS: 52px per unselected row
+  saved at 1440px, 26px at 390px. `web_test` pins the reveal rules and
+  their scope; the e2e organize pass drives every control through
+  `revealRowControls()` and asserts the hidden → hover → focus → hidden
+  cycle explicitly, with the keyboard half walked by real Tab presses
+  from `#show-archived` (a `focus()` call would still pass if a control
+  dropped out of the tab order), and the mobile test adds a `hasTouch`
+  context asserting `(hover: hover)` false plus the tap-selects/reveals
+  path.
+  *Reveal reflow, decided.* `display` toggles the strip in flow, so the
+  rows below the hovered one shift by one control line (26px at 390/860,
+  53px at 1440). The consequence that makes that dangerous — hover
+  flicker, the next row sliding out from under the pointer and back —
+  was measured and does not occur: sweeping the pointer down the list in
+  3px steps gives 0 A-B-A oscillations (4 state changes in 88 samples at
+  1440, 10 in 212 at 390), because the reveal only ever happens on the
+  row already under the pointer. The two no-reflow shapes were measured
+  too and both cost more than the jitter: reserving the line in flow puts
+  the strip's height straight back on every row — 88px to 114px at
+  390/860, 88px to 141px at 1440, where the strip wraps to two lines —
+  which is the whole density win given back, and an absolute overlay puts
+  the strip over the tag chips
+  at desktop width (the 17rem sidebar forces two lines), where
+  `elementFromPoint` over a chip's centre returns the control button,
+  not the chip — a silent loss of chip clicks. So the jitter stands as an
+  accepted trade, pinned by the measured numbers above.
 - **P3 — layout (F3a cap, F4 create-panel reorder, F6 centered column).**
   Grid/markup changes in `page.gleam` + `sidebar()`; browser-suite
   selectors must keep working (`#create-panel`, `#layout`, session rows).

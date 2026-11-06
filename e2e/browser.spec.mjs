@@ -286,6 +286,37 @@ async function selectedId(p) {
   return await p.locator("#layout").evaluate((el) => el.getAttribute("data-selected") || "");
 }
 
+/// Reveal a session row's hover controls (ui-polish F2) before driving
+/// them. Playwright's `click()` waits for visibility *before* hovering,
+/// so a control that only exists on `:hover`/`:focus-within` must be
+/// revealed first — the same thing a real pointer user does by moving
+/// onto the row. Selecting the row is the always-visible path; hover is
+/// the desktop path, and it doubles as the reachability proof.
+async function revealRowControls(row) {
+  const controls = row.locator(".row-controls");
+  if (await controls.isVisible()) return;
+  await row.hover();
+  await poll(async () => await controls.isVisible(), {
+    timeout: 5000,
+    message: "row controls revealed by hover",
+  });
+}
+
+/// Walk real Tab presses from the sidebar's last pre-list control and
+/// return once `row`'s select button holds focus, reporting the trail.
+/// `focus()` is deliberately avoided: it proves nothing about the order,
+/// so a control dropping out of the tab order would pass unnoticed.
+async function tab_to_row_main(page, row) {
+  await page.locator("#show-archived").focus();
+  const want = row.locator(".session-main");
+  for (let i = 0; i < 40; i++) {
+    await page.keyboard.press("Tab");
+    const hit = await want.evaluate((el) => el === document.activeElement || el.getRootNode().activeElement === el).catch(() => false);
+    if (hit) return true;
+  }
+  return false;
+}
+
 async function sendAndWaitIdle(page, text) {
   await page.fill("#input", text);
   const before = await page.$$eval(".turn.user", (els) => els.length);
@@ -510,6 +541,48 @@ async function main() {
       const smartRow = page.locator(`.session-row[data-session-id="${smart.id}"]`);
       const fastRow = page.locator(`.session-row[data-session-id="${fast.id}"]`);
 
+      // Sidebar density (ui-polish F2): an unselected row keeps its five
+      // controls out of the way until you actually want them. Pinned here
+      // so the pass cannot regress in either direction — permanently
+      // hidden (controls unreachable) or permanently shown (no density
+      // win). `fastRow` is the unselected one right now, so it is the
+      // honest subject.
+      {
+        const controls = fastRow.locator(".row-controls");
+        eq(await controls.isVisible(), false, "unselected row hides its controls");
+        // Pointer path.
+        await fastRow.hover();
+        await poll(async () => await controls.isVisible(), {
+          timeout: 5000,
+          message: "hover reveals the row controls",
+        });
+        // Keyboard path: real sequential Tab navigation, not `focus()`.
+        // `focus()` would pass even if the row's controls fell out of the
+        // tab order entirely, which is the regression worth catching. The
+        // sidebar's own `#show-archived` button is the last focusable
+        // before the list, so starting there and pressing Tab walks the
+        // actual order: every hidden control is out of the order until its
+        // row has focus, so the row's `.session-main` is the stop that
+        // opens it.
+        await page.mouse.move(0, 0); // leave the list: no hover help
+        const reached = await tab_to_row_main(page, fastRow);
+        assert(
+          reached,
+          "Tab navigation reached the unselected row's select button",
+        );
+        await poll(async () => await controls.isVisible(), {
+          timeout: 5000,
+          message: "keyboard focus reveals the row controls",
+        });
+        // And it is the *focus* that did it: leaving the row hides them
+        // again, with the pointer still off the list.
+        await page.locator("#new-session").focus();
+        await poll(async () => !(await controls.isVisible()), {
+          timeout: 5000,
+          message: "controls hide again once focus leaves the row",
+        });
+      }
+
       // Auto-title: the row title becomes the collapsed first message.
       await sendAndWaitIdle(page, "hello   organize world");
       let s = await byModel("smart");
@@ -523,7 +596,11 @@ async function main() {
         { timeout: 10_000, message: "auto title in row" },
       );
 
-      // Manual rename through the inline editor pins the title.
+      // Manual rename through the inline editor pins the title. Row
+      // controls are hover-revealed (ui-polish F2), so every control
+      // drive starts with a reveal — that also proves the controls are
+      // reachable, not merely present in the DOM.
+      await revealRowControls(smartRow);
       await smartRow.getByRole("button", { name: "Rename", exact: true }).click();
       await smartRow.locator('input[name="title"]').fill("Renamed session");
       await smartRow
@@ -542,6 +619,7 @@ async function main() {
       eq(s.title_source, "manual", "manual title source");
 
       // Tags through the inline editor render as chips.
+      await revealRowControls(smartRow);
       await smartRow.getByRole("button", { name: "Tags", exact: true }).click();
       // Regression check: the open editor (input + Save + Cancel) must fit
       // inside the sidebar — the input shrinks (flex/min-width) instead of
@@ -583,6 +661,7 @@ async function main() {
       });
 
       // Pin: the row moves into the global pinned section.
+      await revealRowControls(smartRow);
       await smartRow.getByRole("button", { name: "Pin", exact: true }).click();
       await poll(
         async () => {
@@ -596,6 +675,7 @@ async function main() {
       );
 
       // Archive: the row soft-hides; the toggle reveals it; Restore works.
+      await revealRowControls(smartRow);
       await smartRow.getByRole("button", { name: "Archive", exact: true }).click();
       await poll(
         async () => (await smartRow.count()) === 0 || !(await smartRow.isVisible()),
@@ -620,13 +700,16 @@ async function main() {
         0,
         "no pin control on archived row",
       );
+      await revealRowControls(smartRow);
       await smartRow.getByRole("button", { name: "Restore", exact: true }).click();
       await poll(async () => await smartRow.locator(".session-main").isVisible(), {
         timeout: 10_000,
         message: "restored row back in the list",
       });
       // Restored sessions are active again: the pin control is back (the
-      // pin itself stays cleared until re-pinned).
+      // pin itself stays cleared until re-pinned). Reveal first — the
+      // restored row is neither selected nor hovered yet.
+      await revealRowControls(smartRow);
       await poll(
         async () =>
           await smartRow.getByRole("button", { name: "Pin", exact: true }).isVisible(),
@@ -634,6 +717,7 @@ async function main() {
       );
 
       // Delete the fast session: two-step confirm, hard removal.
+      await revealRowControls(fastRow);
       await fastRow.getByRole("button", { name: "Delete", exact: true }).click();
       await fastRow
         .getByRole("button", { name: "Delete forever", exact: true })
@@ -1148,6 +1232,65 @@ async function main() {
         first,
         "desktop selection untouched by the mobile reload",
       );
+
+      // Touch devices and sidebar density (ui-polish F2): the hover half
+      // of the reveal must be off, so the selected row is the reachable
+      // case. A dedicated hasTouch context rather than reusing this one,
+      // so the per-client assertions above stay pointer-only.
+      const touch = await browser.newContext({
+        viewport: { width: 390, height: 844 },
+        hasTouch: true,
+        isMobile: true,
+      });
+      const tpage = await touch.newPage();
+      track(tpage);
+      await tpage.goto(`${base}/?token=${TOKEN}`);
+      await connected(tpage);
+      await tpage.waitForSelector(".session-row", { timeout: 15_000 });
+      const touchState = await tpage.evaluate(() => {
+        const sr = document
+          .querySelector("lustre-server-component")
+          ?.shadowRoot;
+        const rows = [...sr.querySelectorAll(".session-row")];
+        return {
+          hoverHover: matchMedia("(hover: hover)").matches,
+          rows: rows.map((r) => ({
+            selected: r.classList.contains("selected"),
+            shown:
+              getComputedStyle(r.querySelector(".row-controls")).display !==
+              "none",
+          })),
+        };
+      });
+      eq(
+        touchState.hoverHover,
+        false,
+        "touch context reports no hover capability",
+      );
+      assert(
+        touchState.rows.some((r) => r.selected && r.shown),
+        "the selected row shows its controls on touch",
+      );
+      assert(
+        !touchState.rows.some((r) => !r.selected && r.shown),
+        "an unselected row keeps its controls hidden on touch",
+      );
+      // And a tap selects: the row you are in is the row you can act on.
+      const untapped = tpage
+        .locator(".session-row:not(.selected) .session-main")
+        .first();
+      if (await untapped.count()) {
+        await untapped.tap();
+        await poll(
+          async () =>
+            await tpage
+              .locator(".session-row.selected .row-controls")
+              .first()
+              .isVisible(),
+          { timeout: 10_000, message: "tap selects and reveals the controls" },
+        );
+      }
+      await touch.close();
 
       // Leave one session behind, as the suite found it: later tests
       // count rows and chat-request chains.
