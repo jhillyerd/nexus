@@ -302,6 +302,21 @@ async function revealRowControls(row) {
   });
 }
 
+/// Walk real Tab presses from the sidebar's last pre-list control and
+/// return once `row`'s select button holds focus, reporting the trail.
+/// `focus()` is deliberately avoided: it proves nothing about the order,
+/// so a control dropping out of the tab order would pass unnoticed.
+async function tab_to_row_main(page, row) {
+  await page.locator("#show-archived").focus();
+  const want = row.locator(".session-main");
+  for (let i = 0; i < 40; i++) {
+    await page.keyboard.press("Tab");
+    const hit = await want.evaluate((el) => el === document.activeElement || el.getRootNode().activeElement === el).catch(() => false);
+    if (hit) return true;
+  }
+  return false;
+}
+
 async function sendAndWaitIdle(page, text) {
   await page.fill("#input", text);
   const before = await page.$$eval(".turn.user", (els) => els.length);
@@ -541,15 +556,27 @@ async function main() {
           timeout: 5000,
           message: "hover reveals the row controls",
         });
-        // Keyboard path: the row's own select button is its first tab
-        // stop, so `:focus-within` must carry the reveal without a mouse.
-        await page.mouse.move(0, 0); // leave the row
-        await fastRow.locator(".session-main").focus();
+        // Keyboard path: real sequential Tab navigation, not `focus()`.
+        // `focus()` would pass even if the row's controls fell out of the
+        // tab order entirely, which is the regression worth catching. The
+        // sidebar's own `#show-archived` button is the last focusable
+        // before the list, so starting there and pressing Tab walks the
+        // actual order: every hidden control is out of the order until its
+        // row has focus, so the row's `.session-main` is the stop that
+        // opens it.
+        await page.mouse.move(0, 0); // leave the list: no hover help
+        const reached = await tab_to_row_main(page, fastRow);
+        assert(
+          reached,
+          "Tab navigation reached the unselected row's select button",
+        );
         await poll(async () => await controls.isVisible(), {
           timeout: 5000,
           message: "keyboard focus reveals the row controls",
         });
-        await fastRow.locator(".session-main").blur();
+        // And it is the *focus* that did it: leaving the row hides them
+        // again, with the pointer still off the list.
+        await page.locator("#new-session").focus();
         await poll(async () => !(await controls.isVisible()), {
           timeout: 5000,
           message: "controls hide again once focus leaves the row",
@@ -1205,6 +1232,65 @@ async function main() {
         first,
         "desktop selection untouched by the mobile reload",
       );
+
+      // Touch devices and sidebar density (ui-polish F2): the hover half
+      // of the reveal must be off, so the selected row is the reachable
+      // case. A dedicated hasTouch context rather than reusing this one,
+      // so the per-client assertions above stay pointer-only.
+      const touch = await browser.newContext({
+        viewport: { width: 390, height: 844 },
+        hasTouch: true,
+        isMobile: true,
+      });
+      const tpage = await touch.newPage();
+      track(tpage);
+      await tpage.goto(`${base}/?token=${TOKEN}`);
+      await connected(tpage);
+      await tpage.waitForSelector(".session-row", { timeout: 15_000 });
+      const touchState = await tpage.evaluate(() => {
+        const sr = document
+          .querySelector("lustre-server-component")
+          ?.shadowRoot;
+        const rows = [...sr.querySelectorAll(".session-row")];
+        return {
+          hoverHover: matchMedia("(hover: hover)").matches,
+          rows: rows.map((r) => ({
+            selected: r.classList.contains("selected"),
+            shown:
+              getComputedStyle(r.querySelector(".row-controls")).display !==
+              "none",
+          })),
+        };
+      });
+      eq(
+        touchState.hoverHover,
+        false,
+        "touch context reports no hover capability",
+      );
+      assert(
+        touchState.rows.some((r) => r.selected && r.shown),
+        "the selected row shows its controls on touch",
+      );
+      assert(
+        !touchState.rows.some((r) => !r.selected && r.shown),
+        "an unselected row keeps its controls hidden on touch",
+      );
+      // And a tap selects: the row you are in is the row you can act on.
+      const untapped = tpage
+        .locator(".session-row:not(.selected) .session-main")
+        .first();
+      if (await untapped.count()) {
+        await untapped.tap();
+        await poll(
+          async () =>
+            await tpage
+              .locator(".session-row.selected .row-controls")
+              .first()
+              .isVisible(),
+          { timeout: 10_000, message: "tap selects and reveals the controls" },
+        );
+      }
+      await touch.close();
 
       // Leave one session behind, as the suite found it: later tests
       // count rows and chat-request chains.

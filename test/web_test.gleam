@@ -465,20 +465,18 @@ pub fn pico_asset_served_from_priv_test() {
 /// no pointer, where `:focus-within`/`.selected` carry the reveal.
 pub fn m3_session_row_controls_reveal_css_test() {
   let css = nexus_page.html(None)
-  // Hidden by default, revealed on the three reachable states.
+  // Hidden by default, revealed on the three reachable states. The whole
+  // block is asserted as ONE contiguous fragment: checking the media
+  // query and the hover selector separately stays green if the hover
+  // rule drifts out of the guard, which would re-expose hover on touch.
   should.be_true(string.contains(
     css,
-    ".session-row .row-controls { display: none; }",
-  ))
-  should.be_true(string.contains(
-    css,
-    ".session-row.selected .row-controls,\n.session-row:focus-within .row-controls { display: flex; }",
-  ))
-  // The hover half is pointer-only.
-  should.be_true(string.contains(css, "@media (hover: hover) {"))
-  should.be_true(string.contains(
-    css,
-    ".session-row:hover .row-controls { display: flex; }",
+    ".session-row .row-controls { display: none; }\n"
+      <> ".session-row.selected .row-controls,\n"
+      <> ".session-row:focus-within .row-controls { display: flex; }\n"
+      <> "@media (hover: hover) {\n"
+      <> "  .session-row:hover .row-controls { display: flex; }\n"
+      <> "}",
   ))
   // Scoped: a bare `.row-controls` reveal would also hide the provider
   // rows' Disable/Enable/Edit/Test/Delete. The rule may never appear at

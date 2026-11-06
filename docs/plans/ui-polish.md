@@ -237,7 +237,26 @@ regressions the offline suite cannot see.
   saved at 1440px, 26px at 390px. `web_test` pins the reveal rules and
   their scope; the e2e organize pass drives every control through
   `revealRowControls()` and asserts the hidden → hover → focus → hidden
-  cycle explicitly.
+  cycle explicitly, with the keyboard half walked by real Tab presses
+  from `#show-archived` (a `focus()` call would still pass if a control
+  dropped out of the tab order), and the mobile test adds a `hasTouch`
+  context asserting `(hover: hover)` false plus the tap-selects/reveals
+  path.
+  *Reveal reflow, decided.* `display` toggles the strip in flow, so the
+  rows below the hovered one shift by one control line (26px at 390/860,
+  53px at 1440). The consequence that makes that dangerous — hover
+  flicker, the next row sliding out from under the pointer and back —
+  was measured and does not occur: sweeping the pointer down the list in
+  3px steps gives 0 A-B-A oscillations (4 state changes in 88 samples at
+  1440, 10 in 212 at 390), because the reveal only ever happens on the
+  row already under the pointer. The two no-reflow shapes were measured
+  too and both cost more than the jitter: reserving the line in flow
+  returns the row to ~114px from 88px, which is the whole density win
+  given back, and an absolute overlay puts the strip over the tag chips
+  at desktop width (the 17rem sidebar forces two lines), where
+  `elementFromPoint` over a chip's centre returns the control button,
+  not the chip — a silent loss of chip clicks. So the jitter stands as an
+  accepted trade, pinned by the measured numbers above.
 - **P3 — layout (F3a cap, F4 create-panel reorder, F6 centered column).**
   Grid/markup changes in `page.gleam` + `sidebar()`; browser-suite
   selectors must keep working (`#create-panel`, `#layout`, session rows).
