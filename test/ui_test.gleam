@@ -753,6 +753,68 @@ pub fn view_renders_empty_states_test() {
   should.be_true(string.contains(html, "disabled"))
 }
 
+// ui-polish F5: an empty transcript renders an intentional muted hint, not
+// a blank void; the hint disappears the moment there is anything to show.
+pub fn view_empty_transcript_note_test() {
+  let html = new_model() |> view_string
+  should.be_true(string.contains(
+    html,
+    "Send a message to start — tool calls and reasoning will render here",
+  ))
+  // A committed user line displaces the hint (streaming or committed
+  // alike: both make log_lines non-empty).
+  let html = new_model() |> step(ui.UserEcho("hi")) |> view_string
+  should.be_false(string.contains(html, "Send a message to start"))
+}
+
+// ui-polish F8: the header's context span shows the selected session's
+// title, not the bare model alias. The alias stays as the untitled
+// fallback (the row-title rule), and model_label's "connecting…" /
+// "session ended" keep their roles while nothing is selected.
+pub fn view_header_shows_session_title_test() {
+  let titled =
+    session.SessionSummary(..summary("s-1", False), title: "Renamed session")
+  let html =
+    new_model()
+    |> step(ui.SessionsLoaded([titled]))
+    |> step(ui.Select("s-1"))
+    |> view_string
+  should.be_true(string.contains(html, "id=\"model\""))
+  should.be_true(string.contains(html, "Renamed session"))
+
+  // Untitled session: the alias is the fallback, matching the row title.
+  let html =
+    new_model()
+    |> step(ui.SessionsLoaded([summary("s-1", False)]))
+    |> step(ui.Select("s-1"))
+    |> view_string
+  should.be_true(string.contains(html, ">smart<"))
+}
+
+pub fn view_header_fallback_labels_test() {
+  // No selection yet: the boot label.
+  let html = new_model() |> view_string
+  should.be_true(string.contains(html, "connecting…"))
+  // Selection dropped (session vanished): the terminal label.
+  let html =
+    new_model()
+    |> step(ui.SessionsLoaded([summary("s-1", False)]))
+    |> step(ui.Select("s-1"))
+    |> step(ui.SessionsLoaded([]))
+    |> view_string
+  should.be_true(string.contains(html, "session ended"))
+}
+
+// ui-polish F8: the connection state is a labelled group — the dot plus
+// a text twin the static indicator script flips on transport events.
+pub fn view_header_connection_label_test() {
+  let html = new_model() |> view_string
+  should.be_true(string.contains(html, "id=\"status\""))
+  should.be_true(string.contains(html, "id=\"status-label\""))
+  should.be_true(string.contains(html, "class=\"conn\""))
+  should.be_true(string.contains(html, "connected"))
+}
+
 /// The composer must be an uncontrolled textarea inside a keyed form: the
 /// key (invisible in HTML) rotates on every accepted send so the client
 /// runtime replaces — and thereby clears — the element.
@@ -1478,14 +1540,15 @@ pub fn view_jump_latest_button_test() {
   // bottom; Lustre SSR sorts attributes), no event handler, and none of
   // the old repo's inline `onclick` script. It is a sibling AFTER #log,
   // inside #log-wrap, so it never lands in the log's aria-live region
-  // (with no session selected the log renders empty, pinning the exact
-  // structure — including the centered `.conversation` column F6 puts
-  // inside #log, which is why the log is no longer bare).
+  // (with no session selected the log renders the F5 empty-state note
+  // inside the centered `.conversation` column F6 puts in #log, which is
+  // why the log is no longer bare).
   new_model()
   |> view_string
   |> should_contain(
     "<div id=\"log-wrap\"><div aria-live=\"polite\" id=\"log\">"
-    <> "<div class=\"conversation\"></div></div>"
+    <> "<div class=\"conversation\"><div class=\"note\">Send a message to "
+    <> "start — tool calls and reasoning will render here</div></div></div>"
     <> "<button aria-label=\"Jump to latest\" hidden id=\"jump-latest\" "
     <> "type=\"button\">↓</button></div>",
   )

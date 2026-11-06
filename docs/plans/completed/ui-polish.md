@@ -1,12 +1,17 @@
 ---
 title: Nexus — UI polish pass (visual review follow-ups)
-status: planned
+status: completed
 
 tags: [nexus, ui, css, pico, responsive]
 updated: 2026-11-06
 ---
 
 # Nexus: UI polish pass
+
+> **Landed 2026-11-05/06** (P1–P4 as PRs #36–#40; P5 closes the plan).
+> All eight findings shipped as designed; the offline suite and the e2e
+> browser suite stayed green through every phase. Phase records live in
+> §4; the §6 open questions were answered in place.
 
 > Decisions from the 2026-11-05 visual review session:
 >
@@ -331,6 +336,40 @@ regressions the offline suite cannot see.
     dark, clean (add/edit form states captured at 1440 light).
 - **P5 — empty state + header (F5, F8 header).** `log_lines` branch +
   header content; `ui_test` assertions for the new nodes (text-only).
+  **Landed 2026-11-06**:
+  - **F5** is a terminal branch in `log_lines`: when the render list is
+    empty — no committed lines, no live thinking, no bubble, no pending
+    calls — it renders one muted `.note` (the NoteLine recipe, so it sits
+    centered in the F6 column): "Send a message to start — tool calls and
+    reasoning will render here". A Lustre text node, per the hostile-text
+    invariant; it shows for a no-selection boot too (an intentional hint
+    over a void), and any committed line, live block, or pending card
+    displaces it. `view_jump_latest_button_test` pinned `#log`'s exact
+    HTML — its `.conversation` went from empty to note-bearing, so the
+    pin followed the change (that is what the pin is for).
+  - **F8 header, decided: session title only** (not "title · model" —
+    provider/model already ride the row subtitle, so a second alias in
+    the shell read as clutter). The `#model` span renders the selected
+    session's display title via a new `header_title` helper; the row's
+    alias-fallback rule moved into a shared `display_title`, so an
+    untitled session still shows its alias in both places, and
+    `model_label` keeps its feedback role while NOTHING is selected
+    ("connecting…" at boot/select, "session ended" after the selection
+    drops) — the fallback chain is title → alias → model_label. The
+    alias falling back in the header also keeps the e2e switch test's
+    `#model === "smart"` poll honest for the untitled window it runs in.
+  - **F8 connection label**: the dot moved into a `.conn` group with a
+    text twin `#status-label` ("connected"/"offline") — legible without
+    color, the dot's `margin-left: auto` riding the group now. The page's
+    static `indicator_js` flips both from the client runtime's own
+    `lustre:close`/`lustre:connect` events (the server can only ever
+    render "connected", the same one-live-client truth as the green
+    dot); `web_test`'s indicator test pins the label flip, and the e2e
+    reconnect test now asserts the label text on both sides of the
+    outage. `ui_test` pins the header title (titled + alias fallback),
+    both `model_label` fallbacks through the VIEW, and the `.conn`/
+    `#status-label` group; the e2e organize test asserts the header
+    follows a manual rename, and the page-load test asserts the F5 note.
 
 ## 5. Verification
 
@@ -376,4 +415,8 @@ regressions the offline suite cannot see.
   two edge-pinned ones; a long card was watched at 1440 and wrapped its
   `.tool-meta` row inside the 46rem box exactly as before.
 - F8 header: session title vs "session title · model" — trivial, decide
-  in P5.
+  in P5. **Answered in P5: title only.** The alias/provider already live
+  in the row subtitle; a second alias in the shell was the exact clutter
+  F8 set out to remove. Untitled sessions fall back to the alias (the
+  shared `display_title` rule), and the no-selection states keep
+  `model_label`'s "connecting…"/"session ended" feedback.
