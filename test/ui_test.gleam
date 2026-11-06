@@ -706,6 +706,26 @@ fn view_string(model: ui.Model) -> String {
   element.to_string(ui.view(model))
 }
 
+pub fn view_create_panel_precedes_session_list_test() {
+  // ui-polish F4: "New" used to open the create panel below the whole
+  // session list, i.e. below the fold. Markup order is the fix, so the
+  // panel must come FIRST inside the sidebar — and it must still be the
+  // same `#create-panel` section with the same pickers, since the browser
+  // suite drives this flow by those ids.
+  let html =
+    new_model()
+    |> step(ui.AliasesLoaded("p1", ["smart", "fast"]))
+    |> step(ui.SessionsLoaded([summary("s-1", False)]))
+    |> view_string
+  // Everything rendered before the list's id must include the panel's id:
+  // that is the order assertion, without pinning a byte offset.
+  let assert Ok(#(before_list, _)) =
+    string.split_once(html, "id=\"session-list\"")
+  should.be_true(string.contains(before_list, "id=\"create-panel\""))
+  should.be_true(string.contains(html, "id=\"provider-picker\""))
+  should.be_true(string.contains(html, "id=\"create-session\""))
+}
+
 pub fn view_renders_shell_and_sidebar_test() {
   let model =
     new_model()
@@ -1418,11 +1438,13 @@ pub fn view_jump_latest_button_test() {
   // the old repo's inline `onclick` script. It is a sibling AFTER #log,
   // inside #log-wrap, so it never lands in the log's aria-live region
   // (with no session selected the log renders empty, pinning the exact
-  // structure).
+  // structure — including the centered `.conversation` column F6 puts
+  // inside #log, which is why the log is no longer bare).
   new_model()
   |> view_string
   |> should_contain(
-    "<div id=\"log-wrap\"><div aria-live=\"polite\" id=\"log\"></div>"
+    "<div id=\"log-wrap\"><div aria-live=\"polite\" id=\"log\">"
+    <> "<div class=\"conversation\"></div></div>"
     <> "<button aria-label=\"Jump to latest\" hidden id=\"jump-latest\" "
     <> "type=\"button\">↓</button></div>",
   )

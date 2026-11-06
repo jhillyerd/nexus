@@ -2,7 +2,7 @@
 title: Nexus — UI polish pass (visual review follow-ups)
 status: planned
 tags: [nexus, ui, css, pico, responsive]
-updated: 2026-11-05
+updated: 2026-11-06
 ---
 
 # Nexus: UI polish pass
@@ -262,6 +262,37 @@ regressions the offline suite cannot see.
 - **P3 — layout (F3a cap, F4 create-panel reorder, F6 centered column).**
   Grid/markup changes in `page.gleam` + `sidebar()`; browser-suite
   selectors must keep working (`#create-panel`, `#layout`, session rows).
+  **Landed 2026-11-06**:
+  - **F4** is a markup reorder in `sidebar()`: the `#create-panel` section
+    moved ABOVE the session list, so its separator flipped from a top rule
+    to a bottom one (`margin-bottom`/`padding-bottom`/`border-bottom`) and
+    "New" opens on screen. No new state, and every id the suite drives is
+    unchanged. Measured at 390×844 with four sessions: panel `top 61 →
+    bottom 246`, list starting below it at 382 — previously below the fold.
+    `ui_test` pins the order structurally (everything before
+    `id="session-list"` must contain `id="create-panel"`).
+  - **F6** is one inner wrapper: `#log > .conversation` at
+    `max-width: 52rem; margin-inline: auto`, with the inter-turn `gap`
+    moving inside it. `#log` stays the scroll container that
+    `autoscroll_js` observes (so auto-follow and the reload-rescan logic are
+    untouched) and `#jump-latest` keeps `#log-wrap` as its containing block,
+    so it stays pane-relative. The ruled-out `align-items: center` shape is
+    pinned as must-not-appear. Measured at 1440 (pane 1185px): column 780px,
+    left/right gaps 203/203 — dead space collapses to a centered lane and
+    the existing per-child `align-self` reads as right/left.
+  - **F3(a)** is the one-line cap: `aside { max-height: 40dvh }` inside the
+    900px block. Measured with four sessions: 390×844 → aside 337.6px
+    (= the cap), transcript 457.8px, composer bottom exactly 844 (on screen);
+    860×900 → aside 360px, transcript 491px. The cap is on the aside's
+    HEIGHT, not its bottom — the header sits above it, so `bottom` runs past
+    40dvh even when the cap holds; the e2e assertion measures height for
+    that reason.
+  - e2e gained three geometry checks (column narrower than its pane AND
+    centered, jump button anchored to `#log-wrap` with the column `static`,
+    mobile aside capped + composer on screen + panel on screen). The
+    reasoning-order probe follows the wrapper one level down
+    (`#log .conversation > *`). Offline suite 416 green; browser suite
+    21/21 green twice.
 - **P4 — settings restyle (F7).** `ui_settings.gleam` view + `.settings-page`
   CSS; `openSettings`/`backToChat` e2e helpers must stay green.
 - **P5 — empty state + header (F5, F8 header).** `log_lines` branch +
@@ -289,12 +320,26 @@ regressions the offline suite cannot see.
 - F2 on touch: hover-reveal with selected-row exception vs a "…"
   overflow menu — decide during P2 with a phone in hand.
 - F3: is the 40dvh cap enough, or does the session list need a real
-  collapse toggle? Decide during P3 against a realistic (20+ session)
-  list.
+  collapse toggle? **Answered in P3: enough for the sizes measured** —
+  four sessions leave 457px of transcript at 390×844 and 491px at 860×900,
+  with the composer on screen. The list already scrolls inside `aside`, so
+  a deeper list degrades to scrolling rather than crushing the chat.
+  Revisit (option b/c) only if a 20+ session list starts feeling dead.
 - F6: the centered column interacts with the 46rem turn cap and the
   reasoning/tool block widths — settle the wrapper mechanics (single
   inner wrapper vs per-turn max-width + auto margins) while watching a
   long tool card at 1440. The `align-items: center` variant is ruled
-  out (see F6).
+  out (see F6). **Answered in P3: single inner wrapper.** Per-turn
+  `max-width` + auto margins would restate the cap on every turn class
+  (including `details.turn.reasoning`/`.tool`) and center each bubble
+  independently, which reads as a ragged column; one wrapper leaves the
+  existing `align-self` rules and every turn width untouched. The lane is
+  deliberately WIDER than the turn cap (52rem vs 46rem): every turn class
+  keeps its own `max-width: 46rem`, so a long `http_fetch` card stays
+  capped at 46rem inside the lane — left-aligned with ~6rem of slack on
+  the lane's right edge, never stretched to 52rem. The 6rem difference is
+  what lets the two bubble alignments read as a single column instead of
+  two edge-pinned ones; a long card was watched at 1440 and wrapped its
+  `.tool-meta` row inside the 46rem box exactly as before.
 - F8 header: session title vs "session title · model" — trivial, decide
   in P5.
