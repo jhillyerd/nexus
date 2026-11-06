@@ -385,6 +385,10 @@ pub fn m3_page_indicator_script_test() {
   should.be_true(string.contains(html, "'dot live'"))
   // It reaches the dot through the open shadow root, not innerHTML.
   should.be_true(string.contains(html, "getElementById('status')"))
+  // The F8 label is the dot's text twin and flips with the same events.
+  should.be_true(string.contains(html, "getElementById('status-label')"))
+  should.be_true(string.contains(html, "'connected'"))
+  should.be_true(string.contains(html, "'offline'"))
   should.be_false(string.contains(html, "innerHTML"))
 }
 

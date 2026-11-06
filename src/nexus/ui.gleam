@@ -158,8 +158,8 @@ pub fn rel_time(now_epoch: Int, at: Int) -> String {
   }
 }
 
-/// Which main view the shell renders. The header (title, model label,
-/// connection dot, settings button) persists across both; the `#layout`
+/// Which main view the shell renders. The header (title, session context,
+/// connection state, settings button) persists across both; the `#layout`
 /// area swaps between the chat triple and the settings page.
 pub type UiView {
   ChatView
@@ -229,6 +229,10 @@ pub type Model {
     // session existed) — auto-opened, so it also auto-closes again once
     // there is something to select.
     create_auto: Bool,
+    // Header fallback label (ui-polish F8): what the `#model` span shows
+    // while NO session is selected — "connecting…" at boot and on select,
+    // "session ended" after the selection drops. With a selection the
+    // header shows the session's title instead (see `header_title`).
     model_label: String,
     // ---- Session organization (registry metadata, display only) ----
     /// Free-text filter over titles + tags, case-insensitive.
@@ -1490,12 +1494,24 @@ pub fn view(model: Model) -> Element(Msg) {
     html.header([], [
       html.h1([], [html.text("nexus")]),
       html.span([attr.id("model"), attr.class("muted")], [
-        html.text(model.model_label),
+        html.text(header_title(model)),
       ]),
-      html.span(
-        [attr.id("status"), attr.class("dot live"), attr.title("connection")],
-        [html.text("●")],
-      ),
+      // The connection state is a labelled group, not a bare dot
+      // (ui-polish F8): the dot plus a text twin, so the state stays
+      // legible without color. The label flips with the dot via the
+      // page's static indicator script (nexus/page.gleam); the server
+      // always renders "connected" — one runtime serves exactly one
+      // live client, the only truth it can know — exactly like the
+      // dot's green render above.
+      html.span([attr.class("conn")], [
+        html.span(
+          [attr.id("status"), attr.class("dot live"), attr.title("connection")],
+          [html.text("●")],
+        ),
+        html.span([attr.id("status-label"), attr.class("muted")], [
+          html.text("connected"),
+        ]),
+      ]),
       html.button(
         [
           attr.id("settings"),
@@ -1777,18 +1793,39 @@ fn bucket_groups(
   })
 }
 
+/// The header's session context (ui-polish F8): the selected session's
+/// title — the bare model alias ("nexus  smart") was cryptic, and the
+/// alias already rides the row subtitle. An untitled session falls back
+/// to its alias (the row-title rule); with nothing selected the
+/// `model_label` fallbacks ("connecting…", "session ended") keep their
+/// feedback role.
+fn header_title(model: Model) -> String {
+  case model.selected {
+    Some(id) ->
+      case list.find(model.sessions, fn(s) { s.id == id }) {
+        Ok(summary) -> display_title(summary)
+        Error(_) -> model.model_label
+      }
+    None -> model.model_label
+  }
+}
+
+/// Display title for a session: its title, or the model alias until the
+/// first message auto-titles it.
+fn display_title(summary: session.SessionSummary) -> String {
+  case summary.title {
+    "" -> summary.model
+    titled -> titled
+  }
+}
+
 /// One sidebar row: a select button (title + model/age subtitle), tag
 /// chips, compact controls, and hidden inline editors + delete confirm.
 /// Everything is escaped text nodes — no innerHTML anywhere.
 fn session_row(model: Model, summary: session.SessionSummary) -> Element(Msg) {
   let id = summary.id
   let selected = model.selected == Some(id)
-  // An untitled session falls back to its alias until the first message
-  // auto-titles it.
-  let title = case summary.title {
-    "" -> summary.model
-    titled -> titled
-  }
+  let title = display_title(summary)
   // The subtitle pins the session's identity: provider/model (both
   // frozen at creation, §8) plus its age. The provider name resolves
   // from the masked list so renames show at once.
@@ -2131,9 +2168,22 @@ fn log_lines(model: Model) -> List(Element(Msg)) {
     Some(text) -> list.append(with_thinking, [turn("assistant", text)])
     None -> with_thinking
   }
-  case model.pending {
+  let lines = case model.pending {
     [] -> with_bubble
     pending -> list.append(with_bubble, list.map(pending, pending_card))
+  }
+  case lines {
+    // ui-polish F5: an empty transcript used to render a blank void above
+    // the composer. Give the fresh-session state an intentional muted
+    // hint — a Lustre text node, like every word this UI renders.
+    [] -> [
+      html.div([attr.class("note")], [
+        html.text(
+          "Send a message to start — tool calls and reasoning will render here",
+        ),
+      ]),
+    ]
+    _ -> lines
   }
 }
 

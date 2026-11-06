@@ -78,23 +78,30 @@ pub fn html(token: Option(String)) -> String {
 /// behaviour was lost in the Lustre migration). Only the browser knows its
 /// own connection state, so this static script mirrors the client runtime's
 /// own transport events — `lustre:close` / `lustre:connect` dispatched on the
-/// host element — onto the `#status` dot inside its (open) shadow root. A
-/// reconnect remounts the full server view, which resets the dot to truth.
-/// The script is static and token-free; auth still rides the query string.
+/// host element — onto the `#status` dot inside its (open) shadow root, and
+/// onto its text twin `#status-label` (ui-polish F8: "connected"/"offline",
+/// so the state is legible without color). A reconnect remounts the full
+/// server view, which resets both to truth. The script is static and
+/// token-free; auth still rides the query string.
 fn indicator_js() -> String {
   "(function () {\n"
   <> "  'use strict';\n"
   <> "  var host = document.querySelector('lustre-server-component');\n"
   <> "  if (!host) return;\n"
-  <> "  var setDot = function (live) {\n"
-  <> "    var dot = host.shadowRoot && host.shadowRoot.getElementById('status');\n"
+  <> "  var setStatus = function (live) {\n"
+  <> "    var root = host.shadowRoot;\n"
+  <> "    var dot = root && root.getElementById('status');\n"
+  <> "    var label = root && root.getElementById('status-label');\n"
   <> "    if (dot) {\n"
   <> "      dot.className = live ? 'dot live' : 'dot off';\n"
   <> "      dot.textContent = live ? '●' : '○';\n"
   <> "    }\n"
+  <> "    if (label) {\n"
+  <> "      label.textContent = live ? 'connected' : 'offline';\n"
+  <> "    }\n"
   <> "  };\n"
-  <> "  host.addEventListener('lustre:close', function () { setDot(false); });\n"
-  <> "  host.addEventListener('lustre:connect', function () { setDot(true); });\n"
+  <> "  host.addEventListener('lustre:close', function () { setStatus(false); });\n"
+  <> "  host.addEventListener('lustre:connect', function () { setStatus(true); });\n"
   <> "})();"
 }
 
@@ -399,7 +406,10 @@ header { display: flex; align-items: baseline; gap: .75rem; padding: .6rem 1rem;
 header h1 { font-size: 1.05rem; margin: 0; }
 #app header button { font-size: .8rem; padding: .28rem .7rem; }
 .muted { opacity: .6; font-size: .85rem; }
-.dot { margin-left: auto; font-size: 1.2rem; }
+/* ui-polish F8: the connection state is one labelled group — dot + text
+   twin — pushed right as a unit (the auto margin used to sit on the dot). */
+.conn { margin-left: auto; display: inline-flex; align-items: baseline; gap: .4rem; }
+.dot { font-size: 1.2rem; }
 .dot.live { color: #2e9e5b; }
 .dot.off { color: #c0392b; }
 #layout { flex: 1; min-height: 0; display: grid; grid-template-columns: 17rem minmax(0,1fr);

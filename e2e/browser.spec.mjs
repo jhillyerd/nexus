@@ -473,6 +473,15 @@ async function main() {
         (await page.getAttribute("#input", "disabled")) !== null,
         "composer disabled without a session",
       );
+      // ui-polish F5: an empty transcript renders an intentional muted
+      // hint, not a blank void.
+      await poll(
+        async () =>
+          (await page.locator("#log .note").textContent()).includes(
+            "Send a message to start",
+          ),
+        { timeout: 15_000, message: "empty-state note" },
+      );
     });
 
     // -- 3. create + switch sessions ----------------------------------------
@@ -522,6 +531,10 @@ async function main() {
         () => page.locator("#model").evaluate((el) => el.textContent === "smart"),
         { timeout: 15_000, message: "header label after switch" },
       );
+      // ui-polish F8: the header context is the session's TITLE; "smart"
+      // here is the alias fallback (the fresh session is untitled), the
+      // same rule the row title uses. The real title is asserted in the
+      // organize test after its manual rename.
       const smartCurrent = await page
         .locator("#session-list .session-main", { hasText: "fake/smart ·" })
         .first()
@@ -617,6 +630,15 @@ async function main() {
       s = await byModel("smart");
       eq(s.title, "Renamed session", "manual title in API");
       eq(s.title_source, "manual", "manual title source");
+      // ui-polish F8: the header context follows the session's title, not
+      // just the alias fallback.
+      await poll(
+        () =>
+          page
+            .locator("#model")
+            .evaluate((el) => el.textContent === "Renamed session"),
+        { timeout: 10_000, message: "header shows the session title" },
+      );
 
       // Tags through the inline editor render as chips.
       await revealRowControls(smartRow);
@@ -1422,6 +1444,12 @@ async function main() {
         "○",
         "dot glyph while offline",
       );
+      // ui-polish F8: the label is the dot's text twin and flips with it.
+      eq(
+        await ipage.locator("#status-label").evaluate((el) => el.textContent),
+        "offline",
+        "connection label while offline",
+      );
 
       guard = startNexus({ port: guardPort, maxToolIterations: 2, ...pick(services) });
       await waitHealthy(guardPort);
@@ -1432,6 +1460,11 @@ async function main() {
         await ipage.locator("#status").evaluate((el) => el.textContent),
         "●",
         "dot glyph after reconnect",
+      );
+      eq(
+        await ipage.locator("#status-label").evaluate((el) => el.textContent),
+        "connected",
+        "connection label after reconnect",
       );
       await ctx.close();
     });
