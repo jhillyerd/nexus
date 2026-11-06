@@ -485,12 +485,13 @@ pub fn m3_session_row_controls_reveal_css_test() {
 }
 
 /// Layout contract (ui-polish P3): the wide-screen conversation column and
-/// the sub-900px sidebar cap. Both are pure CSS in `page.gleam`'s `css()`;
-/// the mobile block is asserted as one contiguous fragment for the same
-/// reason the F2 reveal block above is — a rule that drifts out of its
-/// media query is invisible to a substring check, and here the drift is
-/// exactly the bug (the cap applying on desktop, or the column never
-/// centering).
+/// the sub-900px sidebar cap. Both are pure CSS in `page.gleam`'s `css()`.
+/// The mobile block is asserted two ways: as one contiguous fragment (the
+/// convention the F2 reveal block above uses — a rule that drifts out of
+/// its media query is invisible to a substring check), AND by splitting the
+/// sheet at the breakpoint so containment is pinned too. The second half is
+/// what makes the drift fail: a cap hoisted into the desktop sheet keeps
+/// the fragment green while becoming a desktop-wide sidebar height limit.
 pub fn m3_layout_column_and_mobile_cap_css_test() {
   let css = nexus_page.html(None)
   // F6: one centered inner column inside #log, so per-child `align-self`
