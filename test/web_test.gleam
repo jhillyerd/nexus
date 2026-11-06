@@ -561,14 +561,20 @@ pub fn m3_settings_page_restyle_css_test() {
     css,
     ".provider-row { display: flex; flex-direction: column; gap: .25rem; border: 1px solid transparent;",
   ))
-  // The add/edit forms are cards too, and the [hidden] override is
-  // load-bearing: `display: flex` on the base rule outranks the UA's
-  // [hidden] { display: none }, so without this rule an unopened form
-  // would render permanently.
+  // The add/edit forms are cards too — the same FULL visible border
+  // recipe the row check pins above (stopping at `border: 1px solid`
+  // would let a `transparent` colour pass).
   should.be_true(string.contains(
     css,
-    ".provider-form { display: flex; flex-direction: column; gap: .45rem; border: 1px solid",
+    ".provider-form { display: flex; flex-direction: column; gap: .45rem; border: 1px solid\n  color-mix(in srgb, currentColor 15%, transparent); border-radius: 10px; padding: .6rem .8rem; }",
   ))
+  // The [hidden] guard is a redundant restatement, not the hider: Pico's
+  // global `[hidden],template { display: none !important }` — author-level
+  // and adopted into the shadow root with the rest of the sheet — already
+  // beats our `display: flex` (P1's Stop-button note leans on the same
+  // rule). The local rule keeps this hidden-able element uniform with its
+  // siblings (.inline-editor[hidden], .confirm-delete[hidden]); the pin
+  // asserts the restatement stays.
   should.be_true(string.contains(
     css,
     ".provider-form[hidden] { display: none; }",

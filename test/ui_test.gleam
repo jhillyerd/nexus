@@ -1352,9 +1352,15 @@ pub fn view_settings_page_structured_test() {
   let head_at = position_of(html, "provider-head")
   let name_at = position_of(html, "provider-name")
   let badge_at = position_of(html, ">keyless<")
+  // Presence first: position_of is -1 on a miss, and a -1 would make the
+  // ordering comparisons below pass vacuously.
+  should.be_true(head_at >= 0)
+  should.be_true(name_at >= 0)
+  should.be_true(badge_at >= 0)
   should.be_true(head_at < name_at && name_at < badge_at)
   let sub_at = position_of(html, "provider-sub")
   // The base URL follows the head (the head wraps name + badges).
+  should.be_true(sub_at >= 0)
   should.be_true(badge_at < sub_at)
   // Both form cards carry a heading, present even while hidden.
   should.be_true(string.contains(html, "<h3"))

@@ -313,9 +313,11 @@ regressions the offline suite cannot see.
   - The add/edit forms are bordered cards with an `h3` heading ("Add
     provider" / "Edit provider", tiny-caps like the sidebar's labels) —
     the add form used to be three bare stacked inputs. The headings are
-    present while the form is `hidden`; `.provider-form[hidden] { display:
-    none }` is load-bearing (the base `display: flex` outranks the UA's
-    hidden rule) and is pinned.
+    present while the form is `hidden`. `.provider-form[hidden] { display:
+    none }` is a redundant guard, not the hider — Pico's global
+    `[hidden],template { display: none !important }` does the hiding (the
+    same rule P1's Stop-button note leans on) — kept for uniformity with
+    the sheet's other `[hidden]` rules, and pinned as such.
   - Controls stay always-visible on provider rows (the P2 scoping
     decision); row cards wrap them fine at 390.
   - `ui_test` pins the markup (section-head title, `provider-head` order
