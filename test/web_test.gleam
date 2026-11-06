@@ -505,7 +505,13 @@ pub fn m3_layout_column_and_mobile_cap_css_test() {
   // so it would look like a fix and change nothing.
   should.be_false(string.contains(css, "#log { align-items: center"))
   // F3(a): stacked layout caps the sidebar, so the transcript keeps the
-  // rest of the viewport instead of collapsing to a sliver.
+  // rest of the viewport instead of collapsing to a sliver. The mobile
+  // block is asserted as one contiguous fragment (the convention the F2
+  // reveal test uses) — but that alone does not prove CONTAINMENT: the cap
+  // could drift out of the media query and become a desktop-wide height
+  // limit on the sidebar, which is the opposite bug. So split the sheet at
+  // the breakpoint and check each side: no `max-height` anywhere above it,
+  // the cap present inside it.
   should.be_true(string.contains(
     css,
     "@media (max-width: 900px) {\n"
@@ -513,7 +519,10 @@ pub fn m3_layout_column_and_mobile_cap_css_test() {
       <> "  #layout.settings-mode { grid-template-rows: minmax(0,1fr); }\n"
       <> "  aside { border: 0; border-bottom: 1px solid color-mix(in srgb, currentColor 15%, transparent); }",
   ))
-  should.be_true(string.contains(css, "aside { max-height: 40dvh; }"))
+  let assert Ok(#(desktop, mobile)) =
+    string.split_once(css, "@media (max-width: 900px) {")
+  should.be_false(string.contains(desktop, "max-height: 40dvh"))
+  should.be_true(string.contains(mobile, "aside { max-height: 40dvh; }"))
   // F4: the create panel now sits ABOVE the list, so its separator flipped
   // from a top rule to a bottom one. A stale `margin-top`/`border-top` here
   // would leave a dead gap between "New" and the panel.

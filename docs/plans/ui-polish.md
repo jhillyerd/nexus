@@ -333,8 +333,13 @@ regressions the offline suite cannot see.
   `max-width` + auto margins would restate the cap on every turn class
   (including `details.turn.reasoning`/`.tool`) and center each bubble
   independently, which reads as a ragged column; one wrapper leaves the
-  existing `align-self` rules and every turn width untouched. A long
-  `http_fetch` card was watched at 1440 — it fills the 52rem lane and the
-  `.tool-meta` row wraps inside it, exactly as before.
+  existing `align-self` rules and every turn width untouched. The lane is
+  deliberately WIDER than the turn cap (52rem vs 46rem): every turn class
+  keeps its own `max-width: 46rem`, so a long `http_fetch` card stays
+  capped at 46rem inside the lane — left-aligned with ~6rem of slack on
+  the lane's right edge, never stretched to 52rem. The 6rem difference is
+  what lets the two bubble alignments read as a single column instead of
+  two edge-pinned ones; a long card was watched at 1440 and wrapped its
+  `.tool-meta` row inside the 46rem box exactly as before.
 - F8 header: session title vs "session title · model" — trivial, decide
   in P5.
