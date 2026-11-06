@@ -1554,43 +1554,11 @@ pub fn view(model: Model) -> Element(Msg) {
 
 fn sidebar(model: Model) -> Element(Msg) {
   html.aside([attr.id("sidebar")], [
-    html.section([], [
-      html.div([attr.class("section-head")], [
-        html.h2([], [html.text("Sessions")]),
-        html.button(
-          [
-            attr.id("new-session"),
-            attr.type_("button"),
-            event.on_click(NewSessionToggled),
-          ],
-          [html.text("New")],
-        ),
-      ]),
-      tag_filter_row(model),
-      html.div([attr.class("archive-toggle-row")], [
-        html.button(
-          [
-            attr.id("show-archived"),
-            attr.type_("button"),
-            attr.class(case model.show_archived {
-              True -> "toggle on"
-              False -> "toggle"
-            }),
-            event.on_click(ArchivedToggled),
-          ],
-          [
-            html.text(case model.show_archived {
-              True -> "Hide archived"
-              False -> "Show archived"
-            }),
-          ],
-        ),
-      ]),
-      html.div(
-        [attr.id("session-list"), attr.class("session-list"), attr.role("list")],
-        session_rows(model),
-      ),
-    ]),
+    // The create panel comes FIRST (ui-polish F4): it used to sit below the
+    // whole session list, so pressing "New" (top-right of the list) usually
+    // opened it below the fold. Markup order is the fix — no new state, and
+    // the `#create-panel` / `#new-session` selectors the browser suite drives
+    // are unchanged.
     html.section([attr.id("create-panel"), attr.hidden(!model.create_open)], [
       html.label([attr.for("provider-picker")], [html.text("Provider")]),
       html.select(
@@ -1626,6 +1594,43 @@ fn sidebar(model: Model) -> Element(Msg) {
           event.on_click(CreateRequested),
         ],
         [html.text("Create session")],
+      ),
+    ]),
+    html.section([], [
+      html.div([attr.class("section-head")], [
+        html.h2([], [html.text("Sessions")]),
+        html.button(
+          [
+            attr.id("new-session"),
+            attr.type_("button"),
+            event.on_click(NewSessionToggled),
+          ],
+          [html.text("New")],
+        ),
+      ]),
+      tag_filter_row(model),
+      html.div([attr.class("archive-toggle-row")], [
+        html.button(
+          [
+            attr.id("show-archived"),
+            attr.type_("button"),
+            attr.class(case model.show_archived {
+              True -> "toggle on"
+              False -> "toggle"
+            }),
+            event.on_click(ArchivedToggled),
+          ],
+          [
+            html.text(case model.show_archived {
+              True -> "Hide archived"
+              False -> "Show archived"
+            }),
+          ],
+        ),
+      ]),
+      html.div(
+        [attr.id("session-list"), attr.class("session-list"), attr.role("list")],
+        session_rows(model),
       ),
     ]),
   ])
@@ -1963,7 +1968,13 @@ fn chat(model: Model) -> Element(Msg) {
     // log itself is the scroll container, so the button must not live in
     // it). See `jump_latest` for why the button is inert.
     html.div([attr.id("log-wrap")], [
-      html.div([attr.id("log"), attr.aria("live", "polite")], log_lines(model)),
+      // `.conversation` is the centered column that keeps wide screens from
+      // pinning user/assistant turns to opposite edges (ui-polish F6) — see
+      // the css() comment in `nexus/page`. `#log` stays the scroll container
+      // (the autoscroll script observes it), so the wrapper goes inside it.
+      html.div([attr.id("log"), attr.aria("live", "polite")], [
+        html.div([attr.class("conversation")], log_lines(model)),
+      ]),
       jump_latest(),
     ]),
     loop_chip(model),

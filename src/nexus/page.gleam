@@ -475,7 +475,10 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
 #app .confirm-delete button { font-size: .72rem; padding: .2rem .55rem; }
 .session-item { display: block; width: 100%; text-align: left; overflow-wrap: anywhere; }
 .session-item[aria-current='true'] { border-color: #3b82f6; background: color-mix(in srgb, #3b82f6 16%, transparent); }
-#create-panel { margin-top: 1rem; padding-top: .8rem; border-top: 1px solid
+/* ui-polish F4: the panel moved ABOVE the session list in `sidebar()`, so
+   its separator is a bottom rule now (it used to sit below the whole list,
+   which is why 'New' opened it off-screen). */
+#create-panel { margin-bottom: 1rem; padding-bottom: .8rem; border-bottom: 1px solid
   color-mix(in srgb, currentColor 15%, transparent); display: flex; flex-direction: column; gap: .45rem; }
 #create-panel[hidden] { display: none; }
 .settings-page { overflow-y: auto; padding: 1.2rem 1.2rem 2.5rem; display: flex; flex-direction: column;
@@ -510,7 +513,19 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
 #app select, #app textarea, #app input, #app label { margin: 0; font: inherit; }
 #chat { min-width: 0; display: flex; flex-direction: column; }
 #log-wrap { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; }
-#log { flex: 1; min-height: 0; overflow-y: auto; padding: 1rem; display: flex; flex-direction: column; gap: .8rem; }
+#log { flex: 1; min-height: 0; overflow-y: auto; padding: 1rem; display: flex; flex-direction: column; }
+/* ui-polish F6: `#log` spans the whole pane, so on a wide screen a 46rem
+   `.turn` with `align-self: flex-end`/`flex-start` pinned user and assistant
+   to OPPOSITE edges with dead space between. The fix is one inner column:
+   a centered 52rem wrapper gives the bubbles a narrow enough lane for their
+   existing per-child `align-self` to read as right/left, not edge-pinned.
+   (`align-items: center` on `#log` was ruled out — `align-self` on the turns
+   overrides it per child, so the bubbles stay edge-pinned.) The wrapper is
+   the only child, so the gap moves inside it; `#log` stays the scroll
+   container that `autoscroll_js` observes, and `#jump-latest` stays
+   pane-relative (it anchors to `#log-wrap`, not to this column). */
+.conversation { width: 100%; max-width: 52rem; margin-inline: auto;
+  display: flex; flex-direction: column; gap: .8rem; }
 /* The prefix is load-bearing in BOTH directions: it lifts the bare-element
    resets below above Pico, and every compact app-local button class must
    carry it too — bare `.ctl`/`.tag-chip`/`#filter-clear` ((0,x,x) or a
@@ -585,6 +600,13 @@ button#send, button#create-session { background: var(--pico-primary-background);
   #layout { grid-template-columns: 1fr; grid-template-rows: auto minmax(0,1fr); }
   #layout.settings-mode { grid-template-rows: minmax(0,1fr); }
   aside { border: 0; border-bottom: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
+  /* ui-polish F3(a): stacked, `aside` used to take its natural height, so
+     three sessions pushed the transcript into a ~100px sliver clipped under
+     the composer. Capping the list at 40dvh keeps the composer on screen and
+     gives the transcript the rest; the list scrolls inside `aside` (already
+     `overflow-y: auto`). A real collapse toggle/drawer (options b/c) stays
+     parked until this cap proves too tight against a 20+ session list. */
+  aside { max-height: 40dvh; }
   .settings-page { padding: .8rem .8rem 2rem; }
 }
 "

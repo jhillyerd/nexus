@@ -484,6 +484,49 @@ pub fn m3_session_row_controls_reveal_css_test() {
   should.be_false(string.contains(css, "\n.row-controls { display: none; }"))
 }
 
+/// Layout contract (ui-polish P3): the wide-screen conversation column and
+/// the sub-900px sidebar cap. Both are pure CSS in `page.gleam`'s `css()`;
+/// the mobile block is asserted as one contiguous fragment for the same
+/// reason the F2 reveal block above is — a rule that drifts out of its
+/// media query is invisible to a substring check, and here the drift is
+/// exactly the bug (the cap applying on desktop, or the column never
+/// centering).
+pub fn m3_layout_column_and_mobile_cap_css_test() {
+  let css = nexus_page.html(None)
+  // F6: one centered inner column inside #log, so per-child `align-self`
+  // on the turns reads as left/right inside a narrow lane instead of
+  // pinning bubbles to opposite edges of a wide pane.
+  should.be_true(string.contains(
+    css,
+    ".conversation { width: 100%; max-width: 52rem; margin-inline: auto;",
+  ))
+  // The `align-items: center` shape that was ruled out must not come back:
+  // `align-self` on `.turn.user`/`.turn.assistant` overrides it per child,
+  // so it would look like a fix and change nothing.
+  should.be_false(string.contains(css, "#log { align-items: center"))
+  // F3(a): stacked layout caps the sidebar, so the transcript keeps the
+  // rest of the viewport instead of collapsing to a sliver.
+  should.be_true(string.contains(
+    css,
+    "@media (max-width: 900px) {\n"
+      <> "  #layout { grid-template-columns: 1fr; grid-template-rows: auto minmax(0,1fr); }\n"
+      <> "  #layout.settings-mode { grid-template-rows: minmax(0,1fr); }\n"
+      <> "  aside { border: 0; border-bottom: 1px solid color-mix(in srgb, currentColor 15%, transparent); }",
+  ))
+  should.be_true(string.contains(css, "aside { max-height: 40dvh; }"))
+  // F4: the create panel now sits ABOVE the list, so its separator flipped
+  // from a top rule to a bottom one. A stale `margin-top`/`border-top` here
+  // would leave a dead gap between "New" and the panel.
+  should.be_false(string.contains(
+    css,
+    "#create-panel { margin-top: 1rem; padding-top: .8rem; border-top",
+  ))
+  should.be_true(string.contains(
+    css,
+    "#create-panel { margin-bottom: 1rem; padding-bottom: .8rem; border-bottom",
+  ))
+}
+
 /// No-CDN guard: the UI must render fully offline, so the shell may not
 /// reference any absolute or protocol-relative external URL — every asset
 /// it loads is vendored in-repo and served by nexus itself (runtime.mjs,

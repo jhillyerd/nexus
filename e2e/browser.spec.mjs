@@ -853,7 +853,11 @@ async function main() {
         ),
         `committed reasoning block: ${JSON.stringify(committed)}`,
       );
-      const classes = await page.$$eval("#log > *", (els) => els.map((e) => e.className));
+      // The centered conversation column (F6) is the log's single child, so
+      // the turn order lives one level down.
+      const classes = await page.$$eval("#log .conversation > *", (els) =>
+        els.map((e) => e.className),
+      );
       // Within the LAST turn: its reasoning block must precede its answer.
       const reasoningAt = classes.findLastIndex((c) => /(^| )reasoning( |$)/.test(c));
       const answerAt = classes.findIndex(
@@ -1153,6 +1157,61 @@ async function main() {
       }));
       assert(overflow.scrollWidth <= overflow.innerWidth + 1, `overflow: ${JSON.stringify(overflow)}`);
 
+      // ui-polish F3(a): stacked, the sidebar is capped so the transcript
+      // keeps the rest of the viewport — without the cap three sessions
+      // pushed #chat into a ~100px sliver clipped under the composer.
+      const mobileBox = await mpage.evaluate(() => {
+        const sr = document.querySelector("lustre-server-component")?.shadowRoot;
+        const rect = (el) => (el ? el.getBoundingClientRect() : null);
+        const aside = rect(sr?.getElementById("sidebar"));
+        const chat = rect(sr?.getElementById("chat"));
+        const composer = rect(sr?.getElementById("composer"));
+        return {
+          asideHeight: aside?.height,
+          asideBottom: aside?.bottom,
+          innerHeight: window.innerHeight,
+          chatTop: chat?.top,
+          chatBottom: chat?.bottom,
+          composerBottom: composer?.bottom,
+        };
+      });
+      // The cap is on the aside's HEIGHT, not its bottom: the header sits
+      // above it, so `bottom` runs past 40dvh even when the cap holds.
+      assert(
+        mobileBox.asideHeight <= mobileBox.innerHeight * 0.4 + 1,
+        `sidebar exceeds its 40dvh cap: ${JSON.stringify(mobileBox)}`,
+      );
+      assert(
+        mobileBox.chatTop >= mobileBox.asideBottom - 1 &&
+          mobileBox.composerBottom <= mobileBox.innerHeight + 1,
+        `transcript is crushed or the composer is off-screen: ${JSON.stringify(mobileBox)}`,
+      );
+
+      // ui-polish F4: the create panel opens ABOVE the session list, so it
+      // lands on screen — previously it opened below the fold, which is what
+      // made the create flow unusable on a phone. The panel is already open
+      // here (the per-client check above), so measure it as-is and only
+      // toggle it open if that changed.
+      const panelVisible = await mpage
+        .locator("#create-panel")
+        .evaluate((el) => !el.hidden)
+        .catch(() => false);
+      if (!panelVisible) {
+        await mpage.click("#new-session");
+        await poll(
+          async () => await mpage.locator("#create-panel").evaluate((el) => !el.hidden),
+          { timeout: 15_000, message: "create panel open before measuring" },
+        );
+      }
+      const panelBox = await mpage.locator("#create-panel").evaluate((el) => {
+        const r = el.getBoundingClientRect();
+        return { top: r.top, bottom: r.bottom, height: window.innerHeight };
+      });
+      assert(
+        panelBox.top >= 0 && panelBox.bottom <= panelBox.height,
+        `create panel opens off-screen: ${JSON.stringify(panelBox)}`,
+      );
+
       // Desktop height clamp: a transcript must scroll inside #log, never
       // grow the document. The #layout grid needs its explicit
       // `grid-template-rows: minmax(0,1fr)` — without it the implicit auto
@@ -1187,6 +1246,50 @@ async function main() {
       assert(
         dOverflow.layoutScrollH <= dOverflow.layoutClientH + 1,
         `#layout row is content-sized (missing grid-template-rows): ${JSON.stringify(dOverflow)}`,
+      );
+
+      // ui-polish F6: the log's children live in one centered column, so a
+      // wide pane no longer pins user and assistant bubbles to opposite
+      // edges. Assert the geometry, not just the class: the column must be
+      // narrower than the pane AND horizontally centered inside it.
+      const column = await dpage.evaluate(() => {
+        const sr = document.querySelector("lustre-server-component")?.shadowRoot;
+        const log = sr?.getElementById("log");
+        const col = sr?.querySelector("#log > .conversation");
+        const jump = sr?.getElementById("jump-latest");
+        if (!log || !col || !jump) return null;
+        const l = log.getBoundingClientRect();
+        const c = col.getBoundingClientRect();
+        return {
+          paneWidth: l.width,
+          colWidth: c.width,
+          leftGap: c.left - l.left,
+          rightGap: l.right - c.right,
+          // The jump button is hidden until the autoscroll script unpins,
+          // so measure its ANCHORING structurally instead of geometrically:
+          // it must sit in `#log-wrap` (the positioned ancestor), never
+          // inside the column, or it would drift with the column's width.
+          jumpParent: jump.parentElement?.id ?? "",
+          wrapPosition: getComputedStyle(jump.parentElement).position,
+          colPosition: getComputedStyle(col).position,
+        };
+      });
+      assert(column, "#log renders the centered .conversation column");
+      assert(
+        column.colWidth < column.paneWidth - 1,
+        `column fills the pane, so turns stay edge-pinned: ${JSON.stringify(column)}`,
+      );
+      assert(
+        Math.abs(column.leftGap - column.rightGap) <= 1,
+        `column is not centered: ${JSON.stringify(column)}`,
+      );
+      assert(
+        column.jumpParent === "log-wrap" && column.wrapPosition === "relative",
+        `jump-to-latest is not anchored to the pane: ${JSON.stringify(column)}`,
+      );
+      assert(
+        column.colPosition === "static",
+        `column became a containing block for the jump button: ${JSON.stringify(column)}`,
       );
 
       // Diverge the contexts for real: create a second session in the
