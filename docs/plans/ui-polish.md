@@ -250,9 +250,11 @@ regressions the offline suite cannot see.
   3px steps gives 0 A-B-A oscillations (4 state changes in 88 samples at
   1440, 10 in 212 at 390), because the reveal only ever happens on the
   row already under the pointer. The two no-reflow shapes were measured
-  too and both cost more than the jitter: reserving the line in flow
-  returns the row to ~114px from 88px, which is the whole density win
-  given back, and an absolute overlay puts the strip over the tag chips
+  too and both cost more than the jitter: reserving the line in flow puts
+  the strip's height straight back on every row — 88px to 114px at
+  390/860, 88px to 141px at 1440, where the strip wraps to two lines —
+  which is the whole density win given back, and an absolute overlay puts
+  the strip over the tag chips
   at desktop width (the 17rem sidebar forces two lines), where
   `elementFromPoint` over a chip's centre returns the control button,
   not the chip — a silent loss of chip clicks. So the jitter stands as an
