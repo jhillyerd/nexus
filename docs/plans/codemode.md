@@ -35,11 +35,16 @@ EYG and ports documented as future alternatives behind the same seam.
   getenv/remove/rename/tmpname`, `package`, `load/loadfile/require/dofile/
   loadstring`). The only world-access is the host table. Codemode is excluded
   from its own `tools` table (recursion guard).
-- **Budgets**: three bounds — wall-clock deadline, output cap, and a
-  per-script **tool-call budget** (constant, ~25 calls; exceeding it fails
-  the script). The call budget bounds retained intermediate results: each
-  host result is already truncated by its own tool's limits, so retained
-  memory ≤ budget × per-tool cap. The tool description documents all three.
+- **Budgets**: four bounds — wall-clock deadline, output cap, per-script
+  **tool-call budget** (constant, ~25 calls; exceeding it fails the script),
+  and a **VM memory bound**. The call budget bounds retained *host results*
+  (each is already truncated by its own tool's limits, so host-derived memory
+  ≤ budget × per-tool cap) — it does **not** bound pure-Lua allocation, so
+  the engine child also sets `process_flag(max_heap_size, …)` (~64 MiB in
+  words; `gleam_erlang` does not expose it — a one-line `nexus_*_n.erl` FFI).
+  Exceeding it kills the engine and surfaces as `Script error: out of
+  memory` (pi caps its codemode VM at 256 MB for comparison). The tool
+  description documents all bounds.
 - **Tool schema**: `{"code": string}`; description documents the mini-API and
   limits (~400 tokens). Sibling tools stay declared normally — the codemode
   description documents only the *calling convention*, not their schemas.
@@ -100,7 +105,8 @@ EYG and ports documented as future alternatives behind the same seam.
    - Infinite-loop script (`while true do end`) killed at deadline, partial
      output preserved.
    - Cancellation: a cancel sent mid-script kills the engine and returns
-     `Script failed (cancelled)` with partial output.
+     `Script failed (<wall ms>)` with `Script error: cancelled` and partial
+     output.
    - Tool-call budget: a script looping past the budget fails with the
      budget error, not an unbounded loop.
    - Config: invalid timeout/cap values rejected at load
