@@ -134,6 +134,15 @@ pub fn vanished_selection_ends_session_test() {
   model.streaming |> should.be_false
   model.model_label |> should.equal("session ended")
   model.create_open |> should.be_true
+  // The hidden flag resets with the bubble it belonged to: a stale False
+  // (the ended session's bubble was visible) would let the NEXT session's
+  // first streamed token — even whitespace-only — render, bypassing the
+  // render-empty rule.
+  model.bubble_hidden |> should.equal(True)
+  let model = model |> step(ui.Token("\n\n"))
+  model.bubble_hidden |> should.equal(True)
+  let html = model |> view_string
+  should_not_contain(html, "turn assistant")
 }
 
 pub fn hello_sets_label_and_busy_state_test() {

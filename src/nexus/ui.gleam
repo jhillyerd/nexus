@@ -1313,6 +1313,14 @@ fn after_sessions(
       True -> None
       False -> model.bubble
     },
+    // The hidden flag belongs to the cleared bubble: a stale False (the
+    // ended session's bubble was visible) would let the NEXT session's
+    // first streamed token — even whitespace-only — render, bypassing the
+    // render-empty rule the Token arm applies.
+    bubble_hidden: case ended {
+      True -> True
+      False -> model.bubble_hidden
+    },
     thinking: case ended {
       True -> None
       False -> model.thinking
