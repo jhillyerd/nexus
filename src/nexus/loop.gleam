@@ -324,7 +324,12 @@ fn execute_all(
             }
         }
         on_event(ToolResultEvent(id, name, ok, content))
-        Ok(transcript.append_tool_result(tr, tool_call_id: id, content: content))
+        Ok(transcript.append_tool_result(
+          tr,
+          tool_call_id: id,
+          content: content,
+          ok: ok,
+        ))
       }
     }
   })

@@ -233,9 +233,11 @@ pub fn transcript_rows(
     tr
     |> transcript.messages
     |> list.drop(base)
-    |> messages_to_rows_with(base, fn(index) {
-      transcript.reasoning_at(tr, index)
-    })
+    |> messages_to_rows_with(
+      base,
+      fn(index) { transcript.reasoning_at(tr, index) },
+      fn(index) { transcript.tool_result_at(tr, index) },
+    )
   rows
 }
 
@@ -245,19 +247,22 @@ pub fn transcript_rows(
 /// the reasoning-free shape; the write-behind lane uses
 /// `messages_to_rows_with` against the transcript's sidecar.
 pub fn messages_to_rows(messages: List(ChatMessage)) -> List(MessageRow) {
-  let #(rows, _) = messages_to_rows_with(messages, 0, fn(_) { None })
+  let #(rows, _) =
+    messages_to_rows_with(messages, 0, fn(_) { None }, fn(_) { None })
   rows
 }
 
 /// The reasoning-aware row mapping: `reasoning_at` resolves a message's
 /// chronological index into its recorded chain-of-thought, so assistant
-/// rows carry it without it ever existing as a message. `base` is the
-/// chronological index of `messages`' head (non-zero when the caller
-/// already dropped a persisted prefix).
+/// rows carry it without it ever existing as a message; `tool_ok_at`
+/// resolves a tool message's outcome the same way (True when unknown).
+/// `base` is the chronological index of `messages`' head (non-zero when
+/// the caller already dropped a persisted prefix).
 fn messages_to_rows_with(
   messages: List(ChatMessage),
   base: Int,
   reasoning_at: fn(Int) -> Option(String),
+  tool_ok_at: fn(Int) -> Option(Bool),
 ) -> #(List(MessageRow), dict.Dict(String, String)) {
   let #(rows, names, _) =
     list.index_fold(messages, #([], dict.new(), 0), fn(acc, message, index) {
@@ -324,7 +329,7 @@ fn messages_to_rows_with(
             ToolResultRow(
               call_id: id,
               name: result.unwrap(dict.get(names, id), "tool"),
-              ok: True,
+              ok: option.unwrap(tool_ok_at(base + index), True),
               content: content,
             ),
             ..rows
@@ -363,8 +368,16 @@ fn append_rows(tr: Transcript, rows: List(MessageRow)) -> Transcript {
         transcript.append_assistant_with_reasoning(tr, content, reasoning),
         rest,
       )
-    [ToolResultRow(call_id: id, content: content, ..), ..rest] ->
-      append_rows(transcript.append_tool_result(tr, id, content), rest)
+    [ToolResultRow(call_id: id, name: _, ok: ok, content: content), ..rest] ->
+      append_rows(
+        transcript.append_tool_result(
+          tr,
+          tool_call_id: id,
+          content: content,
+          ok: ok,
+        ),
+        rest,
+      )
     [ToolCallRow(..), ..] -> {
       // A maximal run of consecutive tool-call rows is one assistant
       // message: the first row's content is the message text, the run's

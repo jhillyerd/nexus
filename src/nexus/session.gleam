@@ -614,7 +614,11 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
               ToolResult(
                 id,
                 dict.get(names, id) |> result.unwrap("tool"),
-                True,
+                // The outcome rides the display-only sidecar — failed
+                // calls stay failed across a reload (True when unknown,
+                // e.g. rows persisted before the sidecar existed).
+                transcript.tool_result_at(state.transcript, index)
+                  |> option.unwrap(True),
                 content,
               ),
             )

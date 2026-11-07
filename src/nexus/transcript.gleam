@@ -50,6 +50,14 @@ pub opaque type Transcript {
     /// rides inside the transcript so the single commit / write-behind /
     /// replay path (typed on `Transcript`) carries it for free.
     reasoning: Dict(Int, String),
+    /// Display-only outcome sidecar: whether each tool result succeeded,
+    /// keyed by the CHRONOLOGICAL message index of the tool message (0 =
+    /// the system prompt). `chat.ToolMessage` cannot carry it and
+    /// `to_request` reads only `messages`, so it rides the same sidecar
+    /// path as reasoning: structurally incapable of changing a request
+    /// byte, yet present on the commit / write-behind / replay lane that
+    /// rebuilds the UI after a reload.
+    tool_results: Dict(Int, Bool),
   )
 }
 
@@ -59,6 +67,7 @@ pub fn new(model: String, system: String) -> Transcript {
     model: model,
     messages: [chat.system_message(system)],
     reasoning: dict.new(),
+    tool_results: dict.new(),
   )
 }
 
@@ -161,16 +170,25 @@ pub fn append_assistant_tool_calls(
   )
 }
 
-/// Append a tool result turn (tool round-trip).
+/// Append a tool result turn (tool round-trip). `ok` records the call's
+/// outcome in the display-only sidecar (failed calls stay failed across a
+/// reload) — it never enters `messages`, so `to_request` output is
+/// byte-identical either way.
 pub fn append_tool_result(
   transcript: Transcript,
   tool_call_id tool_call_id: String,
   content content: String,
+  ok ok: Bool,
 ) -> Transcript {
-  Transcript(..transcript, messages: [
-    chat.tool_message(content, tool_call_id),
-    ..transcript.messages
-  ])
+  Transcript(
+    ..transcript,
+    messages: [chat.tool_message(content, tool_call_id), ..transcript.messages],
+    tool_results: dict.insert(
+      transcript.tool_results,
+      list.length(transcript.messages),
+      ok,
+    ),
+  )
 }
 
 /// The reasoning recorded for the message at chronological `index`
@@ -178,6 +196,13 @@ pub fn append_tool_result(
 /// replay / persistence read side of the sidecar.
 pub fn reasoning_at(transcript: Transcript, index: Int) -> Option(String) {
   dict.get(transcript.reasoning, index) |> option.from_result
+}
+
+/// Whether the tool result message at chronological `index` (0 = the
+/// system prompt) succeeded; `None` when that message is not a tool
+/// result. The replay / persistence read side of the sidecar.
+pub fn tool_result_at(transcript: Transcript, index: Int) -> Option(Bool) {
+  dict.get(transcript.tool_results, index) |> option.from_result
 }
 
 /// Record reasoning against the message about to be appended (its

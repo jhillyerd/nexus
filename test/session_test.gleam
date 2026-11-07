@@ -638,6 +638,7 @@ fn tool_round_runner(
       |> transcript.append_tool_result(
         tool_call_id: "call_1",
         content: "{\"status\":200}",
+        ok: True,
       )
       |> transcript.append_assistant("based on the fetch: fine"),
   )
@@ -678,6 +679,70 @@ pub fn tool_events_are_broadcast_test() {
   // The full tool history is committed: system, user, assistant(call),
   // tool result, assistant text.
   transcript.length(session.snapshot(sess)) |> should.equal(5)
+}
+
+pub fn failed_tool_result_replays_as_failed_test() {
+  // A reload must not launder a failed tool call into green: the outcome
+  // rides the transcript's display-only sidecar, so the replayed
+  // ToolResult carries the same ok the live event did.
+  let sess =
+    start_with(fn(_endpoint, tr, _cancel, on_event) {
+      on_event(loop.LoopStatus(1, 8, "tools"))
+      on_event(loop.ToolCallAssembled("call_9", "http_fetch", "{}"))
+      on_event(loop.ToolResultEvent(
+        "call_9",
+        "http_fetch",
+        False,
+        "{\"error\":\"ssrf guard\"}",
+      ))
+      session.StreamDone(
+        stats(),
+        tr
+          |> transcript.append_assistant_tool_calls(
+            text: None,
+            calls: [#("call_9", "http_fetch", "{}")],
+            reasoning: None,
+          )
+          |> transcript.append_tool_result(
+            tool_call_id: "call_9",
+            content: "{\"error\":\"ssrf guard\"}",
+            ok: False,
+          )
+          |> transcript.append_assistant("the fetch failed"),
+      )
+    })
+  let sub = join(sess)
+  let _ = expect_event(sub)
+  should.equal(session.send_message(sess, "fetch it"), session.Sent)
+  // Live events (UserEcho, LoopStatus, ToolCallAssembled, ToolResult,
+  // TurnDone) — the ToolResult carries ok=False exactly as the loop said.
+  expect_event(sub) |> should.equal(session.UserEcho("fetch it"))
+  expect_event(sub) |> should.equal(session.LoopStatus(1, 8, "tools"))
+  expect_event(sub)
+  |> should.equal(session.ToolCallAssembled("call_9", "http_fetch", "{}"))
+  expect_event(sub)
+  |> should.equal(session.ToolResult(
+    "call_9",
+    "http_fetch",
+    False,
+    "{\"error\":\"ssrf guard\"}",
+  ))
+  let assert session.TurnDone(_) = expect_event(sub)
+
+  // A fresh subscriber (the reload path) sees the failure too.
+  let sub2 = join(sess)
+  let assert session.Hello(_, _, _) = expect_event(sub2)
+  expect_event(sub2) |> should.equal(session.UserEcho("fetch it"))
+  expect_event(sub2)
+  |> should.equal(session.ToolCallAssembled("call_9", "http_fetch", "{}"))
+  expect_event(sub2)
+  |> should.equal(session.ToolResult(
+    "call_9",
+    "http_fetch",
+    False,
+    "{\"error\":\"ssrf guard\"}",
+  ))
+  expect_event(sub2) |> should.equal(session.AssistantFull("the fetch failed"))
 }
 
 pub fn tool_history_replays_on_rejoin_test() {

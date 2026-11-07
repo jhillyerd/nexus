@@ -123,8 +123,8 @@ fn tool_round_runner(
       ],
       reasoning: None,
     )
-    |> transcript.append_tool_result("call_a", "fetched body")
-    |> transcript.append_tool_result("call_b", "search body")
+    |> transcript.append_tool_result("call_a", "fetched body", ok: True)
+    |> transcript.append_tool_result("call_b", "search body", ok: True)
     |> transcript.append_assistant("all done")
   session.StreamDone(stats(), tr)
 }
@@ -155,8 +155,8 @@ fn rich_transcript() -> Transcript {
     ],
     reasoning: None,
   )
-  |> transcript.append_tool_result("call_a", "fetched body")
-  |> transcript.append_tool_result("call_b", "search body")
+  |> transcript.append_tool_result("call_a", "fetched body", ok: True)
+  |> transcript.append_tool_result("call_b", "search body", ok: True)
   |> transcript.append_assistant("all done")
 }
 
@@ -188,7 +188,7 @@ pub fn rows_round_trip_without_call_text_test() {
       ],
       reasoning: None,
     )
-    |> transcript.append_tool_result("c1", "r")
+    |> transcript.append_tool_result("c1", "r", ok: True)
   let rows = store.transcript_rows(tr, 1)
   let rebuilt = store.transcript_from_rows("alias-1", "sys", rows)
   should.equal(
@@ -216,6 +216,50 @@ pub fn transcript_rows_skip_persisted_prefix_test() {
   should.be_true(store.has_delta(tr, 4))
   should.be_false(store.has_delta(tr, transcript.length(tr)))
   should.be_false(store.has_delta(tr, 99))
+}
+
+pub fn failed_tool_result_round_trips_through_rows_test() {
+  // A failed call must survive both the write-behind (rows carry the
+  // real tool_ok) and the rehydration read (sidecar restored), so a
+  // reload or restart replay keeps the card red instead of laundering
+  // it green.
+  let tr =
+    transcript.new("alias-1", "sys")
+    |> transcript.append_user("q")
+    |> transcript.append_assistant_tool_calls(
+      text: None,
+      calls: [#("c1", "http_fetch", "{\"url\":\"x\"}")],
+      reasoning: None,
+    )
+    |> transcript.append_tool_result("c1", "{\"error\":\"boom\"}", ok: False)
+  let rows = store.transcript_rows(tr, 1)
+  let assert [_, _, store.ToolResultRow(ok: False, ..)] = rows
+
+  // The rebuilt transcript restores the outcome at the tool message's
+  // chronological index (user=1, assistant=2, tool=3).
+  let rebuilt = store.transcript_from_rows("alias-1", "sys", rows)
+  transcript.tool_result_at(rebuilt, 3) |> should.equal(Some(False))
+  // Successes keep the same shape with the real ok.
+  let ok_tr =
+    transcript.new("alias-1", "sys")
+    |> transcript.append_user("q")
+    |> transcript.append_assistant_tool_calls(
+      text: None,
+      calls: [#("c1", "http_fetch", "{\"url\":\"x\"}")],
+      reasoning: None,
+    )
+    |> transcript.append_tool_result("c1", "{\"status\":200}", ok: True)
+  store.transcript_rows(ok_tr, 1)
+  |> list.drop(2)
+  |> list.first
+  |> should.equal(
+    Ok(store.ToolResultRow(
+      call_id: "c1",
+      name: "http_fetch",
+      ok: True,
+      content: "{\"status\":200}",
+    )),
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -705,8 +749,8 @@ pub fn tool_call_reasoning_rides_first_row_of_run_test() {
       calls: [#("c1", "echo", "{}"), #("c2", "echo", "{}")],
       reasoning: Some("two calls needed"),
     )
-    |> transcript.append_tool_result("c1", "r1")
-    |> transcript.append_tool_result("c2", "r2")
+    |> transcript.append_tool_result("c1", "r1", ok: True)
+    |> transcript.append_tool_result("c2", "r2", ok: True)
   store.transcript_rows(tr, 1)
   |> should.equal([
     store.UserRow("q"),
