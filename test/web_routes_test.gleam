@@ -23,7 +23,6 @@ import nexus/provider
 import nexus/provider_registry
 import nexus/session
 import nexus/session_registry
-import nexus/timing
 import nexus/transcript
 import nexus/web
 import store_mock
@@ -84,9 +83,14 @@ fn fake_stats() -> openai.StreamStats {
 }
 
 /// Boot factory + registry + mist once; hand back the registry subject.
-/// One mist listener per test: the port is derived from the monotonic
-/// microsecond clock, so concurrent/serial start_server calls never bind
-/// the same port.
+/// One mist listener per test, bound to port 0 so the KERNEL assigns a
+/// port that is free by construction — and the assigned port is read
+/// back from mist's `after_start`, which also replaces the old racy
+/// post-start sleep. (A clock-derived port guess previously lived in
+/// Linux's ephemeral range 32768-60999, where the test client's own
+/// outbound sockets — and their TIME_WAIT remnants — occasionally held
+/// the port and killed the listener with Eaddrinuse; CI flake, run
+/// 42399810506.)
 fn start_server() -> #(process.Subject(session_registry.Msg), Int) {
   let #(registry, _providers, port) = start_server_with(fn(_providers) { Nil })
   #(registry, port)
@@ -103,7 +107,6 @@ fn start_server_with(
   process.Subject(provider_registry.Msg),
   Int,
 ) {
-  let port = 20_000 + { int.absolute_value(timing.now_us()) % 40_000 }
   let cfg = test_config()
   let factory_name = process.new_name("nexus_routes_factory")
   let registry_name = process.new_name("nexus_routes_registry")
@@ -144,12 +147,17 @@ fn start_server_with(
         |> result.replace_error(session_registry.ProviderUnknown)
       },
     )
-  let _ =
+  // Port 0: the kernel picks a free port and mist's after_start hands
+  // it back; a bind failure now fails the test loudly at this line
+  // instead of surfacing later as connection-refused noise.
+  let bound = process.new_subject()
+  let assert Ok(_) =
     mist.new(web.handler(cfg, registry_name, providers_name))
     |> mist.bind("127.0.0.1")
-    |> mist.port(port)
+    |> mist.port(0)
+    |> mist.after_start(fn(port, _scheme, _ip) { process.send(bound, port) })
     |> mist.start
-  process.sleep(100)
+  let assert Ok(port) = process.receive(bound, 5000)
   #(started.data, providers, port)
 }
 
