@@ -235,8 +235,10 @@ fn await(
       await(engine, events, cancel, deadline_us, out_add(out, Console(text)))
     }
     Ok(TurnCancelled) -> #(Cancelled, out)
-    Ok(EngineExit(ExitMessage(pid, reason))) if pid == engine ->
-      #(EngineDied(reason), out)
+    Ok(EngineExit(ExitMessage(pid, reason))) if pid == engine -> #(
+      EngineDied(reason),
+      out,
+    )
     Ok(EngineExit(_)) -> await(engine, events, cancel, deadline_us, out)
   }
 }

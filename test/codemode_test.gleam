@@ -369,6 +369,7 @@ fn run_registered(
 fn spec_names(specs: List(tools.ToolSpec)) -> List(String) {
   list.map(specs, tools.tool_name)
 }
+
 // ---------------------------------------------------------------------------
 // Review fixes (cubic findings on PR #50)
 // ---------------------------------------------------------------------------
@@ -386,12 +387,9 @@ pub fn stop_during_script_stops_the_turn_test() {
     }),
   ]
   let spec =
-    tools.ToolSpec(
-      tool: codemode.schema(),
-      run: fn(ctx, arguments) {
-        codemode.run(hosts, 5000, 32_768, ctx.cancel, arguments)
-      },
-    )
+    tools.ToolSpec(tool: codemode.schema(), run: fn(ctx, arguments) {
+      codemode.run(hosts, 5000, 32_768, ctx.cancel, arguments)
+    })
   let tr =
     transcript.new("m", "s")
     |> transcript.append_user("run a script")
