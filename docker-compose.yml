@@ -19,6 +19,13 @@
 # because this is a dev-only database bound to loopback — production
 # (Nomad) sets real credentials via NEXUS_PG_*.
 
+# Pin the compose project name. Without it, compose derives the name from
+# the working directory, so every worktree / task dir (`nexus`, `t3-*`,
+# `task-*`) silently got its OWN db volume and fought over the fixed
+# container name. With one pinned name, `docker compose up -d` from any
+# checkout targets the same singleton db, and is a no-op while it runs.
+name: nexus
+
 services:
   nexus-db:
     image: postgres:17
