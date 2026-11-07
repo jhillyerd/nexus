@@ -608,17 +608,26 @@ details.turn.tool > summary { cursor: pointer; }
    lines (committed reasoning + tool cards) render inside one .chip-row —
    a wrapping flex line, so each collapsed chip sizes to its label on a
    shared row instead of stacking a full-width block per chip (which cost
-   a whole row + conversation gap apiece). Expansion is pure CSS off the
-   native [open] attribute: flex-basis 100% wraps an open chip onto its
-   own full-width line, and the per-type rules restore the roomy block
-   padding. Closed chips keep their tint/border identity; only the
-   padding shrinks. */
-.chip-row { align-self: flex-start; max-width: 46rem; display: flex; flex-wrap: wrap;
+   a whole row + conversation gap apiece). The row itself takes the full
+   46rem lane (width 100%, capped): flex-basis 100% on an OPENED chip
+   must resolve against a definite width — against a shrink-wrapped row
+   the percentage is cyclic during intrinsic sizing and browsers size the
+   open chip to its content instead. The row is an invisible wrapper, so
+   the definite width costs nothing visually. Expansion is pure CSS off
+   the native [open] attribute: flex-basis 100% wraps an open chip onto
+   its own full-width line, and the per-type rules restore the roomy
+   block padding. Closed chips keep their tint/border identity; only the
+   padding shrinks. Margins are zeroed because Pico gives details AND
+   their summary a 1rem bottom margin each — inside the flex row they
+   don't collapse, so every chip would carry dead space and the row's
+   gap would no longer control vertical spacing. */
+.chip-row { width: 100%; max-width: 46rem; display: flex; flex-wrap: wrap;
   align-items: flex-start; gap: .3rem .5rem; }
-.chip-row > details.turn.reasoning, .chip-row > details.turn.tool { padding: .1rem .5rem; }
+.chip-row > details.turn.reasoning, .chip-row > details.turn.tool { padding: .1rem .5rem; margin: 0; }
 .chip-row > details[open] { flex: 1 1 100%; }
 .chip-row > details.turn.reasoning[open] { padding: .35rem .7rem; }
 .chip-row > details.turn.tool[open] { padding: .45rem .6rem; }
+.chip-row > details > summary { margin: 0; }
 #loop-status { padding: .3rem 1rem; font-size: .72rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   border-top: 1px dashed color-mix(in srgb, currentColor 15%, transparent); opacity: .75; }
 #loop-status[hidden] { display: none; }

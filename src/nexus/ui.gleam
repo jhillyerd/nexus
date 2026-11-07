@@ -2198,16 +2198,25 @@ fn render_line(line: Line) -> Element(Msg) {
 /// stacking a full-width block (a tool-heavy turn used to cost a whole
 /// row plus the conversation gap per chip). Any other line ends the run;
 /// an expanded chip takes its full row back via CSS off the native
-/// `[open]` attribute, no script involved.
+/// `[open]` attribute, no script involved. Tail-recursive on purpose:
+/// session history is unbounded and the per-connection UI process must
+/// not grow a stack frame per transcript group.
 fn group_chips(lines: List(Line)) -> List(Element(Msg)) {
+  group_chips_loop(lines, [])
+}
+
+fn group_chips_loop(
+  lines: List(Line),
+  acc: List(Element(Msg)),
+) -> List(Element(Msg)) {
   case lines {
-    [] -> []
+    [] -> list.reverse(acc)
     [line, ..rest] ->
       case is_chip(line) {
-        False -> [render_line(line), ..group_chips(rest)]
+        False -> group_chips_loop(rest, [render_line(line), ..acc])
         True -> {
           let #(run, rest) = take_chips([line], rest)
-          [chip_row(list.reverse(run)), ..group_chips(rest)]
+          group_chips_loop(rest, [chip_row(list.reverse(run)), ..acc])
         }
       }
   }
