@@ -1875,6 +1875,60 @@ pub fn reasoning_only_turn_discards_thinking_on_done_test() {
   model.log |> should.equal([ui.UserLine("hi")])
 }
 
+pub fn whitespace_assistant_commit_renders_no_pill_test() {
+  // The live commit path: a model streams bare newlines as its text
+  // beside tool calls. The loop commits that text server-side (it is not
+  // empty), but markdown renders it to nothing — an AssistantLine for it
+  // would be an empty tinted pill (the "empty response bubble" glitch).
+  // The reasoning it preceded still commits, exactly as the transcript
+  // carries it, and no pill renders live.
+  let model =
+    new_model()
+    |> step(ui.UserEcho("hi"))
+    |> step(ui.Reasoning("thinking out loud"))
+    |> step(ui.Token("\n\n"))
+    |> step(ui.ToolCallDelta(0, Some("call_1"), Some("http_fetch"), "{}"))
+  // The bubble committed (and was skipped) at the tool-call boundary.
+  model.bubble |> should.equal(None)
+  let model = step(model, ui.TurnDone)
+  model.log
+  |> should.equal([
+    ui.ReasoningLine("thinking out loud"),
+    ui.UserLine("hi"),
+  ])
+  let html = model |> view_string
+  should_contain(html, "turn reasoning")
+  should_not_contain(html, "turn assistant md\"></div>")
+}
+
+pub fn whitespace_assistant_replay_renders_no_pill_test() {
+  // Replay must skip the same shapes the live commit skips, so a reload
+  // cannot resurrect the pill (and cannot drop a real line either).
+  let model =
+    new_model()
+    |> step(ui.AssistantFull("\n\n"))
+    |> step(ui.AssistantFull("the real answer"))
+  model.log |> should.equal([ui.AssistantLine("the real answer")])
+  let html = model |> view_string
+  should_contain(html, "the real answer")
+  should_not_contain(html, "turn assistant md\"></div>")
+}
+
+pub fn live_bubble_waits_for_visible_text_test() {
+  // The streaming bubble stays hidden until its first visible character:
+  // whitespace tokens render as an invisible-to-empty pill otherwise.
+  let model =
+    new_model()
+    |> step(ui.UserEcho("hi"))
+    |> step(ui.Token("  \n"))
+  let html = model |> view_string
+  should_not_contain(html, "turn assistant")
+  let model = step(model, ui.Token("Hello"))
+  let html = model |> view_string
+  should_contain(html, "turn assistant")
+  should_contain(html, "Hello")
+}
+
 pub fn failed_turn_rolls_back_reasoning_test() {
   let model =
     new_model()

@@ -786,14 +786,26 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       effect.none(),
     )
 
-    AssistantFull(text) -> #(
-      Model(
-        ..model,
-        log: [AssistantLine(text), ..model.log],
-        md_cache: dict.insert(model.md_cache, text, markdown.render(text)),
-      ),
-      effect.none(),
-    )
+    // A committed assistant turn replayed from history (or seen by a
+    // second tab). Text that renders to nothing under markdown — a model's
+    // bare leading/trailing newlines beside tool calls is the live case —
+    // is skipped wholesale: an AssistantLine for it would be an empty
+    // tinted pill, and the live commit path skips the same shapes, so
+    // replay and live display stay identical.
+    AssistantFull(text) -> {
+      let elements = markdown.render(text)
+      case elements {
+        [] -> #(model, effect.none())
+        _ -> #(
+          Model(
+            ..model,
+            log: [AssistantLine(text), ..model.log],
+            md_cache: dict.insert(model.md_cache, text, elements),
+          ),
+          effect.none(),
+        )
+      }
+    }
 
     ReasoningFull(text) -> #(
       Model(..model, log: [ReasoningLine(text), ..model.log]),
@@ -1092,16 +1104,26 @@ fn commit_turn_output(model: Model) -> Model {
 }
 
 /// Commit the streaming bubble (if any) as a completed assistant line —
-/// matching the session's own commit rules.
+/// matching the session's own commit rules. Text that renders to nothing
+/// under markdown (whitespace-only fragments this model streams beside
+/// tool calls) commits nothing visible — the transcript keeps it, and a
+/// replay skips it through the same render — so no empty pill appears and
+/// live display matches the post-reload rebuild.
 fn commit_bubble(model: Model) -> Model {
   case model.bubble {
-    Some(text) ->
-      Model(
-        ..model,
-        bubble: None,
-        log: [AssistantLine(text), ..model.log],
-        md_cache: dict.insert(model.md_cache, text, markdown.render(text)),
-      )
+    Some(text) -> {
+      let elements = markdown.render(text)
+      case elements {
+        [] -> Model(..model, bubble: None)
+        _ ->
+          Model(
+            ..model,
+            bubble: None,
+            log: [AssistantLine(text), ..model.log],
+            md_cache: dict.insert(model.md_cache, text, elements),
+          )
+      }
+    }
     None -> model
   }
 }
@@ -2166,8 +2188,18 @@ fn log_lines(model: Model) -> List(Element(Msg)) {
     Some(text) -> list.append(committed, [reasoning_block(text, True)])
     None -> committed
   }
+  // The live bubble stays plain pre-wrap text until the turn commits —
+  // but whitespace-only content (the fragments this model streams before
+  // tool calls) renders as an invisible-then-empty tinted pill, so the
+  // bubble waits for its first visible character. The commit path drops
+  // such text wholesale; this keeps the streaming view consistent with
+  // what committing it would produce.
   let with_bubble = case model.bubble {
-    Some(text) -> list.append(with_thinking, [turn("assistant", text)])
+    Some(text) ->
+      case string.trim(text) {
+        "" -> with_thinking
+        _ -> list.append(with_thinking, [turn("assistant", text)])
+      }
     None -> with_thinking
   }
   let lines = case model.pending {
@@ -2207,11 +2239,17 @@ fn assistant_turn(
   // bubble, so valid HTML nesting returns and the `.turn.md >
   // :first-child`/`:last-child` margin rules reach the first and last
   // block. Cache miss renders on the fly — the miss path only exists
-  // for direct view renders; both commit paths populate the cache.
-  html.div([attr.class("turn assistant md")], case dict.get(md_cache, text) {
+  // for direct view renders; both commit paths populate the cache — and
+  // both reject render-empty text, so an empty element list here would
+  // render an empty tinted pill; guard it anyway (defense in depth).
+  let elements = case dict.get(md_cache, text) {
     Ok(elements) -> elements
     Error(_) -> markdown.render(text)
-  })
+  }
+  case elements {
+    [] -> element.none()
+    _ -> html.div([attr.class("turn assistant md")], elements)
+  }
 }
 
 fn render_line(
