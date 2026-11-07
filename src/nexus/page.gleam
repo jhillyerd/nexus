@@ -604,6 +604,21 @@ details.turn.tool > summary { cursor: pointer; }
 .tool.failed .tool-status { color: #c0392b; }
 .tool-args, .tool-result { white-space: pre-wrap; overflow-wrap: anywhere; opacity: .85; margin: 0; }
 .tool-result { border-top: 1px dashed color-mix(in srgb, currentColor 15%, transparent); padding-top: .25rem; }
+/* Collapsed chips flow like spans, not blocks: consecutive collapsible
+   lines (committed reasoning + tool cards) render inside one .chip-row —
+   a wrapping flex line, so each collapsed chip sizes to its label on a
+   shared row instead of stacking a full-width block per chip (which cost
+   a whole row + conversation gap apiece). Expansion is pure CSS off the
+   native [open] attribute: flex-basis 100% wraps an open chip onto its
+   own full-width line, and the per-type rules restore the roomy block
+   padding. Closed chips keep their tint/border identity; only the
+   padding shrinks. */
+.chip-row { align-self: flex-start; max-width: 46rem; display: flex; flex-wrap: wrap;
+  align-items: flex-start; gap: .3rem .5rem; }
+.chip-row > details.turn.reasoning, .chip-row > details.turn.tool { padding: .1rem .5rem; }
+.chip-row > details[open] { flex: 1 1 100%; }
+.chip-row > details.turn.reasoning[open] { padding: .35rem .7rem; }
+.chip-row > details.turn.tool[open] { padding: .45rem .6rem; }
 #loop-status { padding: .3rem 1rem; font-size: .72rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   border-top: 1px dashed color-mix(in srgb, currentColor 15%, transparent); opacity: .75; }
 #loop-status[hidden] { display: none; }
