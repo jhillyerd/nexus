@@ -794,6 +794,127 @@ fn guard_runner(
   session.StreamGuard(4, tr)
 }
 
+/// Streams a full tool round (reasoning + text + two calls + results),
+/// then the next iteration's first deltas, then freezes until the test
+/// opens its gate — parking the turn mid-flight with finished rounds that
+/// only exist in the worker. The gate subject is created INSIDE the worker
+/// (subjects select from their owner's mailbox) and handed to the test
+/// through a request subject the test owns.
+fn gated_runner(
+  gate_request: process.Subject(process.Subject(Nil)),
+) -> session.TurnRunner {
+  fn(_endpoint, tr, _cancel, on_event) {
+    on_event(loop.LoopStatus(1, 8, "request"))
+    on_event(loop.StreamEvent(openai.ReasoningDelta("weighing ")))
+    on_event(loop.StreamEvent(openai.ReasoningDelta("options")))
+    on_event(loop.StreamEvent(openai.TokenDelta("\n\nLet me check.")))
+    on_event(loop.LoopStatus(1, 8, "tools"))
+    on_event(loop.ToolCallAssembled("call_1", "http_fetch", "{\"url\":\"a\"}"))
+    on_event(loop.ToolResultEvent("call_1", "http_fetch", True, "{\"ok\":true}"))
+    on_event(loop.ToolCallAssembled("call_2", "web_search", "{\"q\":\"x\"}"))
+    on_event(loop.ToolResultEvent("call_2", "web_search", True, "{\"r\":1}"))
+    on_event(loop.LoopStatus(2, 8, "request"))
+    on_event(loop.StreamEvent(openai.ReasoningDelta("final thinking")))
+    on_event(loop.StreamEvent(openai.TokenDelta("Final answer")))
+    let gate = process.new_subject()
+    process.send(gate_request, gate)
+    let _ = process.receive(gate, 5000)
+    session.StreamDone(stats(), transcript.append_assistant(tr, "Final answer"))
+  }
+}
+
+pub fn midturn_rejoin_replays_in_flight_rounds_test() {
+  // The reload/session-switch regression: mid-turn, the session actor's
+  // committed transcript does not yet hold the running turn's rounds (the
+  // worker installs them at WorkerDone), so a Join replayed nothing of the
+  // turn — chips and reasoning vanished until it finished. The in-flight
+  // display mirror must replay them instead.
+  let gate_request = process.new_subject()
+  let sess = start_with(gated_runner(gate_request))
+  let sub = join(sess)
+  let _ = expect_event(sub)
+
+  should.equal(session.send_message(sess, "research it"), session.Sent)
+  // Drain the live events up to the freeze point.
+  expect_event(sub) |> should.equal(session.UserEcho("research it"))
+  expect_event(sub) |> should.equal(session.LoopStatus(1, 8, "request"))
+  expect_event(sub) |> should.equal(session.Reasoning("weighing "))
+  expect_event(sub) |> should.equal(session.Reasoning("options"))
+  expect_event(sub) |> should.equal(session.Token("\n\nLet me check."))
+  expect_event(sub) |> should.equal(session.LoopStatus(1, 8, "tools"))
+  expect_event(sub)
+  |> should.equal(session.ToolCallAssembled(
+    "call_1",
+    "http_fetch",
+    "{\"url\":\"a\"}",
+  ))
+  expect_event(sub)
+  |> should.equal(session.ToolResult(
+    "call_1",
+    "http_fetch",
+    True,
+    "{\"ok\":true}",
+  ))
+  expect_event(sub)
+  |> should.equal(session.ToolCallAssembled(
+    "call_2",
+    "web_search",
+    "{\"q\":\"x\"}",
+  ))
+  expect_event(sub)
+  |> should.equal(session.ToolResult("call_2", "web_search", True, "{\"r\":1}"))
+  expect_event(sub) |> should.equal(session.LoopStatus(2, 8, "request"))
+  expect_event(sub) |> should.equal(session.Reasoning("final thinking"))
+  expect_event(sub) |> should.equal(session.Token("Final answer"))
+
+  // The worker is now parked mid-iteration-2. A fresh subscriber — the
+  // reload path — replays the finished round from the mirror: reasoning
+  // rides the text message, calls/results land in broadcast order.
+  let sub2 = join(sess)
+  let assert session.Hello(_, _, _) = expect_event(sub2)
+  expect_event(sub2) |> should.equal(session.UserEcho("research it"))
+  expect_event(sub2) |> should.equal(session.ReasoningFull("weighing options"))
+  expect_event(sub2) |> should.equal(session.AssistantFull("\n\nLet me check."))
+  expect_event(sub2)
+  |> should.equal(session.ToolCallAssembled(
+    "call_1",
+    "http_fetch",
+    "{\"url\":\"a\"}",
+  ))
+  expect_event(sub2)
+  |> should.equal(session.ToolResult(
+    "call_1",
+    "http_fetch",
+    True,
+    "{\"ok\":true}",
+  ))
+  expect_event(sub2)
+  |> should.equal(session.ToolCallAssembled(
+    "call_2",
+    "web_search",
+    "{\"q\":\"x\"}",
+  ))
+  expect_event(sub2)
+  |> should.equal(session.ToolResult("call_2", "web_search", True, "{\"r\":1}"))
+
+  // Iteration 2's still-streaming text/reasoning are NOT replayed: no
+  // phase boundary has flushed them into the mirror. Release the gate;
+  // the next thing either subscriber sees is the terminal event.
+  let assert Ok(gate) = process.receive(gate_request, 2000)
+  process.send(gate, Nil)
+  let assert session.TurnDone(_) = expect_event(sub2)
+  let assert session.TurnDone(_) = expect_event(sub)
+
+  // After the turn the mirror is gone: a post-turn join replays the
+  // committed transcript only — no reasoning or tool residue from the
+  // mirror (the fake runner commits a plain text reply).
+  let sub3 = join(sess)
+  let assert session.Hello(_, messages, _) = expect_event(sub3)
+  messages |> should.equal(3)
+  expect_event(sub3) |> should.equal(session.UserEcho("research it"))
+  expect_event(sub3) |> should.equal(session.AssistantFull("Final answer"))
+}
+
 pub fn guard_hit_renders_terminal_failure_test() {
   let sess = start_with(guard_runner)
   let sub = join(sess)

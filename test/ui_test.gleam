@@ -134,6 +134,15 @@ pub fn vanished_selection_ends_session_test() {
   model.streaming |> should.be_false
   model.model_label |> should.equal("session ended")
   model.create_open |> should.be_true
+  // The hidden flag resets with the bubble it belonged to: a stale False
+  // (the ended session's bubble was visible) would let the NEXT session's
+  // first streamed token — even whitespace-only — render, bypassing the
+  // render-empty rule.
+  model.bubble_hidden |> should.equal(True)
+  let model = model |> step(ui.Token("\n\n"))
+  model.bubble_hidden |> should.equal(True)
+  let html = model |> view_string
+  should_not_contain(html, "turn assistant")
 }
 
 pub fn hello_sets_label_and_busy_state_test() {
@@ -1873,6 +1882,92 @@ pub fn reasoning_only_turn_discards_thinking_on_done_test() {
   // display rolls the uncommitted thinking back with the turn.
   model.thinking |> should.equal(None)
   model.log |> should.equal([ui.UserLine("hi")])
+}
+
+pub fn whitespace_assistant_commit_renders_no_pill_test() {
+  // The live commit path: a model streams bare newlines as its text
+  // beside tool calls. The loop commits that text server-side (it is not
+  // empty), but markdown renders it to nothing — an AssistantLine for it
+  // would be an empty tinted pill (the "empty response bubble" glitch).
+  // The reasoning it preceded still commits, exactly as the transcript
+  // carries it, and no pill renders live.
+  let model =
+    new_model()
+    |> step(ui.UserEcho("hi"))
+    |> step(ui.Reasoning("thinking out loud"))
+    |> step(ui.Token("\n\n"))
+    |> step(ui.ToolCallDelta(0, Some("call_1"), Some("http_fetch"), "{}"))
+  // The bubble committed (and was skipped) at the tool-call boundary.
+  model.bubble |> should.equal(None)
+  let model = step(model, ui.TurnDone)
+  model.log
+  |> should.equal([
+    ui.ReasoningLine("thinking out loud"),
+    ui.UserLine("hi"),
+  ])
+  let html = model |> view_string
+  should_contain(html, "turn reasoning")
+  should_not_contain(html, "turn assistant md\"></div>")
+}
+
+pub fn whitespace_assistant_replay_renders_no_pill_test() {
+  // Replay must skip the same shapes the live commit skips, so a reload
+  // cannot resurrect the pill (and cannot drop a real line either).
+  let model =
+    new_model()
+    |> step(ui.AssistantFull("\n\n"))
+    |> step(ui.AssistantFull("the real answer"))
+  model.log |> should.equal([ui.AssistantLine("the real answer")])
+  let html = model |> view_string
+  should_contain(html, "the real answer")
+  should_not_contain(html, "turn assistant md\"></div>")
+}
+
+pub fn live_bubble_waits_for_visible_text_test() {
+  // The streaming bubble stays hidden while its text renders to nothing,
+  // decided by the SAME rule the commit path applies (see
+  // live_bubble_follows_the_commit_render_rule_test for the
+  // whitespace-vs-render distinction).
+  let model =
+    new_model()
+    |> step(ui.UserEcho("hi"))
+    |> step(ui.Token("  \n"))
+  model.bubble_hidden |> should.equal(True)
+  let html = model |> view_string
+  should_not_contain(html, "turn assistant")
+  let model = step(model, ui.Token("Hello"))
+  model.bubble_hidden |> should.equal(False)
+  let html = model |> view_string
+  should_contain(html, "turn assistant")
+  should_contain(html, "Hello")
+}
+
+pub fn live_bubble_follows_the_commit_render_rule_test() {
+  // The live bubble's visibility uses the SAME render-empty decision as
+  // the commit and replay paths — not a whitespace approximation. A lone
+  // footnote definition is trim-NONEMPTY but renders to nothing, so it
+  // must stay hidden live (a whitespace check would show it, then the
+  // commit would drop it — the exact live/replay divergence this fix
+  // closes). Once visible, the decision never flips back: the bubble
+  // only grows, and a text that already renders blocks keeps them.
+  let model =
+    new_model()
+    |> step(ui.UserEcho("hi"))
+    |> step(ui.Token("[^1]: note"))
+  model.bubble_hidden |> should.equal(True)
+  let html = model |> view_string
+  should_not_contain(html, "turn assistant")
+  let model = step(model, ui.Token("\n\nanswer body"))
+  model.bubble_hidden |> should.equal(False)
+  let html = model |> view_string
+  should_contain(html, "turn assistant")
+  // And the commit path drops the same shapes on the replay side.
+  let model = step(model, ui.TurnDone)
+  model.log
+  |> should.equal([
+    ui.AssistantLine("[^1]: note\n\nanswer body"),
+    ui.UserLine("hi"),
+  ])
 }
 
 pub fn failed_turn_rolls_back_reasoning_test() {

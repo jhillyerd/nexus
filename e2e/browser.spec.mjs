@@ -876,9 +876,15 @@ async function main() {
         `committed reasoning block: ${JSON.stringify(committed)}`,
       );
       // The centered conversation column (F6) is the log's single child, so
-      // the turn order lives one level down.
+      // the turn order lives one level down. Committed reasoning is a chip
+      // INSIDE a .chip-row wrapper (chips flow together since #43), so the
+      // scan flattens one level into chip rows to keep the order assertion.
       const classes = await page.$$eval("#log .conversation > *", (els) =>
-        els.map((e) => e.className),
+        els.flatMap((e) =>
+          /(^| )chip-row( |$)/.test(e.className)
+            ? [...e.children].map((c) => c.className)
+            : [e.className],
+        ),
       );
       // Within the LAST turn: its reasoning block must precede its answer.
       const reasoningAt = classes.findLastIndex((c) => /(^| )reasoning( |$)/.test(c));
@@ -1027,6 +1033,68 @@ async function main() {
       );
       const userText = await page.$$eval(".turn.user", (els) => els.map((e) => e.textContent));
       assert(userText.some((t) => t.includes("case:fetch")), "user bubbles replayed");
+    });
+
+    // -- 9b. mid-turn reload (in-flight replay) ----------------------------------
+    await test("mid-turn reload: finished rounds replay while the turn still runs", async () => {
+      // A tool round completes and is broadcast; the final round then holds
+      // the stream open (fetchslow). Reloading mid-hold used to drop every
+      // already-broadcast round: the committed transcript did not hold them
+      // until WorkerDone, so Join replayed nothing of the running turn.
+      // This session already carries earlier tests' turns, so the new turn's
+      // cards are identified positionally (the DOM renders oldest-first).
+      const cardsBefore = await page.$$eval(".turn.tool[data-call-id]", (els) => els.length);
+      await page.fill(
+        "#input",
+        `case:fetchslow fetch http://127.0.0.1:${services.docPort}/doc.json`,
+      );
+      await page.press("#input", "Enter");
+      const myCards = () =>
+        page.$$eval(".turn.tool[data-call-id]", (els, before) =>
+          els
+            .slice(before)
+            .map((el) => ({
+              status: el.querySelector(".tool-status")?.textContent,
+              hasResult: Boolean(el.querySelector(".tool-result")),
+            })),
+        cardsBefore,
+      );
+      // Round 1 done: one completed fetch card, pre-reload.
+      await poll(
+        async () => {
+          const cards = await myCards();
+          return cards.length === 1 && cards[0].status === "completed";
+        },
+        { timeout: 30_000, interval: 100, message: "round 1 card completed" },
+      );
+      // Reload while the final round holds the stream open. The session
+      // re-opens via the route query (page shell persistence).
+      await page.reload();
+      await connected(page);
+      // The finished round replays from the session's in-flight mirror:
+      // same single completed card, with its result attached.
+      await poll(
+        async () => {
+          const cards = await myCards();
+          return (
+            cards.length === 1 && cards[0].status === "completed" && cards[0].hasResult
+          );
+        },
+        { timeout: 30_000, interval: 100, message: "in-flight round replayed after reload" },
+      );
+      // The turn was NOT restarted: the held final text lands live and the
+      // send re-enables when the same turn finishes.
+      await poll(() => page.locator("#send").evaluate((el) => !el.disabled), {
+        timeout: 60_000,
+        message: "turn finished live after mid-turn reload",
+      });
+      const texts = await page.$$eval(".turn.assistant", (els) =>
+        els.map((e) => e.textContent),
+      );
+      assert(
+        texts.some((t) => t.includes("nexus-e2e-doc")),
+        `final text streamed live: ${texts}`,
+      );
     });
 
     // -- 10. iteration guard (max=2 instance) -------------------------------------

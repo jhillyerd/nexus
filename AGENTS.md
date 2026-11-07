@@ -89,6 +89,19 @@ Pinned by the M3 browser suite (`docs/plans/completed/m3-verification.md`);
   commits only when the assistant output it preceded commits, and a
   reasoning-only turn discards it. If you change the loop's commit rules,
   change the UI rollback with it (`test/ui_test.gleam` pins both sides).
+- **Mid-turn joins replay the in-flight turn.** The worker owns the
+  extended transcript and only installs it at `WorkerDone`, so a plain
+  replay of the committed transcript shows a running turn's rounds as
+  vanished (refresh or session switch mid-turn loses the chips). The
+  session actor therefore keeps a display-only mirror (`turn_view` in
+  `src/nexus/session.gleam`) rebuilt from the same events it broadcasts,
+  and `Join` replays it while a turn is in flight. It is display-only —
+  never encoded into a request, dropped at `WorkerDone`/`WorkerDown` —
+  so the KV-cache byte contract is structurally unaffected. Assistant
+  text that renders to nothing under markdown (a model's bare newlines
+  beside tool calls) is skipped by BOTH the live commit and the replay
+  (`AssistantFull` / `commit_bubble` in `src/nexus/ui.gleam`) — one
+  skipped shape per path, or a reload resurrects the empty pill.
 - **One frozen toolset for every session.** The registry builds the
   agent-loop runner once at boot
   (`session.agent_runner(cfg.max_tool_iterations, tools.default(cfg))`).

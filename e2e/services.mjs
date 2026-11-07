@@ -273,6 +273,23 @@ async function playScenario(res, request, state) {
       }
       return;
     }
+    case "fetchslow": {
+      // fetch with a long pause before the final round's text, so the
+      // browser can reload MID-TURN with round 1's tool card already
+      // broadcast — the in-flight replay (session display mirror) case.
+      const target = /https?:\/\/\S+/.exec(userText)?.[0] ?? "http://127.0.0.1/doc.json";
+      if (!hasToolResult) {
+        await streamText("Checking that URL now.");
+        await streamToolCall("http_fetch", JSON.stringify({ url: target }));
+        finish();
+      } else {
+        await sleep(8000);
+        await streamText("Fetch complete: the document says nexus-e2e-doc.");
+        sse(res, chunk({}, "stop"));
+        finish();
+      }
+      return;
+    }
     case "search": {
       if (!hasToolResult) {
         await streamText("Searching.");
