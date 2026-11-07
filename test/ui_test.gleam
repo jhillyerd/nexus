@@ -1819,6 +1819,48 @@ pub fn replayed_reasoning_renders_collapsed_test() {
   should_not_contain(html, "reasoning\" open")
 }
 
+pub fn view_groups_consecutive_chips_into_one_row_test() {
+  // Collapsed chips flow like spans, not stacked blocks: committed
+  // reasoning + tool cards share one .chip-row, and an assistant turn
+  // ends the run. Each chip keeps its exact card markup inside the row —
+  // the compaction is the wrapper + CSS, not the chip itself.
+  let model =
+    new_model()
+    |> step(ui.ReasoningFull("the chain"))
+    |> step(ui.ToolCallAssembled("call_1", "web_search", "{}"))
+    |> step(ui.ToolResult("call_1", "web_search", True, "[]"))
+    |> step(ui.AssistantFull("done"))
+  let html = model |> view_string
+  // The row opens with the reasoning chip and the tool chip is its
+  // sibling inside it — no </div> between the two details.
+  should_contain(
+    html,
+    "<div class=\"chip-row\"><details class=\"turn reasoning\">",
+  )
+  should_contain(html, "</details><details class=\"turn tool done\"")
+  // The assistant turn breaks the run: the row closes right before it.
+  should_contain(html, "</div><div class=\"turn assistant\">")
+}
+
+pub fn view_keeps_live_thinking_outside_chip_rows_test() {
+  // The live thinking block renders open and full-width — it must stay a
+  // bare element after the committed chips' row, never folded in as a
+  // collapsed chip.
+  let model =
+    new_model()
+    |> step(ui.ReasoningFull("committed chain"))
+    |> step(ui.Reasoning(" still streaming"))
+  let html = model |> view_string
+  should_contain(
+    html,
+    "<div class=\"chip-row\"><details class=\"turn reasoning\">",
+  )
+  // The row closes and the live block follows OUTSIDE it.
+  should_contain(html, "</div><details class=\"turn reasoning live\" open>")
+  should_not_contain(html, "chip-row\"><details class=\"turn reasoning live\"")
+  should_contain(html, "thinking…")
+}
+
 pub fn reasoning_only_turn_discards_thinking_on_done_test() {
   let model =
     new_model()

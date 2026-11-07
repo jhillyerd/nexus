@@ -2136,33 +2136,15 @@ fn composer(model: Model, has_session: Bool) -> Element(Msg) {
 }
 
 fn log_lines(model: Model) -> List(Element(Msg)) {
-  let completed =
-    list.reverse(model.log)
-    |> list.map(fn(line) {
-      case line {
-        UserLine(text) -> turn("user", text)
-        AssistantLine(text) -> turn("assistant", text)
-        ReasoningLine(text) -> reasoning_block(text, False)
-        ToolLine(..) -> tool_card(line)
-        NoteLine(err, text) ->
-          html.div(
-            [
-              attr.class(case err {
-                True -> "note err"
-                False -> "note"
-              }),
-            ],
-            [html.text(text)],
-          )
-      }
-    })
-  // In-flight state renders newest-last: committed lines, the live
-  // thinking block, the streaming bubble, then tool calls still
+  // Committed lines first, then the in-flight overlays newest-last: the
+  // live thinking block, the streaming bubble, then tool calls still
   // assembling their arguments — reasoning precedes content, live and
-  // committed alike.
+  // committed alike. The live overlays render open (full-width blocks),
+  // so only committed lines go through the chip-row grouping.
+  let committed = group_chips(list.reverse(model.log))
   let with_thinking = case model.thinking {
-    Some(text) -> list.append(completed, [reasoning_block(text, True)])
-    None -> completed
+    Some(text) -> list.append(committed, [reasoning_block(text, True)])
+    None -> committed
   }
   let with_bubble = case model.bubble {
     Some(text) -> list.append(with_thinking, [turn("assistant", text)])
@@ -2189,6 +2171,79 @@ fn log_lines(model: Model) -> List(Element(Msg)) {
 
 fn turn(kind: String, text: String) -> Element(Msg) {
   html.div([attr.class("turn " <> kind)], [html.span([], [html.text(text)])])
+}
+
+fn render_line(line: Line) -> Element(Msg) {
+  case line {
+    UserLine(text) -> turn("user", text)
+    AssistantLine(text) -> turn("assistant", text)
+    ReasoningLine(text) -> reasoning_block(text, False)
+    ToolLine(..) -> tool_card(line)
+    NoteLine(err, text) ->
+      html.div(
+        [
+          attr.class(case err {
+            True -> "note err"
+            False -> "note"
+          }),
+        ],
+        [html.text(text)],
+      )
+  }
+}
+
+/// Runs of consecutive collapsible lines — committed reasoning and tool
+/// cards — render inside one `.chip-row` wrapper, so their collapsed
+/// chips flow together like inline spans on a shared row instead of each
+/// stacking a full-width block (a tool-heavy turn used to cost a whole
+/// row plus the conversation gap per chip). Any other line ends the run;
+/// an expanded chip takes its full row back via CSS off the native
+/// `[open]` attribute, no script involved. Tail-recursive on purpose:
+/// session history is unbounded and the per-connection UI process must
+/// not grow a stack frame per transcript group.
+fn group_chips(lines: List(Line)) -> List(Element(Msg)) {
+  group_chips_loop(lines, [])
+}
+
+fn group_chips_loop(
+  lines: List(Line),
+  acc: List(Element(Msg)),
+) -> List(Element(Msg)) {
+  case lines {
+    [] -> list.reverse(acc)
+    [line, ..rest] ->
+      case is_chip(line) {
+        False -> group_chips_loop(rest, [render_line(line), ..acc])
+        True -> {
+          let #(run, rest) = take_chips([line], rest)
+          group_chips_loop(rest, [chip_row(list.reverse(run)), ..acc])
+        }
+      }
+  }
+}
+
+/// Extend a chip run with every following chip line. The run accumulates
+/// reversed; the caller reverses it before rendering.
+fn take_chips(run: List(Line), rest: List(Line)) -> #(List(Line), List(Line)) {
+  case rest {
+    [line, ..more] ->
+      case is_chip(line) {
+        True -> take_chips([line, ..run], more)
+        False -> #(run, rest)
+      }
+    [] -> #(run, rest)
+  }
+}
+
+fn is_chip(line: Line) -> Bool {
+  case line {
+    ReasoningLine(_) | ToolLine(..) -> True
+    UserLine(_) | AssistantLine(_) | NoteLine(_, _) -> False
+  }
+}
+
+fn chip_row(lines: List(Line)) -> Element(Msg) {
+  html.div([attr.class("chip-row")], list.map(lines, render_line))
 }
 
 /// The model's reasoning (chain of thought) as an inert collapsible
