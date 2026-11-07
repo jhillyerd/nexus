@@ -67,12 +67,14 @@ const description =
   <> "Lua table shaped like that tool's JSON schema; returns its result "
   <> "text, or aborts the script with the tool's error); text(value) "
   <> "appends an output item (strings as-is, other values as JSON); "
-  <> "print(...) appends console lines; the script's final return value "
-  <> "becomes the last output item. Sandboxed Lua only: no io, files, "
-  <> "os.execute, or code loading. Limits: wall-clock deadline (killed at "
-  <> "the deadline, partial output kept), output size cap (head and tail "
-  <> "kept), at most 25 tool calls, bounded VM memory. Keep scripts small: "
-  <> "fetch, filter, and summarize."
+  <> "print(...) appends console lines; each value the script returns "
+  <> "becomes a trailing output item, same rendering as text(). Emit the "
+  <> "answer once — via return OR via text()/print(); returning a value "
+  <> "you already emitted duplicates it (there is no deduplication). "
+  <> "Sandboxed Lua only: no io, files, os.execute, or code loading. "
+  <> "Limits: wall-clock deadline (killed at the deadline, partial output "
+  <> "kept), output size cap (head and tail kept), at most 25 tool calls, "
+  <> "bounded VM memory. Keep scripts small: fetch, filter, and summarize."
 
 const parameters =
   "{\"type\":\"object\",\"properties\":{\"code\":{\"type\":"
@@ -495,23 +497,28 @@ fn engine_action(
   use _ <- glua.then(install_hosts(events, hosts))
   use _ <- glua.then(glua.eval(code: preamble_lua))
   use values <- glua.then(glua.eval(code: code))
+  emit_return_values(events, values)
+}
+
+/// Every value the script's `return` yields becomes a trailing output
+/// item, in order, with `text()`'s rendering (strings as-is, other values
+/// as JSON). `nil` values — and an absent `return` — add nothing. This is
+/// a deliberate amendment after live-agent review (2026-11): keeping only
+/// the first value silently discarded Lua's idiomatic multi-returns.
+fn emit_return_values(
+  events: Subject(EngineEvent),
+  values: List(glua.Value),
+) -> glua.Action(Nil, e) {
   case values {
     [] -> glua.success(Nil)
-    [first, ..] ->
-      glua.call_function_by_name(keys: ["__nexus_render"], args: [first])
-      |> glua.then(fn(rendered) {
-        case rendered {
-          [value, ..] ->
-            glua.dereference(ref: value, using: decode.optional(decode.string))
-            |> glua.map(with: fn(text) {
-              case text {
-                Some(text) -> process.send(events, TextOut(text))
-                None -> Nil
-              }
-            })
-          [] -> glua.success(Nil)
-        }
-      })
+    [first, ..rest] -> {
+      use text <- glua.then(render_value(first))
+      case text {
+        Some(text) -> process.send(events, TextOut(text))
+        None -> Nil
+      }
+      emit_return_values(events, rest)
+    }
   }
 }
 
@@ -657,7 +664,10 @@ fn print_fn(
   }
 }
 
-fn render_value(value: glua.Value) -> glua.Action(Option(String), glua.Never) {
+/// Render one Lua value as output text (strings as-is, other values as
+/// JSON, nil as no item). Generic in the action's error type so both the
+/// Never-constrained host functions and the engine tail can reuse it.
+fn render_value(value: glua.Value) -> glua.Action(Option(String), e) {
   glua.call_function_by_name(keys: ["__nexus_render"], args: [value])
   |> glua.then(fn(values) {
     case values {

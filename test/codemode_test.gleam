@@ -88,6 +88,33 @@ pub fn final_return_table_rendered_as_json_test() {
   should.be_true(string.contains(result, "[1,true]"))
 }
 
+/// Lua's idiomatic multi-returns must not silently lose values: every
+/// returned value becomes a trailing output item, in order, rendered
+/// like text() (live-agent review amendment — the first cut kept only
+/// the first value).
+pub fn multi_value_return_renders_every_value_test() {
+  let assert Ok(result) = run_code("return 1, 'two', {k = 'v'}")
+  let parts = string.split(result, "\n\n")
+  should.equal(list.drop(parts, 1), ["1", "two", "{\"k\":\"v\"}"])
+}
+
+/// No-dedup is deliberate (same review): emitting and returning the same
+/// value duplicates it — visible and predictable beats harness magic that
+/// could eat legitimate repeats. Pinned so the stance cannot regress
+/// silently.
+pub fn emitted_and_returned_value_duplicates_test() {
+  let assert Ok(result) = run_code("text('answer')\nreturn 'answer'")
+  let parts = string.split(result, "\n\n")
+  should.equal(list.drop(parts, 1), ["answer", "answer"])
+}
+
+/// `nil` returns add no phantom item (an absent return already does not).
+pub fn nil_return_adds_no_item_test() {
+  let assert Ok(result) = run_code("text('only')\nreturn nil")
+  let parts = string.split(result, "\n\n")
+  should.equal(list.drop(parts, 1), ["only"])
+}
+
 pub fn print_overridden_to_console_block_test() {
   let assert Ok(result) = run_code("print('a', 1, true)\nprint('line two')")
   should.be_true(string.contains(result, "<console_output>"))

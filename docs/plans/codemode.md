@@ -30,7 +30,16 @@ EYG and ports documented as future alternatives behind the same seam.
     a Lua error carrying the tool error text.
   - `text(value)` — append an output item (strings as-is, tables as JSON).
   - `print(...)` — overridden; appends to a `<console_output>` block.
-  - The script's final `return` value becomes the last output item.
+  - **Every** value the script's `return` yields becomes a trailing output
+    item (same rendering as `text()`; `nil` values and an absent `return`
+    add nothing). Amended 2026-11 after live-agent review — the original
+    "the final return value becomes the last output item" kept only the
+    first value and silently discarded Lua's idiomatic multi-returns
+    (`return a, b`). The same review considered deduplicating
+    `text(x)` + `return x` in the harness and **rejected** it:
+    string-equality magic can eat legitimate repeats, and a visible,
+    predictable duplicate is self-correcting; the tool description tells
+    the model to emit its answer once.
 - **Sandbox**: `glua.new_sandboxed` (blocks `io`, `file`, `os.execute/exit/
   getenv/remove/rename/tmpname`, `package`, `load/loadfile/require/dofile/
   loadstring`). The only world-access is the host table. Codemode is excluded
