@@ -25,6 +25,9 @@ fn set_all(pairs: List(#(String, String))) -> Nil {
   envoy.unset("NEXUS_SYSTEM_PROMPT")
   envoy.unset("NEXUS_UTILITY_ENABLED")
   envoy.unset("NEXUS_UTILITY_DELAY_MS")
+  envoy.unset("NEXUS_CODEMODE")
+  envoy.unset("NEXUS_CODEMODE_TIMEOUT_MS")
+  envoy.unset("NEXUS_CODEMODE_MAX_OUTPUT_CHARS")
   list.each(pairs, fn(pair) { envoy.set(pair.0, pair.1) })
 }
 
@@ -118,4 +121,83 @@ pub fn load_rejects_negative_utility_delay_test() {
   |> should.equal(
     "environment variable NEXUS_UTILITY_DELAY_MS must be >= 0: -1",
   )
+}
+
+// ---------------------------------------------------------------------------
+// Codemode (phase 1)
+// ---------------------------------------------------------------------------
+
+/// Off by default: the frozen tool envelope is byte-identical to the
+/// pre-codemode registry until the flag is explicitly set.
+pub fn load_codemode_defaults_test() {
+  set_all([#("NEXUS_ENCRYPTION_KEY", key_b64)])
+  let assert Ok(cfg) = config.load()
+  cfg.codemode |> should.equal(False)
+  cfg.codemode_timeout_ms |> should.equal(30_000)
+  cfg.codemode_max_output_chars |> should.equal(32_768)
+}
+
+pub fn load_codemode_overrides_test() {
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_CODEMODE", "true"),
+    #("NEXUS_CODEMODE_TIMEOUT_MS", "5000"),
+    #("NEXUS_CODEMODE_MAX_OUTPUT_CHARS", "1024"),
+  ])
+  let assert Ok(cfg) = config.load()
+  cfg.codemode |> should.equal(True)
+  cfg.codemode_timeout_ms |> should.equal(5000)
+  cfg.codemode_max_output_chars |> should.equal(1024)
+}
+
+/// A sub-second deadline could never run a script — fail the load.
+pub fn load_rejects_low_codemode_timeout_test() {
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_CODEMODE_TIMEOUT_MS", "999"),
+  ])
+  let assert Error(message) = config.load()
+  message
+  |> should.equal(
+    "environment variable NEXUS_CODEMODE_TIMEOUT_MS must be >= 1000: 999",
+  )
+}
+
+pub fn load_rejects_negative_codemode_timeout_test() {
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_CODEMODE_TIMEOUT_MS", "-1"),
+  ])
+  let assert Error(message) = config.load()
+  should.be_true(string.contains(message, "NEXUS_CODEMODE_TIMEOUT_MS"))
+}
+
+pub fn load_rejects_non_integer_codemode_timeout_test() {
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_CODEMODE_TIMEOUT_MS", "soon"),
+  ])
+  let assert Error(message) = config.load()
+  should.be_true(string.contains(message, "NEXUS_CODEMODE_TIMEOUT_MS"))
+}
+
+pub fn load_rejects_negative_codemode_output_cap_test() {
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_CODEMODE_MAX_OUTPUT_CHARS", "-1"),
+  ])
+  let assert Error(message) = config.load()
+  message
+  |> should.equal(
+    "environment variable NEXUS_CODEMODE_MAX_OUTPUT_CHARS must be >= 0: -1",
+  )
+}
+
+pub fn load_rejects_non_boolean_codemode_flag_test() {
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_CODEMODE", "maybe"),
+  ])
+  let assert Error(message) = config.load()
+  should.be_true(string.contains(message, "NEXUS_CODEMODE"))
 }

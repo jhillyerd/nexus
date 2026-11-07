@@ -64,6 +64,15 @@ pub type Config {
     /// Utility debounce: how long after a turn commit the side call waits
     /// (so a fast follow-up message cancels it before it starts).
     utility_delay_ms: Int,
+    /// Codemode (codemode plan phase 1): register the Lua-script tool.
+    /// Off keeps the tool schema list byte-identical to the pre-codemode
+    /// registry (KV-cache contract rule 4).
+    codemode: Bool,
+    /// Codemode: per-script wall-clock deadline in ms.
+    codemode_timeout_ms: Int,
+    /// Codemode: rendered-output cap in characters (head and tail kept,
+    /// omission noted).
+    codemode_max_output_chars: Int,
   )
 }
 
@@ -146,6 +155,21 @@ pub fn from_env(
     "NEXUS_UTILITY_DELAY_MS",
     1500,
   ))
+  // ---- Codemode (codemode plan phase 1). Off by default so the frozen
+  // tool envelope is unchanged until explicitly enabled.
+  use codemode <- result.try(optional_bool(get, "NEXUS_CODEMODE", False))
+  use codemode_timeout_ms <- result.try(optional_min_int(
+    get,
+    "NEXUS_CODEMODE_TIMEOUT_MS",
+    30_000,
+    min: 1000,
+  ))
+  use codemode_max_output_chars <- result.try(optional_min_int(
+    get,
+    "NEXUS_CODEMODE_MAX_OUTPUT_CHARS",
+    32_768,
+    min: 0,
+  ))
   Ok(Config(
     encryption_key: encryption_key,
     sse_first_response_timeout_ms: first_response_ms,
@@ -167,6 +191,9 @@ pub fn from_env(
     pg_password: pg_password,
     utility_enabled: utility_enabled,
     utility_delay_ms: utility_delay_ms,
+    codemode: codemode,
+    codemode_timeout_ms: codemode_timeout_ms,
+    codemode_max_output_chars: codemode_max_output_chars,
   ))
 }
 
@@ -246,6 +273,31 @@ fn optional_non_negative_int(
         "environment variable "
         <> name
         <> " must be >= 0: "
+        <> int.to_string(value),
+      )
+    False -> Ok(value)
+  }
+}
+
+/// Like `optional_int`, but a value below `min` fails the load. Codemode's
+/// ranges must be usable the moment the tool runs — a sub-second deadline
+/// or a negative cap would otherwise surface as a broken tool at first
+/// use instead of the loud boot failure this module promises.
+fn optional_min_int(
+  get: fn(String) -> Result(String, Nil),
+  name: String,
+  default: Int,
+  min min_value: Int,
+) -> Result(Int, String) {
+  use value <- result.try(optional_int(get, name, default))
+  case value < min_value {
+    True ->
+      Error(
+        "environment variable "
+        <> name
+        <> " must be >= "
+        <> int.to_string(min_value)
+        <> ": "
         <> int.to_string(value),
       )
     False -> Ok(value)

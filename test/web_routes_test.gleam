@@ -55,6 +55,9 @@ fn test_config() -> Config {
     // `gleam test` stays strictly offline/network-free (AGENTS.md).
     utility_enabled: False,
     utility_delay_ms: 1500,
+    codemode: False,
+    codemode_timeout_ms: 30_000,
+    codemode_max_output_chars: 32_768,
   )
 }
 
