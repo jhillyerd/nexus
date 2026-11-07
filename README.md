@@ -20,7 +20,8 @@ titles and tags ride one prefix-cache "utility branch" — designed in
 ## Development
 
 ```sh
-docker compose up -d        # local Postgres 17 on 127.0.0.1:5433 (schema applied on first boot)
+docker compose up -d        # local Postgres 17 on 127.0.0.1:5433
+gleam run -m nexus/store/migrate  # applies sql/schema.sql (idempotent; rerun after schema edits)
 gleam run                   # web server (registry, sessions, streaming, stop, auth, store)
 gleam test                  # offline unit tests (no network, no database — the store is a mockable seam)
 gleam format src test
@@ -46,8 +47,7 @@ typed Gleam (`gleam run -m squirrel` — needs the live DB above) and
 commit the result; `gleam run -m squirrel check` (CI does this) fails
 when the generated module is stale. Schema changes: edit
 `sql/schema.sql`, re-apply with
-`gleam run -m nexus/store/migrate` (idempotent) or
-`docker compose exec nexus-db psql -U nexus -d nexus -f /docker-entrypoint-initdb.d/schema.sql`.
+`gleam run -m nexus/store/migrate` (idempotent).
 
 ## Providers
 

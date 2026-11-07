@@ -6,14 +6,16 @@
 # .env (untracked, loaded by .envrc):
 #   DATABASE_URL=postgres://nexus@127.0.0.1:5433/nexus
 #
-# First boot applies sql/schema.sql via /docker-entrypoint-initdb.d/.
-# Schema changed? Re-apply (idempotent — the DDL uses IF NOT EXISTS):
+# Schema is applied by the migrate runner, not this file (idempotent —
+# the DDL uses IF NOT EXISTS; safe on every boot):
 #
-#   docker compose exec nexus-db psql -U nexus -d nexus \
-#     -f /docker-entrypoint-initdb.d/schema.sql
-#   # or, through pog:
 #   DATABASE_URL=postgres://nexus@127.0.0.1:5433/nexus \
 #     gleam run -m nexus/store/migrate
+#   # (etc/dev-server.sh does this for you)
+#
+# Deliberately no bind mounts: they would embed a worktree-specific host
+# path in the compose config hash, and `up` would recreate the singleton
+# on every worktree switch.
 #
 # Port 5433 on loopback avoids clashes with a local 5432; auth is trust
 # because this is a dev-only database bound to loopback — production
@@ -38,7 +40,6 @@ services:
       - "127.0.0.1:5433:5432"
     volumes:
       - nexus-db-data:/var/lib/postgresql/data
-      - ./sql/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U nexus -d nexus"]
       interval: 2s

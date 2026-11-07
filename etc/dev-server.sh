@@ -7,9 +7,10 @@
 # project name (`nexus`), so `up -d --wait` from any worktree reaches the
 # same container/volume, starts it if needed, waits for its healthcheck
 # (the server fails fast if Postgres is unreachable), and is a no-op
-# while it already runs. First-boot only applies sql/schema.sql, so the
-# migrate runner re-applies it after (idempotent DDL — cheap no-op when
-# the volume is already current).
+# while it already runs — from any checkout: the compose file carries no
+# worktree-relative paths (no bind mounts), so its config hash does not
+# vary per checkout. Schema applies via the migrate runner below
+# (idempotent DDL — cheap no-op when the volume is already current).
 set -euo pipefail
 
 # Root of THIS checkout (the script lives in <root>/etc).
@@ -23,7 +24,6 @@ main="${main%/.git}"
 set -a
 source "$main/.env"
 set +a
-export NEXUS_HTTP_BIND=0.0.0.0
 
 cd "$root"
 
