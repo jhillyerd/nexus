@@ -571,6 +571,21 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
 .turn { max-width: 46rem; padding: .55rem .8rem; border-radius: 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .turn.user { align-self: flex-end; background: color-mix(in srgb, #3b82f6 18%, transparent); }
 .turn.assistant { align-self: flex-start; background: color-mix(in srgb, currentColor 8%, transparent); }
+/* Markdown assistant turns (.md, see nexus/ui/markdown): the renderer
+   emits block semantics, so pre-wrap text flow switches off and the
+   blocks get chat-sized margins. Headings collapse to body size — a
+   chat bubble is not a document page. #app-prefixed per the Pico
+   cascade traps: Pico matches bare h1..h6/pre/p rules and these must
+   beat them inside the bubble. */
+#app .turn.md { white-space: normal; }
+#app .turn.md > :first-child { margin-top: 0; }
+#app .turn.md > :last-child { margin-bottom: 0; }
+#app .turn.md :is(h1,h2,h3,h4,h5,h6) { font-size: 1em; line-height: 1.35; margin: .6rem 0 .2rem; }
+#app .turn.md p { margin: .3rem 0; }
+#app .turn.md :is(ul,ol) { margin: .3rem 0; }
+#app .turn.md pre { margin: .4rem 0; white-space: pre; }
+#app .turn.md table { margin: .4rem 0; font-size: .9em; }
+#app .turn.md blockquote { margin: .4rem 0; }
 details.turn.reasoning { align-self: flex-start; max-width: 46rem; padding: .35rem .7rem; border-radius: 10px;
   font-size: .8rem; color: color-mix(in srgb, currentColor 80%, transparent);
   border: 1px dashed color-mix(in srgb, currentColor 22%, transparent);

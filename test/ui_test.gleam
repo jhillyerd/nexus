@@ -1839,7 +1839,9 @@ pub fn view_groups_consecutive_chips_into_one_row_test() {
   )
   should_contain(html, "</details><details class=\"turn tool done\"")
   // The assistant turn breaks the run: the row closes right before it.
-  should_contain(html, "</div><div class=\"turn assistant\">")
+  // Committed assistant turns render markdown (nexus/ui/markdown) and
+  // carry the .md class that switches the bubble to block flow.
+  should_contain(html, "</div><div class=\"turn assistant md\">")
 }
 
 pub fn view_keeps_live_thinking_outside_chip_rows_test() {

@@ -44,6 +44,7 @@ import nexus/provider_registry
 import nexus/session.{type SessionEvent}
 import nexus/session_registry
 import nexus/timing
+import nexus/ui/markdown
 import nexus/ui_settings
 
 /// Everything the component needs to talk to the rest of the app. The
@@ -2173,10 +2174,22 @@ fn turn(kind: String, text: String) -> Element(Msg) {
   html.div([attr.class("turn " <> kind)], [html.span([], [html.text(text)])])
 }
 
+/// Committed assistant turns render markdown (see `nexus/ui/markdown`
+/// for the hostile-text contract: raw HTML stays inert text, hrefs are
+/// scheme-filtered, images become links). The `md` class switches the
+/// turn from pre-wrap text flow to block flow — the live streaming
+/// bubble above keeps plain `turn("assistant", …)` rendering until the
+/// turn commits, so a half-streamed construct never looks committed.
+fn assistant_turn(text: String) -> Element(Msg) {
+  html.div([attr.class("turn assistant md")], [
+    html.span([], markdown.render(text)),
+  ])
+}
+
 fn render_line(line: Line) -> Element(Msg) {
   case line {
     UserLine(text) -> turn("user", text)
-    AssistantLine(text) -> turn("assistant", text)
+    AssistantLine(text) -> assistant_turn(text)
     ReasoningLine(text) -> reasoning_block(text, False)
     ToolLine(..) -> tool_card(line)
     NoteLine(err, text) ->
