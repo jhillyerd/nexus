@@ -131,7 +131,7 @@ pub fn print_overridden_to_console_block_test() {
 }
 
 pub fn tool_error_aborts_script_with_reason_test() {
-  let assert Ok(result) =
+  let assert Error(result) =
     run_code("text('before')\ntools.boom({})\ntext('after')")
   should.be_true(string.contains(result, "Script failed ("))
   should.be_true(string.contains(result, "before"))
@@ -162,7 +162,7 @@ pub fn hostile_output_is_inert_test() {
 // ---------------------------------------------------------------------------
 
 pub fn infinite_loop_killed_at_deadline_test() {
-  let assert Ok(result) =
+  let assert Error(result) =
     codemode.run(
       hosts: mock_hosts(),
       timeout_ms: 1000,
@@ -191,7 +191,7 @@ pub fn mid_script_cancellation_test() {
       Ok("cancelling")
     }),
   ]
-  let assert Ok(result) =
+  let assert Error(result) =
     codemode.run(
       hosts: hosts,
       timeout_ms: default_timeout_ms,
@@ -218,7 +218,7 @@ pub fn cancel_during_slow_host_call_test() {
       Ok("finally")
     }),
   ]
-  let assert Ok(result) =
+  let assert Error(result) =
     codemode.run(
       hosts: hosts,
       timeout_ms: default_timeout_ms,
@@ -241,7 +241,7 @@ pub fn cancel_during_slow_host_call_test() {
 // ---------------------------------------------------------------------------
 
 pub fn tool_call_budget_exceeded_test() {
-  let assert Ok(result) =
+  let assert Error(result) =
     run_code(
       "local n = 0\nfor i = 1, 100 do\n  n = n + 1\n  tools.echo({i = i})\nend\nreturn 'ran ' .. n",
     )
@@ -254,19 +254,19 @@ pub fn tool_call_budget_exceeded_test() {
 // ---------------------------------------------------------------------------
 
 pub fn sandbox_denies_load_test() {
-  let assert Ok(result) = run_code("local f = load('return 1')\nreturn f()")
+  let assert Error(result) = run_code("local f = load('return 1')\nreturn f()")
   should.be_true(string.contains(result, "Script failed ("))
   should.be_true(string.contains(result, "load is sandboxed"))
 }
 
 pub fn sandbox_denies_require_test() {
-  let assert Ok(result) = run_code("require('nope')")
+  let assert Error(result) = run_code("require('nope')")
   should.be_true(string.contains(result, "Script failed ("))
   should.be_true(string.contains(result, "require is sandboxed"))
 }
 
 pub fn sandbox_denies_os_execute_test() {
-  let assert Ok(result) = run_code("os.execute('echo hi')")
+  let assert Error(result) = run_code("os.execute('echo hi')")
   should.be_true(string.contains(result, "Script failed ("))
   should.be_true(string.contains(result, "os.execute is sandboxed"))
 }
@@ -276,7 +276,7 @@ pub fn sandbox_denies_os_execute_test() {
 // ---------------------------------------------------------------------------
 
 pub fn unknown_tool_errors_test() {
-  let assert Ok(result) = run_code("return tools.no_such_tool({})")
+  let assert Error(result) = run_code("return tools.no_such_tool({})")
   should.be_true(string.contains(result, "Script failed ("))
   should.be_true(string.contains(result, "unknown tool: no_such_tool"))
 }
@@ -347,7 +347,8 @@ pub fn registry_appends_codemode_when_enabled_test() {
 pub fn codemode_absent_from_own_tools_table_test() {
   let cfg = config.Config(..base_config(), codemode: True)
   let specs = tools.default(cfg)
-  let assert Ok(result) = run_registered(specs, "return type(tools.codemode)")
+  let assert Error(result) =
+    run_registered(specs, "return type(tools.codemode)")
   should.be_true(string.contains(result, "Script failed ("))
   should.be_true(string.contains(result, "unknown tool: codemode"))
 }
@@ -497,7 +498,7 @@ pub fn engine_crash_reported_as_crash_test() {
   let hosts = [
     codemode.HostTool(name: "explode", call: fn(_) { panic as "host crash" }),
   ]
-  let assert Ok(result) =
+  let assert Error(result) =
     codemode.run(
       hosts: hosts,
       timeout_ms: default_timeout_ms,

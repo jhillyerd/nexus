@@ -101,10 +101,15 @@ pub fn schema() -> chat.ChatCompletionTool {
   ))
 }
 
-/// Execute one codemode call. A script that RUNS to completion or fails
-/// at runtime is tool CONTENT (`Ok`) — the status line carries the
-/// outcome; only a malformed call (`missing 'code'`) is an `Error`, which
-/// the agent loop renders like any other tool error.
+/// Execute one codemode call. A COMPLETED script is tool content (`Ok`);
+/// a FAILED script (script error, timeout, cancellation, engine death)
+/// is an `Error` carrying the exact same formatted result — status line,
+/// output items, console block, `Script error: …`. The agent loop marks
+/// an errored tool result failed, so the UI chip renders red and the
+/// persisted `ok` keeps it red across reload (the #44 convention);
+/// the model still sees every byte of the failure detail, rendered by
+/// the loop like any sibling tool error. A malformed CALL (missing
+/// `code`) is also an `Error`, with a short message instead.
 pub fn run(
   hosts hosts: List(HostTool),
   timeout_ms timeout_ms: Int,
@@ -113,7 +118,12 @@ pub fn run(
   arguments arguments: String,
 ) -> Result(String, String) {
   use code <- result.try(decode_code(arguments))
-  Ok(run_script(hosts, timeout_ms, max_output_chars, cancel, code))
+  let #(succeeded, content) =
+    run_script(hosts, timeout_ms, max_output_chars, cancel, code)
+  case succeeded {
+    True -> Ok(content)
+    False -> Error(content)
+  }
 }
 
 fn decode_code(arguments: String) -> Result(String, String) {
@@ -171,7 +181,7 @@ fn run_script(
   max_output_chars: Int,
   cancel: Subject(Nil),
   code: String,
-) -> String {
+) -> #(Bool, String) {
   let started_us = timing.now_us()
   let deadline_us = started_us + timeout_ms * 1000
   let events = process.new_subject()
@@ -203,7 +213,11 @@ fn run_script(
     Cancelled -> process.send(cancel, Nil)
     _ -> Nil
   }
-  render(ended, elapsed_ms(started_us), out)
+  let succeeded = case ended {
+    EngineReported(Ok(_)) -> True
+    _ -> False
+  }
+  #(succeeded, render(ended, elapsed_ms(started_us), out))
 }
 
 /// The worker's select loop: accumulate streamed output until the engine

@@ -61,7 +61,10 @@ EYG and ports documented as future alternatives behind the same seam.
   `Script completed (<wall ms>)` / `Script failed (<wall ms>)`, output items,
   then `<console_output>` block; failed runs keep partial output followed by
   `Script error: <reason>`. Output truncated at a configurable cap (keep head
-  and tail, note the omission).
+  and tail, note the omission). A failed script surfaces as the tool's
+  `Error` — carrying that same formatted result — so the agent loop marks
+  the tool result failed (red chip, persisted `ok=false`, the #44
+  convention) while the model still sees every byte of the failure detail.
 - **Process model & cancellation**: `codemode.run` executes inside the
   per-turn worker process, which spawns a dedicated engine child **linked to
   the worker**. Today `Stop` cannot reach tool execution — the session's
