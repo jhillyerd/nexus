@@ -20,7 +20,7 @@ titles and tags ride one prefix-cache "utility branch" — designed in
 ## Development
 
 ```sh
-docker compose up -d        # local Postgres 17 on 127.0.0.1:5433
+docker compose up -d --wait   # local Postgres 17 on 127.0.0.1:5433 (waits for health)
 gleam run -m nexus/store/migrate  # applies sql/schema.sql (idempotent; rerun after schema edits)
 gleam run                   # web server (registry, sessions, streaming, stop, auth, store)
 gleam test                  # offline unit tests (no network, no database — the store is a mockable seam)

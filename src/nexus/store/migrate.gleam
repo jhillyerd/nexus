@@ -1,15 +1,15 @@
 //// Schema migration runner: applies `sql/schema.sql` to the database in
 //// `DATABASE_URL` (the same convention squirrel uses).
 ////
-//// Two supported apply paths (README documents both):
-//// - docker compose first boot mounts `sql/schema.sql` at
-////   `/docker-entrypoint-initdb.d/` and the postgres image applies it
-////   once on an empty volume;
-//// - this runner is the re-apply path for schema changes and the CI
-////   service container:
+//// This runner is the only schema-apply path: the compose file has no
+//// schema bind mount (its config must stay identical from every
+//// checkout/worktree, so `up` never recreates the singleton db on a
+//// worktree switch). Apply after boot; re-apply after schema changes
+//// and for the CI service container:
 ////
 ////     DATABASE_URL=postgres://nexus@127.0.0.1:5433/nexus \
 ////       gleam run -m nexus/store/migrate
+////   # (etc/dev-server.sh runs this on every dev boot)
 ////
 //// The schema is written idempotently (`create table if not exists`), so
 //// re-running is safe. Statements are split by a quote-aware scanner
