@@ -35,6 +35,11 @@ EYG and ports documented as future alternatives behind the same seam.
   getenv/remove/rename/tmpname`, `package`, `load/loadfile/require/dofile/
   loadstring`). The only world-access is the host table. Codemode is excluded
   from its own `tools` table (recursion guard).
+- **Budgets**: three bounds — wall-clock deadline, output cap, and a
+  per-script **tool-call budget** (constant, ~25 calls; exceeding it fails
+  the script). The call budget bounds retained intermediate results: each
+  host result is already truncated by its own tool's limits, so retained
+  memory ≤ budget × per-tool cap. The tool description documents all three.
 - **Tool schema**: `{"code": string}`; description documents the mini-API and
   limits (~400 tokens). Sibling tools stay declared normally — the codemode
   description documents only the *calling convention*, not their schemas.
@@ -43,12 +48,17 @@ EYG and ports documented as future alternatives behind the same seam.
   then `<console_output>` block; failed runs keep partial output followed by
   `Script error: <reason>`. Output truncated at a configurable cap (keep head
   and tail, note the omission).
-- **Process model**: `codemode.run` executes inside the per-turn worker
-  process (existing seam). It spawns a dedicated engine child **linked to the
-  turn worker** (turn cancel tears it down) and enforces its own wall-clock
-  deadline by killing the child — safe because Luerl state is process-local.
-  `text()`/`print` events stream to the worker before the kill, so partial
-  output survives timeouts.
+- **Process model & cancellation**: `codemode.run` executes inside the
+  per-turn worker process, which spawns a dedicated engine child **linked to
+  the worker**. Today `Stop` cannot reach tool execution — the session's
+  `Stop` handler only signals the *stream* cancel subject or sets a
+  stop-pending flag; nothing interrupts the worker while it runs a tool. So
+  the seam must pass the turn's cancel subject down (see step 4): while the
+  engine child evaluates, the worker blocks in a select over
+  `{engine reply, cancel subject, deadline}` — cancel, timeout, and worker
+  death all kill the engine (safe: Luerl state is process-local; the link
+  covers worker crash/turn teardown). `text()`/`print` events stream to the
+  worker as they happen, so partial output survives timeouts and cancels.
 - **Envelope**: the tools array is frozen per boot. Codemode registers only
   when enabled (`web_search` precedent). Enabling it mid-deployment diverges
   existing sessions' prefixes once (full re-prefill) — documented, accepted.
@@ -58,44 +68,66 @@ EYG and ports documented as future alternatives behind the same seam.
 ## Phase 1 — synchronous codemode
 
 1. `gleam add glua` (pulls luerl; both from hex, offline builds stay clean).
-2. Config (`src/nexus/config.gleam`, fail-fast as always):
+2. Config (`src/nexus/config.gleam`, fail-fast as always) with validated
+   ranges (invalid values halt boot like every other config error):
    - `NEXUS_CODEMODE` — bool, default `false`.
-   - `NEXUS_CODEMODE_TIMEOUT_MS` — int, default `30000`.
-   - `NEXUS_CODEMODE_MAX_OUTPUT_CHARS` — int, default `32768`.
+   - `NEXUS_CODEMODE_TIMEOUT_MS` — int ≥ 1000, default `30000`.
+   - `NEXUS_CODEMODE_MAX_OUTPUT_CHARS` — int ≥ 0, default `32768`.
+   - Negative/zero timeout or negative cap → boot error; covered by
+     invalid-value cases in `test/config_test.gleam`.
 3. New `src/nexus/codemode.gleam`:
    - `schema() -> ChatCompletionTool`.
-   - `run(specs, cfg, arguments) -> Result(String, String)` — decode `code`,
-     build sandboxed Lua state, install host functions (each `tools.<name>`
-     closure calls `tools.execute(specs, name, json)` synchronously), run in
-     the engine child with deadline, format result.
-4. Registry wiring (`src/nexus/tools.gleam`): `default(cfg)` appends the
-   codemode spec **after** building the sibling list, capturing that list
-   (registry stays one-per-boot; KV-cache rule 4 intact).
-5. Tests (offline, `test/codemode_test.gleam` + `tools_test` additions):
+   - `run(specs, cfg, ctx, arguments) -> Result(String, String)` — decode
+     `code`, build sandboxed Lua state, install host functions (each
+     `tools.<name>` closure calls `tools.execute(specs, name, json)`
+     synchronously, counting against the call budget), spawn the engine
+     child, and run the worker select loop over
+     `{reply, ctx.cancel, deadline}`; format the result.
+4. Seam + registry wiring (`src/nexus/tools.gleam`, `src/nexus/loop.gleam`):
+   - Widen `ToolSpec.run` to take a per-turn context
+     (`fn(ctx, arguments)`, `ToolCtx(cancel: Subject(Nil))`); existing tools
+     ignore `ctx`. The loop already receives the cancel subject (the streaming
+     seam's input) — `execute_all` passes it down, which is what makes
+     mid-script `Stop` work (a `Stop` sent during tool execution lands in the
+     subject's queue and wakes the worker's select loop).
+   - `default(cfg)` appends the codemode spec **after** building the sibling
+     list, capturing that list (registry stays one-per-boot; KV-cache rule 4
+     intact).
+5. Tests (offline, `test/codemode_test.gleam` + `config_test.gleam` +
+   `tools_test` additions):
    - Lua eval + host round-trip against mock specs (no network).
    - Hostile output: `<script>` payloads pass through as inert text.
    - Infinite-loop script (`while true do end`) killed at deadline, partial
      output preserved.
+   - Cancellation: a cancel sent mid-script kills the engine and returns
+     `Script failed (cancelled)` with partial output.
+   - Tool-call budget: a script looping past the budget fails with the
+     budget error, not an unbounded loop.
+   - Config: invalid timeout/cap values rejected at load
+     (`test/config_test.gleam`).
    - Sandbox: `load`, `require`, `os.execute` all error as sandboxed.
    - Unknown tool name; `codemode` absent from its own `tools` table.
    - Output truncation; `tools.default` envelope unchanged with flag off.
-6. Acceptance: a model-authored script performs two sequential `fetch` calls,
-   digests both, returns one small result; all tests green offline; UI renders
-   script and result as ordinary (inert, truncated) tool content.
+6. Acceptance: a model-authored script performs two sequential `http_fetch`
+   calls, digests both, returns one small result; all tests green offline; UI
+   renders script and result as ordinary (inert, truncated) tool content.
 
 ## Phase 2 — parallel batch (`tools.call_all`)
 
 1. Add one host function: `tools.call_all({ {name=…, args=…}, … })` — spawns
-   one BEAM process per entry (each runs the plain `spec.run` closure), waits
-   on subjects with the remaining script deadline, returns a result list with
-   **errors as values** (`{ok=false, error=…}`) so one failure never kills the
-   batch (allSettled semantics).
+   one BEAM process per entry **linked to the engine process** (each runs the
+   plain `spec.run` closure), waits on subjects with the remaining script
+   deadline, returns a result list with **errors as values**
+   (`{ok=false, error=…}`) so one failure never kills the batch (allSettled
+   semantics). Linking means the deadline cannot strand work: engine exit —
+   normal end, timeout, cancel, or kill — reaps every in-flight call.
 2. Description gains ~3 lines documenting `call_all`.
 3. Tests: fan-out ordering; a slow mock tool proves overlap (3 parallel calls
    complete in ~1× the single-call wall time, generous margins); per-entry
-   failure isolation; deadline expiry returns partial results.
-4. Acceptance: a script fans out three fetches concurrently and folds the
-   results; wall time demonstrably sub-serial.
+   failure isolation; deadline expiry returns the partial result list and no
+   worker outlives the engine (assert via `ProcessDown`/monitor draining).
+4. Acceptance: a script fans out three `http_fetch` calls concurrently and
+   folds the results; wall time demonstrably sub-serial.
 
 ## Later / non-goals (recorded, not planned)
 
@@ -117,4 +149,8 @@ EYG and ports documented as future alternatives behind the same seam.
   stored byte-exact, no schema change.
 - Offline `gleam test` — engine is pure BEAM; tests use mock tool specs.
 - Hostile text — script source and output render as Lustre text nodes only.
+- Stop/cancel reaches tool execution, not just the streaming seam — a
+  codemode script is interruptible mid-run (verified: the current `Stop`
+  handler only signals the stream cancel subject or sets a stop-pending
+  flag, so this requires the seam change in phase 1 step 4).
 - Fail-fast config validation, exit code 2 on bad values.
