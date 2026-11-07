@@ -121,7 +121,11 @@ pub fn tool_result_roundtrip_encoding_test() {
       name: "get_time",
       arguments: "{}",
     )
-    |> transcript.append_tool_result("call_abc", "\"2026-10-12T00:00:00Z\"")
+    |> transcript.append_tool_result(
+      "call_abc",
+      "\"2026-10-12T00:00:00Z\"",
+      ok: True,
+    )
     |> transcript.request_body(stream_opts())
   // Assistant tool-call turn shape (glopenai: type before id before function).
   should.be_true(string.contains(

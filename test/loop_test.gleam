@@ -280,7 +280,11 @@ pub fn tool_round_extends_request_byte_identically_test() {
       ],
       reasoning: None,
     )
-    |> transcript.append_tool_result(tool_call_id: "c1", content: "echo:{}")
+    |> transcript.append_tool_result(
+      tool_call_id: "c1",
+      content: "echo:{}",
+      ok: True,
+    )
   let tr3 = tr2 |> transcript.append_assistant("based on the tool: yes")
 
   let opts = transcript.default_options()

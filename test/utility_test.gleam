@@ -133,7 +133,7 @@ fn apply_iteration(
     [FxToolResult(tool_call_id, content), ..next] -> {
       let tr = flush_assistant(tr, text, calls)
       apply_iteration(
-        transcript.append_tool_result(tr, tool_call_id, content),
+        transcript.append_tool_result(tr, tool_call_id, content, ok: True),
         next,
         "",
         [],
