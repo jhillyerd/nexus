@@ -6,12 +6,15 @@
 import gleam/erlang/process
 import gleam/json
 import gleam/list
-import gleam/option.{Some}
+import gleam/option.{None, Some}
 import gleam/string
 import gleeunit/should
 import nexus/codemode
 import nexus/config
+import nexus/loop
+import nexus/openai
 import nexus/tools
+import nexus/transcript
 
 const default_timeout_ms = 5000
 
@@ -365,4 +368,146 @@ fn run_registered(
 /// membership are still asserted exactly.
 fn spec_names(specs: List(tools.ToolSpec)) -> List(String) {
   list.map(specs, tools.tool_name)
+}
+// ---------------------------------------------------------------------------
+// Review fixes (cubic findings on PR #50)
+// ---------------------------------------------------------------------------
+
+/// The cancel subject is one-shot: a Stop that lands mid-script is
+/// consumed by codemode's select loop, so codemode must re-signal it —
+/// otherwise the agent loop issues the next model request on an empty
+/// subject and the turn keeps running after the user pressed Stop.
+pub fn stop_during_script_stops_the_turn_test() {
+  let cancel = process.new_subject()
+  let hosts = [
+    codemode.HostTool(name: "cancel_now", call: fn(_) {
+      process.send(cancel, Nil)
+      Ok("ok")
+    }),
+  ]
+  let spec =
+    tools.ToolSpec(
+      tool: codemode.schema(),
+      run: fn(ctx, arguments) {
+        codemode.run(hosts, 5000, 32_768, ctx.cancel, arguments)
+      },
+    )
+  let tr =
+    transcript.new("m", "s")
+    |> transcript.append_user("run a script")
+  let stats =
+    openai.StreamStats(
+      ttft_ms: Some(10),
+      duration_ms: 100,
+      token_deltas: 1,
+      reasoning_deltas: 0,
+      tool_call_deltas: 1,
+      events_parsed: 3,
+      decode_errors: 0,
+      saw_done: True,
+      usage: None,
+    )
+  let stream = fn(_tr, _opts, on_event, stream_cancel) {
+    case take_index() {
+      0 -> {
+        // Round 1: the model calls codemode; the script cancels the turn
+        // from inside a host call.
+        on_event(openai.TokenDelta("running script"))
+        on_event(openai.ToolCallDelta(
+          0,
+          Some("c1"),
+          Some("codemode"),
+          code_argument("tools.cancel_now({})"),
+        ))
+        openai.Completed(stats)
+      }
+      _ ->
+        // Round 2: the turn's cancel subject must still carry the Stop —
+        // codemode consumed it to kill the script, so it re-signals.
+        case process.receive(stream_cancel, 500) {
+          Ok(Nil) -> openai.Cancelled
+          Error(Nil) ->
+            openai.Failed(openai.Transport("cancel was not re-signalled"))
+        }
+    }
+  }
+  let _ = reset_index()
+  let outcome = loop.run([spec], 8, stream, tr, cancel, fn(_) { Nil })
+  case outcome {
+    loop.LoopStopped(_) -> Nil
+    loop.LoopFailed(reason) ->
+      panic as { "expected LoopStopped, got LoopFailed: " <> reason }
+    _ -> panic as "expected LoopStopped"
+  }
+}
+
+@external(erlang, "nexus_loop_test_ffi", "next_index")
+fn take_index() -> Int
+
+@external(erlang, "nexus_loop_test_ffi", "reset_index")
+fn reset_index() -> Nil
+
+/// The output cap counts CHARACTERS (codepoints), not UTF-8 bytes: 10
+/// CJK codepoints are 30 bytes and would be truncated under a byte
+/// budget.
+pub fn output_cap_counts_characters_not_bytes_test() {
+  // 10 hiragana codepoints = 30 UTF-8 bytes, assembled with string.char
+  // because Luerl's tokenizer rejects non-ASCII literals in source (host
+  // -returned unicode is unaffected: it is never tokenized).
+  let assert Ok(result) =
+    codemode.run(
+      hosts: mock_hosts(),
+      timeout_ms: default_timeout_ms,
+      max_output_chars: 20,
+      cancel: process.new_subject(),
+      arguments: code_argument(
+        "text(string.char(227, 129, 130, 227, 129, 132, 227, 129, 134, "
+        <> "227, 129, 136, 227, 129, 138, 227, 129, 139, 227, 129, 141, "
+        <> "227, 129, 143, 227, 129, 145, 227, 129, 147))",
+      ),
+    )
+  // A byte budget (20) would truncate these 30 bytes; a character budget
+  // keeps all 10 codepoints.
+  should.be_true(string.contains(result, "あいうえおかきくけこ"))
+  should.be_false(string.contains(result, "omitted"))
+}
+
+/// Empty text()/print() events carry nothing and must not be retained:
+/// at size zero they would always fit the head and grow it unboundedly
+/// under the cap.
+pub fn empty_segments_are_not_retained_test() {
+  let assert Ok(result) =
+    codemode.run(
+      hosts: mock_hosts(),
+      timeout_ms: default_timeout_ms,
+      max_output_chars: 100,
+      cancel: process.new_subject(),
+      arguments: code_argument(
+        "for i = 1, 10000 do text('') print('') end\nreturn 'ok'",
+      ),
+    )
+  let parts = string.split(result, "\n\n")
+  // Only the return item survives; ten thousand empty segments left no
+  // trace (pre-fix this rendered 10000 empty items).
+  should.equal(list.drop(parts, 1), ["ok"])
+}
+
+/// A sibling host that CRASHES (rather than returning an error) takes
+/// the engine process down with it; the worker survives and reports a
+/// crash — not out of memory.
+pub fn engine_crash_reported_as_crash_test() {
+  let hosts = [
+    codemode.HostTool(name: "explode", call: fn(_) { panic as "host crash" }),
+  ]
+  let assert Ok(result) =
+    codemode.run(
+      hosts: hosts,
+      timeout_ms: default_timeout_ms,
+      max_output_chars: default_cap,
+      cancel: process.new_subject(),
+      arguments: code_argument("tools.explode({})"),
+    )
+  should.be_true(string.contains(result, "Script failed ("))
+  should.be_true(string.contains(result, "engine crashed"))
+  should.be_false(string.contains(result, "out of memory"))
 }

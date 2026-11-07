@@ -9,8 +9,15 @@
 %% that outgrows it is killed with reason `killed`, which the worker
 %% reports as `Script error: out of memory`. The call budget bounds
 %% retained host results, not pure-Lua allocation — this bounds that.
+%% The map form counts OFF-HEAP data too (refc binaries — which is how
+%% Luerl stores every Lua string larger than a heap binary): the plain
+%% integer form would let large-string scripts exhaust node memory
+%% without ever tripping the heap-only limit (review finding).
 set_max_heap_size_words(Words) ->
-    erlang:process_flag(max_heap_size, Words).
+    erlang:process_flag(
+      max_heap_size,
+      #{size => Words, kill => true, include_offheap => true}
+     ).
 
 %% Trap-exit switch returning the previous value so the worker can restore
 %% it after the run; while trapping, the engine child's exit arrives as a

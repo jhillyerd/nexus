@@ -6,9 +6,9 @@
 //// Process model: `run` executes in the per-turn worker. It spawns a
 //// dedicated engine child (linked, so turn teardown and worker death reap
 //// it) that builds a sandboxed glua/Luerl VM and evaluates the script.
-//// `text()`/`print()` events stream to the worker as they happen, so
-//// partial output survives every failure mode. The worker blocks in a
-//// select over `{engine reply, turn cancel subject, wall-clock deadline,
+//// `text()`/`print()` events stream to the worker as they happen — each
+//// individually acknowledged, so delivery is bounded and partial output
+//// survives every failure mode — and the worker blocks in a select over `{engine reply, turn cancel subject, wall-clock deadline,
 //// engine exit}` — cancel, timeout, and engine death (out of memory,
 //// crash) all end the run and keep the partial output. The worker traps
 //// exits for the duration (the engine is its only link) and consumes the
@@ -135,12 +135,15 @@ fn decode_code(arguments: String) -> Result(String, String) {
 // Worker side: spawn, select, kill, render
 // ---------------------------------------------------------------------------
 
-/// Events streamed by the engine child as they happen. `EngineDone` is
-/// always the engine's last send, so anything queued before it (partial
-/// output) is consumed first.
+/// Events streamed by the engine child as they happen — each carried
+/// event blocks the engine until the worker acknowledges it, so delivery
+/// is bounded (the engine can never run more than one event ahead of the
+/// worker; a spamming script cannot outpace `out_add` and grow the
+/// worker's mailbox). `EngineDone` is always the engine's last send, so
+/// anything queued before it (partial output) is consumed first.
 type EngineEvent {
-  TextOut(String)
-  ConsoleLine(String)
+  TextOut(ack: Subject(Nil), text: String)
+  ConsoleLine(ack: Subject(Nil), text: String)
   EngineDone(Result(Nil, String))
 }
 
@@ -155,8 +158,9 @@ type Ended {
   /// The engine reported a finished script (Ok) or a script failure with
   /// a formatted reason.
   EngineReported(Result(Nil, String))
-  /// The engine died without reporting (out of memory, crash).
-  EngineDied
+  /// The engine died without reporting (out of memory, crash) — the
+  /// exit reason distinguishes them.
+  EngineDied(reason: process.ExitReason)
   Cancelled
   Deadline
 }
@@ -184,11 +188,21 @@ fn run_script(
   // still-in-flight `killed` exit signal destroy this worker.
   process.kill(engine)
   let already_seen = case ended {
-    EngineDied -> True
+    EngineDied(_) -> True
     _ -> False
   }
   let _ = drain_exit(engine, already_seen)
   let _ = set_trap_exit(was_trapping)
+  // The cancel subject is one-shot: every other path leaves a queued Nil
+  // in place for the next select (a Stop during tool execution is
+  // normally observed by the NEXT stream call). codemode consumed this
+  // turn's Nil to end the run, so re-signal it — otherwise a Stop that
+  // landed mid-script would vanish and the agent loop would issue
+  // another model request on a now-empty subject (review finding).
+  case ended {
+    Cancelled -> process.send(cancel, Nil)
+    _ -> Nil
+  }
   render(ended, elapsed_ms(started_us), out)
 }
 
@@ -210,12 +224,19 @@ fn await(
   {
     Error(Nil) -> #(Deadline, out)
     Ok(FromEngine(EngineDone(report))) -> #(EngineReported(report), out)
-    Ok(FromEngine(TextOut(text))) ->
+    Ok(FromEngine(TextOut(ack, text))) -> {
+      // Acknowledge before accumulating: the reply is O(1) and keeps the
+      // engine's next event from queuing behind this one.
+      process.send(ack, Nil)
       await(engine, events, cancel, deadline_us, out_add(out, Item(text)))
-    Ok(FromEngine(ConsoleLine(text))) ->
+    }
+    Ok(FromEngine(ConsoleLine(ack, text))) -> {
+      process.send(ack, Nil)
       await(engine, events, cancel, deadline_us, out_add(out, Console(text)))
+    }
     Ok(TurnCancelled) -> #(Cancelled, out)
-    Ok(EngineExit(ExitMessage(pid, _))) if pid == engine -> #(EngineDied, out)
+    Ok(EngineExit(ExitMessage(pid, reason))) if pid == engine ->
+      #(EngineDied(reason), out)
     Ok(EngineExit(_)) -> await(engine, events, cancel, deadline_us, out)
   }
 }
@@ -290,15 +311,20 @@ fn failure_reason(ended: Ended) -> String {
   let reason = case ended {
     EngineReported(Error(reason)) -> reason
     EngineReported(Ok(_)) -> "script completed"
-    EngineDied ->
-      // Killed is the max_heap_size reaper (or our own kill, never seen
-      // here — that path ends as Deadline/Cancelled); anything else is an
-      // engine crash.
-      "engine died (out of memory)"
+    EngineDied(reason) ->
+      // `Killed` here is the max_heap_size reaper (our own kill never
+      // reaches this arm — those paths end as Deadline/Cancelled);
+      // anything else is a genuine engine crash and must not be
+      // misdiagnosed as out of memory (review finding).
+      case reason {
+        process.Killed -> "engine died (out of memory)"
+        process.Normal -> "engine exited unexpectedly"
+        process.Abnormal(_) -> "engine crashed"
+      }
     Cancelled -> "cancelled"
     Deadline -> "timeout"
   }
-  case string.byte_size(reason) > max_reason_chars {
+  case string.length(reason) > max_reason_chars {
     True -> string.slice(reason, 0, max_reason_chars) <> "…"
     False -> reason
   }
@@ -351,11 +377,22 @@ fn new_output(cap: Int) -> Output {
 }
 
 fn out_add(out: Output, seg: Segment) -> Output {
-  let size = seg_size(seg)
-  case out.head_chars + size <= out.half_cap {
-    True ->
-      Output(..out, head: [seg, ..out.head], head_chars: out.head_chars + size)
-    False -> push_tail(out, seg, size)
+  case seg_size(seg) {
+    // Empty segments carry nothing renderable and, at size zero, would
+    // ALWAYS satisfy the head test below — retaining an unbounded list
+    // under the cap (review finding). Drop them: text("") adds no item
+    // and print("") no console line.
+    0 -> out
+    size ->
+      case out.head_chars + size <= out.half_cap {
+        True ->
+          Output(
+            ..out,
+            head: [seg, ..out.head],
+            head_chars: out.head_chars + size,
+          )
+        False -> push_tail(out, seg, size)
+      }
   }
 }
 
@@ -409,8 +446,8 @@ fn evict_loop(
 
 fn seg_size(seg: Segment) -> Int {
   case seg {
-    Item(text) -> string.byte_size(text)
-    Console(text) -> string.byte_size(text)
+    Item(text) -> string.length(text)
+    Console(text) -> string.length(text)
   }
 }
 
@@ -514,12 +551,31 @@ fn emit_return_values(
     [first, ..rest] -> {
       use text <- glua.then(render_value(first))
       case text {
-        Some(text) -> process.send(events, TextOut(text))
+        Some(text) -> emit_event(events, TextOut(_, text))
         None -> Nil
       }
       emit_return_values(events, rest)
     }
   }
+}
+
+/// Send one event and block until the worker acknowledges it: bounded
+/// delivery (review finding — no backpressure). The engine can never run
+/// more than one event ahead of the worker, so a spamming script cannot
+/// fill the worker's mailbox. Runs in the engine process, so the ack
+/// subject is engine-owned and `receive` is local. The timeout is a
+/// safety valve only: the worker replies from its select loop (O(1)
+/// accumulation) and cannot block on the engine, so the reply always
+/// comes while both processes live (and if the worker died, the link
+/// killed this engine first).
+fn emit_event(
+  events: Subject(EngineEvent),
+  make: fn(Subject(Nil)) -> EngineEvent,
+) -> Nil {
+  let ack = process.new_subject()
+  process.send(events, make(ack))
+  let _ = process.receive(ack, within: 5000)
+  Nil
 }
 
 fn install_hosts(
@@ -640,7 +696,7 @@ fn text_fn(
         render_value(value)
         |> glua.then(fn(text) {
           case text {
-            Some(text) -> process.send(events, TextOut(text))
+            Some(text) -> emit_event(events, TextOut(_, text))
             None -> Nil
           }
           glua.success([glua.nil()])
@@ -658,7 +714,7 @@ fn print_fn(
   fn(args) {
     render_values(args)
     |> glua.then(fn(parts) {
-      process.send(events, ConsoleLine(string.join(parts, "\t")))
+      emit_event(events, ConsoleLine(_, string.join(parts, "\t")))
       glua.success([])
     })
   }
