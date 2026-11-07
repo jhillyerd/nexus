@@ -368,6 +368,36 @@ type TurnState {
   )
 }
 
+/// Display-only mirror of the turn in flight: the transcript as of `Send`
+/// (committed prefix + the user message) plus every round the worker has
+/// appended so far, rebuilt from the same loop events that are broadcast
+/// to subscribers. The worker owns the real extended transcript and only
+/// hands it over at `WorkerDone`, so without this mirror a client that
+/// joins mid-turn — a page reload or a session switch — replays nothing
+/// of the running turn: its already-executed tool rounds and reasoning
+/// would never render (regression: chips vanished on refresh mid-turn).
+///
+/// It never touches request encoding: `to_request` reads only the
+/// committed `transcript`, and the mirror is dropped at `WorkerDone`
+/// (committed or failed alike), so the KV-cache byte contract is
+/// structurally unaffected. Fidelity note: an iteration's text flushes at
+/// the loop's own phase boundaries ("tools" / first assembled call), so
+/// the FINAL iteration's still-streaming text is not mirrored — no event
+/// fires between stream close and the terminal broadcast. Chips and
+/// reasoning — the parts that made refreshes lose history — are.
+type LiveTurn {
+  LiveTurn(
+    view: Transcript,
+    /// Content tokens accumulated since the iteration began (reset at the
+    /// loop's "request" phase, flushed into `view` at "tools").
+    text: String,
+    /// Reasoning accumulated since the iteration began. Consumed by the
+    /// text flush when text exists, else attached to the first assembled
+    /// call — mirroring `append_calls`' one-message-with-reasoning shape.
+    reasoning: String,
+  )
+}
+
 /// Utility side-call lifecycle (utility-titles plan §4.2). Mirrors the
 /// turn lifecycle but is invisible to callers: the session never reports
 /// `Busy` because of a side call. `cancelled` is set when a `Send` raced
@@ -402,6 +432,10 @@ type State {
     transcript: Transcript,
     subs: List(Subject(SessionEvent)),
     turn: TurnState,
+    /// The in-flight turn's display mirror (see `LiveTurn`). `Some` from
+    /// `Send` until `WorkerDone`/`WorkerDown` — committed or failed alike.
+    /// Read by `Join` replay only.
+    turn_view: Option(LiveTurn),
     self: Subject(Msg),
     metrics: List(MetricSample),
     /// Wall-clock epoch seconds of the newest committed message (0 until
@@ -510,6 +544,7 @@ fn start_builder(spec: SessionSpec) {
       },
       subs: [],
       turn: Idle,
+      turn_view: None,
       utility: UtilityIdle,
       utility_pending: False,
       // A hydrated (restored) session's first exchange predates this actor:
@@ -565,8 +600,18 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       // `ToolCallAssembled`, tool results as `ToolResult` — so a reconnect
       // can rebuild the full tool state (names resolved from earlier
       // assistant messages, since tool messages only carry ids).
+      //
+      // While a turn is in flight the worker holds the extended
+      // transcript, so the committed one would replay nothing of the
+      // running turn. Replay the display mirror instead: the rounds the
+      // worker already finished (chips + reasoning) render as history,
+      // and the client then joins the live stream from the current point.
+      let replay = case state.turn_view {
+        Some(live) -> live.view
+        None -> state.transcript
+      }
       let names =
-        state.transcript
+        replay
         |> transcript.messages
         |> list.fold(dict.new(), fn(names, message) {
           case message {
@@ -578,7 +623,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
             _ -> names
           }
         })
-      state.transcript
+      replay
       |> transcript.messages
       |> list.index_fold(Nil, fn(_, message, index) {
         case message {
@@ -587,7 +632,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           chat.AssistantMessage(content: text, tool_calls: calls, ..) -> {
             // Reasoning replay first: it was streamed before the message's
             // own output, so it replays before it too.
-            case transcript.reasoning_at(state.transcript, index) {
+            case transcript.reasoning_at(replay, index) {
               Some(reasoning) -> process.send(sub, ReasoningFull(reasoning))
               None -> Nil
             }
@@ -617,7 +662,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
                 // The outcome rides the display-only sidecar — failed
                 // calls stay failed across a reload (True when unknown,
                 // e.g. rows persisted before the sidecar existed).
-                transcript.tool_result_at(state.transcript, index)
+                transcript.tool_result_at(replay, index)
                   |> option.unwrap(True),
                 content,
               ),
@@ -681,6 +726,10 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
               ..state,
               transcript: tr,
               turn: Starting(worker, monitor, False, timing.now_us()),
+              // The mirror starts from the send-time transcript (user
+              // message included): a mid-turn join replays it while the
+              // worker streams the reply.
+              turn_view: Some(LiveTurn(tr, "", "")),
               // The user message is committed the moment it is appended
               // (even a failed turn keeps it), so activity starts here.
               last_commit_s: timing.wall_now_s(),
@@ -771,6 +820,9 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
                   None -> Some(timing.now_us())
                 },
               ),
+              turn_view: option.map(state.turn_view, fn(live) {
+                LiveTurn(..live, text: live.text <> text)
+              }),
             ),
           )
         }
@@ -803,6 +855,9 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
                   None -> Some(timing.now_us())
                 },
               ),
+              turn_view: option.map(state.turn_view, fn(live) {
+                LiveTurn(..live, reasoning: live.reasoning <> text)
+              }),
             ),
           )
         }
@@ -819,7 +874,38 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           if candidate == worker
         -> {
           broadcast(state.subs, ToolCallAssembled(id, name, arguments))
-          actor.continue(state)
+          actor.continue(
+            State(
+              ..state,
+              turn_view: option.map(state.turn_view, fn(live) {
+                // Reasoning still unattached this iteration (no text was
+                // flushed at the "tools" boundary) rides the first call's
+                // message — the mirror's twin of `append_calls` attaching
+                // reasoning to the calls message.
+                let #(view, reasoning) = case live.reasoning {
+                  "" -> #(
+                    transcript.append_assistant_tool_call(
+                      live.view,
+                      id: id,
+                      name: name,
+                      arguments: arguments,
+                    ),
+                    "",
+                  )
+                  r -> #(
+                    transcript.append_assistant_tool_calls(
+                      live.view,
+                      text: None,
+                      calls: [#(id, name, arguments)],
+                      reasoning: Some(r),
+                    ),
+                    "",
+                  )
+                }
+                LiveTurn(..live, view: view, reasoning: reasoning)
+              }),
+            ),
+          )
         }
 
         Streaming(candidate, ..),
@@ -827,14 +913,44 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           if candidate == worker
         -> {
           broadcast(state.subs, ToolResult(call_id, name, ok, content))
-          actor.continue(state)
+          actor.continue(
+            State(
+              ..state,
+              turn_view: option.map(state.turn_view, fn(live) {
+                LiveTurn(
+                  ..live,
+                  view: transcript.append_tool_result(
+                    live.view,
+                    tool_call_id: call_id,
+                    content: content,
+                    ok: ok,
+                  ),
+                )
+              }),
+            ),
+          )
         }
 
         Streaming(candidate, ..), loop.LoopStatus(iteration, max, phase)
           if candidate == worker
         -> {
           broadcast(state.subs, LoopStatus(iteration, max, phase))
-          actor.continue(state)
+          let turn_view = case phase {
+            // New iteration: the loop reset its accumulator cells, so the
+            // mirror's per-iteration text/reasoning restart too.
+            "request" ->
+              option.map(state.turn_view, fn(live) {
+                LiveTurn(..live, text: "", reasoning: "")
+              })
+            // Tool phase: the loop appended the iteration's assistant
+            // message (text + calls + reasoning) before executing. Flush
+            // the text half here; the calls ride the per-call assembled
+            // events that follow.
+            "tools" ->
+              option.map(state.turn_view, fn(live) { flush_live_text(live) })
+            _ -> state.turn_view
+          }
+          actor.continue(State(..state, turn_view: turn_view))
         }
 
         // Usage rides on the outcome's stats; raw usage events need no
@@ -879,6 +995,10 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
               ..state,
               transcript: tr,
               turn: Idle,
+              // The turn is over — committed (the real transcript now
+              // carries everything) or failed (nothing committed, so the
+              // mirror must not leak into the next turn's replay).
+              turn_view: None,
               metrics: push_metric(state.metrics, sample),
               last_commit_s: case committed {
                 True -> timing.wall_now_s()
@@ -1049,6 +1169,10 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
                 State(
                   ..state,
                   turn: Idle,
+                  // The worker died mid-turn: nothing further will be
+                  // mirrored, and the turn committed nothing — drop the
+                  // mirror so the next turn's replay starts clean.
+                  turn_view: None,
                   metrics: push_metric(
                     state.metrics,
                     MetricSample(
@@ -1075,6 +1199,29 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
 
 fn broadcast(subs: List(Subject(SessionEvent)), event: SessionEvent) -> Nil {
   list.each(subs, fn(sub) { process.send(sub, event) })
+}
+
+/// Flush the mirror iteration's accumulated text (with its reasoning, if
+/// the text exists) into the view — the mirror twin of the loop's
+/// `append_calls` text handling. Empty text consumes nothing: reasoning
+/// stays pending for the first assembled call, exactly like the loop's
+/// reasoning-only-iteration shape.
+fn flush_live_text(live: LiveTurn) -> LiveTurn {
+  case live.text {
+    "" -> live
+    text -> {
+      let view =
+        transcript.append_assistant_with_reasoning(
+          live.view,
+          text,
+          reasoning: case live.reasoning {
+            "" -> None
+            reasoning -> Some(reasoning)
+          },
+        )
+      LiveTurn(view: view, text: "", reasoning: "")
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
