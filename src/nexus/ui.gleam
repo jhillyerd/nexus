@@ -206,6 +206,15 @@ pub type Model {
     create_open: Bool,
     log: List(Line),
     bubble: Option(String),
+    /// Whether the live bubble must not render: either there is no bubble
+    /// or its text renders to nothing under markdown (whitespace-only, or
+    /// e.g. a lone footnote definition) — the SAME rule the commit and
+    /// replay paths apply to `AssistantLine`s, so the bubble can never
+    /// show text that then vanishes at commit. True whenever the bubble
+    /// resets; the `Token` arm flips it to False the first time the
+    /// accumulated text renders non-empty and never flips back (the
+    /// bubble only grows), so the parse never re-runs per streamed token.
+    bubble_hidden: Bool,
     // The reasoning (chain of thought) streaming in ahead of the bubble —
     // the display-side twin of the server's reasoning-only-commit rule:
     // it is committed to the log only when the turn's assistant output
@@ -402,6 +411,7 @@ pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
       create_open: False,
       log: [],
       bubble: None,
+      bubble_hidden: True,
       thinking: None,
       streaming: False,
       pending: [],
@@ -692,6 +702,7 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             selected: Some(id),
             log: [],
             bubble: None,
+            bubble_hidden: True,
             thinking: None,
             streaming: False,
             pending: [],
@@ -831,7 +842,26 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         Some(acc) -> Some(acc <> text)
         None -> Some(text)
       }
-      #(Model(..model, bubble: bubble, streaming: True), effect.none())
+      // The live bubble's visibility uses the SAME render-empty decision
+      // the commit and replay paths apply — a cheaper whitespace check
+      // would show trim-nonempty text (a lone footnote definition, say)
+      // that vanishes at commit. Decided here, when the bubble changes,
+      // so the per-token view render never reparses the accumulated
+      // text; once visible it stays visible, so the parse only runs
+      // while the bubble is still render-empty.
+      let bubble_hidden = case model.bubble_hidden {
+        False -> False
+        True -> markdown.render(option.unwrap(bubble, "")) == []
+      }
+      #(
+        Model(
+          ..model,
+          bubble: bubble,
+          bubble_hidden: bubble_hidden,
+          streaming: True,
+        ),
+        effect.none(),
+      )
     }
 
     TurnDone -> #(finish_turn(model, CommitBubble), sessions_effect(model))
@@ -922,6 +952,7 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             ..model,
             log: rollback_log(model.log, model.turn_base),
             bubble: None,
+            bubble_hidden: True,
             thinking: None,
           )
       }
@@ -1086,7 +1117,8 @@ type BubblePolicy {
 fn finish_turn(model: Model, policy: BubblePolicy) -> Model {
   let model = case policy {
     CommitBubble -> commit_turn_output(model)
-    DropBubble -> Model(..model, bubble: None, thinking: None)
+    DropBubble ->
+      Model(..model, bubble: None, bubble_hidden: True, thinking: None)
   }
   Model(..model, pending: [], loop: None, guard: False, streaming: False)
 }
@@ -1114,11 +1146,12 @@ fn commit_bubble(model: Model) -> Model {
     Some(text) -> {
       let elements = markdown.render(text)
       case elements {
-        [] -> Model(..model, bubble: None)
+        [] -> Model(..model, bubble: None, bubble_hidden: True)
         _ ->
           Model(
             ..model,
             bubble: None,
+            bubble_hidden: True,
             log: [AssistantLine(text), ..model.log],
             md_cache: dict.insert(model.md_cache, text, elements),
           )
@@ -2188,17 +2221,15 @@ fn log_lines(model: Model) -> List(Element(Msg)) {
     Some(text) -> list.append(committed, [reasoning_block(text, True)])
     None -> committed
   }
-  // The live bubble stays plain pre-wrap text until the turn commits —
-  // but whitespace-only content (the fragments this model streams before
-  // tool calls) renders as an invisible-then-empty tinted pill, so the
-  // bubble waits for its first visible character. The commit path drops
-  // such text wholesale; this keeps the streaming view consistent with
-  // what committing it would produce.
+  // The live bubble stays plain pre-wrap text until the turn commits,
+  // hidden while its text would render to nothing — the same rule the
+  // commit path applies (see the `Token` arm, which computes
+  // `bubble_hidden`), so nothing appears live that a commit would drop.
   let with_bubble = case model.bubble {
     Some(text) ->
-      case string.trim(text) {
-        "" -> with_thinking
-        _ -> list.append(with_thinking, [turn("assistant", text)])
+      case model.bubble_hidden {
+        True -> with_thinking
+        False -> list.append(with_thinking, [turn("assistant", text)])
       }
     None -> with_thinking
   }

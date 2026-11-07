@@ -1915,18 +1915,50 @@ pub fn whitespace_assistant_replay_renders_no_pill_test() {
 }
 
 pub fn live_bubble_waits_for_visible_text_test() {
-  // The streaming bubble stays hidden until its first visible character:
-  // whitespace tokens render as an invisible-to-empty pill otherwise.
+  // The streaming bubble stays hidden while its text renders to nothing,
+  // decided by the SAME rule the commit path applies (see
+  // live_bubble_follows_the_commit_render_rule_test for the
+  // whitespace-vs-render distinction).
   let model =
     new_model()
     |> step(ui.UserEcho("hi"))
     |> step(ui.Token("  \n"))
+  model.bubble_hidden |> should.equal(True)
   let html = model |> view_string
   should_not_contain(html, "turn assistant")
   let model = step(model, ui.Token("Hello"))
+  model.bubble_hidden |> should.equal(False)
   let html = model |> view_string
   should_contain(html, "turn assistant")
   should_contain(html, "Hello")
+}
+
+pub fn live_bubble_follows_the_commit_render_rule_test() {
+  // The live bubble's visibility uses the SAME render-empty decision as
+  // the commit and replay paths — not a whitespace approximation. A lone
+  // footnote definition is trim-NONEMPTY but renders to nothing, so it
+  // must stay hidden live (a whitespace check would show it, then the
+  // commit would drop it — the exact live/replay divergence this fix
+  // closes). Once visible, the decision never flips back: the bubble
+  // only grows, and a text that already renders blocks keeps them.
+  let model =
+    new_model()
+    |> step(ui.UserEcho("hi"))
+    |> step(ui.Token("[^1]: note"))
+  model.bubble_hidden |> should.equal(True)
+  let html = model |> view_string
+  should_not_contain(html, "turn assistant")
+  let model = step(model, ui.Token("\n\nanswer body"))
+  model.bubble_hidden |> should.equal(False)
+  let html = model |> view_string
+  should_contain(html, "turn assistant")
+  // And the commit path drops the same shapes on the replay side.
+  let model = step(model, ui.TurnDone)
+  model.log
+  |> should.equal([
+    ui.AssistantLine("[^1]: note\n\nanswer body"),
+    ui.UserLine("hi"),
+  ])
 }
 
 pub fn failed_turn_rolls_back_reasoning_test() {
