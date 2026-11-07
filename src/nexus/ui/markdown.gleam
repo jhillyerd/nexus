@@ -185,7 +185,10 @@ fn render_inline(
       case dict.get(doc.links, label) {
         Ok(data) ->
           safe_link_children(data.dest, render_inlines(doc, inner), data.title)
-        // Unresolved reference: the bracketed text renders literally.
+        // Unresolved reference. Probed: mork 1.12.3 never emits RefLink
+        // for an undefined label — `[docs][missing]` stays literal Text
+        // nodes — so this branch is defensive; the link text still
+        // renders, as plain inline content.
         Error(_) -> fragment(render_inlines(doc, inner))
       }
     // Images render as links to their source (see module doc): the alt
@@ -197,12 +200,21 @@ fn render_inline(
         Error(_) -> fragment(render_inlines(doc, inner))
       }
     // Hostile inline HTML: same rule as HtmlBlock — the tag and its
-    // attributes appear as text, its children render as markdown.
-    document.InlineHtml(tag, attrs, children) ->
+    // attributes appear as text, its children render as markdown. Paired
+    // tags keep their closing tag so the inert preview shows the complete
+    // source; childless tags (void elements) get none. Probed: mork 1.12.3
+    // mostly emits paired tags as separate RawHtml nodes anyway, so this
+    // branch is defensive — but it must stay complete if it ever runs.
+    document.InlineHtml(tag, attrs, children) -> {
+      let closing = case children {
+        [] -> []
+        _ -> [text("</" <> tag <> ">")]
+      }
       html.span([], [
         text(tag <> string.concat(dict.to_list(attrs) |> list.map(inline_attr))),
-        ..render_inlines(doc, children)
+        ..list.append(render_inlines(doc, children), closing)
       ])
+    }
     document.RawHtml(raw) -> text(raw)
     // Footnote definitions are dropped entirely; a reference keeps its
     // marker so the numbering the model emitted stays visible.
@@ -301,11 +313,34 @@ fn destination_string(dest: document.Destination) -> String {
 /// allowlist — not a blocklist — is what keeps `javascript:`, `data:`,
 /// and future exotic schemes out.
 fn safe_href(dest: document.Destination) -> Option(String) {
-  case dest {
-    document.Anchor(anchor) -> Some("#" <> anchor)
-    document.Relative(uri) -> Some(uri)
-    document.Absolute(uri) -> scheme_href(uri)
+  case contains_control_char(destination_string(dest)) {
+    True -> None
+    False ->
+      case dest {
+        document.Anchor(anchor) -> Some("#" <> anchor)
+        document.Relative(uri) -> Some(uri)
+        document.Absolute(uri) -> scheme_href(uri)
+      }
   }
+}
+
+/// Refuse any destination carrying an ASCII control character (C0 or
+/// DEL). URL parsers strip tab/LF/CR before scheme detection, so a
+/// control-character-obfuscated scheme could otherwise smuggle past the
+/// prefix check — and mork hands such strings through verbatim (probed:
+/// `[x](<jav\tascript:alert(1)>)` parses to
+/// `Absolute("jav\tascript:alert(1)")`). The prefix allowlist already
+/// refuses every such obfuscation today — an obfuscated scheme cannot
+/// also match `http:` — but that refusal is forensic, not structural;
+/// dropping the whole class keeps it structural. Legit links never
+/// contain control characters.
+fn contains_control_char(s: String) -> Bool {
+  s
+  |> string.to_utf_codepoints
+  |> list.any(fn(cp) {
+    let code = string.utf_codepoint_to_int(cp)
+    code < 0x20 || code == 0x7f
+  })
 }
 
 /// The allowlist for string URIs (autolinks): lowercase-match the scheme

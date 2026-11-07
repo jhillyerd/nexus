@@ -26,6 +26,7 @@
 //// `ui.Settings(msg)` delegates to `ui_settings.update` and folds its
 //// signals back into this model.
 
+import gleam/dict
 import gleam/dynamic/decode
 import gleam/erlang/process.{type Subject}
 import gleam/int
@@ -250,6 +251,14 @@ pub type Model {
     tags_open: Option(String),
     /// The row whose two-step delete confirmation is armed.
     confirm_delete: Option(String),
+    /// Rendered markdown element trees for committed assistant lines,
+    /// keyed by exact message text. Populated when a turn commits, never
+    /// in the view: the log re-renders on every streamed token, and
+    /// reparsing every committed message each time would make long
+    /// transcripts quadratic. assistant_turn reads it, falling back to a
+    /// direct parse on a miss (render is pure, so a stale hit is
+    /// impossible — equal text means equal tree).
+    md_cache: dict.Dict(String, List(Element(Msg))),
   )
 }
 
@@ -408,6 +417,7 @@ pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
       rename_open: None,
       tags_open: None,
       confirm_delete: None,
+      md_cache: dict.new(),
     )
   #(model, events_effect())
 }
@@ -777,7 +787,11 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     )
 
     AssistantFull(text) -> #(
-      Model(..model, log: [AssistantLine(text), ..model.log]),
+      Model(
+        ..model,
+        log: [AssistantLine(text), ..model.log],
+        md_cache: dict.insert(model.md_cache, text, markdown.render(text)),
+      ),
       effect.none(),
     )
 
@@ -1082,7 +1096,12 @@ fn commit_turn_output(model: Model) -> Model {
 fn commit_bubble(model: Model) -> Model {
   case model.bubble {
     Some(text) ->
-      Model(..model, bubble: None, log: [AssistantLine(text), ..model.log])
+      Model(
+        ..model,
+        bubble: None,
+        log: [AssistantLine(text), ..model.log],
+        md_cache: dict.insert(model.md_cache, text, markdown.render(text)),
+      )
     None -> model
   }
 }
@@ -2142,7 +2161,7 @@ fn log_lines(model: Model) -> List(Element(Msg)) {
   // assembling their arguments — reasoning precedes content, live and
   // committed alike. The live overlays render open (full-width blocks),
   // so only committed lines go through the chip-row grouping.
-  let committed = group_chips(list.reverse(model.log))
+  let committed = group_chips(model.md_cache, list.reverse(model.log))
   let with_thinking = case model.thinking {
     Some(text) -> list.append(committed, [reasoning_block(text, True)])
     None -> committed
@@ -2180,16 +2199,28 @@ fn turn(kind: String, text: String) -> Element(Msg) {
 /// turn from pre-wrap text flow to block flow — the live streaming
 /// bubble above keeps plain `turn("assistant", …)` rendering until the
 /// turn commits, so a half-streamed construct never looks committed.
-fn assistant_turn(text: String) -> Element(Msg) {
-  html.div([attr.class("turn assistant md")], [
-    html.span([], markdown.render(text)),
-  ])
+fn assistant_turn(
+  md_cache: dict.Dict(String, List(Element(Msg))),
+  text: String,
+) -> Element(Msg) {
+  // No wrapper span: the markdown blocks are direct children of the
+  // bubble, so valid HTML nesting returns and the `.turn.md >
+  // :first-child`/`:last-child` margin rules reach the first and last
+  // block. Cache miss renders on the fly — the miss path only exists
+  // for direct view renders; both commit paths populate the cache.
+  html.div([attr.class("turn assistant md")], case dict.get(md_cache, text) {
+    Ok(elements) -> elements
+    Error(_) -> markdown.render(text)
+  })
 }
 
-fn render_line(line: Line) -> Element(Msg) {
+fn render_line(
+  md_cache: dict.Dict(String, List(Element(Msg))),
+  line: Line,
+) -> Element(Msg) {
   case line {
     UserLine(text) -> turn("user", text)
-    AssistantLine(text) -> assistant_turn(text)
+    AssistantLine(text) -> assistant_turn(md_cache, text)
     ReasoningLine(text) -> reasoning_block(text, False)
     ToolLine(..) -> tool_card(line)
     NoteLine(err, text) ->
@@ -2214,11 +2245,15 @@ fn render_line(line: Line) -> Element(Msg) {
 /// `[open]` attribute, no script involved. Tail-recursive on purpose:
 /// session history is unbounded and the per-connection UI process must
 /// not grow a stack frame per transcript group.
-fn group_chips(lines: List(Line)) -> List(Element(Msg)) {
-  group_chips_loop(lines, [])
+fn group_chips(
+  md_cache: dict.Dict(String, List(Element(Msg))),
+  lines: List(Line),
+) -> List(Element(Msg)) {
+  group_chips_loop(md_cache, lines, [])
 }
 
 fn group_chips_loop(
+  md_cache: dict.Dict(String, List(Element(Msg))),
   lines: List(Line),
   acc: List(Element(Msg)),
 ) -> List(Element(Msg)) {
@@ -2226,10 +2261,14 @@ fn group_chips_loop(
     [] -> list.reverse(acc)
     [line, ..rest] ->
       case is_chip(line) {
-        False -> group_chips_loop(rest, [render_line(line), ..acc])
+        False ->
+          group_chips_loop(md_cache, rest, [render_line(md_cache, line), ..acc])
         True -> {
           let #(run, rest) = take_chips([line], rest)
-          group_chips_loop(rest, [chip_row(list.reverse(run)), ..acc])
+          group_chips_loop(md_cache, rest, [
+            chip_row(md_cache, list.reverse(run)),
+            ..acc
+          ])
         }
       }
   }
@@ -2255,8 +2294,11 @@ fn is_chip(line: Line) -> Bool {
   }
 }
 
-fn chip_row(lines: List(Line)) -> Element(Msg) {
-  html.div([attr.class("chip-row")], list.map(lines, render_line))
+fn chip_row(
+  md_cache: dict.Dict(String, List(Element(Msg))),
+  lines: List(Line),
+) -> Element(Msg) {
+  html.div([attr.class("chip-row")], list.map(lines, render_line(md_cache, _)))
 }
 
 /// The model's reasoning (chain of thought) as an inert collapsible

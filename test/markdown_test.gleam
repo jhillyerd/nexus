@@ -87,6 +87,14 @@ pub fn inline_html_is_inert_text_test() {
   should.be_true(string.contains(out, "world"))
 }
 
+pub fn paired_inline_html_shows_complete_source_test() {
+  // Paired tags surface as separate RawHtml nodes (probed on mork 1.12.3),
+  // so the full source — open and close — must appear as escaped text.
+  let out = rendered("a <b>x</b> c\n")
+  should.be_true(string.contains(out, "&lt;b&gt;"))
+  should.be_true(string.contains(out, "&lt;/b&gt;"))
+}
+
 pub fn fenced_code_escapes_html_test() {
   let out = rendered("```\n<img src=x onerror=pwn()>\n```\n")
   should.be_false(string.contains(out, "<img"))
@@ -110,6 +118,31 @@ pub fn scheme_check_is_case_insensitive_test() {
   should.be_false(string.contains(out, "href=\""))
 }
 
+pub fn control_char_destination_is_refused_test() {
+  // URL parsers strip tab/LF/CR before scheme detection, so a control-
+  // character-obfuscated scheme could otherwise be smuggled past the
+  // prefix allowlist. Angle-bracket destinations keep such characters
+  // verbatim (probed on mork 1.12.3) — the renderer must refuse the
+  // whole destination, not try to outsmart the obfuscation.
+  let out = rendered("[x](<jav\tascript:alert(1)>)\n")
+  should.be_false(string.contains(out, "href="))
+  should.be_true(string.contains(out, "x"))
+}
+
+pub fn del_char_destination_is_refused_test() {
+  let out = rendered("[x](<http://a.com/\u{7f}b>)\n")
+  should.be_false(string.contains(out, "href="))
+}
+
+pub fn bare_tab_destination_stays_literal_text_test() {
+  // Without angle brackets the tabbed destination fails CommonMark's
+  // grammar — mork leaves the whole construct as literal text, so no
+  // link exists at all to sanitise (probed on mork 1.12.3).
+  let out = rendered("[x](jav\tascript:alert(1))\n")
+  should.be_false(string.contains(out, "href="))
+  should.be_true(string.contains(out, "[x]"))
+}
+
 pub fn images_render_as_links_not_img_test() {
   let out = rendered("![alt text](https://example.com/x.png)\n")
   should.be_false(string.contains(out, "<img"))
@@ -124,4 +157,6 @@ pub fn images_render_as_links_not_img_test() {
 pub fn footnote_reference_renders_marker_test() {
   let out = rendered("claim[^1]\n\n[^1]: the note\n")
   should.be_true(string.contains(out, "<sup>1</sup>"))
+  // The definition body must not render alongside the marker.
+  should.be_false(string.contains(out, "the note"))
 }
