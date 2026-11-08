@@ -203,37 +203,36 @@ pub fn list_returns_creation_order_test() {
   let b = create(registry, "second", happy_runner)
   let _c = create(registry, "third", happy_runner)
 
-  // Sessions created within the same wall second tie on activity; the
-  // stable tiebreak (created_at, then id) keeps insertion order — which
-  // is also what a creation-order list would show.
+  // Order under ties: sessions created within the same wall second tie on
+  // activity and list in creation order — but the creates cannot be
+  // guaranteed to share one wall second on a loaded machine (the sort is
+  // most-recently-active first), so this test asserts the list's MEMBERS
+  // and per-session fields, not positions. Regression (2026-11-08 CI): a
+  // run where the creates and the turn below straddled a wall-second
+  // boundary reordered the recency-sorted list and failed a positional
+  // assert here.
   let summaries = session_registry.list_sessions(registry)
   list.length(summaries) |> should.equal(3)
   summaries
   |> list.map(fn(s) { s.model })
+  |> list.sort(string.compare)
   |> should.equal(["first", "second", "third"])
 
-  case list.first(summaries) {
-    Ok(first) -> {
-      first.id |> should.equal(a.id)
-      first.streaming |> should.be_false
-      first.message_count |> should.equal(1)
-      first.metrics |> should.equal([])
-    }
-    Error(_) -> panic as "expected at least one summary"
-  }
+  let assert Ok(first) = list.find(summaries, fn(s) { s.id == a.id })
+  first.streaming |> should.be_false
+  first.message_count |> should.equal(1)
+  first.metrics |> should.equal([])
 
   // A turn on the middle session shows up in the refreshed list. The fake
   // runner finishes immediately, so the count is 2 (mid-turn) or 3 (turn
-  // committed); either way it has grown past the idle 1.
+  // committed); either way it has grown past the idle 1. The commit also
+  // moves b's activity — possibly into a newer wall second than the
+  // creates, which legitimately reorders the recency-sorted list — so the
+  // refreshed session is found by ID, not by position.
   should.equal(session.send_message(b.subject, "go"), session.Sent)
   let after = session_registry.list_sessions(registry)
-  case list.first(list.drop(after, 1)) {
-    Ok(second) -> {
-      second.id |> should.equal(b.id)
-      should.be_true(second.message_count >= 2)
-    }
-    Error(_) -> panic as "expected three summaries"
-  }
+  let assert Ok(second) = list.find(after, fn(s) { s.id == b.id })
+  should.be_true(second.message_count >= 2)
 }
 
 pub fn get_resolves_each_stored_subject_test() {
