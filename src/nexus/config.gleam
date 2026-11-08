@@ -11,6 +11,25 @@ import gleam/result
 import gleam/string
 import nexus/crypto
 
+/// Default system prompt (NEXUS_SYSTEM_PROMPT unset).
+const default_system_prompt =
+  "You are nexus, a concise personal assistant running on a self-hosted "
+  <> "Gleam/BEAM harness. Answer directly and briefly."
+
+/// Appended to the default system prompt while codemode is enabled.
+/// Manual testing showed models tripping over this in every new session
+/// (em-dash in a string literal -> compile failure): Luerl's tokenizer
+/// rejects non-ASCII in Lua source (both binary and codepoint forms -
+/// upstream, see codemode plan / issue #54), so the warning belongs in
+/// the standing instructions, not only the tool description. ASCII
+/// throughout, leading space to splice onto the prompt.
+const codemode_ascii_note =
+  " When writing codemode (Lua) scripts: script source must be ASCII-only"
+  <> " - non-ASCII characters in string literals (em dashes, curly quotes,"
+  <> " non-Latin text) fail to compile. Build such strings from bytes with"
+  <> " string.char(); text returned by other tools may contain non-ASCII"
+  <> " freely."
+
 pub type Config {
   Config(
     /// Master key for provider API keys at rest: base64 of exactly 32
@@ -64,6 +83,15 @@ pub type Config {
     /// Utility debounce: how long after a turn commit the side call waits
     /// (so a fast follow-up message cancels it before it starts).
     utility_delay_ms: Int,
+    /// Codemode (codemode plan phase 1): register the Lua-script tool.
+    /// Off keeps the tool schema list byte-identical to the pre-codemode
+    /// registry (KV-cache contract rule 4).
+    codemode: Bool,
+    /// Codemode: per-script wall-clock deadline in ms.
+    codemode_timeout_ms: Int,
+    /// Codemode: rendered-output cap in characters (head and tail kept,
+    /// omission noted).
+    codemode_max_output_chars: Int,
   )
 }
 
@@ -92,12 +120,6 @@ pub fn from_env(
     get,
     "NEXUS_HTTP_BIND",
     "127.0.0.1",
-  ))
-  use system_prompt <- result.try(optional_string_or(
-    get,
-    "NEXUS_SYSTEM_PROMPT",
-    "You are nexus, a concise personal assistant running on a self-hosted "
-      <> "Gleam/BEAM harness. Answer directly and briefly.",
   ))
   use max_tool_iterations <- result.try(optional_int(
     get,
@@ -146,6 +168,35 @@ pub fn from_env(
     "NEXUS_UTILITY_DELAY_MS",
     1500,
   ))
+  // ---- Codemode (codemode plan phase 1). Off by default so the frozen
+  // tool envelope is unchanged until explicitly enabled.
+  use codemode <- result.try(optional_bool(get, "NEXUS_CODEMODE", False))
+  use codemode_timeout_ms <- result.try(optional_min_int(
+    get,
+    "NEXUS_CODEMODE_TIMEOUT_MS",
+    30_000,
+    min: 1000,
+  ))
+  use codemode_max_output_chars <- result.try(optional_min_int(
+    get,
+    "NEXUS_CODEMODE_MAX_OUTPUT_CHARS",
+    32_768,
+    min: 0,
+  ))
+  // The ASCII note rides the DEFAULT prompt only, and only while
+  // codemode is enabled: an explicitly set NEXUS_SYSTEM_PROMPT is the
+  // operator's own text and is never amended (enable codemode with a
+  // custom prompt and you add the note yourself - see README). The
+  // system prompt is frozen per session at creation, so this stays
+  // byte-stable within a session (KV-cache contract).
+  let system_prompt = case optional_string(get, "NEXUS_SYSTEM_PROMPT") {
+    option.Some(explicit) -> explicit
+    option.None ->
+      case codemode {
+        True -> default_system_prompt <> codemode_ascii_note
+        False -> default_system_prompt
+      }
+  }
   Ok(Config(
     encryption_key: encryption_key,
     sse_first_response_timeout_ms: first_response_ms,
@@ -167,6 +218,9 @@ pub fn from_env(
     pg_password: pg_password,
     utility_enabled: utility_enabled,
     utility_delay_ms: utility_delay_ms,
+    codemode: codemode,
+    codemode_timeout_ms: codemode_timeout_ms,
+    codemode_max_output_chars: codemode_max_output_chars,
   ))
 }
 
@@ -246,6 +300,31 @@ fn optional_non_negative_int(
         "environment variable "
         <> name
         <> " must be >= 0: "
+        <> int.to_string(value),
+      )
+    False -> Ok(value)
+  }
+}
+
+/// Like `optional_int`, but a value below `min` fails the load. Codemode's
+/// ranges must be usable the moment the tool runs — a sub-second deadline
+/// or a negative cap would otherwise surface as a broken tool at first
+/// use instead of the loud boot failure this module promises.
+fn optional_min_int(
+  get: fn(String) -> Result(String, Nil),
+  name: String,
+  default: Int,
+  min min_value: Int,
+) -> Result(Int, String) {
+  use value <- result.try(optional_int(get, name, default))
+  case value < min_value {
+    True ->
+      Error(
+        "environment variable "
+        <> name
+        <> " must be >= "
+        <> int.to_string(min_value)
+        <> ": "
         <> int.to_string(value),
       )
     False -> Ok(value)

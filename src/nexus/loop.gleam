@@ -195,7 +195,7 @@ fn iterate(
             False -> {
               on_event(LoopStatus(iteration, max_iterations, "tools"))
               let tr2 = append_calls(tr, partial_text, assembled)
-              case execute_all(specs, assembled, on_event, tr2) {
+              case execute_all(specs, cancel, assembled, on_event, tr2) {
                 Error(reason) -> LoopFailed(reason)
                 Ok(tr3) ->
                   iterate(
@@ -304,10 +304,16 @@ fn reasoning_opt(text: String) -> Option(String) {
 
 fn execute_all(
   specs: List(ToolSpec),
+  cancel: Subject(Nil),
   assembled: List(tool_calls.ToolCall),
   on_event: fn(LoopEvent) -> Nil,
   tr: Transcript,
 ) -> Result(Transcript, String) {
+  // The per-turn context: the turn's cancel subject reaches tool
+  // execution (the streaming seam's input), which is what makes a
+  // mid-script `Stop` interruptible — a Stop sent while a tool runs
+  // lands in the subject's queue and wakes an interruptible executor.
+  let ctx = tools.ToolCtx(cancel:)
   list.fold(assembled, Ok(tr), fn(acc, call: tool_calls.ToolCall) {
     case acc {
       Error(reason) -> Error(reason)
@@ -318,7 +324,7 @@ fn execute_all(
         let #(ok, content) = case tool_calls.is_complete(call) {
           False -> #(False, render_error("incomplete tool call"))
           True ->
-            case tools.execute(specs, name, call.arguments) {
+            case tools.execute(specs, ctx, name, call.arguments) {
               Ok(content) -> #(True, content)
               Error(reason) -> #(False, render_error(reason))
             }

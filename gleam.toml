@@ -25,6 +25,7 @@ mist = ">= 6.0.0 and < 7.0.0"
 lustre = ">= 5.0.0 and < 6.0.0"
 pog = ">= 4.1.0 and < 5.0.0"
 mork = ">= 1.12.0 and < 2.0.0"
+glua = ">= 2.0.0 and < 3.0.0"
 
 [dev_dependencies]
 gleeunit = ">= 1.0.0 and < 2.0.0"

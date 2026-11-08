@@ -59,7 +59,7 @@ fn echo_tool() -> ToolSpec {
       description: "echo",
       parameters_json: "{\"type\":\"object\",\"properties\":{}}",
     ),
-    run: fn(arguments) { Ok("echo:" <> arguments) },
+    run: fn(_ctx, arguments) { Ok("echo:" <> arguments) },
   )
 }
 

@@ -2248,6 +2248,9 @@ fn test_config() -> config.Config {
     pg_password: None,
     utility_enabled: True,
     utility_delay_ms: 1500,
+    codemode: False,
+    codemode_timeout_ms: 30_000,
+    codemode_max_output_chars: 32_768,
   )
 }
 
