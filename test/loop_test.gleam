@@ -410,3 +410,162 @@ pub fn reasoning_only_stop_commits_nothing_test() {
     _ -> panic as "expected LoopStopped"
   }
 }
+
+// ---------------------------------------------------------------------------
+// Stop mid-round: skip not-yet-started sibling calls (issue #52)
+// ---------------------------------------------------------------------------
+
+/// A stream fake that serves its scripted round exactly once; a second
+/// call fails loudly — after a mid-round Stop the loop must end the turn
+/// BEFORE opening another model request (the production seam starts its
+/// HTTP request before the cancel select ever runs).
+fn single_round_stream(events: List(openai.StreamEvent)) -> loop.StreamFn {
+  fn(_tr, _opts, on_event, _cancel) {
+    case take_index() {
+      0 -> {
+        list.each(events, on_event)
+        openai.Completed(stats())
+      }
+      _ -> openai.Failed(openai.Transport("stream called after mid-round stop"))
+    }
+  }
+}
+
+pub fn stop_mid_round_skips_remaining_calls_test() {
+  // Round 1 assembles two calls. The first tool's run lands a Stop on the
+  // turn's cancel subject — the same queue state a mid-execution Stop, or
+  // codemode's consume-and-re-signal, leaves behind. The second tool must
+  // never start: its slot becomes a synthetic cancelled result, and the
+  // turn ends without a second model request (the fake fails loudly if
+  // the loop tries one).
+  let _ = reset_index()
+  let cancel = process.new_subject()
+  let signal_tool =
+    tools.ToolSpec(
+      tool: tools.function_tool(
+        name: "signal",
+        description: "signals stop mid-run",
+        parameters_json: "{\"type\":\"object\",\"properties\":{}}",
+      ),
+      run: fn(_ctx, _arguments) {
+        process.send(cancel, Nil)
+        Ok("ran")
+      },
+    )
+  let stream =
+    single_round_stream([
+      openai.ToolCallDelta(0, Some("c1"), Some("signal"), "{}"),
+      openai.ToolCallDelta(1, Some("c2"), Some("echo"), "{}"),
+    ])
+  let events = process.new_subject()
+  let outcome =
+    loop.run(
+      [signal_tool, echo_tool()],
+      8,
+      stream,
+      tr_with_user(),
+      cancel,
+      fn(event) { process.send(events, event) },
+    )
+  let received = drain(events, [])
+  let assert loop.LoopStopped(tr) = outcome
+  // The first tool ran and committed its result...
+  should.be_true(list.contains(
+    received,
+    loop.ToolResultEvent("c1", "signal", True, "ran"),
+  ))
+  // ...the second was assembled but never executed: a synthetic failed
+  // result answers it (wire protocol: every assistant tool call gets a
+  // tool result).
+  should.be_true(list.contains(
+    received,
+    loop.ToolCallAssembled("c2", "echo", "{}"),
+  ))
+  should.be_true(list.contains(
+    received,
+    loop.ToolResultEvent("c2", "echo", False, "{\"error\":\"cancelled\"}"),
+  ))
+  // system + user + assistant(calls) + two tool results.
+  transcript.length(tr) |> should.equal(5)
+  transcript.tool_result_at(tr, 3) |> should.equal(Some(True))
+  transcript.tool_result_at(tr, 4) |> should.equal(Some(False))
+  // The synthetic result is a tool message carrying the cancelled error.
+  let assert [
+    _,
+    _,
+    _,
+    _,
+    chat.ToolMessage(content: chat.ToolTextContent(content), ..),
+  ] = transcript.messages(tr)
+  content |> should.equal("{\"error\":\"cancelled\"}")
+}
+
+pub fn stop_consumed_mid_script_by_codemode_skips_rest_test() {
+  // The issue-#52 shape: a Stop lands MID-SCRIPT, so codemode's select
+  // consumes the subject's Nil to end the script and re-signals it (its
+  // one-shot contract). The loop's pre-dispatch poll sees the re-signaled
+  // Nil and skips every remaining call in the round — here two echoes
+  // that must never start — ending the turn with no second request.
+  let _ = reset_index()
+  let cancel = process.new_subject()
+  let codemode_like =
+    tools.ToolSpec(
+      tool: tools.function_tool(
+        name: "codemode",
+        description: "stop lands mid-script",
+        parameters_json: "{\"type\":\"object\",\"properties\":{}}",
+      ),
+      run: fn(_ctx, _arguments) {
+        // The Stop arrives mid-script; codemode's await consumes it to
+        // end the run, then run_script re-signals the one-shot subject.
+        process.send(cancel, Nil)
+        let assert Ok(Nil) = process.receive(cancel, 0)
+        process.send(cancel, Nil)
+        Error("cancelled")
+      },
+    )
+  let stream =
+    single_round_stream([
+      openai.ToolCallDelta(0, Some("c1"), Some("codemode"), "{}"),
+      openai.ToolCallDelta(1, Some("c2"), Some("echo"), "{}"),
+      openai.ToolCallDelta(2, Some("c3"), Some("echo"), "{}"),
+    ])
+  let events = process.new_subject()
+  let outcome =
+    loop.run(
+      [codemode_like, echo_tool()],
+      8,
+      stream,
+      tr_with_user(),
+      cancel,
+      fn(event) { process.send(events, event) },
+    )
+  let received = drain(events, [])
+  let assert loop.LoopStopped(tr) = outcome
+  // The codemode call itself ran and failed; both later calls were
+  // assembled but answered with the synthetic cancelled result.
+  should.be_true(list.contains(
+    received,
+    loop.ToolResultEvent("c1", "codemode", False, "{\"error\":\"cancelled\"}"),
+  ))
+  should.be_true(list.contains(
+    received,
+    loop.ToolResultEvent("c2", "echo", False, "{\"error\":\"cancelled\"}"),
+  ))
+  should.be_true(list.contains(
+    received,
+    loop.ToolResultEvent("c3", "echo", False, "{\"error\":\"cancelled\"}"),
+  ))
+  // system + user + assistant(calls) + three tool results.
+  transcript.length(tr) |> should.equal(6)
+  // No echo result anywhere — the echo tool never ran.
+  should.be_false(
+    transcript.messages(tr)
+    |> list.any(fn(message) {
+      case message {
+        chat.ToolMessage(content: chat.ToolTextContent("echo:{}"), ..) -> True
+        _ -> False
+      }
+    }),
+  )
+}
