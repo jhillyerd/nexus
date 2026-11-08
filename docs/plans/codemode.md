@@ -139,7 +139,20 @@ EYG and ports documented as future alternatives behind the same seam.
 ## Phase 2 — parallel batch (`tools.call_all`) — IMPLEMENTED
 
 Implemented 2026-11-08 alongside two hardening points the plan text
-under-specified (both found by tests, both pinned by regression tests):
+under-specified (both found by tests, both pinned by regression tests),
+plus three cubic review fixes on the phase-2 PR (all pinned):
+
+- **The batch is budgeted BEFORE the deadline short-circuit** —
+  deadline-exceeded values are still handed to the script, so those
+  entries must draw the same 25-call budget as any other call, or a
+  near-deadline script could keep issuing uncounted batches.
+- **Sparse batches are rejected** (`dense 1-based array` script error):
+  iterating to `#v` silently dropped entries after a hole, dodging
+  both the calls and the budget accounting.
+- **Crash terms are bounded before formatting** (`cap_term`: depth 3,
+  breadth 16, 100-byte binaries): pretty-printing a pathological
+  reason whole and truncating after would still materialise an
+  unbounded iolist in an uncapped batch child.
 
 - **Crashing entries are error values, not engine deaths.** Each child
   runs its host closure under a crash-catching FFI (`safe_call`) — a

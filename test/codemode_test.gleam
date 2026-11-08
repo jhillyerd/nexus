@@ -926,6 +926,78 @@ pub fn call_all_empty_batch_is_empty_test() {
   should.equal(list.drop(parts, 1), ["0"])
 }
 
+/// Over-budget batches fail EVEN on the deadline short-circuit path: the
+/// batch is charged before remaining-time is considered, so a
+/// near-deadline script cannot keep issuing uncounted batches (cubic
+/// review — deadline-exceeded entries still draw budget). The sync
+/// stall guarantees remaining <= 20 ms < the 50 ms margin, so the only
+/// thing that can fail this script is the budget check itself.
+pub fn call_all_budget_charged_on_deadline_path_test() {
+  let hosts = [
+    codemode.HostTool(name: "stall", call: fn(_) {
+      process.sleep(980)
+      Ok("late")
+    }),
+    echo_host(),
+  ]
+  let assert Error(result) =
+    codemode.run(
+      hosts,
+      1000,
+      default_cap,
+      process.new_subject(),
+      code_argument(
+        "tools.stall({})"
+        <> "\nlocal batch = {}\nfor i = 1, 26 do batch[i] = {name = 'echo'} end\n"
+        <> "tools.call_all(batch)\nreturn 'unreachable'",
+      ),
+    )
+  should.be_true(string.contains(result, "tool call budget exceeded (25 calls)"))
+}
+
+/// Sparse batches (holes, or non-1..n keys) are rejected instead of
+/// silently dropping entries after the hole — dropped entries would
+/// dodge both the calls and the budget accounting (cubic review).
+pub fn call_all_rejects_sparse_batches_test() {
+  let assert Error(hole) =
+    run_code("tools.call_all({{name = 'echo'}, [3] = {name = 'echo'}})")
+  should.be_true(string.contains(hole, "dense 1-based array"))
+  let assert Error(named) =
+    run_code("tools.call_all({{name = 'echo'}, extra = 1})")
+  should.be_true(string.contains(named, "dense 1-based array"))
+  // A dense array is still fine.
+  let assert Ok(dense) =
+    run_code(
+      "local rs = tools.call_all({{name = 'echo'}, {name = 'echo'}})"
+      <> "\nreturn #rs",
+    )
+  let parts = string.split(dense, "\n\n")
+  should.equal(list.drop(parts, 1), ["2"])
+}
+
+/// A host crashing with a pathological reason must not blow up the
+/// child: the crash term is bounded BEFORE formatting, so the error
+/// value stays small no matter how large the reason (cubic review).
+pub fn crash_reason_is_bounded_test() {
+  let hosts = [
+    codemode.HostTool(name: "wibble", call: fn(_) {
+      panic as string.repeat("x", 200_000)
+    }),
+  ]
+  let assert Ok(result) =
+    codemode.run(
+      hosts,
+      default_timeout_ms,
+      default_cap,
+      process.new_subject(),
+      code_argument(
+        "local rs = tools.call_all({{name = 'wibble'}})\nreturn rs[1].error",
+      ),
+    )
+  should.be_true(string.contains(result, "host crashed"))
+  should.be_true(string.length(result) < 1000)
+}
+
 /// A Lua runtime TYPE error (glua's formatter crashes on badarg/
 /// badarith — format_lua_value returns IO data that string.join
 /// rejects) must stay a script failure with a readable reason, not take

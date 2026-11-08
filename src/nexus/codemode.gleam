@@ -927,24 +927,30 @@ fn call_all_fn(
           // An empty batch is a no-op and never touches the budget.
           outcomes_action([])
         Ok(entries) -> {
-          let remaining_us = deadline_us - timing.now_us()
-          case remaining_us <= batch_deadline_margin_us {
-            True ->
-              // No usable time left: hand back deadline-exceeded values
-              // without spawning anything — the worker's kill is due.
-              outcomes_action(
-                list.map(entries, fn(_) { BatchErr("deadline exceeded") }),
-              )
-            False ->
-              // The whole batch is budgeted up front (all results are
-              // retained), before anything spawns.
-              case
-                counter_add("nexus_codemode_tool_calls", list.length(entries))
-                > tool_call_budget
-              {
-                True -> glua.error(budget_error())
+          // The whole batch is budgeted up front (all results are
+          // retained), before anything spawns — and BEFORE the
+          // deadline short-circuit too: deadline-exceeded values are
+          // still handed back to the script, so those entries must
+          // draw the same budget as any other call, or a near-deadline
+          // script could keep issuing uncounted batches (cubic review).
+          case
+            counter_add("nexus_codemode_tool_calls", list.length(entries))
+            > tool_call_budget
+          {
+            True -> glua.error(budget_error())
+            False -> {
+              let remaining_us = deadline_us - timing.now_us()
+              case remaining_us <= batch_deadline_margin_us {
+                True ->
+                  // No usable time left: hand back deadline-exceeded
+                  // values without spawning anything — the worker's kill
+                  // is due.
+                  outcomes_action(
+                    list.map(entries, fn(_) { BatchErr("deadline exceeded") }),
+                  )
                 False -> outcomes_action(run_batch(hosts, entries, deadline_us))
               }
+            }
           }
         }
       }
@@ -1269,8 +1275,17 @@ const preamble_lua =
   <> "\n  local dq = string.char(34)"
   <> "\n  if v == nil then return '[]' end"
   <> "\n  if type(v) ~= 'table' then error('call_all wants a table of entries') end"
+  <> "\n  local n = #v"
+  <> "\n  local count = 0"
+  <> "\n  for k in pairs(v) do"
+  <> "\n    count = count + 1"
+  <> "\n    if type(k) ~= 'number' or k % 1 ~= 0 or k < 1 or k > n then"
+  <> "\n      error('call_all batch must be a dense 1-based array')"
+  <> "\n    end"
+  <> "\n  end"
+  <> "\n  if count ~= n then error('call_all batch must be a dense 1-based array') end"
   <> "\n  local out = {}"
-  <> "\n  for i = 1, #v do"
+  <> "\n  for i = 1, n do"
   <> "\n    local e = v[i]"
   <> "\n    if type(e) ~= 'table' then error('call_all entry must be a table') end"
   <> "\n    if type(e.name) ~= 'string' then error('call_all entry missing name') end"
