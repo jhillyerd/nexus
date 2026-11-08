@@ -231,6 +231,9 @@ pub fn list_returns_creation_order_test() {
   // refreshed session is found by ID, not by position.
   should.equal(session.send_message(b.subject, "go"), session.Sent)
   let after = session_registry.list_sessions(registry)
+  // The refresh must not have dropped anything: all three sessions are
+  // still listed (found by ID below, position-free).
+  list.length(after) |> should.equal(3)
   let assert Ok(second) = list.find(after, fn(s) { s.id == b.id })
   should.be_true(second.message_count >= 2)
 }
