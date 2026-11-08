@@ -421,8 +421,8 @@ type Output {
     half_cap: Int,
     head: List(Segment),
     tail: SegQueue,
-    head_chars: Int,
-    tail_chars: Int,
+    head_charge: Int,
+    tail_charge: Int,
     dropped_items: Int,
     dropped_console: Int,
     sealed: Bool,
@@ -444,8 +444,8 @@ fn new_output(cap: Int) -> Output {
     half_cap: half_cap,
     head: [],
     tail: SegQueue([], []),
-    head_chars: 0,
-    tail_chars: 0,
+    head_charge: 0,
+    tail_charge: 0,
     dropped_items: 0,
     dropped_console: 0,
     sealed: sealed,
@@ -469,12 +469,12 @@ fn out_add(out: Output, seg: Segment) -> Output {
       // frozen — a later segment that merely *fits* the head must still
       // go to the tail, or output renders out of arrival order with no
       // omission hint (review finding).
-      case out.head_chars + charge <= out.half_cap && !out.sealed {
+      case out.head_charge + charge <= out.half_cap && !out.sealed {
         True ->
           Output(
             ..out,
             head: [seg, ..out.head],
-            head_chars: out.head_chars + charge,
+            head_charge: out.head_charge + charge,
           )
         False -> push_tail(out, seg, charge)
       }
@@ -504,7 +504,12 @@ fn push_tail(out: Output, seg: Segment, charge: Int) -> Output {
           }
         budget -> {
           let kept = string.slice(seg_text(seg), 0, budget)
-          let dropped = seg_size(seg) - budget
+          // `charge > half_cap` means text + sep overflowed, so text can
+          // still fit with room to spare — a 19-char item at a 20-char
+          // half-budget truncates to itself and omits nothing (negative
+          // counts would corrupt the omission note; cubic review on PR
+          // #56).
+          let dropped = int.max(seg_size(seg) - budget, 0)
           case seg {
             Item(_) -> #(Item(kept), budget, dropped, 0)
             Console(_) -> #(Console(kept), budget, 0, dropped)
@@ -521,10 +526,10 @@ fn push_tail(out: Output, seg: Segment, charge: Int) -> Output {
         dropped_console: out.dropped_console + extra_console,
       )
     _ -> {
-      let #(tail, tail_chars, dropped_items, dropped_console) =
+      let #(tail, tail_charge, dropped_items, dropped_console) =
         evict_loop(
           SegQueue(out.tail.front, [seg, ..out.tail.back]),
-          out.tail_chars + charge,
+          out.tail_charge + charge,
           out.dropped_items + extra_items,
           out.dropped_console + extra_console,
           out.half_cap,
@@ -533,7 +538,7 @@ fn push_tail(out: Output, seg: Segment, charge: Int) -> Output {
         ..out,
         sealed: True,
         tail: tail,
-        tail_chars: tail_chars,
+        tail_charge: tail_charge,
         dropped_items: dropped_items,
         dropped_console: dropped_console,
       )
@@ -550,25 +555,32 @@ fn seg_text(seg: Segment) -> String {
 
 fn evict_loop(
   tail: SegQueue,
-  tail_chars: Int,
+  tail_charge: Int,
   dropped_items: Int,
   dropped_console: Int,
   half_cap: Int,
 ) -> #(SegQueue, Int, Int, Int) {
-  case tail_chars > half_cap {
-    False -> #(tail, tail_chars, dropped_items, dropped_console)
+  case tail_charge > half_cap {
+    False -> #(tail, tail_charge, dropped_items, dropped_console)
     True ->
       case seg_pop(tail) {
-        Error(Nil) -> #(tail, tail_chars, dropped_items, dropped_console)
+        Error(Nil) -> #(tail, tail_charge, dropped_items, dropped_console)
         Ok(#(seg, rest)) -> {
-          let size = seg_size(seg)
+          let dropped = seg_size(seg)
           let #(dropped_items, dropped_console) = case seg {
-            Item(_) -> #(dropped_items + size, dropped_console)
-            Console(_) -> #(dropped_items, dropped_console + size)
+            Item(_) -> #(dropped_items + dropped, dropped_console)
+            Console(_) -> #(dropped_items, dropped_console + dropped)
           }
+          // Subtract the segment's full separator-inclusive charge: the
+          // counter counts charges, and subtracting only its text would
+          // leave the separator units behind — phantom units that
+          // over-evict real segments and, given enough one-character
+          // spam, eventually evict the newest one (cubic review on
+          // PR #56). Dropped stays in text chars: the omission note
+          // counts content, not joins.
           evict_loop(
             rest,
-            tail_chars - size,
+            tail_charge - seg_charge(seg),
             dropped_items,
             dropped_console,
             half_cap,

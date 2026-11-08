@@ -340,7 +340,11 @@ pub fn item_separator_flood_stays_within_cap_test() {
   // Status line, omission note, and the joins around them add ~100
   // chars of metadata on top of the budgeted body (pre-fix: ~98k).
   should.be_true(string.length(result) < default_cap + 200)
-  should.be_true(string.contains(result, "chars omitted"))
+  // Deterministic accounting: halves keep 5461 items each (charge 3
+  // apiece at half-cap 16384), so 21846 one-char items are omitted.
+  // A larger count would mean phantom separator units are over-evicting
+  // the tail (cubic review on PR #56).
+  should.be_true(string.contains(result, "21846 chars omitted"))
 }
 
 /// Console lines join with a single newline; the same bound applies.
@@ -358,7 +362,31 @@ pub fn console_separator_flood_stays_within_cap_test() {
     )
   // Console body ≤ cap; status line and <console_output> tags wrap it.
   should.be_true(string.length(result) < 250)
-  should.be_true(string.contains(result, "chars omitted"))
+  // Halves keep 25 lines each (charge 2 apiece at half-cap 50): exactly
+  // 950 omitted, pinning charge-unit eviction for console sections.
+  should.be_true(string.contains(result, "950 chars omitted"))
+}
+
+/// Eviction must spend real budget, not phantom separator units: the
+/// buggy counter (subtracting only an evicted segment's text) keeps
+/// separator units behind after every eviction, so sustained
+/// one-character console spam first erodes the tail to nothing and then
+/// inflates the counter past the half-cap with an empty queue — after
+/// which EVERY later segment (the final item included) is pushed and
+/// instantly evicted. ~50 tail pushes are needed to drain it, so the
+/// script spams 100 and then emits a large final item.
+pub fn spam_then_final_item_survives_test() {
+  let assert Ok(result) =
+    codemode.run(
+      hosts: mock_hosts(),
+      timeout_ms: default_timeout_ms,
+      max_output_chars: 100,
+      cancel: process.new_subject(),
+      arguments: code_argument(
+        "for i = 1, 100 do print('x') end\nreturn 'END-OF-SCRIPT'",
+      ),
+    )
+  should.be_true(string.contains(result, "END-OF-SCRIPT"))
 }
 
 // ---------------------------------------------------------------------------
