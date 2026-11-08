@@ -41,13 +41,14 @@ import pog
 @external(erlang, "nexus_store_ffi", "database_url")
 fn database_url() -> Result(String, Nil)
 
-// Hold the VM until the pog pool's type server is ready, so the halt's
-// teardown no longer races the connection_starter's boot-time type-server
-// call (intermittent pgo_pool_sup shutdown_error report); see
-// nexus_store_ffi:stop_pool/1. pog.start hands back the pool's queue
-// gen_server.
-@external(erlang, "nexus_store_ffi", "stop_pool")
-fn stop_pool(queue: process.Pid) -> Nil
+// Run main's seed work under with_pool_settled: from pog.start onward the
+// VM must neither halt nor panic while the pool's boot is still in flight
+// (intermittent pgo_pool_sup shutdown_error report at teardown); see
+// nexus_store_ffi:with_pool_settled/2. pog.start hands back the pool's
+// queue gen_server. Panics before pog.start (DATABASE_URL, URL parse) have
+// no pool to race the halt with and stay unwrapped.
+@external(erlang, "nexus_store_ffi", "with_pool_settled")
+fn with_pool_settled(run: fn() -> Nil, queue: process.Pid) -> Nil
 
 pub fn main() -> Nil {
   let started =
@@ -58,8 +59,10 @@ pub fn main() -> Nil {
     |> pog.connection_parameter("timezone", "UTC")
     |> pog.start
     |> or_panic("could not connect — is the database up?")
-  let db = started.data
+  with_pool_settled(fn() { seed_provider(started.data) }, started.pid)
+}
 
+fn seed_provider(db: pog.Connection) -> Nil {
   let key =
     envoy.get("NEXUS_ENCRYPTION_KEY")
     |> or_panic("NEXUS_ENCRYPTION_KEY is not set")
@@ -117,7 +120,6 @@ pub fn main() -> Nil {
       }
     }
   }
-  stop_pool(started.pid)
 }
 
 /// Encrypt the submitted key under AAD = the provider id. Blank/absent

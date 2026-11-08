@@ -1,6 +1,6 @@
 -module(nexus_store_ffi).
 
--export([read_file/1, database_url/0, stop_pool/1]).
+-export([read_file/1, database_url/0, with_pool_settled/2]).
 
 read_file(Path) ->
     case file:read_file(unicode:characters_to_list(Path)) of
@@ -16,17 +16,52 @@ database_url() ->
         Value -> {ok, unicode:characters_to_binary(Value)}
     end.
 
-%% Stop the pool started by pog.start cleanly, before the runner VM halts.
+%% Run Fun to completion, then hold the VM until the pog pool's type server
+%% has settled (see stop_pool/1) — on the raise path too, unlinking the
+%% caller first so the pool tree cannot see it die.
 %%
-%% When a short-lived runner (store/migrate, dev_seed) returns from main/0,
-%% the VM halts and tears the pool tree down. On boot, pgo parks
-%% connection_starter in a blocking gen_statem:call on type_server
-%% ({reload, _}, infinity timeout) that only returns once the type server's
-%% initial OID bootstrap finishes — and that bootstrap checkout competes with
-%% the pool's own connections still handshaking, so readiness can lag. If
-%% the halt lands inside that window, the supervisor's reverse-order
-%% termination kills type_server first, the starter's outstanding call dies
-%% with it ({shutdown, {gen_statem, call, ...}}), and pgo_pool_sup logs a
+%% The reason this wrapper exists at all: a short-lived runner
+%% (store/migrate, dev_seed) can panic anywhere between pog.start and the
+%% end of main — failed statement, missing seed env, crypto failure, query
+%% failure — and every one of those panics used to tear the pool tree down
+%% without the wait, the exact window stop_pool exists to cover.
+%%
+%% On the RAISE path the wait is deliberately skipped (measured, not
+%% assumed): a panic tears the tree down via the parent-death cascade — the
+%% queue gen receives the caller's exit signal and stops gracefully, the
+%% supervisor follows — which is silent even with the bootstrap still in
+%% flight, unlike the halt-after-success teardown that stop_pool's wait
+%% guards. Waiting there would only stall a dead-database failure by up to
+%% the stop_pool deadline for nothing.
+%%
+%% The unlink before re-raising is not optional: the queue gen traps exits
+%% and has no clause for exit signals, so a still-linked caller dying under
+%% it would crash the gen with a function_clause report of its own.
+%% erlang:raise re-raises the original class/reason/stacktrace, so the
+%% runner's panic output and exit status are exactly what they would have
+%% been without this wrapper.
+with_pool_settled(Fun, GenPid) ->
+    try Fun() of
+        Value ->
+            stop_pool(GenPid),
+            Value
+    catch
+        Class:Reason:Stack ->
+            erlang:unlink(GenPid),
+            erlang:raise(Class, Reason, Stack)
+    end.
+
+%% Hold the VM until the pog pool's type server has settled, so the halt's
+%% teardown no longer races the pool's boot. When a short-lived runner
+%% (store/migrate, dev_seed) returns from main/0, the VM halts and tears the
+%% pool tree down. On boot, pgo parks connection_starter in a blocking
+%% gen_statem:call on type_server ({reload, _}, infinity timeout) that only
+%% returns once the type server's initial OID bootstrap finishes — and that
+%% bootstrap checkout competes with the pool's own connections still
+%% handshaking, so readiness can lag. If the halt lands inside that window,
+%% the supervisor's reverse-order termination kills type_server first, the
+%% starter's outstanding call dies with it
+%% ({shutdown, {gen_statem, call, ...}}), and pgo_pool_sup logs a
 %% shutdown_error report. Harmless, but noisy — and empirically intermittent
 %% (it needs the bootstrap to still be in flight at halt).
 %%
