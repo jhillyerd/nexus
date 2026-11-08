@@ -415,17 +415,18 @@ pub fn reasoning_only_stop_commits_nothing_test() {
 // Stop mid-round: skip not-yet-started sibling calls (issue #52)
 // ---------------------------------------------------------------------------
 
-/// A stream fake faithful to the seam's cancel contract: a queued Nil on
-/// the turn subject aborts the round as `Cancelled` (the production seam
-/// aborts at its first receive boundary, request started or not).
-fn cancel_aware_round(events: List(openai.StreamEvent)) -> loop.StreamFn {
-  fn(_tr, _opts, on_event, cancel) {
-    case process.receive(cancel, 0) {
-      Ok(Nil) -> openai.Cancelled
-      Error(Nil) -> {
+/// A stream fake that serves its scripted round exactly once; a second
+/// call fails loudly — after a mid-round Stop the loop must end the turn
+/// BEFORE opening another model request (the production seam starts its
+/// HTTP request before the cancel select ever runs).
+fn single_round_stream(events: List(openai.StreamEvent)) -> loop.StreamFn {
+  fn(_tr, _opts, on_event, _cancel) {
+    case take_index() {
+      0 -> {
         list.each(events, on_event)
         openai.Completed(stats())
       }
+      _ -> openai.Failed(openai.Transport("stream called after mid-round stop"))
     }
   }
 }
@@ -435,7 +436,9 @@ pub fn stop_mid_round_skips_remaining_calls_test() {
   // turn's cancel subject — the same queue state a mid-execution Stop, or
   // codemode's consume-and-re-signal, leaves behind. The second tool must
   // never start: its slot becomes a synthetic cancelled result, and the
-  // next stream round aborts instead of issuing another model request.
+  // turn ends without a second model request (the fake fails loudly if
+  // the loop tries one).
+  let _ = reset_index()
   let cancel = process.new_subject()
   let signal_tool =
     tools.ToolSpec(
@@ -450,7 +453,7 @@ pub fn stop_mid_round_skips_remaining_calls_test() {
       },
     )
   let stream =
-    cancel_aware_round([
+    single_round_stream([
       openai.ToolCallDelta(0, Some("c1"), Some("signal"), "{}"),
       openai.ToolCallDelta(1, Some("c2"), Some("echo"), "{}"),
     ])
@@ -502,7 +505,8 @@ pub fn stop_consumed_mid_script_by_codemode_skips_rest_test() {
   // consumes the subject's Nil to end the script and re-signals it (its
   // one-shot contract). The loop's pre-dispatch poll sees the re-signaled
   // Nil and skips every remaining call in the round — here two echoes
-  // that must never start.
+  // that must never start — ending the turn with no second request.
+  let _ = reset_index()
   let cancel = process.new_subject()
   let codemode_like =
     tools.ToolSpec(
@@ -521,7 +525,7 @@ pub fn stop_consumed_mid_script_by_codemode_skips_rest_test() {
       },
     )
   let stream =
-    cancel_aware_round([
+    single_round_stream([
       openai.ToolCallDelta(0, Some("c1"), Some("codemode"), "{}"),
       openai.ToolCallDelta(1, Some("c2"), Some("echo"), "{}"),
       openai.ToolCallDelta(2, Some("c3"), Some("echo"), "{}"),

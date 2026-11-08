@@ -13,8 +13,9 @@
 //// - cancellation: the cancel subject is threaded through every stream
 ////   call; a stop between iterations aborts immediately, and a stop
 ////   observed mid-round (before a dispatch) skips every not-yet-started
-////   sibling call, answering each with a synthetic cancelled result so
-////   the transcript stays a valid request shape (issue #52);
+////   sibling call — each answered with a synthetic cancelled result so
+////   the transcript stays a valid request shape — and ends the turn
+////   before another model request is opened (issue #52);
 //// - a failed stream commits nothing (the caller keeps its own transcript),
 ////   so a retry resends a byte-identical prefix.
 ////
@@ -199,8 +200,12 @@ fn iterate(
               on_event(LoopStatus(iteration, max_iterations, "tools"))
               let tr2 = append_calls(tr, partial_text, assembled)
               case execute_all(specs, cancel, assembled, on_event, tr2) {
-                Error(reason) -> LoopFailed(reason)
-                Ok(tr3) ->
+                // A Stop observed mid-round ends the turn here: re-entering
+                // the stream would open one more model request before its
+                // cancel select fires (stream_request starts Hackney
+                // first), so the stop is honoured before any of that.
+                ExecRoundStopped(tr3) -> LoopStopped(tr3)
+                ExecRoundDone(tr3) ->
                   iterate(
                     specs,
                     max_iterations,
@@ -310,11 +315,20 @@ fn reasoning_opt(text: String) -> Option(String) {
 /// remaining call in the round is answered with a synthetic cancelled
 /// result instead of being started — a complete `http_fetch`/`web_search`
 /// sibling must not run to completion (network timeouts included) after
-/// the user already asked the turn to stop (issue #52).
+/// the user already asked the turn to stop (issue #52). Tool errors are
+/// NOT loop errors: they become failed tool results and the round
+/// continues, so there is no failure state here.
 type ExecState {
   ExecRunning(tr: Transcript)
   ExecCancelled(tr: Transcript)
-  ExecFailed(reason: String)
+}
+
+/// Outcome of one tool round: the calls ran (the loop continues with the
+/// next model request), or a Stop was observed mid-round (the turn ends
+/// without another model request).
+type ExecOutcome {
+  ExecRoundDone(tr: Transcript)
+  ExecRoundStopped(tr: Transcript)
 }
 
 fn execute_all(
@@ -323,7 +337,7 @@ fn execute_all(
   assembled: List(tool_calls.ToolCall),
   on_event: fn(LoopEvent) -> Nil,
   tr: Transcript,
-) -> Result(Transcript, String) {
+) -> ExecOutcome {
   // The per-turn context: the turn's cancel subject reaches tool
   // execution (the streaming seam's input), which is what makes a
   // mid-script `Stop` interruptible — a Stop sent while a tool runs
@@ -332,7 +346,6 @@ fn execute_all(
   let state =
     list.fold(assembled, ExecRunning(tr), fn(state, call: tool_calls.ToolCall) {
       case state {
-        ExecFailed(reason) -> ExecFailed(reason)
         ExecCancelled(tr) -> ExecCancelled(skip_call(tr, call, on_event))
         ExecRunning(tr) ->
           case cancel_pending(cancel) {
@@ -361,24 +374,21 @@ fn execute_all(
       }
     })
   case state {
-    ExecRunning(tr) | ExecCancelled(tr) -> Ok(tr)
-    ExecFailed(reason) -> Error(reason)
+    ExecRunning(tr) -> ExecRoundDone(tr)
+    ExecCancelled(tr) -> ExecRoundStopped(tr)
   }
 }
 
 /// Non-blocking poll of the turn's one-shot cancel subject. A queued Nil
 /// means a Stop already landed — during a sibling tool's run, or inside a
 /// codemode script (whose runner consumed the Nil to end the script and
-/// re-signalled it). Consuming it here would leave the subject empty for
-/// the next stream call, so put it straight back: the same one-shot
-/// invariant codemode's re-signal keeps. The next stream round therefore
-/// aborts (`LoopStopped`) instead of issuing another model request.
+/// re-signalled it; that re-signal is still what the LAST-call path
+/// relies on, where the next stream call is the observer). The Nil is
+/// consumed here and NOT re-signalled: a mid-round stop ends the turn
+/// directly, before another model request is opened.
 fn cancel_pending(cancel: Subject(Nil)) -> Bool {
   case process.receive(cancel, 0) {
-    Ok(Nil) -> {
-      process.send(cancel, Nil)
-      True
-    }
+    Ok(Nil) -> True
     Error(Nil) -> False
   }
 }
