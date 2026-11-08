@@ -593,3 +593,47 @@ pub fn mixed_table_encodes_as_object_test() {
   should.be_true(string.contains(result, "\"1\":\"first\""))
   should.be_true(string.contains(result, "\"status\":\"ok\""))
 }
+
+/// Degenerate cap handling (cubic review): cap 1 must truncate to one
+/// kept character rather than erasing every nonempty segment (cap/2
+/// rounds to zero), and cap 0 keeps its suppress-everything meaning.
+pub fn tiny_cap_truncates_instead_of_erasing_test() {
+  let assert Ok(one) =
+    codemode.run(
+      hosts: mock_hosts(),
+      timeout_ms: default_timeout_ms,
+      max_output_chars: 1,
+      cancel: process.new_subject(),
+      arguments: code_argument("text('abc')"),
+    )
+  // Exactly one character survives, the rest accounted as omitted.
+  should.be_true(string.contains(one, "a"))
+  should.be_true(string.contains(one, "2 chars omitted"))
+
+  let assert Ok(zero) =
+    codemode.run(
+      hosts: mock_hosts(),
+      timeout_ms: default_timeout_ms,
+      max_output_chars: 0,
+      cancel: process.new_subject(),
+      arguments: code_argument("text('abc')"),
+    )
+  should.be_false(string.contains(zero, "abc"))
+  should.be_true(string.contains(zero, "3 chars omitted"))
+}
+
+/// An event-spamming script (fast producer, ack'd every event) must
+/// still die at the wall-clock deadline: once the deadline passes the
+/// worker stops draining stream events even when one is always queued
+/// (a queued message wins the mailbox race over a fired timeout).
+pub fn event_spam_script_dies_at_deadline_test() {
+  let assert Error(result) =
+    codemode.run(
+      hosts: mock_hosts(),
+      timeout_ms: 1000,
+      max_output_chars: default_cap,
+      cancel: process.new_subject(),
+      arguments: code_argument("while true do print('spam') end"),
+    )
+  should.be_true(string.contains(result, "timeout"))
+}

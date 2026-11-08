@@ -233,30 +233,56 @@ fn await(
   deadline_us: Int,
   out: Output,
 ) -> #(Ended, Output) {
-  case
-    process.selector_receive(
-      worker_selector(events, cancel),
-      in_ms(deadline_us),
-    )
-  {
-    Error(Nil) -> #(Deadline, out)
-    Ok(FromEngine(EngineDone(report))) -> #(EngineReported(report), out)
-    Ok(FromEngine(TextOut(ack, text))) -> {
-      // Acknowledge before accumulating: the reply is O(1) and keeps the
-      // engine's next event from queuing behind this one.
-      process.send(ack, Nil)
-      await(engine, events, cancel, deadline_us, out_add(out, Item(text)))
-    }
-    Ok(FromEngine(ConsoleLine(ack, text))) -> {
-      process.send(ack, Nil)
-      await(engine, events, cancel, deadline_us, out_add(out, Console(text)))
-    }
-    Ok(TurnCancelled) -> #(Cancelled, out)
-    Ok(EngineExit(ExitMessage(pid, reason))) if pid == engine -> #(
-      EngineDied(reason),
-      out,
-    )
-    Ok(EngineExit(_)) -> await(engine, events, cancel, deadline_us, out)
+  case in_ms(deadline_us) <= 0 {
+    // Deadline already passed: stop draining stream events. A queued
+    // event still wins the mailbox race over an (even zero) timeout,
+    // so an engine producing events as fast as they are acked could
+    // otherwise keep the loop fed forever past the deadline (review
+    // clarification). One final non-blocking pass accepts a queued
+    // Done/cancel/exit — a script that finished in time keeps its
+    // result — and everything else ends the run as Deadline.
+    True ->
+      case process.selector_receive(worker_selector(events, cancel), 0) {
+        Ok(FromEngine(EngineDone(report))) -> #(EngineReported(report), out)
+        Ok(TurnCancelled) -> #(Cancelled, out)
+        Ok(EngineExit(ExitMessage(pid, reason))) if pid == engine -> #(
+          EngineDied(reason),
+          out,
+        )
+        _ -> #(Deadline, out)
+      }
+    False ->
+      case
+        process.selector_receive(
+          worker_selector(events, cancel),
+          in_ms(deadline_us),
+        )
+      {
+        Error(Nil) -> #(Deadline, out)
+        Ok(FromEngine(EngineDone(report))) -> #(EngineReported(report), out)
+        Ok(FromEngine(TextOut(ack, text))) -> {
+          // Acknowledge before accumulating: the reply is O(1) and keeps
+          // the engine's next event from queuing behind this one.
+          process.send(ack, Nil)
+          await(engine, events, cancel, deadline_us, out_add(out, Item(text)))
+        }
+        Ok(FromEngine(ConsoleLine(ack, text))) -> {
+          process.send(ack, Nil)
+          await(
+            engine,
+            events,
+            cancel,
+            deadline_us,
+            out_add(out, Console(text)),
+          )
+        }
+        Ok(TurnCancelled) -> #(Cancelled, out)
+        Ok(EngineExit(ExitMessage(pid, reason))) if pid == engine -> #(
+          EngineDied(reason),
+          out,
+        )
+        Ok(EngineExit(_)) -> await(engine, events, cancel, deadline_us, out)
+      }
   }
 }
 
@@ -388,15 +414,25 @@ type Output {
 }
 
 fn new_output(cap: Int) -> Output {
+  // Degenerate caps (review finding): `cap / 2` rounds to zero, which
+  // would erase every nonempty segment (all counted as omitted).
+  // cap 0 keeps its suppress-everything meaning; cap 1 keeps exactly
+  // one character — sealed from the start, so everything flows through
+  // the tail and the eviction budget alone bounds output at 1 char.
+  let #(half_cap, sealed) = case cap {
+    0 -> #(0, True)
+    1 -> #(1, True)
+    _ -> #(cap / 2, False)
+  }
   Output(
-    half_cap: cap / 2,
+    half_cap: half_cap,
     head: [],
     tail: SegQueue([], []),
     head_chars: 0,
     tail_chars: 0,
     dropped_items: 0,
     dropped_console: 0,
-    sealed: False,
+    sealed: sealed,
   )
 }
 

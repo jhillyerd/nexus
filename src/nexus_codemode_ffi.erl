@@ -16,8 +16,16 @@
 %% (review finding): with `include_offheap` alone, a process holding
 %% ~1 GB of live refc binaries SURVIVES a 20k-word limit on all three;
 %% with `include_shared_binaries` it is killed on all three.
-%% `include_offheap` is kept as well for message-queue data (and the
-%% engine's mailbox is bounded by the per-event ack backpressure).
+%% `include_offheap` is inert for binaries on 27-29 (and the OTP 28
+%% parser reportedly ignores it entirely); it is kept defensively in
+%% case a release starts honouring it — the accounting is additive and
+%% unknown keys (none of these are, on any supported release) would
+%% badarg at engine start, which tests would catch immediately.
+%% NOTE: max_heap_size is checked at GC, not per allocation: a single
+%% oversized allocation must transiently fit node memory and is killed
+%% at the first GC after it (measured ~70 ms for a 400 MB string.rep
+%% through the real path). Deployments running untrusted scripts should
+%% still cap the node (cgroup / container memory limit) for that window.
 set_max_heap_size_words(Words) ->
     erlang:process_flag(
       max_heap_size,
