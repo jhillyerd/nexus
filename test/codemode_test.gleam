@@ -362,6 +362,20 @@ pub fn gfind_stays_nil_test() {
   should.equal(list.drop(parts, 1), ["nil"])
 }
 
+/// A missing pattern errors, as in stock Lua: 5.3, 5.4, and 5.5 all read
+/// the pattern with luaL_checklstring -- there is no '.' default in any
+/// version (verified against lstrlib.c in each), so gmatch('abc') must
+/// keep failing here. Pinned so a lenient default cannot creep in.
+pub fn gmatch_missing_pattern_errors_test() {
+  let assert Ok(result) =
+    run_code(
+      "local ok, err = pcall(string.gmatch, 'abc')"
+      <> "\nreturn tostring(ok) .. ':' .. tostring(err)",
+    )
+  should.be_true(string.contains(result, "false:"))
+  should.be_true(string.contains(result, "bad argument #2 to gmatch"))
+}
+
 // ---------------------------------------------------------------------------
 // Unknown tools
 // ---------------------------------------------------------------------------
