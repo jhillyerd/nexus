@@ -411,6 +411,15 @@ pub fn m3_page_autoscroll_script_test() {
   should.be_true(string.contains(html, "#jump-latest[hidden]"))
   should.be_false(string.contains(html, "scrollHeight + 1000"))
   should.be_false(string.contains(html, "innerHTML"))
+  // A scrollTop drop only counts as a drag when the content did NOT
+  // shrink: the bubble -> chips -> bubble transition collapses blocks
+  // (the thinking chip at commit, a tool card on completion), and the
+  // browser's clamp from that shrink lands below the last set with no
+  // user gesture. Without the scrollHeight half of the guard the
+  // script reads the clamp as a drag, unpins, and following dies for
+  // the rest of the turn.
+  should.be_true(string.contains(html, "lastSetHeight"))
+  should.be_true(string.contains(html, "log.scrollHeight >= lastSetHeight - 4"))
 }
 
 /// Under auth, a plain `<script src>` cannot send an Authorization header,
