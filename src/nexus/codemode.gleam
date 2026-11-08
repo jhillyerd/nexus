@@ -240,7 +240,11 @@ fn await(
     // otherwise keep the loop fed forever past the deadline (review
     // clarification). One final non-blocking pass accepts a queued
     // Done/cancel/exit — a script that finished in time keeps its
-    // result — and everything else ends the run as Deadline.
+    // result. A stream event that raced the deadline was still
+    // produced in time, so it is acked and kept (partial output is
+    // kept; backpressure bounds this to one segment, and Done can
+    // never queue behind an un-acked stream event). Everything else
+    // ends the run as Deadline.
     True ->
       case process.selector_receive(worker_selector(events, cancel), 0) {
         Ok(FromEngine(EngineDone(report))) -> #(EngineReported(report), out)
@@ -249,6 +253,14 @@ fn await(
           EngineDied(reason),
           out,
         )
+        Ok(FromEngine(TextOut(ack, text))) -> {
+          process.send(ack, Nil)
+          #(Deadline, out_add(out, Item(text)))
+        }
+        Ok(FromEngine(ConsoleLine(ack, text))) -> {
+          process.send(ack, Nil)
+          #(Deadline, out_add(out, Console(text)))
+        }
         _ -> #(Deadline, out)
       }
     False ->
