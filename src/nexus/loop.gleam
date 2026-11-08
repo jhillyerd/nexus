@@ -11,7 +11,10 @@
 //// - the tool schema is whatever the caller passes — built once at boot
 ////   from the global config, frozen for the VM's lifetime;
 //// - cancellation: the cancel subject is threaded through every stream
-////   call; a stop between iterations aborts immediately;
+////   call; a stop between iterations aborts immediately, and a stop
+////   observed mid-round (before a dispatch) skips every not-yet-started
+////   sibling call, answering each with a synthetic cancelled result so
+////   the transcript stays a valid request shape (issue #52);
 //// - a failed stream commits nothing (the caller keeps its own transcript),
 ////   so a retry resends a byte-identical prefix.
 ////
@@ -302,6 +305,18 @@ fn reasoning_opt(text: String) -> Option(String) {
   }
 }
 
+/// Fold state for one tool round. `ExecCancelled` is entered the first
+/// time a queued Stop is observed before a dispatch: from then on every
+/// remaining call in the round is answered with a synthetic cancelled
+/// result instead of being started — a complete `http_fetch`/`web_search`
+/// sibling must not run to completion (network timeouts included) after
+/// the user already asked the turn to stop (issue #52).
+type ExecState {
+  ExecRunning(tr: Transcript)
+  ExecCancelled(tr: Transcript)
+  ExecFailed(reason: String)
+}
+
 fn execute_all(
   specs: List(ToolSpec),
   cancel: Subject(Nil),
@@ -314,31 +329,82 @@ fn execute_all(
   // mid-script `Stop` interruptible — a Stop sent while a tool runs
   // lands in the subject's queue and wakes an interruptible executor.
   let ctx = tools.ToolCtx(cancel:)
-  list.fold(assembled, Ok(tr), fn(acc, call: tool_calls.ToolCall) {
-    case acc {
-      Error(reason) -> Error(reason)
-      Ok(tr) -> {
-        let id = call_id(call)
-        let name = option.unwrap(call.name, "unknown")
-        on_event(ToolCallAssembled(id, name, call.arguments))
-        let #(ok, content) = case tool_calls.is_complete(call) {
-          False -> #(False, render_error("incomplete tool call"))
-          True ->
-            case tools.execute(specs, ctx, name, call.arguments) {
-              Ok(content) -> #(True, content)
-              Error(reason) -> #(False, render_error(reason))
+  let state =
+    list.fold(assembled, ExecRunning(tr), fn(state, call: tool_calls.ToolCall) {
+      case state {
+        ExecFailed(reason) -> ExecFailed(reason)
+        ExecCancelled(tr) -> ExecCancelled(skip_call(tr, call, on_event))
+        ExecRunning(tr) ->
+          case cancel_pending(cancel) {
+            True -> ExecCancelled(skip_call(tr, call, on_event))
+            False -> {
+              let id = call_id(call)
+              let name = option.unwrap(call.name, "unknown")
+              on_event(ToolCallAssembled(id, name, call.arguments))
+              let #(ok, content) = case tool_calls.is_complete(call) {
+                False -> #(False, render_error("incomplete tool call"))
+                True ->
+                  case tools.execute(specs, ctx, name, call.arguments) {
+                    Ok(content) -> #(True, content)
+                    Error(reason) -> #(False, render_error(reason))
+                  }
+              }
+              on_event(ToolResultEvent(id, name, ok, content))
+              ExecRunning(transcript.append_tool_result(
+                tr,
+                tool_call_id: id,
+                content: content,
+                ok: ok,
+              ))
             }
-        }
-        on_event(ToolResultEvent(id, name, ok, content))
-        Ok(transcript.append_tool_result(
-          tr,
-          tool_call_id: id,
-          content: content,
-          ok: ok,
-        ))
+          }
       }
+    })
+  case state {
+    ExecRunning(tr) | ExecCancelled(tr) -> Ok(tr)
+    ExecFailed(reason) -> Error(reason)
+  }
+}
+
+/// Non-blocking poll of the turn's one-shot cancel subject. A queued Nil
+/// means a Stop already landed — during a sibling tool's run, or inside a
+/// codemode script (whose runner consumed the Nil to end the script and
+/// re-signalled it). Consuming it here would leave the subject empty for
+/// the next stream call, so put it straight back: the same one-shot
+/// invariant codemode's re-signal keeps. The next stream round therefore
+/// aborts (`LoopStopped`) instead of issuing another model request.
+fn cancel_pending(cancel: Subject(Nil)) -> Bool {
+  case process.receive(cancel, 0) {
+    Ok(Nil) -> {
+      process.send(cancel, Nil)
+      True
     }
-  })
+    Error(Nil) -> False
+  }
+}
+
+/// Answer one assembled call with a synthetic failed result instead of
+/// running it. The wire protocol requires a tool result for every
+/// assistant tool call, so the transcript (and the session's mirrored
+/// `turn_view`) stay a valid request shape. The paired
+/// `ToolCallAssembled` is still emitted: the mirror builds each call's
+/// entry from it, and the UI keeps its call/result chip pairing.
+fn skip_call(
+  tr: Transcript,
+  call: tool_calls.ToolCall,
+  on_event: fn(LoopEvent) -> Nil,
+) -> Transcript {
+  let id = call_id(call)
+  let name = option.unwrap(call.name, "unknown")
+  on_event(ToolCallAssembled(id, name, call.arguments))
+  let content = render_error("cancelled")
+  on_event(ToolResultEvent(id, name, False, content))
+  transcript.append_tool_result(
+    tr,
+    tool_call_id: id,
+    content: content,
+    ok: False,
+  )
 }
 
 fn render_error(reason: String) -> String {
