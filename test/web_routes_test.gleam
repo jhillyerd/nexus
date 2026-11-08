@@ -205,7 +205,7 @@ fn send_authorized(req: Request(String)) -> #(Int, String) {
 /// Wait until the freshly created session's fake turn has committed.
 fn drain_turn(subject: process.Subject(session.Msg)) -> Nil {
   let sub = process.new_subject()
-  process.send(subject, session.Join(sub))
+  process.send(subject, session.Join(sub, 0))
   let _ = process.receive(sub, 2000)
   // hello + user echo + assistant + turn done
   list.each(range(4), fn(_) {

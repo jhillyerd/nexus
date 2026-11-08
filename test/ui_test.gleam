@@ -115,20 +115,24 @@ pub fn select_resets_log_and_streams_test() {
   model.model_label |> should.equal("connecting…")
 }
 
-/// Every fan-out delivery carries the emitting session's id
-/// (`session.SessionEvent`), and the update drops anything whose id is
-/// not the selected session: `Leave` cannot stop broadcasts already in
-/// the mailbox when it lands, so without the filter a session that kept
-/// streaming after being switched away from rendered into the OTHER
-/// session's view (the cross-session contamination bug).
+/// Every fan-out delivery carries the emitting session's id AND the
+/// subscriber's visit generation (`session.SessionEvent`), and the update
+/// applies a delivery only when BOTH match: the id drops deliveries from
+/// other sessions; the generation drops leftovers from an EARLIER visit
+/// to the same session (rapid A→B→A). `Leave` cannot stop broadcasts
+/// already in the mailbox when it lands, so without these filters a
+/// session that kept streaming after being switched away from rendered
+/// into the OTHER session's view, and stale same-session events
+/// duplicated history on top of the second visit's replay.
 pub fn events_from_other_session_are_dropped_test() {
   let model =
     new_model()
     |> step(ui.SessionsLoaded([summary("s-1", False), summary("s-2", False)]))
     |> step(ui.Select("s-2"))
+  let visit = model.visit
 
-  // The selected session's events flow normally.
-  let model = step(model, ui.SessionScoped("s-2", ui.Token("kept")))
+  // The selected session's CURRENT-visit events flow normally.
+  let model = step(model, ui.SessionScoped("s-2", visit, ui.Token("kept")))
   model.bubble |> should.equal(Some("kept"))
   model.streaming |> should.be_true
 
@@ -136,31 +140,46 @@ pub fn events_from_other_session_are_dropped_test() {
   // whole: no bubble growth, no streaming flag, no log lines.
   let model =
     model
-    |> step(ui.SessionScoped("s-1", ui.Token("dropped")))
+    |> step(ui.SessionScoped("s-1", visit, ui.Token("dropped")))
     |> step(ui.SessionScoped(
       "s-1",
+      visit,
       ui.ToolCallAssembled("c1", "web_search", "{}"),
     ))
-    |> step(ui.SessionScoped("s-1", ui.TurnDone))
+    |> step(ui.SessionScoped("s-1", visit, ui.TurnDone))
   model.bubble |> should.equal(Some("kept"))
   model.log |> should.equal([])
   model.pending |> should.equal([])
   model.streaming |> should.be_true
+
+  // So are SAME-session deliveries from an earlier visit (the id now
+  // matches; only the stale generation saves us).
+  let model =
+    step(model, ui.SessionScoped("s-2", visit - 1, ui.Token("stale visit")))
+  model.bubble |> should.equal(Some("kept"))
+  model.streaming |> should.be_true
 }
 
-/// Sidebar metadata is global by design (every connected tab refreshes),
-/// so a `MetaUpdated` from a NON-selected session must pass the filter
-/// while turn-stream events from the same session are dropped.
+/// Offline shape of the pass-through rule: a `MetaUpdated` from a foreign
+/// session (id and generation both foreign) reaches the update arm, whose
+/// only observable here is the refresh effect this harness drops. The
+/// end-to-end pass-through — refresh actually landing on the client — is
+/// pinned by `meta_updated_from_other_session_refreshes_sidebar_test`
+/// below.
 pub fn meta_updated_from_other_session_passes_filter_test() {
   let model =
     new_model()
     |> step(ui.SessionsLoaded([summary("s-1", False)]))
     |> step(ui.Select("s-1"))
   let model =
-    step(model, ui.SessionScoped("s-9", ui.MetaUpdated(Some("Other"), ["tag"])))
-  // The pass-through arm re-fetches the session list (an effect, dropped
-  // by this harness), so the observable verdict is that the update ran
-  // with the model intact and the selection untouched.
+    step(
+      model,
+      ui.SessionScoped(
+        "s-9",
+        model.visit + 7,
+        ui.MetaUpdated(Some("Other"), ["tag"]),
+      ),
+    )
   model.sessions |> list.map(fn(s) { s.id }) |> should.equal(["s-1"])
   model.selected |> should.equal(Some("s-1"))
 }
@@ -2379,6 +2398,80 @@ pub fn session_switch_drops_left_session_stream_test() {
   let seen = collect_until_quiet(client, 10, 10, "")
   should.be_false(string.contains(seen, "leak"))
   should.be_false(string.contains(seen, "LEAK-TOKEN"))
+}
+
+/// The `MetaUpdated` pass-through, end to end. A delivery from a foreign
+/// session (id AND generation foreign to the current visit) must reach
+/// the update and trigger the sidebar refresh. The refresh is observable
+/// because the registry's truth changed WITHOUT any broadcast first — a
+/// registry rename fans nothing out (the acting client refreshes via its
+/// own reply path) — so the only way "FRESH-TITLE" can reach the client
+/// is the foreign delivery's refresh. The event's own decoy title must
+/// never appear: the arm re-fetches truth, it does not trust payloads.
+pub fn meta_updated_from_other_session_refreshes_sidebar_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  store_mock.ensure_fixture_provider(seam)
+
+  let assert Ok(started_providers) =
+    provider_registry.start_with_model_fetcher(
+      test_config(),
+      seam,
+      process.new_name("nexus_ui_providers_meta"),
+      fn(_endpoint) { Error(openai.Transport("offline test")) },
+    )
+  let providers = started_providers.data
+  let factory_name = process.new_name("nexus_ui_factory_meta")
+  let assert Ok(_factory) =
+    factory_supervisor.start(session_registry.factory_builder(factory_name))
+  let assert Ok(started_registry) =
+    session_registry.start_with_runner(
+      test_config(),
+      factory_supervisor.get_by_name(factory_name),
+      process.new_name("nexus_ui_registry_meta"),
+      seam,
+      unused_turn_runner,
+      fn(_endpoint, _tr, _cancel, _allow_pass) {
+        Error("no utility call in this test")
+      },
+      fn() { [] },
+      fixture_resolver(),
+    )
+  let registry = started_registry.data
+
+  let assert Ok(a) =
+    session_registry.create(registry, store_mock.fixture_provider_id, "smart")
+
+  let assert Ok(runtime) =
+    lustre.start_server_component(
+      ui_runtime.app(),
+      ui.Flags(registry: registry, providers: providers, session: Some(a.id)),
+    )
+  let client = process.new_subject()
+  server_component.register_subject(client)
+  |> lustre.send(to: runtime)
+
+  // Let the connect cascade settle, then change the sidebar's truth
+  // silently: no refresh has run, so the client still shows the old view.
+  let _ = collect_until_quiet(client, 4, 4, "")
+  should.be_true(session_registry.set_title(registry, a.id, "FRESH-TITLE"))
+
+  // A foreign session's MetaUpdated passes the filter and triggers the
+  // refresh that carries the new truth to the client.
+  lustre.send(
+    to: runtime,
+    message: lustre.dispatch(ui.SessionScoped(
+      "s-other",
+      999,
+      ui.MetaUpdated(Some("HACKED"), []),
+    )),
+  )
+  let seen = wait_for_patch(client, "FRESH-TITLE", 40)
+  should.be_true(string.contains(seen, "FRESH-TITLE"))
+
+  // The foreign payload's own title is decoy data — never rendered.
+  let rest = collect_until_quiet(client, 5, 5, "")
+  should.be_false(string.contains(seen <> rest, "HACKED"))
 }
 
 /// The offline stand-in for the boot resolver (same as the golden suite).

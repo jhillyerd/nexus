@@ -18,9 +18,14 @@ import nexus/utility
 /// session's id — see `session.SessionEvent`).
 const test_session_id = "s-test"
 
-/// Wrap an expected payload in the delivered envelope.
+/// Wrap an expected payload in the delivered envelope (first visit).
 fn scoped(kind: session.EventKind) -> session.SessionEvent {
-  session.SessionEvent(test_session_id, kind)
+  scoped_at(1, kind)
+}
+
+/// Same, with an explicit visit generation.
+fn scoped_at(visit: Int, kind: session.EventKind) -> session.SessionEvent {
+  session.SessionEvent(test_session_id, visit, kind)
 }
 
 fn test_config() -> config.Config {
@@ -178,7 +183,7 @@ fn expect_hello(
 ) -> session.SessionEvent {
   let event = expect_event(sub)
   case event {
-    session.SessionEvent(_, session.Hello(model: m, messages: n, metrics: _))
+    session.SessionEvent(_, 1, session.Hello(model: m, messages: n, metrics: _))
       if m == model && n == messages
     -> event
     _ -> panic as "expected hello"
@@ -251,8 +256,17 @@ fn join(
   sess: process.Subject(session.Msg),
 ) -> process.Subject(session.SessionEvent) {
   let sub = process.new_subject()
-  process.send(sess, session.Join(sub))
+  process.send(sess, session.Join(sub, 1))
   sub
+}
+
+/// Re-subscribe an EXISTING subject with a new visit generation (the
+/// rapid A→B→A shape): later deliveries to `sub` carry generation 2.
+fn rejoin(
+  sess: process.Subject(session.Msg),
+  sub: process.Subject(session.SessionEvent),
+) -> Nil {
+  process.send(sess, session.Join(sub, 2))
 }
 
 pub fn join_replays_history_test() {
@@ -263,14 +277,17 @@ pub fn join_replays_history_test() {
   expect_event(sub) |> should.equal(scoped(session.UserEcho("hi")))
   expect_event(sub) |> should.equal(scoped(session.Token("Hello")))
   expect_event(sub) |> should.equal(scoped(session.Token(" world")))
-  let assert session.SessionEvent(_, session.TurnDone(stats)) =
+  let assert session.SessionEvent(_, 1, session.TurnDone(stats)) =
     expect_event(sub)
   stats.token_deltas |> should.equal(2)
 
   // A second subscriber joins after the turn: it gets Hello + replay.
   let sub2 = join(sess)
-  let assert session.SessionEvent(_, session.Hello(model:, messages:, metrics:)) =
-    expect_event(sub2)
+  let assert session.SessionEvent(
+    _,
+    1,
+    session.Hello(model:, messages:, metrics:),
+  ) = expect_event(sub2)
   model |> should.equal("test-alias")
   messages |> should.equal(3)
   // Reconnect replays the turn's metric sample (M2 §4.2).
@@ -291,7 +308,7 @@ pub fn completed_turn_appends_and_is_byte_stable_test() {
   expect_event(sub) |> should.equal(scoped(session.UserEcho("question")))
   expect_event(sub) |> should.equal(scoped(session.Token("Hello")))
   expect_event(sub) |> should.equal(scoped(session.Token(" world")))
-  let assert session.SessionEvent(_, session.TurnDone(_)) = expect_event(sub)
+  let assert session.SessionEvent(_, 1, session.TurnDone(_)) = expect_event(sub)
 
   let tr = session.snapshot(sess)
   transcript.length(tr) |> should.equal(3)
@@ -350,7 +367,7 @@ pub fn failed_turn_commits_nothing_test() {
   should.equal(session.send_message(sess, "will fail"), session.Sent)
   expect_event(sub) |> should.equal(scoped(session.UserEcho("will fail")))
   expect_event(sub) |> should.equal(scoped(session.Token("never committed")))
-  let assert session.SessionEvent(_, session.TurnFailed(reason)) =
+  let assert session.SessionEvent(_, 1, session.TurnFailed(reason)) =
     expect_event(sub)
   should.be_true(string.contains(reason, "non200"))
 
@@ -372,7 +389,7 @@ pub fn crashing_worker_does_not_kill_session_test() {
 
   should.equal(session.send_message(sess, "boom"), session.Sent)
   expect_event(sub) |> should.equal(scoped(session.UserEcho("boom")))
-  let assert session.SessionEvent(_, session.TurnFailed(reason)) =
+  let assert session.SessionEvent(_, 1, session.TurnFailed(reason)) =
     expect_event(sub)
   should.be_true(string.contains(reason, "worker"))
 
@@ -417,14 +434,14 @@ pub fn leave_stops_fan_out_test() {
   // completion so the negative assertion below is a verdict, not a race.
   process.send(sess, session.Leave(sub))
   let witness = join(sess)
-  let assert session.SessionEvent(_, session.Hello(_, _, _)) =
+  let assert session.SessionEvent(_, 1, session.Hello(_, _, _)) =
     expect_event(witness)
 
   should.equal(session.send_message(sess, "hi"), session.Sent)
   expect_event(witness) |> should.equal(scoped(session.UserEcho("hi")))
   expect_event(witness) |> should.equal(scoped(session.Token("Hello")))
   expect_event(witness) |> should.equal(scoped(session.Token(" world")))
-  let assert session.SessionEvent(_, session.TurnDone(_)) =
+  let assert session.SessionEvent(_, 1, session.TurnDone(_)) =
     expect_event(witness)
 
   // The departed subscriber saw none of it.
@@ -440,14 +457,18 @@ pub fn rejoin_after_leave_resubscribes_test() {
   let _ = expect_event(sub)
 
   process.send(sess, session.Leave(sub))
-  process.send(sess, session.Join(sub))
-  expect_event(sub) |> should.equal(scoped(session.Hello("test-alias", 1, [])))
+  rejoin(sess, sub)
+  // The refreshed generation rides the replay AND every later delivery:
+  // a subscriber that filters on the old generation drops the whole
+  // first-visit era.
+  expect_event(sub)
+  |> should.equal(scoped_at(2, session.Hello("test-alias", 1, [])))
 
   should.equal(session.send_message(sess, "hi"), session.Sent)
-  expect_event(sub) |> should.equal(scoped(session.UserEcho("hi")))
-  expect_event(sub) |> should.equal(scoped(session.Token("Hello")))
-  expect_event(sub) |> should.equal(scoped(session.Token(" world")))
-  let assert session.SessionEvent(_, session.TurnDone(_)) = expect_event(sub)
+  expect_event(sub) |> should.equal(scoped_at(2, session.UserEcho("hi")))
+  expect_event(sub) |> should.equal(scoped_at(2, session.Token("Hello")))
+  expect_event(sub) |> should.equal(scoped_at(2, session.Token(" world")))
+  let assert session.SessionEvent(_, 2, session.TurnDone(_)) = expect_event(sub)
 }
 
 // ---------------------------------------------------------------------------
@@ -550,7 +571,7 @@ pub fn completed_turn_preserves_first_token_time_test() {
   let _ = expect_event(sub)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
-  let assert session.SessionEvent(_, session.TurnDone(_)) = expect_event(sub)
+  let assert session.SessionEvent(_, 1, session.TurnDone(_)) = expect_event(sub)
 
   let status = session.describe(sess)
   let assert Ok(sample) = list.first(status.metrics)
@@ -746,7 +767,7 @@ pub fn tool_events_are_broadcast_test() {
   )
   expect_event(sub)
   |> should.equal(scoped(session.Token("based on the fetch: fine")))
-  let assert session.SessionEvent(_, session.TurnDone(_)) = expect_event(sub)
+  let assert session.SessionEvent(_, 1, session.TurnDone(_)) = expect_event(sub)
 
   // The full tool history is committed: system, user, assistant(call),
   // tool result, assistant text.
@@ -803,11 +824,11 @@ pub fn failed_tool_result_replays_as_failed_test() {
       "{\"error\":\"ssrf guard\"}",
     )),
   )
-  let assert session.SessionEvent(_, session.TurnDone(_)) = expect_event(sub)
+  let assert session.SessionEvent(_, 1, session.TurnDone(_)) = expect_event(sub)
 
   // A fresh subscriber (the reload path) sees the failure too.
   let sub2 = join(sess)
-  let assert session.SessionEvent(_, session.Hello(_, _, _)) =
+  let assert session.SessionEvent(_, 1, session.Hello(_, _, _)) =
     expect_event(sub2)
   expect_event(sub2) |> should.equal(scoped(session.UserEcho("fetch it")))
   expect_event(sub2)
@@ -846,7 +867,7 @@ pub fn tool_history_replays_on_rejoin_test() {
   // A fresh subscriber gets the tool history reconstructed from the
   // transcript, with tool names resolved from the assistant message.
   let sub2 = join(sess)
-  let assert session.SessionEvent(_, session.Hello(_, messages, _)) =
+  let assert session.SessionEvent(_, 1, session.Hello(_, messages, _)) =
     expect_event(sub2)
   messages |> should.equal(5)
   expect_event(sub2) |> should.equal(scoped(session.UserEcho("fetch it")))
@@ -948,7 +969,7 @@ pub fn midturn_rejoin_replays_in_flight_rounds_test() {
   // reload path — replays the finished round from the mirror: reasoning
   // rides the text message, calls/results land in broadcast order.
   let sub2 = join(sess)
-  let assert session.SessionEvent(_, session.Hello(_, _, _)) =
+  let assert session.SessionEvent(_, 1, session.Hello(_, _, _)) =
     expect_event(sub2)
   expect_event(sub2) |> should.equal(scoped(session.UserEcho("research it")))
   expect_event(sub2)
@@ -977,14 +998,15 @@ pub fn midturn_rejoin_replays_in_flight_rounds_test() {
   // the next thing either subscriber sees is the terminal event.
   let assert Ok(gate) = process.receive(gate_request, 2000)
   process.send(gate, Nil)
-  let assert session.SessionEvent(_, session.TurnDone(_)) = expect_event(sub2)
-  let assert session.SessionEvent(_, session.TurnDone(_)) = expect_event(sub)
+  let assert session.SessionEvent(_, 1, session.TurnDone(_)) =
+    expect_event(sub2)
+  let assert session.SessionEvent(_, 1, session.TurnDone(_)) = expect_event(sub)
 
   // After the turn the mirror is gone: a post-turn join replays the
   // committed transcript only — no reasoning or tool residue from the
   // mirror (the fake runner commits a plain text reply).
   let sub3 = join(sess)
-  let assert session.SessionEvent(_, session.Hello(_, messages, _)) =
+  let assert session.SessionEvent(_, 1, session.Hello(_, messages, _)) =
     expect_event(sub3)
   messages |> should.equal(3)
   expect_event(sub3) |> should.equal(scoped(session.UserEcho("research it")))
@@ -1000,7 +1022,7 @@ pub fn guard_hit_renders_terminal_failure_test() {
   should.equal(session.send_message(sess, "keep calling"), session.Sent)
   let _ = expect_event(sub)
   expect_event(sub) |> should.equal(scoped(session.LoopStatus(4, 4, "guard")))
-  let assert session.SessionEvent(_, session.TurnFailed(reason)) =
+  let assert session.SessionEvent(_, 1, session.TurnFailed(reason)) =
     expect_event(sub)
   should.be_true(string.contains(reason, "iteration guard"))
 
@@ -1048,12 +1070,12 @@ pub fn reasoning_streams_live_and_replays_on_rejoin_test() {
   expect_event(sub) |> should.equal(scoped(session.Reasoning("pondering ")))
   expect_event(sub) |> should.equal(scoped(session.Reasoning("deeply")))
   expect_event(sub) |> should.equal(scoped(session.Token("answer")))
-  let assert session.SessionEvent(_, session.TurnDone(_)) = expect_event(sub)
+  let assert session.SessionEvent(_, 1, session.TurnDone(_)) = expect_event(sub)
 
   // A fresh subscriber replays the committed reasoning just before the
   // assistant message it preceded.
   let sub2 = join(sess)
-  let assert session.SessionEvent(_, session.Hello(_, 3, _)) =
+  let assert session.SessionEvent(_, 1, session.Hello(_, 3, _)) =
     expect_event(sub2)
   expect_event(sub2) |> should.equal(scoped(session.UserEcho("think")))
   expect_event(sub2)
@@ -1623,7 +1645,8 @@ pub fn utility_rearms_when_followup_turn_fails_test() {
   let _ = expect_event(sub)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
-  let assert session.SessionEvent(_, session.TurnFailed(_)) = expect_event(sub)
+  let assert session.SessionEvent(_, 1, session.TurnFailed(_)) =
+    expect_event(sub)
 
   // Nothing has re-armed yet — a failed turn commits nothing. The held
   // attempt now reports its cancellation: its completion records the

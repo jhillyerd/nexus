@@ -285,7 +285,7 @@ pub fn killed_session_restarts_same_id_hydrated_test() {
   // survived the crash verbatim (system, user, assistant).
   let assert Ok(subject) = session_registry.get(registry, a.id)
   let sub = process.new_subject()
-  process.send(subject, session.Join(sub))
+  process.send(subject, session.Join(sub, 0))
   let _ = process.receive(sub, 2000)
   let tr = session.snapshot(subject)
   transcript.length(tr) |> should.equal(3)
