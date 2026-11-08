@@ -31,6 +31,15 @@ fn read_file(path: String) -> Result(String, String)
 @external(erlang, "nexus_store_ffi", "database_url")
 fn database_url() -> Result(String, Nil)
 
+// Run main's schema work under with_pool_settled: from pog.start onward the
+// VM must neither halt nor panic while the pool's boot is still in flight
+// (intermittent pgo_pool_sup shutdown_error report at teardown); see
+// nexus_store_ffi:with_pool_settled/2. pog.start hands back the pool's
+// queue gen_server. Panics before pog.start (schema file, DATABASE_URL,
+// URL parse) have no pool to race the halt with and stay unwrapped.
+@external(erlang, "nexus_store_ffi", "with_pool_settled")
+fn with_pool_settled(run: fn() -> Nil, queue: process.Pid) -> Nil
+
 pub fn main() -> Nil {
   let schema =
     or_panic(read_file("sql/schema.sql"), "cannot read sql/schema.sql")
@@ -45,7 +54,10 @@ pub fn main() -> Nil {
       pog.start(pog.connection_parameter(config, "timezone", "UTC")),
       "could not connect — is the database up?",
     )
-  let db = started.data
+  with_pool_settled(fn() { apply_schema(schema, started.data) }, started.pid)
+}
+
+fn apply_schema(schema: String, db: pog.Connection) -> Nil {
   let stmts = statements(schema)
   case stmts {
     [] -> io.println("migrate: schema file contains no statements (?)")

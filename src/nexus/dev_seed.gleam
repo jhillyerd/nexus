@@ -41,8 +41,17 @@ import pog
 @external(erlang, "nexus_store_ffi", "database_url")
 fn database_url() -> Result(String, Nil)
 
+// Run main's seed work under with_pool_settled: from pog.start onward the
+// VM must neither halt nor panic while the pool's boot is still in flight
+// (intermittent pgo_pool_sup shutdown_error report at teardown); see
+// nexus_store_ffi:with_pool_settled/2. pog.start hands back the pool's
+// queue gen_server. Panics before pog.start (DATABASE_URL, URL parse) have
+// no pool to race the halt with and stay unwrapped.
+@external(erlang, "nexus_store_ffi", "with_pool_settled")
+fn with_pool_settled(run: fn() -> Nil, queue: process.Pid) -> Nil
+
 pub fn main() -> Nil {
-  let db =
+  let started =
     database_url()
     |> or_panic("DATABASE_URL is not set")
     |> fn(url) { pog.url_config(process.new_name("nexus_dev_seed_pool"), url) }
@@ -50,8 +59,10 @@ pub fn main() -> Nil {
     |> pog.connection_parameter("timezone", "UTC")
     |> pog.start
     |> or_panic("could not connect — is the database up?")
-    |> fn(started) { started.data }
+  with_pool_settled(fn() { seed_provider(started.data) }, started.pid)
+}
 
+fn seed_provider(db: pog.Connection) -> Nil {
   let key =
     envoy.get("NEXUS_ENCRYPTION_KEY")
     |> or_panic("NEXUS_ENCRYPTION_KEY is not set")
