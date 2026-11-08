@@ -9,14 +9,20 @@
 %% that outgrows it is killed with reason `killed`, which the worker
 %% reports as `Script error: out of memory`. The call budget bounds
 %% retained host results, not pure-Lua allocation — this bounds that.
-%% The map form counts OFF-HEAP data too (refc binaries — which is how
-%% Luerl stores every Lua string larger than a heap binary): the plain
-%% integer form would let large-string scripts exhaust node memory
-%% without ever tripping the heap-only limit (review finding).
+%%
+%% `include_shared_binaries` is the flag that actually counts refc
+%% binaries — which is how Luerl stores every Lua string above heap-binary
+%% size — toward the limit. Verified empirically on OTP 27, 28 and 29
+%% (review finding): with `include_offheap` alone, a process holding
+%% ~1 GB of live refc binaries SURVIVES a 20k-word limit on all three;
+%% with `include_shared_binaries` it is killed on all three.
+%% `include_offheap` is kept as well for message-queue data (and the
+%% engine's mailbox is bounded by the per-event ack backpressure).
 set_max_heap_size_words(Words) ->
     erlang:process_flag(
       max_heap_size,
-      #{size => Words, kill => true, include_offheap => true}
+      #{size => Words, kill => true, include_offheap => true,
+        include_shared_binaries => true}
      ).
 
 %% Trap-exit switch returning the previous value so the worker can restore

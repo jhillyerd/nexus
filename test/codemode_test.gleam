@@ -510,3 +510,86 @@ pub fn engine_crash_reported_as_crash_test() {
   should.be_true(string.contains(result, "engine crashed"))
   should.be_false(string.contains(result, "out of memory"))
 }
+
+/// Retained Lua strings are refc binaries, so the engine's memory
+/// ceiling must count them: `include_shared_binaries` is the only
+/// max_heap_size flag that does on OTP 27–29 (`include_offheap` alone
+/// lets ~1 GB of live binaries through on all three — verified
+/// empirically). The script below retains ~200 MB across the loop; the
+/// reaper must kill the engine long before it finishes.
+pub fn string_rep_retention_killed_by_max_heap_test() {
+  let assert Error(result) =
+    codemode.run(
+      hosts: mock_hosts(),
+      timeout_ms: default_timeout_ms,
+      max_output_chars: default_cap,
+      cancel: process.new_subject(),
+      arguments: code_argument(
+        "local t = {}\n"
+        <> "for i = 1, 50 do\n"
+        <> "  t[i] = string.rep('x', 4000000)\n"
+        <> "end\n"
+        <> "return #t",
+      ),
+    )
+  should.be_true(string.contains(result, "Script failed ("))
+  should.be_true(string.contains(result, "out of memory"))
+}
+
+/// Once a segment overflows to the tail, the head is sealed: a later
+/// segment that merely *fits* the head budget must still go to the tail,
+/// or items render out of arrival order with no omission hint.
+/// (cap 40, half 20: items of 15 then 10 overflow; a trailing 5 must
+/// not sneak back into the head between them.)
+pub fn head_sealed_once_tail_starts_test() {
+  let assert Ok(result) =
+    codemode.run(
+      hosts: mock_hosts(),
+      timeout_ms: default_timeout_ms,
+      max_output_chars: 40,
+      cancel: process.new_subject(),
+      arguments: code_argument(
+        "text(string.rep('a', 15))\n"
+        <> "text(string.rep('b', 10))\n"
+        <> "text(string.rep('c', 5))",
+      ),
+    )
+  // All three items, in arrival order, nothing dropped.
+  let first = string.contains(result, "aaaaaaaaaaaaaaa\n\nbbbbbbbbbb\n\nccccc")
+  should.be_true(first)
+  should.be_false(string.contains(result, "omitted"))
+}
+
+/// A single output item larger than the tail budget must not be
+/// discarded wholesale (marker-only output for a big host result):
+/// it is front-truncated to the budget and the remainder is counted
+/// among the omitted chars.
+pub fn oversized_item_keeps_its_head_test() {
+  let assert Ok(result) =
+    codemode.run(
+      hosts: mock_hosts(),
+      timeout_ms: default_timeout_ms,
+      max_output_chars: 40,
+      cancel: process.new_subject(),
+      arguments: code_argument("return string.rep('a', 25)"),
+    )
+  // First 20 of the 25 chars kept, remainder accounted as omitted.
+  should.be_true(string.contains(result, "aaaaaaaaaaaaaaaaaaaa"))
+  should.be_true(string.contains(result, "5 chars omitted"))
+}
+
+/// Mixed tables (array part plus named fields) must encode as objects
+/// with every field present — not take the array branch and silently
+/// drop the named ones.
+pub fn mixed_table_encodes_as_object_test() {
+  let assert Ok(result) =
+    codemode.run(
+      hosts: mock_hosts(),
+      timeout_ms: default_timeout_ms,
+      max_output_chars: default_cap,
+      cancel: process.new_subject(),
+      arguments: code_argument("return {'first', status = 'ok'}"),
+    )
+  should.be_true(string.contains(result, "\"1\":\"first\""))
+  should.be_true(string.contains(result, "\"status\":\"ok\""))
+}

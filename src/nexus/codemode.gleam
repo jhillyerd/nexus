@@ -72,6 +72,9 @@ const description =
   <> "answer once — via return OR via text()/print(); returning a value "
   <> "you already emitted duplicates it (there is no deduplication). "
   <> "Sandboxed Lua only: no io, files, os.execute, or code loading. "
+  <> "Script source must be ASCII-only (the Lua compiler rejects "
+  <> "non-ASCII literals; build such strings with string.char bytes — "
+  <> "tool results may freely contain non-ASCII). "
   <> "Limits: wall-clock deadline (killed at the deadline, partial output "
   <> "kept), output size cap (head and tail kept), at most 25 tool calls, "
   <> "bounded VM memory. Keep scripts small: fetch, filter, and summarize."
@@ -364,10 +367,13 @@ type SegQueue {
 }
 
 /// Bounded accumulator: keeps a head and a tail of the arrival-ordered
-/// segments under one shared character (byte) budget — the configured cap.
-/// A segment that would overflow the head goes to the tail; the tail
-/// evicts its oldest segments (counted per kind) once past the half-cap,
-/// so worker memory stays O(cap) no matter how much the script emits.
+/// segments under one shared character budget — the configured cap. A
+/// segment that would overflow the head goes to the tail and SEALS the
+/// head (arrival order must not invert: once anything overflows, later
+/// segments always go to the tail, even if they would still fit the
+/// head — review finding); the tail evicts its oldest segments (counted
+/// per kind) once past the half-cap, so worker memory stays O(cap) no
+/// matter how much the script emits.
 type Output {
   Output(
     half_cap: Int,
@@ -377,6 +383,7 @@ type Output {
     tail_chars: Int,
     dropped_items: Int,
     dropped_console: Int,
+    sealed: Bool,
   )
 }
 
@@ -389,6 +396,7 @@ fn new_output(cap: Int) -> Output {
     tail_chars: 0,
     dropped_items: 0,
     dropped_console: 0,
+    sealed: False,
   )
 }
 
@@ -400,7 +408,11 @@ fn out_add(out: Output, seg: Segment) -> Output {
     // and print("") no console line.
     0 -> out
     size ->
-      case out.head_chars + size <= out.half_cap {
+      // `sealed`: once anything has overflowed to the tail, the head is
+      // frozen — a later segment that merely *fits* the head must still
+      // go to the tail, or output renders out of arrival order with no
+      // omission hint (review finding).
+      case out.head_chars + size <= out.half_cap && !out.sealed {
         True ->
           Output(
             ..out,
@@ -413,21 +425,64 @@ fn out_add(out: Output, seg: Segment) -> Output {
 }
 
 fn push_tail(out: Output, seg: Segment, size: Int) -> Output {
-  let #(tail, tail_chars, dropped_items, dropped_console) =
-    evict_loop(
-      SegQueue(out.tail.front, [seg, ..out.tail.back]),
-      out.tail_chars + size,
-      out.dropped_items,
-      out.dropped_console,
-      out.half_cap,
-    )
-  Output(
-    ..out,
-    tail: tail,
-    tail_chars: tail_chars,
-    dropped_items: dropped_items,
-    dropped_console: dropped_console,
-  )
+  // An oversized segment (larger than the tail budget) would evict
+  // itself and leave a marker-only result — a single big item (e.g. a
+  // large host result) would vanish entirely (review finding).
+  // Front-truncate it to the budget and count the remainder among the
+  // omitted chars, so its head survives. A zero budget keeps nothing.
+  let #(seg, size, extra_items, extra_console) = case size > out.half_cap {
+    False -> #(seg, size, 0, 0)
+    True ->
+      case out.half_cap {
+        0 ->
+          case seg {
+            Item(_) -> #(seg, 0, size, 0)
+            Console(_) -> #(seg, 0, 0, size)
+          }
+        budget -> {
+          let kept = string.slice(seg_text(seg), 0, budget)
+          let dropped = size - budget
+          case seg {
+            Item(_) -> #(Item(kept), budget, dropped, 0)
+            Console(_) -> #(Console(kept), budget, 0, dropped)
+          }
+        }
+      }
+  }
+  case size {
+    0 ->
+      Output(
+        ..out,
+        sealed: True,
+        dropped_items: out.dropped_items + extra_items,
+        dropped_console: out.dropped_console + extra_console,
+      )
+    _ -> {
+      let #(tail, tail_chars, dropped_items, dropped_console) =
+        evict_loop(
+          SegQueue(out.tail.front, [seg, ..out.tail.back]),
+          out.tail_chars + size,
+          out.dropped_items + extra_items,
+          out.dropped_console + extra_console,
+          out.half_cap,
+        )
+      Output(
+        ..out,
+        sealed: True,
+        tail: tail,
+        tail_chars: tail_chars,
+        dropped_items: dropped_items,
+        dropped_console: dropped_console,
+      )
+    }
+  }
+}
+
+fn seg_text(seg: Segment) -> String {
+  case seg {
+    Item(text) -> text
+    Console(text) -> text
+  }
 }
 
 fn evict_loop(
@@ -813,6 +868,17 @@ const preamble_lua =
   <> "\n  if arr then"
   <> "\n    for i = 1, n do"
   <> "\n      if v[i] == nil then"
+  <> "\n        arr = false"
+  <> "\n        break"
+  <> "\n      end"
+  <> "\n    end"
+  <> "\n  end"
+  <> "\n  if arr then"
+  <> "\n    -- Dense 1..n; still an array only if no key falls outside it:"
+  <> "\n    -- a mixed table like {'a', status = 'b'} must encode as an"
+  <> "\n    -- object, not silently drop its named fields."
+  <> "\n    for k in pairs(v) do"
+  <> "\n      if type(k) ~= 'number' or k < 1 or k > n or k % 1 ~= 0 then"
   <> "\n        arr = false"
   <> "\n        break"
   <> "\n      end"
