@@ -90,7 +90,8 @@ pub type Config {
     /// Codemode: per-script wall-clock deadline in ms.
     codemode_timeout_ms: Int,
     /// Codemode: rendered-output cap in characters (head and tail kept,
-    /// omission noted).
+    /// omission noted; item/console separators are budgeted with their
+    /// segments — issue #53).
     codemode_max_output_chars: Int,
   )
 }

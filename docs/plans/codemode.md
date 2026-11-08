@@ -44,7 +44,9 @@ EYG and ports documented as future alternatives behind the same seam.
   getenv/remove/rename/tmpname`, `package`, `load/loadfile/require/dofile/
   loadstring`). The only world-access is the host table. Codemode is excluded
   from its own `tools` table (recursion guard).
-- **Budgets**: four bounds — wall-clock deadline, output cap, per-script
+- **Budgets**: four bounds — wall-clock deadline, output cap (separator-
+  inclusive: the renderer's item/console joins count against it — issue
+  #53), per-script
   **tool-call budget** (constant, ~25 calls; exceeding it fails the script),
   and a **VM memory bound**. The call budget bounds retained *host results*
   (each is already truncated by its own tool's limits, so host-derived memory
