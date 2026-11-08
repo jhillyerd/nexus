@@ -24,7 +24,9 @@
 ////
 //// Bounds (all documented in the tool description):
 //// - wall-clock deadline (config, default 30 s; kill, not preemption),
-//// - output cap (config; head and tail kept, omission noted),
+//// - output cap (config; head and tail kept, omission noted; the
+////   renderer's item/console separators are budgeted with their
+////   segments — issue #53),
 //// - tool-call budget (constant, 25 calls — bounds retained host results,
 ////   each already truncated by its own tool's limits),
 //// - engine heap ceiling (`max_heap_size`, ~64 MiB in words — bounds the
@@ -405,7 +407,9 @@ type SegQueue {
 }
 
 /// Bounded accumulator: keeps a head and a tail of the arrival-ordered
-/// segments under one shared character budget — the configured cap. A
+/// segments under one shared character budget — the configured cap,
+/// charged separator-inclusively (the joins `render_section` inserts
+/// count against the cap, issue #53). A
 /// segment that would overflow the head goes to the tail and SEALS the
 /// head (arrival order must not invert: once anything overflows, later
 /// segments always go to the tail, even if they would still fit the
@@ -455,41 +459,52 @@ fn out_add(out: Output, seg: Segment) -> Output {
     // under the cap (review finding). Drop them: text("") adds no item
     // and print("") no console line.
     0 -> out
-    size ->
+    _ -> {
+      // The segment budgets its separator WITH its text (issue #53):
+      // render_section joins items with a blank line and console lines
+      // with a newline, so those joins are part of the rendered output
+      // and a separator can be the drop trigger just like a character.
+      let charge = seg_charge(seg)
       // `sealed`: once anything has overflowed to the tail, the head is
       // frozen — a later segment that merely *fits* the head must still
       // go to the tail, or output renders out of arrival order with no
       // omission hint (review finding).
-      case out.head_chars + size <= out.half_cap && !out.sealed {
+      case out.head_chars + charge <= out.half_cap && !out.sealed {
         True ->
           Output(
             ..out,
             head: [seg, ..out.head],
-            head_chars: out.head_chars + size,
+            head_chars: out.head_chars + charge,
           )
-        False -> push_tail(out, seg, size)
+        False -> push_tail(out, seg, charge)
       }
+    }
   }
 }
 
-fn push_tail(out: Output, seg: Segment, size: Int) -> Output {
-  // An oversized segment (larger than the tail budget) would evict
-  // itself and leave a marker-only result — a single big item (e.g. a
-  // large host result) would vanish entirely (review finding).
-  // Front-truncate it to the budget and count the remainder among the
-  // omitted chars, so its head survives. A zero budget keeps nothing.
-  let #(seg, size, extra_items, extra_console) = case size > out.half_cap {
-    False -> #(seg, size, 0, 0)
+fn push_tail(out: Output, seg: Segment, charge: Int) -> Output {
+  // An oversized segment (separator-inclusive charge above the tail
+  // budget) would evict itself and leave a marker-only result — a
+  // single big item (e.g. a large host result) would vanish entirely
+  // (review finding). Front-truncate it to the budget and count the
+  // remainder among the omitted chars, so its head survives. A zero
+  // budget keeps nothing. The truncated segment is charged at the
+  // budget itself: its text fills the half with no room left to also
+  // budget the join around it (issue #53) — at most one such segment
+  // survives per section, so the render stays within cap + one
+  // separator.
+  let #(seg, charge, extra_items, extra_console) = case charge > out.half_cap {
+    False -> #(seg, charge, 0, 0)
     True ->
       case out.half_cap {
         0 ->
           case seg {
-            Item(_) -> #(seg, 0, size, 0)
-            Console(_) -> #(seg, 0, 0, size)
+            Item(_) -> #(seg, 0, seg_size(seg), 0)
+            Console(_) -> #(seg, 0, 0, seg_size(seg))
           }
         budget -> {
           let kept = string.slice(seg_text(seg), 0, budget)
-          let dropped = size - budget
+          let dropped = seg_size(seg) - budget
           case seg {
             Item(_) -> #(Item(kept), budget, dropped, 0)
             Console(_) -> #(Console(kept), budget, 0, dropped)
@@ -497,7 +512,7 @@ fn push_tail(out: Output, seg: Segment, size: Int) -> Output {
         }
       }
   }
-  case size {
+  case charge {
     0 ->
       Output(
         ..out,
@@ -509,7 +524,7 @@ fn push_tail(out: Output, seg: Segment, size: Int) -> Output {
       let #(tail, tail_chars, dropped_items, dropped_console) =
         evict_loop(
           SegQueue(out.tail.front, [seg, ..out.tail.back]),
-          out.tail_chars + size,
+          out.tail_chars + charge,
           out.dropped_items + extra_items,
           out.dropped_console + extra_console,
           out.half_cap,
@@ -568,6 +583,27 @@ fn seg_size(seg: Segment) -> Int {
     Item(text) -> string.length(text)
     Console(text) -> string.length(text)
   }
+}
+
+/// Separator `render_section` inserts AFTER this segment when another
+/// one follows it in the same section: a blank line between output
+/// items, a newline between console lines. Issue #53: these are part
+/// of the rendered output, so every segment budgets its separator with
+/// its text — otherwise 32,768 one-character items render ~98k chars
+/// (~3x the cap) before status metadata. Charging every segment (not
+/// all but each section's first) overcounts by at most one separator
+/// per section, keeping the bound conservative without tracking
+/// section positions through head sealing and tail eviction.
+fn seg_sep(seg: Segment) -> Int {
+  case seg {
+    Item(_) -> 2
+    Console(_) -> 1
+  }
+}
+
+/// A segment's budgeted size: its text plus the join around it.
+fn seg_charge(seg: Segment) -> Int {
+  seg_size(seg) + seg_sep(seg)
 }
 
 fn seg_pop(q: SegQueue) -> Result(#(Segment, SegQueue), Nil) {

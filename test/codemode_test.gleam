@@ -320,6 +320,48 @@ pub fn output_truncated_head_and_tail_test() {
 }
 
 // ---------------------------------------------------------------------------
+// Issue #53: separators are budgeted against the output cap
+// ---------------------------------------------------------------------------
+
+/// The renderer joins output items with a blank line and console lines
+/// with a newline — joins that are part of the rendered output, so the
+/// accumulator budgets them with their segments. The issue's repro:
+/// 32,768 one-character items at the default cap used to render ~98k
+/// chars (~3x cap) before status metadata.
+pub fn item_separator_flood_stays_within_cap_test() {
+  let assert Ok(result) =
+    codemode.run(
+      hosts: mock_hosts(),
+      timeout_ms: default_timeout_ms,
+      max_output_chars: default_cap,
+      cancel: process.new_subject(),
+      arguments: code_argument("for i = 1, 32768 do text('x') end"),
+    )
+  // Status line, omission note, and the joins around them add ~100
+  // chars of metadata on top of the budgeted body (pre-fix: ~98k).
+  should.be_true(string.length(result) < default_cap + 200)
+  should.be_true(string.contains(result, "chars omitted"))
+}
+
+/// Console lines join with a single newline; the same bound applies.
+/// 1000 one-character prints at cap 100: each line charges 2 (text +
+/// separator), so the halves keep ~25 lines each and the console body
+/// renders ~50 lines + separators ≈ under the cap (pre-fix: ~2x).
+pub fn console_separator_flood_stays_within_cap_test() {
+  let assert Ok(result) =
+    codemode.run(
+      hosts: mock_hosts(),
+      timeout_ms: default_timeout_ms,
+      max_output_chars: 100,
+      cancel: process.new_subject(),
+      arguments: code_argument("for i = 1, 1000 do print('y') end"),
+    )
+  // Console body ≤ cap; status line and <console_output> tags wrap it.
+  should.be_true(string.length(result) < 250)
+  should.be_true(string.contains(result, "chars omitted"))
+}
+
+// ---------------------------------------------------------------------------
 // Registry envelope (KV-cache contract rule 4)
 // ---------------------------------------------------------------------------
 
