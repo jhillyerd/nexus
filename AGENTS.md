@@ -52,6 +52,20 @@ The persistence layer lives in `sql/schema.sql` + `src/nexus/store/sql/`.
   `messages`, so it is structurally unable to change a request byte; a
   turn that produced only reasoning commits nothing (no empty assistant
   messages — the pre-reasoning `"" -> tr` guard still holds).
+- **`session_message.created_at` is display-only wall-clock** (nullable
+  `timestamptz`, read through the `coalesce(..., 0)` sentinel because the
+  wire protocol reports expression columns as NOT NULL —
+  `load_messages.sql`). It rides the transcript's timestamp sidecar
+  (`transcript.stamp` / `transcript.stamped_at`), never `messages`, and
+  drives the chat log's per-message ages. Legacy rows are NULL (no
+  honest backfill exists) and render without a timestamp.
+- **One clock for message timestamps.** The sidecar stamp set at
+  append time is the ONLY source: terminal events carry
+  `transcript.last_text_stamp`, the loop broadcasts the flush stamp on
+  `ToolCallAssembled` (the UI's delta-time flush commit restamps from
+  it — that commit is deliberately unstamped, never UI-clock), and
+  replay events carry `stamped_at`. The UI never reads a clock to stamp
+  a line.
 
 ## Changing the schema or queries
 

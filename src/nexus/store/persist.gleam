@@ -621,10 +621,13 @@ fn append_row(
   seq: Int,
   row: store.MessageRow,
 ) -> Result(pog.Returned(Nil), pog.QueryError) {
+  // The stamp travels as epoch seconds; the queries' `nullif($n, 0)`
+  // sentinel turns the unstamped 0 back into NULL (see the append_*.sql
+  // files).
   case row {
-    store.UserRow(content) ->
-      sql.append_plain_message(db, id, seq, "user", content, "")
-    store.AssistantRow(content, reasoning) ->
+    store.UserRow(content, at) ->
+      sql.append_plain_message(db, id, seq, "user", content, "", at_param(at))
+    store.AssistantRow(content, reasoning, at) ->
       sql.append_plain_message(
         db,
         id,
@@ -632,8 +635,9 @@ fn append_row(
         "assistant",
         content,
         option.unwrap(reasoning, ""),
+        at_param(at),
       )
-    store.ToolCallRow(content, call_id, name, arguments, reasoning) ->
+    store.ToolCallRow(content, call_id, name, arguments, reasoning, at) ->
       sql.append_tool_call(
         db,
         id,
@@ -643,10 +647,24 @@ fn append_row(
         name,
         arguments,
         option.unwrap(reasoning, ""),
+        at_param(at),
       )
-    store.ToolResultRow(call_id, name, ok, content) ->
-      sql.append_tool_result(db, id, seq, content, call_id, name, ok)
+    store.ToolResultRow(call_id, name, ok, content, at) ->
+      sql.append_tool_result(
+        db,
+        id,
+        seq,
+        content,
+        call_id,
+        name,
+        ok,
+        at_param(at),
+      )
   }
+}
+
+fn at_param(at: option.Option(Int)) -> Int {
+  option.unwrap(at, 0)
 }
 
 /// Metadata write-through outcome: errors are logged and surfaced, never
@@ -745,8 +763,14 @@ fn key_param(key: option.Option(BitArray)) -> BitArray {
 
 fn message_row_from_row(row: sql.LoadMessagesRow) -> store.MessageRow {
   let name = row.tool_name |> option.unwrap("tool")
+  // The stamp rides the 0 sentinel (see load_messages.sql): 0 decodes
+  // back to None, so unstamped legacy rows render without a timestamp.
+  let at = case row.created_s {
+    0 -> None
+    seconds -> Some(seconds)
+  }
   case row.role, row.tool_call_id {
-    "user", _ -> store.UserRow(row.content)
+    "user", _ -> store.UserRow(row.content, at)
     "assistant", Some(call_id) ->
       store.ToolCallRow(
         content: row.content,
@@ -754,14 +778,16 @@ fn message_row_from_row(row: sql.LoadMessagesRow) -> store.MessageRow {
         name: name,
         arguments: row.tool_args |> option.unwrap(""),
         reasoning: row.reasoning,
+        at: at,
       )
-    "assistant", None -> store.AssistantRow(row.content, row.reasoning)
+    "assistant", None -> store.AssistantRow(row.content, row.reasoning, at)
     "tool", Some(call_id) ->
       store.ToolResultRow(
         call_id: call_id,
         name: name,
         ok: row.tool_ok |> option.unwrap(True),
         content: row.content,
+        at: at,
       )
     "tool", None ->
       store.ToolResultRow(
@@ -769,8 +795,9 @@ fn message_row_from_row(row: sql.LoadMessagesRow) -> store.MessageRow {
         name: name,
         ok: row.tool_ok |> option.unwrap(True),
         content: row.content,
+        at: at,
       )
-    _, _ -> store.AssistantRow(row.content, row.reasoning)
+    _, _ -> store.AssistantRow(row.content, row.reasoning, at)
   }
 }
 

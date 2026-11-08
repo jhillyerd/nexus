@@ -33,6 +33,7 @@ import gleam/string
 import glopenai/chat
 import glopenai/shared
 import nexus/openai
+import nexus/timing
 import nexus/tool_calls.{type Accumulator}
 import nexus/tools.{type ToolSpec}
 import nexus/transcript.{type Options, type Transcript}
@@ -70,8 +71,17 @@ pub type StreamFn =
 pub type LoopEvent {
   /// A raw transport event forwarded while streaming (token/tool deltas).
   StreamEvent(openai.StreamEvent)
-  /// One fully-assembled native tool call about to be executed.
-  ToolCallAssembled(id: String, name: String, arguments: String)
+  /// One fully-assembled native tool call about to be executed. `at` is
+  /// the flushed round's stamp — the wall-clock epoch the round's
+  /// assistant message was appended (and its text committed) at — so
+  /// subscribers can timestamp the text they committed at first-delta
+  /// time with the session's own clock (see `nexus/ui`'s restamp).
+  ToolCallAssembled(
+    id: String,
+    name: String,
+    arguments: String,
+    at: Option(Int),
+  )
   /// A tool finished; `content` is the (already truncated) result or a
   /// rendered error object.
   ToolResultEvent(call_id: String, name: String, ok: Bool, content: String)
@@ -198,8 +208,10 @@ fn iterate(
             }
             False -> {
               on_event(LoopStatus(iteration, max_iterations, "tools"))
-              let tr2 = append_calls(tr, partial_text, assembled)
-              case execute_all(specs, cancel, assembled, on_event, tr2) {
+              let #(tr2, flushed_at) = append_calls(tr, partial_text, assembled)
+              case
+                execute_all(specs, cancel, assembled, flushed_at, on_event, tr2)
+              {
                 // A Stop observed mid-round ends the turn here: re-entering
                 // the stream would open one more model request before its
                 // cancel select fires (stream_request starts Hackney
@@ -267,7 +279,7 @@ fn append_calls(
   tr: Transcript,
   text: String,
   assembled: List(tool_calls.ToolCall),
-) -> Transcript {
+) -> #(Transcript, Int) {
   let calls =
     list.map(assembled, fn(call: tool_calls.ToolCall) {
       #(call_id(call), option.unwrap(call.name, "unknown"), call.arguments)
@@ -278,12 +290,19 @@ fn append_calls(
   }
   // Emit assembled events here (not during streaming): arguments are only
   // complete once the stream closes. The caller already saw the fragments.
-  transcript.append_assistant_tool_calls(
-    tr,
-    text: text,
-    calls: calls,
-    reasoning: reasoning_opt(take_reasoning()),
-  )
+  // The flush's stamp is returned beside the transcript: the appended
+  // message's sidecar entry IS the round's committed timestamp, and the
+  // assembled events below carry it to subscribers.
+  let flushed_at = timing.wall_now_s()
+  let tr2 =
+    transcript.append_assistant_tool_calls(
+      tr,
+      text: text,
+      calls: calls,
+      reasoning: reasoning_opt(take_reasoning()),
+    )
+    |> transcript.stamp(flushed_at)
+  #(tr2, flushed_at)
 }
 
 /// Commit one iteration's final assistant output (no tool calls): the
@@ -300,6 +319,7 @@ fn append_iteration_output(tr: Transcript, partial_text: String) -> Transcript {
         text,
         reasoning: reasoning_opt(take_reasoning()),
       )
+      |> transcript.stamp(timing.wall_now_s())
   }
 }
 
@@ -335,6 +355,7 @@ fn execute_all(
   specs: List(ToolSpec),
   cancel: Subject(Nil),
   assembled: List(tool_calls.ToolCall),
+  flushed_at: Int,
   on_event: fn(LoopEvent) -> Nil,
   tr: Transcript,
 ) -> ExecOutcome {
@@ -343,17 +364,19 @@ fn execute_all(
   // mid-script `Stop` interruptible — a Stop sent while a tool runs
   // lands in the subject's queue and wakes an interruptible executor.
   let ctx = tools.ToolCtx(cancel:)
+  let stamped = Some(flushed_at)
   let state =
     list.fold(assembled, ExecRunning(tr), fn(state, call: tool_calls.ToolCall) {
       case state {
-        ExecCancelled(tr) -> ExecCancelled(skip_call(tr, call, on_event))
+        ExecCancelled(tr) ->
+          ExecCancelled(skip_call(tr, call, stamped, on_event))
         ExecRunning(tr) ->
           case cancel_pending(cancel) {
-            True -> ExecCancelled(skip_call(tr, call, on_event))
+            True -> ExecCancelled(skip_call(tr, call, stamped, on_event))
             False -> {
               let id = call_id(call)
               let name = option.unwrap(call.name, "unknown")
-              on_event(ToolCallAssembled(id, name, call.arguments))
+              on_event(ToolCallAssembled(id, name, call.arguments, stamped))
               let #(ok, content) = case tool_calls.is_complete(call) {
                 False -> #(False, render_error("incomplete tool call"))
                 True ->
@@ -363,12 +386,15 @@ fn execute_all(
                   }
               }
               on_event(ToolResultEvent(id, name, ok, content))
-              ExecRunning(transcript.append_tool_result(
-                tr,
-                tool_call_id: id,
-                content: content,
-                ok: ok,
-              ))
+              ExecRunning(
+                transcript.append_tool_result(
+                  tr,
+                  tool_call_id: id,
+                  content: content,
+                  ok: ok,
+                )
+                |> transcript.stamp(timing.wall_now_s()),
+              )
             }
           }
       }
@@ -397,16 +423,18 @@ fn cancel_pending(cancel: Subject(Nil)) -> Bool {
 /// running it. The wire protocol requires a tool result for every
 /// assistant tool call, so the transcript (and the session's mirrored
 /// `turn_view`) stay a valid request shape. The paired
-/// `ToolCallAssembled` is still emitted: the mirror builds each call's
-/// entry from it, and the UI keeps its call/result chip pairing.
+/// `ToolCallAssembled` is still emitted — with the round's own stamp, as
+/// everywhere: the mirror builds each call's entry from it, and the UI
+/// keeps its call/result chip pairing.
 fn skip_call(
   tr: Transcript,
   call: tool_calls.ToolCall,
+  flushed_at: Option(Int),
   on_event: fn(LoopEvent) -> Nil,
 ) -> Transcript {
   let id = call_id(call)
   let name = option.unwrap(call.name, "unknown")
-  on_event(ToolCallAssembled(id, name, call.arguments))
+  on_event(ToolCallAssembled(id, name, call.arguments, flushed_at))
   let content = render_error("cancelled")
   on_event(ToolResultEvent(id, name, False, content))
   transcript.append_tool_result(
@@ -415,6 +443,7 @@ fn skip_call(
     content: content,
     ok: False,
   )
+  |> transcript.stamp(timing.wall_now_s())
 }
 
 fn render_error(reason: String) -> String {

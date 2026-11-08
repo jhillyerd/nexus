@@ -3,6 +3,7 @@
 //// and view rendering (element/text APIs only, no innerHTML).
 
 import gleam/erlang/process
+import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -19,6 +20,7 @@ import nexus/provider
 import nexus/provider_registry
 import nexus/session
 import nexus/session_registry
+import nexus/timing
 import nexus/transcript
 import nexus/ui
 import nexus/ui_runtime
@@ -106,7 +108,7 @@ pub fn select_resets_log_and_streams_test() {
     new_model()
     |> step(ui.SessionsLoaded([summary("s-1", False), summary("s-2", False)]))
     |> step(ui.Hello("smart"))
-    |> step(ui.UserEcho("hi"))
+    |> step(ui.UserEcho("hi", None))
     |> step(ui.Select("s-2"))
   model.selected |> should.equal(Some("s-2"))
   model.log |> should.equal([])
@@ -144,9 +146,9 @@ pub fn events_from_other_session_are_dropped_test() {
     |> step(ui.SessionScoped(
       "s-1",
       visit,
-      ui.ToolCallAssembled("c1", "web_search", "{}"),
+      ui.ToolCallAssembled("c1", "web_search", "{}", None),
     ))
-    |> step(ui.SessionScoped("s-1", visit, ui.TurnDone))
+    |> step(ui.SessionScoped("s-1", visit, ui.TurnDone(None)))
   model.bubble |> should.equal(Some("kept"))
   model.log |> should.equal([])
   model.pending |> should.equal([])
@@ -196,7 +198,7 @@ pub fn vanished_selection_ends_session_test() {
     new_model()
     |> step(ui.SessionsLoaded([summary("s-1", False)]))
     |> step(ui.Hello("smart"))
-    |> step(ui.UserEcho("hi"))
+    |> step(ui.UserEcho("hi", None))
     |> step(ui.Token("par"))
   let model = model |> step(ui.SessionsLoaded([]))
   model.selected |> should.equal(None)
@@ -242,28 +244,29 @@ pub fn tokens_assemble_into_bubble_test() {
 pub fn turn_done_commits_bubble_test() {
   let model =
     new_model()
-    |> step(ui.UserEcho("hi"))
+    |> step(ui.UserEcho("hi", None))
     |> step(ui.Token("Hel"))
     |> step(ui.Token("lo"))
-    |> step(ui.TurnDone)
+    |> step(ui.TurnDone(None))
   model.bubble |> should.equal(None)
   model.streaming |> should.be_false
   model.log
   |> list.reverse
-  |> should.equal([ui.UserLine("hi"), ui.AssistantLine("Hello")])
+  |> log_shapes
+  |> should.equal([ui.UserLine("hi", None), ui.AssistantLine("Hello", None)])
 }
 
 pub fn turn_stopped_commits_partial_test() {
-  let model = new_model() |> step(ui.Token("par")) |> step(ui.TurnStopped)
+  let model = new_model() |> step(ui.Token("par")) |> step(ui.TurnStopped(None))
   model.bubble |> should.equal(None)
-  model.log |> should.equal([ui.AssistantLine("par")])
+  model.log |> log_shapes |> should.equal([ui.AssistantLine("par", None)])
 }
 
 pub fn turn_failed_discards_partial_test() {
   let model =
     new_model()
     |> step(ui.Token("par"))
-    |> step(ui.TurnFailed("boom"))
+    |> step(ui.TurnFailed("boom", None))
   model.bubble |> should.equal(None)
   model.streaming |> should.be_false
   model.log
@@ -273,11 +276,14 @@ pub fn turn_failed_discards_partial_test() {
 pub fn replay_events_render_in_order_test() {
   let model =
     new_model()
-    |> step(ui.AssistantFull("old answer"))
-    |> step(ui.UserEcho("hi"))
+    |> step(ui.AssistantFull("old answer", None))
+    |> step(ui.UserEcho("hi", None))
   model.log
   |> list.reverse
-  |> should.equal([ui.AssistantLine("old answer"), ui.UserLine("hi")])
+  |> should.equal([
+    ui.AssistantLine("old answer", None),
+    ui.UserLine("hi", None),
+  ])
 }
 
 // ---------------------------------------------------------------------------
@@ -394,16 +400,16 @@ pub fn sessions_loaded_reconcile_skips_changed_selection_test() {
 pub fn event_translation_test() {
   ui.from_session_event(session.Hello("smart", 3, []))
   |> should.equal(ui.Hello("smart"))
-  ui.from_session_event(session.UserEcho("hi"))
-  |> should.equal(ui.UserEcho("hi"))
-  ui.from_session_event(session.AssistantFull("full"))
-  |> should.equal(ui.AssistantFull("full"))
+  ui.from_session_event(session.UserEcho("hi", Some(1_700_000_000)))
+  |> should.equal(ui.UserEcho("hi", Some(1_700_000_000)))
+  ui.from_session_event(session.AssistantFull("full", None))
+  |> should.equal(ui.AssistantFull("full", None))
   ui.from_session_event(session.Token("t"))
   |> should.equal(ui.Token("t"))
-  ui.from_session_event(session.TurnStopped(4))
-  |> should.equal(ui.TurnStopped)
-  ui.from_session_event(session.TurnFailed("x"))
-  |> should.equal(ui.TurnFailed("x"))
+  ui.from_session_event(session.TurnStopped(4, Some(1_700_000_000)))
+  |> should.equal(ui.TurnStopped(Some(1_700_000_000)))
+  ui.from_session_event(session.TurnFailed("x", None))
+  |> should.equal(ui.TurnFailed("x", None))
 }
 
 // ---------------------------------------------------------------------------
@@ -443,14 +449,15 @@ pub fn tool_delta_keeps_parallel_calls_separate_test() {
 pub fn tool_delta_commits_bubble_first_test() {
   let model =
     new_model()
-    |> step(ui.UserEcho("look this up"))
+    |> step(ui.UserEcho("look this up", None))
     |> step(ui.Token("checking"))
     |> step(ui.ToolCallDelta(0, Some("call_1"), Some("web_search"), "{}"))
   model.log
   |> list.reverse
+  |> log_shapes
   |> should.equal([
-    ui.UserLine("look this up"),
-    ui.AssistantLine("checking"),
+    ui.UserLine("look this up", None),
+    ui.AssistantLine("checking", None),
   ])
   model.bubble |> should.equal(None)
 }
@@ -459,7 +466,12 @@ pub fn tool_assembled_replaces_pending_with_running_card_test() {
   let model =
     new_model()
     |> step(ui.ToolCallDelta(0, Some("call_1"), Some("web_search"), "{\"q"))
-    |> step(ui.ToolCallAssembled("call_1", "web_search", "{\"query\":\"cats\"}"))
+    |> step(ui.ToolCallAssembled(
+      "call_1",
+      "web_search",
+      "{\"query\":\"cats\"}",
+      None,
+    ))
   model.pending |> should.equal([])
   model.log
   |> should.equal([
@@ -486,7 +498,12 @@ pub fn tools_phase_clears_stale_pending_test() {
 pub fn tool_result_completes_matching_card_test() {
   let model =
     new_model()
-    |> step(ui.ToolCallAssembled("call_1", "web_search", "{\"query\":\"cats\"}"))
+    |> step(ui.ToolCallAssembled(
+      "call_1",
+      "web_search",
+      "{\"query\":\"cats\"}",
+      None,
+    ))
     |> step(ui.ToolResult(
       "call_1",
       "web_search",
@@ -508,7 +525,7 @@ pub fn tool_result_completes_matching_card_test() {
 pub fn tool_result_failure_marks_card_failed_test() {
   let model =
     new_model()
-    |> step(ui.ToolCallAssembled("call_9", "http_fetch", "{}"))
+    |> step(ui.ToolCallAssembled("call_9", "http_fetch", "{}", None))
     |> step(ui.ToolResult("call_9", "http_fetch", False, "{\"error\":\"ssrf\"}"))
   let assert [ui.ToolLine(_, _, _, status, result), ..] = model.log
   status |> should.equal(ui.ToolDone(False))
@@ -528,59 +545,61 @@ pub fn unmatched_tool_result_becomes_completed_card_test() {
 pub fn turn_done_commits_tool_round_and_clears_loop_test() {
   let model =
     new_model()
-    |> step(ui.UserEcho("search"))
+    |> step(ui.UserEcho("search", None))
     |> step(ui.Token("looking"))
-    |> step(ui.ToolCallAssembled("call_1", "web_search", "{}"))
+    |> step(ui.ToolCallAssembled("call_1", "web_search", "{}", None))
     |> step(ui.ToolResult("call_1", "web_search", True, "[]"))
     |> step(ui.LoopStatus(2, 8, "request"))
     |> step(ui.Token("found it"))
-    |> step(ui.TurnDone)
+    |> step(ui.TurnDone(None))
   model.loop |> should.equal(None)
   model.streaming |> should.be_false
   model.log
   |> list.reverse
+  |> log_shapes
   |> should.equal([
-    ui.UserLine("search"),
-    ui.AssistantLine("looking"),
+    ui.UserLine("search", None),
+    ui.AssistantLine("looking", None),
     ui.ToolLine("call_1", "web_search", "{}", ui.ToolDone(True), Some("[]")),
-    ui.AssistantLine("found it"),
+    ui.AssistantLine("found it", None),
   ])
 }
 
 pub fn turn_stopped_drops_pending_keeps_completed_rounds_test() {
   let model =
     new_model()
-    |> step(ui.ToolCallAssembled("call_1", "http_fetch", "{}"))
+    |> step(ui.ToolCallAssembled("call_1", "http_fetch", "{}", None))
     |> step(ui.ToolResult("call_1", "http_fetch", True, "ok"))
     |> step(ui.ToolCallDelta(0, Some("call_2"), Some("web_search"), "{\"q"))
     |> step(ui.Token("partial"))
-    |> step(ui.TurnStopped)
+    |> step(ui.TurnStopped(None))
   model.pending |> should.equal([])
   model.log
   |> list.reverse
+  |> log_shapes
   |> should.equal([
     ui.ToolLine("call_1", "http_fetch", "{}", ui.ToolDone(True), Some("ok")),
-    ui.AssistantLine("partial"),
+    ui.AssistantLine("partial", None),
   ])
 }
 
 pub fn turn_failed_rolls_back_uncommitted_turn_test() {
   let model =
     new_model()
-    |> step(ui.AssistantFull("previous answer"))
-    |> step(ui.UserEcho("search"))
+    |> step(ui.AssistantFull("previous answer", None))
+    |> step(ui.UserEcho("search", None))
     |> step(ui.Token("looking"))
-    |> step(ui.ToolCallAssembled("call_1", "web_search", "{}"))
+    |> step(ui.ToolCallAssembled("call_1", "web_search", "{}", None))
     |> step(ui.ToolResult("call_1", "web_search", True, "[]"))
     |> step(ui.LoopStatus(2, 8, "request"))
     |> step(ui.Token("more"))
-    |> step(ui.TurnFailed("transport error: boom"))
+    |> step(ui.TurnFailed("transport error: boom", None))
   // Nothing from the failed turn survives except the user line and note.
   model.log
   |> list.reverse
   |> should.equal([
-    ui.AssistantLine("previous answer"),
-    ui.UserLine("search"),
+    ui.AssistantLine("previous answer", None),
+    ui.UserLine("search", None),
     ui.NoteLine(err: True, text: "turn failed: transport error: boom"),
   ])
   model.bubble |> should.equal(None)
@@ -592,19 +611,23 @@ pub fn turn_failed_rolls_back_uncommitted_turn_test() {
 pub fn guard_failure_keeps_committed_rounds_test() {
   let model =
     new_model()
-    |> step(ui.UserEcho("keep searching"))
+    |> step(ui.UserEcho("keep searching", None))
     |> step(ui.Token("partial text"))
-    |> step(ui.ToolCallAssembled("call_1", "web_search", "{}"))
+    |> step(ui.ToolCallAssembled("call_1", "web_search", "{}", None))
     |> step(ui.ToolResult("call_1", "web_search", True, "[]"))
     |> step(ui.LoopStatus(8, 8, "guard"))
-    |> step(ui.TurnFailed("iteration guard: reached max 8 model round-trips"))
+    |> step(ui.TurnFailed(
+      "iteration guard: reached max 8 model round-trips",
+      None,
+    ))
   // The guard commits final text + completed rounds; only the never-run
   // trailing call is absent.
   model.log
   |> list.reverse
+  |> log_shapes
   |> should.equal([
-    ui.UserLine("keep searching"),
-    ui.AssistantLine("partial text"),
+    ui.UserLine("keep searching", None),
+    ui.AssistantLine("partial text", None),
     ui.ToolLine("call_1", "web_search", "{}", ui.ToolDone(True), Some("[]")),
     ui.NoteLine(
       err: True,
@@ -624,21 +647,26 @@ pub fn replay_reconstructs_complete_tool_history_test() {
   let model =
     new_model()
     |> step(ui.Hello("smart"))
-    |> step(ui.UserEcho("search for cats"))
-    |> step(ui.AssistantFull("checking"))
-    |> step(ui.ToolCallAssembled("call_1", "web_search", "{\"query\":\"cats\"}"))
+    |> step(ui.UserEcho("search for cats", None))
+    |> step(ui.AssistantFull("checking", None))
+    |> step(ui.ToolCallAssembled(
+      "call_1",
+      "web_search",
+      "{\"query\":\"cats\"}",
+      None,
+    ))
     |> step(ui.ToolResult(
       "call_1",
       "web_search",
       True,
       "[{\"title\":\"cats\"}]",
     ))
-    |> step(ui.AssistantFull("cats are great"))
+    |> step(ui.AssistantFull("cats are great", None))
   model.log
   |> list.reverse
   |> should.equal([
-    ui.UserLine("search for cats"),
-    ui.AssistantLine("checking"),
+    ui.UserLine("search for cats", None),
+    ui.AssistantLine("checking", None),
     ui.ToolLine(
       "call_1",
       "web_search",
@@ -646,7 +674,7 @@ pub fn replay_reconstructs_complete_tool_history_test() {
       ui.ToolDone(True),
       Some("[{\"title\":\"cats\"}]"),
     ),
-    ui.AssistantLine("cats are great"),
+    ui.AssistantLine("cats are great", None),
   ])
   model.pending |> should.equal([])
 }
@@ -658,7 +686,12 @@ pub fn replay_reconstructs_complete_tool_history_test() {
 pub fn view_renders_tool_card_test() {
   let model =
     new_model()
-    |> step(ui.ToolCallAssembled("call_1", "web_search", "{\"query\":\"cats\"}"))
+    |> step(ui.ToolCallAssembled(
+      "call_1",
+      "web_search",
+      "{\"query\":\"cats\"}",
+      None,
+    ))
     |> step(ui.ToolResult(
       "call_1",
       "web_search",
@@ -689,14 +722,15 @@ pub fn view_renders_tool_card_test() {
 
 pub fn view_renders_running_and_failed_states_test() {
   let running =
-    new_model() |> step(ui.ToolCallAssembled("call_1", "http_fetch", "{}"))
+    new_model()
+    |> step(ui.ToolCallAssembled("call_1", "http_fetch", "{}", None))
   running |> view_string |> should_contain("turn tool running")
   // A running call stays open — the live twin of the thinking block.
   running |> view_string |> should_contain("data-tool=\"http_fetch\" open>")
   running |> view_string |> should_contain(">running</span>")
   let failed =
     new_model()
-    |> step(ui.ToolCallAssembled("call_2", "http_fetch", "{}"))
+    |> step(ui.ToolCallAssembled("call_2", "http_fetch", "{}", None))
     |> step(ui.ToolResult("call_2", "http_fetch", False, "{\"error\":\"no\"}"))
   failed |> view_string |> should_contain("turn tool failed")
   failed |> view_string |> should_contain(">failed</span>")
@@ -708,7 +742,7 @@ pub fn view_truncates_tool_previews_test() {
   let long_result = string.repeat("r", 500)
   let model =
     new_model()
-    |> step(ui.ToolCallAssembled("call_1", "http_fetch", long_args))
+    |> step(ui.ToolCallAssembled("call_1", "http_fetch", long_args, None))
     |> step(ui.ToolResult("call_1", "http_fetch", True, long_result))
   let html = view_string(model)
   // 120-char argument preview + ellipsis, 200-char result preview.
@@ -739,7 +773,7 @@ pub fn view_renders_pending_card_test() {
 pub fn view_escapes_tool_content_test() {
   let model =
     new_model()
-    |> step(ui.ToolCallAssembled("<x>", "web_search", "{}"))
+    |> step(ui.ToolCallAssembled("<x>", "web_search", "{}", None))
     |> step(ui.ToolResult(
       "<x>",
       "web_search",
@@ -758,6 +792,119 @@ pub fn view_renders_loop_chip_test() {
   should.be_true(string.contains(html, "iter 2/8 · tools"))
 }
 
+// Message timestamps: relative age as the label, absolute instant on
+// hover (`title`) and as the machine datetime, epoch for timestamps_js.
+pub fn view_renders_message_timestamps_test() {
+  // Five minutes ago — the label is deterministic ("5m ago") with no
+  // unit-boundary anywhere near.
+  let stamp = timing.wall_now_s() - 300
+  let model =
+    new_model()
+    |> step(ui.UserEcho("hello", Some(stamp)))
+    |> step(ui.AssistantFull("hi there", Some(stamp)))
+  let html = view_string(model)
+  should_contain(html, "5m ago")
+  let instant = timing.wall_to_rfc3339(stamp)
+  should.be_true(string.contains(html, "title=\"" <> instant <> "\""))
+  should.be_true(string.contains(html, "datetime=\"" <> instant <> "\""))
+  should.be_true(string.contains(
+    html,
+    "data-epoch=\"" <> int.to_string(stamp) <> "\"",
+  ))
+}
+
+pub fn view_omits_timestamps_for_unstamped_lines_test() {
+  // Legacy history persisted before created_at replays with None stamps:
+  // no <time> element at all, not a bogus epoch.
+  let model =
+    new_model()
+    |> step(ui.UserEcho("legacy", None))
+    |> step(ui.AssistantFull("legacy reply", None))
+  let html = view_string(model)
+  should_not_contain(html, "data-epoch")
+  should_not_contain(html, "<time")
+}
+
+pub fn turn_done_stamps_committed_bubble_test() {
+  // The terminal event carries the session's committed stamp
+  // (`transcript.last_text_stamp`, sourced by the actor) — the live
+  // bubble before TurnDone renders no timestamp at all, and the commit
+  // carries EXACTLY the event's value: one clock, no UI-side read.
+  let stamp = timing.wall_now_s() - 300
+  let live = new_model() |> step(ui.Token("stream"))
+  live |> view_string |> should_not_contain("data-epoch")
+  let committed = live |> step(ui.TurnDone(Some(stamp)))
+  let html = view_string(committed)
+  should_contain(html, "5m ago")
+  let instant = timing.wall_to_rfc3339(stamp)
+  should.be_true(string.contains(html, "title=\"" <> instant <> "\""))
+  should.be_true(string.contains(
+    html,
+    "data-epoch=\"" <> int.to_string(stamp) <> "\"",
+  ))
+  // Unstamped terminal (legacy / nothing committed) renders no time.
+  new_model()
+  |> step(ui.Token("raw"))
+  |> step(ui.TurnDone(None))
+  |> view_string
+  |> should_not_contain("data-epoch")
+}
+
+/// The delta arm commits the flushed round's text ahead of the worker's
+/// append (display-order rule, pinned since the MVP) with NO stamp — the
+/// authoritative value does not exist yet. The round's ToolCallAssembled
+/// carries the loop's flush stamp and restamps exactly that line.
+pub fn assembled_restamps_flushed_line_test() {
+  let model =
+    new_model()
+    |> step(ui.UserEcho("look this up", None))
+    |> step(ui.Token("checking"))
+    |> step(ui.ToolCallDelta(0, Some("call_1"), Some("web_search"), "{}"))
+  // Committed at fragment time, unstamped: no UI clock read.
+  let assert [ui.AssistantLine("checking", None), ..] = model.log
+  let model =
+    step(
+      model,
+      ui.ToolCallAssembled("call_1", "web_search", "{}", Some(1_700_000_000)),
+    )
+  // Assembly restamps by the committed text and prepends the call card.
+  let assert [
+    ui.ToolLine("call_1", "web_search", "{}", ui.ToolRunning, None),
+    ui.AssistantLine("checking", Some(1_700_000_000)),
+    ui.UserLine("look this up", None),
+  ] = model.log
+}
+
+/// A Stop landing between the fragment commit and its round's assembly
+/// restamps the flushed line from the terminal event instead (the loop
+/// commits the partial text on stop, so `last_text_stamp` is its value).
+pub fn turn_stopped_restamps_flushed_line_test() {
+  let model =
+    new_model()
+    |> step(ui.UserEcho("q", None))
+    |> step(ui.Token("partial"))
+    |> step(ui.ToolCallDelta(0, Some("c1"), Some("echo"), "{}"))
+    |> step(ui.TurnStopped(Some(5_000_000)))
+  let assert [
+    ui.AssistantLine("partial", Some(5_000_000)),
+    ui.UserLine("q", None),
+  ] = model.log
+}
+
+pub fn age_label_units_test() {
+  let now = 1_000_000
+  ui.age_label(now, now) |> should.equal("just now")
+  ui.age_label(now, now - 30) |> should.equal("just now")
+  ui.age_label(now, now - 60) |> should.equal("1m ago")
+  ui.age_label(now, now - 300) |> should.equal("5m ago")
+  ui.age_label(now, now - 7200) |> should.equal("2h ago")
+  ui.age_label(now, now - 3 * 86_400) |> should.equal("3d ago")
+  ui.age_label(now, now - 14 * 86_400) |> should.equal("2w ago")
+  ui.age_label(now, now - 400 * 86_400) |> should.equal("1y ago")
+  // Future stamps (clock skew) clamp to "just now", never negative.
+  ui.age_label(now, now + 100) |> should.equal("just now")
+}
+
 pub fn view_hides_loop_chip_without_loop_test() {
   // Lustre SSR sorts attributes: hidden precedes id.
   new_model() |> view_string |> should_contain("hidden id=\"loop-status\"")
@@ -766,7 +913,8 @@ pub fn view_hides_loop_chip_without_loop_test() {
 pub fn view_renders_guard_chip_terminal_test() {
   let model = new_model() |> step(ui.LoopStatus(8, 8, "guard"))
   model |> view_string |> should_contain("iter 8/8 · guard")
-  let terminal = model |> step(ui.TurnFailed("iteration guard: reached max 8"))
+  let terminal =
+    model |> step(ui.TurnFailed("iteration guard: reached max 8", None))
   terminal |> view_string |> should_contain("turn failed: iteration guard")
 }
 
@@ -776,6 +924,21 @@ fn should_contain(haystack: String, needle: String) {
 
 fn should_not_contain(haystack: String, needle: String) {
   should.be_false(string.contains(haystack, needle))
+}
+
+/// Commit stamps are the wall-clock commit instant (see
+/// `commit_bubble`), so commit-shape assertions compare with stamps
+/// stripped; `turn_done_stamps_committed_bubble_test` pins that the
+/// stamp is actually there, and the timestamp rendering tests pin its
+/// value end-to-end.
+fn log_shapes(log: List(ui.Line)) -> List(ui.Line) {
+  list.map(log, fn(line) {
+    case line {
+      ui.UserLine(text, _) -> ui.UserLine(text, None)
+      ui.AssistantLine(text, _) -> ui.AssistantLine(text, None)
+      other -> other
+    }
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -843,7 +1006,7 @@ pub fn view_empty_transcript_note_test() {
   ))
   // A committed user line displaces the hint (streaming or committed
   // alike: both make log_lines non-empty).
-  let html = new_model() |> step(ui.UserEcho("hi")) |> view_string
+  let html = new_model() |> step(ui.UserEcho("hi", None)) |> view_string
   should.be_false(string.contains(html, "Send a message to start"))
 }
 
@@ -925,7 +1088,7 @@ pub fn composer_key_rotates_after_send_test() {
 pub fn view_escapes_markup_test() {
   let model =
     new_model()
-    |> step(ui.UserEcho("<script>alert(1)</script>"))
+    |> step(ui.UserEcho("<script>alert(1)</script>", None))
   let html = view_string(model)
   should.be_true(string.contains(html, "&lt;script&gt;"))
   should.be_false(string.contains(html, "<script>alert"))
@@ -1794,7 +1957,7 @@ pub fn settings_view_escapes_hostile_text_test() {
 pub fn reasoning_streams_into_thinking_block_test() {
   let model =
     new_model()
-    |> step(ui.UserEcho("hi"))
+    |> step(ui.UserEcho("hi", None))
     |> step(ui.Reasoning("step "))
     |> step(ui.Reasoning("one"))
   model.thinking |> should.equal(Some("step one"))
@@ -1811,18 +1974,19 @@ pub fn reasoning_streams_into_thinking_block_test() {
 pub fn first_token_commits_reasoning_above_text_test() {
   let model =
     new_model()
-    |> step(ui.UserEcho("hi"))
+    |> step(ui.UserEcho("hi", None))
     |> step(ui.Reasoning("chain"))
     |> step(ui.Token("answer"))
-    |> step(ui.TurnDone)
+    |> step(ui.TurnDone(None))
   model.thinking |> should.equal(None)
   model.bubble |> should.equal(None)
   // ReasoningLine was pushed before AssistantLine, so it renders above it.
   model.log
+  |> log_shapes
   |> should.equal([
-    ui.AssistantLine("answer"),
+    ui.AssistantLine("answer", None),
     ui.ReasoningLine("chain"),
-    ui.UserLine("hi"),
+    ui.UserLine("hi", None),
   ])
   // …and the rendered log agrees: the collapsed reasoning block sits
   // above the assistant turn it preceded, not just first in the list.
@@ -1838,14 +2002,14 @@ pub fn first_token_commits_reasoning_above_text_test() {
 pub fn reasoning_commits_before_tool_call_test() {
   let model =
     new_model()
-    |> step(ui.UserEcho("hi"))
+    |> step(ui.UserEcho("hi", None))
     |> step(ui.Reasoning("need a tool"))
-    |> step(ui.ToolCallAssembled("call_1", "echo", "{}"))
+    |> step(ui.ToolCallAssembled("call_1", "echo", "{}", None))
   model.log
   |> should.equal([
     ui.ToolLine("call_1", "echo", "{}", ui.ToolRunning, None),
     ui.ReasoningLine("need a tool"),
-    ui.UserLine("hi"),
+    ui.UserLine("hi", None),
   ])
   model.thinking |> should.equal(None)
 }
@@ -1857,12 +2021,12 @@ pub fn tool_call_fragment_without_text_defers_reasoning_test() {
   // thinking buffer either (it defers to the assembly commit).
   let model =
     new_model()
-    |> step(ui.UserEcho("hi"))
+    |> step(ui.UserEcho("hi", None))
     |> step(ui.Reasoning("reached for a tool"))
     |> step(ui.ToolCallDelta(0, Some("call_1"), Some("echo"), "{\"x\""))
-    |> step(ui.TurnStopped)
+    |> step(ui.TurnStopped(None))
   model.thinking |> should.equal(None)
-  model.log |> should.equal([ui.UserLine("hi")])
+  model.log |> should.equal([ui.UserLine("hi", None)])
 }
 
 pub fn tool_call_fragment_with_text_commits_reasoning_test() {
@@ -1870,16 +2034,17 @@ pub fn tool_call_fragment_with_text_commits_reasoning_test() {
   // commits text + reasoning server-side, exactly like this display.
   let model =
     new_model()
-    |> step(ui.UserEcho("hi"))
+    |> step(ui.UserEcho("hi", None))
     |> step(ui.Reasoning("reached for a tool"))
     |> step(ui.Token("partial"))
     |> step(ui.ToolCallDelta(0, Some("call_1"), Some("echo"), "{\"x\""))
-    |> step(ui.TurnStopped)
+    |> step(ui.TurnStopped(None))
   model.log
+  |> log_shapes
   |> should.equal([
-    ui.AssistantLine("partial"),
+    ui.AssistantLine("partial", None),
     ui.ReasoningLine("reached for a tool"),
-    ui.UserLine("hi"),
+    ui.UserLine("hi", None),
   ])
   model.thinking |> should.equal(None)
 }
@@ -1888,7 +2053,7 @@ pub fn replayed_reasoning_renders_collapsed_test() {
   let model =
     new_model()
     |> step(ui.ReasoningFull("the chain of thought"))
-    |> step(ui.AssistantFull("the answer"))
+    |> step(ui.AssistantFull("the answer", None))
   let html = model |> view_string
   should_contain(html, "turn reasoning\"")
   should_not_contain(html, "thinking…")
@@ -1907,9 +2072,9 @@ pub fn view_groups_consecutive_chips_into_one_row_test() {
   let model =
     new_model()
     |> step(ui.ReasoningFull("the chain"))
-    |> step(ui.ToolCallAssembled("call_1", "web_search", "{}"))
+    |> step(ui.ToolCallAssembled("call_1", "web_search", "{}", None))
     |> step(ui.ToolResult("call_1", "web_search", True, "[]"))
-    |> step(ui.AssistantFull("done"))
+    |> step(ui.AssistantFull("done", None))
   let html = model |> view_string
   // The row opens with the reasoning chip and the tool chip is its
   // sibling inside it — no </div> between the two details.
@@ -1946,13 +2111,13 @@ pub fn view_keeps_live_thinking_outside_chip_rows_test() {
 pub fn reasoning_only_turn_discards_thinking_on_done_test() {
   let model =
     new_model()
-    |> step(ui.UserEcho("hi"))
+    |> step(ui.UserEcho("hi", None))
     |> step(ui.Reasoning("never finished"))
-    |> step(ui.TurnDone)
+    |> step(ui.TurnDone(None))
   // The server committed nothing (no empty assistant messages), so the
   // display rolls the uncommitted thinking back with the turn.
   model.thinking |> should.equal(None)
-  model.log |> should.equal([ui.UserLine("hi")])
+  model.log |> should.equal([ui.UserLine("hi", None)])
 }
 
 pub fn whitespace_assistant_commit_renders_no_pill_test() {
@@ -1964,17 +2129,17 @@ pub fn whitespace_assistant_commit_renders_no_pill_test() {
   // carries it, and no pill renders live.
   let model =
     new_model()
-    |> step(ui.UserEcho("hi"))
+    |> step(ui.UserEcho("hi", None))
     |> step(ui.Reasoning("thinking out loud"))
     |> step(ui.Token("\n\n"))
     |> step(ui.ToolCallDelta(0, Some("call_1"), Some("http_fetch"), "{}"))
   // The bubble committed (and was skipped) at the tool-call boundary.
   model.bubble |> should.equal(None)
-  let model = step(model, ui.TurnDone)
+  let model = step(model, ui.TurnDone(None))
   model.log
   |> should.equal([
     ui.ReasoningLine("thinking out loud"),
-    ui.UserLine("hi"),
+    ui.UserLine("hi", None),
   ])
   let html = model |> view_string
   should_contain(html, "turn reasoning")
@@ -1986,9 +2151,9 @@ pub fn whitespace_assistant_replay_renders_no_pill_test() {
   // cannot resurrect the pill (and cannot drop a real line either).
   let model =
     new_model()
-    |> step(ui.AssistantFull("\n\n"))
-    |> step(ui.AssistantFull("the real answer"))
-  model.log |> should.equal([ui.AssistantLine("the real answer")])
+    |> step(ui.AssistantFull("\n\n", None))
+    |> step(ui.AssistantFull("the real answer", None))
+  model.log |> should.equal([ui.AssistantLine("the real answer", None)])
   let html = model |> view_string
   should_contain(html, "the real answer")
   should_not_contain(html, "turn assistant md\"></div>")
@@ -2001,7 +2166,7 @@ pub fn live_bubble_waits_for_visible_text_test() {
   // whitespace-vs-render distinction).
   let model =
     new_model()
-    |> step(ui.UserEcho("hi"))
+    |> step(ui.UserEcho("hi", None))
     |> step(ui.Token("  \n"))
   model.bubble_hidden |> should.equal(True)
   let html = model |> view_string
@@ -2023,7 +2188,7 @@ pub fn live_bubble_follows_the_commit_render_rule_test() {
   // only grows, and a text that already renders blocks keeps them.
   let model =
     new_model()
-    |> step(ui.UserEcho("hi"))
+    |> step(ui.UserEcho("hi", None))
     |> step(ui.Token("[^1]: note"))
   model.bubble_hidden |> should.equal(True)
   let html = model |> view_string
@@ -2033,23 +2198,27 @@ pub fn live_bubble_follows_the_commit_render_rule_test() {
   let html = model |> view_string
   should_contain(html, "turn assistant")
   // And the commit path drops the same shapes on the replay side.
-  let model = step(model, ui.TurnDone)
+  let model = step(model, ui.TurnDone(None))
   model.log
+  |> log_shapes
   |> should.equal([
-    ui.AssistantLine("[^1]: note\n\nanswer body"),
-    ui.UserLine("hi"),
+    ui.AssistantLine("[^1]: note\n\nanswer body", None),
+    ui.UserLine("hi", None),
   ])
 }
 
 pub fn failed_turn_rolls_back_reasoning_test() {
   let model =
     new_model()
-    |> step(ui.UserEcho("hi"))
+    |> step(ui.UserEcho("hi", None))
     |> step(ui.Reasoning("doomed"))
     |> step(ui.Token("partial"))
-    |> step(ui.TurnFailed("non-200"))
+    |> step(ui.TurnFailed("non-200", None))
   model.log
-  |> should.equal([ui.NoteLine(True, "turn failed: non-200"), ui.UserLine("hi")])
+  |> should.equal([
+    ui.NoteLine(True, "turn failed: non-200"),
+    ui.UserLine("hi", None),
+  ])
   model.thinking |> should.equal(None)
   model.bubble |> should.equal(None)
 }

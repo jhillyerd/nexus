@@ -222,3 +222,92 @@ pub fn empty_reasoning_is_dropped_test() {
     |> transcript.append_assistant_with_reasoning("a", reasoning: Some(""))
   transcript.reasoning_at(tr, 2) |> should.equal(None)
 }
+
+// ---------------------------------------------------------------------------
+// Timestamp sidecar (display-only, never in a request byte)
+// ---------------------------------------------------------------------------
+
+pub fn stamp_never_changes_request_bytes_test() {
+  let opts = transcript.default_options()
+  let plain =
+    transcript.new("m", "s")
+    |> transcript.append_user("q")
+    |> transcript.append_assistant("a")
+  let stamped =
+    transcript.new("m", "s")
+    |> transcript.append_user("q")
+    |> transcript.stamp(1000)
+    |> transcript.append_assistant("a")
+    |> transcript.stamp(2000)
+  // The sidecar mirrors reasoning's contract: present on the commit /
+  // write-behind / replay lane, structurally absent from every byte.
+  transcript.request_body(plain, opts)
+  |> should.equal(transcript.request_body(stamped, opts))
+}
+
+pub fn stamped_at_indexes_chronologically_test() {
+  let tr =
+    transcript.new("m", "s")
+    |> transcript.append_user("q")
+    |> transcript.stamp(1000)
+    |> transcript.append_assistant("a")
+    |> transcript.stamp(2000)
+  // system=0 (never stamped), user=1, assistant=2.
+  transcript.stamped_at(tr, 1) |> should.equal(Some(1000))
+  transcript.stamped_at(tr, 2) |> should.equal(Some(2000))
+  transcript.stamped_at(tr, 0) |> should.equal(None)
+  // Never-stamped messages have no entry, not a zero.
+  transcript.stamped_at(tr, 3) |> should.equal(None)
+}
+
+pub fn stamp_opt_passthrough_test() {
+  let tr = transcript.new("m", "s") |> transcript.append_user("q")
+  let kept = transcript.stamp_opt(tr, Some(5000))
+  transcript.stamped_at(kept, 1) |> should.equal(Some(5000))
+  // The persistence lane's no-op for unstamped (legacy) rows.
+  let dropped = transcript.stamp_opt(tr, None)
+  transcript.stamped_at(dropped, 1) |> should.equal(None)
+}
+
+pub fn last_text_stamp_picks_newest_assistant_text_test() {
+  let tr =
+    transcript.new("m", "s")
+    |> transcript.append_user("q")
+    |> transcript.stamp(1000)
+    |> transcript.append_assistant("a")
+    |> transcript.stamp(2000)
+    |> transcript.append_tool_result("c1", "r", ok: True)
+    |> transcript.stamp(3000)
+    |> transcript.append_assistant("final")
+    |> transcript.stamp(4000)
+  // The terminal-turn stamp: the newest assistant TEXT message (tool
+  // results and the user turn in between are skipped).
+  transcript.last_text_stamp(tr) |> should.equal(Some(4000))
+}
+
+pub fn last_text_stamp_none_without_stamped_assistant_text_test() {
+  // Nothing committed at all.
+  transcript.last_text_stamp(transcript.new("m", "s")) |> should.equal(None)
+  // User/tool messages only: no assistant text to stamp.
+  transcript.last_text_stamp(
+    transcript.new("m", "s")
+    |> transcript.append_user("q")
+    |> transcript.stamp(1000),
+  )
+  |> should.equal(None)
+  // An unstamped assistant text (legacy hydration shape) reads as None.
+  transcript.last_text_stamp(
+    transcript.new("m", "s") |> transcript.append_assistant("unstamped"),
+  )
+  |> should.equal(None)
+  // An UNSTAMPED newest text over an older stamped one must report None —
+  // the older stamp belongs to a different message and must not leak into
+  // the newer text's terminal event.
+  transcript.last_text_stamp(
+    transcript.new("m", "s")
+    |> transcript.append_assistant("old")
+    |> transcript.stamp(2000)
+    |> transcript.append_assistant("new"),
+  )
+  |> should.equal(None)
+}

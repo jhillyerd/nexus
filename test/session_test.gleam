@@ -10,6 +10,7 @@ import nexus/config
 import nexus/loop
 import nexus/openai
 import nexus/session
+import nexus/timing
 import nexus/transcript
 import nexus/utility
 
@@ -81,7 +82,13 @@ fn happy_runner(
 ) -> session.TurnOutcome {
   on_event(loop.StreamEvent(openai.TokenDelta("Hello")))
   on_event(loop.StreamEvent(openai.TokenDelta(" world")))
-  session.StreamDone(stats(), transcript.append_assistant(tr, "Hello world"))
+  // Stamped like the real loop stamps every append, so the turn's
+  // terminal event and its replay carry the session's committed stamp.
+  session.StreamDone(
+    stats(),
+    transcript.append_assistant(tr, "Hello world")
+      |> transcript.stamp(timing.wall_now_s()),
+  )
 }
 
 /// Emits one token, then blocks until cancelled (Stop) or times out.
@@ -94,7 +101,11 @@ fn blocking_runner(
   on_event(loop.StreamEvent(openai.TokenDelta("partial")))
   let selector = process.new_selector() |> process.select(cancel)
   case process.selector_receive(selector, 5000) {
-    Ok(_) -> session.StreamStopped(transcript.append_assistant(tr, "partial"))
+    Ok(_) ->
+      session.StreamStopped(
+        transcript.append_assistant(tr, "partial")
+        |> transcript.stamp(timing.wall_now_s()),
+      )
     Error(_) -> session.StreamErrored("timeout")
   }
 }
@@ -109,7 +120,11 @@ fn delayed_runner(
   on_event(loop.StreamEvent(openai.TokenDelta("first")))
   process.sleep(60)
   on_event(loop.StreamEvent(openai.TokenDelta("second")))
-  session.StreamDone(stats(), transcript.append_assistant(tr, "firstsecond"))
+  session.StreamDone(
+    stats(),
+    transcript.append_assistant(tr, "firstsecond")
+      |> transcript.stamp(timing.wall_now_s()),
+  )
 }
 
 /// Emits a token then fails: nothing may be committed.
@@ -169,7 +184,8 @@ fn flaky_runner(counter: process.Subject(CounterMsg)) -> session.TurnRunner {
       1 ->
         session.StreamDone(
           stats(),
-          transcript.append_assistant(tr, "Hello world"),
+          transcript.append_assistant(tr, "Hello world")
+            |> transcript.stamp(timing.wall_now_s()),
         )
       _ -> session.StreamErrored("later turn failed")
     }
@@ -205,6 +221,58 @@ fn expect_event(
 ) -> session.SessionEvent {
   let assert Ok(event) = process.receive(sub, 2000)
   event
+}
+
+/// `expect_event |> should.equal(scoped_at(visit, UserEcho(text)))` for
+/// events whose display stamp is the wall clock (unpredictable in
+/// tests): assert the envelope's filter keys and the text, require the
+/// stamp to be present (every live echo and replay is stamped), and
+/// RETURN it so callers can verify the feature's contract — the same
+/// message carries the same stamp live and on replay.
+fn expect_user_echo_at(
+  sub: process.Subject(session.SessionEvent),
+  visit: Int,
+  text: String,
+) -> Int {
+  let assert session.SessionEvent(sid, v, session.UserEcho(actual, Some(stamp))) =
+    expect_event(sub)
+  sid |> should.equal(test_session_id)
+  v |> should.equal(visit)
+  actual |> should.equal(text)
+  stamp
+}
+
+/// The first-visit shorthand — the overwhelmingly common shape.
+fn expect_user_echo(
+  sub: process.Subject(session.SessionEvent),
+  text: String,
+) -> Int {
+  expect_user_echo_at(sub, 1, text)
+}
+
+/// The AssistantFull twin of `expect_user_echo_at`.
+fn expect_assistant_full_at(
+  sub: process.Subject(session.SessionEvent),
+  visit: Int,
+  text: String,
+) -> Int {
+  let assert session.SessionEvent(
+    sid,
+    v,
+    session.AssistantFull(actual, Some(stamp)),
+  ) = expect_event(sub)
+  sid |> should.equal(test_session_id)
+  v |> should.equal(visit)
+  actual |> should.equal(text)
+  stamp
+}
+
+/// The first-visit shorthand.
+fn expect_assistant_full(
+  sub: process.Subject(session.SessionEvent),
+  text: String,
+) -> Int {
+  expect_assistant_full_at(sub, 1, text)
 }
 
 fn test_endpoint() -> openai.Endpoint {
@@ -274,11 +342,14 @@ pub fn join_replays_history_test() {
   let sub = join(sess)
   expect_event(sub) |> should.equal(scoped(session.Hello("test-alias", 1, [])))
   should.equal(session.send_message(sess, "hi"), session.Sent)
-  expect_event(sub) |> should.equal(scoped(session.UserEcho("hi")))
+  let live_stamp = expect_user_echo(sub, "hi")
   expect_event(sub) |> should.equal(scoped(session.Token("Hello")))
   expect_event(sub) |> should.equal(scoped(session.Token(" world")))
-  let assert session.SessionEvent(_, 1, session.TurnDone(stats)) =
-    expect_event(sub)
+  let assert session.SessionEvent(
+    _,
+    1,
+    session.TurnDone(stats, Some(turn_stamp)),
+  ) = expect_event(sub)
   stats.token_deltas |> should.equal(2)
 
   // A second subscriber joins after the turn: it gets Hello + replay.
@@ -294,9 +365,12 @@ pub fn join_replays_history_test() {
   metrics |> list.length |> should.equal(1)
   let assert Ok(sample) = list.first(metrics)
   should.be_true(is_completed(sample))
-  expect_event(sub2) |> should.equal(scoped(session.UserEcho("hi")))
-  expect_event(sub2)
-  |> should.equal(scoped(session.AssistantFull("Hello world")))
+  // The timestamp contract: replayed events carry the SAME stamps the
+  // live echo/turn committed — one clock (the transcript sidecar), so a
+  // reload renders identical ages. (The reply's stamp is TurnDone's, not
+  // the echo's: different messages, different instants.)
+  expect_user_echo_at(sub2, 1, "hi") |> should.equal(live_stamp)
+  expect_assistant_full(sub2, "Hello world") |> should.equal(turn_stamp)
 }
 
 pub fn completed_turn_appends_and_is_byte_stable_test() {
@@ -305,10 +379,11 @@ pub fn completed_turn_appends_and_is_byte_stable_test() {
   let _ = expect_event(sub)
 
   should.equal(session.send_message(sess, "question"), session.Sent)
-  expect_event(sub) |> should.equal(scoped(session.UserEcho("question")))
+  expect_user_echo(sub, "question")
   expect_event(sub) |> should.equal(scoped(session.Token("Hello")))
   expect_event(sub) |> should.equal(scoped(session.Token(" world")))
-  let assert session.SessionEvent(_, 1, session.TurnDone(_)) = expect_event(sub)
+  let assert session.SessionEvent(_, 1, session.TurnDone(_, _)) =
+    expect_event(sub)
 
   let tr = session.snapshot(sess)
   transcript.length(tr) |> should.equal(3)
@@ -327,7 +402,7 @@ pub fn busy_rejects_second_send_test() {
 
   should.equal(session.send_message(sess, "first"), session.Sent)
   // The worker emits its token before blocking; wait for it.
-  expect_event(sub) |> should.equal(scoped(session.UserEcho("first")))
+  expect_user_echo(sub, "first")
   expect_event(sub) |> should.equal(scoped(session.Token("partial")))
 
   // Turn in flight: second send is rejected.
@@ -342,18 +417,22 @@ pub fn stop_cancels_and_commits_partial_test() {
   let _ = expect_event(sub)
 
   should.equal(session.send_message(sess, "stop me"), session.Sent)
-  expect_event(sub) |> should.equal(scoped(session.UserEcho("stop me")))
+  expect_user_echo(sub, "stop me")
   expect_event(sub) |> should.equal(scoped(session.Token("partial")))
 
   session.stop(sess)
-  expect_event(sub) |> should.equal(scoped(session.TurnStopped(7)))
+  // The stop commits the partial text, so the terminal event carries the
+  // session's committed stamp (the loop stamps every append).
+  let assert session.SessionEvent(sid, 1, session.TurnStopped(7, Some(_))) =
+    expect_event(sub)
+  sid |> should.equal(test_session_id)
 
   // Partial text was committed as the assistant turn.
   transcript.length(session.snapshot(sess)) |> should.equal(3)
 
   // Session accepts a new turn after the stop.
   should.equal(session.send_message(sess, "again"), session.Sent)
-  expect_event(sub) |> should.equal(scoped(session.UserEcho("again")))
+  expect_user_echo(sub, "again")
   expect_event(sub) |> should.equal(scoped(session.Token("partial")))
   session.stop(sess)
   let _ = expect_event(sub)
@@ -365,9 +444,9 @@ pub fn failed_turn_commits_nothing_test() {
   let _ = expect_event(sub)
 
   should.equal(session.send_message(sess, "will fail"), session.Sent)
-  expect_event(sub) |> should.equal(scoped(session.UserEcho("will fail")))
+  expect_user_echo(sub, "will fail")
   expect_event(sub) |> should.equal(scoped(session.Token("never committed")))
-  let assert session.SessionEvent(_, 1, session.TurnFailed(reason)) =
+  let assert session.SessionEvent(_, 1, session.TurnFailed(reason, _)) =
     expect_event(sub)
   should.be_true(string.contains(reason, "non200"))
 
@@ -377,7 +456,7 @@ pub fn failed_turn_commits_nothing_test() {
 
   // And the session is usable again afterwards.
   should.equal(session.send_message(sess, "retry"), session.Sent)
-  expect_event(sub) |> should.equal(scoped(session.UserEcho("retry")))
+  expect_user_echo(sub, "retry")
   expect_event(sub) |> should.equal(scoped(session.Token("never committed")))
   let _ = expect_event(sub)
 }
@@ -388,8 +467,8 @@ pub fn crashing_worker_does_not_kill_session_test() {
   let _ = expect_event(sub)
 
   should.equal(session.send_message(sess, "boom"), session.Sent)
-  expect_event(sub) |> should.equal(scoped(session.UserEcho("boom")))
-  let assert session.SessionEvent(_, 1, session.TurnFailed(reason)) =
+  expect_user_echo(sub, "boom")
+  let assert session.SessionEvent(_, 1, session.TurnFailed(reason, _)) =
     expect_event(sub)
   should.be_true(string.contains(reason, "worker"))
 
@@ -407,14 +486,10 @@ pub fn fan_out_to_all_subscribers_test() {
   let _ = expect_event(sub2)
 
   should.equal(session.send_message(sess, "both"), session.Sent)
-  let expected = [
-    scoped(session.UserEcho("both")),
-    scoped(session.Token("Hello")),
-    scoped(session.Token(" world")),
-  ]
-  list.each(expected, fn(event) {
-    expect_event(sub1) |> should.equal(event)
-    expect_event(sub2) |> should.equal(event)
+  list.each([sub1, sub2], fn(sub) {
+    expect_user_echo(sub, "both")
+    expect_event(sub) |> should.equal(scoped(session.Token("Hello")))
+    expect_event(sub) |> should.equal(scoped(session.Token(" world")))
   })
 }
 
@@ -438,10 +513,10 @@ pub fn leave_stops_fan_out_test() {
     expect_event(witness)
 
   should.equal(session.send_message(sess, "hi"), session.Sent)
-  expect_event(witness) |> should.equal(scoped(session.UserEcho("hi")))
+  expect_user_echo(witness, "hi")
   expect_event(witness) |> should.equal(scoped(session.Token("Hello")))
   expect_event(witness) |> should.equal(scoped(session.Token(" world")))
-  let assert session.SessionEvent(_, 1, session.TurnDone(_)) =
+  let assert session.SessionEvent(_, 1, session.TurnDone(_, _)) =
     expect_event(witness)
 
   // The departed subscriber saw none of it.
@@ -465,10 +540,11 @@ pub fn rejoin_after_leave_resubscribes_test() {
   |> should.equal(scoped_at(2, session.Hello("test-alias", 1, [])))
 
   should.equal(session.send_message(sess, "hi"), session.Sent)
-  expect_event(sub) |> should.equal(scoped_at(2, session.UserEcho("hi")))
+  expect_user_echo_at(sub, 2, "hi")
   expect_event(sub) |> should.equal(scoped_at(2, session.Token("Hello")))
   expect_event(sub) |> should.equal(scoped_at(2, session.Token(" world")))
-  let assert session.SessionEvent(_, 2, session.TurnDone(_)) = expect_event(sub)
+  let assert session.SessionEvent(_, 2, session.TurnDone(_, _)) =
+    expect_event(sub)
 }
 
 // ---------------------------------------------------------------------------
@@ -515,7 +591,11 @@ pub fn runner_receives_frozen_endpoint_test() {
   let seen = process.new_subject()
   let capturing = fn(endpoint, tr, _cancel, _on_event) {
     process.send(seen, endpoint)
-    session.StreamDone(stats(), transcript.append_assistant(tr, "ok"))
+    session.StreamDone(
+      stats(),
+      transcript.append_assistant(tr, "ok")
+        |> transcript.stamp(timing.wall_now_s()),
+    )
   }
   let spec =
     session.SessionSpec(
@@ -571,7 +651,8 @@ pub fn completed_turn_preserves_first_token_time_test() {
   let _ = expect_event(sub)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
-  let assert session.SessionEvent(_, 1, session.TurnDone(_)) = expect_event(sub)
+  let assert session.SessionEvent(_, 1, session.TurnDone(_, _)) =
+    expect_event(sub)
 
   let status = session.describe(sess)
   let assert Ok(sample) = list.first(status.metrics)
@@ -590,7 +671,11 @@ pub fn stopped_turn_records_metric_test() {
   let _ = expect_event(sub)
   let _ = expect_event(sub)
   session.stop(sess)
-  expect_event(sub) |> should.equal(scoped(session.TurnStopped(7)))
+  // The stop commits the partial text, so the terminal event carries the
+  // session's committed stamp (the loop stamps every append).
+  let assert session.SessionEvent(sid, 1, session.TurnStopped(7, Some(_))) =
+    expect_event(sub)
+  sid |> should.equal(test_session_id)
 
   let status = session.describe(sess)
   status.metrics |> list.length |> should.equal(1)
@@ -708,6 +793,7 @@ fn tool_round_runner(
     "call_1",
     "http_fetch",
     "{\"url\":\"https://example.invalid/\"}",
+    None,
   ))
   on_event(loop.ToolResultEvent(
     "call_1",
@@ -731,7 +817,8 @@ fn tool_round_runner(
         content: "{\"status\":200}",
         ok: True,
       )
-      |> transcript.append_assistant("based on the fetch: fine"),
+      |> transcript.append_assistant("based on the fetch: fine")
+      |> transcript.stamp(timing.wall_now_s()),
   )
 }
 
@@ -741,7 +828,7 @@ pub fn tool_events_are_broadcast_test() {
   let _ = expect_event(sub)
 
   should.equal(session.send_message(sess, "fetch it"), session.Sent)
-  expect_event(sub) |> should.equal(scoped(session.UserEcho("fetch it")))
+  expect_user_echo(sub, "fetch it")
   expect_event(sub) |> should.equal(scoped(session.LoopStatus(1, 8, "request")))
   expect_event(sub)
   |> should.equal(
@@ -759,6 +846,7 @@ pub fn tool_events_are_broadcast_test() {
       "call_1",
       "http_fetch",
       "{\"url\":\"https://example.invalid/\"}",
+      None,
     )),
   )
   expect_event(sub)
@@ -767,7 +855,8 @@ pub fn tool_events_are_broadcast_test() {
   )
   expect_event(sub)
   |> should.equal(scoped(session.Token("based on the fetch: fine")))
-  let assert session.SessionEvent(_, 1, session.TurnDone(_)) = expect_event(sub)
+  let assert session.SessionEvent(_, 1, session.TurnDone(_, _)) =
+    expect_event(sub)
 
   // The full tool history is committed: system, user, assistant(call),
   // tool result, assistant text.
@@ -781,7 +870,7 @@ pub fn failed_tool_result_replays_as_failed_test() {
   let sess =
     start_with(fn(_endpoint, tr, _cancel, on_event) {
       on_event(loop.LoopStatus(1, 8, "tools"))
-      on_event(loop.ToolCallAssembled("call_9", "http_fetch", "{}"))
+      on_event(loop.ToolCallAssembled("call_9", "http_fetch", "{}", None))
       on_event(loop.ToolResultEvent(
         "call_9",
         "http_fetch",
@@ -801,7 +890,8 @@ pub fn failed_tool_result_replays_as_failed_test() {
             content: "{\"error\":\"ssrf guard\"}",
             ok: False,
           )
-          |> transcript.append_assistant("the fetch failed"),
+          |> transcript.append_assistant("the fetch failed")
+          |> transcript.stamp(timing.wall_now_s()),
       )
     })
   let sub = join(sess)
@@ -809,11 +899,11 @@ pub fn failed_tool_result_replays_as_failed_test() {
   should.equal(session.send_message(sess, "fetch it"), session.Sent)
   // Live events (UserEcho, LoopStatus, ToolCallAssembled, ToolResult,
   // TurnDone) — the ToolResult carries ok=False exactly as the loop said.
-  expect_event(sub) |> should.equal(scoped(session.UserEcho("fetch it")))
+  expect_user_echo(sub, "fetch it")
   expect_event(sub) |> should.equal(scoped(session.LoopStatus(1, 8, "tools")))
   expect_event(sub)
   |> should.equal(
-    scoped(session.ToolCallAssembled("call_9", "http_fetch", "{}")),
+    scoped(session.ToolCallAssembled("call_9", "http_fetch", "{}", None)),
   )
   expect_event(sub)
   |> should.equal(
@@ -824,16 +914,17 @@ pub fn failed_tool_result_replays_as_failed_test() {
       "{\"error\":\"ssrf guard\"}",
     )),
   )
-  let assert session.SessionEvent(_, 1, session.TurnDone(_)) = expect_event(sub)
+  let assert session.SessionEvent(_, 1, session.TurnDone(_, _)) =
+    expect_event(sub)
 
   // A fresh subscriber (the reload path) sees the failure too.
   let sub2 = join(sess)
   let assert session.SessionEvent(_, 1, session.Hello(_, _, _)) =
     expect_event(sub2)
-  expect_event(sub2) |> should.equal(scoped(session.UserEcho("fetch it")))
+  expect_user_echo(sub2, "fetch it")
   expect_event(sub2)
   |> should.equal(
-    scoped(session.ToolCallAssembled("call_9", "http_fetch", "{}")),
+    scoped(session.ToolCallAssembled("call_9", "http_fetch", "{}", None)),
   )
   expect_event(sub2)
   |> should.equal(
@@ -844,8 +935,7 @@ pub fn failed_tool_result_replays_as_failed_test() {
       "{\"error\":\"ssrf guard\"}",
     )),
   )
-  expect_event(sub2)
-  |> should.equal(scoped(session.AssistantFull("the fetch failed")))
+  expect_assistant_full(sub2, "the fetch failed")
 }
 
 pub fn tool_history_replays_on_rejoin_test() {
@@ -870,21 +960,21 @@ pub fn tool_history_replays_on_rejoin_test() {
   let assert session.SessionEvent(_, 1, session.Hello(_, messages, _)) =
     expect_event(sub2)
   messages |> should.equal(5)
-  expect_event(sub2) |> should.equal(scoped(session.UserEcho("fetch it")))
+  expect_user_echo(sub2, "fetch it")
   expect_event(sub2)
   |> should.equal(
     scoped(session.ToolCallAssembled(
       "call_1",
       "http_fetch",
       "{\"url\":\"https://example.invalid/\"}",
+      None,
     )),
   )
   expect_event(sub2)
   |> should.equal(
     scoped(session.ToolResult("call_1", "http_fetch", True, "{\"status\":200}")),
   )
-  expect_event(sub2)
-  |> should.equal(scoped(session.AssistantFull("based on the fetch: fine")))
+  expect_assistant_full(sub2, "based on the fetch: fine")
 }
 
 fn guard_runner(
@@ -907,14 +997,28 @@ fn gated_runner(
   gate_request: process.Subject(process.Subject(Nil)),
 ) -> session.TurnRunner {
   fn(_endpoint, tr, _cancel, on_event) {
+    // A fixed flush stamp: the loop stamps the round at append time and
+    // broadcasts the same value on every assembled event — the tests pin
+    // it end to end (live echo, mirror replay, restamp).
+    let flushed = 1_729_000_000
     on_event(loop.LoopStatus(1, 8, "request"))
     on_event(loop.StreamEvent(openai.ReasoningDelta("weighing ")))
     on_event(loop.StreamEvent(openai.ReasoningDelta("options")))
     on_event(loop.StreamEvent(openai.TokenDelta("\n\nLet me check.")))
     on_event(loop.LoopStatus(1, 8, "tools"))
-    on_event(loop.ToolCallAssembled("call_1", "http_fetch", "{\"url\":\"a\"}"))
+    on_event(loop.ToolCallAssembled(
+      "call_1",
+      "http_fetch",
+      "{\"url\":\"a\"}",
+      Some(flushed),
+    ))
     on_event(loop.ToolResultEvent("call_1", "http_fetch", True, "{\"ok\":true}"))
-    on_event(loop.ToolCallAssembled("call_2", "web_search", "{\"q\":\"x\"}"))
+    on_event(loop.ToolCallAssembled(
+      "call_2",
+      "web_search",
+      "{\"q\":\"x\"}",
+      Some(flushed),
+    ))
     on_event(loop.ToolResultEvent("call_2", "web_search", True, "{\"r\":1}"))
     on_event(loop.LoopStatus(2, 8, "request"))
     on_event(loop.StreamEvent(openai.ReasoningDelta("final thinking")))
@@ -922,7 +1026,11 @@ fn gated_runner(
     let gate = process.new_subject()
     process.send(gate_request, gate)
     let _ = process.receive(gate, 5000)
-    session.StreamDone(stats(), transcript.append_assistant(tr, "Final answer"))
+    session.StreamDone(
+      stats(),
+      transcript.append_assistant(tr, "Final answer")
+        |> transcript.stamp(timing.wall_now_s()),
+    )
   }
 }
 
@@ -939,7 +1047,7 @@ pub fn midturn_rejoin_replays_in_flight_rounds_test() {
 
   should.equal(session.send_message(sess, "research it"), session.Sent)
   // Drain the live events up to the freeze point.
-  expect_event(sub) |> should.equal(scoped(session.UserEcho("research it")))
+  expect_user_echo(sub, "research it")
   expect_event(sub) |> should.equal(scoped(session.LoopStatus(1, 8, "request")))
   expect_event(sub) |> should.equal(scoped(session.Reasoning("weighing ")))
   expect_event(sub) |> should.equal(scoped(session.Reasoning("options")))
@@ -947,7 +1055,12 @@ pub fn midturn_rejoin_replays_in_flight_rounds_test() {
   expect_event(sub) |> should.equal(scoped(session.LoopStatus(1, 8, "tools")))
   expect_event(sub)
   |> should.equal(
-    scoped(session.ToolCallAssembled("call_1", "http_fetch", "{\"url\":\"a\"}")),
+    scoped(session.ToolCallAssembled(
+      "call_1",
+      "http_fetch",
+      "{\"url\":\"a\"}",
+      Some(1_729_000_000),
+    )),
   )
   expect_event(sub)
   |> should.equal(
@@ -955,7 +1068,12 @@ pub fn midturn_rejoin_replays_in_flight_rounds_test() {
   )
   expect_event(sub)
   |> should.equal(
-    scoped(session.ToolCallAssembled("call_2", "web_search", "{\"q\":\"x\"}")),
+    scoped(session.ToolCallAssembled(
+      "call_2",
+      "web_search",
+      "{\"q\":\"x\"}",
+      Some(1_729_000_000),
+    )),
   )
   expect_event(sub)
   |> should.equal(
@@ -971,14 +1089,21 @@ pub fn midturn_rejoin_replays_in_flight_rounds_test() {
   let sub2 = join(sess)
   let assert session.SessionEvent(_, 1, session.Hello(_, _, _)) =
     expect_event(sub2)
-  expect_event(sub2) |> should.equal(scoped(session.UserEcho("research it")))
+  expect_user_echo(sub2, "research it")
   expect_event(sub2)
   |> should.equal(scoped(session.ReasoningFull("weighing options")))
-  expect_event(sub2)
-  |> should.equal(scoped(session.AssistantFull("\n\nLet me check.")))
+  // The mirror round carries the worker's flush stamp: the replayed
+  // text and assembled events pin it exactly.
+  expect_assistant_full(sub2, "\n\nLet me check.")
+  |> should.equal(1_729_000_000)
   expect_event(sub2)
   |> should.equal(
-    scoped(session.ToolCallAssembled("call_1", "http_fetch", "{\"url\":\"a\"}")),
+    scoped(session.ToolCallAssembled(
+      "call_1",
+      "http_fetch",
+      "{\"url\":\"a\"}",
+      Some(1_729_000_000),
+    )),
   )
   expect_event(sub2)
   |> should.equal(
@@ -986,7 +1111,12 @@ pub fn midturn_rejoin_replays_in_flight_rounds_test() {
   )
   expect_event(sub2)
   |> should.equal(
-    scoped(session.ToolCallAssembled("call_2", "web_search", "{\"q\":\"x\"}")),
+    scoped(session.ToolCallAssembled(
+      "call_2",
+      "web_search",
+      "{\"q\":\"x\"}",
+      Some(1_729_000_000),
+    )),
   )
   expect_event(sub2)
   |> should.equal(
@@ -998,9 +1128,10 @@ pub fn midturn_rejoin_replays_in_flight_rounds_test() {
   // the next thing either subscriber sees is the terminal event.
   let assert Ok(gate) = process.receive(gate_request, 2000)
   process.send(gate, Nil)
-  let assert session.SessionEvent(_, 1, session.TurnDone(_)) =
+  let assert session.SessionEvent(_, 1, session.TurnDone(_, _)) =
     expect_event(sub2)
-  let assert session.SessionEvent(_, 1, session.TurnDone(_)) = expect_event(sub)
+  let assert session.SessionEvent(_, 1, session.TurnDone(_, _)) =
+    expect_event(sub)
 
   // After the turn the mirror is gone: a post-turn join replays the
   // committed transcript only — no reasoning or tool residue from the
@@ -1009,9 +1140,8 @@ pub fn midturn_rejoin_replays_in_flight_rounds_test() {
   let assert session.SessionEvent(_, 1, session.Hello(_, messages, _)) =
     expect_event(sub3)
   messages |> should.equal(3)
-  expect_event(sub3) |> should.equal(scoped(session.UserEcho("research it")))
-  expect_event(sub3)
-  |> should.equal(scoped(session.AssistantFull("Final answer")))
+  expect_user_echo(sub3, "research it")
+  expect_assistant_full(sub3, "Final answer")
 }
 
 pub fn guard_hit_renders_terminal_failure_test() {
@@ -1022,7 +1152,7 @@ pub fn guard_hit_renders_terminal_failure_test() {
   should.equal(session.send_message(sess, "keep calling"), session.Sent)
   let _ = expect_event(sub)
   expect_event(sub) |> should.equal(scoped(session.LoopStatus(4, 4, "guard")))
-  let assert session.SessionEvent(_, 1, session.TurnFailed(reason)) =
+  let assert session.SessionEvent(_, 1, session.TurnFailed(reason, _)) =
     expect_event(sub)
   should.be_true(string.contains(reason, "iteration guard"))
 
@@ -1057,7 +1187,8 @@ fn reasoning_runner(
       tr,
       "answer",
       Some("pondering deeply"),
-    ),
+    )
+      |> transcript.stamp(timing.wall_now_s()),
   )
 }
 
@@ -1066,21 +1197,22 @@ pub fn reasoning_streams_live_and_replays_on_rejoin_test() {
   let sub = join(sess)
   let _ = expect_event(sub)
   should.equal(session.send_message(sess, "think"), session.Sent)
-  expect_event(sub) |> should.equal(scoped(session.UserEcho("think")))
+  expect_user_echo(sub, "think")
   expect_event(sub) |> should.equal(scoped(session.Reasoning("pondering ")))
   expect_event(sub) |> should.equal(scoped(session.Reasoning("deeply")))
   expect_event(sub) |> should.equal(scoped(session.Token("answer")))
-  let assert session.SessionEvent(_, 1, session.TurnDone(_)) = expect_event(sub)
+  let assert session.SessionEvent(_, 1, session.TurnDone(_, _)) =
+    expect_event(sub)
 
   // A fresh subscriber replays the committed reasoning just before the
   // assistant message it preceded.
   let sub2 = join(sess)
   let assert session.SessionEvent(_, 1, session.Hello(_, 3, _)) =
     expect_event(sub2)
-  expect_event(sub2) |> should.equal(scoped(session.UserEcho("think")))
+  expect_user_echo(sub2, "think")
   expect_event(sub2)
   |> should.equal(scoped(session.ReasoningFull("pondering deeply")))
-  expect_event(sub2) |> should.equal(scoped(session.AssistantFull("answer")))
+  expect_assistant_full(sub2, "answer")
 }
 
 // ---------------------------------------------------------------------------
@@ -1645,7 +1777,7 @@ pub fn utility_rearms_when_followup_turn_fails_test() {
   let _ = expect_event(sub)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
-  let assert session.SessionEvent(_, 1, session.TurnFailed(_)) =
+  let assert session.SessionEvent(_, 1, session.TurnFailed(_, _)) =
     expect_event(sub)
 
   // Nothing has re-armed yet — a failed turn commits nothing. The held

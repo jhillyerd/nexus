@@ -70,9 +70,13 @@ pub type EventKind {
   /// Sent once to a fresh subscriber after `Join` (before any replay).
   Hello(model: String, messages: Int, metrics: List(MetricSample))
   /// A user turn, echoed so every tab sees it. Also used for history replay.
-  UserEcho(text: String)
+  /// `at` is the message's display stamp — wall-clock epoch seconds from
+  /// the transcript's timestamp sidecar (None for unstamped legacy
+  /// history) — so every tab and a post-reload replay render the same age.
+  UserEcho(text: String, at: Option(Int))
   /// A complete assistant turn, used for history replay on (re)connect.
-  AssistantFull(text: String)
+  /// `at` mirrors UserEcho's display stamp.
+  AssistantFull(text: String, at: Option(Int))
   /// A committed assistant message's full reasoning — history replay,
   /// always sent just before that message's own events.
   ReasoningFull(text: String)
@@ -82,12 +86,23 @@ pub type EventKind {
   /// emitted before any content. Display-only — reasoning is never
   /// replayed into a request.
   Reasoning(text: String)
-  /// The turn finished; stats for the metrics line.
-  TurnDone(stats: openai.StreamStats)
-  /// The turn was stopped by the user; `chars` were committed.
-  TurnStopped(chars: Int)
-  /// The turn failed (non-200 / transport / decode); nothing was committed.
-  TurnFailed(reason: String)
+  /// The turn finished; stats for the metrics line. `at` is the committed
+  /// turn's final assistant-text stamp (`transcript.last_text_stamp`) —
+  /// the UI's live bubble commit carries it so live display and a
+  /// post-reload replay render the same absolute timestamp for that
+  /// message, sourced from ONE clock (the transcript sidecar), never the
+  /// UI's own.
+  TurnDone(stats: openai.StreamStats, at: Option(Int))
+  /// The turn was stopped by the user; `chars` were committed. `at`
+  /// mirrors TurnDone's committed stamp (the loop commits the partial
+  /// text on stop).
+  TurnStopped(chars: Int, at: Option(Int))
+  /// The turn failed (non-200 / transport / decode); nothing was
+  /// committed. When the failure is a tripped iteration guard the final
+  /// partial text and completed rounds WERE committed — that arm carries
+  /// the committed stamp (`at`) so the UI's surviving bubble renders the
+  /// same timestamp a replay will; the pure-error arm passes None.
+  TurnFailed(reason: String, at: Option(Int))
   /// M3: a fragment of a native tool call, still unassembled.
   ToolCallDelta(
     index: Int,
@@ -96,8 +111,17 @@ pub type EventKind {
     fragment: String,
   )
   /// M3: a fully-assembled tool call about to be executed. Also used for
-  /// history replay of assistant tool-call messages.
-  ToolCallAssembled(id: String, name: String, arguments: String)
+  /// history replay of assistant tool-call messages. `at` is the flushed
+  /// round's committed stamp — the wall-clock epoch the round's assistant
+  /// message was appended at — so the UI can timestamp the text it
+  /// committed at first-fragment time with the session's own clock
+  /// (None in legacy replays).
+  ToolCallAssembled(
+    id: String,
+    name: String,
+    arguments: String,
+    at: Option(Int),
+  )
   /// M3: a tool finished. `content` is truncated/inert. Also used for
   /// replay of tool result messages.
   ToolResult(call_id: String, name: String, ok: Bool, content: String)
@@ -417,7 +441,7 @@ type TurnState {
 /// committed `transcript`, and the mirror is dropped at `WorkerDone`
 /// (committed or failed alike), so the KV-cache byte contract is
 /// structurally unaffected. Fidelity note: an iteration's text flushes at
-/// the loop's own phase boundaries ("tools" / first assembled call), so
+/// the loop's first assembled call (with the loop's own flush stamp), so
 /// the FINAL iteration's still-streaming text is not mirrored — no event
 /// fires between stream close and the terminal broadcast. Chips and
 /// reasoning — the parts that made refreshes lose history — are.
@@ -425,7 +449,8 @@ type LiveTurn {
   LiveTurn(
     view: Transcript,
     /// Content tokens accumulated since the iteration began (reset at the
-    /// loop's "request" phase, flushed into `view` at "tools").
+    /// loop's "request" phase, flushed into `view` at the round's first
+    /// ToolCallAssembled, stamped with the loop's flush stamp).
     text: String,
     /// Reasoning accumulated since the iteration began. Consumed by the
     /// text flush when text exists, else attached to the first assembled
@@ -676,7 +701,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       |> list.index_fold(Nil, fn(_, message, index) {
         case message {
           chat.UserMessage(content: chat.UserTextContent(text), ..) ->
-            deliver(UserEcho(text))
+            deliver(UserEcho(text, transcript.stamped_at(replay, index)))
           chat.AssistantMessage(content: text, tool_calls: calls, ..) -> {
             // Reasoning replay first: it was streamed before the message's
             // own output, so it replays before it too.
@@ -686,14 +711,22 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
             }
             case text {
               Some(chat.AssistantTextContent(content)) ->
-                deliver(AssistantFull(content))
+                deliver(AssistantFull(
+                  content,
+                  transcript.stamped_at(replay, index),
+                ))
               _ -> Nil
             }
             case calls {
               Some(calls) ->
                 list.each(calls, fn(call) {
                   let chat.FunctionToolCall(id: id, function: f) = call
-                  deliver(ToolCallAssembled(id, f.name, f.arguments))
+                  deliver(ToolCallAssembled(
+                    id,
+                    f.name,
+                    f.arguments,
+                    transcript.stamped_at(replay, index),
+                  ))
                 })
               None -> Nil
             }
@@ -774,8 +807,15 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       let state = cancel_utility(state)
       case state.turn {
         Idle -> {
-          let tr = transcript.append_user(state.transcript, text)
-          emit(state, UserEcho(text))
+          // One stamp for the append AND the echo broadcast, so the
+          // sender's bubble and every other tab's (and a reload's replay)
+          // render the same wall-clock age for the same message.
+          let stamped = timing.wall_now_s()
+          let tr =
+            state.transcript
+            |> transcript.append_user(text)
+            |> transcript.stamp(stamped)
+          emit(state, UserEcho(text, Some(stamped)))
           let worker =
             process.spawn_unlinked(fn() {
               let cancel = process.new_subject()
@@ -941,18 +981,52 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           actor.continue(state)
         }
 
-        Streaming(candidate, ..), loop.ToolCallAssembled(id, name, arguments)
+        Streaming(candidate, ..),
+          loop.ToolCallAssembled(id, name, arguments, flushed_at)
           if candidate == worker
         -> {
-          emit(state, ToolCallAssembled(id, name, arguments))
+          // The worker's own flush stamp rides the loop event: the round's
+          // assistant message was appended (and its text committed) at
+          // that instant, so subscribers can timestamp the text and the
+          // mirror can record the AUTHORITATIVE value instead of a local
+          // clock read. (Worker-origin events always carry Some — the loop
+          // stamps every append — but `stamp_opt` keeps the mirror honest
+          // for the None case without an assert.)
+          emit(state, ToolCallAssembled(id, name, arguments, flushed_at))
           actor.continue(
             State(
               ..state,
               turn_view: option.map(state.turn_view, fn(live) {
-                // Reasoning still unattached this iteration (no text was
-                // flushed at the "tools" boundary) rides the first call's
-                // message — the mirror's twin of `append_calls` attaching
-                // reasoning to the calls message.
+                // The worker's own flush stamp: the round's message was
+                // appended (and its text committed) at that instant, and
+                // EVERY mirror half of the round — the text the loop
+                // flushed and the calls — carries it, so a mid-turn join
+                // renders the same timestamp a post-commit replay will.
+                // (Worker-origin events always stamp; stamp_opt keeps the
+                // mirror honest without an assert.)
+                // The pending iteration text flushes FIRST, as its own
+                // message carrying the same stamp, consuming the
+                // iteration's reasoning — the mirror's twin of
+                // `append_calls` attaching reasoning to the text-bearing
+                // message. When no text streamed, the reasoning rides the
+                // first call's message instead, exactly as before.
+                let live = case live.text {
+                  "" -> live
+                  text ->
+                    LiveTurn(
+                      view: transcript.append_assistant_with_reasoning(
+                        live.view,
+                        text,
+                        reasoning: case live.reasoning {
+                          "" -> None
+                          r -> Some(r)
+                        },
+                      )
+                        |> transcript.stamp_opt(flushed_at),
+                      text: "",
+                      reasoning: "",
+                    )
+                }
                 let #(view, reasoning) = case live.reasoning {
                   "" -> #(
                     transcript.append_assistant_tool_call(
@@ -960,7 +1034,8 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
                       id: id,
                       name: name,
                       arguments: arguments,
-                    ),
+                    )
+                      |> transcript.stamp_opt(flushed_at),
                     "",
                   )
                   r -> #(
@@ -969,7 +1044,8 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
                       text: None,
                       calls: [#(id, name, arguments)],
                       reasoning: Some(r),
-                    ),
+                    )
+                      |> transcript.stamp_opt(flushed_at),
                     "",
                   )
                 }
@@ -991,11 +1067,12 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
                 LiveTurn(
                   ..live,
                   view: transcript.append_tool_result(
-                    live.view,
-                    tool_call_id: call_id,
-                    content: content,
-                    ok: ok,
-                  ),
+                      live.view,
+                      tool_call_id: call_id,
+                      content: content,
+                      ok: ok,
+                    )
+                    |> transcript.stamp(timing.wall_now_s()),
                 )
               }),
             ),
@@ -1013,12 +1090,13 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
               option.map(state.turn_view, fn(live) {
                 LiveTurn(..live, text: "", reasoning: "")
               })
-            // Tool phase: the loop appended the iteration's assistant
-            // message (text + calls + reasoning) before executing. Flush
-            // the text half here; the calls ride the per-call assembled
-            // events that follow.
-            "tools" ->
-              option.map(state.turn_view, fn(live) { flush_live_text(live) })
+            // Tool phase: the loop appends the iteration's assistant
+            // message (text + calls + reasoning, stamped at append) right
+            // after this event, then executes. The mirror's text half is
+            // NOT flushed here — the worker's stamp does not exist yet —
+            // it flushes with the loop's own flush stamp on the round's
+            // first ToolCallAssembled event instead (see that arm).
+            "tools" -> state.turn_view
             _ -> state.turn_view
           }
           actor.continue(State(..state, turn_view: turn_view))
@@ -1238,7 +1316,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           case is_current {
             False -> actor.continue(state)
             True -> {
-              emit(state, TurnFailed("turn worker exited unexpectedly"))
+              emit(state, TurnFailed("turn worker exited unexpectedly", None))
               actor.continue(
                 State(
                   ..state,
@@ -1278,29 +1356,6 @@ fn emit(state: State, kind: EventKind) -> Nil {
   dict.each(state.subs, fn(sub, subscriber) {
     process.send(sub, SessionEvent(state.id, subscriber.visit, kind))
   })
-}
-
-/// Flush the mirror iteration's accumulated text (with its reasoning, if
-/// the text exists) into the view — the mirror twin of the loop's
-/// `append_calls` text handling. Empty text consumes nothing: reasoning
-/// stays pending for the first assembled call, exactly like the loop's
-/// reasoning-only-iteration shape.
-fn flush_live_text(live: LiveTurn) -> LiveTurn {
-  case live.text {
-    "" -> live
-    text -> {
-      let view =
-        transcript.append_assistant_with_reasoning(
-          live.view,
-          text,
-          reasoning: case live.reasoning {
-            "" -> None
-            reasoning -> Some(reasoning)
-          },
-        )
-      LiveTurn(view: view, text: "", reasoning: "")
-    }
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1444,7 +1499,7 @@ fn finish_outcome(
   case outcome {
     StreamDone(stats, tr2) -> #(
       tr2,
-      TurnDone(stats),
+      TurnDone(stats, transcript.last_text_stamp(tr2)),
       MetricSample(
         outcome: Completed,
         ttft_ms: ttft_ms,
@@ -1460,7 +1515,7 @@ fn finish_outcome(
       let chars = turn_chars(turn)
       #(
         tr2,
-        TurnStopped(chars),
+        TurnStopped(chars, transcript.last_text_stamp(tr2)),
         MetricSample(
           outcome: Stopped,
           ttft_ms: ttft_ms,
@@ -1480,7 +1535,9 @@ fn finish_outcome(
         <> " model round-trips"
       #(
         tr2,
-        TurnFailed(reason),
+        // The guard committed the final partial text and completed
+        // rounds, so the UI's surviving bubble needs the committed stamp.
+        TurnFailed(reason, transcript.last_text_stamp(tr2)),
         MetricSample(
           outcome: Failed,
           ttft_ms: ttft_ms,
@@ -1493,9 +1550,12 @@ fn finish_outcome(
         ),
       )
     }
+    // Nothing committed — `tr` is the actor's untouched transcript, so
+    // its stamps (if any) belong to EARLIER turns and must not leak into
+    // this terminal event: the UI rolls this turn's display back.
     StreamErrored(reason) -> #(
       tr,
-      TurnFailed(reason),
+      TurnFailed(reason, None),
       MetricSample(
         outcome: Failed,
         ttft_ms: ttft_ms,

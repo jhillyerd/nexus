@@ -1,8 +1,9 @@
 //// The M3 page shell: server-rendered HTML hosting the Lustre server
 //// component. The page carries no client-side application code — just the
 //// prebuilt Lustre client runtime, a `<lustre-server-component>` element
-//// whose `route` points at the WebSocket transport, and three tiny static
-//// scripts (see `indicator_js`, `session_js`, and `autoscroll_js`).
+//// whose `route` points at the WebSocket transport, and four tiny static
+//// scripts (see `indicator_js`, `session_js`, `autoscroll_js`, and
+//// `timestamps_js`).
 ////
 //// The bearer token (when auth is on) is echoed into the route's query
 //// string server-side, mirroring the M2 `?token=` convention: the token
@@ -67,6 +68,8 @@ pub fn html(token: Option(String)) -> String {
     session_js(),
     "\n",
     autoscroll_js(),
+    "\n",
+    timestamps_js(),
     "\n</script>\n</body>\n</html>\n",
   ])
 }
@@ -354,6 +357,75 @@ fn autoscroll_js() -> String {
   <> "})();"
 }
 
+/// Re-ages the chat log's per-message timestamps (`nexus/ui` `time_stamp`
+/// renders `<time data-epoch>` with the server clock's label as its
+/// no-JS fallback). The server label is frozen at render time — a tab
+/// sitting idle would show "3m ago" forever — so this script recomputes
+/// each label from the viewer's clock on a fixed cadence and localizes
+/// `title` (the hover tooltip's absolute instant) to the viewer's
+/// timezone. A MutationObserver covers the render-time case the cadence
+/// misses: messages arrive over the WebSocket AFTER this script's first
+/// pass, so without it the server's RFC3339 fallback would sit in every
+/// `title` until the next tick — the first hover would show machine
+/// format where later hovers show the localized string. Writes only on
+/// change: our own textContent writes are shadow-root mutations this
+/// very observer watches, so an unconditional write would feed itself
+/// forever (the guard makes each refresh quiesce after one settling
+/// pass). Static and token-free, like its sibling scripts.
+fn timestamps_js() -> String {
+  "(function () {\n"
+  <> "  'use strict';\n"
+  <> "  var host = document.querySelector('lustre-server-component');\n"
+  <> "  if (!host) return;\n"
+  <> "  var AGE_MS = 30000; // how often labels re-age\n"
+  <> "  // Same thresholds as the server's rel_time (nexus/ui), plus the\n"
+  <> "  // ' ago' suffix of age_label; negative deltas (clock skew) read as\n"
+  <> "  // 'just now', mirroring the server's clamp.\n"
+  <> "  var label = function (ms) {\n"
+  <> "    if (ms < 60000) return 'just now';\n"
+  <> "    var compact =\n"
+  <> "      ms < 3600000 ? Math.floor(ms / 60000) + 'm'\n"
+  <> "      : ms < 86400000 ? Math.floor(ms / 3600000) + 'h'\n"
+  <> "      : ms < 604800000 ? Math.floor(ms / 86400000) + 'd'\n"
+  <> "      : ms < 31536000000 ? Math.floor(ms / 604800000) + 'w'\n"
+  <> "      : Math.floor(ms / 31536000000) + 'y';\n"
+  <> "    return compact + ' ago';\n"
+  <> "  };\n"
+  <> "  var refresh = function () {\n"
+  <> "    var root = host.shadowRoot;\n"
+  <> "    if (!root) return;\n"
+  <> "    var now = Date.now();\n"
+  <> "    var times = root.querySelectorAll('time[data-epoch]');\n"
+  <> "    for (var i = 0; i < times.length; i++) {\n"
+  <> "      var el = times[i];\n"
+  <> "      var epoch = parseInt(el.getAttribute('data-epoch'), 10) * 1000;\n"
+  <> "      var text = label(now - epoch);\n"
+  <> "      if (el.textContent !== text) el.textContent = text;\n"
+  <> "      var title = new Date(epoch).toLocaleString();\n"
+  <> "      if (el.getAttribute('title') !== title) el.setAttribute('title', title);\n"
+  <> "    }\n"
+  <> "  };\n"
+  <> "  var attached = false;\n"
+  <> "  var attach = function () {\n"
+  <> "    var root = host.shadowRoot;\n"
+  <> "    if (!root || attached) return;\n"
+  <> "    attached = true;\n"
+  <> "    new MutationObserver(function () {\n"
+  <> "      refresh();\n"
+  <> "    }).observe(root, { childList: true, subtree: true });\n"
+  <> "  };\n"
+  <> "  // The shadow root does not exist until the client runtime mounts;\n"
+  <> "  // the mount/connect hooks are the same re-entry points the sibling\n"
+  <> "  // scripts use (a crash costs one socket and the browser reconnects\n"
+  <> "  // into a fresh runtime — re-attach there too).\n"
+  <> "  host.addEventListener('lustre:mount', attach);\n"
+  <> "  host.addEventListener('lustre:connect', attach);\n"
+  <> "  attach();\n"
+  <> "  setInterval(refresh, AGE_MS);\n"
+  <> "  refresh();\n"
+  <> "})();"
+}
+
 fn css() -> String {
   "
 :root { color-scheme: light dark; }
@@ -571,6 +643,16 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
 .turn { max-width: 46rem; padding: .55rem .8rem; border-radius: 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .turn.user { align-self: flex-end; background: color-mix(in srgb, #3b82f6 18%, transparent); }
 .turn.assistant { align-self: flex-start; background: color-mix(in srgb, currentColor 8%, transparent); }
+/* Per-message timestamp (nexus/ui time_stamp): a small muted line under
+   the bubble text. #app-prefix per the cascade traps above (bare `time`
+   could meet framework element rules); `white-space` resets off `.turn`'s
+   pre-wrap so the label wraps as a normal short line. The server label is
+   the no-JS fallback — `timestamps_js` re-ages it and localizes `title`.
+   User bubbles right-align the stamp to hug the pill's anchored edge. */
+#app .turn time.ts { display: block; margin-top: .3rem; font-size: .72rem; opacity: .62;
+  white-space: normal; }
+#app .turn.user time.ts { text-align: right; }
+#app .turn.md > time.ts:last-child { margin-bottom: 0; }
 /* Markdown assistant turns (.md, see nexus/ui/markdown): the renderer
    emits block semantics, so pre-wrap text flow switches off and the
    blocks get chat-sized margins. Headings collapse to body size — a

@@ -74,10 +74,13 @@ pub type ToolStatus {
 }
 
 /// One completed line in the chat log. The in-flight assistant bubble is
-/// kept separately (like M2) so tokens can be appended cheaply.
+/// kept separately (like M2) so tokens can be appended cheaply. `at` on
+/// the text lines is the message's display stamp (wall-clock epoch
+/// seconds; None = unstamped legacy history) — display metadata like the
+/// reasoning sidecar it mirrors, never a request byte.
 pub type Line {
-  UserLine(text: String)
-  AssistantLine(text: String)
+  UserLine(text: String, at: Option(Int))
+  AssistantLine(text: String, at: Option(Int))
   /// The reasoning (chain of thought) a committed assistant message was
   /// preceded by — replayed from history or committed from the live
   /// thinking stream. Rendered as an inert, collapsed block.
@@ -210,6 +213,19 @@ pub type Model {
     /// must not re-apply session A's queued first-visit events (same id,
     /// stale generation) on top of the second visit's replay.
     visit: Int,
+    /// The text the `ToolCallDelta` arm committed ahead of the worker's
+    /// append (the loop commits round text at assembly time, but the UI
+    /// commits at the first fragment so the pill lands above the pending
+    /// card — pinned display behaviour). Its authoritative stamp arrives
+    /// on the round's `ToolCallAssembled` (`loop.append_calls`' sidecar
+    /// entry), which restamps all of them; `finish_turn` restamps with the
+    /// terminal event's stamp for a Stop that landed between the fragments
+    /// and the assembly. Text and call fragments can interleave within one
+    /// round, so a round may flush MORE THAN ONE segment — all are tracked,
+    /// newest-first. Cleared when the selection changes or the session
+    /// ends: a stale entry must never stamp another session's (possibly
+    /// legacy-unstamped) line that happens to carry the same text.
+    flushed: List(String),
     picker: String,
     create_open: Bool,
     log: List(Line),
@@ -331,17 +347,27 @@ pub type Msg {
   SendRejected(String)
   StopRequested
   Hello(model: String)
-  UserEcho(String)
-  AssistantFull(String)
+  /// A committed user line. `at` is its display stamp — wall-clock epoch
+  /// seconds from the session's echo (live and replay carry the same
+  /// value); None = unstamped legacy history, rendered without a time.
+  UserEcho(String, Option(Int))
+  /// A committed assistant line, replayed from history (or seen by a
+  /// second tab). `at` mirrors UserEcho's display stamp.
+  AssistantFull(String, Option(Int))
   /// A committed assistant message's reasoning, replayed with history
   /// (always just before that message's own events).
   ReasoningFull(String)
   Token(String)
   /// A streamed fragment of the model's reasoning (chain of thought).
   Reasoning(String)
-  TurnDone
-  TurnStopped
-  TurnFailed(String)
+  /// The turn's terminal state. `at` is the committed turn's final
+  /// assistant-text stamp from the session actor (`transcript
+  /// .last_text_stamp` — the SAME value a post-reload replay attaches to
+  /// that message), so the live bubble commit renders the same absolute
+  /// timestamp as replay; None = nothing committed (or unstamped legacy).
+  TurnDone(Option(Int))
+  TurnStopped(Option(Int))
+  TurnFailed(String, Option(Int))
   /// The session's organizational metadata changed server-side (the
   /// model-generated title upgrade landed). Refreshes the session list so
   /// EVERY connected tab's sidebar updates — not just the client that
@@ -355,7 +381,17 @@ pub type Msg {
     name: Option(String),
     fragment: String,
   )
-  ToolCallAssembled(id: String, name: String, arguments: String)
+  /// A tool call fully assembled (about to execute). `at` is the flushed
+  /// round's committed stamp from the loop: the wall-clock epoch the
+  /// round's assistant message (and the text the UI committed at
+  /// first-fragment time) was appended at — the authoritative value for
+  /// the pending-flush restamp. None = legacy replay (nothing to stamp).
+  ToolCallAssembled(
+    id: String,
+    name: String,
+    arguments: String,
+    at: Option(Int),
+  )
   ToolResult(id: String, name: String, ok: Bool, content: String)
   LoopStatus(iteration: Int, max_iterations: Int, phase: String)
   // ---- Session organization ----
@@ -387,19 +423,19 @@ pub type Msg {
 pub fn from_session_event(event: session.EventKind) -> Msg {
   case event {
     session.Hello(model, _messages, _metrics) -> Hello(model)
-    session.UserEcho(text) -> UserEcho(text)
-    session.AssistantFull(text) -> AssistantFull(text)
+    session.UserEcho(text, at) -> UserEcho(text, at)
+    session.AssistantFull(text, at) -> AssistantFull(text, at)
     session.ReasoningFull(text) -> ReasoningFull(text)
     session.Token(text) -> Token(text)
     session.Reasoning(text) -> Reasoning(text)
-    session.TurnDone(_stats) -> TurnDone
-    session.TurnStopped(_chars) -> TurnStopped
-    session.TurnFailed(reason) -> TurnFailed(reason)
+    session.TurnDone(_stats, at) -> TurnDone(at)
+    session.TurnStopped(_chars, at) -> TurnStopped(at)
+    session.TurnFailed(reason, at) -> TurnFailed(reason, at)
     session.MetaUpdated(title, tags) -> MetaUpdated(title, tags)
     session.ToolCallDelta(index, id, name, fragment) ->
       ToolCallDelta(index, id, name, fragment)
-    session.ToolCallAssembled(id, name, arguments) ->
-      ToolCallAssembled(id, name, arguments)
+    session.ToolCallAssembled(id, name, arguments, at) ->
+      ToolCallAssembled(id, name, arguments, at)
     session.ToolResult(id, name, ok, content) ->
       ToolResult(id, name, ok, content)
     session.LoopStatus(iteration, max, phase) ->
@@ -431,6 +467,10 @@ pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
       // take over — same as any stale selection.
       selected: flags.session,
       visit: 0,
+      // The text the delta arm committed ahead of the worker's append
+      // (see the ToolCallDelta arm): its authoritative stamp arrives on
+      // the round's ToolCallAssembled and restamps the line.
+      flushed: [],
       picker: "",
       create_open: False,
       log: [],
@@ -763,6 +803,7 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               selected: Some(id),
               visit: model.visit + 1,
               log: [],
+              flushed: [],
               bubble: None,
               bubble_hidden: True,
               thinking: None,
@@ -856,10 +897,10 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       effect.none(),
     )
 
-    UserEcho(text) -> #(
+    UserEcho(text, at) -> #(
       Model(
         ..model,
-        log: [UserLine(text), ..model.log],
+        log: [UserLine(text, at), ..model.log],
         // The user message marks the start of a (possibly live) turn: lines
           // beyond this point belong to it and roll back on a failed turn.
           turn_base: list.length(model.log) + 1,
@@ -873,14 +914,14 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     // is skipped wholesale: an AssistantLine for it would be an empty
     // tinted pill, and the live commit path skips the same shapes, so
     // replay and live display stay identical.
-    AssistantFull(text) -> {
+    AssistantFull(text, at) -> {
       let elements = markdown.render(text)
       case elements {
         [] -> #(model, effect.none())
         _ -> #(
           Model(
             ..model,
-            log: [AssistantLine(text), ..model.log],
+            log: [AssistantLine(text, at), ..model.log],
             md_cache: dict.insert(model.md_cache, text, elements),
           ),
           effect.none(),
@@ -934,9 +975,15 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       )
     }
 
-    TurnDone -> #(finish_turn(model, CommitBubble), sessions_effect(model))
+    TurnDone(at) -> #(
+      finish_turn(model, CommitBubble(at)),
+      sessions_effect(model),
+    )
 
-    TurnStopped -> #(finish_turn(model, CommitBubble), sessions_effect(model))
+    TurnStopped(at) -> #(
+      finish_turn(model, CommitBubble(at)),
+      sessions_effect(model),
+    )
 
     // Server-side metadata change (title upgrade): the payload is display
     // metadata — the refresh re-reads the whole list from the registry, so
@@ -953,8 +1000,17 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     // its reasoning), so with no text yet an early commit here would
     // orphan the reasoning line after a stop.
     ToolCallDelta(index, id, name, fragment) -> {
+      // Commit the bubble with NO timestamp yet: the worker has not
+      // appended (and stamped) the round's message at fragment time — its
+      // instant does not exist. The authoritative stamp arrives on the
+      // round's `ToolCallAssembled` and restamps this line (see `flushed`);
+      // a Stop landing first restamps via the terminal event instead. No
+      // UI clock read anywhere.
       let model = case model.bubble {
-        Some(_) -> model |> commit_thinking |> commit_bubble
+        Some(text) ->
+          Model(..model, flushed: [text, ..model.flushed])
+          |> commit_thinking
+          |> commit_bubble(None)
         None -> model
       }
       let pending =
@@ -965,8 +1021,20 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     // The call is assembled and about to execute: drop its pending card
     // (and any sibling fragments — the "tools" phase boundary clears the
     // rest), then commit a running card for the stable id.
-    ToolCallAssembled(id, name, arguments) -> {
-      let model = model |> commit_thinking |> commit_bubble
+    ToolCallAssembled(id, name, arguments, at) -> {
+      // The loop's flush stamp has arrived: first restamp the line the
+      // delta arm committed ahead of the append (matching by text — the
+      // exact string this connection committed — so a legacy unstamped
+      // line can never be hit), then commit anything still in the bubble
+      // (the empty-arguments case: no fragments ever fired, so this is
+      // its first commit) with the stamp directly.
+      let model =
+        Model(
+          ..model,
+          flushed: [],
+          log: restamp_flushed(model.log, model.flushed, at),
+        )
+      let model = model |> commit_thinking |> commit_bubble(at)
       let pending = drop_pending(model.pending, id, name)
       #(
         Model(..model, pending: pending, log: [
@@ -1014,12 +1082,16 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     // never-run call is dropped); any other failure commits nothing, so the
     // whole turn's display rolls back to the user line and the partial
     // bubble is discarded.
-    TurnFailed(reason) -> {
+    TurnFailed(reason, at) -> {
       let model = case model.guard {
-        True -> commit_turn_output(model)
+        // The guard committed: the surviving bubble carries the session's
+        // own stamp, exactly as a replay of that transcript will.
+        True -> commit_turn_output(settle_flushed(model, at), at)
         False ->
+          // Nothing committed — the whole turn's display rolls back, so
+          // the pending flush goes with it (unrestamped, like its line).
           Model(
-            ..model,
+            ..settle_flushed(model, None),
             log: rollback_log(model.log, model.turn_base),
             bubble: None,
             bubble_hidden: True,
@@ -1175,9 +1247,12 @@ pub fn matches_filter(summary: session.SessionSummary, filter: String) -> Bool {
   }
 }
 
-/// How a terminal event treats the streaming bubble.
+/// How a terminal event treats the streaming bubble. `CommitBubble(at)`
+/// carries the committed turn's stamp from the terminal event — the
+/// session's own clock (`transcript.last_text_stamp`, read by the actor
+/// off the committed transcript), never a second UI-side read.
 type BubblePolicy {
-  CommitBubble
+  CommitBubble(at: Option(Int))
   DropBubble
 }
 
@@ -1186,11 +1261,70 @@ type BubblePolicy {
 /// stay (completed rounds are committed server-side on done/stopped/guard).
 fn finish_turn(model: Model, policy: BubblePolicy) -> Model {
   let model = case policy {
-    CommitBubble -> commit_turn_output(model)
+    CommitBubble(at) ->
+      // A Stop (or guard) can land between the delta-time flush commit
+      // and its round's assembly: the terminal stamp is the committed
+      // transcript's (`last_text_stamp` — the loop commits the partial
+      // text on stop), so restamp the pending line with it before the
+      // bubble commit (which is a no-op when the delta arm already
+      // consumed it).
+      // settle_flushed is a no-op without a pending flush, so one call
+      // covers both cases.
+      commit_turn_output(settle_flushed(model, at), at)
     DropBubble ->
-      Model(..model, bubble: None, bubble_hidden: True, thinking: None)
+      Model(
+        ..settle_flushed(model, None),
+        bubble: None,
+        bubble_hidden: True,
+        thinking: None,
+      )
   }
   Model(..model, pending: [], loop: None, guard: False, streaming: False)
+}
+
+/// Settle a pending delta-time flush: give the line the delta arm
+/// committed ahead of the worker's append its authoritative stamp (`at` —
+/// None on a rollback, where the line is about to be dropped anyway) and
+/// clear the pending marker. No-op without a pending flush.
+fn settle_flushed(model: Model, at: Option(Int)) -> Model {
+  case model.flushed {
+    [] -> model
+    texts ->
+      Model(..model, flushed: [], log: restamp_flushed(model.log, texts, at))
+  }
+}
+
+/// Restamp every pending flush text (see the `flushed` field) with `at`.
+/// Matching is by the exact committed text — it cannot hit a legacy
+/// unstamped line, and within one session rounds are serial, so the
+/// first (newest) match per text is the right line. A text that is
+/// already restamped (or absent — replay, where no delta-time commit
+/// happens) is a no-op.
+fn restamp_flushed(
+  log: List(Line),
+  texts: List(String),
+  at: Option(Int),
+) -> List(Line) {
+  case texts {
+    [] -> log
+    [text, ..rest] -> restamp_flushed(restamp_one(log, text, at), rest, at)
+  }
+}
+
+/// The single-text worker of `restamp_flushed`.
+fn restamp_one(log: List(Line), text: String, at: Option(Int)) -> List(Line) {
+  case log {
+    [] -> []
+    [line, ..rest] ->
+      case line {
+        AssistantLine(t, None) ->
+          case t == text {
+            True -> [AssistantLine(t, at), ..rest]
+            False -> [line, ..restamp_one(rest, text, at)]
+          }
+        other -> [other, ..restamp_one(rest, text, at)]
+      }
+  }
 }
 
 /// Commit one finished turn's visible output, mirroring the loop's own
@@ -1198,9 +1332,9 @@ fn finish_turn(model: Model, policy: BubblePolicy) -> Model {
 /// preceded. A turn that produced reasoning but no text/tool output
 /// commits NOTHING server-side, so the thinking buffer is dropped here
 /// too — display state must mirror the server's transcript exactly.
-fn commit_turn_output(model: Model) -> Model {
+fn commit_turn_output(model: Model, at: Option(Int)) -> Model {
   case model.bubble {
-    Some(_text) -> model |> commit_thinking |> commit_bubble
+    Some(_text) -> model |> commit_thinking |> commit_bubble(at)
     None -> Model(..model, thinking: None)
   }
 }
@@ -1211,7 +1345,7 @@ fn commit_turn_output(model: Model) -> Model {
 /// tool calls) commits nothing visible — the transcript keeps it, and a
 /// replay skips it through the same render — so no empty pill appears and
 /// live display matches the post-reload rebuild.
-fn commit_bubble(model: Model) -> Model {
+fn commit_bubble(model: Model, at: Option(Int)) -> Model {
   case model.bubble {
     Some(text) -> {
       let elements = markdown.render(text)
@@ -1222,7 +1356,14 @@ fn commit_bubble(model: Model) -> Model {
             ..model,
             bubble: None,
             bubble_hidden: True,
-            log: [AssistantLine(text), ..model.log],
+            // `at` rode the terminal event from the actor: the stamp of
+            // the committed turn's final assistant-text message, read off
+            // the transcript sidecar — the exact value a post-reload
+            // replay attaches to that message's AssistantFull. One clock
+            // end to end; the UI never stamps from its own read. None =
+            // unstamped (legacy), rendering without a timestamp — same
+            // as the replay it mirrors.
+            log: [AssistantLine(text, at), ..model.log],
             md_cache: dict.insert(model.md_cache, text, elements),
           )
       }
@@ -1378,6 +1519,13 @@ fn after_sessions(
     log: case ended {
       True -> []
       False -> model.log
+    },
+    // The pending flushes belong to the ended session's log; a stale
+    // entry must never stamp another session's (possibly legacy-
+    // unstamped) line that happens to carry the same text.
+    flushed: case ended {
+      True -> []
+      False -> model.flushed
     },
     bubble: case ended {
       True -> None
@@ -2328,11 +2476,13 @@ fn log_lines(model: Model) -> List(Element(Msg)) {
   // hidden while its text would render to nothing — the same rule the
   // commit path applies (see the `Token` arm, which computes
   // `bubble_hidden`), so nothing appears live that a commit would drop.
+  // No timestamp: the bubble is not committed yet, and the commit rules
+  // it mirrors commit nothing server-side — the stamp lands at TurnDone.
   let with_bubble = case model.bubble {
     Some(text) ->
       case model.bubble_hidden {
         True -> with_thinking
-        False -> list.append(with_thinking, [turn("assistant", text)])
+        False -> list.append(with_thinking, [turn("assistant", text, None)])
       }
     None -> with_thinking
   }
@@ -2355,8 +2505,11 @@ fn log_lines(model: Model) -> List(Element(Msg)) {
   }
 }
 
-fn turn(kind: String, text: String) -> Element(Msg) {
-  html.div([attr.class("turn " <> kind)], [html.span([], [html.text(text)])])
+fn turn(kind: String, text: String, at: Option(Int)) -> Element(Msg) {
+  html.div([attr.class("turn " <> kind)], [
+    html.span([], [html.text(text)]),
+    time_stamp(at),
+  ])
 }
 
 /// Committed assistant turns render markdown (see `nexus/ui/markdown`
@@ -2368,6 +2521,7 @@ fn turn(kind: String, text: String) -> Element(Msg) {
 fn assistant_turn(
   md_cache: dict.Dict(String, List(Element(Msg))),
   text: String,
+  at: Option(Int),
 ) -> Element(Msg) {
   // No wrapper span: the markdown blocks are direct children of the
   // bubble, so valid HTML nesting returns and the `.turn.md >
@@ -2376,13 +2530,55 @@ fn assistant_turn(
   // for direct view renders; both commit paths populate the cache — and
   // both reject render-empty text, so an empty element list here would
   // render an empty tinted pill; guard it anyway (defense in depth).
+  // The timestamp rides AFTER the markdown blocks (it is not part of the
+  // cached render — the cache is keyed by text alone) and becomes the
+  // last child, where the existing `:last-child` margin reset covers it.
   let elements = case dict.get(md_cache, text) {
     Ok(elements) -> elements
     Error(_) -> markdown.render(text)
   }
   case elements {
     [] -> element.none()
-    _ -> html.div([attr.class("turn assistant md")], elements)
+    _ ->
+      html.div(
+        [attr.class("turn assistant md")],
+        list.append(elements, [time_stamp(at)]),
+      )
+  }
+}
+
+/// The per-message timestamp: a `<time data-epoch>` with the compact
+/// relative age ("3m ago", "just now") as its text, the RFC3339 UTC
+/// instant as both `datetime` and `title` (the browser renders `title`
+/// as the hover tooltip — the absolute half of the display, server-side
+/// and no-JS). `data-epoch` lets the page shell's `timestamps_js` re-age
+/// the labels as time passes and localize `title` to the viewer's
+/// timezone; unstamped (legacy) messages render no element at all.
+fn time_stamp(at: Option(Int)) -> Element(Msg) {
+  case at {
+    None -> element.none()
+    Some(at) -> {
+      let instant = timing.wall_to_rfc3339(at)
+      html.time(
+        [
+          attr.class("ts"),
+          attr.datetime(instant),
+          attr.title(instant),
+          attr.attribute("data-epoch", int.to_string(at)),
+        ],
+        [html.text(age_label(timing.wall_now_s(), at))],
+      )
+    }
+  }
+}
+
+/// The bubble's relative-age label: the sidebar's compact `rel_time`
+/// ("3m", "2h", "5d") with an " ago" suffix, except "just now" which
+/// reads as itself. Pure; same deterministic UTC arithmetic as rel_time.
+pub fn age_label(now_epoch: Int, at: Int) -> String {
+  case rel_time(now_epoch, at) {
+    "just now" -> "just now"
+    compact -> compact <> " ago"
   }
 }
 
@@ -2391,8 +2587,8 @@ fn render_line(
   line: Line,
 ) -> Element(Msg) {
   case line {
-    UserLine(text) -> turn("user", text)
-    AssistantLine(text) -> assistant_turn(md_cache, text)
+    UserLine(text, at) -> turn("user", text, at)
+    AssistantLine(text, at) -> assistant_turn(md_cache, text, at)
     ReasoningLine(text) -> reasoning_block(text, False)
     ToolLine(..) -> tool_card(line)
     NoteLine(err, text) ->
@@ -2462,7 +2658,7 @@ fn take_chips(run: List(Line), rest: List(Line)) -> #(List(Line), List(Line)) {
 fn is_chip(line: Line) -> Bool {
   case line {
     ReasoningLine(_) | ToolLine(..) -> True
-    UserLine(_) | AssistantLine(_) | NoteLine(_, _) -> False
+    UserLine(_, _) | AssistantLine(_, _) | NoteLine(_, _) -> False
   }
 }
 

@@ -13,6 +13,10 @@ import pog
 /// NULL — Postgres exposes no parameter nullability, so squirrel
 /// parameters cannot be nullable and the sentinel is its documented
 /// workaround (see insert_provider.sql).
+/// created_at is display-only (the chat log's per-message ages); the 0
+/// sentinel inserts NULL the same way (to_timestamp(NULL) is NULL), so
+/// unstamped rows stay honestly unstamped instead of borrowing the write
+/// instant as a fake append time.
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
@@ -24,6 +28,7 @@ pub fn append_plain_message(
   arg_3: String,
   arg_4: String,
   arg_5: String,
+  arg_6: Int,
 ) -> Result(pog.Returned(Nil), pog.QueryError) {
   let decoder = decode.map(decode.dynamic, fn(_) { Nil })
 
@@ -32,8 +37,12 @@ pub fn append_plain_message(
 -- NULL — Postgres exposes no parameter nullability, so squirrel
 -- parameters cannot be nullable and the sentinel is its documented
 -- workaround (see insert_provider.sql).
-insert into session_message (session_id, seq, role, content, reasoning)
-values ($1, $2, $3, $4, nullif($5, ''::text))
+-- created_at is display-only (the chat log's per-message ages); the 0
+-- sentinel inserts NULL the same way (to_timestamp(NULL) is NULL), so
+-- unstamped rows stay honestly unstamped instead of borrowing the write
+-- instant as a fake append time.
+insert into session_message (session_id, seq, role, content, reasoning, created_at)
+values ($1, $2, $3, $4, nullif($5, ''::text), to_timestamp(nullif($6, 0::bigint)))
 on conflict (session_id, seq) do nothing
 "
   |> pog.query
@@ -42,6 +51,7 @@ on conflict (session_id, seq) do nothing
   |> pog.parameter(pog.text(arg_3))
   |> pog.parameter(pog.text(arg_4))
   |> pog.parameter(pog.text(arg_5))
+  |> pog.parameter(pog.int(arg_6))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }
@@ -50,6 +60,9 @@ on conflict (session_id, seq) do nothing
 /// continuation rows of the same assistant message). The run's FIRST row
 /// also carries the message's reasoning; the '' sentinel inserts NULL
 /// (Postgres exposes no parameter nullability — see insert_provider.sql).
+/// created_at is display-only and follows the same first-row rule as
+/// content/reasoning; the 0 sentinel inserts NULL (see
+/// append_plain_message.sql).
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
@@ -63,6 +76,7 @@ pub fn append_tool_call(
   arg_5: String,
   arg_6: String,
   arg_7: String,
+  arg_8: Int,
 ) -> Result(pog.Returned(Nil), pog.QueryError) {
   let decoder = decode.map(decode.dynamic, fn(_) { Nil })
 
@@ -70,8 +84,11 @@ pub fn append_tool_call(
 -- continuation rows of the same assistant message). The run's FIRST row
 -- also carries the message's reasoning; the '' sentinel inserts NULL
 -- (Postgres exposes no parameter nullability — see insert_provider.sql).
-insert into session_message (session_id, seq, role, content, tool_call_id, tool_name, tool_args, reasoning)
-values ($1, $2, 'assistant', $3, $4, $5, $6, nullif($7, ''::text))
+-- created_at is display-only and follows the same first-row rule as
+-- content/reasoning; the 0 sentinel inserts NULL (see
+-- append_plain_message.sql).
+insert into session_message (session_id, seq, role, content, tool_call_id, tool_name, tool_args, reasoning, created_at)
+values ($1, $2, 'assistant', $3, $4, $5, $6, nullif($7, ''::text), to_timestamp(nullif($8, 0::bigint)))
 on conflict (session_id, seq) do nothing
 "
   |> pog.query
@@ -82,11 +99,14 @@ on conflict (session_id, seq) do nothing
   |> pog.parameter(pog.text(arg_5))
   |> pog.parameter(pog.text(arg_6))
   |> pog.parameter(pog.text(arg_7))
+  |> pog.parameter(pog.int(arg_8))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }
 
 /// Append one tool-result row.
+/// created_at is display-only (the chat log's per-message ages); the 0
+/// sentinel inserts NULL (see append_plain_message.sql).
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
@@ -99,12 +119,15 @@ pub fn append_tool_result(
   arg_4: String,
   arg_5: String,
   arg_6: Bool,
+  arg_7: Int,
 ) -> Result(pog.Returned(Nil), pog.QueryError) {
   let decoder = decode.map(decode.dynamic, fn(_) { Nil })
 
   "-- Append one tool-result row.
-insert into session_message (session_id, seq, role, content, tool_call_id, tool_name, tool_ok)
-values ($1, $2, 'tool', $3, $4, $5, $6)
+-- created_at is display-only (the chat log's per-message ages); the 0
+-- sentinel inserts NULL (see append_plain_message.sql).
+insert into session_message (session_id, seq, role, content, tool_call_id, tool_name, tool_ok, created_at)
+values ($1, $2, 'tool', $3, $4, $5, $6, to_timestamp(nullif($7, 0::bigint)))
 on conflict (session_id, seq) do nothing
 "
   |> pog.query
@@ -114,6 +137,7 @@ on conflict (session_id, seq) do nothing
   |> pog.parameter(pog.text(arg_4))
   |> pog.parameter(pog.text(arg_5))
   |> pog.parameter(pog.bool(arg_6))
+  |> pog.parameter(pog.int(arg_7))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }
@@ -751,6 +775,7 @@ pub type LoadMessagesRow {
     tool_args: Option(String),
     tool_ok: Option(Bool),
     reasoning: Option(String),
+    created_s: Int,
     message_count: Int,
   )
 }
@@ -759,6 +784,12 @@ pub type LoadMessagesRow {
 /// denormalized message_count (the authoritative persisted transcript
 /// length, including the system prompt — a multi-call assistant message is
 /// one message but several rows, so rows alone would undercount).
+/// created_at is the display-only wall-clock stamp (NULL for legacy rows).
+/// It reads through the 0 sentinel (0 = unstamped) rather than relying on
+/// NULL: Postgres reports expression results as NOT NULL in the wire
+/// protocol's row description, so squirrel would generate a non-optional
+/// decoder for a bare extract(...) and crash on legacy NULL rows — the
+/// same sentinel workaround as the '' text sentinel (insert_provider.sql).
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
@@ -776,7 +807,8 @@ pub fn load_messages(
     use tool_args <- decode.field(5, decode.optional(decode.string))
     use tool_ok <- decode.field(6, decode.optional(decode.bool))
     use reasoning <- decode.field(7, decode.optional(decode.string))
-    use message_count <- decode.field(8, decode.int)
+    use created_s <- decode.field(8, decode.int)
+    use message_count <- decode.field(9, decode.int)
     decode.success(LoadMessagesRow(
       seq:,
       role:,
@@ -786,6 +818,7 @@ pub fn load_messages(
       tool_args:,
       tool_ok:,
       reasoning:,
+      created_s:,
       message_count:,
     ))
   }
@@ -794,7 +827,13 @@ pub fn load_messages(
 -- denormalized message_count (the authoritative persisted transcript
 -- length, including the system prompt — a multi-call assistant message is
 -- one message but several rows, so rows alone would undercount).
-select m.seq, m.role, m.content, m.tool_call_id, m.tool_name, m.tool_args, m.tool_ok, m.reasoning, s.message_count
+-- created_at is the display-only wall-clock stamp (NULL for legacy rows).
+-- It reads through the 0 sentinel (0 = unstamped) rather than relying on
+-- NULL: Postgres reports expression results as NOT NULL in the wire
+-- protocol's row description, so squirrel would generate a non-optional
+-- decoder for a bare extract(...) and crash on legacy NULL rows — the
+-- same sentinel workaround as the '' text sentinel (insert_provider.sql).
+select m.seq, m.role, m.content, m.tool_call_id, m.tool_name, m.tool_args, m.tool_ok, m.reasoning, coalesce(extract(epoch from m.created_at)::int8, 0) as created_s, s.message_count
 from session_message m
 join session s on s.id = m.session_id
 where m.session_id = $1
