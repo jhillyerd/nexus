@@ -1,0 +1,9 @@
+# CodeRabbit configuration — https://docs.coderabbit.ai/reference/configuration
+# Reviews run on demand via the `@coderabbitai review` PR comment. Automatic
+# reviews are disabled explicitly here (a repo config file can mask the
+# org-level setting, and the schema default is enabled), and the "Review
+# skipped" status comment is silenced.
+reviews:
+  review_status: false
+  auto_review:
+    enabled: false
