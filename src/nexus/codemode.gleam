@@ -1,7 +1,7 @@
-//// The codemode tool (phase 1 of the codemode plan): the model authors a
-//// Lua 5.3 script; the script calls nexus's sibling tools through a host
-//// API, digests the results, and returns one compact tool result — N tool
-//// round-trips collapse into one model turn.
+//// The codemode tool (phases 1–2 of the codemode plan): the model
+//// authors a Lua 5.3 script; the script calls nexus's sibling tools
+//// through a host API, digests the results, and returns one compact
+//// tool result — N tool round-trips collapse into one model turn.
 ////
 //// Process model: `run` executes in the per-turn worker. It spawns a
 //// dedicated engine child (linked, so turn teardown and worker death reap
@@ -14,6 +14,16 @@
 //// exits for the duration (the engine is its only link) and consumes the
 //// engine's exit message BEFORE restoring the flag, or the delayed
 //// `killed` signal would take the worker down after the run.
+////
+//// Phase 2 adds the parallel batch tier: `tools.call_all(entries)` runs
+//// each entry in its own BEAM process linked to the engine, waits with
+//// the remaining script deadline (less a wrap-up margin so a partial
+//// batch can be folded and emitted before the worker's kill), and
+//// returns every entry as a VALUE (`{ok=true, result=...}` /
+//// `{ok=false, error=...}` — allSettled). Children never outlive the
+//// engine: links reap them on every death path, and the happy path
+//// kills stragglers explicitly because a NORMAL engine exit does not
+//// propagate to links.
 ////
 //// This module is deliberately a leaf — it must not import
 //// `nexus/tools`: the registry (`tools.default`) builds the host list
@@ -32,6 +42,7 @@
 //// - engine heap ceiling (`max_heap_size`, ~64 MiB in words — bounds the
 ////   pure-Lua allocation the call budget cannot see).
 
+import gleam/dict
 import gleam/dynamic/decode
 import gleam/erlang/process.{type ExitMessage, type Subject, ExitMessage}
 import gleam/int
@@ -58,6 +69,13 @@ const max_heap_words = 8_388_608
 /// blow past the output budget from the error path alone.
 const max_reason_chars = 2000
 
+/// The batch's internal deadline sits this far inside the script's
+/// wall-clock deadline: expiring early (rather than exactly at the
+/// deadline) lets a script fold its partial batch and emit output
+/// BEFORE the worker's kill fires — call_all "returns the partial
+/// result list" instead of racing the reaper (phase-2 plan wording).
+const batch_deadline_margin_us = 50_000
+
 // ---------------------------------------------------------------------------
 // Tool surface
 // ---------------------------------------------------------------------------
@@ -73,6 +91,12 @@ const description =
   <> "becomes a trailing output item, same rendering as text(). Emit the "
   <> "answer once — via return OR via text()/print(); returning a value "
   <> "you already emitted duplicates it (there is no deduplication). "
+  <> "tools.call_all({{name = ..., args = ...}, ...}) runs a list of tool "
+  <> "calls in parallel and returns one array in input order, each entry "
+  <> "{ok = true, result = ...} or {ok = false, error = ...} — one "
+  <> "failing entry never aborts the batch, and entries unfinished at "
+  <> "the deadline come back {ok = false, error = 'deadline exceeded'}; "
+  <> "every entry counts toward the tool-call budget. "
   <> "Sandboxed Lua only: no io, files, os.execute, or code loading. "
   <> "Script source must be ASCII-only (the Lua compiler rejects "
   <> "non-ASCII literals; build such strings with string.char bytes — "
@@ -195,7 +219,8 @@ fn run_script(
   // engine is the worker's only link, so no other EXITs are expected —
   // any that appear are consumed and discarded below.
   let was_trapping = set_trap_exit(True)
-  let engine = process.spawn(fn() { engine_main(events, hosts, code) })
+  let engine =
+    process.spawn(fn() { engine_main(events, hosts, deadline_us, code) })
   let #(ended, out) =
     await(engine, events, cancel, deadline_us, new_output(max_output_chars))
   // Kill first (a no-op on a dead engine), then consume the engine's exit
@@ -681,14 +706,15 @@ fn pick_console(seg: Segment) -> Result(String, Nil) {
 fn engine_main(
   events: Subject(EngineEvent),
   hosts: List(HostTool),
+  deadline_us: Int,
   code: String,
 ) -> Nil {
   let _ = set_max_heap_size(max_heap_words)
   let outcome = case glua.new_sandboxed(allow: []) {
     Error(setup_error) -> Error(glua.format_error(setup_error))
     Ok(lua) ->
-      glua.run(lua, engine_action(events, hosts, code))
-      |> result.map_error(glua.format_error)
+      glua.run(lua, engine_action(events, hosts, deadline_us, code))
+      |> result.map_error(safe_format_error)
   }
   process.send(events, EngineDone(outcome))
 }
@@ -696,9 +722,10 @@ fn engine_main(
 fn engine_action(
   events: Subject(EngineEvent),
   hosts: List(HostTool),
+  deadline_us: Int,
   code: String,
 ) -> glua.Action(Nil, e) {
-  use _ <- glua.then(install_hosts(events, hosts))
+  use _ <- glua.then(install_hosts(events, hosts, deadline_us))
   use _ <- glua.then(glua.eval(code: preamble_lua))
   use values <- glua.then(glua.eval(code: code))
   emit_return_values(events, values)
@@ -748,8 +775,9 @@ fn emit_event(
 fn install_hosts(
   events: Subject(EngineEvent),
   hosts: List(HostTool),
+  deadline_us: Int,
 ) -> glua.Action(Nil, e) {
-  use tools_tbl <- glua.then(build_tools_table(hosts))
+  use tools_tbl <- glua.then(build_tools_table(hosts, deadline_us))
   use _ <- glua.then(glua.set(keys: ["tools"], value: tools_tbl))
   use _ <- glua.then(glua.set(
     keys: ["text"],
@@ -767,7 +795,10 @@ fn install_hosts(
 /// access site (plain nil would surface later as Luerl's cryptic
 /// "Undefined function: nil", and the recursion guard — `tools.codemode`
 /// — names itself the same way).
-fn build_tools_table(hosts: List(HostTool)) -> glua.Action(glua.Value, e) {
+fn build_tools_table(
+  hosts: List(HostTool),
+  deadline_us: Int,
+) -> glua.Action(glua.Value, e) {
   use tools_tbl <- glua.then(glua.table([]))
   use _ <- glua.then(
     hosts
@@ -782,6 +813,11 @@ fn build_tools_table(hosts: List(HostTool)) -> glua.Action(glua.Value, e) {
       glua.then(acc, fn(_) { action })
     }),
   )
+  use _ <- glua.then(glua.new_index(
+    table: tools_tbl,
+    key: glua.string("call_all"),
+    value: glua.function(call_all_fn(hosts, deadline_us)),
+  ))
   use index_fn <- glua.then(
     glua.table([
       #(glua.string("__index"), glua.function(unknown_tool_fn())),
@@ -819,12 +855,7 @@ fn host_call(
   fn(args) {
     let calls = counter_next("nexus_codemode_tool_calls")
     case calls > tool_call_budget {
-      True ->
-        glua.error(
-          "tool call budget exceeded ("
-          <> int.to_string(tool_call_budget)
-          <> " calls)",
-        )
+      True -> glua.error(budget_error())
       False ->
         glua.call_function_by_name(keys: ["__nexus_encode_args"], args: args)
         |> glua.then(fn(values) {
@@ -849,6 +880,237 @@ fn execute_host(
   case list.find(hosts, fn(host) { host.name == name }) {
     Error(Nil) -> Error("unknown tool: " <> name)
     Ok(host) -> host.call(arguments)
+  }
+}
+
+fn budget_error() -> String {
+  "tool call budget exceeded (" <> int.to_string(tool_call_budget) <> " calls)"
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: parallel batch (tools.call_all)
+// ---------------------------------------------------------------------------
+
+/// One entry's settled outcome — errors are VALUES (allSettled), so a
+/// failing or crashing entry never aborts the batch or the script.
+type BatchOutcome {
+  BatchOk(content: String)
+  BatchErr(reason: String)
+}
+
+/// One child's report to the engine: its index in the input list and
+/// its outcome.
+type BatchMsg {
+  BatchMsg(index: Int, outcome: BatchOutcome)
+}
+
+/// `tools.call_all({{name = ..., args = ...}, ...})`: run the entries in
+/// parallel — one BEAM process per entry, linked to this engine process
+/// so no call can outlive the script — and return one array in input
+/// order. Runs in the engine process like `host_call`.
+fn call_all_fn(
+  hosts: List(HostTool),
+  deadline_us: Int,
+) -> fn(List(glua.Value)) -> glua.Action(List(glua.Value), glua.Never) {
+  fn(args) {
+    glua.call_function_by_name(keys: ["__nexus_encode_batch"], args: args)
+    |> glua.then(fn(values) {
+      use encoded <- glua.then(case values {
+        [first, ..] -> glua.dereference(ref: first, using: decode.string)
+        [] -> glua.success("[]")
+      })
+      case decode_batch(encoded) {
+        // Shape problems are script errors, exactly like a malformed
+        // `tools.<name>` call.
+        Error(reason) -> glua.error(reason)
+        Ok([]) ->
+          // An empty batch is a no-op and never touches the budget.
+          outcomes_action([])
+        Ok(entries) -> {
+          // The whole batch is budgeted up front (all results are
+          // retained), before anything spawns — and BEFORE the
+          // deadline short-circuit too: deadline-exceeded values are
+          // still handed back to the script, so those entries must
+          // draw the same budget as any other call, or a near-deadline
+          // script could keep issuing uncounted batches (cubic review).
+          case
+            counter_add("nexus_codemode_tool_calls", list.length(entries))
+            > tool_call_budget
+          {
+            True -> glua.error(budget_error())
+            False -> {
+              let remaining_us = deadline_us - timing.now_us()
+              case remaining_us <= batch_deadline_margin_us {
+                True ->
+                  // No usable time left: hand back deadline-exceeded
+                  // values without spawning anything — the worker's kill
+                  // is due.
+                  outcomes_action(
+                    list.map(entries, fn(_) { BatchErr("deadline exceeded") }),
+                  )
+                False -> outcomes_action(run_batch(hosts, entries, deadline_us))
+              }
+            }
+          }
+        }
+      }
+    })
+  }
+}
+
+/// Decode the Lua-side-encoded batch: a JSON array of
+/// `{name: string, args: <pre-encoded JSON>}` entries. Only a decode
+/// mismatch is possible here — shape validation (missing name, entry
+/// not a table) happens Lua-side and surfaces as a script error.
+fn decode_batch(encoded: String) -> Result(List(#(String, String)), String) {
+  let entry = {
+    use name <- decode.field("name", decode.string)
+    use args <- decode.optional_field("args", "{}", decode.string)
+    decode.success(#(name, args))
+  }
+  case json.parse(encoded, decode.dynamic) {
+    Error(_) -> Error("call_all batch failed to encode")
+    Ok(dynamic) ->
+      case decode.run(dynamic, decode.list(entry)) {
+        Ok(entries) -> Ok(entries)
+        Error(_) -> Error("call_all batch failed to encode")
+      }
+  }
+}
+
+/// Spawn one linked child per entry, collect outcomes until all report
+/// or the (margined) deadline expires, kill every child (a no-op for
+/// the finished; the only reaper covering a NORMAL engine exit — links
+/// do not propagate normal), and fill unreported slots with
+/// deadline-exceeded values. Runs in the engine process.
+fn run_batch(
+  hosts: List(HostTool),
+  entries: List(#(String, String)),
+  deadline_us: Int,
+) -> List(BatchOutcome) {
+  let results = process.new_subject()
+  let children =
+    list.index_map(entries, fn(entry, index) {
+      let #(name, arguments) = entry
+      // Linked to this engine: worker kill, deadline kill, cancel, or
+      // the max-heap reaper all take the engine down, and the link
+      // reaps every in-flight child with it.
+      process.spawn(fn() { batch_child(hosts, name, arguments, results, index) })
+    })
+  let collected =
+    collect_batch(results, deadline_us, list.length(entries), dict.new())
+  // Kill stragglers — but unlink first: the link's job is to reap
+  // in-flight children when the ENGINE dies; a child that reported and
+  // is merely winding down must not be killed through its link, or the
+  // EXIT(killed) signal takes the engine down with it (every outcome
+  // was already collected, so the child is dead weight either way).
+  // Links do not propagate a NORMAL engine exit, so this explicit reap
+  // is also the only thing guaranteeing no call outlives the script on
+  // the happy path.
+  list.each(children, fn(child) {
+    process.unlink(child)
+    process.kill(child)
+  })
+  list.index_map(entries, fn(_entry, index) {
+    case dict.get(collected, index) {
+      Ok(outcome) -> outcome
+      Error(Nil) -> BatchErr("deadline exceeded")
+    }
+  })
+}
+
+fn collect_batch(
+  results: Subject(BatchMsg),
+  deadline_us: Int,
+  n: Int,
+  acc: dict.Dict(Int, BatchOutcome),
+) -> dict.Dict(Int, BatchOutcome) {
+  case dict.size(acc) >= n {
+    True -> acc
+    False ->
+      case batch_wait_ms(deadline_us) {
+        0 -> acc
+        ms ->
+          case process.receive(results, within: ms) {
+            Error(Nil) -> acc
+            Ok(BatchMsg(index, outcome)) ->
+              collect_batch(
+                results,
+                deadline_us,
+                n,
+                dict.insert(acc, index, outcome),
+              )
+          }
+      }
+  }
+}
+
+/// Milliseconds left before the batch's internal deadline — the script
+/// deadline less the wrap-up margin — rounded up, floored at 1 ms while
+/// time remains, and 0 when nothing usable is left (what stops the
+/// collect loop). Rounding up keeps a sub-millisecond remainder from
+/// expiring a batch that still has time.
+fn batch_wait_ms(deadline_us: Int) -> Int {
+  let remaining_us = deadline_us - batch_deadline_margin_us - timing.now_us()
+  case remaining_us <= 0 {
+    True -> 0
+    False -> int.max({ remaining_us + 999 } / 1000, 1)
+  }
+}
+
+/// One entry's child: run the host closure under `safe_call` (a crash
+/// becomes an error value — allSettled; nothing an entry can do takes
+/// the engine down), report, exit. The child always exits normally.
+fn batch_child(
+  hosts: List(HostTool),
+  name: String,
+  arguments: String,
+  results: Subject(BatchMsg),
+  index: Int,
+) -> Nil {
+  let outcome = case safe_call(fn() { execute_host(hosts, name, arguments) }) {
+    Ok(Ok(content)) -> BatchOk(content)
+    Ok(Error(reason)) -> BatchErr(reason)
+    Error(crash) -> BatchErr(crash)
+  }
+  process.send(results, BatchMsg(index, outcome))
+}
+
+/// Build the Lua return value: one array table, input order, each entry
+/// `{ok = true, result = ...}` or `{ok = false, error = ...}`.
+fn outcomes_action(
+  outcomes: List(BatchOutcome),
+) -> glua.Action(List(glua.Value), e) {
+  use tables <- glua.then(outcome_tables(outcomes))
+  use array <- glua.then(glua.table_list(tables))
+  glua.success([array])
+}
+
+fn outcome_tables(
+  outcomes: List(BatchOutcome),
+) -> glua.Action(List(glua.Value), e) {
+  case outcomes {
+    [] -> glua.success([])
+    [outcome, ..rest] -> {
+      use table <- glua.then(outcome_table(outcome))
+      use rest_tables <- glua.then(outcome_tables(rest))
+      glua.success([table, ..rest_tables])
+    }
+  }
+}
+
+fn outcome_table(outcome: BatchOutcome) -> glua.Action(glua.Value, e) {
+  case outcome {
+    BatchOk(content) ->
+      glua.table([
+        #(glua.string("ok"), glua.bool(True)),
+        #(glua.string("result"), glua.string(content)),
+      ])
+    BatchErr(reason) ->
+      glua.table([
+        #(glua.string("ok"), glua.bool(False)),
+        #(glua.string("error"), glua.string(reason)),
+      ])
   }
 }
 
@@ -1009,6 +1271,30 @@ const preamble_lua =
   <> "\n  if type(v) == 'string' then return v end"
   <> "\n  return enc(v, 0)"
   <> "\nend"
+  <> "\nfunction __nexus_encode_batch(v)"
+  <> "\n  local dq = string.char(34)"
+  <> "\n  if v == nil then return '[]' end"
+  <> "\n  if type(v) ~= 'table' then error('call_all wants a table of entries') end"
+  <> "\n  local n = #v"
+  <> "\n  local count = 0"
+  <> "\n  for k in pairs(v) do"
+  <> "\n    count = count + 1"
+  <> "\n    if type(k) ~= 'number' or k % 1 ~= 0 or k < 1 or k > n then"
+  <> "\n      error('call_all batch must be a dense 1-based array')"
+  <> "\n    end"
+  <> "\n  end"
+  <> "\n  if count ~= n then error('call_all batch must be a dense 1-based array') end"
+  <> "\n  local out = {}"
+  <> "\n  for i = 1, n do"
+  <> "\n    local e = v[i]"
+  <> "\n    if type(e) ~= 'table' then error('call_all entry must be a table') end"
+  <> "\n    if type(e.name) ~= 'string' then error('call_all entry missing name') end"
+  <> "\n    local a = e.args"
+  <> "\n    if a == nil then a = {} end"
+  <> "\n    out[i] = '{' .. dq .. 'name' .. dq .. ':' .. q(e.name) .. ',' .. dq .. 'args' .. dq .. ':' .. q(enc(a, 0)) .. '}'"
+  <> "\n  end"
+  <> "\n  return '[' .. table.concat(out, ',') .. ']'"
+  <> "\nend"
 
 // ---------------------------------------------------------------------------
 // Erlang FFI (src/nexus_codemode_ffi.erl)
@@ -1022,3 +1308,20 @@ fn set_trap_exit(trap: Bool) -> Bool
 
 @external(erlang, "nexus_codemode_ffi", "counter_next")
 fn counter_next(key: String) -> Int
+
+/// glua's error formatter crashes on Lua runtime type errors (see the
+/// FFI); this wrapper keeps a script type error a script FAILURE —
+/// formatted reason line, partial output — instead of an engine crash.
+@external(erlang, "nexus_codemode_ffi", "safe_format_error")
+fn safe_format_error(error: e) -> String
+
+@external(erlang, "nexus_codemode_ffi", "counter_add")
+fn counter_add(key: String, n: Int) -> Int
+
+/// Run a host closure, turning a crash into `Error("host crashed: …")`
+/// so a batch child always reports a value instead of dying (and taking
+/// the engine down through the link).
+@external(erlang, "nexus_codemode_ffi", "safe_call")
+fn safe_call(
+  thunk: fn() -> Result(String, String),
+) -> Result(Result(String, String), String)

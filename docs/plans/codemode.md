@@ -2,7 +2,7 @@
 title: Nexus — codemode tool (Lua scripts in the agent loop)
 status: active
 tags: [computing, self-hosting, local-llm, agents, gleam, beam, codemode]
-updated: 2026-11-09
+updated: 2026-11-08
 ---
 
 # Codemode: model-authored Lua scripts as a tool
@@ -28,6 +28,8 @@ EYG and ports documented as future alternatives behind the same seam.
   - `tools.<name>(args)` — call a sibling tool; `args` is a Lua table shaped
     like the tool's JSON schema; returns the tool's content string, or raises
     a Lua error carrying the tool error text.
+  - `tools.call_all({{name=…, args=…}, …})` — phase 2: run a list of calls in
+    parallel, one array of allSettled values back in input order.
   - `text(value)` — append an output item (strings as-is, tables as JSON).
   - `print(...)` — overridden; appends to a `<console_output>` block.
   - **Every** value the script's `return` yields becomes a trailing output
@@ -84,7 +86,9 @@ EYG and ports documented as future alternatives behind the same seam.
   The offline golden test and e2e fixture keep codemode **off** in the smoke
   config, so no fixture recapture in these phases.
 
-## Phase 1 — synchronous codemode
+## Phase 1 — synchronous codemode — IMPLEMENTED
+
+(Implemented in PR #50 plus review fixes #52/#55 and #53/#56.)
 
 1. `gleam add glua` (pulls luerl; both from hex, offline builds stay clean).
 2. Config (`src/nexus/config.gleam`, fail-fast as always) with validated
@@ -132,7 +136,45 @@ EYG and ports documented as future alternatives behind the same seam.
    calls, digests both, returns one small result; all tests green offline; UI
    renders script and result as ordinary (inert, truncated) tool content.
 
-## Phase 2 — parallel batch (`tools.call_all`)
+## Phase 2 — parallel batch (`tools.call_all`) — IMPLEMENTED
+
+Implemented 2026-11-08 alongside two hardening points the plan text
+under-specified (both found by tests, both pinned by regression tests),
+plus three cubic review fixes on the phase-2 PR (all pinned):
+
+- **The batch is budgeted BEFORE the deadline short-circuit** —
+  deadline-exceeded values are still handed to the script, so those
+  entries must draw the same 25-call budget as any other call, or a
+  near-deadline script could keep issuing uncounted batches.
+- **Sparse batches are rejected** (`dense 1-based array` script error):
+  iterating to `#v` silently dropped entries after a hole, dodging
+  both the calls and the budget accounting.
+- **Crash terms are bounded before formatting** (`cap_term`: depth 3,
+  breadth 16, 100-byte binaries): pretty-printing a pathological
+  reason whole and truncating after would still materialise an
+  unbounded iolist in an uncapped batch child.
+
+- **Crashing entries are error values, not engine deaths.** Each child
+  runs its host closure under a crash-catching FFI (`safe_call`) — a
+  panicking entry returns `{ok=false, error="host crashed: …"}` instead
+  of taking the engine down through the link (allSettled semantics,
+  applied to crashes too; the SYNC path still dies as "engine crashed",
+  its pinned phase-1 behavior).
+- **The straggler reap unlinks before killing.** Killing a child that
+  already reported but is still winding down would otherwise deliver
+  `EXIT(killed)` through its link and take the ENGINE down — every
+  outcome was already collected, so the child is unlinked first.
+  A `glua` formatter bug also surfaced here and was wrapped at the
+  seam: a Lua runtime TYPE error (`'a' .. true`, badarg/badarith)
+  crashed glua's `format_error` (it feeds `luerl_lib:format_value`'s
+  IO data to `string.join`), turning a script type error into
+  "engine crashed" with no self-correction signal; `engine_main` now
+  formats through `safe_format_error`, falling back to
+  `luerl_lib:format_error/1`.
+
+Original plan (as implemented, with the batch deadline margined 50 ms
+inside the script deadline so a partial list can be folded and emitted
+before the wall-clock kill — see `batch_deadline_margin_us`):
 
 1. Add one host function: `tools.call_all({ {name=…, args=…}, … })` — spawns
    one BEAM process per entry **linked to the engine process** (each runs the
@@ -147,7 +189,9 @@ EYG and ports documented as future alternatives behind the same seam.
    failure isolation; deadline expiry returns the partial result list and no
    worker outlives the engine (assert via `ProcessDown`/monitor draining).
 4. Acceptance: a script fans out three `http_fetch` calls concurrently and
-   folds the results; wall time demonstrably sub-serial.
+   folds the results; wall time demonstrably sub-serial. (Offline overlap
+   test pins the mechanism; live http_fetch acceptance rides the next
+   codemode-enabled e2e pass — the m3 smoke keeps codemode off.)
 
 ## Later / non-goals (recorded, not planned)
 
