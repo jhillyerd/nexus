@@ -31,6 +31,14 @@ fn read_file(path: String) -> Result(String, String)
 @external(erlang, "nexus_store_ffi", "database_url")
 fn database_url() -> Result(String, Nil)
 
+// Hold the VM until the pog pool's type server is ready, so the halt's
+// teardown no longer races the connection_starter's boot-time type-server
+// call (intermittent pgo_pool_sup shutdown_error report); see
+// nexus_store_ffi:stop_pool/1. pog.start hands back the pool's queue
+// gen_server.
+@external(erlang, "nexus_store_ffi", "stop_pool")
+fn stop_pool(queue: process.Pid) -> Nil
+
 pub fn main() -> Nil {
   let schema =
     or_panic(read_file("sql/schema.sql"), "cannot read sql/schema.sql")
@@ -73,6 +81,7 @@ pub fn main() -> Nil {
   io.println(
     "migrate: done (" <> int.to_string(list.length(stmts)) <> " statements)",
   )
+  stop_pool(started.pid)
 }
 
 fn or_panic(result: Result(a, e), message: String) -> a {

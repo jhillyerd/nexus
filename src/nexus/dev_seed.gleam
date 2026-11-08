@@ -41,8 +41,16 @@ import pog
 @external(erlang, "nexus_store_ffi", "database_url")
 fn database_url() -> Result(String, Nil)
 
+// Hold the VM until the pog pool's type server is ready, so the halt's
+// teardown no longer races the connection_starter's boot-time type-server
+// call (intermittent pgo_pool_sup shutdown_error report); see
+// nexus_store_ffi:stop_pool/1. pog.start hands back the pool's queue
+// gen_server.
+@external(erlang, "nexus_store_ffi", "stop_pool")
+fn stop_pool(queue: process.Pid) -> Nil
+
 pub fn main() -> Nil {
-  let db =
+  let started =
     database_url()
     |> or_panic("DATABASE_URL is not set")
     |> fn(url) { pog.url_config(process.new_name("nexus_dev_seed_pool"), url) }
@@ -50,7 +58,7 @@ pub fn main() -> Nil {
     |> pog.connection_parameter("timezone", "UTC")
     |> pog.start
     |> or_panic("could not connect — is the database up?")
-    |> fn(started) { started.data }
+  let db = started.data
 
   let key =
     envoy.get("NEXUS_ENCRYPTION_KEY")
@@ -109,6 +117,7 @@ pub fn main() -> Nil {
       }
     }
   }
+  stop_pool(started.pid)
 }
 
 /// Encrypt the submitted key under AAD = the provider id. Blank/absent
