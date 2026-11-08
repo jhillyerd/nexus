@@ -280,6 +280,16 @@ pub type Msg {
   // — one runtime serves exactly one client for its whole life, so connect
   // is `init` and disconnect is the runtime dying with its socket.
   GotEvents(Subject(SessionEvent))
+  /// One session event delivered on the subscription, stamped with the
+  /// emitting session's id (`session.SessionEvent`). The id is the filter:
+  /// the subject is shared by every session this connection visits, and
+  /// `Leave` cannot stop broadcasts already in the mailbox when it lands
+  /// (nor a replay sliced mid-flight by a fast double switch). Events
+  /// whose id is not the selected session are dropped — without this,
+  /// a session that kept streaming after being switched away from
+  /// rendered its tokens into the OTHER session's view. `MetaUpdated`
+  /// deliberately passes the filter: sidebar metadata is global.
+  SessionScoped(session_id: String, event: Msg)
   // ---- Providers (P5: management + provider-scoped picker) ----
   /// Masked metadata for every provider (Settings page + picker).
   ProvidersLoaded(List(Provider))
@@ -358,10 +368,12 @@ pub type Msg {
   SessionOpFailed(String)
 }
 
-/// Translate a `session.SessionEvent` into a typed component message.
+/// Translate a `session.EventKind` into a typed component message.
 /// Session events arrive on the subject selected in `init` and flow through
-/// the same `update` as DOM events.
-pub fn from_session_event(event: SessionEvent) -> Msg {
+/// the same `update` as DOM events. The emitting session's id rides the
+/// `session.SessionEvent` envelope and is handled by `SessionScoped` —
+/// this function sees only the payload.
+pub fn from_session_event(event: session.EventKind) -> Msg {
   case event {
     session.Hello(model, _messages, _metrics) -> Hello(model)
     session.UserEcho(text) -> UserEcho(text)
@@ -439,13 +451,31 @@ fn events_effect() -> Effect(Msg) {
   server_component.select(fn(dispatch, subject: Subject(SessionEvent)) {
     dispatch(GotEvents(subject))
     process.new_selector()
-    |> process.select_map(subject, from_session_event)
+    |> process.select_map(subject, fn(delivery) {
+      let session.SessionEvent(session_id, kind) = delivery
+      SessionScoped(session_id, from_session_event(kind))
+    })
   })
 }
 
 pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
   case msg {
     Ignored -> #(model, effect.none())
+
+    // Per-session delivery filter — see the `SessionScoped` msg. One level
+    // of recursion applies (or drops) the inner event.
+    SessionScoped(session_id, event) ->
+      case model.selected {
+        Some(selected) if selected == session_id -> update(model, event)
+        _ ->
+          case event {
+            // Sidebar metadata is global by design: a title upgrade lands
+            // while some OTHER client is mid-turn, and every connected
+            // tab's sidebar must refresh. Applied wherever it lands.
+            MetaUpdated(_, _) -> update(model, event)
+            _ -> #(model, effect.none())
+          }
+      }
 
     GotEvents(subject) -> {
       // The connect point of a per-client runtime: the subscription
@@ -678,7 +708,15 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         Some(id) ->
           case model.selected {
             Some(prev) if prev == id -> effect.none()
-            _ -> join_effect(next, id)
+            Some(prev) ->
+              // The selection changed under us (auto-selection after the
+              // previous one vanished): detach from the old session too.
+              // A vanished session fails the registry lookup harmlessly.
+              effect.batch([
+                leave_effect(next, prev),
+                join_effect(next, id),
+              ])
+            None -> join_effect(next, id)
           }
         None -> effect.none()
       }
@@ -711,7 +749,14 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             turn_base: 0,
             model_label: "connecting…",
           ),
-          join_effect(model, id),
+          case model.selected {
+            Some(current) ->
+              effect.batch([
+                leave_effect(model, current),
+                join_effect(model, id),
+              ])
+            None -> join_effect(model, id)
+          },
         )
       }
 
@@ -1428,6 +1473,30 @@ fn join_effect(model: Model, id: String) -> Effect(Msg) {
       effect.from(fn(_dispatch) {
         case session_registry.get(registry, id) {
           Ok(subject) -> process.send(subject, session.Join(events))
+          Error(_) -> Nil
+        }
+      })
+    None -> effect.none()
+  }
+}
+
+/// Detach this connection's subscription from a session it is leaving.
+/// The session-event subject is ONE long-lived subject per connection
+/// (see `events_effect`), so a session switch must explicitly Leave the
+/// old session: the session actor only prunes subscribers whose process
+/// died — a live subject stays in the fan-out forever, and without the
+/// Leave the old session's stream kept rendering into the new session's
+/// view. Fan-out hygiene, not correctness: correctness is the per-event
+/// id filter (`SessionScoped`), because broadcasts already in the
+/// subscriber's mailbox when Leave lands still arrive. Unknown/vanished
+/// sessions fail the registry lookup harmlessly.
+fn leave_effect(model: Model, id: String) -> Effect(Msg) {
+  let registry = model.registry
+  case model.events {
+    Some(events) ->
+      effect.from(fn(_dispatch) {
+        case session_registry.get(registry, id) {
+          Ok(subject) -> process.send(subject, session.Leave(events))
           Error(_) -> Nil
         }
       })
