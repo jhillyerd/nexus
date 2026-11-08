@@ -289,7 +289,8 @@ pub fn gmatch_iterates_words_test() {
 }
 
 /// gmatch yields every capture as its own loop variable (whole match
-/// only when the pattern has no captures) -- via string.match's returns.
+/// only when the pattern has no captures) -- via string.find's extra
+/// returns, which carry the captures after the two positions.
 pub fn gmatch_yields_captures_test() {
   let assert Ok(result) =
     run_code(
@@ -336,7 +337,9 @@ pub fn gmatch_position_captures_test() {
 
 pub fn gmatch_no_match_yields_nothing_test() {
   let assert Ok(result) =
-    run_code("local n = 0\nfor _ in ('abc'):gmatch('%d') do n = n + 1 end\nreturn n")
+    run_code(
+      "local n = 0\nfor _ in ('abc'):gmatch('%d') do n = n + 1 end\nreturn n",
+    )
   let parts = string.split(result, "\n\n")
   should.equal(list.drop(parts, 1), ["0"])
 }
@@ -352,6 +355,24 @@ pub fn gmatch_bad_args_raise_catchable_error_test() {
     )
   should.be_true(string.contains(result, "false:"))
   should.be_true(string.contains(result, "bad argument #1 to gmatch"))
+}
+
+/// A leading '^' is a LITERAL caret in Lua 5.3's gmatch: gmatch_aux
+/// hands the pattern to match() unstripped and match() has no '^' case,
+/// so '^%w+' matches a caret followed by word chars -- never an anchor.
+/// The polyfill escapes it before find, whose engine would otherwise
+/// anchor '^' at every init (luerl match_pat anchors when I =:= 1 and
+/// find slices the subject from init).
+pub fn gmatch_caret_is_literal_test() {
+  let assert Ok(result) =
+    run_code(
+      "local out = {}"
+      <> "\nfor w in ('hello world'):gmatch('^%w+') do out[#out + 1] = w end"
+      <> "\nfor w in ('x ^abc'):gmatch('^%w+') do out[#out + 1] = w end"
+      <> "\nreturn table.concat(out, ',')",
+    )
+  let parts = string.split(result, "\n\n")
+  should.equal(list.drop(parts, 1), ["^abc"])
 }
 
 /// Lua 5.3 has no string.gfind (removed in 5.2; gmatch is the successor)
