@@ -261,7 +261,7 @@ Bifrost/SearxNG, and the production cache check whose golden fixture is
 | `NEXUS_HTTP_BIND` | `127.0.0.1` | server bind (loopback per PRD) |
 | `NEXUS_HTTP_PORT` | `8080` | server port |
 | `NEXUS_UI_TOKEN` | unset | single-user bearer token; unset disables auth |
-| `NEXUS_SYSTEM_PROMPT` | concise assistant | frozen for newly created sessions |
+| `NEXUS_SYSTEM_PROMPT` | concise assistant (default gains an ASCII-only codemode note while `NEXUS_CODEMODE=on`; explicitly set values are never amended) | frozen for newly created sessions |
 | `NEXUS_MAX_TOOL_ITERATIONS` | `8` | agent-loop guard: max model round-trips per user turn |
 | `NEXUS_HTTP_FETCH_MAX_BYTES` | `20000` | `http_fetch`: response body cap per call |
 | `NEXUS_HTTP_FETCH_TIMEOUT_MS` | `15000` | `http_fetch` HTTP connect+receive timeout per hop |

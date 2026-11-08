@@ -100,6 +100,39 @@ pub fn load_overrides_test() {
   cfg.system_prompt |> should.equal("custom prompt")
 }
 
+/// The ASCII-only codemode warning rides the DEFAULT prompt only while
+/// codemode is on: manual testing showed models writing em dashes into
+/// Lua string literals in every new session, and the tool description
+/// alone was not being read first.
+pub fn system_prompt_gains_codemode_ascii_note_test() {
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_CODEMODE", "true"),
+  ])
+  let assert Ok(cfg) = config.load()
+  should.be_true(cfg.system_prompt |> string.starts_with("You are nexus"))
+  should.be_true(cfg.system_prompt |> string.contains("ASCII-only"))
+  should.be_true(cfg.system_prompt |> string.contains("string.char"))
+}
+
+pub fn system_prompt_without_codemode_has_no_ascii_note_test() {
+  set_all([#("NEXUS_ENCRYPTION_KEY", key_b64)])
+  let assert Ok(cfg) = config.load()
+  should.be_false(cfg.system_prompt |> string.contains("ASCII"))
+}
+
+/// An explicitly set NEXUS_SYSTEM_PROMPT is the operator's text: never
+/// amended, even with codemode enabled.
+pub fn explicit_system_prompt_is_never_amended_test() {
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_CODEMODE", "true"),
+    #("NEXUS_SYSTEM_PROMPT", "custom prompt"),
+  ])
+  let assert Ok(cfg) = config.load()
+  cfg.system_prompt |> should.equal("custom prompt")
+}
+
 pub fn load_rejects_non_integer_test() {
   set_all([
     #("NEXUS_ENCRYPTION_KEY", key_b64),
