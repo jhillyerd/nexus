@@ -969,6 +969,24 @@ async function main() {
       eq(scripts.shadow, 0, "no scripts inside the component view");
       const finalText = await page.$$eval(".turn.assistant", (els) => els.map((e) => e.textContent));
       assert(finalText.some((t) => t.includes("Fetch complete")), `final answer: ${finalText}`);
+      // Auto-follow must survive the transition this turn just exercised:
+      // bubble -> tool chip -> bubble shrinks #log twice (the thinking
+      // chip collapses at commit, the tool card collapses on completion),
+      // and each shrink clamps scrollTop downward. A drag-detector that
+      // reads that clamp as a user gesture unpins and following dies for
+      // the rest of the turn — so assert we still sit at the bottom and
+      // the jump button never surfaced.
+      const follow = await page.evaluate(() => {
+        const sr = document.querySelector("lustre-server-component")?.shadowRoot;
+        const log = sr?.getElementById("log");
+        const jump = sr?.getElementById("jump-latest");
+        return {
+          fromBottom: log ? log.scrollHeight - log.scrollTop - log.clientHeight : -1,
+          jumpShown: jump ? !jump.hidden : null,
+        };
+      });
+      assert(follow.fromBottom < 80, `auto-follow died mid-turn: ${JSON.stringify(follow)}`);
+      assert(!follow.jumpShown, `jump button surfaced mid-turn: ${JSON.stringify(follow)}`);
     });
 
     // -- 7. web_search tool loop -----------------------------------------------
