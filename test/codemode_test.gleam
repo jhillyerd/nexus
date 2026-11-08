@@ -274,6 +274,130 @@ pub fn sandbox_denies_os_execute_test() {
 }
 
 // ---------------------------------------------------------------------------
+// string.gmatch polyfill (Luerl 1.5 ships a badarg stub, rvirding/luerl#150)
+// ---------------------------------------------------------------------------
+
+pub fn gmatch_iterates_words_test() {
+  let assert Ok(result) =
+    run_code(
+      "local out = {}"
+      <> "\nfor w in ('a b c'):gmatch('%w+') do out[#out + 1] = w end"
+      <> "\nreturn table.concat(out, ',')",
+    )
+  let parts = string.split(result, "\n\n")
+  should.equal(list.drop(parts, 1), ["a,b,c"])
+}
+
+/// gmatch yields every capture as its own loop variable (whole match
+/// only when the pattern has no captures) -- via string.find's extra
+/// returns, which carry the captures after the two positions.
+pub fn gmatch_yields_captures_test() {
+  let assert Ok(result) =
+    run_code(
+      "local out = {}"
+      <> "\nfor k, v in ('k=v x=y'):gmatch('(%w+)=(%w+)') do"
+      <> "\n  out[#out + 1] = k .. v"
+      <> "\nend"
+      <> "\nreturn table.concat(out, ',')",
+    )
+  let parts = string.split(result, "\n\n")
+  should.equal(list.drop(parts, 1), ["kv,xy"])
+}
+
+/// Zero-or-more patterns advance one position per empty match, and an
+/// empty match landing exactly at the previous match's end is skipped
+/// (lstrlib.c's e != lastmatch guard). Real Lua 5.3 yields exactly
+/// '', 'b', '' for ('abc'):gmatch('b*') -- and just 'a' for ('a'):gmatch('a*'),
+/// with no trailing empty string. Pinned so the polyfill cannot drift.
+pub fn gmatch_empty_match_semantics_test() {
+  let assert Ok(result) =
+    run_code(
+      "local out = {}"
+      <> "\nfor m in ('abc'):gmatch('b*') do out[#out + 1] = '[' .. m .. ']' end"
+      <> "\nfor m in ('a'):gmatch('a*') do out[#out + 1] = m end"
+      <> "\nreturn table.concat(out, ',')",
+    )
+  let parts = string.split(result, "\n\n")
+  should.equal(list.drop(parts, 1), ["[],[b],[],a"])
+}
+
+/// Position captures must come through too, including the empty match at
+/// len+1 (Luerl's own string.match cannot serve the polyfill's yield: it
+/// rejects init > len).
+pub fn gmatch_position_captures_test() {
+  let assert Ok(result) =
+    run_code(
+      "local out = {}"
+      <> "\nfor pos in ('abc'):gmatch('()') do out[#out + 1] = pos end"
+      <> "\nreturn table.concat(out, ',')",
+    )
+  let parts = string.split(result, "\n\n")
+  should.equal(list.drop(parts, 1), ["1,2,3,4"])
+}
+
+pub fn gmatch_no_match_yields_nothing_test() {
+  let assert Ok(result) =
+    run_code(
+      "local n = 0\nfor _ in ('abc'):gmatch('%d') do n = n + 1 end\nreturn n",
+    )
+  let parts = string.split(result, "\n\n")
+  should.equal(list.drop(parts, 1), ["0"])
+}
+
+/// The type guards fail at iterator construction with a named-slot
+/// message, and the error is an ordinary catchable Lua error (unlike the
+/// stub's echoed-everything badarg the polyfill replaced).
+pub fn gmatch_bad_args_raise_catchable_error_test() {
+  let assert Ok(result) =
+    run_code(
+      "local ok, err = pcall(string.gmatch, 123, '%d+')"
+      <> "\nreturn tostring(ok) .. ':' .. tostring(err)",
+    )
+  should.be_true(string.contains(result, "false:"))
+  should.be_true(string.contains(result, "bad argument #1 to gmatch"))
+}
+
+/// A leading '^' is a LITERAL caret in Lua 5.3's gmatch: gmatch_aux
+/// hands the pattern to match() unstripped and match() has no '^' case,
+/// so '^%w+' matches a caret followed by word chars -- never an anchor.
+/// The polyfill escapes it before find, whose engine would otherwise
+/// anchor '^' at every init (luerl match_pat anchors when I =:= 1 and
+/// find slices the subject from init).
+pub fn gmatch_caret_is_literal_test() {
+  let assert Ok(result) =
+    run_code(
+      "local out = {}"
+      <> "\nfor w in ('hello world'):gmatch('^%w+') do out[#out + 1] = w end"
+      <> "\nfor w in ('x ^abc'):gmatch('^%w+') do out[#out + 1] = w end"
+      <> "\nreturn table.concat(out, ',')",
+    )
+  let parts = string.split(result, "\n\n")
+  should.equal(list.drop(parts, 1), ["^abc"])
+}
+
+/// Lua 5.3 has no string.gfind (removed in 5.2; gmatch is the successor)
+/// -- nil is the correct value, not a missing export.
+pub fn gfind_stays_nil_test() {
+  let assert Ok(result) = run_code("return tostring(string.gfind)")
+  let parts = string.split(result, "\n\n")
+  should.equal(list.drop(parts, 1), ["nil"])
+}
+
+/// A missing pattern errors, as in stock Lua: 5.3, 5.4, and 5.5 all read
+/// the pattern with luaL_checklstring -- there is no '.' default in any
+/// version (verified against lstrlib.c in each), so gmatch('abc') must
+/// keep failing here. Pinned so a lenient default cannot creep in.
+pub fn gmatch_missing_pattern_errors_test() {
+  let assert Ok(result) =
+    run_code(
+      "local ok, err = pcall(string.gmatch, 'abc')"
+      <> "\nreturn tostring(ok) .. ':' .. tostring(err)",
+    )
+  should.be_true(string.contains(result, "false:"))
+  should.be_true(string.contains(result, "bad argument #2 to gmatch"))
+}
+
+// ---------------------------------------------------------------------------
 // Unknown tools
 // ---------------------------------------------------------------------------
 
