@@ -47,8 +47,26 @@ import nexus/tools
 import nexus/transcript.{type Transcript}
 import nexus/utility
 
-/// Events broadcast to subscribers (Mist SSE connections, tests).
+/// One fan-out delivery: the emitting session's id and the receiving
+/// subscriber's current visit generation, stamped beside the payload
+/// (`EventKind`). Both are filter keys, not bookkeeping: a subscriber
+/// shares ONE event subject across every session it visits
+/// (`nexus/ui.events_effect`), and `Leave` cannot stop broadcasts that
+/// are already in the subscriber's mailbox when it lands — cross-actor
+/// message ordering gives no guarantee. Carrying both lets the UI drop
+/// anything not from the session it is viewing NOW: the id covers
+/// deliveries from other sessions, the visit generation covers stale
+/// deliveries from an EARLIER visit to the same session (a rapid
+/// A→B→A switch would otherwise re-apply queued first-visit events on
+/// top of the second visit's replay — the cross-session
+/// stream-contamination bug and its same-session cousin).
 pub type SessionEvent {
+  SessionEvent(session_id: String, visit: Int, kind: EventKind)
+}
+
+/// The fan-out payload. Always delivered inside a `SessionEvent` envelope
+/// stamped with the emitting session's id.
+pub type EventKind {
   /// Sent once to a fresh subscriber after `Join` (before any replay).
   Hello(model: String, messages: Int, metrics: List(MetricSample))
   /// A user turn, echoed so every tab sees it. Also used for history replay.
@@ -225,6 +243,10 @@ pub type SendResult {
 ///   manual rename or manual tag edit wins forever).
 pub type SessionSpec {
   SessionSpec(
+    /// The session's own id (registry-assigned). Stamped onto every
+    /// fan-out event as the subscriber-side filter key — see
+    /// `SessionEvent`.
+    id: String,
     cfg: Config,
     model: String,
     /// The frozen provider endpoint — what the runner streams through.
@@ -330,7 +352,13 @@ pub type SessionSummary {
 
 pub type Msg {
   /// Subscribe `sub` to session events (replies with Hello + replay).
-  Join(sub: Subject(SessionEvent))
+  /// `visit` is the subscriber-issued generation for THIS visit; the
+  /// actor echoes it on every delivery to `sub` (replacing any previous
+  /// generation for the same subject), so the subscriber can drop
+  /// deliveries left over from an earlier visit to this session.
+  Join(sub: Subject(SessionEvent), visit: Int)
+  /// Unsubscribe `sub` from session events (unknown subs are ignored).
+  Leave(sub: Subject(SessionEvent))
   /// Append a user turn and start streaming a reply.
   Send(text: String, reply: Subject(SendResult))
   /// Cancel the in-flight turn, if any.
@@ -352,6 +380,14 @@ pub type Msg {
   WorkerDown(worker: Pid)
   /// Selector plumbing for non-process monitors; always ignored.
   MonitorNoise
+}
+
+/// One fan-out subscriber: its current visit generation (echoed on every
+/// delivery — the subscriber-side filter key, see `SessionEvent`) and the
+/// owner monitor taken at Join, demonitored on Leave so cycling away and
+/// back cannot accumulate monitors on the same connection.
+type Subscriber {
+  Subscriber(visit: Int, monitor: Option(Monitor))
 }
 
 type TurnState {
@@ -426,11 +462,18 @@ const max_utility_passes = 1
 
 type State {
   State(
+    /// This session's id (`SessionSpec.id`): stamped onto every fan-out
+    /// event as the subscriber-side filter key — see `SessionEvent`.
+    id: String,
     cfg: Config,
     endpoint: openai.Endpoint,
     runner: TurnRunner,
     transcript: Transcript,
-    subs: List(Subject(SessionEvent)),
+    /// Fan-out subscribers by event subject, each carrying its current
+    /// visit generation (echoed on every delivery) and the owner monitor
+    /// taken at Join — demonitored on Leave so cycling away and back
+    /// cannot accumulate monitors.
+    subs: dict.Dict(Subject(SessionEvent), Subscriber),
     turn: TurnState,
     /// The in-flight turn's display mirror (see `LiveTurn`). `Some` from
     /// `Send` until `WorkerDone`/`WorkerDown` — committed or failed alike.
@@ -519,6 +562,7 @@ pub fn supervised(
 
 fn start_builder(spec: SessionSpec) {
   let SessionSpec(
+    id: id,
     cfg: cfg,
     model: model,
     endpoint: endpoint,
@@ -530,6 +574,7 @@ fn start_builder(spec: SessionSpec) {
   ) = spec
   actor.new_with_initialiser(1000, fn(self) {
     actor.initialised(State(
+      id: id,
       cfg: cfg,
       endpoint: endpoint,
       runner: runner,
@@ -542,7 +587,7 @@ fn start_builder(spec: SessionSpec) {
         Some(restored) -> restored
         None -> transcript.new(model, cfg.system_prompt)
       },
-      subs: [],
+      subs: dict.new(),
       turn: Idle,
       turn_view: None,
       utility: UtilityIdle,
@@ -585,15 +630,18 @@ fn start_builder(spec: SessionSpec) {
 
 fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
   case msg {
-    Join(sub) -> {
-      process.send(
-        sub,
-        Hello(
-          transcript.model(state.transcript),
-          transcript.length(state.transcript),
-          state.metrics,
-        ),
-      )
+    Join(sub, visit) -> {
+      // Deliveries to the JOINING subscriber carry its visit generation:
+      // the filter key that lets it drop leftovers from an earlier visit
+      // to this session (see `SessionEvent`).
+      let deliver = fn(kind) {
+        process.send(sub, SessionEvent(state.id, visit, kind))
+      }
+      deliver(Hello(
+        transcript.model(state.transcript),
+        transcript.length(state.transcript),
+        state.metrics,
+      ))
       // Replay existing history so a fresh page load / reconnect sees the
       // session (system prompt stays server-side, per the cache contract).
       // M3: tool history is replayed too — assistant tool-call messages as
@@ -628,24 +676,24 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       |> list.index_fold(Nil, fn(_, message, index) {
         case message {
           chat.UserMessage(content: chat.UserTextContent(text), ..) ->
-            process.send(sub, UserEcho(text))
+            deliver(UserEcho(text))
           chat.AssistantMessage(content: text, tool_calls: calls, ..) -> {
             // Reasoning replay first: it was streamed before the message's
             // own output, so it replays before it too.
             case transcript.reasoning_at(replay, index) {
-              Some(reasoning) -> process.send(sub, ReasoningFull(reasoning))
+              Some(reasoning) -> deliver(ReasoningFull(reasoning))
               None -> Nil
             }
             case text {
               Some(chat.AssistantTextContent(content)) ->
-                process.send(sub, AssistantFull(content))
+                deliver(AssistantFull(content))
               _ -> Nil
             }
             case calls {
               Some(calls) ->
                 list.each(calls, fn(call) {
                   let chat.FunctionToolCall(id: id, function: f) = call
-                  process.send(sub, ToolCallAssembled(id, f.name, f.arguments))
+                  deliver(ToolCallAssembled(id, f.name, f.arguments))
                 })
               None -> Nil
             }
@@ -654,43 +702,66 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
             content: chat.ToolTextContent(content),
             tool_call_id: id,
           ) ->
-            process.send(
-              sub,
-              ToolResult(
-                id,
-                dict.get(names, id) |> result.unwrap("tool"),
-                // The outcome rides the display-only sidecar — failed
-                // calls stay failed across a reload (True when unknown,
-                // e.g. rows persisted before the sidecar existed).
-                transcript.tool_result_at(replay, index)
-                  |> option.unwrap(True),
-                content,
-              ),
-            )
+            deliver(ToolResult(
+              id,
+              dict.get(names, id) |> result.unwrap("tool"),
+              // The outcome rides the display-only sidecar — failed
+              // calls stay failed across a reload (True when unknown,
+              // e.g. rows persisted before the sidecar existed).
+              transcript.tool_result_at(replay, index)
+                |> option.unwrap(True),
+              content,
+            ))
           _ -> Nil
         }
         Nil
       })
       // M3: the UI component keeps one long-lived subscription across
-      // reconnects, so a re-Join must not duplicate the fan-out entry.
-      // Per-client break: subscriber subjects are owned by per-connection
-      // Lustre runtimes that die with their sockets — monitor a new
-      // subscriber's owner so its exit prunes the entry in the
-      // `WorkerDown` arm (every monitored ProcessDown funnels there).
-      let subs = case list.contains(state.subs, sub) {
-        True -> state.subs
-        False -> {
-          case process.subject_owner(sub) {
-            Ok(owner) -> {
-              let _ = process.monitor(owner)
-              Nil
-            }
-            Error(_) -> Nil
+      // reconnects, so a re-Join must not duplicate the fan-out entry —
+      // it REFRESHES the visit generation instead (the stale-delivery
+      // filter keys off it, see `SessionEvent`) and keeps the existing
+      // owner monitor. Per-client break: subscriber subjects are owned
+      // by per-connection Lustre runtimes that die with their sockets —
+      // monitor a new subscriber's owner so its exit prunes the entry in
+      // the `WorkerDown` arm (every monitored ProcessDown funnels there).
+      let subs = case dict.get(state.subs, sub) {
+        Ok(subscriber) ->
+          dict.insert(state.subs, sub, Subscriber(..subscriber, visit: visit))
+        Error(_) -> {
+          let monitor = case process.subject_owner(sub) {
+            Ok(owner) -> Some(process.monitor(owner))
+            Error(_) -> None
           }
-          [sub, ..state.subs]
+          dict.insert(state.subs, sub, Subscriber(visit:, monitor:))
         }
       }
-      actor.continue(State(..state, subs:))
+      actor.continue(State(..state, subs: subs))
+    }
+
+    Leave(sub) -> {
+      // A subscriber that moved to another session. The UI component keeps
+      // ONE long-lived event subject per connection and re-Joins it on
+      // every session switch (`nexus/ui.join_effect`), so a switch must
+      // Leave here explicitly: nothing else removes a live subscriber —
+      // the owner monitor only fires when the subscriber's process dies —
+      // and without the removal this session's stream kept fanning out to
+      // the shared subject, rendering into the OTHER session's view
+      // (cross-session contamination while a turn was in flight).
+      //
+      // Demonitor on the way out: a subscriber that cycles away and back
+      // would otherwise accumulate one dangling monitor per visit on the
+      // same connection.
+      let state = case dict.get(state.subs, sub) {
+        Ok(subscriber) -> {
+          case subscriber.monitor {
+            Some(monitor) -> process.demonitor_process(monitor)
+            None -> Nil
+          }
+          State(..state, subs: dict.delete(state.subs, sub))
+        }
+        Error(_) -> state
+      }
+      actor.continue(state)
     }
 
     Send(text, reply) -> {
@@ -704,7 +775,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       case state.turn {
         Idle -> {
           let tr = transcript.append_user(state.transcript, text)
-          broadcast(state.subs, UserEcho(text))
+          emit(state, UserEcho(text))
           let worker =
             process.spawn_unlinked(fn() {
               let cancel = process.new_subject()
@@ -804,7 +875,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           loop.StreamEvent(openai.TokenDelta(text))
           if candidate == worker
         -> {
-          broadcast(state.subs, Token(text))
+          emit(state, Token(text))
           actor.continue(
             State(
               ..state,
@@ -839,7 +910,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           loop.StreamEvent(openai.ReasoningDelta(text))
           if candidate == worker
         -> {
-          broadcast(state.subs, Reasoning(text))
+          emit(state, Reasoning(text))
           actor.continue(
             State(
               ..state,
@@ -866,14 +937,14 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           loop.StreamEvent(openai.ToolCallDelta(index, id, name, fragment))
           if candidate == worker
         -> {
-          broadcast(state.subs, ToolCallDelta(index, id, name, fragment))
+          emit(state, ToolCallDelta(index, id, name, fragment))
           actor.continue(state)
         }
 
         Streaming(candidate, ..), loop.ToolCallAssembled(id, name, arguments)
           if candidate == worker
         -> {
-          broadcast(state.subs, ToolCallAssembled(id, name, arguments))
+          emit(state, ToolCallAssembled(id, name, arguments))
           actor.continue(
             State(
               ..state,
@@ -912,7 +983,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           loop.ToolResultEvent(call_id, name, ok, content)
           if candidate == worker
         -> {
-          broadcast(state.subs, ToolResult(call_id, name, ok, content))
+          emit(state, ToolResult(call_id, name, ok, content))
           actor.continue(
             State(
               ..state,
@@ -934,7 +1005,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
         Streaming(candidate, ..), loop.LoopStatus(iteration, max, phase)
           if candidate == worker
         -> {
-          broadcast(state.subs, LoopStatus(iteration, max, phase))
+          emit(state, LoopStatus(iteration, max, phase))
           let turn_view = case phase {
             // New iteration: the loop reset its accumulator cells, so the
             // mirror's per-iteration text/reasoning restart too.
@@ -974,7 +1045,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           }
           let #(tr, event, sample) =
             finish_outcome(state.turn, state.transcript, outcome)
-          broadcast(state.subs, event)
+          emit(state, event)
           // Done/stopped/guard outcomes install the worker's extended
           // transcript (a commit); only a pure error leaves it untouched.
           let committed = case outcome {
@@ -1128,16 +1199,22 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       // died with its socket prunes its fan-out entry. Without this,
       // stale subjects accumulate per historical connection — sends to
       // them are silent no-ops, but the list would grow unboundedly.
-      let state =
-        State(
-          ..state,
-          subs: list.filter(state.subs, fn(sub) {
-            case process.subject_owner(sub) {
-              Ok(owner) -> owner != worker
-              Error(_) -> True
-            }
-          }),
-        )
+      // Their owner monitors are spent; demonitor them on the way out.
+      let #(kept, dead) =
+        dict.to_list(state.subs)
+        |> list.partition(fn(entry) {
+          case process.subject_owner(entry.0) {
+            Ok(owner) -> owner != worker
+            Error(_) -> True
+          }
+        })
+      list.each(dead, fn(entry) {
+        case entry.1.monitor {
+          Some(monitor) -> process.demonitor_process(monitor)
+          None -> Nil
+        }
+      })
+      let state = State(..state, subs: dict.from_list(kept))
       let is_current = case state.turn {
         Starting(candidate, ..) | Streaming(candidate, ..) ->
           candidate == worker
@@ -1161,10 +1238,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           case is_current {
             False -> actor.continue(state)
             True -> {
-              broadcast(
-                state.subs,
-                TurnFailed("turn worker exited unexpectedly"),
-              )
+              emit(state, TurnFailed("turn worker exited unexpectedly"))
               actor.continue(
                 State(
                   ..state,
@@ -1197,8 +1271,13 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
   }
 }
 
-fn broadcast(subs: List(Subject(SessionEvent)), event: SessionEvent) -> Nil {
-  list.each(subs, fn(sub) { process.send(sub, event) })
+/// Fan one payload out to every subscriber, stamped with this session's
+/// id AND each subscriber's current visit generation — the two
+/// subscriber-side filter keys (see `SessionEvent`).
+fn emit(state: State, kind: EventKind) -> Nil {
+  dict.each(state.subs, fn(sub, subscriber) {
+    process.send(sub, SessionEvent(state.id, subscriber.visit, kind))
+  })
 }
 
 /// Flush the mirror iteration's accumulated text (with its reasoning, if
@@ -1337,7 +1416,7 @@ fn finish_utility(
   }
   case result {
     UtilityApplied(title, tags) -> {
-      broadcast(state.subs, MetaUpdated(Some(title), tags))
+      emit(state, MetaUpdated(Some(title), tags))
       actor.continue(state)
     }
     UtilityFailed | UtilityPassed -> actor.continue(state)
@@ -1353,7 +1432,7 @@ fn finish_outcome(
   turn: TurnState,
   tr: Transcript,
   outcome: TurnOutcome,
-) -> #(Transcript, SessionEvent, MetricSample) {
+) -> #(Transcript, EventKind, MetricSample) {
   let now = timing.now_us()
   let started_us = turn_start_us(turn)
   let ttft_ms = case turn_first_us(turn) {

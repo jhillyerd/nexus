@@ -513,6 +513,7 @@ fn handle_create(
           let name = process.new_name("nexus_session_" <> id)
           let spec =
             session.SessionSpec(
+              id: id,
               cfg: state.cfg,
               model: alias,
               endpoint: endpoint,
@@ -1159,6 +1160,7 @@ fn lazy_start(state: State, summary: StoredSummary) -> Resolved {
         Ok(transcript) -> {
           let spec =
             session.SessionSpec(
+              id: summary.id,
               cfg: state.cfg,
               model: summary.model,
               endpoint: endpoint,

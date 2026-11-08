@@ -426,7 +426,7 @@ fn fake_stats() -> openai.StreamStats {
 /// commits have landed before the snapshot.
 fn drain_turn(subject: process.Subject(session.Msg)) -> Nil {
   let sub = process.new_subject()
-  process.send(subject, session.Join(sub))
+  process.send(subject, session.Join(sub, 0))
   let _ = process.receive(sub, 2000)
   // hello + user echo + assistant full + turn done
   let _ = drain(sub, 4)
