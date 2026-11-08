@@ -112,8 +112,8 @@ fn tool_round_runner(
   _cancel,
   on_event: fn(loop.LoopEvent) -> Nil,
 ) -> session.TurnOutcome {
-  on_event(loop.ToolCallAssembled("call_a", "http_fetch", args_a))
-  on_event(loop.ToolCallAssembled("call_b", "web_search", args_b))
+  on_event(loop.ToolCallAssembled("call_a", "http_fetch", args_a, None))
+  on_event(loop.ToolCallAssembled("call_b", "web_search", args_b, None))
   on_event(loop.ToolResultEvent("call_a", "http_fetch", True, "fetched body"))
   on_event(loop.ToolResultEvent("call_b", "web_search", True, "search body"))
   let tr =
@@ -261,6 +261,7 @@ pub fn failed_tool_result_round_trips_through_rows_test() {
       name: "http_fetch",
       ok: True,
       content: "{\"status\":200}",
+      at: None,
     )),
   )
 }
@@ -731,10 +732,10 @@ pub fn reasoning_rows_round_trip_test() {
   let rows = store.transcript_rows(tr, 1)
   rows
   |> should.equal([
-    store.UserRow("think hard"),
-    store.AssistantRow("the answer", Some("step one, then step two")),
-    store.UserRow("again"),
-    store.AssistantRow("done", None),
+    store.UserRow("think hard", None),
+    store.AssistantRow("the answer", Some("step one, then step two"), None),
+    store.UserRow("again", None),
+    store.AssistantRow("done", None, None),
   ])
   let rebuilt =
     store.transcript_from_rows("alias-1", test_config().system_prompt, rows)
@@ -756,12 +757,75 @@ pub fn tool_call_reasoning_rides_first_row_of_run_test() {
     |> transcript.append_tool_result("c2", "r2", ok: True)
   store.transcript_rows(tr, 1)
   |> should.equal([
-    store.UserRow("q"),
-    store.ToolCallRow("", "c1", "echo", "{}", Some("two calls needed")),
-    store.ToolCallRow("", "c2", "echo", "{}", None),
-    store.ToolResultRow("c1", "echo", True, "r1"),
-    store.ToolResultRow("c2", "echo", True, "r2"),
+    store.UserRow("q", None),
+    store.ToolCallRow("", "c1", "echo", "{}", Some("two calls needed"), None),
+    store.ToolCallRow("", "c2", "echo", "{}", None, None),
+    store.ToolResultRow("c1", "echo", True, "r1", None),
+    store.ToolResultRow("c2", "echo", True, "r2", None),
   ])
+}
+
+// ---------------------------------------------------------------------------
+// Timestamp stamps (display-only created_at round-trip)
+// ---------------------------------------------------------------------------
+
+pub fn timestamp_rows_round_trip_test() {
+  let tr =
+    transcript.new("alias-1", test_config().system_prompt)
+    |> transcript.append_user("q")
+    |> transcript.stamp(1000)
+    |> transcript.append_assistant("a")
+    |> transcript.stamp(2000)
+    |> transcript.append_user("again")
+    |> transcript.stamp(3000)
+    |> transcript.append_assistant("done")
+    |> transcript.stamp(4000)
+  let rows = store.transcript_rows(tr, 1)
+  rows
+  |> should.equal([
+    store.UserRow("q", Some(1000)),
+    store.AssistantRow("a", None, Some(2000)),
+    store.UserRow("again", Some(3000)),
+    store.AssistantRow("done", None, Some(4000)),
+  ])
+  // Hydration restores the stamps at the same chronological indexes, so
+  // a reloaded session renders the same per-message ages.
+  let rebuilt =
+    store.transcript_from_rows("alias-1", test_config().system_prompt, rows)
+  transcript.stamped_at(rebuilt, 1) |> should.equal(Some(1000))
+  transcript.stamped_at(rebuilt, 2) |> should.equal(Some(2000))
+  // The second user message rides the same round-trip: a hydration bug
+  // affecting later USER timestamps must not slip through.
+  transcript.stamped_at(rebuilt, 3) |> should.equal(Some(3000))
+  transcript.stamped_at(rebuilt, 4) |> should.equal(Some(4000))
+}
+
+pub fn tool_call_stamp_rides_first_row_of_run_test() {
+  let tr =
+    transcript.new("alias-1", "sys")
+    |> transcript.append_user("q")
+    |> transcript.stamp(1000)
+    |> transcript.append_assistant_tool_calls(
+      text: None,
+      calls: [#("c1", "echo", "{}"), #("c2", "echo", "{}")],
+      reasoning: None,
+    )
+    |> transcript.stamp(2000)
+    |> transcript.append_tool_result("c1", "r1", ok: True)
+    |> transcript.stamp(3000)
+  store.transcript_rows(tr, 1)
+  |> should.equal([
+    store.UserRow("q", Some(1000)),
+    // One assistant message = one stamp, on the run's FIRST row only —
+    // same rule as content/reasoning.
+    store.ToolCallRow("", "c1", "echo", "{}", None, Some(2000)),
+    store.ToolCallRow("", "c2", "echo", "{}", None, None),
+    store.ToolResultRow("c1", "echo", True, "r1", Some(3000)),
+  ])
+  let rebuilt =
+    store.transcript_from_rows("alias-1", "sys", store.transcript_rows(tr, 1))
+  transcript.stamped_at(rebuilt, 2) |> should.equal(Some(2000))
+  transcript.stamped_at(rebuilt, 3) |> should.equal(Some(3000))
 }
 
 // ---------------------------------------------------------------------------

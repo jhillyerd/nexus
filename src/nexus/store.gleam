@@ -26,7 +26,10 @@
 //// - A tool result is one row; `name` is resolved from the preceding
 ////   assistant call (display metadata, like the SSE replay does) and
 ////   `ok` is persisted as the replay value (the transcript itself does
-////   not carry an ok flag).
+////   not carry an ok flag). Each row's `at` carries the display-only
+////   wall-clock stamp (`session_message.created_at`) so the chat log's
+////   per-message ages survive a reload; on a call run it follows the
+////   same first-row-only rule as `content`.
 //// - The system prompt is NOT a row: it lives in `sessions.system_prompt`
 ////   and hydration refreezes it via `transcript.new`.
 //// - `seq` is the 0-based index of the row within the session
@@ -111,15 +114,21 @@ pub type StoredProvider {
 }
 
 /// One append-only message row. The write shape and the read shape are the
-/// same type; `seq` is assigned by the store, not carried here.
+/// same type; `seq` is assigned by the store, not carried here. `at` is
+/// the row's display-only wall-clock epoch stamp (the transcript's
+/// timestamp sidecar round-tripped through `session_message.created_at`);
+/// `None` for rows persisted before the column existed. On ToolCallRow —
+/// like `content` and `reasoning` — it is set on the FIRST row of a run
+/// only: a call run is one assistant message, so it carries one stamp.
 pub type MessageRow {
-  UserRow(content: String)
+  UserRow(content: String, at: Option(Int))
   AssistantRow(
     content: String,
     /// The model's chain-of-thought for this message, when it emitted
     /// any. Display-only — never sent back to the model. Plain text for
     /// the same byte-stability rationale as `tool_args` (never jsonb).
     reasoning: Option(String),
+    at: Option(Int),
   )
   ToolCallRow(
     /// The assistant message's text — set on the FIRST row of a run, ''
@@ -134,8 +143,15 @@ pub type MessageRow {
     /// The message's reasoning — set on the FIRST row of a run only,
     /// exactly like `content`.
     reasoning: Option(String),
+    at: Option(Int),
   )
-  ToolResultRow(call_id: String, name: String, ok: Bool, content: String)
+  ToolResultRow(
+    call_id: String,
+    name: String,
+    ok: Bool,
+    content: String,
+    at: Option(Int),
+  )
 }
 
 /// Sanitized store error (already safe to log; never contains secrets).
@@ -237,6 +253,7 @@ pub fn transcript_rows(
       base,
       fn(index) { transcript.reasoning_at(tr, index) },
       fn(index) { transcript.tool_result_at(tr, index) },
+      fn(index) { transcript.stamped_at(tr, index) },
     )
   rows
 }
@@ -244,33 +261,37 @@ pub fn transcript_rows(
 /// Translate chronological transcript messages into rows. Messages this
 /// module's constructors never produce (developer messages, non-text user
 /// content) are skipped — see the module docs for the row model. This is
-/// the reasoning-free shape; the write-behind lane uses
-/// `messages_to_rows_with` against the transcript's sidecar.
+/// the metadata-free shape; the write-behind lane uses
+/// `messages_to_rows_with` against the transcript's sidecars.
 pub fn messages_to_rows(messages: List(ChatMessage)) -> List(MessageRow) {
   let #(rows, _) =
-    messages_to_rows_with(messages, 0, fn(_) { None }, fn(_) { None })
+    messages_to_rows_with(messages, 0, fn(_) { None }, fn(_) { None }, fn(_) {
+      None
+    })
   rows
 }
 
 /// The reasoning-aware row mapping: `reasoning_at` resolves a message's
 /// chronological index into its recorded chain-of-thought, so assistant
 /// rows carry it without it ever existing as a message; `tool_ok_at`
-/// resolves a tool message's outcome the same way (True when unknown).
-/// `base` is the chronological index of `messages`' head (non-zero when
-/// the caller already dropped a persisted prefix).
+/// resolves a tool message's outcome the same way (True when unknown);
+/// `stamped_at` resolves the wall-clock epoch the message was appended
+/// at (None = unstamped, e.g. legacy rows).
 fn messages_to_rows_with(
   messages: List(ChatMessage),
   base: Int,
   reasoning_at: fn(Int) -> Option(String),
   tool_ok_at: fn(Int) -> Option(Bool),
+  stamped_at: fn(Int) -> Option(Int),
 ) -> #(List(MessageRow), dict.Dict(String, String)) {
   let #(rows, names, _) =
     list.index_fold(messages, #([], dict.new(), 0), fn(acc, message, index) {
       let #(rows, names, _index) = acc
       let reasoning = reasoning_at(base + index)
+      let at = stamped_at(base + index)
       case message {
         chat.UserMessage(content: chat.UserTextContent(text), ..) -> #(
-          [UserRow(text), ..rows],
+          [UserRow(text, at), ..rows],
           names,
           index + 1,
         )
@@ -303,6 +324,10 @@ fn messages_to_rows_with(
                           0 -> reasoning
                           _ -> None
                         },
+                        at: case index {
+                          0 -> at
+                          _ -> None
+                        },
                       ),
                       ..rows
                     ],
@@ -314,7 +339,7 @@ fn messages_to_rows_with(
             None ->
               case text {
                 Some(chat.AssistantTextContent(content)) -> #(
-                  [AssistantRow(content, reasoning), ..rows],
+                  [AssistantRow(content, reasoning, at), ..rows],
                   names,
                   index + 1,
                 )
@@ -331,6 +356,7 @@ fn messages_to_rows_with(
               name: result.unwrap(dict.get(names, id), "tool"),
               ok: option.unwrap(tool_ok_at(base + index), True),
               content: content,
+              at: at,
             ),
             ..rows
           ],
@@ -361,35 +387,50 @@ pub fn transcript_from_rows(
 fn append_rows(tr: Transcript, rows: List(MessageRow)) -> Transcript {
   case rows {
     [] -> tr
-    [UserRow(content), ..rest] ->
-      append_rows(transcript.append_user(tr, content), rest)
-    [AssistantRow(content, reasoning), ..rest] ->
+    // Stamps restore through the same construction path as the sidecars
+    // they mirror: append, then stamp the newest message. `stamp_opt` is
+    // the no-op for unstamped (legacy) rows.
+    [UserRow(content, at), ..rest] ->
       append_rows(
-        transcript.append_assistant_with_reasoning(tr, content, reasoning),
+        tr |> transcript.append_user(content) |> transcript.stamp_opt(at),
         rest,
       )
-    [ToolResultRow(call_id: id, name: _, ok: ok, content: content), ..rest] ->
+    [AssistantRow(content, reasoning, at), ..rest] ->
+      append_rows(
+        tr
+          |> transcript.append_assistant_with_reasoning(content, reasoning)
+          |> transcript.stamp_opt(at),
+        rest,
+      )
+    [
+      ToolResultRow(call_id: id, name: _, ok: ok, content: content, at: at),
+      ..rest
+    ] ->
       append_rows(
         transcript.append_tool_result(
           tr,
           tool_call_id: id,
           content: content,
           ok: ok,
-        ),
+        )
+          |> transcript.stamp_opt(at),
         rest,
       )
     [ToolCallRow(..), ..] -> {
       // A maximal run of consecutive tool-call rows is one assistant
       // message: the first row's content is the message text, the run's
       // calls are the message's tool calls, and the first row's
-      // reasoning is the message's reasoning.
+      // reasoning (and stamp — see MessageRow) is the message's.
       let #(group, rest) = split_call_run(rows, [])
-      let assert [ToolCallRow(content: text, reasoning: reasoning, ..), ..] =
-        group
+      let assert [
+        ToolCallRow(content: text, reasoning: reasoning, at: at, ..),
+        ..
+      ] = group
       let calls =
         list.filter_map(group, fn(row) {
           case row {
-            ToolCallRow(_, id, name, arguments, _) -> Ok(#(id, name, arguments))
+            ToolCallRow(_, id, name, arguments, _, _) ->
+              Ok(#(id, name, arguments))
             _ -> Error(Nil)
           }
         })
@@ -402,7 +443,8 @@ fn append_rows(tr: Transcript, rows: List(MessageRow)) -> Transcript {
           },
           calls: calls,
           reasoning: reasoning,
-        ),
+        )
+          |> transcript.stamp_opt(at),
         rest,
       )
     }

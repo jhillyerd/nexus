@@ -83,12 +83,20 @@ CREATE TABLE IF NOT EXISTS session_message (
   tool_args    text,                           -- raw argument JSON as the model emitted it. NOTE: deliberately text, not jsonb: jsonb normalizes (sorts keys, strips whitespace, dedupes), which would break the byte-identical hydration contract for tool-call arguments that sit above the request tail (see the `tool_args` invariant in AGENTS.md)
   tool_ok      boolean,
   reasoning    text,                           -- display-only chain-of-thought emitted before an assistant message; NULL for user/tool rows and reasoning-free messages. Plain text for the same byte-stability rationale as tool_args. Never sent back to the model.
+  created_at   timestamptz,                    -- display-only wall-clock stamp of the message (drives the chat log's relative ages). NULL for rows persisted before the column existed; those render without a timestamp. Never sent back to the model.
   UNIQUE (session_id, seq)
 );
 
 -- Reasoning column for databases created before it existed (the CREATE
 -- TABLE above already includes it for fresh ones; both are idempotent).
 ALTER TABLE session_message ADD COLUMN IF NOT EXISTS reasoning text;
+
+-- created_at for databases created before it existed (see the reasoning
+-- ALTER above for the pattern). Deliberately nullable: there is no honest
+-- backfill for pre-existing rows (DEFAULT now() would stamp every legacy
+-- message with the migration instant), so they stay NULL and the UI omits
+-- the timestamp for them. Writes always supply it via to_timestamp($n).
+ALTER TABLE session_message ADD COLUMN IF NOT EXISTS created_at timestamptz;
 
 -- Tags provenance columns (docs/plans/completed/utility-tags.md §3.4),
 -- added for databases created before they existed. Both live in ONE DO

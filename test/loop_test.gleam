@@ -150,10 +150,17 @@ pub fn tool_round_then_answer_test() {
   // The loop reported request/tools/request and the assembled call/result.
   should.be_true(list.contains(events, loop.LoopStatus(1, 8, "request")))
   should.be_true(list.contains(events, loop.LoopStatus(1, 8, "tools")))
-  should.be_true(list.contains(
-    events,
-    loop.ToolCallAssembled("c1", "echo", "{}"),
-  ))
+  // The assembled event carries the round's flush stamp — the SAME value
+  // the loop recorded on the round's transcript message, never None.
+  let assert Some(round_stamp) = transcript.stamped_at(tr, 2)
+  should.be_true(
+    list.any(events, fn(e) {
+      case e {
+        loop.ToolCallAssembled("c1", "echo", "{}", Some(s)) -> s == round_stamp
+        _ -> False
+      }
+    }),
+  )
   should.be_true(list.contains(
     events,
     loop.ToolResultEvent("c1", "echo", True, "echo:{}"),
@@ -477,10 +484,17 @@ pub fn stop_mid_round_skips_remaining_calls_test() {
   // ...the second was assembled but never executed: a synthetic failed
   // result answers it (wire protocol: every assistant tool call gets a
   // tool result).
-  should.be_true(list.contains(
-    received,
-    loop.ToolCallAssembled("c2", "echo", "{}"),
-  ))
+  // The cancelled call's assembled event still carries the round's flush
+  // stamp (the round message was appended before the calls executed).
+  let assert Some(round_stamp) = transcript.stamped_at(tr, 2)
+  should.be_true(
+    list.any(received, fn(e) {
+      case e {
+        loop.ToolCallAssembled("c2", "echo", "{}", Some(s)) -> s == round_stamp
+        _ -> False
+      }
+    }),
+  )
   should.be_true(list.contains(
     received,
     loop.ToolResultEvent("c2", "echo", False, "{\"error\":\"cancelled\"}"),

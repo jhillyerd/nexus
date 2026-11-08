@@ -58,6 +58,14 @@ pub opaque type Transcript {
     /// byte, yet present on the commit / write-behind / replay lane that
     /// rebuilds the UI after a reload.
     tool_results: Dict(Int, Bool),
+    /// Display-only timestamp sidecar: the wall-clock epoch second each
+    /// message was appended at, keyed by the CHRONOLOGICAL message index
+    /// (0 = the system prompt, which is never stamped). `to_request`
+    /// reads only `messages`, so — exactly like the sidecars above — it
+    /// is structurally incapable of changing a request byte, yet rides
+    /// the commit / write-behind / replay lane that persists and restores
+    /// it, so the chat log's per-message ages survive a reload.
+    timestamps: Dict(Int, Int),
   )
 }
 
@@ -68,6 +76,7 @@ pub fn new(model: String, system: String) -> Transcript {
     messages: [chat.system_message(system)],
     reasoning: dict.new(),
     tool_results: dict.new(),
+    timestamps: dict.new(),
   )
 }
 
@@ -203,6 +212,69 @@ pub fn reasoning_at(transcript: Transcript, index: Int) -> Option(String) {
 /// result. The replay / persistence read side of the sidecar.
 pub fn tool_result_at(transcript: Transcript, index: Int) -> Option(Bool) {
   dict.get(transcript.tool_results, index) |> option.from_result
+}
+
+/// Stamp the newest message with a wall-clock epoch second (the read side
+/// is `stamped_at`). Call immediately after the append that created the
+/// message — the chronological index is derived from the message count,
+/// so a stamp applied before an append would silently land on the wrong
+/// message. Never stamped messages (unstamped legacy rows, messages
+/// built before this sidecar existed) simply have no entry, which the UI
+/// renders as no timestamp. Pure display metadata: never enters a
+/// request body.
+pub fn stamp(transcript: Transcript, at: Int) -> Transcript {
+  Transcript(
+    ..transcript,
+    timestamps: dict.insert(
+      transcript.timestamps,
+      list.length(transcript.messages) - 1,
+      at,
+    ),
+  )
+}
+
+/// Stamp only when a stamp exists — the persistence lane's helper for
+/// rows loaded before `created_at` was recorded.
+pub fn stamp_opt(transcript: Transcript, at: Option(Int)) -> Transcript {
+  case at {
+    Some(at) -> stamp(transcript, at)
+    None -> transcript
+  }
+}
+
+/// The wall-clock epoch second the message at chronological `index`
+/// (0 = the system prompt) was appended at; `None` when it carries no
+/// stamp. The replay / persistence read side of the sidecar.
+pub fn stamped_at(transcript: Transcript, index: Int) -> Option(Int) {
+  dict.get(transcript.timestamps, index) |> option.from_result
+}
+
+/// The stamped epoch of the NEWEST assistant text message — the terminal
+/// turn's bubble text. The session actor attaches this to the terminal
+/// event (TurnDone/TurnStopped/guard-committed TurnFailed), so the UI's
+/// live bubble commit carries exactly the value a post-reload replay
+/// attaches to that message's AssistantFull: one clock, not two. `None`
+/// when the newest assistant text carries no stamp (nothing committed,
+/// or rows persisted before the sidecar existed) — an OLDER message's
+/// stamp never leaks into a newer text's terminal event.
+pub fn last_text_stamp(transcript: Transcript) -> Option(Int) {
+  let total = list.length(transcript.messages)
+  do_last_text_stamp(transcript, total - 1, transcript.messages)
+}
+
+/// Newest-first scan: stop at the FIRST assistant text — even when its
+/// own stamp is `None` — and report that stamp, whatever it is.
+fn do_last_text_stamp(
+  transcript: Transcript,
+  index: Int,
+  messages: List(ChatMessage),
+) -> Option(Int) {
+  case messages {
+    [] -> None
+    [chat.AssistantMessage(content: Some(chat.AssistantTextContent(_)), ..), ..] ->
+      stamped_at(transcript, index)
+    [_, ..rest] -> do_last_text_stamp(transcript, index - 1, rest)
+  }
 }
 
 /// Record reasoning against the message about to be appended (its
