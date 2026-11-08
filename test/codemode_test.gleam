@@ -929,26 +929,28 @@ pub fn call_all_empty_batch_is_empty_test() {
 /// Over-budget batches fail EVEN on the deadline short-circuit path: the
 /// batch is charged before remaining-time is considered, so a
 /// near-deadline script cannot keep issuing uncounted batches (cubic
-/// review — deadline-exceeded entries still draw budget). The sync
-/// stall guarantees remaining <= 20 ms < the 50 ms margin, so the only
-/// thing that can fail this script is the budget check itself.
+/// review — deadline-exceeded entries still draw budget).
+///
+/// Race-free by arithmetic (cubic follow-up: an earlier cut slept 980 ms
+/// of a 1 s deadline, but `process.sleep` can overshoot arbitrarily —
+/// past the kill — on a loaded CI box). Instead: no sleep at all. With
+/// timeout 55 ms and nominal engine startup ~20 ms, call_all is entered
+/// with ~35 ms remaining — inside the 50 ms wrap-up margin, i.e. ON the
+/// deadline path — while the budget error's Done still lands ~35 ms
+/// ahead of the worker's kill. There is no wake-up to overshoot; the
+/// only way this can time out is engine startup alone exceeding 55 ms
+/// (>2.5x nominal, well past what the suite's other timing tests
+/// tolerate). And post-fix the assertion holds on EITHER path, since
+/// the budget check now runs before the remaining-time branch.
 pub fn call_all_budget_charged_on_deadline_path_test() {
-  let hosts = [
-    codemode.HostTool(name: "stall", call: fn(_) {
-      process.sleep(980)
-      Ok("late")
-    }),
-    echo_host(),
-  ]
   let assert Error(result) =
     codemode.run(
-      hosts,
-      1000,
+      [echo_host()],
+      55,
       default_cap,
       process.new_subject(),
       code_argument(
-        "tools.stall({})"
-        <> "\nlocal batch = {}\nfor i = 1, 26 do batch[i] = {name = 'echo'} end\n"
+        "local batch = {}\nfor i = 1, 26 do batch[i] = {name = 'echo'} end\n"
         <> "tools.call_all(batch)\nreturn 'unreachable'",
       ),
     )
