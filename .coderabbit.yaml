@@ -1,0 +1,6 @@
+# CodeRabbit configuration — https://docs.coderabbit.ai/reference/configuration
+# Automatic reviews stay disabled (CodeRabbit org UI); reviews run on demand
+# via the `@coderabbitai review` PR comment. `review_status: false` only
+# silences the "Review skipped" status comment CodeRabbit posts on PRs.
+reviews:
+  review_status: false
