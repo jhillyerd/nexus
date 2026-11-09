@@ -76,7 +76,10 @@ flowchart TB
 
 Crash policy: the tree is deliberately aggressive. A crash loop at the root
 halts the VM and the *outer* supervisor (Nomad job / run script) restarts it
-into a clean state; history survives via the store. Everything below is
+into a clean state; **persisted** history is rehydrated from the store —
+with the caveat that turn commits travel the write-behind lane, so anything
+still queued at the moment of a crash is lost (the PRD accepts this window
+for the MVP). Everything below is
 designed so that the only things that can kill a supervised actor are its
 own bugs — network and tool failures are contained in unlinked workers
 (§5).
@@ -130,8 +133,10 @@ Notes on the "ties":
 
 ## 4. Communication map
 
-Solid edges are synchronous `actor.call` request/response; dashed edges are
-fire-and-forget message sends.
+Among the nexus-process edges: solid = synchronous request/response
+(`actor.call` / subject ask); dashed = fire-and-forget message sends.
+External transports are labeled on their own edges — the browser edge is a
+WebSocket, `store → Postgres` is the pool connection — and are neither.
 
 ```mermaid
 flowchart TB
@@ -159,6 +164,8 @@ flowchart TB
     sa -.->|"SessionEvent fan-out<br/>(id + visit filtered)"| rt
     sa -->|"spawn unlinked + monitor"| tw
     sa -->|"spawn unlinked + monitor"| uw
+    uw -->|"TagCorpus ask"| sa
+    uw -->|"UpgradeAutoTitle ask<br/>(guarded apply)"| reg
     tw -->|"SSE stream<br/>(nexus/openai over net)"| llm
     tw -->|"tool exec"| eng
     tw -->|"tool exec"| web
@@ -185,11 +192,16 @@ flowchart TB
   bookkeeping: a subscriber shares ONE event subject across every session it
   visits, and these two fields are what let the UI drop deliveries from the
   wrong session or a stale earlier visit.
-- **Registry → session** only, never the reverse. A session's code path
-  never calls back into the registry (it would deadlock); the session sees
-  the outside world only through closures injected at start: the turn
-  runner, the `commit_hook` (store write-behind lane), and its frozen
-  endpoint.
+- **Registry → session** is the primary direction — a session actor's own
+  message loop never calls back into the registry. The session sees the
+  outside world through closures injected at start: the turn runner, the
+  `commit_hook` (store write-behind lane), and its frozen endpoint. The
+  ONE exception lives in the unlinked utility worker, never the session
+  actor: it asks its session actor for the tag corpus (`TagCorpus`) and
+  asks the registry to land the parsed title/tags (`UpgradeAutoTitle`).
+  Both asks are deadlock-safe because the worker is a separate process
+  (the session actor never blocks on it) and the registry answers purely
+  from its state + the store, never calling into any session (§8 rule 1).
 - **Scripting API → registries**: the same registry subjects the UI uses,
   over bearer-token-authenticated JSON routes (`/sessions` CRUD + send/stop,
   `/providers` CRUD + model listing; `/healthz` is the one open route).
@@ -198,9 +210,13 @@ flowchart TB
 
 ## 5. Ephemeral workers (crash containment)
 
-All network-facing work runs in **unlinked, monitored** workers spawned by
-the owning actor, so a crash or timeout kills at most the turn that was
-running:
+Network-facing work runs **outside the actor that owns it**, spawned
+unlinked so a crash or timeout kills at most the task that was running.
+The turn and utility workers are additionally **monitored**; two deliberate
+exceptions to the "monitored" half: the provider registry's `ListModels`
+fetch is unlinked and **unmonitored** (a one-off HTTP call whose reply is
+simply dropped if the caller's budget already expired), and the store's
+Postgres queries run **inside** the supervised store actor:
 
 ```mermaid
 sequenceDiagram
@@ -212,6 +228,7 @@ sequenceDiagram
 
     B->>S: Send(text)
     S->>S: append + commit user turn immediately<br/>(a failed turn keeps it)
+    S->>St: commit_hook — write-behind (user turn)
     S->>W: spawn + monitor (working transcript, cancel subject)
     loop bounded iterations (NEXUS_MAX_TOOL_ITERATIONS, default 32)
         W->>L: stream (full transcript re-encode)
@@ -220,15 +237,20 @@ sequenceDiagram
         W->>W: execute tools (http_fetch / web_search / codemode)
     end
     W->>S: WorkerDone(outcome)
-    S->>S: commit assistant content (nothing on failure)
-    S->>St: commit_hook(tr) — fire-and-forget, arrival-ordered
+    S->>S: done/stopped/guard outcomes install the worker's<br/>extended transcript (a commit) — a transport<br/>error (StreamErrored) commits none
+    S->>St: commit_hook(tr) — write-behind, arrival-ordered
     S-->>B: TurnDone / TurnStopped / TurnFailed
 ```
 
 - **Turn worker** — runs the bounded agent loop (`nexus/loop`): stream →
   assemble tool calls → execute → append → stream again, until done, guard,
   user `Stop`, or transport failure. It holds its *own* working transcript;
-  the session actor's committed transcript only advances at `WorkerDone`.
+  the session actor's committed transcript advances at TWO points: at
+  `Send` (the user message is appended and committed immediately, hook
+  fired before the worker starts) and at `WorkerDone` (done/stopped/guard
+  outcomes install the worker's extended transcript and fire the hook —
+  note the iteration guard is one of the committing outcomes; only a
+  transport error, `StreamErrored`, commits nothing).
   The cancel subject is threaded through every stream call and tool run, so
   `Stop` kills an in-flight script and answers not-yet-started sibling
   calls with synthetic cancelled results.
@@ -245,9 +267,16 @@ sequenceDiagram
   `max_completion_tokens` delta. It is invisible to callers: a `Send`
   arriving mid-attempt **cancels** it instead of reporting `Busy`, and its
   reply becomes session metadata (title/tags), never transcript content.
+  It lands its own result: the worker asks its session actor for the tag
+  corpus (`TagCorpus`) and asks the registry to apply the parsed title and
+  tags behind the `UpgradeAutoTitle` provenance guard (the injected
+  `utility_apply_for` closure) — the only calls that flow from the session
+  side into the registry (§8 rule 1).
 - **`ListModels` fetch** — the provider registry resolves an endpoint from
-  state synchronously, then runs the live HTTP fetch in an unlinked process,
-  so a slow provider can never stall `Resolve` (which sits on the
+  state synchronously, then runs the live HTTP fetch in an unlinked,
+  unmonitored process (if the caller's call budget expired, the reply is
+  dropped — nobody waits on the fetch), so a slow provider can never stall
+  `Resolve` (which sits on the
   session-create path).
 
 ---
@@ -286,7 +315,8 @@ Hydrates the dormant set from the store at boot (after pruning never-used
 sessions), lazily starts hydrated actors on first `Get`, and owns the
 monitors that replace a dead session actor through the factory — the
 replacement rehydrates from the store, so the rebuilt transcript re-encodes
-byte-identically.
+byte-identically (§2's write-behind loss window applies here too: the last
+commits still queued at the crash are missing from the rehydrated set).
 
 ### Session actor
 
@@ -313,7 +343,14 @@ utility-attempt bookkeeping.
 
 ## 8. Dependency rules (structural, do not add edges)
 
-1. **registry → session, one way.** Sessions never call the registry.
+1. **registry → session is the primary direction.** A session actor's own
+   message loop never calls the registry. The one exception runs in the
+   unlinked utility worker (never the actor): it asks the registry to
+   apply the parsed title/tags (`UpgradeAutoTitle` guard, via the injected
+   `utility_apply_for` closure) and asks its session actor for the tag
+   corpus (`TagCorpus`). Safe because the asks come from the worker
+   process — the session actor never blocks on it — and the registry
+   answers purely from state + store, never calling into any session.
 2. **session → store only via the injected `commit_hook`** (fire-and-forget);
    all other store access goes through the registries.
 3. **sessions never call the provider registry.** Boot injects a resolver
