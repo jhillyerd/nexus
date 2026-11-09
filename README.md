@@ -314,6 +314,12 @@ the stream timeouts `NEXUS_AUDIT_SSE_FIRST_RESPONSE_TIMEOUT_MS` (30000) /
 
 ## Architecture
 
+**Process model — actors, lifetimes, and communication — is mapped in
+[ARCHITECTURE.md](ARCHITECTURE.md)** (which processes exist, what each is
+scoped to — VM / browser connection / session / turn — and who talks to
+whom, with Mermaid diagrams).
+
+Module map:
 - `nexus/config` — environment-driven configuration and validation
 - `nexus/transcript` — append-only transcript; **the single request-encoding path**
 - `nexus/openai` — model listing, streaming, cancellation, and stream statistics
