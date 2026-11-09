@@ -943,10 +943,7 @@ pub fn view_popup_pending_survives_assembly_test() {
     |> step(ui.ToolCallDelta(1, Some("call_2"), Some("http_fetch"), "{\"u"))
     |> step(ui.ToolViewOpened(ui.PendingPop(1)))
   let assembled_sibling =
-    step(
-      sibling,
-      ui.ToolCallAssembled("call_1", "web_search", "{}", None),
-    )
+    step(sibling, ui.ToolCallAssembled("call_1", "web_search", "{}", None))
   should_contain(view_string(assembled_sibling), "<dialog open>")
 }
 
