@@ -700,25 +700,17 @@ pub fn view_renders_tool_card_test() {
       "[{\"title\":\"cats\"}]",
     ))
   let html = view_string(model)
-  // Committed card collapses exactly like a committed reasoning block:
-  // a <details> with no open attribute.
-  should_contain(html, "<details class=\"turn tool done\"")
-  should_not_contain(html, " open>")
-  should.be_true(string.contains(html, "data-call-id=\"call_1\""))
-  should.be_true(string.contains(html, "data-tool=\"web_search\""))
-  should.be_true(string.contains(html, ">web_search</strong>"))
-  // The collapsed chip is the tool name alone — one short line; call id
-  // and status moved into the body's meta row, with the status repeated
-  // as an aria-label so the collapsed state is never color-only.
+  // A completed call renders as ONE compact clickable chip — the whole
+  // chip is the popup opener (no separate affordance, no inline body).
+  // The status rides the aria-label so the collapsed state is never
+  // color-only.
   should_contain(
     html,
-    "<summary aria-label=\"web_search (completed)\"><strong class=\"tool-name\">web_search</strong></summary>",
+    "<button aria-label=\"web_search (completed)\" class=\"turn tool done\" data-call-id=\"call_1\" data-tool=\"web_search\" title=\"View full call\" type=\"button\"><strong class=\"tool-name\">web_search</strong></button>",
   )
-  should_contain(html, "<div class=\"tool-meta\">")
-  should.be_true(string.contains(html, ">completed</span>"))
-  // Lustre escapes quotes in text nodes.
-  should.be_true(string.contains(html, "{&quot;query&quot;:&quot;cats&quot;}"))
-  should.be_true(string.contains(html, "[{&quot;title&quot;:&quot;cats&quot;}]"))
+  // The full call text lives in the popup only — nothing renders inline.
+  should_not_contain(html, "{&quot;query&quot;:&quot;cats&quot;}")
+  should_not_contain(html, "[{&quot;title&quot;:&quot;cats&quot;}]")
 }
 
 pub fn view_renders_running_and_failed_states_test() {
@@ -726,19 +718,23 @@ pub fn view_renders_running_and_failed_states_test() {
     new_model()
     |> step(ui.ToolCallAssembled("call_1", "http_fetch", "{}", None))
   running |> view_string |> should_contain("turn tool running")
-  // A running call stays open — the live twin of the thinking block.
-  running |> view_string |> should_contain("data-tool=\"http_fetch\" open>")
-  running |> view_string |> should_contain(">running</span>")
+  // The status is legible without color: it rides the aria-label.
+  running
+  |> view_string
+  |> should_contain("aria-label=\"http_fetch (running)\"")
   let failed =
     new_model()
     |> step(ui.ToolCallAssembled("call_2", "http_fetch", "{}", None))
     |> step(ui.ToolResult("call_2", "http_fetch", False, "{\"error\":\"no\"}"))
   failed |> view_string |> should_contain("turn tool failed")
-  failed |> view_string |> should_contain(">failed</span>")
-  failed |> view_string |> should_not_contain(" open>")
+  failed
+  |> view_string
+  |> should_contain("aria-label=\"http_fetch (failed)\"")
 }
 
-pub fn view_truncates_tool_previews_test() {
+// The old inline previews are gone: the chip shows the tool name only,
+// and the complete argument/result text appears only in the popup.
+pub fn view_chip_shows_name_only_test() {
   let long_args = string.repeat("a", 500)
   let long_result = string.repeat("r", 500)
   let model =
@@ -746,11 +742,171 @@ pub fn view_truncates_tool_previews_test() {
     |> step(ui.ToolCallAssembled("call_1", "http_fetch", long_args, None))
     |> step(ui.ToolResult("call_1", "http_fetch", True, long_result))
   let html = view_string(model)
-  // 120-char argument preview + ellipsis, 200-char result preview.
-  should.be_true(string.contains(html, string.repeat("a", 120) <> "…"))
-  should.be_false(string.contains(html, string.repeat("a", 121)))
-  should.be_true(string.contains(html, string.repeat("r", 200) <> "…"))
-  should.be_false(string.contains(html, string.repeat("r", 201)))
+  should.be_false(string.contains(html, long_args))
+  should.be_false(string.contains(html, long_result))
+  // Opening the popup is where the full text renders.
+  let open = step(model, ui.ToolViewOpened(ui.CallPop("call_1")))
+  let open_html = view_string(open)
+  should.be_true(string.contains(open_html, long_args))
+  should.be_true(string.contains(open_html, long_result))
+}
+
+// The full-call popup: clicking the chip opens a <dialog> with the
+// COMPLETE argument and result text.
+pub fn view_popup_shows_full_call_test() {
+  let long_args = string.repeat("a", 500)
+  let long_result = string.repeat("r", 500)
+  let model =
+    new_model()
+    |> step(ui.ToolCallAssembled("call_1", "http_fetch", long_args, None))
+    |> step(ui.ToolResult("call_1", "http_fetch", True, long_result))
+    // The result line is stored with the full content only; the earlier
+    // assembled log line carries the arguments.
+    |> step(ui.ToolViewOpened(ui.CallPop("call_1")))
+  let html = view_string(model)
+  should_contain(html, "<dialog open>")
+  // The backdrop click-catcher renders as the dialog's first child, so
+  // clicking outside the card dismisses the popup (see the .tool-pop-hit
+  // CSS note; server components cannot stop an event's bubble, so the
+  // card simply paints above the catcher).
+  should_contain(
+    html,
+    "<dialog open><div class=\"tool-pop-hit\"></div><article class=\"tool-pop done\"",
+  )
+  should.be_true(string.contains(html, ">http_fetch</h2>"))
+  // Full text, not the truncated preview.
+  should.be_true(string.contains(html, string.repeat("a", 500)))
+  should.be_true(string.contains(html, string.repeat("r", 500)))
+}
+
+pub fn view_popup_closed_test() {
+  let model =
+    new_model()
+    |> step(ui.ToolCallAssembled("call_1", "http_fetch", "{}", None))
+    |> step(ui.ToolResult("call_1", "http_fetch", True, "[]"))
+    |> step(ui.ToolViewOpened(ui.CallPop("call_1")))
+    |> step(ui.ToolViewClosed)
+  let html = view_string(model)
+  should_not_contain(html, "<dialog open>")
+  // The chip stays; only the popup closed.
+  should_contain(
+    html,
+    "<button aria-label=\"http_fetch (completed)\" class=\"turn tool done\"",
+  )
+}
+
+pub fn view_popup_defaults_closed_test() {
+  let model =
+    new_model()
+    |> step(ui.ToolCallAssembled("call_1", "http_fetch", "{}", None))
+  view_string(model) |> should_not_contain("<dialog")
+}
+
+// A popup whose call no longer resolves — a rolled-back turn's card, or a
+// pending call whose fragments cleared — renders nothing rather than going
+// stale over content that is gone.
+pub fn view_popup_rolled_back_call_renders_nothing_test() {
+  let model =
+    new_model()
+    |> step(ui.Hello("test-model"))
+    |> step(ui.UserEcho("hi", None))
+    |> step(ui.ToolCallAssembled("call_1", "http_fetch", "{}", None))
+    |> step(ui.ToolViewOpened(ui.CallPop("call_1")))
+  should_contain(view_string(model), "<dialog open>")
+  // TurnFailed with nothing committed rolls the whole turn back; the
+  // popup goes with it.
+  let failed = step(model, ui.TurnFailed("boom", None))
+  view_string(failed) |> should_not_contain("<dialog open>")
+}
+
+pub fn view_popup_unknown_call_renders_nothing_test() {
+  let model =
+    new_model()
+    |> step(ui.ToolCallAssembled("call_1", "http_fetch", "{}", None))
+    |> step(ui.ToolViewOpened(ui.CallPop("call_nope")))
+  view_string(model) |> should_not_contain("<dialog")
+}
+
+// Selecting a different session drops the popup with the rest of the
+// per-session display state.
+pub fn view_popup_cleared_on_session_switch_test() {
+  let model =
+    new_model()
+    |> step(ui.ToolCallAssembled("call_1", "http_fetch", "{}", None))
+    |> step(ui.ToolViewOpened(ui.CallPop("call_1")))
+  should_contain(view_string(model), "<dialog open>")
+  let switched = step(model, ui.Select("other-session"))
+  view_string(switched) |> should_not_contain("<dialog")
+}
+
+// A pending (still-streaming) call's popup resolves against the pending
+// list and live-updates as further fragments arrive.
+pub fn view_popup_pending_call_test() {
+  let model =
+    new_model()
+    |> step(ui.ToolCallDelta(0, Some("call_1"), Some("http_fetch"), "start"))
+    |> step(ui.ToolViewOpened(ui.PendingPop(0)))
+  let html = view_string(model)
+  should_contain(html, "<dialog open>")
+  should.be_true(string.contains(html, "class=\"tool-pop running\""))
+  should.be_true(string.contains(html, "<pre>start"))
+  // The next fragment updates the open popup in place.
+  let grown = step(model, ui.ToolCallDelta(0, Some("call_1"), None, "-more"))
+  should.be_true(string.contains(view_string(grown), "<pre>start-more"))
+}
+
+// Codemode arguments are JSON {"code": "<lua source>"} with every
+// newline escaped — one unreadable line as raw JSON. The popup decodes
+// the string field and renders the script under a "Script" label.
+pub fn view_popup_decodes_codemode_script_test() {
+  let args = "{\"code\":\"-- init\\nlocal x = 1\"}"
+  let model =
+    new_model()
+    |> step(ui.ToolCallAssembled("call_1", "codemode", args, None))
+    |> step(ui.ToolResult("call_1", "codemode", True, "ok"))
+    |> step(ui.ToolViewOpened(ui.CallPop("call_1")))
+  let html = view_string(model)
+  should_contain(html, ">Script</h3>")
+  // The decoded source with its REAL newline, not the \\n escape.
+  should.be_true(string.contains(html, "<pre>-- init\nlocal x = 1</pre>"))
+  should_not_contain(html, "{&quot;code&quot;")
+}
+
+// Any other argument shape (plain JSON objects without a string `code`
+// field, malformed JSON) renders the raw argument text under
+// "Arguments".
+pub fn view_popup_raw_arguments_fallback_test() {
+  let model =
+    new_model()
+    |> step(ui.ToolCallAssembled(
+      "call_1",
+      "web_search",
+      "{\"query\":\"cats\"}",
+      None,
+    ))
+    |> step(ui.ToolViewOpened(ui.CallPop("call_1")))
+  let html = view_string(model)
+  should_contain(html, ">Arguments</h3>")
+  should_not_contain(html, ">Script</h3>")
+  should.be_true(string.contains(html, "{&quot;query&quot;:&quot;cats&quot;}"))
+}
+
+// Popup content is hostile text: a script payload in a tool result renders
+// as escaped text inside the dialog — never as an element.
+pub fn view_popup_escapes_hostile_content_test() {
+  let model =
+    new_model()
+    |> step(ui.ToolCallAssembled("call_1", "http_fetch", "{}", None))
+    |> step(ui.ToolResult(
+      "call_1",
+      "http_fetch",
+      True,
+      "<script>alert(1)</script>",
+    ))
+    |> step(ui.ToolViewOpened(ui.CallPop("call_1")))
+  let html = view_string(model)
+  should.be_true(string.contains(html, "&lt;script&gt;alert(1)&lt;/script&gt;"))
+  should_not_contain(html, "<script>")
 }
 
 pub fn view_renders_pending_card_test() {
@@ -758,17 +914,13 @@ pub fn view_renders_pending_card_test() {
     new_model()
     |> step(ui.ToolCallDelta(0, Some("call_1"), Some("web_search"), "{\"que"))
   let html = view_string(model)
-  should.be_true(string.contains(html, "turn tool running pending"))
-  // Pending calls stream open, like the live thinking block.
-  should_contain(html, "<details class=\"turn tool running pending\"")
-  should_contain(html, "data-call-index=\"0\" open>")
-  should.be_true(string.contains(html, "data-call-index=\"0\""))
-  should.be_true(string.contains(html, ">web_search</strong>"))
+  // A streaming call renders as the same compact clickable chip; its
+  // popup resolves against the pending list, keyed by chunk index.
   should_contain(
     html,
-    "<summary aria-label=\"web_search (running)\"><strong class=\"tool-name\">web_search</strong></summary>",
+    "<button aria-label=\"web_search (running)\" class=\"turn tool running pending\" data-call-index=\"0\" title=\"View full call\" type=\"button\"><strong class=\"tool-name\">web_search</strong></button>",
   )
-  should.be_true(string.contains(html, "{&quot;que"))
+  should_not_contain(html, "{&quot;que")
 }
 
 pub fn view_escapes_tool_content_test() {
@@ -782,8 +934,11 @@ pub fn view_escapes_tool_content_test() {
       "<script>alert(1)</script>",
     ))
   let html = view_string(model)
-  should.be_true(string.contains(html, "&lt;script&gt;"))
-  should.be_false(string.contains(html, "<script>alert"))
+  // The call id rides the chip as a data attribute — escaped like any
+  // attribute value — and the result text does not render inline at all
+  // (the popup render is pinned by view_popup_escapes_hostile_content_test).
+  should.be_true(string.contains(html, "data-call-id=\"&lt;x&gt;\""))
+  should_not_contain(html, "<script>alert")
 }
 
 pub fn view_renders_loop_chip_test() {
@@ -2078,12 +2233,15 @@ pub fn view_groups_consecutive_chips_into_one_row_test() {
     |> step(ui.AssistantFull("done", None))
   let html = model |> view_string
   // The row opens with the reasoning chip and the tool chip is its
-  // sibling inside it — no </div> between the two details.
+  // sibling inside it — no </div> between the two chips.
   should_contain(
     html,
     "<div class=\"chip-row\"><details class=\"turn reasoning\">",
   )
-  should_contain(html, "</details><details class=\"turn tool done\"")
+  should_contain(
+    html,
+    "</details><button aria-label=\"web_search (completed)\" class=\"turn tool done\"",
+  )
   // The assistant turn breaks the run: the row closes right before it.
   // Committed assistant turns render markdown (nexus/ui/markdown) and
   // carry the .md class that switches the bubble to block flow.
