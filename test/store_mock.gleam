@@ -92,6 +92,11 @@ pub type MockMsg {
   /// commits — the next Commit re-emits the delta, which is exactly the
   /// crash-recovery replay the real store makes idempotent.
   Rewind(id: String, keep_rows: Int, messages: Int, reply: Subject(Nil))
+  /// Test-only: overwrite a stored row's `last_active_at` (epoch
+  /// seconds). `Commit` stamps recency with the wall clock, so a test
+  /// that lays down message rows through the seam cannot also present
+  /// the session as previously active — this restores the age afterwards.
+  SetLastActive(id: String, at: Int, reply: Subject(Nil))
 }
 
 type Stored {
@@ -239,6 +244,12 @@ pub fn rewind(
   messages: Int,
 ) -> Nil {
   call(mock, 5000, fn(r) { Rewind(id, keep_rows, messages, r) })
+}
+
+/// Overwrite a stored row's `last_active_at` (epoch seconds) — see
+/// `SetLastActive`.
+pub fn set_last_active(mock: Subject(MockMsg), id: String, at: Int) -> Nil {
+  call(mock, 5000, fn(r) { SetLastActive(id, at, r) })
 }
 
 /// Wait until the mock has observed at least `n` commits — commits are
@@ -751,6 +762,15 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
               message_count: messages,
             ),
           )
+        }),
+      )
+    }
+
+    SetLastActive(id, at, reply) -> {
+      process.send(reply, Nil)
+      actor.continue(
+        update(state, id, fn(summary) {
+          store.StoredSummary(..summary, last_active_at: at)
         }),
       )
     }
