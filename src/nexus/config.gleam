@@ -125,7 +125,7 @@ pub fn from_env(
   use max_tool_iterations <- result.try(optional_int(
     get,
     "NEXUS_MAX_TOOL_ITERATIONS",
-    8,
+    32,
   ))
   use http_fetch_max_bytes <- result.try(optional_int(
     get,
