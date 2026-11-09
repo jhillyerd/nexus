@@ -2390,8 +2390,12 @@ pub fn send_moves_previous_day_row_into_today_immediately_test() {
   // first, then one committed user message — so the send below is NOT
   // the first message (the auto-title branch always refreshed; this pins
   // the path that did not) — then age the row back to yesterday (Commit
-  // stamps recency with the wall clock).
-  let yesterday = timing.wall_now_s() - 90_000
+  // stamps recency with the wall clock). Exactly 86_400, never more: the
+  // bucket is calendar-day arithmetic (day_index = epoch / 86_400), so a
+  // longer offset crosses a second UTC day boundary whenever the test
+  // runs within that excess after midnight UTC — 86_400 lands exactly one
+  // boundary back at any wall-clock time and still renders "1d".
+  let yesterday = timing.wall_now_s() - 86_400
   let assert Ok(Nil) =
     seam.insert_session(
       store.StoredSummary(
