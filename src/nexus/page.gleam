@@ -706,8 +706,12 @@ details.turn.reasoning.live > summary { color: color-mix(in srgb, currentColor 8
   font-size: .78rem; line-height: 1.45; padding: .1rem .5rem; margin: 0; border-radius: 10px;
   border: 1px solid color-mix(in srgb, currentColor 15%, transparent); background: transparent;
   color: inherit; text-align: left; }
+/* Hover/focus affordance is a box-shadow ring, NOT a border-color
+   change: a hover border would out-rank the state tints below (same id
+   count, more classes) and the running/completed/failed state would
+   vanish whenever the user pointed at the chip. */
 #app .turn.tool:hover:not(:disabled), #app .turn.tool:focus-visible { opacity: 1;
-  border-color: color-mix(in srgb, currentColor 40%, transparent); }
+  box-shadow: 0 0 0 1px color-mix(in srgb, currentColor 30%, transparent); }
 .tool-meta { display: flex; align-items: baseline; gap: .5rem; min-width: 0; flex-wrap: wrap; }
 .tool-name { overflow-wrap: anywhere; }
 .call-id { opacity: .55; font-size: .7rem; overflow-wrap: anywhere; }
@@ -729,7 +733,13 @@ details.turn.reasoning.live > summary { color: color-mix(in srgb, currentColor 8
    #app-prefix per the cascade traps. */
 #app .tool-pop { position: relative; max-width: min(58rem, 92vw); font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   border: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
-#app .tool-pop > header { padding-right: 2.4rem; }
+/* The card is the scroll container (Pico), so the header — and the ✕
+   anchored to it — must stick: top: 0 pins both while long content
+   scrolls underneath, and the opaque card background stops scrolled text
+   showing through. Sticky is a positioned value, so the header becomes
+   the ✕'s anchor (replacing the article-relative position on .tool-pop). */
+#app .tool-pop > header { position: sticky; top: 0; padding-right: 2.4rem; margin: 0;
+  background: var(--pico-card-background-color); }
 #app .tool-pop h3 { margin: .8rem 0 0; font-size: .7rem; font-weight: 600; text-transform: uppercase;
   letter-spacing: .07em; opacity: .55; }
 /* pre-wrap + anywhere, not Pico's scrolling pre: a codemode script

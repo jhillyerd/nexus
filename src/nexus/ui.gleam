@@ -297,7 +297,8 @@ pub type Model {
     /// The row whose two-step delete confirmation is armed.
     confirm_delete: Option(String),
     /// The tool call the full-call popup shows, if any (at most one).
-    /// See `Pop` — cleared on session switch and turn rollback; a stale
+    /// See `Pop` — cleared on session switch, turn rollback, and when a
+    /// new turn begins (call ids are only unique within a turn); a stale
     /// entry whose call no longer resolves simply renders nothing.
     pop: Option(Pop),
     /// Rendered markdown element trees for committed assistant lines,
@@ -931,6 +932,12 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         // The user message marks the start of a (possibly live) turn: lines
           // beyond this point belong to it and roll back on a failed turn.
           turn_base: list.length(model.log) + 1,
+        // A new turn is beginning: drop any open popup. Call ids are only
+        // unique WITHIN a turn (providers may omit ids, and the loop's
+        // fallback `call_<index>` restarts at 0 every turn), so a popup
+        // left open across turns could silently switch to the new turn's
+        // same-named call. The user can re-click the chip.
+        pop: None,
       ),
       effect.none(),
     )
@@ -1063,8 +1070,25 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         )
       let model = model |> commit_thinking |> commit_bubble(at)
       let pending = drop_pending(model.pending, id, name)
+      // If the popup was open on the call that just assembled, its
+      // resolution source (the pending entry) is about to disappear:
+      // migrate the selection to the stable id so the popup stays live
+      // through execution and completion. Same id-or-name match as
+      // drop_pending above.
+      let pop = case model.pop {
+        Some(PendingPop(index)) ->
+          case
+            list.find(model.pending, fn(call) {
+              call.id == Some(id) || call.name == Some(name)
+            })
+          {
+            Ok(assembled) if assembled.index == index -> Some(CallPop(id))
+            _ -> model.pop
+          }
+        _ -> model.pop
+      }
       #(
-        Model(..model, pending: pending, log: [
+        Model(..model, pending: pending, pop: pop, log: [
           ToolLine(id, name, arguments, ToolRunning, None),
           ..model.log
         ]),
@@ -2936,16 +2960,21 @@ fn pop_content(model: Model) -> Option(PopContent) {
 /// Codemode calls (the tool registered in `nexus/codemode`, schema
 /// `{"code": string}`) carry their script as a JSON string value — every
 /// newline escaped, so the raw arguments render as one unreadable line.
-/// When the arguments decode as an object with a string `code` field,
-/// show the decoded source under a "Script" label; any other shape (and
-/// any malformed JSON) renders the raw argument text under "Arguments".
+/// Only an object whose SINGLE key is a string `code` decodes as a
+/// script; anything else — extra keys (whose values would otherwise be
+/// silently hidden), a non-string `code`, malformed JSON — renders the
+/// raw argument text under "Arguments", hiding nothing.
 fn script_or_arguments(arguments: String) -> #(String, String) {
-  let decoder = {
-    use code <- decode.field("code", decode.string)
-    decode.success(code)
-  }
-  case json.parse(arguments, decoder) {
-    Ok(code) -> #("Script", code)
+  case json.parse(arguments, decode.dict(decode.string, decode.dynamic)) {
+    Ok(fields) ->
+      case dict.size(fields) == 1, dict.get(fields, "code") {
+        True, Ok(code) ->
+          case decode.run(code, decode.string) {
+            Ok(script) -> #("Script", script)
+            Error(_) -> #("Arguments", arguments)
+          }
+        _, _ -> #("Arguments", arguments)
+      }
     Error(_) -> #("Arguments", arguments)
   }
 }

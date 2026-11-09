@@ -872,9 +872,11 @@ pub fn view_popup_decodes_codemode_script_test() {
   should_not_contain(html, "{&quot;code&quot;")
 }
 
-// Any other argument shape (plain JSON objects without a string `code`
-// field, malformed JSON) renders the raw argument text under
-// "Arguments".
+// Any other argument shape renders the raw argument text under
+// "Arguments" — non-JSON text, malformed JSON, non-string `code`, and
+// objects with EXTRA keys (a single-key {"code": string} is codemode's
+// exact schema; extra-key objects would silently hide the other
+// arguments if decoded).
 pub fn view_popup_raw_arguments_fallback_test() {
   let model =
     new_model()
@@ -889,6 +891,77 @@ pub fn view_popup_raw_arguments_fallback_test() {
   should_contain(html, ">Arguments</h3>")
   should_not_contain(html, ">Script</h3>")
   should.be_true(string.contains(html, "{&quot;query&quot;:&quot;cats&quot;}"))
+  // A code field with extra keys is NOT a codemode call: decoding it
+  // would drop the sibling arguments.
+  let extra =
+    step(
+      model,
+      ui.ToolCallAssembled(
+        "call_2",
+        "codemode",
+        "{\"code\":\"return 1\",\"note\":\"hi\"}",
+        None,
+      ),
+    )
+    |> step(ui.ToolViewOpened(ui.CallPop("call_2")))
+  let extra_html = view_string(extra)
+  should_contain(extra_html, ">Arguments</h3>")
+  should_not_contain(extra_html, ">Script</h3>")
+  // A non-string code field is not a script either.
+  let typed =
+    new_model()
+    |> step(ui.ToolCallAssembled("call_1", "codemode", "{\"code\":1}", None))
+    |> step(ui.ToolViewOpened(ui.CallPop("call_1")))
+  view_string(typed) |> should_contain(">Arguments</h3>")
+}
+
+// An open pending popup survives assembly: when the matching call
+// commits under its stable id, the selection migrates from the chunk
+// index to the id so the popup stays live through execution and
+// completion.
+pub fn view_popup_pending_survives_assembly_test() {
+  let model =
+    new_model()
+    |> step(ui.ToolCallDelta(0, Some("call_1"), Some("http_fetch"), "{\"u"))
+    |> step(ui.ToolViewOpened(ui.PendingPop(0)))
+  should_contain(view_string(model), "<dialog open>")
+  let assembled =
+    step(
+      model,
+      ui.ToolCallAssembled("call_1", "http_fetch", "{\"url\":\"x\"}", None),
+    )
+  let html = view_string(assembled)
+  should_contain(html, "<dialog open>")
+  // The migrated popup resolves against the committed line and shows the
+  // complete assembled arguments.
+  should.be_true(string.contains(html, "{&quot;url&quot;:&quot;x&quot;}"))
+  // A DIFFERENT pending index does not migrate (its call has not
+  // assembled) and stays resolvable against the pending list.
+  let sibling =
+    new_model()
+    |> step(ui.ToolCallDelta(0, Some("call_1"), Some("web_search"), "{}"))
+    |> step(ui.ToolCallDelta(1, Some("call_2"), Some("http_fetch"), "{\"u"))
+    |> step(ui.ToolViewOpened(ui.PendingPop(1)))
+  let assembled_sibling =
+    step(
+      sibling,
+      ui.ToolCallAssembled("call_1", "web_search", "{}", None),
+    )
+  should_contain(view_string(assembled_sibling), "<dialog open>")
+}
+
+// A new turn's user echo drops an open popup: call ids are only unique
+// WITHIN a turn (fallback ids are `call_<index>`, restarting at 0 every
+// turn), so a popup left open across turns could silently switch to the
+// new turn's same-named call.
+pub fn view_popup_cleared_when_turn_begins_test() {
+  let model =
+    new_model()
+    |> step(ui.ToolCallAssembled("call_0", "http_fetch", "{}", None))
+    |> step(ui.ToolViewOpened(ui.CallPop("call_0")))
+  should_contain(view_string(model), "<dialog open>")
+  let next_turn = step(model, ui.UserEcho("run it again", None))
+  view_string(next_turn) |> should_not_contain("<dialog")
 }
 
 // Popup content is hostile text: a script payload in a tool result renders
