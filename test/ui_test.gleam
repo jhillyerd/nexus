@@ -98,6 +98,114 @@ pub fn sessions_auto_select_first_test() {
   model.create_open |> should.be_false
 }
 
+/// The auto-selection fires a join carrying a NEW visit generation, and
+/// that generation must land on the RETURNED model: a delivery only
+/// applies when the model's generation matches, so a bump that lives only
+/// in the join effect leaves the model one generation behind — deaf to
+/// the whole Hello + replay. That was the blank-chat-on-boot bug: the
+/// top-most session showed selected while the pane stayed empty until the
+/// user switched away and back (#58 regression).
+pub fn sessions_loaded_auto_select_bumps_visit_test() {
+  let model = new_model() |> step(ui.SessionsLoaded([summary("s-1", False)]))
+  let visit = model.visit
+  // The fresh harness model sits at generation 0 (its GotEvents effect is
+  // dropped), so the auto-switch must have bumped to 1 — the same value
+  // the join carried.
+  visit |> should.equal(1)
+  // A replay delivery stamped with the join's generation APPLIES — this
+  // is the assertion that failed while the bump was shadowed.
+  let model = step(model, ui.SessionScoped("s-1", visit, ui.Token("kept")))
+  model.bubble |> should.equal(Some("kept"))
+}
+
+/// Archiving the OPEN session ends the visit: the selection clears and
+/// the chat pane goes blank (the row is soft-hidden, so keeping the
+/// selection highlighted nothing while the pane still showed the archived
+/// content — the ghost-selection bug). The refresh that the registry
+/// write triggers must not auto-select a replacement, and an explicit
+/// pick works normally afterwards.
+pub fn archive_of_selection_clears_selection_test() {
+  let model =
+    new_model()
+    |> step(ui.SessionsLoaded([summary("s-1", False), summary("s-2", False)]))
+    |> step(ui.Select("s-1"))
+    |> step(ui.UserEcho("hi", None))
+    |> step(ui.Archived("s-1", True))
+  model.selected |> should.equal(None)
+  model.log |> should.equal([])
+  model.model_label |> should.equal("no session selected")
+  // The post-write refresh (active sessions available) must NOT
+  // auto-select: the empty state is deliberate.
+  let model =
+    step(
+      model,
+      ui.SessionsLoaded([summary("s-1", False), summary("s-2", False)]),
+    )
+  model.selected |> should.equal(None)
+  // An explicit pick re-arms normal selection behaviour.
+  let model = step(model, ui.Select("s-2"))
+  model.selected |> should.equal(Some("s-2"))
+}
+
+/// The New button can be clicked BEFORE the first session list arrives
+/// (the sidebar renders immediately on a fresh connection). The hand-opened
+/// panel must mark the no-selection state as deliberate, or the arriving
+/// list auto-selects right over the open panel.
+pub fn new_session_before_first_load_suppresses_autoselect_test() {
+  let model = new_model() |> step(ui.NewSessionToggled)
+  model.create_open |> should.be_true
+  model.selected |> should.equal(None)
+  // The first (or any later) list load must not auto-select over the
+  // hand-opened panel.
+  let model = step(model, ui.SessionsLoaded([summary("s-1", False)]))
+  model.selected |> should.equal(None)
+  model.create_open |> should.be_true
+  // A row pick recovers normally.
+  let model = step(model, ui.Select("s-1"))
+  model.selected |> should.equal(Some("s-1"))
+}
+
+/// Archiving a session that is NOT the open one leaves the selection
+/// alone — the pane keeps showing what the user is reading.
+pub fn archive_of_other_session_keeps_selection_test() {
+  let model =
+    new_model()
+    |> step(ui.SessionsLoaded([summary("s-1", False), summary("s-2", False)]))
+    |> step(ui.Select("s-1"))
+    |> step(ui.Archived("s-2", True))
+  model.selected |> should.equal(Some("s-1"))
+  model.log |> should.equal([])
+}
+
+/// The New-session button enters the same deliberate no-selection state:
+/// the create panel opens AND the open session's view clears, so the
+/// user composes the new session against a blank pane. The panel toggle
+/// still works, and the state holds across refreshes until a row is
+/// picked.
+pub fn new_session_button_clears_selection_test() {
+  let model =
+    new_model()
+    |> step(ui.SessionsLoaded([summary("s-1", False)]))
+    |> step(ui.Select("s-1"))
+    |> step(ui.UserEcho("hi", None))
+    |> step(ui.NewSessionToggled)
+  model.create_open |> should.be_true
+  model.selected |> should.equal(None)
+  model.log |> should.equal([])
+  model.model_label |> should.equal("no session selected")
+  // A refresh (title upgrade from any session) keeps the state: no
+  // auto-select, panel stays open.
+  let model = step(model, ui.SessionsLoaded([summary("s-1", False)]))
+  model.selected |> should.equal(None)
+  model.create_open |> should.be_true
+  // Closing the panel leaves the no-selection state; a row pick recovers.
+  let model = step(model, ui.NewSessionToggled)
+  model.create_open |> should.be_false
+  model.selected |> should.equal(None)
+  let model = step(model, ui.Select("s-1"))
+  model.selected |> should.equal(Some("s-1"))
+}
+
 pub fn sessions_empty_opens_create_panel_test() {
   let model = new_model() |> step(ui.SessionsLoaded([]))
   model.selected |> should.equal(None)
@@ -1225,14 +1333,32 @@ pub fn view_renders_empty_states_test() {
 // ui-polish F5: an empty transcript renders an intentional muted hint, not
 // a blank void; the hint disappears the moment there is anything to show.
 pub fn view_empty_transcript_note_test() {
+  // No session selected (the deliberate no-selection state): the hint
+  // points at the sidebar — the composer is disabled, so a send hint
+  // would invite a failing submit.
   let html = new_model() |> view_string
+  should.be_true(string.contains(
+    html,
+    "No session selected — pick one from the list or create a new one.",
+  ))
+  // With a selection and an empty transcript the hint invites a send.
+  let html =
+    new_model()
+    |> step(ui.SessionsLoaded([summary("s-1", False)]))
+    |> step(ui.Select("s-1"))
+    |> view_string
   should.be_true(string.contains(
     html,
     "Send a message to start — tool calls and reasoning will render here",
   ))
   // A committed user line displaces the hint (streaming or committed
   // alike: both make log_lines non-empty).
-  let html = new_model() |> step(ui.UserEcho("hi", None)) |> view_string
+  let html =
+    new_model()
+    |> step(ui.SessionsLoaded([summary("s-1", False)]))
+    |> step(ui.Select("s-1"))
+    |> step(ui.UserEcho("hi", None))
+    |> view_string
   should.be_false(string.contains(html, "Send a message to start"))
 }
 
@@ -1439,8 +1565,11 @@ pub fn archived_selection_survives_refresh_test() {
     new_model()
     |> step(ui.Select("s-1"))
     |> step(ui.SessionsLoaded([archived]))
-  // Archiving the open session keeps it open (the user sees what they
-  // archived); only a real disappearance ends it.
+  // A selection POINTING at an archived session (e.g. the user re-opened
+  // the row via Show archived) survives a refresh — only a real
+  // disappearance ends it. (Archiving the open session is different: the
+  // `Archived` arm clears the selection itself — see
+  // archive_of_selection_clears_selection_test.)
   model.selected |> should.equal(Some("s-1"))
   model.model_label |> should.equal("connecting…")
 }
@@ -2009,10 +2138,12 @@ pub fn view_jump_latest_button_test() {
   // bottom; Lustre SSR sorts attributes), no event handler, and none of
   // the old repo's inline `onclick` script. It is a sibling AFTER #log,
   // inside #log-wrap, so it never lands in the log's aria-live region
-  // (with no session selected the log renders the F5 empty-state note
-  // inside the centered `.conversation` column F6 puts in #log, which is
-  // why the log is no longer bare).
+  // (with a session selected and an empty transcript the log renders the
+  // F5 empty-state note inside the centered `.conversation` column F6
+  // puts in #log, which is why the log is no longer bare).
   new_model()
+  |> step(ui.SessionsLoaded([summary("s-1", False)]))
+  |> step(ui.Select("s-1"))
   |> view_string
   |> should_contain(
     "<div id=\"log-wrap\"><div aria-live=\"polite\" id=\"log\">"
