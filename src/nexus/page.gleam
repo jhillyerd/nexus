@@ -710,7 +710,7 @@ details.turn.reasoning.live > summary { color: color-mix(in srgb, currentColor 8
    change: a hover border would out-rank the state tints below (same id
    count, more classes) and the running/completed/failed state would
    vanish whenever the user pointed at the chip. */
-#app .turn.tool:hover:not(:disabled), #app .turn.tool:focus-visible { opacity: 1;
+#app .turn.tool:hover:not(:disabled), #app .turn.tool:focus-visible {
   box-shadow: 0 0 0 1px color-mix(in srgb, currentColor 30%, transparent); }
 .tool-meta { display: flex; align-items: baseline; gap: .5rem; min-width: 0; flex-wrap: wrap; }
 .tool-name { overflow-wrap: anywhere; }
