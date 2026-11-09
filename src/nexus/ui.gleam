@@ -214,6 +214,13 @@ pub type Model {
     /// list that later becomes empty (e.g. external deletes + reconnect
     /// refresh) never hijacks a session in progress back into settings.
     providers_seen: Bool,
+    /// Set by the deliberate no-selection entry points (archiving the
+    /// open session, the New-session button): the loaded list must not
+    /// auto-select a replacement — an empty selection is a real state,
+    /// not a gap to paper over. Cleared whenever a selection exists or
+    /// lands (auto-select or `Select`), so the boot auto-selection and
+    /// the vanished-selection reselect keep working unchanged.
+    suppress_autoselect: Bool,
     aliases: List(String),
     sessions: List(session.SessionSummary),
     selected: Option(String),
@@ -483,6 +490,7 @@ pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
       settings: ui_settings.init(),
       settings_manual: False,
       providers_seen: False,
+      suppress_autoselect: False,
       aliases: [],
       sessions: [],
       // A reload re-opens the client's last-selected session: the page
@@ -782,27 +790,31 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           }
         _, _ -> next
       }
-      let eff = case next.selected {
-        Some(id) ->
-          case model.selected {
-            Some(prev) if prev == id -> effect.none()
-            // The selection changed under us (boot auto-selection, or the
-            // previous one vanished): a NEW visit — bump the generation
-            // so any stale deliveries cannot ride along. A vanished
-            // session fails the registry lookup harmlessly.
-            Some(prev) -> {
-              let next = Model(..next, visit: next.visit + 1)
-              effect.batch([
-                leave_effect(next, prev),
-                join_effect(next, id),
-              ])
-            }
-            None -> {
-              let next = Model(..next, visit: next.visit + 1)
-              join_effect(next, id)
-            }
-          }
-        None -> effect.none()
+      // The selection changed under us (boot auto-selection, or the
+      // previous one vanished): a NEW visit — bump the generation so any
+      // stale deliveries cannot ride along. A vanished session fails the
+      // registry lookup harmlessly. The bump lands on the RETURNED model:
+      // the join fires carrying `next.visit`, and a delivery only applies
+      // when the model's generation matches — a bump that lives only in
+      // the effect leaves the model one generation behind, deaf to the
+      // whole replay (the blank-chat-on-boot regression from #58).
+      let #(next, eff) = case next.selected, model.selected {
+        Some(id), Some(prev) if prev == id -> #(next, effect.none())
+        Some(id), Some(prev) -> {
+          let next = Model(..next, visit: next.visit + 1)
+          #(
+            next,
+            effect.batch([
+              leave_effect(next, prev),
+              join_effect(next, id),
+            ]),
+          )
+        }
+        Some(id), None -> {
+          let next = Model(..next, visit: next.visit + 1)
+          #(next, join_effect(next, id))
+        }
+        None, _ -> #(next, effect.none())
       }
       #(next, eff)
     }
@@ -841,6 +853,9 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               // The popup belongs to the previous session's log; its
               // ids cannot resolve against the new selection's.
               pop: None,
+              // An explicit pick re-arms the refresh auto-selection
+              // window (see `suppress_autoselect`).
+              suppress_autoselect: False,
             )
           let eff = case model.selected {
             Some(current) ->
@@ -854,10 +869,22 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         }
       }
 
-    NewSessionToggled -> #(
-      Model(..model, create_open: !model.create_open, create_auto: False),
-      effect.none(),
-    )
+    NewSessionToggled -> {
+      let model =
+        Model(..model, create_open: !model.create_open, create_auto: False)
+      // Opening the create panel enters the deliberate no-selection state:
+      // the chat pane goes blank so the user composes a new session
+      // against nothing, and a later refresh must not auto-select a
+      // replacement (see `deselect`). Closing it just closes the panel —
+      // the no-selection state stays until a row is picked.
+      case model.create_open, model.selected {
+        True, Some(current) -> {
+          let next = deselect(model, "no session selected")
+          #(next, leave_effect(model, current))
+        }
+        _, _ -> #(model, effect.none())
+      }
+    }
 
     PickerChanged(alias) -> #(Model(..model, picker: alias), effect.none())
 
@@ -1236,12 +1263,35 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       )
     }
 
-    Archived(id, archived) -> #(
-      model,
-      mutate_effect(model, fn(registry) {
-        session_registry.set_archived(registry, id, archived)
-      }),
-    )
+    Archived(id, archived) -> {
+      // Archiving the OPEN session ends the visit: the selection clears
+      // (the row is soft-hidden, so a kept selection would highlight
+      // nothing while the chat pane keeps showing the archived content —
+      // the ghost-selection bug), the pane goes blank, and the refresh
+      // that the registry write triggers must not auto-select a
+      // replacement (see `deselect`). Archiving any OTHER session — or
+      // restoring — leaves the selection alone.
+      case archived, model.selected {
+        True, Some(current) if current == id -> {
+          let next = deselect(model, "no session selected")
+          #(
+            next,
+            effect.batch([
+              leave_effect(model, current),
+              mutate_effect(next, fn(registry) {
+                session_registry.set_archived(registry, id, archived)
+              }),
+            ]),
+          )
+        }
+        _, _ -> #(
+          model,
+          mutate_effect(model, fn(registry) {
+            session_registry.set_archived(registry, id, archived)
+          }),
+        )
+      }
+    }
 
     DeleteRequested(id) -> #(
       Model(
@@ -1530,11 +1580,39 @@ fn line_result(line: Line) -> Option(String) {
   }
 }
 
+/// Enter the deliberate no-selection state: the chat pane goes blank and
+/// refresh auto-selection stays off until the user picks a row (the same
+/// reset `Select` performs, minus the join — the caller sends a `Leave`
+/// for the session that was selected). Shared by the archive-of-selection
+/// and New-session entry points; `label` feeds the header's fallback.
+fn deselect(model: Model, label: String) -> Model {
+  Model(
+    ..model,
+    selected: None,
+    visit: model.visit + 1,
+    log: [],
+    flushed: [],
+    bubble: None,
+    bubble_hidden: True,
+    thinking: None,
+    streaming: False,
+    pending: [],
+    loop: None,
+    guard: False,
+    turn_base: 0,
+    model_label: label,
+    pop: None,
+    suppress_autoselect: True,
+  )
+}
+
 /// Apply the M2 refresh rules to the loaded session list: drop a vanished
-/// selection, auto-select the first ACTIVE (non-archived) session, and show
+/// selection, auto-select the first ACTIVE (non-archived) session — unless
+/// the no-selection state is deliberate (`suppress_autoselect`) — and show
 /// the create panel only when there is nothing to select. An archived
-/// selection stays selected (the chat pane keeps showing what the user just
-/// archived) but never auto-selects.
+/// selection stays selected (the chat pane keeps showing what the user
+/// just archived, and a deliberately re-opened archived row survives a
+/// refresh) but never auto-selects.
 fn after_sessions(
   model: Model,
   summaries: List(session.SessionSummary),
@@ -1548,19 +1626,27 @@ fn after_sessions(
       }
     None -> None
   }
-  let selected = case selected, active {
-    Some(id), _ -> Some(id)
-    None, [first, ..] -> Some(first.id)
-    None, [] -> None
+  let selected = case selected, active, model.suppress_autoselect {
+    Some(id), _, _ -> Some(id)
+    None, [first, ..], False -> Some(first.id)
+    None, _, _ -> None
   }
   let ended = option.is_some(model.selected) && option.is_none(selected)
   Model(
     ..model,
     sessions: summaries,
     selected: selected,
+    // A landed selection re-arms the auto-selection window (the next
+      // deliberate deselect must suppress again); a deliberate no-selection
+      // state keeps the suppression across refreshes.
+      suppress_autoselect: option.is_none(selected) && model.suppress_autoselect,
     create_open: case active, selected {
       [], _ -> True
-      _, None -> False
+      // No selection with sessions available is now a real state (the
+      // deliberate no-selection mode), not a gap: keep the panel as the
+      // user left it — closed after an archive-deselect, open when the
+      // New-session button opened it alongside the deselect.
+      _, None -> model.create_open
       // A panel auto-opened by an (empty-at-boot) session list closes
       // again as soon as there is something to select; one the user opened
       // by hand stays open.
@@ -2566,12 +2652,18 @@ fn log_lines(model: Model) -> List(Element(Msg)) {
   case lines {
     // ui-polish F5: an empty transcript used to render a blank void above
     // the composer. Give the fresh-session state an intentional muted
-    // hint — a Lustre text node, like every word this UI renders.
+    // hint — a Lustre text node, like every word this UI renders. With no
+    // session selected (the deliberate no-selection state) the composer
+    // is disabled, so the hint points at the sidebar instead of a send
+    // that would fail.
     [] -> [
       html.div([attr.class("note")], [
-        html.text(
-          "Send a message to start — tool calls and reasoning will render here",
-        ),
+        html.text(case model.selected {
+          Some(_) ->
+            "Send a message to start — tool calls and reasoning will render here"
+          None ->
+            "No session selected — pick one from the list or create a new one."
+        }),
       ]),
     ]
     _ -> lines
