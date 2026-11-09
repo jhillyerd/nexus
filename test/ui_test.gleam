@@ -147,6 +147,24 @@ pub fn archive_of_selection_clears_selection_test() {
   model.selected |> should.equal(Some("s-2"))
 }
 
+/// The New button can be clicked BEFORE the first session list arrives
+/// (the sidebar renders immediately on a fresh connection). The hand-opened
+/// panel must mark the no-selection state as deliberate, or the arriving
+/// list auto-selects right over the open panel.
+pub fn new_session_before_first_load_suppresses_autoselect_test() {
+  let model = new_model() |> step(ui.NewSessionToggled)
+  model.create_open |> should.be_true
+  model.selected |> should.equal(None)
+  // The first (or any later) list load must not auto-select over the
+  // hand-opened panel.
+  let model = step(model, ui.SessionsLoaded([summary("s-1", False)]))
+  model.selected |> should.equal(None)
+  model.create_open |> should.be_true
+  // A row pick recovers normally.
+  let model = step(model, ui.Select("s-1"))
+  model.selected |> should.equal(Some("s-1"))
+}
+
 /// Archiving a session that is NOT the open one leaves the selection
 /// alone — the pane keeps showing what the user is reading.
 pub fn archive_of_other_session_keeps_selection_test() {

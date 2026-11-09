@@ -876,11 +876,19 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       // the chat pane goes blank so the user composes a new session
       // against nothing, and a later refresh must not auto-select a
       // replacement (see `deselect`). Closing it just closes the panel —
-      // the no-selection state stays until a row is picked.
+      // the no-selection state stays until a row is picked. The button can
+      // also be clicked BEFORE the first session list arrives (the sidebar
+      // renders immediately on a fresh connection): the deliberate mark
+      // must land then too, or the arriving list auto-selects right over
+      // the open panel.
       case model.create_open, model.selected {
         True, Some(current) -> {
           let next = deselect(model, "no session selected")
           #(next, leave_effect(model, current))
+        }
+        True, None -> {
+          let next = Model(..model, suppress_autoselect: True)
+          #(next, effect.none())
         }
         _, _ -> #(model, effect.none())
       }
@@ -1637,9 +1645,12 @@ fn after_sessions(
     sessions: summaries,
     selected: selected,
     // A landed selection re-arms the auto-selection window (the next
-      // deliberate deselect must suppress again); a deliberate no-selection
-      // state keeps the suppression across refreshes.
-      suppress_autoselect: option.is_none(selected) && model.suppress_autoselect,
+    // deliberate deselect must suppress again); a deliberate no-selection
+    // state keeps the suppression across refreshes.
+    suppress_autoselect: case selected {
+      Some(_) -> False
+      None -> model.suppress_autoselect
+    },
     create_open: case active, selected {
       [], _ -> True
       // No selection with sessions available is now a real state (the
