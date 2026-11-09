@@ -20,6 +20,7 @@ import nexus/provider
 import nexus/provider_registry
 import nexus/session
 import nexus/session_registry
+import nexus/store
 import nexus/timing
 import nexus/transcript
 import nexus/ui
@@ -2370,6 +2371,119 @@ pub fn meta_updated_refreshes_sidebar_test() {
   should.be_false(string.contains(seen, "EVENT-PAYLOAD"))
 }
 
+/// A send into a previous-day conversation must move its sidebar row up
+/// to Today the MOMENT the message lands — not when the reply finishes.
+/// The session bumps its activity at the send itself (the user message
+/// commits on append, even if the turn later fails), and the send path
+/// refreshes the sidebar from the registry, so the row re-buckets while
+/// the turn is still running. Pinned over a REAL runtime and registries:
+/// the turn's runner parks until long after the test ends, so no
+/// TurnDone refresh can produce the observed signal — with the refresh
+/// gone from the send path, the row sits under Yesterday until the
+/// (never-arriving) reply.
+pub fn send_moves_previous_day_row_into_today_immediately_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  store_mock.ensure_fixture_provider(seam)
+
+  // Seed the previous-day conversation through the store seam: the row
+  // first, then one committed user message — so the send below is NOT
+  // the first message (the auto-title branch always refreshed; this pins
+  // the path that did not) — then age the row back to yesterday (Commit
+  // stamps recency with the wall clock).
+  let yesterday = timing.wall_now_s() - 90_000
+  let assert Ok(Nil) =
+    seam.insert_session(
+      store.StoredSummary(
+        id: "s-old",
+        provider_id: store_mock.fixture_provider_id,
+        title: "Resumed chat",
+        title_source: session.ManualTitle,
+        model: "alias-1",
+        pinned: False,
+        archived: False,
+        tags: [],
+        tags_manual: [],
+        tags_source: session.AutoTags,
+        created_at: yesterday,
+        last_active_at: yesterday,
+        message_count: 1,
+      ),
+      "test system prompt",
+    )
+  seam.commit(
+    "s-old",
+    transcript.new("alias-1", "test system prompt")
+      |> transcript.append_user("yesterday's question"),
+  )
+  store_mock.set_last_active(mock, "s-old", yesterday)
+
+  // Real registries over the offline seams — the refresh effect calls
+  // both, so a dead subject would crash the runtime's actor. The turn
+  // runner parks on its cancel subject: the reply never finishes here.
+  let assert Ok(started_providers) =
+    provider_registry.start_with_model_fetcher(
+      test_config(),
+      seam,
+      process.new_name("nexus_ui_providers_row"),
+      fn(_endpoint) { Error(openai.Transport("offline test")) },
+    )
+  let providers = started_providers.data
+  let factory_name = process.new_name("nexus_ui_factory_row")
+  let assert Ok(_factory) =
+    factory_supervisor.start(session_registry.factory_builder(factory_name))
+  let assert Ok(started_registry) =
+    session_registry.start_with_runner(
+      test_config(),
+      factory_supervisor.get_by_name(factory_name),
+      process.new_name("nexus_ui_registry_row"),
+      seam,
+      parked_runner,
+      fn(_endpoint, _tr, _cancel, _allow_pass) {
+        Error("no utility call in this test")
+      },
+      // The corpus seam: never asked here (the fake runner refuses), pure
+      // so the boot stays offline.
+      fn() { [] },
+      fixture_resolver(),
+    )
+  let registry = started_registry.data
+
+  // A today session, so the Today bucket exists before the send: the old
+  // row must move INTO it, jumping above it by recency.
+  let assert Ok(_today) =
+    session_registry.create(registry, store_mock.fixture_provider_id, "alias-1")
+
+  // The connection re-opens the previous-day session (the /ws route's
+  // persisted selection).
+  let assert Ok(runtime) =
+    lustre.start_server_component(
+      ui_runtime.app(),
+      ui.Flags(registry: registry, providers: providers, session: Some("s-old")),
+    )
+  let client = process.new_subject()
+  server_component.register_subject(client)
+  |> lustre.send(to: runtime)
+
+  // The connect cascade settles with the old row under Yesterday — its
+  // subtitle age reads "1d".
+  let before = collect_until_quiet(client, 10, 10, "")
+  should.be_true(string.contains(before, "Yesterday"))
+  should.be_true(string.contains(before, "· 1d"))
+
+  lustre.send(
+    to: runtime,
+    message: lustre.dispatch(ui.SendRequested("hello again")),
+  )
+
+  // While the reply is still parked, the row re-buckets into Today: its
+  // subtitle age flips to "just now" — written by nothing but the
+  // send-time refresh (the user echo proves the cascade itself flowed).
+  let after = collect_until_quiet(client, 10, 10, "")
+  should.be_true(string.contains(after, "hello again"))
+  should.be_true(string.contains(after, "· just now"))
+}
+
 /// Regression (bogus "no provider configured" note): the connect-time
 /// alias effect used to dispatch `NoProviders` whenever the model had no
 /// *selected* provider — always true before the first provider load
@@ -2446,6 +2560,18 @@ fn unused_turn_runner(
   _on_event,
 ) -> session.TurnOutcome {
   session.StreamErrored("no turn expected in this test")
+}
+
+/// Parks on the session's cancel subject until long after any test ends —
+/// the stand-in for a reply that is still streaming. Whatever a test
+/// observes while a turn runs this runner cannot have come from the
+/// turn's own commit.
+fn parked_runner(_endpoint, tr, cancel, _on_event) -> session.TurnOutcome {
+  let selector =
+    process.new_selector()
+    |> process.select_map(cancel, fn(_) { Nil })
+  let _ = process.selector_receive(selector, 60_000)
+  session.StreamStopped(tr)
 }
 
 /// Emits one distinctive token delta then completes. The stream the

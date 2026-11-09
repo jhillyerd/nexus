@@ -1703,14 +1703,19 @@ fn send_effect(model: Model, text: String) -> Effect(Msg) {
                     session_id,
                     session_registry.title_from_first_message(text),
                   )
-                // Refresh so the new title lands in the sidebar at once;
-                // the turn's own events (and TurnDone's refresh) follow.
-                dispatch(
-                  SessionsLoaded(session_registry.list_sessions(registry)),
-                )
+                Nil
               }
               _, _ -> Nil
             }
+            // Refresh on EVERY send, not just the first: the session
+            // bumps its activity at the send itself (the user message
+            // commits on append, even if the turn later fails), so a
+            // previous-day conversation re-buckets to Today and jumps to
+            // the top the moment the message lands. Waiting for the
+            // reply's TurnDone refresh left the row under Yesterday for
+            // the whole turn. The first-message case also lands the new
+            // title here; the turn's own events follow.
+            dispatch(SessionsLoaded(session_registry.list_sessions(registry)))
             dispatch(SendAccepted)
           }
           session.Busy -> dispatch(SendRejected("busy"))
