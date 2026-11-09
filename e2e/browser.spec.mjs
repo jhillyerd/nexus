@@ -935,30 +935,45 @@ async function main() {
     });
 
     // -- 6. http_fetch tool loop ----------------------------------------------
-    await test("tools: http_fetch card renders args, result, and status", async () => {
+    await test("tools: http_fetch chip opens a popup with args, result, and status", async () => {
       await sendAndWaitIdle(
         page,
         `case:fetch fetch http://127.0.0.1:${services.docPort}/doc.json`,
       );
-      const card = page.locator(".turn.tool[data-call-id]");
-      await card.first().waitFor({ timeout: 30_000 });
-      const info = await card.first().evaluate((el) => ({
+      const chip = page.locator(".turn.tool[data-call-id]");
+      await chip.first().waitFor({ timeout: 30_000 });
+      // The chip itself is the popup opener: one compact button carrying
+      // the tool name, state tint, and an aria-label (never color-only).
+      const chipInfo = await chip.first().evaluate((el) => ({
         tool: el.getAttribute("data-tool"),
-        status: el.querySelector(".tool-status").textContent,
-        args: el.querySelector(".tool-args").textContent,
-        result: el.querySelector(".tool-result")?.textContent ?? null,
-        open: el.open,
+        label: el.getAttribute("aria-label"),
+        done: el.classList.contains("done"),
+        text: el.textContent,
       }));
-      eq(info.tool, "http_fetch", "tool name");
+      eq(chipInfo.tool, "http_fetch", "tool name");
+      eq(chipInfo.done, true, "terminal tint class");
+      assert(chipInfo.label.includes("completed"), `aria status: ${chipInfo.label}`);
+      eq(chipInfo.text.trim(), "http_fetch", "chip is the name only — no inline preview");
+      // Clicking the chip opens the full-call popup.
+      await chip.first().click();
+      const pop = page.locator("dialog[open] article.tool-pop");
+      await pop.waitFor({ timeout: 10_000 });
+      const info = await pop.evaluate((el) => ({
+        status: el.querySelector(".tool-status").textContent,
+        sections: [...el.querySelectorAll("h3")].map((h) => h.textContent),
+        pres: [...el.querySelectorAll("pre")].map((p) => p.textContent),
+      }));
       eq(info.status, "completed", "terminal status");
-      // Completed cards collapse like committed reasoning blocks.
-      assert(!info.open, `completed card collapsed: ${JSON.stringify(info)}`);
-      assert(info.args.includes(`/doc.json`), `argument preview: ${info.args}`);
-      assert(info.result.includes("nexus-e2e-doc"), `result preview: ${info.result}`);
-      assert(info.result.includes("<script>alert"), "result preview shows markup as text");
+      assert(info.sections.includes("Arguments"), `sections: ${info.sections}`);
+      const args = info.pres[0];
+      const result = info.pres[info.pres.length - 1];
+      assert(args.includes(`/doc.json`), `full arguments: ${args}`);
+      assert(result.includes("nexus-e2e-doc"), `full result: ${result}`);
+      assert(result.includes("<script>alert"), "popup shows markup as text");
       // Inertness: the document keeps exactly its two static scripts (the
       // runtime module and the connection indicator), and the component's
-      // shadow root — where rendered tool output lives — has none.
+      // shadow root — where rendered tool output lives, popup included —
+      // has none.
       const scripts = await page.evaluate(() => ({
         document: document.querySelectorAll("script").length,
         shadow: document
@@ -967,14 +982,22 @@ async function main() {
       }));
       eq(scripts.document, 2, "static scripts only");
       eq(scripts.shadow, 0, "no scripts inside the component view");
+      // Close the popup by clicking OUTSIDE the card — the backdrop
+      // catcher dismisses it (the ✕ button path is covered in the
+      // web_search test below). The fixed overlay must not block later
+      // tests, so wait for it to be gone.
+      await page.mouse.click(10, 10);
+      await poll(
+        () => page.locator("dialog[open]").count().then((c) => c === 0),
+        { timeout: 10_000, message: "popup dismissed by outside click" },
+      );
       const finalText = await page.$$eval(".turn.assistant", (els) => els.map((e) => e.textContent));
       assert(finalText.some((t) => t.includes("Fetch complete")), `final answer: ${finalText}`);
-      // Auto-follow must survive the transition this turn just exercised:
-      // bubble -> tool chip -> bubble shrinks #log twice (the thinking
-      // chip collapses at commit, the tool card collapses on completion),
-      // and each shrink clamps scrollTop downward. A drag-detector that
-      // reads that clamp as a user gesture unpins and following dies for
-      // the rest of the turn.
+      // Auto-follow must survive the transitions this turn just exercised:
+      // bubble -> tool chip -> bubble changes #log's height (the thinking
+      // chip collapses at commit), and each shrink clamps scrollTop
+      // downward. A drag-detector that reads that clamp as a user gesture
+      // unpins and following dies for the rest of the turn.
       //
       // The distance-from-bottom check is only meaningful when #log
       // actually overflows — with a short transcript fromBottom reads ~0
@@ -1011,16 +1034,20 @@ async function main() {
     });
 
     // -- 7. web_search tool loop -----------------------------------------------
-    await test("tools: web_search card completes with stub result", async () => {
+    await test("tools: web_search chip completes with stub result", async () => {
       await sendAndWaitIdle(page, "case:search look it up");
-      const card = page.locator(".turn.tool[data-tool='web_search']");
-      await card.first().waitFor({ timeout: 30_000 });
-      await page
-        .locator("details.turn.tool.done[data-tool='web_search']")
-        .first()
-        .waitFor({ timeout: 30_000 });
-      const result = await card.first().locator(".tool-result").textContent();
+      const chip = page.locator(".turn.tool.done[data-tool='web_search']");
+      await chip.first().waitFor({ timeout: 30_000 });
+      await chip.first().click();
+      const pop = page.locator("dialog[open] article.tool-pop");
+      await pop.waitFor({ timeout: 10_000 });
+      const result = await pop.locator("pre").last().textContent();
       assert(result.includes("nexus-e2e stub title"), `searxng stub result: ${result}`);
+      await pop.locator("button.close").click();
+      await poll(
+        () => page.locator("dialog[open]").count().then((c) => c === 0),
+        { timeout: 10_000, message: "popup closed" },
+      );
     });
 
     // -- 8. loop chip appeared during tool turns -------------------------------
@@ -1043,27 +1070,35 @@ async function main() {
     });
 
     // -- 9. reconnect / replay ---------------------------------------------------
-    await test("reconnect: reload replays full tool history as cards", async () => {
+    await test("reconnect: reload replays full tool history as chips", async () => {
       await page.reload();
       await connected(page);
       await page.waitForSelector(".turn.tool[data-call-id]", { timeout: 30_000 });
-      const cards = await page.$$eval(".turn.tool[data-call-id]", (els) =>
+      const chips = await page.$$eval(".turn.tool[data-call-id]", (els) =>
         els.map((el) => ({
           id: el.getAttribute("data-call-id"),
           tool: el.getAttribute("data-tool"),
-          status: el.querySelector(".tool-status").textContent,
-          hasResult: Boolean(el.querySelector(".tool-result")),
-          open: el.open,
+          done: el.classList.contains("done"),
+          label: el.getAttribute("aria-label"),
         })),
       );
-      const fetchCards = cards.filter((c) => c.tool === "http_fetch");
-      const searchCards = cards.filter((c) => c.tool === "web_search");
-      assert(fetchCards.length === 2, `two fetch cards replayed: ${JSON.stringify(cards)}`);
-      eq(searchCards.length, 1, "one search card replayed");
-      assert(cards.every((c) => c.status === "completed" && c.hasResult), "all replayed cards completed with results");
-      // Replay renders completed cards collapsed, like reasoning on reload.
-      assert(cards.every((c) => !c.open), `replayed cards collapsed: ${JSON.stringify(cards)}`);
-      assert(cards.every((c) => c.id.startsWith("call_")), "stable call ids preserved");
+      const fetchChips = chips.filter((c) => c.tool === "http_fetch");
+      const searchChips = chips.filter((c) => c.tool === "web_search");
+      assert(fetchChips.length === 2, `two fetch chips replayed: ${JSON.stringify(chips)}`);
+      eq(searchChips.length, 1, "one search chip replayed");
+      assert(chips.every((c) => c.done && c.label.includes("completed")), "all replayed chips completed");
+      assert(chips.every((c) => c.id.startsWith("call_")), "stable call ids preserved");
+      // A replayed chip still opens its popup with the result attached.
+      await page.locator(".turn.tool.done[data-tool='web_search']").first().click();
+      const pop = page.locator("dialog[open] article.tool-pop");
+      await pop.waitFor({ timeout: 10_000 });
+      const result = await pop.locator("pre").last().textContent();
+      assert(result.includes("nexus-e2e stub title"), `replayed result in popup: ${result}`);
+      await pop.locator("button.close").click();
+      await poll(
+        () => page.locator("dialog[open]").count().then((c) => c === 0),
+        { timeout: 10_000, message: "popup closed" },
+      );
       // Tool events must never render as model text.
       const assistantText = await page.$$eval(".turn.assistant", (els) => els.map((e) => e.textContent));
       assert(
@@ -1088,38 +1123,46 @@ async function main() {
         `case:fetchslow fetch http://127.0.0.1:${services.docPort}/doc.json`,
       );
       await page.press("#input", "Enter");
-      const myCards = () =>
+      const myChips = () =>
         page.$$eval(".turn.tool[data-call-id]", (els, before) =>
           els
             .slice(before)
             .map((el) => ({
-              status: el.querySelector(".tool-status")?.textContent,
-              hasResult: Boolean(el.querySelector(".tool-result")),
+              done: el.classList.contains("done"),
+              label: el.getAttribute("aria-label") ?? "",
             })),
         cardsBefore,
       );
-      // Round 1 done: one completed fetch card, pre-reload.
+      // Round 1 done: one completed fetch chip, pre-reload.
       await poll(
         async () => {
-          const cards = await myCards();
-          return cards.length === 1 && cards[0].status === "completed";
+          const chips = await myChips();
+          return chips.length === 1 && chips[0].done;
         },
-        { timeout: 30_000, interval: 100, message: "round 1 card completed" },
+        { timeout: 30_000, interval: 100, message: "round 1 chip completed" },
       );
       // Reload while the final round holds the stream open. The session
       // re-opens via the route query (page shell persistence).
       await page.reload();
       await connected(page);
       // The finished round replays from the session's in-flight mirror:
-      // same single completed card, with its result attached.
+      // same single completed chip. Its popup carries the result.
       await poll(
         async () => {
-          const cards = await myCards();
-          return (
-            cards.length === 1 && cards[0].status === "completed" && cards[0].hasResult
-          );
+          const chips = await myChips();
+          return chips.length === 1 && chips[0].done;
         },
         { timeout: 30_000, interval: 100, message: "in-flight round replayed after reload" },
+      );
+      await page.locator(".turn.tool[data-call-id]").last().click();
+      const pop = page.locator("dialog[open] article.tool-pop");
+      await pop.waitFor({ timeout: 10_000 });
+      const result = await pop.locator("pre").last().textContent();
+      assert(result.includes("nexus-e2e-doc"), `replayed result in popup: ${result}`);
+      await pop.locator("button.close").click();
+      await poll(
+        () => page.locator("dialog[open]").count().then((c) => c === 0),
+        { timeout: 10_000, message: "popup closed" },
       );
       // The turn was NOT restarted: the held final text lands live and the
       // send re-enables when the same turn finishes.
@@ -1160,10 +1203,10 @@ async function main() {
         noteText.includes("iteration guard: reached max 2 model round-trips"),
         `guard note: ${noteText}`,
       );
-      const cards = await page.$$eval(".turn.tool[data-call-id]", (els) => els.map((el) => ({
-        status: el.querySelector(".tool-status").textContent,
+      const chips = await page.$$eval(".turn.tool[data-call-id]", (els) => els.map((el) => ({
+        label: el.getAttribute("aria-label") ?? "",
       })));
-      assert(cards.length >= 1 && cards.every((c) => c.status === "completed"), `completed rounds kept: ${JSON.stringify(cards)}`);
+      assert(chips.length >= 1 && chips.every((c) => c.label.includes("completed")), `completed rounds kept: ${JSON.stringify(chips)}`);
       const chipHidden = await page.locator("#loop-status").evaluate((el) => el.hidden);
       eq(chipHidden, true, "chip hidden after terminal failure");
     });

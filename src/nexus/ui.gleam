@@ -8,10 +8,10 @@
 //// preview, running/completed/failed status, compact inert result
 //// picker, session sidebar, streaming log with a single in-flight assistant
 //// bubble, **typed tool-call cards** (name, stable call id, argument
-//// preview, running/completed/failed status, compact inert result
-//// preview) rendered as collapsible `<details>` blocks in the same shape
-//// as reasoning: open while the call streams/runs, collapsed to a single
-//// head line once it completes, loop/iteration status, the model's streamed **reasoning**
+//// preview, running/completed/failed status) rendered as compact
+//// clickable chips — clicking one opens the **full-call popup** (a Pico
+//// `<dialog>` carrying the entire argument and result text; codemode
+//// scripts render decoded, not as escaped JSON), loop/iteration status, the model's streamed **reasoning**
 //// (chain of thought, as an inert collapsible block whose commit/rollback
 //// mirrors the server's). Log
 //// auto-follow and the jump-to-latest control are browser-only behaviour
@@ -30,6 +30,7 @@ import gleam/dict
 import gleam/dynamic/decode
 import gleam/erlang/process.{type Subject}
 import gleam/int
+import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/string
@@ -107,6 +108,17 @@ pub type PendingCall {
     name: Option(String),
     args: String,
   )
+}
+
+/// Which tool call the full-call popup shows, if any. One popup at a time.
+/// A committed call is keyed by its stable call id (resolved against the
+/// log at render time — a rolled-back turn's id resolves to nothing and
+/// the popup silently disappears); a still-streaming call has no stable id
+/// yet, so it is keyed by its chunk index and resolved against `pending`.
+/// Display-only per-client state: it never touches a request byte.
+pub type Pop {
+  CallPop(id: String)
+  PendingPop(index: Int)
 }
 
 /// Live loop state for the turn in flight (M3 iteration chip).
@@ -284,6 +296,11 @@ pub type Model {
     tags_open: Option(String),
     /// The row whose two-step delete confirmation is armed.
     confirm_delete: Option(String),
+    /// The tool call the full-call popup shows, if any (at most one).
+    /// See `Pop` — cleared on session switch, turn rollback, and when a
+    /// new turn begins (call ids are only unique within a turn); a stale
+    /// entry whose call no longer resolves simply renders nothing.
+    pop: Option(Pop),
     /// Rendered markdown element trees for committed assistant lines,
     /// keyed by exact message text. Populated when a turn commits, never
     /// in the view: the log re-renders on every streamed token, and
@@ -394,6 +411,13 @@ pub type Msg {
   )
   ToolResult(id: String, name: String, ok: Bool, content: String)
   LoopStatus(iteration: Int, max_iterations: Int, phase: String)
+  /// A chip's "view" control was clicked: open the full-call popup for
+  /// that call (see `Pop`). Pure display state — the popup re-resolves
+  /// the call from the log/pending lists on every render, so it live-
+  /// updates while the call streams and vanishes if the turn rolls back.
+  ToolViewOpened(Pop)
+  /// The popup's close control was clicked.
+  ToolViewClosed
   // ---- Session organization ----
   /// The filter input while typing (uncontrolled: text rides the event).
   TagFilterChanged(String)
@@ -491,6 +515,7 @@ pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
       rename_open: None,
       tags_open: None,
       confirm_delete: None,
+      pop: None,
       md_cache: dict.new(),
     )
   #(model, events_effect())
@@ -813,6 +838,9 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               guard: False,
               turn_base: 0,
               model_label: "connecting…",
+              // The popup belongs to the previous session's log; its
+              // ids cannot resolve against the new selection's.
+              pop: None,
             )
           let eff = case model.selected {
             Some(current) ->
@@ -904,6 +932,12 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         // The user message marks the start of a (possibly live) turn: lines
           // beyond this point belong to it and roll back on a failed turn.
           turn_base: list.length(model.log) + 1,
+        // A new turn is beginning: drop any open popup. Call ids are only
+        // unique WITHIN a turn (providers may omit ids, and the loop's
+        // fallback `call_<index>` restarts at 0 every turn), so a popup
+        // left open across turns could silently switch to the new turn's
+        // same-named call. The user can re-click the chip.
+        pop: None,
       ),
       effect.none(),
     )
@@ -1036,8 +1070,25 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         )
       let model = model |> commit_thinking |> commit_bubble(at)
       let pending = drop_pending(model.pending, id, name)
+      // If the popup was open on the call that just assembled, its
+      // resolution source (the pending entry) is about to disappear:
+      // migrate the selection to the stable id so the popup stays live
+      // through execution and completion. Same id-or-name match as
+      // drop_pending above.
+      let pop = case model.pop {
+        Some(PendingPop(index)) ->
+          case
+            list.find(model.pending, fn(call) {
+              call.id == Some(id) || call.name == Some(name)
+            })
+          {
+            Ok(assembled) if assembled.index == index -> Some(CallPop(id))
+            _ -> model.pop
+          }
+        _ -> model.pop
+      }
       #(
-        Model(..model, pending: pending, log: [
+        Model(..model, pending: pending, pop: pop, log: [
           ToolLine(id, name, arguments, ToolRunning, None),
           ..model.log
         ]),
@@ -1076,6 +1127,10 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       )
     }
 
+    ToolViewOpened(pop) -> #(Model(..model, pop: Some(pop)), effect.none())
+
+    ToolViewClosed -> #(Model(..model, pop: None), effect.none())
+
     // Terminal failures: how much of the turn survives depends on what the
     // server committed. After the guard tripped, the final partial text and
     // all completed tool rounds ARE committed (only the trailing,
@@ -1096,6 +1151,9 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             bubble: None,
             bubble_hidden: True,
             thinking: None,
+            // Nothing committed — any popup on this turn's calls now
+            // points at rolled-back lines; drop it with the rest.
+            pop: None,
           )
       }
       #(
@@ -1567,6 +1625,12 @@ fn after_sessions(
       True -> "session ended"
       False -> model.model_label
     },
+    // The popup belongs to the ended session's log — same rule as the
+    // pending flushes above it.
+    pop: case ended {
+      True -> None
+      False -> model.pop
+    },
   )
 }
 
@@ -1896,6 +1960,10 @@ pub fn view(model: Model) -> Element(Msg) {
         ]
       },
     ),
+    // The full-call popup (`tool_pop`) renders at the shell's top level,
+    // not inside the chat pane: it overlays whatever view is up, and its
+    // `<dialog>` is position-fixed anyway. Renders nothing when closed.
+    tool_pop(model),
   ])
 }
 
@@ -2703,89 +2771,211 @@ fn reasoning_block(text: String, live: Bool) -> Element(Msg) {
   )
 }
 
-/// One assistant tool call as a collapsible block in the same shape as
-/// the reasoning block: a native `<details>` whose collapsed summary is
-/// just the tool name — one compact chip, with the call state riding the
-/// border tint — and whose body carries the stable call id, status, and
-/// truncated argument and result previews. Open while the call runs —
-/// the tool-phase twin of the live "thinking…" block — and collapsed
-/// once it completes. No script, and every preview is a Lustre text node,
+/// One assistant tool call as a compact clickable chip: the tool name,
+/// with the call state riding the border tint (and the aria-label, so the
+/// state is never color-only). Clicking anywhere on the chip opens the
+/// full-call popup (`tool_pop`) — the whole point of the chip; the
+/// inline body of the old `<details>` cards (truncated previews, meta
+/// row) moved into the popup, where the text is complete. A real button,
+/// so keyboard activation works too. Every label is a Lustre text node,
 /// so hostile tool output is inert by construction.
 fn tool_card(line: Line) -> Element(Msg) {
-  let assert ToolLine(id, name, arguments, status, result) = line
+  let assert ToolLine(id, name, _arguments, status, _result) = line
   let #(status_label, state_class) = case status {
     ToolRunning -> #("running", "running")
     ToolDone(True) -> #("completed", "done")
     ToolDone(False) -> #("failed", "failed")
   }
-  html.details(
+  html.button(
     [
+      attr.type_("button"),
       attr.class("turn tool " <> state_class),
       attr.data("call-id", id),
       attr.data("tool", name),
-      attr.open(status == ToolRunning),
+      attr.attribute("aria-label", name <> " (" <> status_label <> ")"),
+      attr.title("View full call"),
+      event.on_click(ToolViewOpened(CallPop(id))),
     ],
-    [
-      // The collapsed chip reads as one word: the tool name. Call id and
-      // status live in the body — visible while running (open) and on
-      // expand, hidden once the tinted border tells the story alone. The
-      // aria-label carries the status to assistive tech so the collapsed
-      // state is never color-only.
-      html.summary(
-        [attr.attribute("aria-label", name <> " (" <> status_label <> ")")],
-        [html.strong([attr.class("tool-name")], [html.text(name)])],
-      ),
-      html.div([attr.class("tool-meta")], [
-        html.span([attr.class("call-id")], [html.text(id)]),
-        html.span([attr.class("tool-status")], [html.text(status_label)]),
-      ]),
-      html.div([attr.class("tool-args")], [html.text(preview(arguments, 120))]),
-      case result {
-        Some(content) ->
-          html.div([attr.class("tool-result")], [
-            html.text(preview(content, 200)),
-          ])
-        None -> element.none()
-      },
-    ],
+    [html.strong([attr.class("tool-name")], [html.text(name)])],
   )
 }
 
-/// A tool call still streaming its arguments: name/id when the backend sent
-/// them, plus the arguments accumulated so far. Open, like the live
-/// thinking block — it collapses when the call assembles and completes.
+/// A tool call still streaming its arguments: the same compact clickable
+/// chip as a committed card (the popup resolves it against `pending`, so
+/// an open popup live-updates as fragments arrive), keyed by chunk index
+/// until the backend assigns a stable call id.
 fn pending_card(call: PendingCall) -> Element(Msg) {
   let name = option.unwrap(call.name, "…")
-  let id = option.unwrap(call.id, "…")
   let aria_name = case call.name {
     Some(name) -> name
     None -> "tool call"
   }
-  html.details(
+  html.button(
     [
+      attr.type_("button"),
       attr.class("turn tool running pending"),
       attr.data("call-index", int.to_string(call.index)),
-      attr.open(True),
+      attr.attribute("aria-label", aria_name <> " (running)"),
+      attr.title("View full call"),
+      event.on_click(ToolViewOpened(PendingPop(call.index))),
     ],
-    [
-      html.summary([attr.attribute("aria-label", aria_name <> " (running)")], [
-        html.strong([attr.class("tool-name")], [html.text(name)]),
-      ]),
-      html.div([attr.class("tool-meta")], [
-        html.span([attr.class("call-id")], [html.text(id)]),
-        html.span([attr.class("tool-status")], [html.text("running")]),
-      ]),
-      html.div([attr.class("tool-args")], [html.text(preview(call.args, 120))]),
-    ],
+    [html.strong([attr.class("tool-name")], [html.text(name)])],
   )
 }
 
-/// Compact one-line preview: truncate with an ellipsis. Applied to tool
-/// arguments and results only — never to model or user text.
-fn preview(text: String, max: Int) -> String {
-  case string.length(text) > max {
-    True -> string.slice(text, 0, max) <> "…"
-    False -> text
+/// The full-call popup: a native `<dialog open>` — Pico styles the open
+/// dialog as the centered overlay (backdrop included, no script) and its
+/// `article` child as the card. The call is re-resolved from the log /
+/// pending lists on EVERY render: an open popup live-updates as arguments
+/// stream and the result lands, and a popup whose call no longer resolves
+/// (rolled-back turn, session switch) renders nothing instead of going
+/// stale. The full argument and result strings are Lustre text nodes
+/// inside `<pre>` — inert, like everything else this UI renders; the
+/// popup just doesn't truncate. Codemode calls carry their script as the
+/// JSON string value of a `code` field (`codemode.gleam`'s own schema);
+/// that string is decoded and shown under a "Script" label — the raw
+/// JSON escapes every newline into one unreadable line.
+fn tool_pop(model: Model) -> Element(Msg) {
+  case pop_content(model) {
+    None -> element.none()
+    Some(content) -> {
+      let PopContent(name, id, status_label, state_class, section, body, result) =
+        content
+      html.dialog([attr.open(True)], [
+        // Click-outside dismissal without stopPropagation (a server
+        // component cannot stop an event's bubble): an invisible layer
+        // under the card covers the whole overlay and carries the close
+        // handler. Clicks on the card land on the article, which paints
+        // above the layer; clicks on the dimmed backdrop land on the
+        // layer and close the popup.
+        html.div(
+          [attr.class("tool-pop-hit"), event.on_click(ToolViewClosed)],
+          [],
+        ),
+        html.article([attr.class("tool-pop " <> state_class)], [
+          html.header([], [
+            html.button(
+              [
+                attr.type_("button"),
+                attr.class("close"),
+                attr.aria("label", "Close"),
+                attr.title("Close"),
+                event.on_click(ToolViewClosed),
+              ],
+              // A text glyph, not Pico's background-icon close: the
+              // shell's #app button reset out-ranks Pico's .close rule
+              // and strips the icon (an empty-looking box). The shell
+              // reads as words, so the text glyph is also consistent.
+              [html.text("×")],
+            ),
+            html.h2([], [html.text(name)]),
+          ]),
+          html.div([attr.class("tool-meta")], [
+            html.span([attr.class("call-id")], [html.text(id)]),
+            html.span([attr.class("tool-status")], [html.text(status_label)]),
+          ]),
+          html.h3([], [html.text(section)]),
+          html.pre([], [html.text(body)]),
+          case result {
+            Some(text) ->
+              html.div([], [
+                html.h3([], [html.text("Result")]),
+                html.pre([], [html.text(text)]),
+              ])
+            None -> element.none()
+          },
+        ]),
+      ])
+    }
+  }
+}
+
+/// The popup's resolved content: tool name, call id, status label and
+/// state class, the argument section's label ("Script" when the codemode
+/// `code` field decoded, "Arguments" otherwise), the full argument body,
+/// and the result once available (None while the call is running).
+type PopContent {
+  PopContent(
+    name: String,
+    id: String,
+    status_label: String,
+    state_class: String,
+    section: String,
+    body: String,
+    result: Option(String),
+  )
+}
+
+fn pop_content(model: Model) -> Option(PopContent) {
+  case model.pop {
+    None -> None
+    Some(CallPop(id)) ->
+      case
+        list.find(model.log, fn(line) {
+          case line {
+            ToolLine(line_id, _, _, _, _) -> line_id == id
+            _ -> False
+          }
+        })
+      {
+        Error(_) -> None
+        Ok(ToolLine(id, name, arguments, status, result)) -> {
+          let #(status_label, state_class) = case status {
+            ToolRunning -> #("running", "running")
+            ToolDone(True) -> #("completed", "done")
+            ToolDone(False) -> #("failed", "failed")
+          }
+          let #(section, body) = script_or_arguments(arguments)
+          Some(PopContent(
+            name: name,
+            id: id,
+            status_label: status_label,
+            state_class: state_class,
+            section: section,
+            body: body,
+            result: result,
+          ))
+        }
+        Ok(_) -> None
+      }
+    Some(PendingPop(index)) ->
+      case list.find(model.pending, fn(call) { call.index == index }) {
+        Error(_) -> None
+        Ok(call) -> {
+          let #(section, body) = script_or_arguments(call.args)
+          Some(PopContent(
+            name: option.unwrap(call.name, "…"),
+            id: option.unwrap(call.id, "…"),
+            status_label: "running",
+            state_class: "running",
+            section: section,
+            body: body,
+            result: None,
+          ))
+        }
+      }
+  }
+}
+
+/// Codemode calls (the tool registered in `nexus/codemode`, schema
+/// `{"code": string}`) carry their script as a JSON string value — every
+/// newline escaped, so the raw arguments render as one unreadable line.
+/// Only an object whose SINGLE key is a string `code` decodes as a
+/// script; anything else — extra keys (whose values would otherwise be
+/// silently hidden), a non-string `code`, malformed JSON — renders the
+/// raw argument text under "Arguments", hiding nothing.
+fn script_or_arguments(arguments: String) -> #(String, String) {
+  case json.parse(arguments, decode.dict(decode.string, decode.dynamic)) {
+    Ok(fields) ->
+      case dict.size(fields) == 1, dict.get(fields, "code") {
+        True, Ok(code) ->
+          case decode.run(code, decode.string) {
+            Ok(script) -> #("Script", script)
+            Error(_) -> #("Arguments", arguments)
+          }
+        _, _ -> #("Arguments", arguments)
+      }
+    Error(_) -> #("Arguments", arguments)
   }
 }
 

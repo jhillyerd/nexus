@@ -694,53 +694,104 @@ details.turn.reasoning > summary { cursor: pointer; font-style: italic; opacity:
 details.turn.reasoning.live > summary { color: color-mix(in srgb, currentColor 85%, #b8860b); opacity: 1; }
 .reasoning-body { white-space: pre-wrap; overflow-wrap: anywhere; padding: .3rem 0 .1rem;
   max-height: 40vh; overflow-y: auto; }
-/* Not details-prefixed on purpose: at (0,2,0) this ties with the later
-   .tool.running/.done/.failed border-color rules and loses to them in
-   source order; a details.turn.tool prefix would outrank them (0,2,1) and
-   the state tints would never render. */
-.turn.tool { align-self: flex-start; font-size: .78rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  padding: .45rem .6rem; margin: 0; border: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
-/* Summary is just the tool name (phrasing content, valid inside summary)
-   so the collapsed chip is one short line; the collapse affordance is
-   Pico's trailing summary chevron — no list-style of our own, or the
-   native marker stacks a second arrow ahead of it. Call id and status
-   sit in the .tool-meta body row instead. */
-details.turn.tool > summary { cursor: pointer; }
+/* Tool chips are real buttons (nexus/ui tool_card / pending_card): one
+   compact clickable control — the tool name — whose click opens the
+   full-call dialog. Everything here is #app-prefixed on purpose: the
+   #app button reset above is (1,0,1), so the bare .turn.tool rules of
+   the old details cards lost to it on the id count (font, padding,
+   background AND the state tints below would all have reverted to the
+   reset). Chip look matches the old collapsed card: transparent
+   background, hairline tinted border, mono face, shrink-wrapped. */
+#app .turn.tool { display: inline-block; align-self: flex-start; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: .78rem; line-height: 1.45; padding: .1rem .5rem; margin: 0; border-radius: 10px;
+  border: 1px solid color-mix(in srgb, currentColor 15%, transparent); background: transparent;
+  color: inherit; text-align: left; }
+/* Hover/focus affordance is a box-shadow ring, NOT a border-color
+   change: a hover border would out-rank the state tints below (same id
+   count, more classes) and the running/completed/failed state would
+   vanish whenever the user pointed at the chip. */
+#app .turn.tool:hover:not(:disabled), #app .turn.tool:focus-visible {
+  box-shadow: 0 0 0 1px color-mix(in srgb, currentColor 30%, transparent); }
 .tool-meta { display: flex; align-items: baseline; gap: .5rem; min-width: 0; flex-wrap: wrap; }
 .tool-name { overflow-wrap: anywhere; }
 .call-id { opacity: .55; font-size: .7rem; overflow-wrap: anywhere; }
 .tool-status { margin-left: auto; font-size: .68rem; text-transform: uppercase; letter-spacing: .05em; opacity: .8; }
-.tool.running { border-color: color-mix(in srgb, #b8860b 55%, transparent); }
-.tool.running .tool-status { color: #b8860b; }
-.tool.done { border-color: color-mix(in srgb, #2e9e5b 45%, transparent); }
-.tool.done .tool-status { color: #2e9e5b; }
-.tool.failed { border-color: color-mix(in srgb, #c0392b 55%, transparent); }
-.tool.failed .tool-status { color: #c0392b; }
-.tool-args, .tool-result { white-space: pre-wrap; overflow-wrap: anywhere; opacity: .85; margin: 0; }
-.tool-result { border-top: 1px dashed color-mix(in srgb, currentColor 15%, transparent); padding-top: .25rem; }
+#app .tool.running { border-color: color-mix(in srgb, #b8860b 55%, transparent); }
+#app .tool.running .tool-status { color: #b8860b; }
+#app .tool.done { border-color: color-mix(in srgb, #2e9e5b 45%, transparent); }
+#app .tool.done .tool-status { color: #2e9e5b; }
+#app .tool.failed { border-color: color-mix(in srgb, #c0392b 55%, transparent); }
+#app .tool.failed .tool-status { color: #c0392b; }
+/* Full-call popup (nexus/ui tool_pop): Pico styles <dialog open> as the
+   centered overlay — backdrop blur and dim included, no script — and its
+   article child as the card. These rules only carry the app's chip
+   language into the card (mono face, state tints, tiny-caps section
+   labels), widen it for reading code, and style the chrome: the close X
+   floats in the card's top-right corner (the article is its positioning
+   context), and the header keeps its text clear of it. The backdrop
+   click-catcher (.tool-pop-hit) is styled with the dialog rules below.
+   #app-prefix per the cascade traps. */
+#app .tool-pop { position: relative; max-width: min(58rem, 92vw); font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  border: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
+/* The card is the scroll container (Pico), so the header — and the ✕
+   anchored to it — must stick: top: 0 pins both while long content
+   scrolls underneath, and the opaque card background stops scrolled text
+   showing through. Sticky is a positioned value, so the header becomes
+   the ✕'s anchor (replacing the article-relative position on .tool-pop). */
+#app .tool-pop > header { position: sticky; top: 0; padding-right: 2.4rem; margin: 0;
+  background: var(--pico-card-background-color); }
+#app .tool-pop h3 { margin: .8rem 0 0; font-size: .7rem; font-weight: 600; text-transform: uppercase;
+  letter-spacing: .07em; opacity: .55; }
+/* pre-wrap + anywhere, not Pico's scrolling pre: a codemode script
+   decodes to real newlines but can still carry long lines, and raw JSON
+   arguments are one giant line — wrap them inside the card instead of
+   scrolling horizontally. */
+#app .tool-pop pre { margin: .3rem 0 0; font-size: .78rem; white-space: pre-wrap;
+  overflow-wrap: anywhere; }
+#app .tool-pop .tool-meta { margin-top: .2rem; }
+/* The close X: a text glyph pinned to the card's corner, out of the
+   header's flow (absolute + float-cancelled). Sized ~1.5x a header
+   button label so it reads as a control, not punctuation. The shell's
+   #app button reset out-ranks Pico's .close rule and strips the icon
+   background — the glyph replaces it. */
+#app .tool-pop .close { position: absolute; top: .35rem; right: .55rem; background-image: none;
+  width: auto; height: auto; padding: 0 .3rem; margin: 0; border: none; font-size: 1.4rem;
+  line-height: 1.3; opacity: .55; }
+#app .tool-pop .close:hover, #app .tool-pop .close:focus { opacity: 1; }
+/* The backdrop click-catcher (nexus/ui tool_pop): an invisible inset-0
+   layer inside the dialog, BELOW the card in paint order (later sibling
+   wins, both positioned), carrying the close handler — clicks outside
+   the card hit it, clicks on the card never reach it. */
+#app .tool-pop-hit { position: absolute; inset: 0; }
+#app .tool-pop.running { border-color: color-mix(in srgb, #b8860b 55%, transparent); }
+#app .tool-pop.running .tool-status { color: #b8860b; }
+#app .tool-pop.done { border-color: color-mix(in srgb, #2e9e5b 45%, transparent); }
+#app .tool-pop.done .tool-status { color: #2e9e5b; }
+#app .tool-pop.failed { border-color: color-mix(in srgb, #c0392b 55%, transparent); }
+#app .tool-pop.failed .tool-status { color: #c0392b; }
 /* Collapsed chips flow like spans, not blocks: consecutive collapsible
-   lines (committed reasoning + tool cards) render inside one .chip-row —
-   a wrapping flex line, so each collapsed chip sizes to its label on a
-   shared row instead of stacking a full-width block per chip (which cost
-   a whole row + conversation gap apiece). The row itself takes the full
-   46rem lane (width 100%, capped): flex-basis 100% on an OPENED chip
+   lines (committed reasoning + tool chips) render inside one .chip-row —
+   a wrapping flex line, so each chip sizes to its label on a shared row
+   instead of stacking a full-width block per chip (which cost a whole
+   row + conversation gap apiece). The row itself takes the full 46rem
+   lane (width 100%, capped): flex-basis 100% on an OPENED reasoning chip
    must resolve against a definite width — against a shrink-wrapped row
    the percentage is cyclic during intrinsic sizing and browsers size the
    open chip to its content instead. The row is an invisible wrapper, so
    the definite width costs nothing visually. Expansion is pure CSS off
-   the native [open] attribute: flex-basis 100% wraps an open chip onto
-   its own full-width line, and the per-type rules restore the roomy
-   block padding. Closed chips keep their tint/border identity; only the
-   padding shrinks. Margins are zeroed because Pico gives details AND
-   their summary a 1rem bottom margin each — inside the flex row they
-   don't collapse, so every chip would carry dead space and the row's
-   gap would no longer control vertical spacing. */
+   the native [open] attribute (reasoning only — tool chips click through
+   to the popup instead of expanding): flex-basis 100% wraps an open chip
+   onto its own full-width line, and the per-type rules restore the
+   roomy block padding. Closed chips keep their tint/border identity;
+   only the padding shrinks. Margins are zeroed because Pico gives
+   details AND their summary a 1rem bottom margin each — inside the flex
+   row they don't collapse, so every chip would carry dead space and the
+   row's gap would no longer control vertical spacing. */
 .chip-row { width: 100%; max-width: 46rem; display: flex; flex-wrap: wrap;
   align-items: flex-start; gap: .3rem .5rem; }
-.chip-row > details.turn.reasoning, .chip-row > details.turn.tool { padding: .1rem .5rem; margin: 0; }
+.chip-row > details.turn.reasoning, .chip-row > .turn.tool { padding: .1rem .5rem; margin: 0; }
 .chip-row > details[open] { flex: 1 1 100%; }
 .chip-row > details.turn.reasoning[open] { padding: .35rem .7rem; }
-.chip-row > details.turn.tool[open] { padding: .45rem .6rem; }
 .chip-row > details > summary { margin: 0; }
 #loop-status { padding: .3rem 1rem; font-size: .72rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   border-top: 1px dashed color-mix(in srgb, currentColor 15%, transparent); opacity: .75; }
