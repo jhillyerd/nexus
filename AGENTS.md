@@ -39,8 +39,8 @@ The persistence layer lives in `sql/schema.sql` + `src/nexus/store/sql/`.
 - **Timestamps are `timestamptz`.** Read as `extract(epoch from x)::int8`
   (epoch seconds, the Phase 1 wire format), write via `to_timestamp($1)`
   or server-side `now()`. Never introduce naive `timestamp` columns —
-  `now()` into one shifts by the thread timezone under config drift
-  (measured +9h in the Phase 2 round-trip spike).
+  `now()` into one shifts by the Postgres connection's `TimeZone` under
+  config drift (measured +9h in the Phase 2 round-trip spike).
 - **`thread.message_count` counts messages including the system prompt**
   (Phase 1 `ThreadSummary` semantics) and doubles as the write-behind
   watermark: an assistant message with N tool calls is ONE message but N

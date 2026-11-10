@@ -30,7 +30,7 @@
 ////   wall-clock stamp (`thread_message.created_at`) so the chat log's
 ////   per-message ages survive a reload; on a call run it follows the
 ////   same first-row-only rule as `content`.
-//// - The system prompt is NOT a row: it lives in `threads.system_prompt`
+//// - The system prompt is NOT a row: it lives in `thread.system_prompt`
 ////   and hydration refreezes it via `transcript.new`.
 //// - `seq` is the 0-based index of the row within the thread
 ////   (transcript message index minus one, skipping the system message).
@@ -363,7 +363,7 @@ fn messages_to_rows_with(
           names,
           index + 1,
         )
-        // System prompts are not rows (threads.system_prompt); the other
+        // System prompts are not rows (thread.system_prompt); the other
         // shapes have no constructor in nexus — skipping is losing nothing
         // that can exist.
         _ -> #(rows, names, index + 1)

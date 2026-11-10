@@ -12,7 +12,7 @@
 --
 -- Timestamps are `timestamptz` (the Phase 2 round-trip spike measured a
 -- naive `timestamp` column shifting +9h when `now()` was cast under a
--- non-UTC thread timezone): the app reads them as epoch seconds via
+-- Postgres connection left in a non-UTC `TimeZone`): the app reads them as epoch seconds via
 -- `extract(epoch from x)::int8` (matching Phase 1's wire format) and writes
 -- them through server-side `now()`; explicit params are rare and cast
 -- `$1::timestamptz` from text.

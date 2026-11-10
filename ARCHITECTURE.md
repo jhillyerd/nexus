@@ -1,6 +1,7 @@
 # Architecture — actors, lifetimes, and communication
 
-Nexus is a Gleam-on-BEAM multi-thread chat server: every thread is an actor,
+Nexus is a Gleam-on-BEAM multi-thread chat server: every live thread is an actor
+(dormant persisted threads are store rows until first use),
 browser tabs each get their own UI runtime, and all model I/O happens in
 short-lived worker processes so a crash can never take more than its own turn
 down. This document maps **which processes exist, what each one is scoped to
@@ -34,7 +35,7 @@ flowchart TB
             prov["provider registry"]
             store["store actor"]
         end
-        subgraph persess["per live thread"]
+        subgraph perthread["per live thread"]
             sa["thread actor"]
         end
     end
@@ -335,7 +336,7 @@ utility-attempt bookkeeping.
 |---|---|---|
 | Tool schemas + `tool_choice` envelope | per VM (built once at boot) | identical request envelope across threads keeps prefixes cacheable |
 | `openai.Endpoint` (base URL, key, timeouts) + model | per thread, pinned at create/hydration | a thread only ever exists with its (provider, model) pin in place |
-| System prompt | per thread (refrozen from `threads.system_prompt` on hydration) | part of the immutable prefix |
+| System prompt | per thread (refrozen from `thread.system_prompt` on hydration) | part of the immutable prefix |
 | Request bytes | per prefix — immutable forever (`nexus/transcript.to_request` is the only encode path) | the KV-cache contract |
 | UI runtime + per-client model | per browser connection | tabs never mirror each other; a UI crash costs one socket |
 
