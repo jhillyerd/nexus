@@ -6,7 +6,7 @@
 -- and a manual save racing an in-flight apply is refused here
 -- atomically. Twin of the registry's in-memory UpgradeAutoTitle guard.
 -- Rowcount is the guard outcome.
-update session set title = $1, tags = $3
+update thread set title = $1, tags = $3
 where id = $2
   and title_source = 'auto'
   and tags_source = 'auto'

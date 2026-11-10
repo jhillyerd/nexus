@@ -3,5 +3,5 @@
 -- closes — one statement, so the freeze itself is atomic (all three
 -- fields or nothing; the tags_source flip is what auto_meta_upgrade's
 -- guard reads).
-update session set tags = $1, tags_manual = $1, tags_source = 'manual'
+update thread set tags = $1, tags_manual = $1, tags_source = 'manual'
 where id = $2

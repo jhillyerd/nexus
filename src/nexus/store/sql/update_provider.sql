@@ -5,7 +5,7 @@
 --   true  → envelope := nullif($5, ''::bytea) — a real value replaces
 --           it, the '' sentinel goes keyless (NULL) — and key_version
 --           := $6. (Sentinel for the same reason as insert_provider.)
--- updated_at is server-side now(), like the session metadata writes.
+-- updated_at is server-side now(), like the thread metadata writes.
 update provider set
   name = $2,
   base_url = $3,

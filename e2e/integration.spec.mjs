@@ -13,9 +13,9 @@
 //   3. an http_fetch tool round on the llama.cpp alias against a public URL
 //   4. replay of real tool history after reload
 // and then runs the production cache verification:
-//   5. a multi-turn tool session whose per-turn TTFT/cached-token metrics
+//   5. a multi-turn tool thread whose per-turn TTFT/cached-token metrics
 //      are captured (cold vs warm, PRD gate warm/cold ≤ 0.3)
-//   6. the session's replayed transcript is archived to cache-session.json
+//   6. the thread's replayed transcript is archived to cache-thread.json
 //      for the offline golden prefix test (test/m3_prefix_test.gleam), read
 //      back through the browser UI the Lustre component replays.
 //
@@ -40,14 +40,14 @@ const ENC_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
 const DATABASE_URL = process.env.E2E_DATABASE_URL ?? "postgres://nexus@127.0.0.1:5433/nexus";
 
 /// Reset the shared e2e database so reruns are deterministic: stale
-/// sessions/providers from earlier runs (this suite or the browser one)
+/// threads/providers from earlier runs (this suite or the browser one)
 /// must not leak into list assertions or provider resolution. Requires
 /// `psql` next to the (already mandatory) Postgres.
 function resetDatabase() {
   return new Promise((resolve, reject) => {
     const child = spawn(
       "psql",
-      ["-q", DATABASE_URL, "-c", "truncate session_message, session, provider cascade;"],
+      ["-q", DATABASE_URL, "-c", "truncate thread_message, thread, provider cascade;"],
       { stdio: ["ignore", "pipe", "pipe"] },
     );
     let out = "";
@@ -214,11 +214,11 @@ function startNexus({ port = PORT, systemPrompt = SYSTEM_PROMPT } = {}) {
 }
 
 /// A long, unique, inert preamble: forces the cold turn to prefill ~4k
-/// uncached tokens (the spike-C "cold-session nonce" technique). Without
+/// uncached tokens (the spike-C "cold-thread nonce" technique). Without
 /// it the live server's retained system+tools prefix makes every "cold"
 /// turn partially warm.
-function nonceSystemPrompt(session) {
-  const nonce = `nexus-m3-cache-nonce-${Date.now()}-${session}-${Math.random().toString(36).slice(2, 10)}`;
+function nonceSystemPrompt(thread) {
+  const nonce = `nexus-m3-cache-nonce-${Date.now()}-${thread}-${Math.random().toString(36).slice(2, 10)}`;
   let filler = "";
   for (let i = 0; i < 90; i++) {
     filler += `Audit block ${i}: reference ${nonce} section ${i}. This inert prose exists to grow the prefill; it contains no instructions and no facts about the world. `;
@@ -242,11 +242,11 @@ async function waitHealthyAt(port, timeoutMs = 60_000) {
   throw new Error(`nexus on :${port} never became healthy`);
 }
 
-/// Drive one cache session over the HTTP API (same data the panel shows).
-async function cacheSessionViaApi(port, alias, prompts) {
+/// Drive one cache thread over the HTTP API (same data the panel shows).
+async function cacheThreadViaApi(port, alias, prompts) {
   const base = `http://127.0.0.1:${port}`;
   const headers = { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" };
-  const createRes = await fetch(`${base}/sessions`, {
+  const createRes = await fetch(`${base}/threads`, {
     method: "POST",
     headers,
     body: JSON.stringify({ provider: "bifrost", model: alias }),
@@ -257,24 +257,24 @@ async function cacheSessionViaApi(port, alias, prompts) {
   const created = await createRes.json();
   const id = created.id;
   for (const prompt of prompts) {
-    const res = await fetch(`${base}/sessions/${id}/send`, {
+    const res = await fetch(`${base}/threads/${id}/send`, {
       method: "POST",
       headers,
       body: JSON.stringify({ text: prompt }),
     });
     if (res.status !== 202) throw new Error(`send failed: ${res.status} ${await res.text()}`);
-    // Wait for the turn to finish (session summary says streaming=false).
+    // Wait for the turn to finish (thread summary says streaming=false).
     const deadline = Date.now() + 300_000;
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 700));
-      const summary = (await (await fetch(`${base}/sessions`, { headers })).json()).sessions.find(
+      const summary = (await (await fetch(`${base}/threads`, { headers })).json()).threads.find(
         (s) => s.id === id,
       );
       if (!summary?.streaming) break;
     }
   }
   await new Promise((r) => setTimeout(r, 500));
-  const summary = (await (await fetch(`${base}/sessions`, { headers })).json()).sessions.find(
+  const summary = (await (await fetch(`${base}/threads`, { headers })).json()).threads.find(
     (s) => s.id === id,
   );
   return { id, metrics: summary.metrics.slice().reverse() };
@@ -284,20 +284,20 @@ async function connected() {
   await page.waitForSelector("#status.live", { timeout: 30_000 });
 }
 
-async function createSession(alias) {
+async function createThread(alias) {
   const panelOpen = () => page.locator("#create-panel").evaluate((el) => !el.hidden);
-  if (!(await panelOpen().catch(() => false))) await page.click("#new-session");
+  if (!(await panelOpen().catch(() => false))) await page.click("#new-thread");
   await poll(panelOpen, { timeout: 15_000, message: "create panel open" });
   await page.selectOption("#model-picker", alias);
-  await page.click("#create-session");
+  await page.click("#create-thread");
   await poll(
     async () => {
       const current = await page
-        .locator("#session-list .session-main[aria-current='true']")
+        .locator("#thread-list .thread-main[aria-current='true']")
         .textContent();
       return current?.includes(`${alias} ·`);
     },
-    { timeout: 30_000, message: `session on ${alias} selected` },
+    { timeout: 30_000, message: `thread on ${alias} selected` },
   );
 }
 
@@ -340,7 +340,7 @@ async function main() {
   await seedProvider();
   const nexus = startNexus();
   const cacheCapture = { alias: null, system: null, turns: [], metrics: [], usage: [] };
-  const cacheSessions = [];
+  const cacheThreads = [];
 
   let browser = null;
   let exitCode = 0;
@@ -384,7 +384,7 @@ async function main() {
     });
 
     await test(`tools: web_search round on vLLM (${VLLM_ALIAS}) via real SearxNG`, async () => {
-      await createSession(VLLM_ALIAS);
+      await createThread(VLLM_ALIAS);
       await turn(page,
         "Use the web_search tool to search for 'gleam language release notes', " +
         "then summarise the top result in one sentence.",
@@ -405,7 +405,7 @@ async function main() {
     });
 
     await test(`tools: http_fetch round on llama.cpp (${LLAMACPP_ALIAS})`, async () => {
-      await createSession(LLAMACPP_ALIAS);
+      await createThread(LLAMACPP_ALIAS);
       await turn(
         page,
         `Use the http_fetch tool to fetch ${FETCH_URL} and tell me what project this README describes.`,
@@ -427,7 +427,7 @@ async function main() {
     await test("reconnect: real tool history replays after reload", async () => {
       await page.reload();
       await connected();
-      // The current session is the llama.cpp one: its fetch card must replay.
+      // The current thread is the llama.cpp one: its fetch card must replay.
       await poll(
         () =>
           page
@@ -441,9 +441,9 @@ async function main() {
             .catch(() => false),
         { timeout: 60_000, message: "http_fetch card replayed with result" },
       );
-      // Switch to the vLLM session: its search card must replay there too.
+      // Switch to the vLLM thread: its search card must replay there too.
       await page
-        .locator("#session-list .session-item", { hasText: VLLM_ALIAS })
+        .locator("#thread-list .thread-item", { hasText: VLLM_ALIAS })
         .first()
         .click();
       await poll(
@@ -464,25 +464,25 @@ async function main() {
           hasResult: Boolean(el.querySelector(".tool-result")),
         })),
       );
-      console.log(`  replayed (vLLM session): ${JSON.stringify(replayed)}`);
+      console.log(`  replayed (vLLM thread): ${JSON.stringify(replayed)}`);
     });
 
     // -----------------------------------------------------------------
-    // Production cache verification: multi-turn tool session on the
+    // Production cache verification: multi-turn tool thread on the
     // llama.cpp alias (verified prefix-cache passthrough in spike C).
     // -----------------------------------------------------------------
-    await test("cache: multi-turn tool sessions — warm/cold TTFT medians + cached tokens", async () => {
+    await test("cache: multi-turn tool threads — warm/cold TTFT medians + cached tokens", async () => {
       // Spike-C protocol: each repeat is a FRESH nexus VM whose system
       // prompt carries a unique ~4k-token nonce, so the first turn prefills
       // genuinely uncached tokens; short follow-ups then measure warm TTFT.
       // Medians absorb the llama.cpp node's scheduling variance.
-      const SESSIONS = 3;
+      const THREADS = 3;
       const WARMS = 5;
       const cachePort = PORT + 1;
       const options = await page.$$eval("#model-picker option", (els) => els.map((e) => e.value));
       const cacheAlias = pickAlias(options, [CACHE_ALIAS, "fractal/unsloth/Qwen3.6-35B"], "cache (llama.cpp)");
       cacheCapture.alias = cacheAlias;
-      console.log(`  cache alias: ${cacheAlias} (fresh VM per session)`);
+      console.log(`  cache alias: ${cacheAlias} (fresh VM per thread)`);
 
       const prompts = [
         `Use the http_fetch tool to fetch ${FETCH_URL}, then summarise it in two sentences.`,
@@ -503,16 +503,16 @@ async function main() {
           console.log("  ratio above gate on attempt 1 — one retry after node settle");
           await new Promise((r) => setTimeout(r, 20_000));
         }
-        cacheSessions.length = 0;
+        cacheThreads.length = 0;
         cacheCapture.metrics = [];
         await runCacheMeasurement();
-        report = analyseCache(cacheSessions);
+        report = analyseCache(cacheThreads);
       }
       cacheCapture.cache = report;
       cacheCapture.attempts = attempt;
       console.log(`  cold median=${report.coldMedianMs}ms warm median=${report.warmMedianMs}ms ratio=${report.ratio} (attempt ${attempt})`);
-      assert(report.coldSamples.length === SESSIONS, "cold samples");
-      assert(report.warmSamples.length === SESSIONS * WARMS, "warm samples");
+      assert(report.coldSamples.length === THREADS, "cold samples");
+      assert(report.warmSamples.length === THREADS * WARMS, "warm samples");
       assert(
         report.warmSamples.some((x) => x.cached && x.cached[0] / x.cached[1] >= 0.5),
         "cached/prompt tokens with a majority cache hit on warm turns",
@@ -521,7 +521,7 @@ async function main() {
     });
 
     async function runCacheMeasurement() {
-      const SESSIONS = 3;
+      const THREADS = 3;
       const WARMS = 5;
       const cachePort = PORT + 1;
       const cacheAlias = cacheCapture.alias;
@@ -534,13 +534,13 @@ async function main() {
         "Summarise the README in exactly two sentences.",
       ];
       let lastPrompt = null;
-      for (let session = 1; session <= SESSIONS; session++) {
-        const prompt = nonceSystemPrompt(session);
-        if (session === SESSIONS) lastPrompt = prompt;
+      for (let thread = 1; thread <= THREADS; thread++) {
+        const prompt = nonceSystemPrompt(thread);
+        if (thread === THREADS) lastPrompt = prompt;
         const vm = startNexus({ port: cachePort, systemPrompt: prompt });
         try {
           await waitHealthyAt(cachePort);
-          const { id, metrics } = await cacheSessionViaApi(cachePort, cacheAlias, prompts);
+          const { id, metrics } = await cacheThreadViaApi(cachePort, cacheAlias, prompts);
           const completed = metrics.filter((m) => m.outcome === "completed");
           const ttfts = completed.map((m) => m.ttft_ms);
           const cached = completed.map((m) =>
@@ -548,20 +548,20 @@ async function main() {
               ? null
               : [m.cached_tokens, m.prompt_tokens],
           );
-          console.log(`  session ${session}: ttfts=${JSON.stringify(ttfts)} cached=${JSON.stringify(cached)}`);
-          cacheCapture.metrics.push({ session, samples: metrics });
-          cacheSessions.push({ ttfts, cached });
-          if (session === SESSIONS) {
-            // Archive the last session's transcript for the golden prefix
+          console.log(`  thread ${thread}: ttfts=${JSON.stringify(ttfts)} cached=${JSON.stringify(cached)}`);
+          cacheCapture.metrics.push({ thread, samples: metrics });
+          cacheThreads.push({ ttfts, cached });
+          if (thread === THREADS) {
+            // Archive the last thread's transcript for the golden prefix
             // test: open a second page against this cache instance, pick
-            // the session in the sidebar, and scrape the replay the Lustre
+            // the thread in the sidebar, and scrape the replay the Lustre
             // component renders from stored history.
             const replayPage = await context.newPage();
             try {
               await replayPage.goto(`http://127.0.0.1:${cachePort}/?token=${TOKEN}`);
               await replayPage.waitForSelector("#status.live", { timeout: 30_000 });
               await replayPage
-                .locator(`#session-list .session-row[data-session-id="${id}"] .session-main`)
+                .locator(`#thread-list .thread-row[data-thread-id="${id}"] .thread-main`)
                 .click();
               await waitForTranscriptSettled(replayPage);
               cacheCapture.turns = await scrapeTurns(replayPage);
@@ -587,15 +587,15 @@ async function main() {
     // Offline golden capture: the replayed transcript becomes the fixture
     // for test/m3_prefix_test.gleam (byte-identical prefix re-encode).
     // -----------------------------------------------------------------
-    await test("capture: cache session archived for the golden prefix test", async () => {
+    await test("capture: cache thread archived for the golden prefix test", async () => {
       assert(cacheCapture.turns.length >= 4, `archived turns: ${cacheCapture.turns.length}`);
       assert(cacheCapture.system, "system prompt captured");
       mkdirSync(new URL("./", import.meta.url).pathname, { recursive: true });
       writeFileSync(
-        new URL("./cache-session.json", import.meta.url),
+        new URL("./cache-thread.json", import.meta.url),
         JSON.stringify(cacheCapture, null, 2),
       );
-      console.log(`  wrote e2e/cache-session.json (${cacheCapture.turns.length} turns)`);
+      console.log(`  wrote e2e/cache-thread.json (${cacheCapture.turns.length} turns)`);
     });
   } catch (err) {
     console.error("fatal:", err);
@@ -624,12 +624,12 @@ async function main() {
     return sorted.length ? sorted[Math.floor((sorted.length - 1) / 2)] : null;
   }
 
-  /// Spike-C gate: per fresh session, turn 1 is the cold sample and turns
+  /// Spike-C gate: per fresh thread, turn 1 is the cold sample and turns
   /// 2+ are warm; the PRD gate is median(warm) / median(cold) ≤ 0.3.
-  function analyseCache(sessions) {
+  function analyseCache(threads) {
     const coldSamples = [];
     const warmSamples = [];
-    for (const { ttfts, cached } of sessions) {
+    for (const { ttfts, cached } of threads) {
       const chrono = ttfts.map((ttft, i) => ({ ttft, cached: cached[i] }));
       coldSamples.push(chrono[0]);
       warmSamples.push(...chrono.slice(1));

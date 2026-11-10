@@ -36,7 +36,7 @@ fn unique_integer() -> Int
 
 pub type TurnResult {
   TurnResult(
-    session: Int,
+    thread: Int,
     turn: Int,
     stats: openai.StreamStats,
     prompt_chars: Int,
@@ -90,8 +90,8 @@ fn report_invalid_results(cfg: AuditConfig, results: List(TurnResult)) -> Nil {
     <> case list.append(missing_ttft, without_tokens) {
       [] -> "none"
       [result, ..] ->
-        "session="
-        <> int.to_string(result.session)
+        "thread="
+        <> int.to_string(result.thread)
         <> ",turn="
         <> int.to_string(result.turn)
         <> ",events="
@@ -191,10 +191,10 @@ fn run_csv(cfg: AuditConfig) -> Nil {
 fn collect_results(cfg: AuditConfig) -> List(TurnResult) {
   int.range(1, cfg.repeats + 1, [], list.prepend)
   |> list.reverse
-  |> list.flat_map(fn(session) { run_session(cfg, session) })
+  |> list.flat_map(fn(thread) { run_thread(cfg, thread) })
 }
 
-fn run_session(cfg: AuditConfig, session: Int) -> List(TurnResult) {
+fn run_thread(cfg: AuditConfig, thread: Int) -> List(TurnResult) {
   let ep = endpoint(cfg)
   let nonce = unique_integer()
   let initial = transcript.new(cfg.model, system_prompt(nonce))
@@ -206,8 +206,8 @@ fn run_session(cfg: AuditConfig, session: Int) -> List(TurnResult) {
     let prompt_chars =
       string.length(transcript.request_body(requested, options()))
     io.println(
-      "session="
-      <> int.to_string(session)
+      "thread="
+      <> int.to_string(thread)
       <> " turn="
       <> int.to_string(turn)
       <> " started",
@@ -219,12 +219,12 @@ fn run_session(cfg: AuditConfig, session: Int) -> List(TurnResult) {
     case outcome {
       Ok(stats) -> #(
         transcript.append_assistant(requested, assistant_prompt(turn)),
-        [TurnResult(session, turn, stats, prompt_chars), ..results],
+        [TurnResult(thread, turn, stats, prompt_chars), ..results],
       )
       Error(openai.Non200(status, body)) -> {
         io.println(
-          "session="
-          <> int.to_string(session)
+          "thread="
+          <> int.to_string(thread)
           <> " turn="
           <> int.to_string(turn)
           <> " error=non200 status="
@@ -235,11 +235,11 @@ fn run_session(cfg: AuditConfig, session: Int) -> List(TurnResult) {
         #(requested, results)
       }
       Error(openai.Transport(reason)) -> {
-        report_stream_error(session, turn, "transport", reason)
+        report_stream_error(thread, turn, "transport", reason)
         #(requested, results)
       }
       Error(openai.Decode(reason)) -> {
-        report_stream_error(session, turn, "decode", reason)
+        report_stream_error(thread, turn, "decode", reason)
         #(requested, results)
       }
     }
@@ -248,10 +248,10 @@ fn run_session(cfg: AuditConfig, session: Int) -> List(TurnResult) {
   |> list.reverse
 }
 
-fn report_stream_error(session: Int, turn: Int, kind: String, reason: String) {
+fn report_stream_error(thread: Int, turn: Int, kind: String, reason: String) {
   io.println(
-    "session="
-    <> int.to_string(session)
+    "thread="
+    <> int.to_string(thread)
     <> " turn="
     <> int.to_string(turn)
     <> " error="
@@ -309,7 +309,7 @@ pub fn system_prompt(nonce: Int) -> String {
       "Every conversation turn extends an append-only transcript",
       "The system prompt and prior turns never change after creation",
       "Request encoding follows one deterministic construction path",
-      "No clock values, session metadata, or random IDs enter old turns",
+      "No clock values, thread metadata, or random IDs enter old turns",
       "A cache-friendly agent treats history as an immutable prefix",
       "Each new request may append one deterministic tail turn",
       "Stable field ordering keeps serialized prefixes byte-identical",
@@ -318,7 +318,7 @@ pub fn system_prompt(nonce: Int) -> String {
     ]
     |> string.join(". ")
   let discipline = list.repeat(discipline, 180) |> string.join(". ")
-  "You are the nexus TTFT audit assistant, deterministic by design. Session nonce: "
+  "You are the nexus TTFT audit assistant, deterministic by design. Thread nonce: "
   <> int.to_string(nonce)
   <> ". Cache discipline: "
   <> discipline
@@ -338,13 +338,13 @@ pub fn assistant_prompt(turn: Int) -> String {
 }
 
 pub fn csv_header() -> String {
-  "session,turn,ttft_ms,duration_ms,token_deltas,events_parsed,prompt_tokens,cached_tokens,prompt_tokens_estimated,tokens_per_second"
+  "thread,turn,ttft_ms,duration_ms,token_deltas,events_parsed,prompt_tokens,cached_tokens,prompt_tokens_estimated,tokens_per_second"
 }
 
 pub fn csv_row(result: TurnResult) -> String {
   let #(prompt_tokens, cached_tokens, estimated) = usage_fields(result)
   [
-    int.to_string(result.session),
+    int.to_string(result.thread),
     int.to_string(result.turn),
     option.unwrap(result.stats.ttft_ms, 0) |> int.to_string,
     int.to_string(result.stats.duration_ms),
@@ -386,8 +386,8 @@ fn tokens_per_second(result: TurnResult) -> Float {
 
 fn report_turn(result: TurnResult) -> Nil {
   io.println(
-    "session="
-    <> int.to_string(result.session)
+    "thread="
+    <> int.to_string(result.thread)
     <> " turn="
     <> int.to_string(result.turn)
     <> " ttft_ms="

@@ -25,7 +25,7 @@ an HTTP client or async framework they don't actually need.
 | Transport fallback | own `httpc` FFI + `ssevents` | — | ~100 lines Erlang, zero third-party HTTP deps |
 | Web server | **mist** | 6.0.3 | SSE support built in (`mist.server_sent_events`) |
 | Web framework (non-streaming routes) | wisp | 2.2.2 | No streaming/SSE — bypass for the chat route |
-| Concurrency | gleam_otp actor + supervisor | — | One actor per session, per PRD |
+| Concurrency | gleam_otp actor + supervisor | — | One actor per thread, per PRD |
 | JSON | gleam_json | 3.x | Deterministic encoding — see cache notes |
 | Env config | envoy | — | Bifrost URL, bearer token |
 | Tests | gleeunit (+ birdie optional) | — | Birdie snapshots for request encoding |
@@ -99,7 +99,7 @@ Anthropic / Gemini / Ollama).
 
 - `httpp/sse.event_source(req, timeout, subject)` spawns a managed process that streams the
   response and **sends parsed `Event(event_type, event_id, data)` / `Closed` messages to a Gleam
-  subject**. That's the BEAM-native shape we want: a session actor just receives tokens like any
+  subject**. That's the BEAM-native shape we want: a thread actor just receives tokens like any
   other message, supervision falls out for free.
 - SSE framing handled internally (data/event/id/comment lines, `\n\n` splits). No auto-reconnect —
   which is what we want: a dropped stream is a failed turn, never a silently-resumed one (append-only
@@ -109,7 +109,7 @@ Anthropic / Gemini / Ollama).
 
 Assembly: `glopenai.chat.create_request(... |> with_stream(True))` → `event_source` → for each
 `Event(data: d)` call `glopenai.chat.parse_stream_chunk(d)` → forward text/tool deltas to the
-session actor → `mist` SSE to the browser.
+thread actor → `mist` SSE to the browser.
 
 ### Fallback: stdlib httpc FFI + ssevents
 
@@ -125,7 +125,7 @@ messages. If httpp fights us in spike A, this is the two-evening fallback, not a
 - **mist** v6.0.3 is the server. It has **built-in SSE**: `mist.server_sent_events` +
   `mist.send_event`, with `actor.stop()` closing the stream — exactly the stop-button semantics we
   need, and WebSockets too (the shipped UI uses the WebSocket path).
-- **wisp** v2.2.2 for the boring routes (auth check, session list, model picker) — but it
+- **wisp** v2.2.2 for the boring routes (auth check, thread list, model picker) — but it
   **cannot stream**: [wisp#149](https://github.com/gleam-wisp/wisp/issues/149) is still open and
   lpil explicitly notes wisp lacks SSE/chunked by design pending a story. Pattern: mount mist as
   the server, branch the streaming path (SSE or WebSocket) *before* delegating the rest to
@@ -144,7 +144,7 @@ research that informed the switch lives in git history
 [lustre](https://lustre.hexdocs.pm/lustre/server_component.html) v5 server components run the
 component *on the server*: view patches broadcast to a ~10kb client runtime
 (`lustre-server-component.mjs`) that patches the DOM, and client events flow back in real time.
-The Elm-architecture model lives in our session actor — the UI state and the transcript state are
+The Elm-architecture model lives in our thread actor — the UI state and the transcript state are
 the same process.
 
 This isn't hypothetical either: **nexus-old's chat used exactly this** (lustre 5.6, mist 5, wisp 2)
@@ -158,7 +158,7 @@ and it worked:
   route → `priv/static/lustre-server-component.mjs`) — one wisp static route.
 
 What it buys: typed Gleam views instead of JS string-shuffling; **free multi-client sync** (phone
-+ desktop tabs on one session stay in sync — each connection just registers another subject); the
++ desktop tabs on one thread stay in sync — each connection just registers another subject); the
 stop button is a message to the actor, not DOM plumbing. What it costs: the lustre dependency and
 its "advanced feature" surface, WebSocket instead of plain SSE, per-token server re-render
 (irrelevant at chat scale), markdown needing unsafe-HTML insertion, and API drift to re-verify
@@ -172,8 +172,8 @@ post-MVP cleanup (git history).
 
 ## Rest of the stack (quick justifications)
 
-- **Concurrency**: one `gleam_otp` actor per session holding the transcript; a supervisor restarts
-  crashed sessions clean (`kill -9` acceptance criterion). Telegram adapter later is just another
+- **Concurrency**: one `gleam_otp` actor per thread holding the transcript; a supervisor restarts
+  crashed threads clean (`kill -9` acceptance criterion). Telegram adapter later is just another
   supervised actor.
 - **gleam_json**: deterministic encoding — field order follows construction order, so re-encoding
   an unchanged transcript prefix yields byte-identical output. The KV-cache contract's
@@ -208,5 +208,5 @@ post-MVP cleanup (git history).
 
 Bottom line: nothing here justifies failing M0 on paper — the stack is Gleam 1.15/OTP 28, glopenai
 for the OpenAI wire format, httpp for streaming bytes, mist for streaming to the browser, plain
-actors for sessions. The spikes now verify behavior (timeouts, error paths, cache passthrough),
+actors for threads. The spikes now verify behavior (timeouts, error paths, cache passthrough),
 not whether the pieces exist.

@@ -16,8 +16,8 @@ import nexus/crypto
 import nexus/openai
 import nexus/provider
 import nexus/provider_registry
-import nexus/session
 import nexus/store
+import nexus/thread
 import store_mock
 
 /// Valid base64 of exactly 32 bytes — same fixture value as the other
@@ -103,18 +103,18 @@ fn stored_row(id: String, name: String, envelope: Option(BitArray)) {
   )
 }
 
-fn pinned_session(id: String, provider_id: String) -> store.StoredSummary {
+fn pinned_thread(id: String, provider_id: String) -> store.StoredSummary {
   store.StoredSummary(
     id: id,
     provider_id: provider_id,
     title: "",
-    title_source: session.AutoTitle,
+    title_source: thread.AutoTitle,
     model: "alias-1",
     pinned: False,
     archived: False,
     tags: [],
     tags_manual: [],
-    tags_source: session.AutoTags,
+    tags_source: thread.AutoTags,
     created_at: 1_700_000_000,
     last_active_at: 1_700_000_000,
     message_count: 1,
@@ -475,8 +475,8 @@ pub fn delete_guarded_while_pinned_test() {
         r,
       )
     })
-  // A session pins p1 (the FK story: sessions reference providers).
-  let assert Ok(Nil) = seam.insert_session(pinned_session("s1", "p1"), "sys")
+  // A thread pins p1 (the FK story: threads reference providers).
+  let assert Ok(Nil) = seam.insert_thread(pinned_thread("s1", "p1"), "sys")
 
   call(registry, fn(r) { provider_registry.Delete("p1", r) })
   |> should.equal(Error(provider_registry.StillReferenced))
@@ -484,7 +484,7 @@ pub fn delete_guarded_while_pinned_test() {
   let assert Ok(_) = call(registry, fn(r) { provider_registry.Get("p1", r) })
 
   // Unpinned: delete goes through, and every path forgets the provider.
-  let assert Ok(Nil) = seam.delete_session("s1")
+  let assert Ok(Nil) = seam.delete_thread("s1")
   call(registry, fn(r) { provider_registry.Delete("p1", r) })
   |> should.equal(Ok(Nil))
   store_mock.providers(mock) |> should.equal([])
@@ -497,7 +497,7 @@ pub fn delete_guarded_while_pinned_test() {
   |> should.equal(Error(provider_registry.Unknown))
 }
 
-/// The race the FK covers: a session lands between the registry's
+/// The race the FK covers: a thread lands between the registry's
 /// count pre-check and the delete (think another instance, mid-delete).
 /// The recheck must turn the refused delete into StillReferenced —
 /// not a raw store failure.
@@ -508,7 +508,7 @@ pub fn delete_race_surfaces_still_referenced_test() {
     store.Store(..base, delete_provider: fn(id) {
       // Exactly what the interleaving looks like at the store: the
       // concurrent insert commits, THEN the delete is refused.
-      let assert Ok(Nil) = base.insert_session(pinned_session("s9", id), "sys")
+      let assert Ok(Nil) = base.insert_thread(pinned_thread("s9", id), "sys")
       Error("delete failed: provider still referenced")
     })
   let assert Ok(registry) = start_registry(racing)
@@ -620,7 +620,7 @@ pub fn boot_fails_when_store_unreachable_test() {
 
 /// With the fetch parked mid-flight, the registry must still answer
 /// `Resolve` — the whole point of running ListModels off-loop, since
-/// Resolve sits on the session-create path — and then deliver the
+/// Resolve sits on the thread-create path — and then deliver the
 /// model list once the fetch is released.
 pub fn list_models_fetch_never_blocks_resolve_test() {
   let mock = store_mock.start()

@@ -2,15 +2,15 @@
 //// component. The page carries no client-side application code — just the
 //// prebuilt Lustre client runtime, a `<lustre-server-component>` element
 //// whose `route` points at the WebSocket transport, and four tiny static
-//// scripts (see `indicator_js`, `session_js`, `autoscroll_js`, and
+//// scripts (see `indicator_js`, `thread_js`, `autoscroll_js`, and
 //// `timestamps_js`).
 ////
 //// The bearer token (when auth is on) is echoed into the route's query
 //// string server-side, mirroring the M2 `?token=` convention: the token
 //// never enters JavaScript. The same query string carries the
-//// client-supplied last-selected session back to the server (per-client
-//// runtimes: `session_js` persists it and re-supplies it on connect so a
-//// reload re-opens the same session).
+//// client-supplied last-selected thread back to the server (per-client
+//// runtimes: `thread_js` persists it and re-supplies it on connect so a
+//// reload re-opens the same thread).
 
 import gleam/option.{type Option, None, Some}
 import gleam/string
@@ -65,7 +65,7 @@ pub fn html(token: Option(String)) -> String {
     "\"></lustre-server-component>\n<script>\n",
     indicator_js(),
     "\n",
-    session_js(),
+    thread_js(),
     "\n",
     autoscroll_js(),
     "\n",
@@ -109,46 +109,46 @@ fn indicator_js() -> String {
 }
 
 /// Per-client runtime break: each /ws connection owns its model, so a
-/// reload must tell the fresh runtime which session to re-open. This
+/// reload must tell the fresh runtime which thread to re-open. This
 /// static script is the only client-side keeper of that choice. Storage is
 /// `sessionStorage` — per-tab and reload-surviving, so one tab's selection
 /// never leaks into another tab's restore (a brand-new tab falls back to
 /// the server's auto-selection). Before the runtime module loads (it is
 /// deferred; this classic script runs during parsing) it appends the
-/// stored session to the `route` attribute's query string; once the
+/// stored thread to the `route` attribute's query string; once the
 /// component renders it mirrors the server-rendered
 /// `#layout[data-selected]` back into storage, and on `lustre:close` it
-/// re-syncs the route's `session` parameter with the CURRENT selection so
+/// re-syncs the route's `thread` parameter with the CURRENT selection so
 /// a reconnect without a reload re-opens what this tab is looking at, not
 /// what it opened at load. The script is static, token-free, and never
 /// touches the rendered DOM — auth still rides the query string.
-fn session_js() -> String {
+fn thread_js() -> String {
   "(function () {\n"
   <> "  'use strict';\n"
   <> "  var host = document.querySelector('lustre-server-component');\n"
   <> "  if (!host) return;\n"
   <> "  var read = function () {\n"
-  <> "    try { return sessionStorage.getItem('nexus.session'); } catch (e) { return null; }\n"
+  <> "    try { return sessionStorage.getItem('nexus.thread'); } catch (e) { return null; }\n"
   <> "  };\n"
   <> "  var write = function (id) {\n"
   <> "    try {\n"
-  <> "      if (id) sessionStorage.setItem('nexus.session', id);\n"
-  <> "      else sessionStorage.removeItem('nexus.session');\n"
+  <> "      if (id) sessionStorage.setItem('nexus.thread', id);\n"
+  <> "      else sessionStorage.removeItem('nexus.thread');\n"
   <> "    } catch (e) {}\n"
   <> "  };\n"
   <> "  var currentId = function () {\n"
   <> "    var layout = host.shadowRoot && host.shadowRoot.getElementById('layout');\n"
   <> "    return layout ? (layout.getAttribute('data-selected') || '') : null;\n"
   <> "  };\n"
-  <> "  // Pre-connect: append this tab's last-selected session to the ws\n"
+  <> "  // Pre-connect: append this tab's last-selected thread to the ws\n"
   <> "  // route. The attribute is final before the element upgrades, so\n"
-  <> "  // the runtime connects once, with the session in hand.\n"
+  <> "  // the runtime connects once, with the thread in hand.\n"
   <> "  var stored = read();\n"
   <> "  if (stored) {\n"
   <> "    var route = host.getAttribute('route');\n"
   <> "    if (route) {\n"
   <> "      var url = new URL(route, location.href);\n"
-  <> "      url.searchParams.set('session', stored);\n"
+  <> "      url.searchParams.set('thread', stored);\n"
   <> "      host.setAttribute('route', url.pathname + url.search);\n"
   <> "    }\n"
   <> "  }\n"
@@ -168,10 +168,10 @@ fn session_js() -> String {
   <> "    var route = host.getAttribute('route');\n"
   <> "    if (!route) return;\n"
   <> "    var url = new URL(route, location.href);\n"
-  <> "    var carried = url.searchParams.get('session') || '';\n"
+  <> "    var carried = url.searchParams.get('thread') || '';\n"
   <> "    if (carried === id) return;\n"
-  <> "    if (id) url.searchParams.set('session', id);\n"
-  <> "    else url.searchParams.delete('session');\n"
+  <> "    if (id) url.searchParams.set('thread', id);\n"
+  <> "    else url.searchParams.delete('thread');\n"
   <> "    host.setAttribute('route', url.pathname + url.search);\n"
   <> "  };\n"
   <> "  var watch = function () {\n"
@@ -191,7 +191,7 @@ fn session_js() -> String {
 
 /// Auto-follow for the chat log (`#log`): only the browser knows the
 /// scroll position and the user's scroll intent, so (like the indicator
-/// and session scripts) a static script owns what the server view
+/// and thread scripts) a static script owns what the server view
 /// cannot. While the log sits near its bottom the latest content is kept
 /// in view — every streamed chunk scrolls immediately (`scrollTop =
 /// scrollHeight`, no debounce, no overshoot) with one animation-frame
@@ -203,7 +203,7 @@ fn session_js() -> String {
 /// server renders the inert `#jump-latest` button (`nexus/ui`); this
 /// script mirrors the pin state onto its `hidden` attribute and handles
 /// clicks by delegation on the shadow root, so the press never
-/// round-trips through the server. Opening or switching a session
+/// round-trips through the server. Opening or switching a thread
 /// (`#layout[data-selected]`) or a remount re-opens at the latest
 /// message, following again. The script is static and token-free; auth
 /// still rides the query string.
@@ -266,7 +266,7 @@ fn autoscroll_js() -> String {
   <> "      lastSetHeight = log.scrollHeight;\n"
   <> "    });\n"
   <> "  };\n"
-  <> "  // Forced jumps (open, session switch, button click) re-pin and\n"
+  <> "  // Forced jumps (open, thread switch, button click) re-pin and\n"
   <> "  // reset the moved-position detector: the fresh content's scrollTop\n"
   <> "  // is not comparable to the previous content's last set.\n"
   <> "  var forceBottom = function () {\n"
@@ -334,7 +334,7 @@ fn autoscroll_js() -> String {
   <> "          forceBottom();\n"
   <> "        }\n"
   <> "      });\n"
-  <> "      // A session switch re-renders #log for another conversation:\n"
+  <> "      // A thread switch re-renders #log for another conversation:\n"
   <> "      // open it at the latest message, following again.\n"
   <> "      new MutationObserver(function () {\n"
   <> "        forceBottom();\n"
@@ -521,17 +521,17 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
 .archive-toggle-row { margin-bottom: .6rem; }
 #app .toggle { font-size: .78rem; padding: .28rem .6rem; opacity: .8; }
 #app .toggle.on { opacity: 1; border-color: #3b82f6; color: #3b82f6; }
-.session-list { display: flex; flex-direction: column; gap: .55rem; }
-.session-group { display: flex; flex-direction: column; gap: .3rem; }
+.thread-list { display: flex; flex-direction: column; gap: .55rem; }
+.thread-group { display: flex; flex-direction: column; gap: .3rem; }
 .group-label { font-size: .68rem; text-transform: uppercase; letter-spacing: .07em; opacity: .55;
   margin: .5rem 0 .1rem; }
 .pinned-group .group-label { opacity: .9; }
-.session-row { display: flex; flex-direction: column; gap: .25rem; border: 1px solid transparent;
+.thread-row { display: flex; flex-direction: column; gap: .25rem; border: 1px solid transparent;
   border-radius: 10px; padding: .3rem; }
-.session-row.selected { border-color: #3b82f6; background: color-mix(in srgb, #3b82f6 12%, transparent); }
-.session-main { display: flex; flex-direction: column; gap: .1rem; text-align: left; }
-.session-title { overflow-wrap: anywhere; }
-.session-sub { font-size: .72rem; opacity: .6; overflow-wrap: anywhere; }
+.thread-row.selected { border-color: #3b82f6; background: color-mix(in srgb, #3b82f6 12%, transparent); }
+.thread-main { display: flex; flex-direction: column; gap: .1rem; text-align: left; }
+.thread-title { overflow-wrap: anywhere; }
+.thread-sub { font-size: .72rem; opacity: .6; overflow-wrap: anywhere; }
 .tag-chips { display: flex; flex-wrap: wrap; gap: .25rem; }
 /* Quiet chip (ui-polish F2): no border by default, so a tagged row reads
    as content rather than as five more buttons; the outline returns on
@@ -541,22 +541,22 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
   color-mix(in srgb, currentColor 6%, transparent); }
 #app .tag-chip:hover { border-color: color-mix(in srgb, currentColor 35%, transparent); }
 .row-controls { display: flex; flex-wrap: wrap; gap: .25rem; }
-/* Session-row controls appear on demand (ui-polish F2) — five bordered
+/* Thread-row controls appear on demand (ui-polish F2) — five bordered
    buttons per active row outweighed the title and subtitle, and wrapped
-   to three lines at 390px. Scoped to `.session-row` deliberately:
+   to three lines at 390px. Scoped to `.thread-row` deliberately:
    Settings' provider rows share `.row-controls` and must keep
    Disable/Enable/Edit/Test/Delete visible at all times.
    Keyboard reachability survives `display: none`: the row's own
-   `.session-main` button is the first tab stop inside the row, so
+   `.thread-main` button is the first tab stop inside the row, so
    tabbing to a row matches `:focus-within`, reveals the controls, and
    the next Tab presses step through them in DOM order. `:selected` is
    the always-on case, which is also the touch story — a device with no
    hover still shows the controls for the row you are in. */
-.session-row .row-controls { display: none; }
-.session-row.selected .row-controls,
-.session-row:focus-within .row-controls { display: flex; }
+.thread-row .row-controls { display: none; }
+.thread-row.selected .row-controls,
+.thread-row:focus-within .row-controls { display: flex; }
 @media (hover: hover) {
-  .session-row:hover .row-controls { display: flex; }
+  .thread-row:hover .row-controls { display: flex; }
 }
 #app .ctl { font-size: .7rem; padding: .18rem .5rem; opacity: .75; }
 /* :not(:disabled) keeps the hover brighten from outranking the
@@ -572,9 +572,9 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
 .confirm-delete { display: flex; flex-wrap: wrap; align-items: center; gap: .35rem; font-size: .74rem;
   color: #c0392b; }
 #app .confirm-delete button { font-size: .72rem; padding: .2rem .55rem; }
-.session-item { display: block; width: 100%; text-align: left; overflow-wrap: anywhere; }
-.session-item[aria-current='true'] { border-color: #3b82f6; background: color-mix(in srgb, #3b82f6 16%, transparent); }
-/* ui-polish F4: the panel moved ABOVE the session list in `sidebar()`, so
+.thread-item { display: block; width: 100%; text-align: left; overflow-wrap: anywhere; }
+.thread-item[aria-current='true'] { border-color: #3b82f6; background: color-mix(in srgb, #3b82f6 16%, transparent); }
+/* ui-polish F4: the panel moved ABOVE the thread list in `sidebar()`, so
    its separator is a bottom rule now (it used to sit below the whole list,
    which is why 'New' opened it off-screen). */
 #create-panel { margin-bottom: 1rem; padding-bottom: .8rem; border-bottom: 1px solid
@@ -815,7 +815,7 @@ textarea { flex: 1; resize: none; }
   /* Pico's button defaults are for full-width form CTAs; the shell's
      chrome buttons are inline-sized, self-spaced, and flat. */
   width: auto; margin: 0; }
-button#send, button#create-session { background: var(--pico-primary-background);
+button#send, button#create-thread { background: var(--pico-primary-background);
   border-color: var(--pico-primary-border); color: #fff; }
 #app button:disabled { opacity: .45; cursor: default; }
 @media (max-width: 900px) {
@@ -823,11 +823,11 @@ button#send, button#create-session { background: var(--pico-primary-background);
   #layout.settings-mode { grid-template-rows: minmax(0,1fr); }
   aside { border: 0; border-bottom: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
   /* ui-polish F3(a): stacked, `aside` used to take its natural height, so
-     three sessions pushed the transcript into a ~100px sliver clipped under
+     three threads pushed the transcript into a ~100px sliver clipped under
      the composer. Capping the list at 40dvh keeps the composer on screen and
      gives the transcript the rest; the list scrolls inside `aside` (already
      `overflow-y: auto`). A real collapse toggle/drawer (options b/c) stays
-     parked until this cap proves too tight against a 20+ session list. */
+     parked until this cap proves too tight against a 20+ thread list. */
   aside { max-height: 40dvh; }
   .settings-page { padding: .8rem .8rem 2rem; }
 }

@@ -22,17 +22,17 @@ same requirements, new candidate — write it.
 - No third-party candidate satisfies both halves: hermes-agent is a fine harness but every UI
   option is a compromise (built-in dashboard / Hermes Desktop everywhere, or nesquena's webui
   which is rough and painful to pin).
-- The gap is small: I need sessions + streaming + tools + a UI, not a platform. That's a
+- The gap is small: I need threads + streaming + tools + a UI, not a platform. That's a
   buildable amount of software.
 - BEAM is the right runtime for a harness: supervision means a crashed LLM client or tool run
-  never takes the session store; one process per session is the natural concurrency model;
+  never takes the thread store; one process per thread is the natural concurrency model;
   Telegram long-polling later is just another supervised actor.
 - Honest motivation: I want to learn Gleam. The MVP is sized so that wanting-to-learn is the
   *only* thing at risk if it fails.
 
 ## Hard requirements (inherited, non-negotiable)
 
-1. **Multi-session web UI**, mobile-friendly — the primary surface.
+1. **Multi-thread web UI**, mobile-friendly — the primary surface.
 2. **Prefill/KV-cache preservation** — hard disqualifier if violated (contract below).
 3. **Topology**: deployed as a Nomad job (quick deploys), no GPU at the app; all inference via
    Bifrost (OpenAI-compatible, aliased model names).
@@ -48,9 +48,9 @@ same requirements, new candidate — write it.
 
 **In:**
 
-- Sessions: create / list / resume; in-memory history only (lost on restart — accepted for MVP)
+- Threads: create / list / resume; in-memory history only (lost on restart — accepted for MVP)
 - Chat: send → tokens stream to the browser; stop button
-- Model alias picker sourced from Bifrost `/v1/models`; alias pinned per session
+- Model alias picker sourced from Bifrost `/v1/models`; alias pinned per thread
 - Tool-calling loop with two safe tools: `http_fetch` + `web_search` (Nomad-hosted SearXNG);
   max-iteration guard
 - Per-request metrics: TTFT, prefill hit/miss, token counts — the cache contract stays verified
@@ -67,18 +67,18 @@ Rules enforced in code, not by convention:
 
 1. Transcript is **append-only**. No edits, no reordering, no re-summarization. (MVP: editing
    simply disabled.)
-2. System prompt + tool schema are **frozen at session creation**. Changing either forks a new
-   session.
+2. System prompt + tool schema are **frozen at thread creation**. Changing either forks a new
+   thread.
 3. Volatile context (timestamps, recall results) may only appear **in the newest user turn** —
    never above the tail.
 4. Requests are **stateless but identical**: full history every turn, byte-identical prefix.
    Prefix caching (llama.cpp `cache_prompt`, vLLM APC) does the actual work — the app's only job
    is to never change a byte above the tail. No per-turn IDs or timestamps injected early.
-5. **Session→backend affinity**: Bifrost must route one session to one backend (llama.cpp slot /
+5. **Thread→backend affinity**: Bifrost must route one thread to one backend (llama.cpp slot /
    vLLM node) or hit rates collapse. Verify Bifrost routing; pin client-side if needed.
 6. **Bifrost must pass request bodies through unmodified** between turns — verify in M0.
 
-Acceptance: warm TTFT ≤ 30% of cold TTFT on a 20-turn session. Every request logs prefill
+Acceptance: warm TTFT ≤ 30% of cold TTFT on a 20-turn thread. Every request logs prefill
 hit/miss + TTFT; a warm/cold ratio drifting above the threshold is a bug, not a curiosity.
 
 ## Milestones
@@ -86,8 +86,8 @@ hit/miss + TTFT; a warm/cold ratio drifting above the threshold is a bug, not a 
 | ID | Scope | Timebox |
 |----|-------|---------|
 | M0 | De-risk spikes (see below) — go/no-go gate | ≤ 1 week |
-| M1 | Walking skeleton: one session, web page, streamed replies, clean restart recovery | ≤ 1 week |
-| M2 | Multi-session UI: list/switch, alias picker, stop, metrics panel | 1–2 weeks |
+| M1 | Walking skeleton: one thread, web page, streamed replies, clean restart recovery | ≤ 1 week |
+| M2 | Multi-thread UI: list/switch, alias picker, stop, metrics panel | 1–2 weeks |
 | M3 | Tool loop: `http_fetch` + `web_search` (SearXNG), iteration guard, tool calls rendered in UI | ≤ 1 week |
 | v1 | Telegram adapter, external Postgres persistence, Hindsight tool, shell tool w/ approval gate, attachments | post-MVP |
 

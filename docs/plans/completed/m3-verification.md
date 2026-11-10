@@ -115,9 +115,9 @@ live Bifrost (`bifrost.bytemonkey.org/v1`), Nomad-hosted SearxNG
   page: live alias list from real Bifrost          (dgx1/qwen3.8-flash-next-a5b, fractal/unsloth/Qwen3.6-35B-A3B-GGUF:…)
   tools: web_search round on vLLM via real SearxNG (completed card, GitHub releases result)
   tools: http_fetch round on llama.cpp             (public URL — see note)
-  reconnect: real tool history replays after reload (per session)
-  cache: multi-turn tool sessions — warm/cold TTFT medians + cached tokens
-  capture: cache session archived for the golden prefix test
+  reconnect: real tool history replays after reload (per thread)
+  cache: multi-turn tool threads — warm/cold TTFT medians + cached tokens
+  capture: cache thread archived for the golden prefix test
 ```
 
 Notes:
@@ -161,9 +161,9 @@ cold median = 11010 ms   warm median = 1785 ms   ratio = 0.162  ✓ (≤ 0.3, at
 
 ### Byte-identical prefixes (offline golden)
 
-The last real session (system prompt incl. nonce, user texts, tool call
+The last real thread (system prompt incl. nonce, user texts, tool call
 ids/names/arguments, tool results, final answers) is archived in
-`test/fixtures/m3_cache_session.json`. `test/m3_prefix_test.gleam` rebuilds
+`test/fixtures/m3_cache_thread.json`. `test/m3_prefix_test.gleam` rebuilds
 it turn-by-turn through the same append-only `nexus/transcript` path the
 loop uses and asserts, per turn boundary:
 
@@ -185,4 +185,4 @@ node e2e/integration.spec.mjs                       # real Bifrost + SearxNG + c
 ```
 
 `e2e/integration.spec.mjs` writes `e2e/integration-report.json` and
-`e2e/cache-session.json`; the committed fixture is a copy of the capture.
+`e2e/cache-thread.json`; the committed fixture is a copy of the capture.

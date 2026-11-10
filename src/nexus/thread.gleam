@@ -1,22 +1,22 @@
-//// The M1 session actor: one process owns the single session's transcript,
+//// The M1 thread actor: one process owns the single thread's transcript,
 //// fan-out to SSE subscribers, and the per-turn worker lifecycle.
 ////
-//// Concurrency model (PRD: "one actor per session"):
+//// Concurrency model (PRD: "one actor per thread"):
 ////
 //// - The actor never blocks on the network. Each turn spawns an **unlinked,
 ////   monitored** worker process that runs the seam (`stream_with_cancel`)
 ////   and reports deltas back as messages; a crashed worker or SSE handler
-////   (verdict finding 9) therefore cannot take the session actor down.
+////   (verdict finding 9) therefore cannot take the thread actor down.
 //// - One turn at a time (M1). A `Send` while a turn is streaming is
 ////   rejected as `Busy`.
 //// - `Stop` cancels the in-flight turn through the seam's cancel subject;
 ////   partial text received so far is committed as the assistant turn.
 ////
 //// Utility side-call (utility-titles plan §4.2): after the first committed
-//// exchange, a debounced, once-per-session title branch runs in its own
+//// exchange, a debounced, once-per-thread title branch runs in its own
 //// unlinked worker beside the turn machinery. It is invisible to callers —
 //// a `Send` cancels it instead of reporting `Busy` — and structurally
-//// isolated: the branch never enters the session's transcript, like the
+//// isolated: the branch never enters the thread's transcript, like the
 //// reasoning sidecar.
 ////
 //// KV-cache contract: the transcript is only ever appended to
@@ -25,7 +25,7 @@
 //// single encode path guarded by the golden test. A failed turn commits
 //// nothing, so retrying sends a byte-identical prefix.
 ////
-//// M2 adds per-session model pinning (`SessionSpec`), turn metrics kept
+//// M2 adds per-thread model pinning (`ThreadSpec`), turn metrics kept
 //// outside the transcript, and the `Describe` request the registry uses to
 //// build sidebar summaries.
 
@@ -47,25 +47,25 @@ import nexus/tools
 import nexus/transcript.{type Transcript}
 import nexus/utility
 
-/// One fan-out delivery: the emitting session's id and the receiving
+/// One fan-out delivery: the emitting thread's id and the receiving
 /// subscriber's current visit generation, stamped beside the payload
 /// (`EventKind`). Both are filter keys, not bookkeeping: a subscriber
-/// shares ONE event subject across every session it visits
+/// shares ONE event subject across every thread it visits
 /// (`nexus/ui.events_effect`), and `Leave` cannot stop broadcasts that
 /// are already in the subscriber's mailbox when it lands — cross-actor
 /// message ordering gives no guarantee. Carrying both lets the UI drop
-/// anything not from the session it is viewing NOW: the id covers
-/// deliveries from other sessions, the visit generation covers stale
-/// deliveries from an EARLIER visit to the same session (a rapid
+/// anything not from the thread it is viewing NOW: the id covers
+/// deliveries from other threads, the visit generation covers stale
+/// deliveries from an EARLIER visit to the same thread (a rapid
 /// A→B→A switch would otherwise re-apply queued first-visit events on
-/// top of the second visit's replay — the cross-session
-/// stream-contamination bug and its same-session cousin).
-pub type SessionEvent {
-  SessionEvent(session_id: String, visit: Int, kind: EventKind)
+/// top of the second visit's replay — the cross-thread
+/// stream-contamination bug and its same-thread cousin).
+pub type ThreadEvent {
+  ThreadEvent(thread_id: String, visit: Int, kind: EventKind)
 }
 
-/// The fan-out payload. Always delivered inside a `SessionEvent` envelope
-/// stamped with the emitting session's id.
+/// The fan-out payload. Always delivered inside a `ThreadEvent` envelope
+/// stamped with the emitting thread's id.
 pub type EventKind {
   /// Sent once to a fresh subscriber after `Join` (before any replay).
   Hello(model: String, messages: Int, metrics: List(MetricSample))
@@ -114,7 +114,7 @@ pub type EventKind {
   /// history replay of assistant tool-call messages. `at` is the flushed
   /// round's committed stamp — the wall-clock epoch the round's assistant
   /// message was appended at — so the UI can timestamp the text it
-  /// committed at first-fragment time with the session's own clock
+  /// committed at first-fragment time with the thread's own clock
   /// (None when the replay carries no committed stamp).
   ToolCallAssembled(
     id: String,
@@ -128,7 +128,7 @@ pub type EventKind {
   /// M3: loop progress — `iteration` is 1-based; `phase` is "request",
   /// "tools", or "guard" (terminal rendering when the guard trips).
   LoopStatus(iteration: Int, max_iterations: Int, phase: String)
-  /// The session's organizational metadata changed server-side — P2: the
+  /// The thread's organizational metadata changed server-side — P2: the
   /// model-generated title upgrade landed. Broadcast to subscribers ONLY
   /// when something applied, so every connected tab refreshes its sidebar
   /// (the registry mutations of the acting client refresh via their own
@@ -152,8 +152,8 @@ pub type TurnOutcome {
 
 /// A blocking turn runner. Runs inside a dedicated worker process; must
 /// honour the cancel subject (see `agent_runner` for the real one and the
-/// tests for fakes). The endpoint is the session's frozen provider
-/// endpoint — resolved once at create/hydration, never swapped mid-session
+/// tests for fakes). The endpoint is the thread's frozen provider
+/// endpoint — resolved once at create/hydration, never swapped mid-thread
 /// (multi-provider plan §8; a provider change is a fork, not an edit).
 pub type TurnRunner =
   fn(openai.Endpoint, Transcript, Subject(Nil), fn(loop.LoopEvent) -> Nil) ->
@@ -166,7 +166,7 @@ pub type TurnRunner =
 /// for a parsed title, or `Error` for anything unusable (transport
 /// failure, cancellation, a tool-call answer, a refusal, or a PASS under
 /// the forced instruction): best-effort, discarded, never retried. The
-/// endpoint is the session's frozen one; `cancel` must be owned by the
+/// endpoint is the thread's frozen one; `cancel` must be owned by the
 /// calling process.
 pub type UtilityRunner =
   fn(openai.Endpoint, Transcript, Subject(Nil), Bool) ->
@@ -182,7 +182,7 @@ pub type UtilityMeta {
 /// registry `UpgradeAutoTitle` ask (guard: `title_source = 'auto'` AND
 /// `tags_source = 'auto'`, utility-tags plan §3.5), injected exactly like
 /// the turn runner so this module never depends on the registry
-/// (dependency direction stays registry → session, and the session actor
+/// (dependency direction stays registry → thread, and the thread actor
 /// never blocks on an ask). `Error` when the guard refused (a manual
 /// rename or a manual tag edit wins forever, unknown id, empty title).
 /// The title argument is line 1 of the utility reply; the tags argument
@@ -196,7 +196,7 @@ pub type UtilityResult {
   /// The guard applied the title; carries the fresh display metadata.
   UtilityApplied(title: String, tags: List(String))
   /// The model replied PASS (honored only on an allow-pass attempt): no
-  /// title yet, and the once-per-session attempt is NOT consumed — the
+  /// title yet, and the once-per-thread attempt is NOT consumed — the
   /// debounce re-arms at the next turn-commit point. Exactly
   /// `max_utility_passes` passes are honored; later attempts run under
   /// the forced instruction, where a PASS reply arrives as
@@ -212,7 +212,7 @@ pub type UtilityResult {
 /// byte-identical to every turn request by construction), so the only
 /// per-call delta is the generation-side token cap applied inside
 /// `utility.run`. `specs` is the same boot-frozen tool registry the agent
-/// loop uses — never a per-session set.
+/// loop uses — never a per-thread set.
 ///
 /// `corpus` supplies the reuse vocabulary for the instruction (Y): a
 /// closure asked from INSIDE the utility worker right before the one
@@ -235,17 +235,17 @@ pub type SendResult {
   Busy
 }
 
-/// Everything needed to construct one session actor. The alias is frozen at
+/// Everything needed to construct one thread actor. The alias is frozen at
 /// construction (M2 §4.1): the transcript is created from `model`, never
 /// from a config default, and the config itself is never mutated.
 ///
 /// Multi-provider P3 adds the second frozen half of the pin: `endpoint`,
 /// the provider transport resolved by the registry at create/hydration
-/// and held for the session's lifetime. Together `model` + `endpoint`
-/// fix every request byte of the session (KV-cache contract rule 5).
+/// and held for the thread's lifetime. Together `model` + `endpoint`
+/// fix every request byte of the thread (KV-cache contract rule 5).
 ///
 /// Phase 2 adds two seams, both injected by the registry so this module
-/// never depends on it (dependency direction stays registry → session):
+/// never depends on it (dependency direction stays registry → thread):
 ///
 /// - `commit_hook` is called with the committed transcript at every commit
 ///   point (user append, turn completion). It is a non-blocking observer —
@@ -257,7 +257,7 @@ pub type SendResult {
 ///   re-encodes byte-identically by construction.
 ///
 /// Utility-titles P2 adds two more injected seams, again built by the
-/// registry so the dependency direction stays registry → session:
+/// registry so the dependency direction stays registry → thread:
 ///
 /// - `utility_runner` performs the one side-call (title branch) over a
 ///   committed transcript snapshot; the real one is `utility_runner`
@@ -265,11 +265,11 @@ pub type SendResult {
 /// - `utility_apply` lands the parsed title + tags behind the registry's
 ///   provenance guards (`title_source` AND `tags_source` both 'auto'; a
 ///   manual rename or manual tag edit wins forever).
-pub type SessionSpec {
-  SessionSpec(
-    /// The session's own id (registry-assigned). Stamped onto every
+pub type ThreadSpec {
+  ThreadSpec(
+    /// The thread's own id (registry-assigned). Stamped onto every
     /// fan-out event as the subscriber-side filter key — see
-    /// `SessionEvent`.
+    /// `ThreadEvent`.
     id: String,
     cfg: Config,
     model: String,
@@ -278,7 +278,7 @@ pub type SessionSpec {
     runner: TurnRunner,
     /// Write-behind observer; `fn(_) { Nil }` when nobody persists.
     commit_hook: fn(Transcript) -> Nil,
-    /// Starting transcript for a hydrated (restored) session; `None`
+    /// Starting transcript for a hydrated (restored) thread; `None`
     /// builds `transcript.new(model, cfg.system_prompt)` as before.
     hydrate: Option(Transcript),
     /// The utility side-call (title branch) — see `UtilityRunner`.
@@ -310,30 +310,30 @@ pub type MetricSample {
   )
 }
 
-/// How a session's display title came to be. Organizational metadata —
+/// How a thread's display title came to be. Organizational metadata —
 /// lives beside the transcript in the registry, never in a request body.
 pub type TitleSource {
   AutoTitle
   ManualTitle
 }
 
-/// How a session's tag set is governed (utility-tags plan §3.4):
+/// How a thread's tag set is governed (utility-tags plan §3.4):
 /// `AutoTags` — model tags may still merge into the display set;
 /// `ManualTags` — a manual tag edit froze the set forever (the guard IS
 /// the tombstone: a user-deleted auto tag can never resurrect). Mirrors
 /// `tags_source` in the schema ('auto' | 'manual'). Organizational
-/// metadata beside the transcript; the UI-facing `SessionSummary`
+/// metadata beside the transcript; the UI-facing `ThreadSummary`
 /// deliberately does not carry it — chips are provenance-indistinguishable.
 pub type TagsSource {
   AutoTags
   ManualTags
 }
 
-/// What a session reports about itself; the registry fills in the
+/// What a thread reports about itself; the registry fills in the
 /// user-visible `id` and the organizational metadata when it builds a
-/// `SessionSummary`.
-pub type SessionStatus {
-  SessionStatus(
+/// `ThreadSummary`.
+pub type ThreadStatus {
+  ThreadStatus(
     model: String,
     message_count: Int,
     streaming: Bool,
@@ -346,19 +346,19 @@ pub type SessionStatus {
 }
 
 /// Sidebar row (M2 §4.2). `id` is assigned by the registry, never by the
-/// session, and never enters the transcript. The M3 organization fields
+/// thread, and never enters the transcript. The M3 organization fields
 /// (title, title_source, pinned, tags, archived, created_at,
 /// last_active_at) are registry-owned metadata: they ride beside the
 /// transcript and must never alter a single request byte (KV-cache
 /// contract — guarded by the golden metadata-isolation test).
-pub type SessionSummary {
-  SessionSummary(
+pub type ThreadSummary {
+  ThreadSummary(
     id: String,
     /// The pinned provider (its registry id; display names are resolved
     /// by the caller — the UI looks the name up in its provider list, so
-    /// the session registry stays decoupled from the provider registry).
+    /// the thread registry stays decoupled from the provider registry).
     /// A rename never reaches summaries; a provider cannot be deleted
-    /// while sessions pin it, so the id always resolves.
+    /// while threads pin it, so the id always resolves.
     provider_id: String,
     model: String,
     title: String,
@@ -375,22 +375,22 @@ pub type SessionSummary {
 }
 
 pub type Msg {
-  /// Subscribe `sub` to session events (replies with Hello + replay).
+  /// Subscribe `sub` to thread events (replies with Hello + replay).
   /// `visit` is the subscriber-issued generation for THIS visit; the
   /// actor echoes it on every delivery to `sub` (replacing any previous
   /// generation for the same subject), so the subscriber can drop
-  /// deliveries left over from an earlier visit to this session.
-  Join(sub: Subject(SessionEvent), visit: Int)
-  /// Unsubscribe `sub` from session events (unknown subs are ignored).
-  Leave(sub: Subject(SessionEvent))
+  /// deliveries left over from an earlier visit to this thread.
+  Join(sub: Subject(ThreadEvent), visit: Int)
+  /// Unsubscribe `sub` from thread events (unknown subs are ignored).
+  Leave(sub: Subject(ThreadEvent))
   /// Append a user turn and start streaming a reply.
   Send(text: String, reply: Subject(SendResult))
   /// Cancel the in-flight turn, if any.
   Stop
-  /// Current transcript (for M2 session resume / tests).
+  /// Current transcript (for M2 thread resume / tests).
   Snapshot(reply: Subject(Transcript))
-  /// Current status for the registry's session list (M2 §4.2).
-  Describe(reply: Subject(SessionStatus))
+  /// Current status for the registry's thread list (M2 §4.2).
+  Describe(reply: Subject(ThreadStatus))
   /// Worker plumbing (internal).
   TurnStarted(worker: Pid, cancel: Subject(Nil))
   WorkerEvent(worker: Pid, event: loop.LoopEvent)
@@ -407,7 +407,7 @@ pub type Msg {
 }
 
 /// One fan-out subscriber: its current visit generation (echoed on every
-/// delivery — the subscriber-side filter key, see `SessionEvent`) and the
+/// delivery — the subscriber-side filter key, see `ThreadEvent`) and the
 /// owner monitor taken at Join, demonitored on Leave so cycling away and
 /// back cannot accumulate monitors on the same connection.
 type Subscriber {
@@ -433,7 +433,7 @@ type TurnState {
 /// appended so far, rebuilt from the same loop events that are broadcast
 /// to subscribers. The worker owns the real extended transcript and only
 /// hands it over at `WorkerDone`, so without this mirror a client that
-/// joins mid-turn — a page reload or a session switch — replays nothing
+/// joins mid-turn — a page reload or a thread switch — replays nothing
 /// of the running turn: its already-executed tool rounds and reasoning
 /// would never render (regression: chips vanished on refresh mid-turn).
 ///
@@ -460,7 +460,7 @@ type LiveTurn {
 }
 
 /// Utility side-call lifecycle (utility-titles plan §4.2). Mirrors the
-/// turn lifecycle but is invisible to callers: the session never reports
+/// turn lifecycle but is invisible to callers: the thread never reports
 /// `Busy` because of a side call. `cancelled` is set when a `Send` raced
 /// the attempt — a cancelled attempt's completion must not consume
 /// `utility_attempted`.
@@ -478,17 +478,17 @@ type UtilityState {
 /// Newest-first cap on stored metric samples (M2 §4.2).
 const metrics_cap = 20
 
-/// How many PASS replies the session honors before the forced instruction
+/// How many PASS replies the thread honors before the forced instruction
 /// takes over (utility-titles §4.2, PASS postpone): one. A postponed
 /// attempt is nearly free under the cached prefix (~Y + title tokens), but
 /// an uncapped pass-forever policy would re-arm a side call after every
-/// turn of a perpetual small-talk session and never converge to a title.
+/// turn of a perpetual small-talk thread and never converge to a title.
 const max_utility_passes = 1
 
 type State {
   State(
-    /// This session's id (`SessionSpec.id`): stamped onto every fan-out
-    /// event as the subscriber-side filter key — see `SessionEvent`.
+    /// This thread's id (`ThreadSpec.id`): stamped onto every fan-out
+    /// event as the subscriber-side filter key — see `ThreadEvent`.
     id: String,
     cfg: Config,
     endpoint: openai.Endpoint,
@@ -498,7 +498,7 @@ type State {
     /// visit generation (echoed on every delivery) and the owner monitor
     /// taken at Join — demonitored on Leave so cycling away and back
     /// cannot accumulate monitors.
-    subs: dict.Dict(Subject(SessionEvent), Subscriber),
+    subs: dict.Dict(Subject(ThreadEvent), Subscriber),
     turn: TurnState,
     /// The in-flight turn's display mirror (see `LiveTurn`). `Some` from
     /// `Send` until `WorkerDone`/`WorkerDown` — committed or failed alike.
@@ -520,20 +520,20 @@ type State {
     /// deferred to the turn's end (committed or failed) or to the running
     /// attempt's completion, instead of being dropped or rescheduled (a
     /// timer-based re-arm would spin at delay 0). Whoever finds the
-    /// session idle consumes this: the commit-point arm and
+    /// thread idle consumes this: the commit-point arm and
     /// `finish_utility` both deliver through `arm_utility`.
     utility_pending: Bool,
-    /// The session's ONE title attempt (utility-titles plan §4.2). Flips
+    /// The thread's ONE title attempt (utility-titles plan §4.2). Flips
     /// only when an attempt COMPLETES (applied or failed) — never when one
     /// is armed or cancelled — so a fast follow-up can kill at most the
-    /// in-flight try, never the session's only one.
+    /// in-flight try, never the thread's only one.
     utility_attempted: Bool,
     /// PASS replies honored so far. Gates the instruction variant handed
     /// to the runner: below `max_utility_passes` the attempt may pass,
     /// after it the forced instruction applies and a PASS reply counts as
     /// a failure. Bumped only when a `UtilityPassed` completes.
     utility_passes: Int,
-    /// The injected side-call seams (see `SessionSpec`): the LLM branch
+    /// The injected side-call seams (see `ThreadSpec`): the LLM branch
     /// and the guarded title application, both run by the unlinked worker.
     utility_runner: UtilityRunner,
     utility_apply: UtilityApply,
@@ -542,8 +542,8 @@ type State {
 
 /// The real turn runner (M3): the bounded agent loop over the frozen tool
 /// registry. `specs` is built once at boot from the global config — never
-/// per session — so the tool schema is identical in every request; the
-/// endpoint arrives per call and is the session's frozen one.
+/// per thread — so the tool schema is identical in every request; the
+/// endpoint arrives per call and is the thread's frozen one.
 pub fn agent_runner(
   max_iterations: Int,
   specs: List(tools.ToolSpec),
@@ -553,8 +553,8 @@ pub fn agent_runner(
       loop.run(
         specs,
         max_iterations,
-        // The session's frozen endpoint threads straight through: one
-        // provider per session for every iteration of every turn
+        // The thread's frozen endpoint threads straight through: one
+        // provider per thread for every iteration of every turn
         // (byte-identical prefixes, single encode path).
         loop.endpoint_stream(endpoint),
         tr,
@@ -570,14 +570,14 @@ pub fn agent_runner(
   }
 }
 
-/// Start the session actor standalone with an explicit spec (M2 §7 step 1).
-pub fn start_with_spec(spec: SessionSpec) -> actor.StartResult(Subject(Msg)) {
+/// Start the thread actor standalone with an explicit spec (M2 §7 step 1).
+pub fn start_with_spec(spec: ThreadSpec) -> actor.StartResult(Subject(Msg)) {
   start_builder(spec) |> actor.start
 }
 
 /// Child specification for the supervision tree (boot).
 pub fn supervised(
-  spec: SessionSpec,
+  spec: ThreadSpec,
   name: process.Name(Msg),
 ) -> actor.StartResult(Subject(Msg)) {
   start_builder(spec)
@@ -585,8 +585,8 @@ pub fn supervised(
   |> actor.start
 }
 
-fn start_builder(spec: SessionSpec) {
-  let SessionSpec(
+fn start_builder(spec: ThreadSpec) {
+  let ThreadSpec(
     id: id,
     cfg: cfg,
     model: model,
@@ -605,7 +605,7 @@ fn start_builder(spec: SessionSpec) {
       runner: runner,
       // The selected alias is frozen into the transcript (M2 §4.1);
       // the provider endpoint is frozen beside it (multi-provider §8).
-      // A hydrated session starts from the rebuilt transcript — built by
+      // A hydrated thread starts from the rebuilt transcript — built by
       // the very same `transcript.new` + `append_*` path, so the actor
       // re-encodes byte-identically (KV-cache contract).
       transcript: case hydrate {
@@ -617,17 +617,17 @@ fn start_builder(spec: SessionSpec) {
       turn_view: None,
       utility: UtilityIdle,
       utility_pending: False,
-      // A hydrated (restored) session's first exchange predates this actor:
-      // the utility-titles plan's §8 proposal — only sessions whose first
+      // A hydrated (restored) thread's first exchange predates this actor:
+      // the utility-titles plan's §8 proposal — only threads whose first
       // exchange happens in the actor's lifetime attempt the upgrade. A
-      // restart therefore never re-titles an already-upgraded session (the
+      // restart therefore never re-titles an already-upgraded thread (the
       // upgrade leaves title_source = 'auto', so the store alone cannot
       // tell "upgraded" from "still the heuristic placeholder").
       utility_attempted: case hydrate {
         Some(_) -> True
         None -> False
       },
-      // A hydrated session never attempts anyway (above), so the pass
+      // A hydrated thread never attempts anyway (above), so the pass
       // count starts at zero in both cases and never moves.
       utility_passes: 0,
       self: self,
@@ -658,9 +658,9 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
     Join(sub, visit) -> {
       // Deliveries to the JOINING subscriber carry its visit generation:
       // the filter key that lets it drop leftovers from an earlier visit
-      // to this session (see `SessionEvent`).
+      // to this thread (see `ThreadEvent`).
       let deliver = fn(kind) {
-        process.send(sub, SessionEvent(state.id, visit, kind))
+        process.send(sub, ThreadEvent(state.id, visit, kind))
       }
       deliver(Hello(
         transcript.model(state.transcript),
@@ -668,7 +668,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
         state.metrics,
       ))
       // Replay existing history so a fresh page load / reconnect sees the
-      // session (system prompt stays server-side, per the cache contract).
+      // thread (system prompt stays server-side, per the cache contract).
       // M3: tool history is replayed too — assistant tool-call messages as
       // `ToolCallAssembled`, tool results as `ToolResult` — so a reconnect
       // can rebuild the full tool state (names resolved from earlier
@@ -752,7 +752,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       // M3: the UI component keeps one long-lived subscription across
       // reconnects, so a re-Join must not duplicate the fan-out entry —
       // it REFRESHES the visit generation instead (the stale-delivery
-      // filter keys off it, see `SessionEvent`) and keeps the existing
+      // filter keys off it, see `ThreadEvent`) and keeps the existing
       // owner monitor. Per-client break: subscriber subjects are owned
       // by per-connection Lustre runtimes that die with their sockets —
       // monitor a new subscriber's owner so its exit prunes the entry in
@@ -772,14 +772,14 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
     }
 
     Leave(sub) -> {
-      // A subscriber that moved to another session. The UI component keeps
+      // A subscriber that moved to another thread. The UI component keeps
       // ONE long-lived event subject per connection and re-Joins it on
-      // every session switch (`nexus/ui.join_effect`), so a switch must
+      // every thread switch (`nexus/ui.join_effect`), so a switch must
       // Leave here explicitly: nothing else removes a live subscriber —
       // the owner monitor only fires when the subscriber's process dies —
-      // and without the removal this session's stream kept fanning out to
-      // the shared subject, rendering into the OTHER session's view
-      // (cross-session contamination while a turn was in flight).
+      // and without the removal this thread's stream kept fanning out to
+      // the shared subject, rendering into the OTHER thread's view
+      // (cross-thread contamination while a turn was in flight).
       //
       // Demonitor on the way out: a subscriber that cycles away and back
       // would otherwise accumulate one dangling monitor per visit on the
@@ -799,7 +799,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
 
     Send(text, reply) -> {
       // A utility side-call in flight never blocks a send: cancel it and
-      // proceed normally — the session must never report `Busy` because of
+      // proceed normally — the thread must never report `Busy` because of
       // a side call (required fairness on serialized backends: the side
       // call would otherwise queue the user's turn behind it). The
       // cancelled attempt does not consume `utility_attempted`; the next
@@ -876,7 +876,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
     Describe(reply) -> {
       process.send(
         reply,
-        SessionStatus(
+        ThreadStatus(
           model: transcript.model(state.transcript),
           message_count: transcript.length(state.transcript),
           streaming: case state.turn {
@@ -1103,7 +1103,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
         }
 
         // Usage rides on the outcome's stats; raw usage events need no
-        // session-level handling. Stale worker events are ignored.
+        // thread-level handling. Stale worker events are ignored.
         _, _ -> actor.continue(state)
       }
 
@@ -1182,7 +1182,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
         Idle, UtilityIdle, False, True, True -> {
           // Unlinked worker (mirror of the turn worker): holds the
           // committed transcript snapshot — an immutable value, and the
-          // branch (Y + reply B) never enters the session's transcript,
+          // branch (Y + reply B) never enters the thread's transcript,
           // structurally unable to change a request byte — and creates its
           // own cancel subject (stream_with_cancel ownership rule). The
           // WORKER applies the title through the registry ask (the actor
@@ -1300,7 +1300,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       }
       // A crashed UTILITY worker is best-effort: reset the side-call state
       // WITHOUT consuming `utility_attempted` (a crash must not eat the
-      // session's only attempt) — and deliver any trigger already recorded
+      // thread's only attempt) — and deliver any trigger already recorded
       // as owed right here: the slot is idle again, and waiting for the
       // next turn-commit point would strand the retry when no further turn
       // ever commits.
@@ -1349,12 +1349,12 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
   }
 }
 
-/// Fan one payload out to every subscriber, stamped with this session's
+/// Fan one payload out to every subscriber, stamped with this thread's
 /// id AND each subscriber's current visit generation — the two
-/// subscriber-side filter keys (see `SessionEvent`).
+/// subscriber-side filter keys (see `ThreadEvent`).
 fn emit(state: State, kind: EventKind) -> Nil {
   dict.each(state.subs, fn(sub, subscriber) {
-    process.send(sub, SessionEvent(state.id, subscriber.visit, kind))
+    process.send(sub, ThreadEvent(state.id, subscriber.visit, kind))
   })
 }
 
@@ -1380,7 +1380,7 @@ fn cancel_utility(state: State) -> State {
 /// The utility trigger, called at the turn-commit point: when the turn
 /// committed — or an earlier-committed exchange still owes a deferred
 /// trigger (`utility_pending`, set when the debounce fired mid-turn) — and
-/// the once-per-session attempt is still available, the feature is
+/// the once-per-thread attempt is still available, the feature is
 /// enabled, and no side call is in flight → arm the debounce timer
 /// (`NEXUS_UTILITY_DELAY_MS`). Nothing else changes here: the timer's
 /// message re-checks every condition at fire time, so racing timers are
@@ -1400,7 +1400,7 @@ fn arm_utility(state: State, committed: Bool) -> State {
     // A FAILED turn with an attempt still in flight (necessarily one the
     // turn's own Send cancelled): neither this turn nor the attempt has a
     // delivery point, so record the trigger as owed — the attempt's
-    // cancelled completion must re-arm instead of stranding the session's
+    // cancelled completion must re-arm instead of stranding the thread's
     // only try. (With a COMMITTED turn this is branch one's delivery; the
     // attempt's completion needs this only when the turn failed.)
     False, False, True, UtilityStarting(..), True ->
@@ -1461,7 +1461,7 @@ fn finish_utility(
   // once-flag. If the turn-commit arm ran while this worker was still
   // unreported, the trigger was recorded as owed — deliver it NOW: the
   // slot is idle again and waiting for the next commit point could
-  // strand the session's only attempt when no further turn commits. A
+  // strand the thread's only attempt when no further turn commits. A
   // PASS that raced a Send behaves the same: nothing was consumed, so
   // the owed trigger is still deliverable.
   let state = case result, cancelled {
@@ -1633,19 +1633,19 @@ fn usage_cached(usage: Option(CompletionUsage)) -> Option(Int) {
 }
 
 /// Request/response helpers over the actor's subject.
-pub fn send_message(session: Subject(Msg), text: String) -> SendResult {
-  actor.call(session, 5000, fn(reply) { Send(text, reply) })
+pub fn send_message(thread: Subject(Msg), text: String) -> SendResult {
+  actor.call(thread, 5000, fn(reply) { Send(text, reply) })
 }
 
-pub fn stop(session: Subject(Msg)) -> Nil {
-  process.send(session, Stop)
+pub fn stop(thread: Subject(Msg)) -> Nil {
+  process.send(thread, Stop)
 }
 
-pub fn snapshot(session: Subject(Msg)) -> Transcript {
-  actor.call(session, 5000, Snapshot)
+pub fn snapshot(thread: Subject(Msg)) -> Transcript {
+  actor.call(thread, 5000, Snapshot)
 }
 
-/// Ask a session for its current status (model, counts, metrics).
-pub fn describe(session: Subject(Msg)) -> SessionStatus {
-  actor.call(session, 5000, Describe)
+/// Ask a thread for its current status (model, counts, metrics).
+pub fn describe(thread: Subject(Msg)) -> ThreadStatus {
+  actor.call(thread, 5000, Describe)
 }

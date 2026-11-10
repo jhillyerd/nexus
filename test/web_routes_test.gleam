@@ -1,5 +1,5 @@
-//// Live-loopback route tests for the M3 session-organization surface:
-//// PATCH/DELETE /sessions/<id>, the archived query on GET /sessions, and
+//// Live-loopback route tests for the M3 thread-organization surface:
+//// PATCH/DELETE /threads/<id>, the archived query on GET /threads, and
 //// the auto-title-at-send boundary — over a real mist server and a real
 //// registry (fake turn runner; no Bifrost, no network beyond loopback).
 
@@ -21,8 +21,8 @@ import nexus/loop
 import nexus/openai
 import nexus/provider
 import nexus/provider_registry
-import nexus/session
-import nexus/session_registry
+import nexus/thread
+import nexus/thread_registry
 import nexus/transcript
 import nexus/web
 import store_mock
@@ -66,9 +66,9 @@ fn happy_runner(
   tr,
   _cancel,
   on_event: fn(loop.LoopEvent) -> Nil,
-) -> session.TurnOutcome {
+) -> thread.TurnOutcome {
   on_event(loop.StreamEvent(openai.TokenDelta("hi")))
-  session.StreamDone(fake_stats(), transcript.append_assistant(tr, "hi"))
+  thread.StreamDone(fake_stats(), transcript.append_assistant(tr, "hi"))
 }
 
 fn fake_stats() -> openai.StreamStats {
@@ -94,19 +94,19 @@ fn fake_stats() -> openai.StreamStats {
 /// outbound sockets — and their TIME_WAIT remnants — occasionally held
 /// the port and killed the listener with Eaddrinuse; CI flake, run
 /// 42399810506.)
-fn start_server() -> #(process.Subject(session_registry.Msg), Int) {
+fn start_server() -> #(process.Subject(thread_registry.Msg), Int) {
   let #(registry, _providers, port) = start_server_with(fn(_providers) { Nil })
   #(registry, port)
 }
 
 /// The full rig: factory + store mock + REAL provider registry (per-base-
-/// URL model fetcher, so tests can tell providers apart) + session
+/// URL model fetcher, so tests can tell providers apart) + thread
 /// registry + mist. `extra` runs against the fresh provider registry
 /// before the server starts — used to set up colliding providers.
 fn start_server_with(
   extra: fn(process.Subject(provider_registry.Msg)) -> Nil,
 ) -> #(
-  process.Subject(session_registry.Msg),
+  process.Subject(thread_registry.Msg),
   process.Subject(provider_registry.Msg),
   Int,
 ) {
@@ -115,12 +115,12 @@ fn start_server_with(
   let registry_name = process.new_name("nexus_routes_registry")
   let providers_name = process.new_name("nexus_routes_providers")
   let assert Ok(_factory) =
-    factory_supervisor.start(session_registry.factory_builder(factory_name))
+    factory_supervisor.start(thread_registry.factory_builder(factory_name))
   let persistence = store_mock.seam(store_mock.start())
   store_mock.ensure_fixture_provider(persistence)
   // The REAL provider registry over the same mock store, with the live
   // model fetch replaced by a fixed alias list — offline, like the rest
-  // of the suite. The session registry resolves through it exactly like
+  // of the suite. The thread registry resolves through it exactly like
   // boot does.
   let assert Ok(_providers) =
     provider_registry.start_with_model_fetcher(
@@ -139,7 +139,7 @@ fn start_server_with(
   let providers = process.named_subject(providers_name)
   extra(providers)
   let assert Ok(started) =
-    session_registry.start(
+    thread_registry.start(
       cfg,
       factory_supervisor.get_by_name(factory_name),
       registry_name,
@@ -147,7 +147,7 @@ fn start_server_with(
       fn(id) {
         provider_registry.resolve(providers, id)
         |> result.map(fn(resolved) { resolved.endpoint })
-        |> result.replace_error(session_registry.ProviderUnknown)
+        |> result.replace_error(thread_registry.ProviderUnknown)
       },
     )
   // Port 0: the kernel picks a free port and mist's after_start hands
@@ -202,10 +202,10 @@ fn send_authorized(req: Request(String)) -> #(Int, String) {
   #(response.status, response.body)
 }
 
-/// Wait until the freshly created session's fake turn has committed.
-fn drain_turn(subject: process.Subject(session.Msg)) -> Nil {
+/// Wait until the freshly created thread's fake turn has committed.
+fn drain_turn(subject: process.Subject(thread.Msg)) -> Nil {
   let sub = process.new_subject()
-  process.send(subject, session.Join(sub, 0))
+  process.send(subject, thread.Join(sub, 0))
   let _ = process.receive(sub, 2000)
   // hello + user echo + assistant + turn done
   list.each(range(4), fn(_) {
@@ -221,7 +221,7 @@ fn range(n: Int) -> List(Int) {
   }
 }
 
-fn session_ids(body: String) -> List(String) {
+fn thread_ids(body: String) -> List(String) {
   // Lightweight extraction: pull "id":"s…" pairs out of the JSON array.
   body
   |> string.split("\"id\":\"")
@@ -240,7 +240,7 @@ fn unwrap(value: Result(String, Nil)) -> String {
 pub fn patch_delete_and_archive_routes_test() {
   let #(registry, port) = start_server()
   let assert Ok(record) =
-    session_registry.create_with_runner(
+    thread_registry.create_with_runner(
       registry,
       store_mock.fixture_provider_id,
       "alpha",
@@ -250,15 +250,10 @@ pub fn patch_delete_and_archive_routes_test() {
   // ---- auth gates the new routes --------------------------------------
   // A PATCH without the token never reaches the handler.
   let assert Ok(denied) =
-    hackney.send(req(
-      port,
-      Patch,
-      "/sessions/" <> record.id,
-      "{\"pinned\":true}",
-    ))
+    hackney.send(req(port, Patch, "/threads/" <> record.id, "{\"pinned\":true}"))
   should.equal(denied.status, 401)
   let assert Ok(unauthorized) =
-    hackney.send(req(port, Delete, "/sessions/" <> record.id, ""))
+    hackney.send(req(port, Delete, "/threads/" <> record.id, ""))
   should.equal(unauthorized.status, 401)
 
   // ---- auto-title at the send boundary --------------------------------
@@ -266,13 +261,13 @@ pub fn patch_delete_and_archive_routes_test() {
     send_authorized(req(
       port,
       Post,
-      "/sessions/" <> record.id <> "/send",
+      "/threads/" <> record.id <> "/send",
       "{\"text\":\"  first   message\\nhere  \"}",
     )),
     #(202, "{\"ok\":true}"),
   )
   drain_turn(record.subject)
-  let #(status, body) = send_authorized(req(port, Get, "/sessions", ""))
+  let #(status, body) = send_authorized(req(port, Get, "/threads", ""))
   should.equal(status, 200)
   should.be_true(string.contains(body, "\"title\":\"first message here\""))
   should.be_true(string.contains(body, "\"title_source\":\"auto\""))
@@ -286,7 +281,7 @@ pub fn patch_delete_and_archive_routes_test() {
     send_authorized(req(
       port,
       Patch,
-      "/sessions/" <> record.id,
+      "/threads/" <> record.id,
       "{\"title\":\"Renamed\",\"pinned\":true,\"tags\":[\"ops\",\"ops\"]}",
     ))
   should.equal(status, 200)
@@ -301,12 +296,12 @@ pub fn patch_delete_and_archive_routes_test() {
     send_authorized(req(
       port,
       Post,
-      "/sessions/" <> record.id <> "/send",
+      "/threads/" <> record.id <> "/send",
       "{\"text\":\"second\"}",
     )),
     #(202, "{\"ok\":true}"),
   )
-  let #(_status, body) = send_authorized(req(port, Get, "/sessions", ""))
+  let #(_status, body) = send_authorized(req(port, Get, "/threads", ""))
   should.be_true(string.contains(body, "\"title\":\"Renamed\""))
 
   // ---- archive: soft-hide + archived view + restore --------------------
@@ -314,33 +309,33 @@ pub fn patch_delete_and_archive_routes_test() {
     send_authorized(req(
       port,
       Patch,
-      "/sessions/" <> record.id,
+      "/threads/" <> record.id,
       "{\"archived\":true}",
     ))
   should.equal(status, 200)
   should.be_true(string.contains(body, "\"archived\":true"))
 
   // Default list hides it; ?archived=1 shows exactly it.
-  let #(_status, active) = send_authorized(req(port, Get, "/sessions", ""))
-  should.equal(session_ids(active), [])
+  let #(_status, active) = send_authorized(req(port, Get, "/threads", ""))
+  should.equal(thread_ids(active), [])
   let #(_status, archived) =
-    send_authorized(req(port, Get, "/sessions?archived=1", ""))
-  should.equal(session_ids(archived), [record.id])
+    send_authorized(req(port, Get, "/threads?archived=1", ""))
+  should.equal(thread_ids(archived), [record.id])
 
   // ---- pinned/archived invariant ----------------------------------------
-  // Pinning an archived session via PATCH is rejected wholesale…
+  // Pinning an archived thread via PATCH is rejected wholesale…
   should.equal(
     send_authorized(req(
       port,
       Patch,
-      "/sessions/" <> record.id,
+      "/threads/" <> record.id,
       "{\"pinned\":true}",
     )),
-    #(409, "{\"error\":\"cannot pin an archived session\"}"),
+    #(409, "{\"error\":\"cannot pin an archived thread\"}"),
   )
   // …and the refusal changed nothing.
   let #(_status, still) =
-    send_authorized(req(port, Get, "/sessions?archived=1", ""))
+    send_authorized(req(port, Get, "/threads?archived=1", ""))
   should.be_true(string.contains(still, "\"pinned\":false"))
   // A restore+pin in one patch is fine (archive state applies first),
   // and the earlier pin was cleared by archiving, so it re-pins cleanly.
@@ -348,7 +343,7 @@ pub fn patch_delete_and_archive_routes_test() {
     send_authorized(req(
       port,
       Patch,
-      "/sessions/" <> record.id,
+      "/threads/" <> record.id,
       "{\"archived\":false,\"pinned\":true}",
     ))
   should.equal(status, 200)
@@ -357,56 +352,56 @@ pub fn patch_delete_and_archive_routes_test() {
 
   // ---- PATCH validation -------------------------------------------------
   should.equal(
-    send_authorized(req(port, Patch, "/sessions/" <> record.id, "{}")),
+    send_authorized(req(port, Patch, "/threads/" <> record.id, "{}")),
     #(400, "{\"error\":\"empty patch\"}"),
   )
   should.equal(
-    send_authorized(req(port, Patch, "/sessions/" <> record.id, "not json")),
+    send_authorized(req(port, Patch, "/threads/" <> record.id, "not json")),
     #(400, "{\"error\":\"unreadable body\"}"),
   )
   should.equal(
     send_authorized(req(
       port,
       Patch,
-      "/sessions/" <> record.id,
+      "/threads/" <> record.id,
       "{\"title\":\"  \"}",
     )),
     #(400, "{\"error\":\"empty title\"}"),
   )
   should.equal(
-    send_authorized(req(port, Patch, "/sessions/nope", "{\"pinned\":true}")),
-    #(404, "{\"error\":\"session not found\"}"),
+    send_authorized(req(port, Patch, "/threads/nope", "{\"pinned\":true}")),
+    #(404, "{\"error\":\"thread not found\"}"),
   )
 
   // ---- DELETE: hard removal ---------------------------------------------
   should.equal(
-    send_authorized(req(port, Delete, "/sessions/" <> record.id, "")),
+    send_authorized(req(port, Delete, "/threads/" <> record.id, "")),
     #(204, ""),
   )
   let #(_status, after) =
-    send_authorized(req(port, Get, "/sessions?archived=1", ""))
-  should.equal(session_ids(after), [])
+    send_authorized(req(port, Get, "/threads?archived=1", ""))
+  should.equal(thread_ids(after), [])
   should.equal(
-    send_authorized(req(port, Delete, "/sessions/" <> record.id, "")),
-    #(404, "{\"error\":\"session not found\"}"),
+    send_authorized(req(port, Delete, "/threads/" <> record.id, "")),
+    #(404, "{\"error\":\"thread not found\"}"),
   )
-  session_registry.get(registry, record.id) |> should.equal(Error(Nil))
+  thread_registry.get(registry, record.id) |> should.equal(Error(Nil))
 }
 
 // ---------------------------------------------------------------------------
-// P3: POST /sessions pins provider + model
+// P3: POST /threads pins provider + model
 // ---------------------------------------------------------------------------
 
 /// The full create flow over the real (loopback) surface: provider
-/// resolved by id, model validated against the provider's list, session
+/// resolved by id, model validated against the provider's list, thread
 /// created and persisted with the pin.
-pub fn create_session_pins_provider_and_model_test() {
+pub fn create_thread_pins_provider_and_model_test() {
   let #(registry, port) = start_server()
   let #(status, body) =
     send_authorized(req(
       port,
       Post,
-      "/sessions",
+      "/threads",
       "{\"provider\":\""
         <> store_mock.fixture_provider_id
         <> "\",\"model\":\"alias-a\"}",
@@ -414,33 +409,33 @@ pub fn create_session_pins_provider_and_model_test() {
   should.equal(status, 201)
   should.be_true(string.contains(body, "\"model\":\"alias-a\""))
   // The pin is in the stored row too.
-  let assert [summary] = session_registry.list_sessions(registry)
+  let assert [summary] = thread_registry.list_threads(registry)
   summary.model |> should.equal("alias-a")
-  let #(_, listed) = send_authorized(req(port, Get, "/sessions", ""))
+  let #(_, listed) = send_authorized(req(port, Get, "/threads", ""))
   should.be_true(string.contains(listed, "\"model\":\"alias-a\""))
 }
 
 /// Provider lookup accepts the NAME as well as the id (plan §11).
-pub fn create_session_resolves_provider_by_name_test() {
+pub fn create_thread_resolves_provider_by_name_test() {
   let #(_registry, port) = start_server()
   let #(status, _body) =
     send_authorized(req(
       port,
       Post,
-      "/sessions",
+      "/threads",
       "{\"provider\":\"fixture\",\"model\":\"alias-b\"}",
     ))
   should.equal(status, 201)
 }
 
-pub fn create_session_validation_test() {
+pub fn create_thread_validation_test() {
   let #(_registry, port) = start_server()
   // Unknown provider -> 400 (plan §11 mapping).
   should.equal(
     send_authorized(req(
       port,
       Post,
-      "/sessions",
+      "/threads",
       "{\"provider\":\"nope\",\"model\":\"alias-a\"}",
     )),
     #(400, "{\"error\":\"unknown provider: nope\"}"),
@@ -450,7 +445,7 @@ pub fn create_session_validation_test() {
     send_authorized(req(
       port,
       Post,
-      "/sessions",
+      "/threads",
       "{\"provider\":\""
         <> store_mock.fixture_provider_id
         <> "\",\"model\":\"nope\"}",
@@ -459,14 +454,14 @@ pub fn create_session_validation_test() {
   )
   // Missing provider field -> 400 (no default provider exists anymore).
   should.equal(
-    send_authorized(req(port, Post, "/sessions", "{\"model\":\"alias-a\"}")),
+    send_authorized(req(port, Post, "/threads", "{\"model\":\"alias-a\"}")),
     #(400, "{\"error\":\"unreadable body\"}"),
   )
   should.equal(
     send_authorized(req(
       port,
       Post,
-      "/sessions",
+      "/threads",
       "{\"provider\":\"\",\"model\":\"alias-a\"}",
     )),
     #(400, "{\"error\":\"empty provider\"}"),
@@ -475,7 +470,7 @@ pub fn create_session_validation_test() {
     send_authorized(req(
       port,
       Post,
-      "/sessions",
+      "/threads",
       "{\"provider\":\""
         <> store_mock.fixture_provider_id
         <> "\",\"model\":\"   \"}",
@@ -498,7 +493,7 @@ pub fn models_route_removed_test() {
 // unambiguous key and must win: a request for "p1" pins the provider
 // WITH ID p1, never the provider merely named "p1" (review finding on
 // PR #12).
-pub fn create_session_provider_id_wins_over_name_test() {
+pub fn create_thread_provider_id_wins_over_name_test() {
   let #(_registry, _providers, port) =
     start_server_with(fn(providers) {
       // Registry-minted ids: beta -> p1, the second -> p2, NAMED "p1".
@@ -512,7 +507,7 @@ pub fn create_session_provider_id_wins_over_name_test() {
     send_authorized(req(
       port,
       Post,
-      "/sessions",
+      "/threads",
       "{\"provider\":\"p1\",\"model\":\"alias-a\"}",
     ))
       |> fn(pair) { #(pair.0, "") },
@@ -523,7 +518,7 @@ pub fn create_session_provider_id_wins_over_name_test() {
     send_authorized(req(
       port,
       Post,
-      "/sessions",
+      "/threads",
       "{\"provider\":\"p1\",\"model\":\"gamma-only\"}",
     )),
     #(400, "{\"error\":\"unknown model: gamma-only\"}"),
@@ -725,9 +720,9 @@ pub fn providers_crud_test() {
   ))
 }
 
-/// The 409 delete guard (plan §11/§17): a provider pinned by any session
+/// The 409 delete guard (plan §11/§17): a provider pinned by any thread
 /// cannot be hard-deleted — disabling is the reversible path, and even
-/// disabled the sessions still pin the row. Unpin (delete the session)
+/// disabled the threads still pin the row. Unpin (delete the thread)
 /// and the delete goes through.
 pub fn provider_delete_guard_test() {
   let #(_registry, _providers, port) = start_server_with(fn(_) { Nil })
@@ -740,26 +735,26 @@ pub fn provider_delete_guard_test() {
     ))
   let provider_id = first_id(created)
 
-  // A session pins it (model list comes from gamma's own fetcher).
-  let assert #(201, session) =
+  // A thread pins it (model list comes from gamma's own fetcher).
+  let assert #(201, thread) =
     send_authorized(req(
       port,
       Post,
-      "/sessions",
+      "/threads",
       "{\"provider\":\"" <> provider_id <> "\",\"model\":\"gamma-only\"}",
     ))
-  let session_id = first_id(session)
+  let thread_id = first_id(thread)
 
   // Referenced -> 409, with the disable hint.
   should.equal(
     send_authorized(req(port, Delete, "/providers/" <> provider_id, "")),
     #(
       409,
-      "{\"error\":\"provider is still pinned by sessions; disable it instead\"}",
+      "{\"error\":\"provider is still pinned by threads; disable it instead\"}",
     ),
   )
   // Disabling is allowed (the reversible path) but does NOT unpin —
-  // the sessions still reference the row, so the guard holds.
+  // the threads still reference the row, so the guard holds.
   let assert #(200, _disabled) =
     send_authorized(req(
       port,
@@ -771,13 +766,13 @@ pub fn provider_delete_guard_test() {
     send_authorized(req(port, Delete, "/providers/" <> provider_id, "")),
     #(
       409,
-      "{\"error\":\"provider is still pinned by sessions; disable it instead\"}",
+      "{\"error\":\"provider is still pinned by threads; disable it instead\"}",
     ),
   )
 
-  // Unpin (hard-delete the session) and the provider deletes cleanly.
+  // Unpin (hard-delete the thread) and the provider deletes cleanly.
   should.equal(
-    send_authorized(req(port, Delete, "/sessions/" <> session_id, ""))
+    send_authorized(req(port, Delete, "/threads/" <> thread_id, ""))
       |> fn(pair) { #(pair.0, "") },
     #(204, ""),
   )

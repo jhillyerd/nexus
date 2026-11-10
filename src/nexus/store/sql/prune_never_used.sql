@@ -1,4 +1,4 @@
--- Boot sweep: hard-delete never-used sessions older than the grace
+-- Boot sweep: hard-delete never-used threads older than the grace
 -- window, in ONE statement (bounded startup work — the registry runs
 -- this inside its actor-initialiser deadline).
 --
@@ -8,10 +8,10 @@
 -- manual rename is intent and survives), never pinned (also intent).
 -- Archived or not: an archived empty is still litter.
 --
--- The grace window protects a session another concurrently-running
+-- The grace window protects a thread another concurrently-running
 -- server created moments ago and still holds live — it stays empty
 -- until its first turn commits. 15 minutes is far past any first turn.
-delete from session
+delete from thread
 where message_count <= 1
   and title_source = 'auto'
   and pinned = false

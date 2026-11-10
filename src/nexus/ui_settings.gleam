@@ -7,7 +7,7 @@
 //// The split is deliberately one-way:
 ////
 //// - the parent owns the masked provider list (it feeds the create
-////   panel's picker and the session-row subtitles) and passes it into
+////   panel's picker and the thread-row subtitles) and passes it into
 ////   `view`;
 //// - this module owns the editor states (add form, inline edit,
 ////   two-step delete confirmation, per-row connection test) and the
@@ -332,13 +332,13 @@ fn add_provider_form(state: State) -> Element(Msg) {
 /// One provider row: name, badges (key/keyless, off), base URL, the
 /// enable/disable + edit + test + delete controls, the hidden inline
 /// editor, the two-step delete confirmation, and (after a Test) the
-/// connection-test result. Mirrors the session rows.
+/// connection-test result. Mirrors the thread rows.
 fn provider_row(state: State, p: Provider) -> Element(Msg) {
   let id = p.id
   html.div([attr.class("provider-row"), attr.data("provider-id", id)], [
     html.div([attr.class("provider-main")], [
       // The row head: name and badges on one line, base URL under it —
-      // the session-row shape (title line, subtitle line). Badges used
+      // the thread-row shape (title line, subtitle line). Badges used
       // to sit on their own line, which read as loose text (F7).
       html.div([attr.class("provider-head")], [
         html.strong([attr.class("provider-name")], [html.text(p.name)]),
@@ -428,7 +428,7 @@ fn provider_row(state: State, p: Provider) -> Element(Msg) {
       ],
     ),
     // Two-step delete confirmation. The registry still refuses while
-    // sessions pin the provider (the 409 guard) — that refusal lands
+    // threads pin the provider (the 409 guard) — that refusal lands
     // as a note in the chat log.
     html.div(
       [
@@ -438,7 +438,7 @@ fn provider_row(state: State, p: Provider) -> Element(Msg) {
       [
         html.span([], [
           html.text(
-            "Delete " <> p.name <> "? Sessions pinning it block the delete.",
+            "Delete " <> p.name <> "? Threads pinning it block the delete.",
           ),
         ]),
         html.button(
@@ -484,7 +484,7 @@ fn span_badge(class: String, label: String) -> Element(Msg) {
 }
 
 /// One compact row-control button. Generic in the message type so the
-/// parent's session rows reuse the same builder (ui.gleam imports this
+/// parent's thread rows reuse the same builder (ui.gleam imports this
 /// module; the reverse would be circular).
 pub fn control(label: String, title: String, msg: a) -> Element(a) {
   html.button(
@@ -577,7 +577,7 @@ fn set_provider_enabled_effect(
 }
 
 /// Hard delete (two-step confirmed): the registry's 409 guard surfaces
-/// as a chat-log note when sessions still pin the provider.
+/// as a chat-log note when threads still pin the provider.
 fn delete_provider_effect(
   providers: Subject(provider_registry.Msg),
   id: String,
@@ -619,7 +619,7 @@ fn models_effect(
 // ---------------------------------------------------------------------------
 
 /// Toggle a per-row editor open-state: clicking the same row closes
-/// it. Shared with the parent's session rows (ui.gleam imports this
+/// it. Shared with the parent's thread rows (ui.gleam imports this
 /// module; the reverse would be circular).
 pub fn toggle_open(current: Option(String), id: String) -> Option(String) {
   case current {

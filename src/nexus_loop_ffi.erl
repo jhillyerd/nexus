@@ -1,5 +1,5 @@
 %% Tiny mutable cells for the M3 agent loop fold. The loop runs inside the
-%% per-turn worker process (never the session actor), so the process
+%% per-turn worker process (never the thread actor), so the process
 %% dictionary is a safe place to accumulate streamed fragments while the
 %% transport seam pushes events through a plain callback.
 -module(nexus_loop_ffi).

@@ -3,10 +3,10 @@
 //// and runtime wiring live in `nexus/ui_runtime`.
 ////
 //// The component mirrors the M2 client plus the M3 tool surface: alias
-//// picker, session sidebar, streaming log with a single in-flight assistant
+//// picker, thread sidebar, streaming log with a single in-flight assistant
 //// bubble, **typed tool-call cards** (name, stable call id, argument
 //// preview, running/completed/failed status, compact inert result
-//// picker, session sidebar, streaming log with a single in-flight assistant
+//// picker, thread sidebar, streaming log with a single in-flight assistant
 //// bubble, **typed tool-call cards** (name, stable call id, argument
 //// preview, running/completed/failed status) rendered as compact
 //// clickable chips — clicking one opens the **full-call popup** (a Pico
@@ -43,8 +43,8 @@ import lustre/event
 import lustre/server_component
 import nexus/provider.{type Provider}
 import nexus/provider_registry
-import nexus/session.{type SessionEvent}
-import nexus/session_registry
+import nexus/thread.{type ThreadEvent}
+import nexus/thread_registry
 import nexus/timing
 import nexus/ui/markdown
 import nexus/ui_settings
@@ -53,16 +53,16 @@ import nexus/ui_settings
 /// registry subjects are resolved from their names at boot and stay
 /// stable across component restarts.
 ///
-/// `session` is the client-supplied last-selected session (the `/ws`
-/// route's `session` query parameter, persisted by the page shell): each
+/// `thread` is the client-supplied last-selected thread (the `/ws`
+/// route's `thread` query parameter, persisted by the page shell): each
 /// connection gets a fresh runtime and model, so this is what re-opens the
-/// same session after a reload instead of falling back to the arbitrary
+/// same thread after a reload instead of falling back to the arbitrary
 /// auto-selection. `None` for a first-time visitor.
 pub type Flags {
   Flags(
-    registry: Subject(session_registry.Msg),
+    registry: Subject(thread_registry.Msg),
     providers: Subject(provider_registry.Msg),
-    session: Option(String),
+    thread: Option(String),
   )
 }
 
@@ -126,7 +126,7 @@ pub type LoopState {
   LoopState(iteration: Int, max_iterations: Int, phase: String)
 }
 
-/// Sidebar recency bucket for a session's last activity. Pure UTC-day
+/// Sidebar recency bucket for a thread's last activity. Pure UTC-day
 /// arithmetic over epoch seconds — deliberately deterministic, with frozen
 /// boundary fixtures in the tests.
 pub type Bucket {
@@ -175,7 +175,7 @@ pub fn rel_time(now_epoch: Int, at: Int) -> String {
   }
 }
 
-/// Which main view the shell renders. The header (title, session context,
+/// Which main view the shell renders. The header (title, thread context,
 /// connection state, settings button) persists across both; the `#layout`
 /// area swaps between the chat triple and the settings page.
 pub type UiView {
@@ -186,18 +186,18 @@ pub type UiView {
 pub type Model {
   Model(
     providers: Subject(provider_registry.Msg),
-    registry: Subject(session_registry.Msg),
-    // Long-lived subscription to the selected session's events, owned by
+    registry: Subject(thread_registry.Msg),
+    // Long-lived subscription to the selected thread's events, owned by
     // this connection's runtime (one runtime per /ws client since the
-    // per-client break; a reload is a new subject, and the session actor
+    // per-client break; a reload is a new subject, and the thread actor
     // de-duplicates re-Joins by subject).
-    events: Option(Subject(SessionEvent)),
+    events: Option(Subject(ThreadEvent)),
     /// The provider whose models fill the create panel's picker (P5): the
     /// user's selection, defaulting to the first enabled provider. Aliases
     /// reload whenever this changes.
     provider: Option(String),
     /// All providers as masked metadata (the Settings page, the picker's
-    /// options, and provider-name resolution for session subtitles).
+    /// options, and provider-name resolution for thread subtitles).
     /// `has_key` only — key material never reaches this model.
     provider_list: List(Provider),
     /// Which main view the shell renders (chat vs settings).
@@ -212,24 +212,24 @@ pub type Model {
     /// True once any `ProvidersLoaded` has arrived on this connection:
     /// the auto-open rule fires only on the FIRST load, so a provider
     /// list that later becomes empty (e.g. external deletes + reconnect
-    /// refresh) never hijacks a session in progress back into settings.
+    /// refresh) never hijacks a thread in progress back into settings.
     providers_seen: Bool,
     /// Set by the deliberate no-selection entry points (archiving the
-    /// open session, the New-session button): the loaded list must not
+    /// open thread, the New-thread button): the loaded list must not
     /// auto-select a replacement — an empty selection is a real state,
     /// not a gap to paper over. Cleared whenever a selection exists or
     /// lands (auto-select or `Select`), so the boot auto-selection and
     /// the vanished-selection reselect keep working unchanged.
     suppress_autoselect: Bool,
     aliases: List(String),
-    sessions: List(session.SessionSummary),
+    threads: List(thread.ThreadSummary),
     selected: Option(String),
-    /// Monotonic per-connection visit generation, bumped on every session
-    /// join (`GotEvents`, `Select`, the `SessionsLoaded` auto-switch) and
-    /// sent with `session.Join`; the actor echoes it on every delivery to
-    /// this subscriber. `SessionScoped` applies a delivery only when BOTH
-    /// the session id and this generation match — a rapid A→B→A switch
-    /// must not re-apply session A's queued first-visit events (same id,
+    /// Monotonic per-connection visit generation, bumped on every thread
+    /// join (`GotEvents`, `Select`, the `ThreadsLoaded` auto-switch) and
+    /// sent with `thread.Join`; the actor echoes it on every delivery to
+    /// this subscriber. `ThreadScoped` applies a delivery only when BOTH
+    /// the thread id and this generation match — a rapid A→B→A switch
+    /// must not re-apply thread A's queued first-visit events (same id,
     /// stale generation) on top of the second visit's replay.
     visit: Int,
     /// The text the `ToolCallDelta` arm committed ahead of the worker's
@@ -241,8 +241,8 @@ pub type Model {
     /// terminal event's stamp for a Stop that landed between the fragments
     /// and the assembly. Text and call fragments can interleave within one
     /// round, so a round may flush MORE THAN ONE segment — all are tracked,
-    /// newest-first. Cleared when the selection changes or the session
-    /// ends: a stale entry must never stamp another session's (possibly
+    /// newest-first. Cleared when the selection changes or the thread
+    /// ends: a stale entry must never stamp another thread's (possibly
     /// unstamped) line that happens to carry the same text.
     flushed: List(String),
     picker: String,
@@ -278,24 +278,24 @@ pub type Model {
     // it after an accepted send replaces the (uncontrolled) textarea, which
     // is the only way a server component can clear it — see `composer` below.
     composer: Int,
-    // True while the create panel is open *because the session list was
+    // True while the create panel is open *because the thread list was
     // empty* (e.g. the component booted before the registry's first
-    // session existed) — auto-opened, so it also auto-closes again once
+    // thread existed) — auto-opened, so it also auto-closes again once
     // there is something to select.
     create_auto: Bool,
     // Header fallback label (ui-polish F8): what the `#model` span shows
-    // while NO session is selected — "connecting…" at boot and on select,
-    // "session ended" after the selection drops. With a selection the
-    // header shows the session's title instead (see `header_title`).
+    // while NO thread is selected — "connecting…" at boot and on select,
+    // "thread ended" after the selection drops. With a selection the
+    // header shows the thread's title instead (see `header_title`).
     model_label: String,
-    // ---- Session organization (registry metadata, display only) ----
+    // ---- Thread organization (registry metadata, display only) ----
     /// Free-text filter over titles + tags, case-insensitive.
     tag_filter: String,
     /// Bumped on every *programmatic* filter change (chip click, clear) so
     /// the keyed filter input is replaced wholesale — an uncontrolled
     /// input cannot be patched, only replaced (the composer pattern).
     filter_gen: Int,
-    /// Soft-hidden sessions are listed only while this is on.
+    /// Soft-hidden threads are listed only while this is on.
     show_archived: Bool,
     /// The row whose inline rename editor is open (at most one).
     rename_open: Option(String),
@@ -304,7 +304,7 @@ pub type Model {
     /// The row whose two-step delete confirmation is armed.
     confirm_delete: Option(String),
     /// The tool call the full-call popup shows, if any (at most one).
-    /// See `Pop` — cleared on session switch, turn rollback, and when a
+    /// See `Pop` — cleared on thread switch, turn rollback, and when a
     /// new turn begins (call ids are only unique within a turn); a stale
     /// entry whose call no longer resolves simply renders nothing.
     pop: Option(Pop),
@@ -321,26 +321,26 @@ pub type Model {
 
 pub type Msg {
   Ignored
-  // The session-event subscription created by the select effect in `init`.
+  // The thread-event subscription created by the select effect in `init`.
   // A per-client runtime's connect point: the load cascade (and the
-  // re-Join of the client-supplied session) starts once the subject is in
+  // re-Join of the client-supplied thread) starts once the subject is in
   // the model. There is deliberately no ClientConnected/ClientDisconnected
   // — one runtime serves exactly one client for its whole life, so connect
   // is `init` and disconnect is the runtime dying with its socket.
-  GotEvents(Subject(SessionEvent))
-  /// One session event delivered on the subscription, stamped with the
-  /// emitting session's id AND the receiving subscriber's visit
-  /// generation (`session.SessionEvent`). Both are the filter: the subject
-  /// is shared by every session this connection visits, and `Leave`
+  GotEvents(Subject(ThreadEvent))
+  /// One thread event delivered on the subscription, stamped with the
+  /// emitting thread's id AND the receiving subscriber's visit
+  /// generation (`thread.ThreadEvent`). Both are the filter: the subject
+  /// is shared by every thread this connection visits, and `Leave`
   /// cannot stop broadcasts already in the mailbox when it lands (nor a
   /// replay sliced mid-flight by a fast double switch). The id drops
-  /// deliveries from other sessions; the generation drops deliveries left
-  /// over from an EARLIER visit to the same session (rapid A→B→A).
-  /// Without these, a session that kept streaming after being switched
-  /// away from rendered its tokens into the OTHER session's view.
+  /// deliveries from other threads; the generation drops deliveries left
+  /// over from an EARLIER visit to the same thread (rapid A→B→A).
+  /// Without these, a thread that kept streaming after being switched
+  /// away from rendered its tokens into the OTHER thread's view.
   /// `MetaUpdated` deliberately passes the filter: sidebar metadata is
   /// global.
-  SessionScoped(session_id: String, visit: Int, event: Msg)
+  ThreadScoped(thread_id: String, visit: Int, event: Msg)
   // ---- Providers (P5: management + provider-scoped picker) ----
   /// Masked metadata for every provider (Settings page + picker).
   ProvidersLoaded(List(Provider))
@@ -356,13 +356,13 @@ pub type Msg {
   Settings(ui_settings.Msg)
   AliasesLoaded(provider: String, aliases: List(String))
   AliasesFailed
-  SessionsLoaded(List(session.SessionSummary))
-  SessionsFailed(String)
+  ThreadsLoaded(List(thread.ThreadSummary))
+  ThreadsFailed(String)
   Select(String)
-  NewSessionToggled
+  NewThreadToggled
   PickerChanged(String)
   CreateRequested
-  Created(session.SessionSummary)
+  Created(thread.ThreadSummary)
   CreateFailed(String)
   // The composer is uncontrolled: its text rides the event itself (the
   // keydown's `target.value` for Enter, `detail.formData` for submits).
@@ -372,7 +372,7 @@ pub type Msg {
   StopRequested
   Hello(model: String)
   /// A committed user line. `at` is its display stamp — wall-clock epoch
-  /// seconds from the session's echo (live and replay carry the same
+  /// seconds from the thread's echo (live and replay carry the same
   /// value); None = unstamped history, rendered without a time.
   UserEcho(String, Option(Int))
   /// A committed assistant line, replayed from history (or seen by a
@@ -385,15 +385,15 @@ pub type Msg {
   /// A streamed fragment of the model's reasoning (chain of thought).
   Reasoning(String)
   /// The turn's terminal state. `at` is the committed turn's final
-  /// assistant-text stamp from the session actor (`transcript
+  /// assistant-text stamp from the thread actor (`transcript
   /// .last_text_stamp` — the SAME value a post-reload replay attaches to
   /// that message), so the live bubble commit renders the same absolute
   /// timestamp as replay; None = nothing committed (or unstamped).
   TurnDone(Option(Int))
   TurnStopped(Option(Int))
   TurnFailed(String, Option(Int))
-  /// The session's organizational metadata changed server-side (the
-  /// model-generated title upgrade landed). Refreshes the session list so
+  /// The thread's organizational metadata changed server-side (the
+  /// model-generated title upgrade landed). Refreshes the thread list so
   /// EVERY connected tab's sidebar updates — not just the client that
   /// happens to be mid-turn.
   MetaUpdated(title: Option(String), tags: List(String))
@@ -425,7 +425,7 @@ pub type Msg {
   ToolViewOpened(Pop)
   /// The popup's close control was clicked.
   ToolViewClosed
-  // ---- Session organization ----
+  // ---- Thread organization ----
   /// The filter input while typing (uncontrolled: text rides the event).
   TagFilterChanged(String)
   /// Programmatic filter set (tag-chip click, clear button): stores the
@@ -441,35 +441,35 @@ pub type Msg {
   DeleteRequested(id: String)
   DeleteCancelled
   DeleteConfirmed(id: String)
-  /// A registry mutation failed (session vanished mid-edit); surfaces a
+  /// A registry mutation failed (thread vanished mid-edit); surfaces a
   /// note in the log instead of failing silently.
-  SessionOpFailed(String)
+  ThreadOpFailed(String)
 }
 
-/// Translate a `session.EventKind` into a typed component message.
-/// Session events arrive on the subject selected in `init` and flow through
-/// the same `update` as DOM events. The emitting session's id rides the
-/// `session.SessionEvent` envelope and is handled by `SessionScoped` —
+/// Translate a `thread.EventKind` into a typed component message.
+/// Thread events arrive on the subject selected in `init` and flow through
+/// the same `update` as DOM events. The emitting thread's id rides the
+/// `thread.ThreadEvent` envelope and is handled by `ThreadScoped` —
 /// this function sees only the payload.
-pub fn from_session_event(event: session.EventKind) -> Msg {
+pub fn from_thread_event(event: thread.EventKind) -> Msg {
   case event {
-    session.Hello(model, _messages, _metrics) -> Hello(model)
-    session.UserEcho(text, at) -> UserEcho(text, at)
-    session.AssistantFull(text, at) -> AssistantFull(text, at)
-    session.ReasoningFull(text) -> ReasoningFull(text)
-    session.Token(text) -> Token(text)
-    session.Reasoning(text) -> Reasoning(text)
-    session.TurnDone(_stats, at) -> TurnDone(at)
-    session.TurnStopped(_chars, at) -> TurnStopped(at)
-    session.TurnFailed(reason, at) -> TurnFailed(reason, at)
-    session.MetaUpdated(title, tags) -> MetaUpdated(title, tags)
-    session.ToolCallDelta(index, id, name, fragment) ->
+    thread.Hello(model, _messages, _metrics) -> Hello(model)
+    thread.UserEcho(text, at) -> UserEcho(text, at)
+    thread.AssistantFull(text, at) -> AssistantFull(text, at)
+    thread.ReasoningFull(text) -> ReasoningFull(text)
+    thread.Token(text) -> Token(text)
+    thread.Reasoning(text) -> Reasoning(text)
+    thread.TurnDone(_stats, at) -> TurnDone(at)
+    thread.TurnStopped(_chars, at) -> TurnStopped(at)
+    thread.TurnFailed(reason, at) -> TurnFailed(reason, at)
+    thread.MetaUpdated(title, tags) -> MetaUpdated(title, tags)
+    thread.ToolCallDelta(index, id, name, fragment) ->
       ToolCallDelta(index, id, name, fragment)
-    session.ToolCallAssembled(id, name, arguments, at) ->
+    thread.ToolCallAssembled(id, name, arguments, at) ->
       ToolCallAssembled(id, name, arguments, at)
-    session.ToolResult(id, name, ok, content) ->
+    thread.ToolResult(id, name, ok, content) ->
       ToolResult(id, name, ok, content)
-    session.LoopStatus(iteration, max, phase) ->
+    thread.LoopStatus(iteration, max, phase) ->
       LoopStatus(iteration, max, phase)
   }
 }
@@ -492,12 +492,12 @@ pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
       providers_seen: False,
       suppress_autoselect: False,
       aliases: [],
-      sessions: [],
-      // A reload re-opens the client's last-selected session: the page
+      threads: [],
+      // A reload re-opens the client's last-selected thread: the page
       // shell persists it and supplies it on the /ws route. If it has since
-      // vanished, `after_sessions` drops it and the auto-selection rules
+      // vanished, `after_threads` drops it and the auto-selection rules
       // take over — same as any stale selection.
-      selected: flags.session,
+      selected: flags.thread,
       visit: 0,
       // The text the delta arm committed ahead of the worker's append
       // (see the ToolCallDelta arm): its authoritative stamp arrives on
@@ -529,16 +529,16 @@ pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
   #(model, events_effect())
 }
 
-/// Create the long-lived session-event subscription. The fresh subject is
-/// stored in the model via `GotEvents`; the registry/session lookups then
+/// Create the long-lived thread-event subscription. The fresh subject is
+/// stored in the model via `GotEvents`; the registry/thread lookups then
 /// happen in ordinary effects.
 fn events_effect() -> Effect(Msg) {
-  server_component.select(fn(dispatch, subject: Subject(SessionEvent)) {
+  server_component.select(fn(dispatch, subject: Subject(ThreadEvent)) {
     dispatch(GotEvents(subject))
     process.new_selector()
     |> process.select_map(subject, fn(delivery) {
-      let session.SessionEvent(session_id, visit, kind) = delivery
-      SessionScoped(session_id, visit, from_session_event(kind))
+      let thread.ThreadEvent(thread_id, visit, kind) = delivery
+      ThreadScoped(thread_id, visit, from_thread_event(kind))
     })
   })
 }
@@ -547,11 +547,11 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
   case msg {
     Ignored -> #(model, effect.none())
 
-    // Per-session delivery filter — see the `SessionScoped` msg. One level
+    // Per-thread delivery filter — see the `ThreadScoped` msg. One level
     // of recursion applies (or drops) the inner event.
-    SessionScoped(session_id, visit, event) ->
+    ThreadScoped(thread_id, visit, event) ->
       case model.selected {
-        Some(selected) if selected == session_id && model.visit == visit ->
+        Some(selected) if selected == thread_id && model.visit == visit ->
           update(model, event)
         _ ->
           case event {
@@ -566,7 +566,7 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     GotEvents(subject) -> {
       // The connect point of a per-client runtime: the subscription
       // subject exists, so load everything (and re-Join the client's
-      // session — Hello + replay is idempotent). This is the old
+      // thread — Hello + replay is idempotent). This is the old
       // ClientConnected arm minus the stale-view clearing a fresh model
       // makes unnecessary.
       //
@@ -587,12 +587,12 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             // Provider metadata refreshes here: the load re-aims the
             // picker and pulls the selected provider's models with it.
             providers_effect(model),
-            sessions_effect(model),
+            threads_effect(model),
           ])
         None ->
           effect.batch([
             providers_effect(model),
-            sessions_effect(model),
+            threads_effect(model),
           ])
       }
       #(model, eff)
@@ -656,7 +656,7 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       // auto-opens the Settings view (the guided path the always-visible
       // sidebar panel used to provide) — unless the user toggled the
       // view by hand. Later loads never re-open it (a list that becomes
-      // empty mid-session must not hijack the chat view).
+      // empty mid-thread must not hijack the chat view).
       let model = case providers, model.providers_seen, model.settings_manual {
         [], False, False -> Model(..model, view: SettingsView)
         _, _, _ -> model
@@ -680,7 +680,7 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           // Stale aliases must not survive a provider switch: the picker
           // empties until the new provider's list lands (Create is
           // disabled while it is), and never offers another provider's
-          // models as the pin for a new session.
+          // models as the pin for a new thread.
           Model(..model, provider: Some(id), aliases: [], picker: ""),
           aliases_for(model, id),
         )
@@ -774,13 +774,13 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       effect.none(),
     )
 
-    SessionsLoaded(summaries) -> {
-      let next = after_sessions(model, summaries)
+    ThreadsLoaded(summaries) -> {
+      let next = after_threads(model, summaries)
       // A fresh per-client model can see Hello (replay) before the
-      // summaries land: Hello then found an empty session list and
+      // summaries land: Hello then found an empty thread list and
       // reported `streaming: False`. Reconcile from the authoritative
       // summary when the selection is unchanged, so the composer shows
-      // the true busy state instead of accepting a send that the session
+      // the true busy state instead of accepting a send that the thread
       // will reject with "busy".
       let next = case next.selected, model.selected {
         Some(id), Some(previous) if id == previous ->
@@ -792,7 +792,7 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       }
       // The selection changed under us (boot auto-selection, or the
       // previous one vanished): a NEW visit — bump the generation so any
-      // stale deliveries cannot ride along. A vanished session fails the
+      // stale deliveries cannot ride along. A vanished thread fails the
       // registry lookup harmlessly. The bump lands on the RETURNED model:
       // the join fires carrying `next.visit`, and a delivery only applies
       // when the model's generation matches — a bump that lives only in
@@ -819,9 +819,9 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       #(next, eff)
     }
 
-    SessionsFailed(reason) -> #(
+    ThreadsFailed(reason) -> #(
       Model(..model, log: [
-        NoteLine(True, "could not load sessions: " <> reason),
+        NoteLine(True, "could not load threads: " <> reason),
         ..model.log
       ]),
       effect.none(),
@@ -832,8 +832,8 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         Some(current) if current == id -> #(model, effect.none())
         _ -> {
           // A new visit: the view resets AND the generation bumps, so the
-          // old session's stale deliveries (and any leftovers from an
-          // earlier visit to THIS session) cannot render after the reset.
+          // old thread's stale deliveries (and any leftovers from an
+          // earlier visit to THIS thread) cannot render after the reset.
           let next =
             Model(
               ..model,
@@ -850,7 +850,7 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               guard: False,
               turn_base: 0,
               model_label: "connecting…",
-              // The popup belongs to the previous session's log; its
+              // The popup belongs to the previous thread's log; its
               // ids cannot resolve against the new selection's.
               pop: None,
               // An explicit pick re-arms the refresh auto-selection
@@ -869,21 +869,21 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         }
       }
 
-    NewSessionToggled -> {
+    NewThreadToggled -> {
       let model =
         Model(..model, create_open: !model.create_open, create_auto: False)
       // Opening the create panel enters the deliberate no-selection state:
-      // the chat pane goes blank so the user composes a new session
+      // the chat pane goes blank so the user composes a new thread
       // against nothing, and a later refresh must not auto-select a
       // replacement (see `deselect`). Closing it just closes the panel —
       // the no-selection state stays until a row is picked. The button can
-      // also be clicked BEFORE the first session list arrives (the sidebar
+      // also be clicked BEFORE the first thread list arrives (the sidebar
       // renders immediately on a fresh connection): the deliberate mark
       // must land then too, or the arriving list auto-selects right over
       // the open panel.
       case model.create_open, model.selected {
         True, Some(current) -> {
-          let next = deselect(model, "no session selected")
+          let next = deselect(model, "no thread selected")
           #(next, leave_effect(model, current))
         }
         True, None -> {
@@ -904,17 +904,13 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
 
     Created(summary) -> {
       let model =
-        Model(
-          ..model,
-          sessions: [summary, ..model.sessions],
-          create_open: False,
-        )
+        Model(..model, threads: [summary, ..model.threads], create_open: False)
       update(model, Select(summary.id))
     }
 
     CreateFailed(reason) -> #(
       Model(..model, log: [
-        NoteLine(True, "could not create session: " <> reason),
+        NoteLine(True, "could not create thread: " <> reason),
         ..model.log
       ]),
       effect.none(),
@@ -940,7 +936,7 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     SendRejected(reason) -> {
       let note = case reason {
         "busy" -> "a reply is already streaming — stop it first"
-        "gone" -> "session ended"
+        "gone" -> "thread ended"
         other -> "send failed: " <> other
       }
       #(Model(..model, log: [NoteLine(True, note), ..model.log]), effect.none())
@@ -951,7 +947,7 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     Hello(name) -> #(
       Model(..model, model_label: name, streaming: case model.selected {
         Some(id) ->
-          case list.find(model.sessions, fn(s) { s.id == id }) {
+          case list.find(model.threads, fn(s) { s.id == id }) {
             Ok(summary) -> summary.streaming
             Error(_) -> False
           }
@@ -1046,19 +1042,19 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
 
     TurnDone(at) -> #(
       finish_turn(model, CommitBubble(at)),
-      sessions_effect(model),
+      threads_effect(model),
     )
 
     TurnStopped(at) -> #(
       finish_turn(model, CommitBubble(at)),
-      sessions_effect(model),
+      threads_effect(model),
     )
 
     // Server-side metadata change (title upgrade): the payload is display
     // metadata — the refresh re-reads the whole list from the registry, so
     // every subscribed tab's sidebar re-renders with the new title. Titles
     // render as text nodes, so hostile model output stays inert.
-    MetaUpdated(_title, _tags) -> #(model, sessions_effect(model))
+    MetaUpdated(_title, _tags) -> #(model, threads_effect(model))
 
     // A tool call's arguments are streaming in fragments. Any assistant
     // text seen so far belongs *before* the call (the loop commits text at
@@ -1174,7 +1170,7 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     // bubble is discarded.
     TurnFailed(reason, at) -> {
       let model = case model.guard {
-        // The guard committed: the surviving bubble carries the session's
+        // The guard committed: the surviving bubble carries the thread's
         // own stamp, exactly as a replay of that transcript will.
         True -> commit_turn_output(settle_flushed(model, at), at)
         False ->
@@ -1200,11 +1196,11 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           streaming: False,
           log: [NoteLine(True, "turn failed: " <> reason), ..model.log],
         ),
-        sessions_effect(model),
+        threads_effect(model),
       )
     }
 
-    // ---- Session organization (registry metadata mutations) ----
+    // ---- Thread organization (registry metadata mutations) ----
     TagFilterChanged(text) -> #(Model(..model, tag_filter: text), effect.none())
 
     TagFilterSet(text) -> #(
@@ -1235,7 +1231,7 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         title -> #(
           model,
           mutate_effect(model, fn(registry) {
-            session_registry.set_title(registry, id, title)
+            thread_registry.set_title(registry, id, title)
           }),
         )
       }
@@ -1254,7 +1250,7 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     TagsEdited(id, raw) -> #(
       Model(..model, tags_open: None),
       mutate_effect(model, fn(registry) {
-        session_registry.set_tags(registry, id, parse_tags(raw))
+        thread_registry.set_tags(registry, id, parse_tags(raw))
       }),
     )
 
@@ -1266,28 +1262,28 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       #(
         model,
         mutate_effect(model, fn(registry) {
-          session_registry.set_pinned(registry, id, !pinned)
+          thread_registry.set_pinned(registry, id, !pinned)
         }),
       )
     }
 
     Archived(id, archived) -> {
-      // Archiving the OPEN session ends the visit: the selection clears
+      // Archiving the OPEN thread ends the visit: the selection clears
       // (the row is soft-hidden, so a kept selection would highlight
       // nothing while the chat pane keeps showing the archived content —
       // the ghost-selection bug), the pane goes blank, and the refresh
       // that the registry write triggers must not auto-select a
-      // replacement (see `deselect`). Archiving any OTHER session — or
+      // replacement (see `deselect`). Archiving any OTHER thread — or
       // restoring — leaves the selection alone.
       case archived, model.selected {
         True, Some(current) if current == id -> {
-          let next = deselect(model, "no session selected")
+          let next = deselect(model, "no thread selected")
           #(
             next,
             effect.batch([
               leave_effect(model, current),
               mutate_effect(next, fn(registry) {
-                session_registry.set_archived(registry, id, archived)
+                thread_registry.set_archived(registry, id, archived)
               }),
             ]),
           )
@@ -1295,7 +1291,7 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         _, _ -> #(
           model,
           mutate_effect(model, fn(registry) {
-            session_registry.set_archived(registry, id, archived)
+            thread_registry.set_archived(registry, id, archived)
           }),
         )
       }
@@ -1316,13 +1312,13 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     DeleteConfirmed(id) -> #(
       Model(..model, confirm_delete: None),
       mutate_effect(model, fn(registry) {
-        session_registry.delete_session(registry, id)
+        thread_registry.delete_thread(registry, id)
       }),
     )
 
-    SessionOpFailed(reason) -> #(
+    ThreadOpFailed(reason) -> #(
       Model(..model, log: [
-        NoteLine(True, "session update failed: " <> reason),
+        NoteLine(True, "thread update failed: " <> reason),
         ..model.log
       ]),
       effect.none(),
@@ -1333,8 +1329,8 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
 fn summary_by_id(
   model: Model,
   id: String,
-) -> Result(session.SessionSummary, Nil) {
-  list.find(model.sessions, fn(summary) { summary.id == id })
+) -> Result(thread.ThreadSummary, Nil) {
+  list.find(model.threads, fn(summary) { summary.id == id })
 }
 
 /// Comma-separated editor input → the tag list handed to the registry
@@ -1348,9 +1344,9 @@ pub fn parse_tags(raw: String) -> List(String) {
   |> list.unique
 }
 
-/// Case-insensitive free-text match over a session's title and tags. The
+/// Case-insensitive free-text match over a thread's title and tags. The
 /// empty filter matches everything.
-pub fn matches_filter(summary: session.SessionSummary, filter: String) -> Bool {
+pub fn matches_filter(summary: thread.ThreadSummary, filter: String) -> Bool {
   case string.trim(filter) {
     "" -> True
     query -> {
@@ -1365,7 +1361,7 @@ pub fn matches_filter(summary: session.SessionSummary, filter: String) -> Bool {
 
 /// How a terminal event treats the streaming bubble. `CommitBubble(at)`
 /// carries the committed turn's stamp from the terminal event — the
-/// session's own clock (`transcript.last_text_stamp`, read by the actor
+/// thread's own clock (`transcript.last_text_stamp`, read by the actor
 /// off the committed transcript), never a second UI-side read.
 type BubblePolicy {
   CommitBubble(at: Option(Int))
@@ -1412,7 +1408,7 @@ fn settle_flushed(model: Model, at: Option(Int)) -> Model {
 
 /// Restamp every pending flush text (see the `flushed` field) with `at`.
 /// Matching is by the exact committed text — it cannot hit an unrelated
-/// line, and within one session rounds are serial, so the
+/// line, and within one thread rounds are serial, so the
 /// first (newest) match per text is the right line. A text that is
 /// already restamped (or absent — replay, where no delta-time commit
 /// happens) is a no-op.
@@ -1456,7 +1452,7 @@ fn commit_turn_output(model: Model, at: Option(Int)) -> Model {
 }
 
 /// Commit the streaming bubble (if any) as a completed assistant line —
-/// matching the session's own commit rules. Text that renders to nothing
+/// matching the thread's own commit rules. Text that renders to nothing
 /// under markdown (whitespace-only fragments this model streams beside
 /// tool calls) commits nothing visible — the transcript keeps it, and a
 /// replay skips it through the same render — so no empty pill appears and
@@ -1591,8 +1587,8 @@ fn line_result(line: Line) -> Option(String) {
 /// Enter the deliberate no-selection state: the chat pane goes blank and
 /// refresh auto-selection stays off until the user picks a row (the same
 /// reset `Select` performs, minus the join — the caller sends a `Leave`
-/// for the session that was selected). Shared by the archive-of-selection
-/// and New-session entry points; `label` feeds the header's fallback.
+/// for the thread that was selected). Shared by the archive-of-selection
+/// and New-thread entry points; `label` feeds the header's fallback.
 fn deselect(model: Model, label: String) -> Model {
   Model(
     ..model,
@@ -1614,17 +1610,14 @@ fn deselect(model: Model, label: String) -> Model {
   )
 }
 
-/// Apply the M2 refresh rules to the loaded session list: drop a vanished
-/// selection, auto-select the first ACTIVE (non-archived) session — unless
+/// Apply the M2 refresh rules to the loaded thread list: drop a vanished
+/// selection, auto-select the first ACTIVE (non-archived) thread — unless
 /// the no-selection state is deliberate (`suppress_autoselect`) — and show
 /// the create panel only when there is nothing to select. An archived
 /// selection stays selected (the chat pane keeps showing what the user
 /// just archived, and a deliberately re-opened archived row survives a
 /// refresh) but never auto-selects.
-fn after_sessions(
-  model: Model,
-  summaries: List(session.SessionSummary),
-) -> Model {
+fn after_threads(model: Model, summaries: List(thread.ThreadSummary)) -> Model {
   let active = list.filter(summaries, fn(summary) { !summary.archived })
   let selected = case model.selected {
     Some(id) ->
@@ -1642,7 +1635,7 @@ fn after_sessions(
   let ended = option.is_some(model.selected) && option.is_none(selected)
   Model(
     ..model,
-    sessions: summaries,
+    threads: summaries,
     selected: selected,
     // A landed selection re-arms the auto-selection window (the next
     // deliberate deselect must suppress again); a deliberate no-selection
@@ -1653,12 +1646,12 @@ fn after_sessions(
     },
     create_open: case active, selected {
       [], _ -> True
-      // No selection with sessions available is now a real state (the
+      // No selection with threads available is now a real state (the
       // deliberate no-selection mode), not a gap: keep the panel as the
       // user left it — closed after an archive-deselect, open when the
-      // New-session button opened it alongside the deselect.
+      // New-thread button opened it alongside the deselect.
       _, None -> model.create_open
-      // A panel auto-opened by an (empty-at-boot) session list closes
+      // A panel auto-opened by an (empty-at-boot) thread list closes
       // again as soon as there is something to select; one the user opened
       // by hand stays open.
       _, Some(_) ->
@@ -1675,8 +1668,8 @@ fn after_sessions(
       True -> []
       False -> model.log
     },
-    // The pending flushes belong to the ended session's log; a stale
-    // entry must never stamp another session's (possibly unstamped)
+    // The pending flushes belong to the ended thread's log; a stale
+    // entry must never stamp another thread's (possibly unstamped)
     // line that happens to carry the same text.
     flushed: case ended {
       True -> []
@@ -1687,7 +1680,7 @@ fn after_sessions(
       False -> model.bubble
     },
     // The hidden flag belongs to the cleared bubble: a stale False (the
-    // ended session's bubble was visible) would let the NEXT session's
+    // ended thread's bubble was visible) would let the NEXT thread's
     // first streamed token — even whitespace-only — render, bypassing the
     // render-empty rule the Token arm applies.
     bubble_hidden: case ended {
@@ -1719,10 +1712,10 @@ fn after_sessions(
       False -> model.turn_base
     },
     model_label: case ended {
-      True -> "session ended"
+      True -> "thread ended"
       False -> model.model_label
     },
-    // The popup belongs to the ended session's log — same rule as the
+    // The popup belongs to the ended thread's log — same rule as the
     // pending flushes above it.
     pop: case ended {
       True -> None
@@ -1739,7 +1732,7 @@ fn first_alias(model: Model, aliases: List(String)) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Effects (registry / session / model API glue)
+// Effects (registry / thread / model API glue)
 // ---------------------------------------------------------------------------
 
 /// Fetch the selected provider's live model list (multi-provider §12:
@@ -1790,13 +1783,13 @@ pub fn pick_provider(
 }
 
 // ---------------------------------------------------------------------------
-// Session / registry effects
+// Thread / registry effects
 // ---------------------------------------------------------------------------
 
-fn sessions_effect(model: Model) -> Effect(Msg) {
+fn threads_effect(model: Model) -> Effect(Msg) {
   let registry = model.registry
   effect.from(fn(dispatch) {
-    dispatch(SessionsLoaded(session_registry.list_sessions(registry)))
+    dispatch(ThreadsLoaded(thread_registry.list_threads(registry)))
   })
 }
 
@@ -1806,8 +1799,8 @@ fn join_effect(model: Model, id: String) -> Effect(Msg) {
   case model.events {
     Some(events) ->
       effect.from(fn(_dispatch) {
-        case session_registry.get(registry, id) {
-          Ok(subject) -> process.send(subject, session.Join(events, visit))
+        case thread_registry.get(registry, id) {
+          Ok(subject) -> process.send(subject, thread.Join(events, visit))
           Error(_) -> Nil
         }
       })
@@ -1815,23 +1808,23 @@ fn join_effect(model: Model, id: String) -> Effect(Msg) {
   }
 }
 
-/// Detach this connection's subscription from a session it is leaving.
-/// The session-event subject is ONE long-lived subject per connection
-/// (see `events_effect`), so a session switch must explicitly Leave the
-/// old session: the session actor only prunes subscribers whose process
+/// Detach this connection's subscription from a thread it is leaving.
+/// The thread-event subject is ONE long-lived subject per connection
+/// (see `events_effect`), so a thread switch must explicitly Leave the
+/// old thread: the thread actor only prunes subscribers whose process
 /// died — a live subject stays in the fan-out forever, and without the
-/// Leave the old session's stream kept rendering into the new session's
+/// Leave the old thread's stream kept rendering into the new thread's
 /// view. Fan-out hygiene, not correctness: correctness is the per-event
-/// id filter (`SessionScoped`), because broadcasts already in the
+/// id filter (`ThreadScoped`), because broadcasts already in the
 /// subscriber's mailbox when Leave lands still arrive. Unknown/vanished
-/// sessions fail the registry lookup harmlessly.
+/// threads fail the registry lookup harmlessly.
 fn leave_effect(model: Model, id: String) -> Effect(Msg) {
   let registry = model.registry
   case model.events {
     Some(events) ->
       effect.from(fn(_dispatch) {
-        case session_registry.get(registry, id) {
-          Ok(subject) -> process.send(subject, session.Leave(events))
+        case thread_registry.get(registry, id) {
+          Ok(subject) -> process.send(subject, thread.Leave(events))
           Error(_) -> Nil
         }
       })
@@ -1844,7 +1837,7 @@ fn send_effect(model: Model, text: String) -> Effect(Msg) {
   let id = model.selected
   effect.from(fn(dispatch) {
     let resolved = case id {
-      Some(session_id) -> session_registry.get(registry, session_id)
+      Some(thread_id) -> thread_registry.get(registry, thread_id)
       None -> Error(Nil)
     }
     case resolved {
@@ -1853,22 +1846,22 @@ fn send_effect(model: Model, text: String) -> Effect(Msg) {
         // rule. The transcript always carries the system prompt, so "no
         // user message yet" is a count of 1; the registry refuses to
         // clobber a manual (or already generated) title regardless.
-        let is_first = session.describe(subject).message_count <= 1
-        case session.send_message(subject, text) {
-          session.Sent -> {
+        let is_first = thread.describe(subject).message_count <= 1
+        case thread.send_message(subject, text) {
+          thread.Sent -> {
             case is_first, id {
-              True, Some(session_id) -> {
+              True, Some(thread_id) -> {
                 let _ =
-                  session_registry.auto_title(
+                  thread_registry.auto_title(
                     registry,
-                    session_id,
-                    session_registry.title_from_first_message(text),
+                    thread_id,
+                    thread_registry.title_from_first_message(text),
                   )
                 Nil
               }
               _, _ -> Nil
             }
-            // Refresh on EVERY send, not just the first: the session
+            // Refresh on EVERY send, not just the first: the thread
             // bumps its activity at the send itself (the user message
             // commits on append, even if the turn later fails), so a
             // previous-day conversation re-buckets to Today and jumps to
@@ -1876,10 +1869,10 @@ fn send_effect(model: Model, text: String) -> Effect(Msg) {
             // reply's TurnDone refresh left the row under Yesterday for
             // the whole turn. The first-message case also lands the new
             // title here; the turn's own events follow.
-            dispatch(SessionsLoaded(session_registry.list_sessions(registry)))
+            dispatch(ThreadsLoaded(thread_registry.list_threads(registry)))
             dispatch(SendAccepted)
           }
-          session.Busy -> dispatch(SendRejected("busy"))
+          thread.Busy -> dispatch(SendRejected("busy"))
         }
       }
       Error(_) -> dispatch(SendRejected("gone"))
@@ -1892,11 +1885,11 @@ fn stop_effect(model: Model) -> Effect(Msg) {
   let id = model.selected
   effect.from(fn(_dispatch) {
     let resolved = case id {
-      Some(session_id) -> session_registry.get(registry, session_id)
+      Some(thread_id) -> thread_registry.get(registry, thread_id)
       None -> Error(Nil)
     }
     case resolved {
-      Ok(subject) -> session.stop(subject)
+      Ok(subject) -> thread.stop(subject)
       Error(_) -> Nil
     }
   })
@@ -1906,25 +1899,25 @@ fn create_effect(model: Model, alias: String) -> Effect(Msg) {
   let registry = model.registry
   effect.from(fn(dispatch) {
     // The registry builds the M3 agent-loop runner itself, from the tool
-    // registry frozen at its boot — sessions created here get the full
+    // registry frozen at its boot — threads created here get the full
     // toolset, pinned to the create panel's selected provider + model
     // (multi-provider §8: the pin is explicit, never defaulted).
     let create = case model.provider {
-      Some(provider_id) -> session_registry.create(registry, provider_id, alias)
+      Some(provider_id) -> thread_registry.create(registry, provider_id, alias)
       None ->
-        Error(session_registry.ProviderFailed(session_registry.ProviderUnknown))
+        Error(thread_registry.ProviderFailed(thread_registry.ProviderUnknown))
     }
     case create {
       Ok(record) -> {
         let now = timing.wall_now_s()
         dispatch(
           Created(
-            session.SessionSummary(
+            thread.ThreadSummary(
               id: record.id,
               provider_id: option.unwrap(model.provider, ""),
               model: record.model,
               title: "",
-              title_source: session.AutoTitle,
+              title_source: thread.AutoTitle,
               pinned: False,
               tags: [],
               archived: False,
@@ -1937,38 +1930,37 @@ fn create_effect(model: Model, alias: String) -> Effect(Msg) {
           ),
         )
       }
-      Error(session_registry.EmptyModel) ->
-        dispatch(CreateFailed("empty model"))
-      Error(session_registry.ProviderFailed(reason)) ->
+      Error(thread_registry.EmptyModel) -> dispatch(CreateFailed("empty model"))
+      Error(thread_registry.ProviderFailed(reason)) ->
         dispatch(CreateFailed(describe_provider_error(reason)))
-      Error(session_registry.StartFailed(reason)) ->
+      Error(thread_registry.StartFailed(reason)) ->
         dispatch(CreateFailed(reason))
     }
   })
 }
 
 /// Fixed text for a provider resolution failure on the create path.
-fn describe_provider_error(reason: session_registry.ProviderError) -> String {
+fn describe_provider_error(reason: thread_registry.ProviderError) -> String {
   case reason {
-    session_registry.ProviderUnknown -> "no provider configured"
-    session_registry.ProviderDisabled -> "provider is disabled"
-    session_registry.ProviderKeyUnavailable -> "provider key unavailable"
+    thread_registry.ProviderUnknown -> "no provider configured"
+    thread_registry.ProviderDisabled -> "provider is disabled"
+    thread_registry.ProviderKeyUnavailable -> "provider key unavailable"
   }
 }
 
-/// Run one registry metadata mutation, then refresh the session list so
+/// Run one registry metadata mutation, then refresh the thread list so
 /// the sidebar reflects it immediately (pins re-order, archive hides,
-/// delete drops the row). A `False` reply means the session vanished
+/// delete drops the row). A `False` reply means the thread vanished
 /// mid-edit — surface it as a note.
 fn mutate_effect(
   model: Model,
-  run: fn(process.Subject(session_registry.Msg)) -> Bool,
+  run: fn(process.Subject(thread_registry.Msg)) -> Bool,
 ) -> Effect(Msg) {
   let registry = model.registry
   effect.from(fn(dispatch) {
     case run(registry) {
-      True -> dispatch(SessionsLoaded(session_registry.list_sessions(registry)))
-      False -> dispatch(SessionOpFailed("session is gone"))
+      True -> dispatch(ThreadsLoaded(thread_registry.list_threads(registry)))
+      False -> dispatch(ThreadOpFailed("thread is gone"))
     }
   })
 }
@@ -2067,9 +2059,9 @@ pub fn view(model: Model) -> Element(Msg) {
 fn sidebar(model: Model) -> Element(Msg) {
   html.aside([attr.id("sidebar")], [
     // The create panel comes FIRST (ui-polish F4): it used to sit below the
-    // whole session list, so pressing "New" (top-right of the list) usually
+    // whole thread list, so pressing "New" (top-right of the list) usually
     // opened it below the fold. Markup order is the fix — no new state, and
-    // the `#create-panel` / `#new-session` selectors the browser suite drives
+    // the `#create-panel` / `#new-thread` selectors the browser suite drives
     // are unchanged.
     html.section([attr.id("create-panel"), attr.hidden(!model.create_open)], [
       html.label([attr.for("provider-picker")], [html.text("Provider")]),
@@ -2100,22 +2092,22 @@ fn sidebar(model: Model) -> Element(Msg) {
       ),
       html.button(
         [
-          attr.id("create-session"),
+          attr.id("create-thread"),
           attr.type_("button"),
           attr.disabled(model.aliases == [] || model.provider == None),
           event.on_click(CreateRequested),
         ],
-        [html.text("Create session")],
+        [html.text("Create thread")],
       ),
     ]),
     html.section([], [
       html.div([attr.class("section-head")], [
-        html.h2([], [html.text("Sessions")]),
+        html.h2([], [html.text("Threads")]),
         html.button(
           [
-            attr.id("new-session"),
+            attr.id("new-thread"),
             attr.type_("button"),
-            event.on_click(NewSessionToggled),
+            event.on_click(NewThreadToggled),
           ],
           [html.text("New")],
         ),
@@ -2141,8 +2133,8 @@ fn sidebar(model: Model) -> Element(Msg) {
         ),
       ]),
       html.div(
-        [attr.id("session-list"), attr.class("session-list"), attr.role("list")],
-        session_rows(model),
+        [attr.id("thread-list"), attr.class("thread-list"), attr.role("list")],
+        thread_rows(model),
       ),
     ]),
   ])
@@ -2189,7 +2181,7 @@ fn tag_filter_row(model: Model) -> Element(Msg) {
         attr.type_("text"),
         attr.value(model.tag_filter),
         attr.placeholder("Filter by title or tag…"),
-        attr.aria("label", "Filter sessions"),
+        attr.aria("label", "Filter threads"),
         filter_changed(),
       ]),
     ),
@@ -2212,9 +2204,9 @@ fn tag_filter_row(model: Model) -> Element(Msg) {
 /// The visible rows: the filter runs first (title + tags), then the list
 /// splits into the pinned section, the recency buckets, and (when the
 /// toggle is on) the archived section.
-fn session_rows(model: Model) -> List(Element(Msg)) {
+fn thread_rows(model: Model) -> List(Element(Msg)) {
   let visible =
-    list.filter(model.sessions, fn(summary) {
+    list.filter(model.threads, fn(summary) {
       matches_filter(summary, model.tag_filter)
     })
   let has_active = list.any(visible, fn(summary) { !summary.archived })
@@ -2231,16 +2223,16 @@ fn session_rows(model: Model) -> List(Element(Msg)) {
       let pinned_group = case pinned {
         [] -> element.none()
         rows ->
-          html.div([attr.class("session-group pinned-group")], [
+          html.div([attr.class("thread-group pinned-group")], [
             html.h3([attr.class("group-label")], [html.text("Pinned")]),
-            ..list.map(rows, session_row(model, _))
+            ..list.map(rows, thread_row(model, _))
           ])
       }
       let archived_group = case model.show_archived, archived {
         True, [_first, ..] ->
-          html.div([attr.class("session-group archive-group")], [
+          html.div([attr.class("thread-group archive-group")], [
             html.h3([attr.class("group-label")], [html.text("Archived")]),
-            ..list.map(archived, session_row(model, _))
+            ..list.map(archived, thread_row(model, _))
           ])
         _, _ -> element.none()
       }
@@ -2258,10 +2250,10 @@ fn empty_state_text(model: Model) -> String {
   case string.trim(model.tag_filter) {
     "" ->
       case model.show_archived {
-        True -> "No sessions."
-        False -> "No sessions yet."
+        True -> "No threads."
+        False -> "No threads yet."
       }
-    _ -> "No sessions match the filter."
+    _ -> "No threads match the filter."
   }
 }
 
@@ -2269,7 +2261,7 @@ fn empty_state_text(model: Model) -> String {
 /// already sorted by activity, so each bucket keeps that order.
 fn bucket_groups(
   model: Model,
-  summaries: List(session.SessionSummary),
+  summaries: List(thread.ThreadSummary),
 ) -> List(Element(Msg)) {
   let now = timing.wall_now_s()
   [Today, Yesterday, Previous7Days, Older]
@@ -2282,23 +2274,23 @@ fn bucket_groups(
   |> list.filter(fn(entry) { entry.1 != [] })
   |> list.map(fn(entry) {
     let #(wanted, rows) = entry
-    html.div([attr.class("session-group")], [
+    html.div([attr.class("thread-group")], [
       html.h3([attr.class("group-label")], [html.text(bucket_label(wanted))]),
-      ..list.map(rows, session_row(model, _))
+      ..list.map(rows, thread_row(model, _))
     ])
   })
 }
 
-/// The header's session context (ui-polish F8): the selected session's
+/// The header's thread context (ui-polish F8): the selected thread's
 /// title — the bare model alias ("nexus  smart") was cryptic, and the
-/// alias already rides the row subtitle. An untitled session falls back
+/// alias already rides the row subtitle. An untitled thread falls back
 /// to its alias (the row-title rule); with nothing selected the
-/// `model_label` fallbacks ("connecting…", "session ended") keep their
+/// `model_label` fallbacks ("connecting…", "thread ended") keep their
 /// feedback role.
 fn header_title(model: Model) -> String {
   case model.selected {
     Some(id) ->
-      case list.find(model.sessions, fn(s) { s.id == id }) {
+      case list.find(model.threads, fn(s) { s.id == id }) {
         Ok(summary) -> display_title(summary)
         Error(_) -> model.model_label
       }
@@ -2306,9 +2298,9 @@ fn header_title(model: Model) -> String {
   }
 }
 
-/// Display title for a session: its title, or the model alias until the
+/// Display title for a thread: its title, or the model alias until the
 /// first message auto-titles it.
-fn display_title(summary: session.SessionSummary) -> String {
+fn display_title(summary: thread.ThreadSummary) -> String {
   case summary.title {
     "" -> summary.model
     titled -> titled
@@ -2318,11 +2310,11 @@ fn display_title(summary: session.SessionSummary) -> String {
 /// One sidebar row: a select button (title + model/age subtitle), tag
 /// chips, compact controls, and hidden inline editors + delete confirm.
 /// Everything is escaped text nodes — no innerHTML anywhere.
-fn session_row(model: Model, summary: session.SessionSummary) -> Element(Msg) {
+fn thread_row(model: Model, summary: thread.ThreadSummary) -> Element(Msg) {
   let id = summary.id
   let selected = model.selected == Some(id)
   let title = display_title(summary)
-  // The subtitle pins the session's identity: provider/model (both
+  // The subtitle pins the thread's identity: provider/model (both
   // frozen at creation, §8) plus its age. The provider name resolves
   // from the masked list so renames show at once.
   let subtitle =
@@ -2334,21 +2326,21 @@ fn session_row(model: Model, summary: session.SessionSummary) -> Element(Msg) {
   html.div(
     [
       attr.class(case selected {
-        True -> "session-row selected"
-        False -> "session-row"
+        True -> "thread-row selected"
+        False -> "thread-row"
       }),
-      attr.data("session-id", id),
+      attr.data("thread-id", id),
     ],
     [
       html.button(
         [
-          attr.class("session-main"),
+          attr.class("thread-main"),
           attr.type_("button"),
           attr.aria("current", bool_aria(selected)),
           event.on_click(Select(id)),
         ],
         [
-          html.span([attr.class("session-title")], [
+          html.span([attr.class("thread-title")], [
             html.text(
               case summary.pinned {
                 True -> "📌 "
@@ -2357,7 +2349,7 @@ fn session_row(model: Model, summary: session.SessionSummary) -> Element(Msg) {
               <> title,
             ),
           ]),
-          html.span([attr.class("session-sub")], [html.text(subtitle)]),
+          html.span([attr.class("thread-sub")], [html.text(subtitle)]),
         ],
       ),
       case summary.tags {
@@ -2379,7 +2371,7 @@ fn session_row(model: Model, summary: session.SessionSummary) -> Element(Msg) {
           )
       },
       html.div([attr.class("row-controls")], [
-        // Invariant: an archived session is never pinned (archiving
+        // Invariant: an archived thread is never pinned (archiving
         // unpins; the registry refuses pins on archived rows), so the
         // control simply does not exist there.
         case summary.archived {
@@ -2391,16 +2383,16 @@ fn session_row(model: Model, summary: session.SessionSummary) -> Element(Msg) {
                 False -> "Pin"
               },
               case summary.pinned {
-                True -> "Unpin this session"
-                False -> "Pin this session to the top"
+                True -> "Unpin this thread"
+                False -> "Pin this thread to the top"
               },
               PinToggled(id),
             )
         },
-        ui_settings.control("Rename", "Rename this session", RenameToggled(id)),
+        ui_settings.control("Rename", "Rename this thread", RenameToggled(id)),
         ui_settings.control(
           "Tags",
-          "Edit tags for this session",
+          "Edit tags for this thread",
           TagsToggled(id),
         ),
         ui_settings.control(
@@ -2409,14 +2401,14 @@ fn session_row(model: Model, summary: session.SessionSummary) -> Element(Msg) {
             False -> "Archive"
           },
           case summary.archived {
-            True -> "Restore this session to the active list"
-            False -> "Archive (soft-hide) this session"
+            True -> "Restore this thread to the active list"
+            False -> "Archive (soft-hide) this thread"
           },
           Archived(id, !summary.archived),
         ),
         ui_settings.control(
           "Delete",
-          "Delete this session forever",
+          "Delete this thread forever",
           DeleteRequested(id),
         ),
       ]),
@@ -2435,7 +2427,7 @@ fn session_row(model: Model, summary: session.SessionSummary) -> Element(Msg) {
             attr.type_("text"),
             attr.name("title"),
             attr.value(summary.title),
-            attr.placeholder("Session title"),
+            attr.placeholder("Thread title"),
             attr.aria("label", "New title for " <> id),
           ]),
           html.button([attr.type_("submit")], [html.text("Save")]),
@@ -2475,7 +2467,7 @@ fn session_row(model: Model, summary: session.SessionSummary) -> Element(Msg) {
         ],
         [
           html.span([], [
-            html.text("Delete this session? This cannot be undone."),
+            html.text("Delete this thread? This cannot be undone."),
           ]),
           html.button(
             [
@@ -2495,7 +2487,7 @@ fn session_row(model: Model, summary: session.SessionSummary) -> Element(Msg) {
 }
 
 fn chat(model: Model) -> Element(Msg) {
-  let has_session = option.is_some(model.selected)
+  let has_thread = option.is_some(model.selected)
   html.main([attr.id("chat")], [
     // `#log-wrap` anchors the jump button to the log's bottom edge (the
     // log itself is the scroll container, so the button must not live in
@@ -2511,7 +2503,7 @@ fn chat(model: Model) -> Element(Msg) {
       jump_latest(),
     ]),
     loop_chip(model),
-    composer(model, has_session),
+    composer(model, has_thread),
   ])
 }
 
@@ -2578,7 +2570,7 @@ fn loop_chip(model: Model) -> Element(Msg) {
 /// - On `SendAccepted` the textarea's key changes, which replaces the
 ///   element wholesale — clearing it no `value` patch ever could — and its
 ///   `autofocus` attribute puts the caret right back for the next turn.
-fn composer(model: Model, has_session: Bool) -> Element(Msg) {
+fn composer(model: Model, has_thread: Bool) -> Element(Msg) {
   keyed.element(
     "form",
     [attr.id("composer"), attr.action("#"), submit_requested()],
@@ -2594,7 +2586,7 @@ fn composer(model: Model, has_session: Bool) -> Element(Msg) {
               "Send a message… (Enter · Shift+Enter for a new line)",
             ),
             attr.autofocus(True),
-            attr.disabled(!has_session),
+            attr.disabled(!has_thread),
             enter_key(),
           ],
           "",
@@ -2621,7 +2613,7 @@ fn composer(model: Model, has_session: Bool) -> Element(Msg) {
             [
               attr.id("send"),
               attr.type_("submit"),
-              attr.disabled(model.streaming || !has_session),
+              attr.disabled(model.streaming || !has_thread),
             ],
             [html.text("Send")],
           ),
@@ -2662,9 +2654,9 @@ fn log_lines(model: Model) -> List(Element(Msg)) {
   }
   case lines {
     // ui-polish F5: an empty transcript used to render a blank void above
-    // the composer. Give the fresh-session state an intentional muted
+    // the composer. Give the fresh-thread state an intentional muted
     // hint — a Lustre text node, like every word this UI renders. With no
-    // session selected (the deliberate no-selection state) the composer
+    // thread selected (the deliberate no-selection state) the composer
     // is disabled, so the hint points at the sidebar instead of a send
     // that would fail.
     [] -> [
@@ -2673,7 +2665,7 @@ fn log_lines(model: Model) -> List(Element(Msg)) {
           Some(_) ->
             "Send a message to start — tool calls and reasoning will render here"
           None ->
-            "No session selected — pick one from the list or create a new one."
+            "No thread selected — pick one from the list or create a new one."
         }),
       ]),
     ]
@@ -2787,7 +2779,7 @@ fn render_line(
 /// row plus the conversation gap per chip). Any other line ends the run;
 /// an expanded chip takes its full row back via CSS off the native
 /// `[open]` attribute, no script involved. Tail-recursive on purpose:
-/// session history is unbounded and the per-connection UI process must
+/// thread history is unbounded and the per-connection UI process must
 /// not grow a stack frame per transcript group.
 fn group_chips(
   md_cache: dict.Dict(String, List(Element(Msg))),
@@ -2931,7 +2923,7 @@ fn pending_card(call: PendingCall) -> Element(Msg) {
 /// `article` child as the card. The call is re-resolved from the log /
 /// pending lists on EVERY render: an open popup live-updates as arguments
 /// stream and the result lands, and a popup whose call no longer resolves
-/// (rolled-back turn, session switch) renders nothing instead of going
+/// (rolled-back turn, thread switch) renders nothing instead of going
 /// stale. The full argument and result strings are Lustre text nodes
 /// inside `<pre>` — inert, like everything else this UI renders; the
 /// popup just doesn't truncate. Codemode calls carry their script as the
@@ -3138,7 +3130,7 @@ fn provider_change() -> attr.Attribute(Msg) {
 
 /// The display name for a summary's pinned provider, resolved from the
 /// masked list (renames show at once); the id stands in while the list
-/// lags. Deletes are guarded while sessions pin a provider, so the
+/// lags. Deletes are guarded while threads pin a provider, so the
 /// fallback is cosmetic, not semantic.
 fn provider_display(model: Model, provider_id: String) -> String {
   case list.find(model.provider_list, fn(p) { p.id == provider_id }) {

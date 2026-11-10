@@ -1,4 +1,4 @@
-//// Offline tests for the M1 session actor protocol, using scripted fake
+//// Offline tests for the M1 thread actor protocol, using scripted fake
 //// turn runners — no network, no Bifrost.
 
 import gleam/erlang/process
@@ -9,24 +9,24 @@ import gleeunit/should
 import nexus/config
 import nexus/loop
 import nexus/openai
-import nexus/session
+import nexus/thread
 import nexus/timing
 import nexus/transcript
 import nexus/utility
 
-/// Every session actor in this file starts with this id; `scoped` stamps
+/// Every thread actor in this file starts with this id; `scoped` stamps
 /// it onto expected events (each fan-out delivery carries the emitting
-/// session's id — see `session.SessionEvent`).
-const test_session_id = "s-test"
+/// thread's id — see `thread.ThreadEvent`).
+const test_thread_id = "s-test"
 
 /// Wrap an expected payload in the delivered envelope (first visit).
-fn scoped(kind: session.EventKind) -> session.SessionEvent {
+fn scoped(kind: thread.EventKind) -> thread.ThreadEvent {
   scoped_at(1, kind)
 }
 
 /// Same, with an explicit visit generation.
-fn scoped_at(visit: Int, kind: session.EventKind) -> session.SessionEvent {
-  session.SessionEvent(test_session_id, visit, kind)
+fn scoped_at(visit: Int, kind: thread.EventKind) -> thread.ThreadEvent {
+  thread.ThreadEvent(test_thread_id, visit, kind)
 }
 
 fn test_config() -> config.Config {
@@ -79,12 +79,12 @@ fn happy_runner(
   tr,
   _cancel,
   on_event: fn(loop.LoopEvent) -> Nil,
-) -> session.TurnOutcome {
+) -> thread.TurnOutcome {
   on_event(loop.StreamEvent(openai.TokenDelta("Hello")))
   on_event(loop.StreamEvent(openai.TokenDelta(" world")))
   // Stamped like the real loop stamps every append, so the turn's
-  // terminal event and its replay carry the session's committed stamp.
-  session.StreamDone(
+  // terminal event and its replay carry the thread's committed stamp.
+  thread.StreamDone(
     stats(),
     transcript.append_assistant(tr, "Hello world")
       |> transcript.stamp(timing.wall_now_s()),
@@ -97,16 +97,16 @@ fn blocking_runner(
   tr,
   cancel: process.Subject(Nil),
   on_event: fn(loop.LoopEvent) -> Nil,
-) -> session.TurnOutcome {
+) -> thread.TurnOutcome {
   on_event(loop.StreamEvent(openai.TokenDelta("partial")))
   let selector = process.new_selector() |> process.select(cancel)
   case process.selector_receive(selector, 5000) {
     Ok(_) ->
-      session.StreamStopped(
+      thread.StreamStopped(
         transcript.append_assistant(tr, "partial")
         |> transcript.stamp(timing.wall_now_s()),
       )
-    Error(_) -> session.StreamErrored("timeout")
+    Error(_) -> thread.StreamErrored("timeout")
   }
 }
 
@@ -116,11 +116,11 @@ fn delayed_runner(
   tr,
   _cancel,
   on_event: fn(loop.LoopEvent) -> Nil,
-) -> session.TurnOutcome {
+) -> thread.TurnOutcome {
   on_event(loop.StreamEvent(openai.TokenDelta("first")))
   process.sleep(60)
   on_event(loop.StreamEvent(openai.TokenDelta("second")))
-  session.StreamDone(
+  thread.StreamDone(
     stats(),
     transcript.append_assistant(tr, "firstsecond")
       |> transcript.stamp(timing.wall_now_s()),
@@ -133,16 +133,16 @@ fn failing_runner(
   _tr,
   _cancel,
   on_event: fn(loop.LoopEvent) -> Nil,
-) -> session.TurnOutcome {
+) -> thread.TurnOutcome {
   on_event(loop.StreamEvent(openai.TokenDelta("never committed")))
-  session.StreamErrored("non200")
+  thread.StreamErrored("non200")
 }
 
 /// Kills its own (worker) process: the monitor path must convert this into
-/// a TurnFailed without hurting the session actor.
-fn crashing_runner(_endpoint, _tr, _cancel, _on_event) -> session.TurnOutcome {
+/// a TurnFailed without hurting the thread actor.
+fn crashing_runner(_endpoint, _tr, _cancel, _on_event) -> thread.TurnOutcome {
   process.kill(process.self())
-  session.StreamErrored("unreachable")
+  thread.StreamErrored("unreachable")
 }
 
 type CounterMsg {
@@ -150,7 +150,7 @@ type CounterMsg {
 }
 
 /// A tiny turn counter: the flaky runner below needs to know which turn it
-/// is on, and the session actor serialises turns, so the count is exact.
+/// is on, and the thread actor serialises turns, so the count is exact.
 fn start_counter() -> process.Subject(CounterMsg) {
   // The subject must be owned by the counter process itself, so create it
   // there and hand it back over an ack subject.
@@ -173,33 +173,33 @@ fn counter_loop(subj: process.Subject(CounterMsg), count: Int) -> Nil {
   }
 }
 
-/// First turn streams normally, later turns fail: session A gets two metric
-/// samples while committing the same history as a single-turn session.
-fn flaky_runner(counter: process.Subject(CounterMsg)) -> session.TurnRunner {
+/// First turn streams normally, later turns fail: thread A gets two metric
+/// samples while committing the same history as a single-turn thread.
+fn flaky_runner(counter: process.Subject(CounterMsg)) -> thread.TurnRunner {
   fn(_endpoint, tr, _cancel, on_event: fn(loop.LoopEvent) -> Nil) {
     let turn = process.call(counter, 1000, fn(reply) { Ping(reply) })
     on_event(loop.StreamEvent(openai.TokenDelta("Hello")))
     on_event(loop.StreamEvent(openai.TokenDelta(" world")))
     case turn {
       1 ->
-        session.StreamDone(
+        thread.StreamDone(
           stats(),
           transcript.append_assistant(tr, "Hello world")
             |> transcript.stamp(timing.wall_now_s()),
         )
-      _ -> session.StreamErrored("later turn failed")
+      _ -> thread.StreamErrored("later turn failed")
     }
   }
 }
 
 fn expect_hello(
-  sub: process.Subject(session.SessionEvent),
+  sub: process.Subject(thread.ThreadEvent),
   model: String,
   messages: Int,
-) -> session.SessionEvent {
+) -> thread.ThreadEvent {
   let event = expect_event(sub)
   case event {
-    session.SessionEvent(_, 1, session.Hello(model: m, messages: n, metrics: _))
+    thread.ThreadEvent(_, 1, thread.Hello(model: m, messages: n, metrics: _))
       if m == model && n == messages
     -> event
     _ -> panic as "expected hello"
@@ -208,8 +208,8 @@ fn expect_hello(
 
 /// The sample a `happy_runner` turn must leave behind. Timings are measured
 /// from the actor's monotonic clock, so only the shape is asserted here.
-fn is_completed(sample: session.MetricSample) -> Bool {
-  sample.outcome == session.Completed
+fn is_completed(sample: thread.MetricSample) -> Bool {
+  sample.outcome == thread.Completed
   && sample.token_deltas == 2
   && sample.duration_ms >= 0
   && sample.stopped_chars == None
@@ -217,8 +217,8 @@ fn is_completed(sample: session.MetricSample) -> Bool {
 }
 
 fn expect_event(
-  sub: process.Subject(session.SessionEvent),
-) -> session.SessionEvent {
+  sub: process.Subject(thread.ThreadEvent),
+) -> thread.ThreadEvent {
   let assert Ok(event) = process.receive(sub, 2000)
   event
 }
@@ -230,13 +230,13 @@ fn expect_event(
 /// RETURN it so callers can verify the feature's contract — the same
 /// message carries the same stamp live and on replay.
 fn expect_user_echo_at(
-  sub: process.Subject(session.SessionEvent),
+  sub: process.Subject(thread.ThreadEvent),
   visit: Int,
   text: String,
 ) -> Int {
-  let assert session.SessionEvent(sid, v, session.UserEcho(actual, Some(stamp))) =
+  let assert thread.ThreadEvent(sid, v, thread.UserEcho(actual, Some(stamp))) =
     expect_event(sub)
-  sid |> should.equal(test_session_id)
+  sid |> should.equal(test_thread_id)
   v |> should.equal(visit)
   actual |> should.equal(text)
   stamp
@@ -244,7 +244,7 @@ fn expect_user_echo_at(
 
 /// The first-visit shorthand — the overwhelmingly common shape.
 fn expect_user_echo(
-  sub: process.Subject(session.SessionEvent),
+  sub: process.Subject(thread.ThreadEvent),
   text: String,
 ) -> Int {
   expect_user_echo_at(sub, 1, text)
@@ -252,16 +252,16 @@ fn expect_user_echo(
 
 /// The AssistantFull twin of `expect_user_echo_at`.
 fn expect_assistant_full_at(
-  sub: process.Subject(session.SessionEvent),
+  sub: process.Subject(thread.ThreadEvent),
   visit: Int,
   text: String,
 ) -> Int {
-  let assert session.SessionEvent(
+  let assert thread.ThreadEvent(
     sid,
     v,
-    session.AssistantFull(actual, Some(stamp)),
+    thread.AssistantFull(actual, Some(stamp)),
   ) = expect_event(sub)
-  sid |> should.equal(test_session_id)
+  sid |> should.equal(test_thread_id)
   v |> should.equal(visit)
   actual |> should.equal(text)
   stamp
@@ -269,7 +269,7 @@ fn expect_assistant_full_at(
 
 /// The first-visit shorthand.
 fn expect_assistant_full(
-  sub: process.Subject(session.SessionEvent),
+  sub: process.Subject(thread.ThreadEvent),
   text: String,
 ) -> Int {
   expect_assistant_full_at(sub, 1, text)
@@ -298,14 +298,14 @@ fn no_utility_runner(
 fn no_utility_apply(
   _title: String,
   _tags: List(String),
-) -> Result(session.UtilityMeta, Nil) {
+) -> Result(thread.UtilityMeta, Nil) {
   Error(Nil)
 }
 
-fn start_with(runner: session.TurnRunner) -> process.Subject(session.Msg) {
+fn start_with(runner: thread.TurnRunner) -> process.Subject(thread.Msg) {
   let assert Ok(started) =
-    session.start_with_spec(session.SessionSpec(
-      id: test_session_id,
+    thread.start_with_spec(thread.ThreadSpec(
+      id: test_thread_id,
       cfg: test_config(),
       model: "test-alias",
       endpoint: test_endpoint(),
@@ -321,44 +321,38 @@ fn start_with(runner: session.TurnRunner) -> process.Subject(session.Msg) {
 }
 
 fn join(
-  sess: process.Subject(session.Msg),
-) -> process.Subject(session.SessionEvent) {
+  sess: process.Subject(thread.Msg),
+) -> process.Subject(thread.ThreadEvent) {
   let sub = process.new_subject()
-  process.send(sess, session.Join(sub, 1))
+  process.send(sess, thread.Join(sub, 1))
   sub
 }
 
 /// Re-subscribe an EXISTING subject with a new visit generation (the
 /// rapid A→B→A shape): later deliveries to `sub` carry generation 2.
 fn rejoin(
-  sess: process.Subject(session.Msg),
-  sub: process.Subject(session.SessionEvent),
+  sess: process.Subject(thread.Msg),
+  sub: process.Subject(thread.ThreadEvent),
 ) -> Nil {
-  process.send(sess, session.Join(sub, 2))
+  process.send(sess, thread.Join(sub, 2))
 }
 
 pub fn join_replays_history_test() {
   let sess = start_with(happy_runner)
   let sub = join(sess)
-  expect_event(sub) |> should.equal(scoped(session.Hello("test-alias", 1, [])))
-  should.equal(session.send_message(sess, "hi"), session.Sent)
+  expect_event(sub) |> should.equal(scoped(thread.Hello("test-alias", 1, [])))
+  should.equal(thread.send_message(sess, "hi"), thread.Sent)
   let live_stamp = expect_user_echo(sub, "hi")
-  expect_event(sub) |> should.equal(scoped(session.Token("Hello")))
-  expect_event(sub) |> should.equal(scoped(session.Token(" world")))
-  let assert session.SessionEvent(
-    _,
-    1,
-    session.TurnDone(stats, Some(turn_stamp)),
-  ) = expect_event(sub)
+  expect_event(sub) |> should.equal(scoped(thread.Token("Hello")))
+  expect_event(sub) |> should.equal(scoped(thread.Token(" world")))
+  let assert thread.ThreadEvent(_, 1, thread.TurnDone(stats, Some(turn_stamp))) =
+    expect_event(sub)
   stats.token_deltas |> should.equal(2)
 
   // A second subscriber joins after the turn: it gets Hello + replay.
   let sub2 = join(sess)
-  let assert session.SessionEvent(
-    _,
-    1,
-    session.Hello(model:, messages:, metrics:),
-  ) = expect_event(sub2)
+  let assert thread.ThreadEvent(_, 1, thread.Hello(model:, messages:, metrics:)) =
+    expect_event(sub2)
   model |> should.equal("test-alias")
   messages |> should.equal(3)
   // Reconnect replays the turn's metric sample (M2 §4.2).
@@ -378,14 +372,13 @@ pub fn completed_turn_appends_and_is_byte_stable_test() {
   let sub = join(sess)
   let _ = expect_event(sub)
 
-  should.equal(session.send_message(sess, "question"), session.Sent)
+  should.equal(thread.send_message(sess, "question"), thread.Sent)
   expect_user_echo(sub, "question")
-  expect_event(sub) |> should.equal(scoped(session.Token("Hello")))
-  expect_event(sub) |> should.equal(scoped(session.Token(" world")))
-  let assert session.SessionEvent(_, 1, session.TurnDone(_, _)) =
-    expect_event(sub)
+  expect_event(sub) |> should.equal(scoped(thread.Token("Hello")))
+  expect_event(sub) |> should.equal(scoped(thread.Token(" world")))
+  let assert thread.ThreadEvent(_, 1, thread.TurnDone(_, _)) = expect_event(sub)
 
-  let tr = session.snapshot(sess)
+  let tr = thread.snapshot(sess)
   transcript.length(tr) |> should.equal(3)
 
   // Contract rule 4: rebuilding from the same immutable list is
@@ -400,14 +393,14 @@ pub fn busy_rejects_second_send_test() {
   let sub = join(sess)
   let _ = expect_event(sub)
 
-  should.equal(session.send_message(sess, "first"), session.Sent)
+  should.equal(thread.send_message(sess, "first"), thread.Sent)
   // The worker emits its token before blocking; wait for it.
   expect_user_echo(sub, "first")
-  expect_event(sub) |> should.equal(scoped(session.Token("partial")))
+  expect_event(sub) |> should.equal(scoped(thread.Token("partial")))
 
   // Turn in flight: second send is rejected.
-  should.equal(session.send_message(sess, "second"), session.Busy)
-  session.stop(sess)
+  should.equal(thread.send_message(sess, "second"), thread.Busy)
+  thread.stop(sess)
   let _ = expect_event(sub)
 }
 
@@ -416,25 +409,25 @@ pub fn stop_cancels_and_commits_partial_test() {
   let sub = join(sess)
   let _ = expect_event(sub)
 
-  should.equal(session.send_message(sess, "stop me"), session.Sent)
+  should.equal(thread.send_message(sess, "stop me"), thread.Sent)
   expect_user_echo(sub, "stop me")
-  expect_event(sub) |> should.equal(scoped(session.Token("partial")))
+  expect_event(sub) |> should.equal(scoped(thread.Token("partial")))
 
-  session.stop(sess)
+  thread.stop(sess)
   // The stop commits the partial text, so the terminal event carries the
-  // session's committed stamp (the loop stamps every append).
-  let assert session.SessionEvent(sid, 1, session.TurnStopped(7, Some(_))) =
+  // thread's committed stamp (the loop stamps every append).
+  let assert thread.ThreadEvent(sid, 1, thread.TurnStopped(7, Some(_))) =
     expect_event(sub)
-  sid |> should.equal(test_session_id)
+  sid |> should.equal(test_thread_id)
 
   // Partial text was committed as the assistant turn.
-  transcript.length(session.snapshot(sess)) |> should.equal(3)
+  transcript.length(thread.snapshot(sess)) |> should.equal(3)
 
-  // Session accepts a new turn after the stop.
-  should.equal(session.send_message(sess, "again"), session.Sent)
+  // Thread accepts a new turn after the stop.
+  should.equal(thread.send_message(sess, "again"), thread.Sent)
   expect_user_echo(sub, "again")
-  expect_event(sub) |> should.equal(scoped(session.Token("partial")))
-  session.stop(sess)
+  expect_event(sub) |> should.equal(scoped(thread.Token("partial")))
+  thread.stop(sess)
   let _ = expect_event(sub)
 }
 
@@ -443,40 +436,40 @@ pub fn failed_turn_commits_nothing_test() {
   let sub = join(sess)
   let _ = expect_event(sub)
 
-  should.equal(session.send_message(sess, "will fail"), session.Sent)
+  should.equal(thread.send_message(sess, "will fail"), thread.Sent)
   expect_user_echo(sub, "will fail")
-  expect_event(sub) |> should.equal(scoped(session.Token("never committed")))
-  let assert session.SessionEvent(_, 1, session.TurnFailed(reason, _)) =
+  expect_event(sub) |> should.equal(scoped(thread.Token("never committed")))
+  let assert thread.ThreadEvent(_, 1, thread.TurnFailed(reason, _)) =
     expect_event(sub)
   should.be_true(string.contains(reason, "non200"))
 
   // System + user only: no assistant message, so a retry resends a
   // byte-identical prefix (cache-friendly).
-  transcript.length(session.snapshot(sess)) |> should.equal(2)
+  transcript.length(thread.snapshot(sess)) |> should.equal(2)
 
-  // And the session is usable again afterwards.
-  should.equal(session.send_message(sess, "retry"), session.Sent)
+  // And the thread is usable again afterwards.
+  should.equal(thread.send_message(sess, "retry"), thread.Sent)
   expect_user_echo(sub, "retry")
-  expect_event(sub) |> should.equal(scoped(session.Token("never committed")))
+  expect_event(sub) |> should.equal(scoped(thread.Token("never committed")))
   let _ = expect_event(sub)
 }
 
-pub fn crashing_worker_does_not_kill_session_test() {
+pub fn crashing_worker_does_not_kill_thread_test() {
   let sess = start_with(crashing_runner)
   let sub = join(sess)
   let _ = expect_event(sub)
 
-  should.equal(session.send_message(sess, "boom"), session.Sent)
+  should.equal(thread.send_message(sess, "boom"), thread.Sent)
   expect_user_echo(sub, "boom")
-  let assert session.SessionEvent(_, 1, session.TurnFailed(reason, _)) =
+  let assert thread.ThreadEvent(_, 1, thread.TurnFailed(reason, _)) =
     expect_event(sub)
   should.be_true(string.contains(reason, "worker"))
 
   // The actor survived and accepts another turn.
-  should.equal(session.send_message(sess, "still alive"), session.Sent)
+  should.equal(thread.send_message(sess, "still alive"), thread.Sent)
 }
 
-/// Live-streaming sessions stay single-turn even when the subscriber list
+/// Live-streaming threads stay single-turn even when the subscriber list
 /// keeps growing: two subscribers both see every event.
 pub fn fan_out_to_all_subscribers_test() {
   let sess = start_with(happy_runner)
@@ -485,20 +478,20 @@ pub fn fan_out_to_all_subscribers_test() {
   let sub2 = join(sess)
   let _ = expect_event(sub2)
 
-  should.equal(session.send_message(sess, "both"), session.Sent)
+  should.equal(thread.send_message(sess, "both"), thread.Sent)
   list.each([sub1, sub2], fn(sub) {
     expect_user_echo(sub, "both")
-    expect_event(sub) |> should.equal(scoped(session.Token("Hello")))
-    expect_event(sub) |> should.equal(scoped(session.Token(" world")))
+    expect_event(sub) |> should.equal(scoped(thread.Token("Hello")))
+    expect_event(sub) |> should.equal(scoped(thread.Token(" world")))
   })
 }
 
 /// A subscriber that moved on must stop receiving events. The UI keeps
 /// ONE subscription subject per connection and re-Joins it on every
-/// session switch (`nexus/ui.join_effect`), so the switch Leaves the old
-/// session — without the removal the old session's stream kept fanning
-/// out to the shared subject (the cross-session contamination bug).
-/// Delivery correctness beyond Leave is the id filter (`SessionEvent`),
+/// thread switch (`nexus/ui.join_effect`), so the switch Leaves the old
+/// thread — without the removal the old thread's stream kept fanning
+/// out to the shared subject (the cross-thread contamination bug).
+/// Delivery correctness beyond Leave is the id filter (`ThreadEvent`),
 /// pinned by the UI tests; this pins the actor-side unsubscribe.
 pub fn leave_stops_fan_out_test() {
   let sess = start_with(happy_runner)
@@ -507,16 +500,16 @@ pub fn leave_stops_fan_out_test() {
 
   // Leave, then run a whole turn; a fresh subscriber witnesses its
   // completion so the negative assertion below is a verdict, not a race.
-  process.send(sess, session.Leave(sub))
+  process.send(sess, thread.Leave(sub))
   let witness = join(sess)
-  let assert session.SessionEvent(_, 1, session.Hello(_, _, _)) =
+  let assert thread.ThreadEvent(_, 1, thread.Hello(_, _, _)) =
     expect_event(witness)
 
-  should.equal(session.send_message(sess, "hi"), session.Sent)
+  should.equal(thread.send_message(sess, "hi"), thread.Sent)
   expect_user_echo(witness, "hi")
-  expect_event(witness) |> should.equal(scoped(session.Token("Hello")))
-  expect_event(witness) |> should.equal(scoped(session.Token(" world")))
-  let assert session.SessionEvent(_, 1, session.TurnDone(_, _)) =
+  expect_event(witness) |> should.equal(scoped(thread.Token("Hello")))
+  expect_event(witness) |> should.equal(scoped(thread.Token(" world")))
+  let assert thread.ThreadEvent(_, 1, thread.TurnDone(_, _)) =
     expect_event(witness)
 
   // The departed subscriber saw none of it.
@@ -524,27 +517,26 @@ pub fn leave_stops_fan_out_test() {
 }
 
 /// Leave is not sticky: re-Joining the same subject subscribes it again
-/// (fresh view of the same session on the same connection). Guards a
+/// (fresh view of the same thread on the same connection). Guards a
 /// naive "ignore subjects we have seen" Join dedupe regression.
 pub fn rejoin_after_leave_resubscribes_test() {
   let sess = start_with(happy_runner)
   let sub = join(sess)
   let _ = expect_event(sub)
 
-  process.send(sess, session.Leave(sub))
+  process.send(sess, thread.Leave(sub))
   rejoin(sess, sub)
   // The refreshed generation rides the replay AND every later delivery:
   // a subscriber that filters on the old generation drops the whole
   // first-visit era.
   expect_event(sub)
-  |> should.equal(scoped_at(2, session.Hello("test-alias", 1, [])))
+  |> should.equal(scoped_at(2, thread.Hello("test-alias", 1, [])))
 
-  should.equal(session.send_message(sess, "hi"), session.Sent)
+  should.equal(thread.send_message(sess, "hi"), thread.Sent)
   expect_user_echo_at(sub, 2, "hi")
-  expect_event(sub) |> should.equal(scoped_at(2, session.Token("Hello")))
-  expect_event(sub) |> should.equal(scoped_at(2, session.Token(" world")))
-  let assert session.SessionEvent(_, 2, session.TurnDone(_, _)) =
-    expect_event(sub)
+  expect_event(sub) |> should.equal(scoped_at(2, thread.Token("Hello")))
+  expect_event(sub) |> should.equal(scoped_at(2, thread.Token(" world")))
+  let assert thread.ThreadEvent(_, 2, thread.TurnDone(_, _)) = expect_event(sub)
 }
 
 // ---------------------------------------------------------------------------
@@ -555,8 +547,8 @@ pub fn rejoin_after_leave_resubscribes_test() {
 /// spec; there is no config default to fall back to after the P3 hard cut.
 pub fn selected_alias_is_frozen_test() {
   let spec =
-    session.SessionSpec(
-      id: test_session_id,
+    thread.ThreadSpec(
+      id: test_thread_id,
       cfg: test_config(),
       model: "chosen-alias",
       endpoint: test_endpoint(),
@@ -566,12 +558,12 @@ pub fn selected_alias_is_frozen_test() {
       utility_runner: no_utility_runner,
       utility_apply: no_utility_apply,
     )
-  let assert Ok(started) = session.start_with_spec(spec)
+  let assert Ok(started) = thread.start_with_spec(spec)
   let sess = started.data
   let sub = join(sess)
   expect_hello(sub, "chosen-alias", 1)
 
-  should.equal(session.send_message(sess, "hi"), session.Sent)
+  should.equal(thread.send_message(sess, "hi"), thread.Sent)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
@@ -579,27 +571,27 @@ pub fn selected_alias_is_frozen_test() {
 
   // The transcript carries the selected alias, never anything else —
   // there is no config default to fall back to after the P3 hard cut.
-  let tr = session.snapshot(sess)
+  let tr = thread.snapshot(sess)
   transcript.model(tr) |> should.equal("chosen-alias")
 }
 
-/// P3 (multi-provider §8): the session hands its runner the FROZEN
-/// endpoint from the spec — one provider per session, for every turn of
+/// P3 (multi-provider §8): the thread hands its runner the FROZEN
+/// endpoint from the spec — one provider per thread, for every turn of
 /// its lifetime. A swapped-in different endpoint must never reach an
-/// existing session's runner.
+/// existing thread's runner.
 pub fn runner_receives_frozen_endpoint_test() {
   let seen = process.new_subject()
   let capturing = fn(endpoint, tr, _cancel, _on_event) {
     process.send(seen, endpoint)
-    session.StreamDone(
+    thread.StreamDone(
       stats(),
       transcript.append_assistant(tr, "ok")
         |> transcript.stamp(timing.wall_now_s()),
     )
   }
   let spec =
-    session.SessionSpec(
-      id: test_session_id,
+    thread.ThreadSpec(
+      id: test_thread_id,
       cfg: test_config(),
       model: "test-alias",
       endpoint: test_endpoint(),
@@ -609,9 +601,9 @@ pub fn runner_receives_frozen_endpoint_test() {
       utility_runner: no_utility_runner,
       utility_apply: no_utility_apply,
     )
-  let assert Ok(started) = session.start_with_spec(spec)
+  let assert Ok(started) = thread.start_with_spec(spec)
   let sess = started.data
-  should.equal(session.send_message(sess, "hi"), session.Sent)
+  should.equal(thread.send_message(sess, "hi"), thread.Sent)
   let assert Ok(endpoint) = process.receive(seen, 2000)
   endpoint |> should.equal(test_endpoint())
 }
@@ -622,18 +614,18 @@ pub fn completed_turn_records_metric_test() {
   let sub = join(sess)
   let _ = expect_event(sub)
 
-  should.equal(session.send_message(sess, "go"), session.Sent)
+  should.equal(thread.send_message(sess, "go"), thread.Sent)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
 
-  let status = session.describe(sess)
+  let status = thread.describe(sess)
   status.streaming |> should.be_false
   status.message_count |> should.equal(3)
   status.metrics |> list.length |> should.equal(1)
   let assert Ok(sample) = list.first(status.metrics)
-  sample.outcome |> should.equal(session.Completed)
+  sample.outcome |> should.equal(thread.Completed)
   sample.token_deltas |> should.equal(2)
   sample.stopped_chars |> should.equal(None)
   sample.failure_reason |> should.equal(None)
@@ -647,14 +639,13 @@ pub fn completed_turn_preserves_first_token_time_test() {
   let sub = join(sess)
   let _ = expect_event(sub)
 
-  should.equal(session.send_message(sess, "slow second token"), session.Sent)
+  should.equal(thread.send_message(sess, "slow second token"), thread.Sent)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
-  let assert session.SessionEvent(_, 1, session.TurnDone(_, _)) =
-    expect_event(sub)
+  let assert thread.ThreadEvent(_, 1, thread.TurnDone(_, _)) = expect_event(sub)
 
-  let status = session.describe(sess)
+  let status = thread.describe(sess)
   let assert Ok(sample) = list.first(status.metrics)
   let assert Some(ttft_ms) = sample.ttft_ms
   should.be_true(ttft_ms + 10 <= sample.duration_ms)
@@ -667,20 +658,20 @@ pub fn stopped_turn_records_metric_test() {
   let sub = join(sess)
   let _ = expect_event(sub)
 
-  should.equal(session.send_message(sess, "stop me"), session.Sent)
+  should.equal(thread.send_message(sess, "stop me"), thread.Sent)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
-  session.stop(sess)
+  thread.stop(sess)
   // The stop commits the partial text, so the terminal event carries the
-  // session's committed stamp (the loop stamps every append).
-  let assert session.SessionEvent(sid, 1, session.TurnStopped(7, Some(_))) =
+  // thread's committed stamp (the loop stamps every append).
+  let assert thread.ThreadEvent(sid, 1, thread.TurnStopped(7, Some(_))) =
     expect_event(sub)
-  sid |> should.equal(test_session_id)
+  sid |> should.equal(test_thread_id)
 
-  let status = session.describe(sess)
+  let status = thread.describe(sess)
   status.metrics |> list.length |> should.equal(1)
   let assert Ok(sample) = list.first(status.metrics)
-  sample.outcome |> should.equal(session.Stopped)
+  sample.outcome |> should.equal(thread.Stopped)
   sample.stopped_chars |> should.equal(Some(7))
   sample.failure_reason |> should.equal(None)
 }
@@ -691,15 +682,15 @@ pub fn failed_turn_records_metric_test() {
   let sub = join(sess)
   let _ = expect_event(sub)
 
-  should.equal(session.send_message(sess, "will fail"), session.Sent)
+  should.equal(thread.send_message(sess, "will fail"), thread.Sent)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
 
-  let status = session.describe(sess)
+  let status = thread.describe(sess)
   status.metrics |> list.length |> should.equal(1)
   let assert Ok(sample) = list.first(status.metrics)
-  sample.outcome |> should.equal(session.Failed)
+  sample.outcome |> should.equal(thread.Failed)
   case sample.failure_reason {
     Some(reason) -> should.be_true(string.contains(reason, "non200"))
     None -> panic as "expected a failure reason"
@@ -708,26 +699,26 @@ pub fn failed_turn_records_metric_test() {
   status.message_count |> should.equal(2)
 }
 
-/// Metrics are display state only: two sessions carrying different numbers
+/// Metrics are display state only: two threads carrying different numbers
 /// of metric samples must still produce byte-identical request bodies for
 /// the same committed history (KV-cache contract rule 4).
 pub fn metrics_do_not_affect_request_bytes_test() {
-  // Session A records a Completed *and* a Failed sample; the failed turn
-  // commits nothing, so A's committed history equals session B's.
+  // Thread A records a Completed *and* a Failed sample; the failed turn
+  // commits nothing, so A's committed history equals thread B's.
   let counter = start_counter()
   let a = start_with(flaky_runner(counter))
   let sub_a = join(a)
   let _ = expect_event(sub_a)
-  should.equal(session.send_message(a, "same"), session.Sent)
+  should.equal(thread.send_message(a, "same"), thread.Sent)
   let _ = expect_event(sub_a)
   let _ = expect_event(sub_a)
   let _ = expect_event(sub_a)
   let _ = expect_event(sub_a)
-  // Snapshot after the successful turn: this is the history both sessions
+  // Snapshot after the successful turn: this is the history both threads
   // end up with.
-  let tr_a = session.snapshot(a)
+  let tr_a = thread.snapshot(a)
 
-  should.equal(session.send_message(a, "boom"), session.Sent)
+  should.equal(thread.send_message(a, "boom"), thread.Sent)
   let _ = expect_event(sub_a)
   let _ = expect_event(sub_a)
   let _ = expect_event(sub_a)
@@ -735,22 +726,22 @@ pub fn metrics_do_not_affect_request_bytes_test() {
   let b = start_with(happy_runner)
   let sub_b = join(b)
   let _ = expect_event(sub_b)
-  should.equal(session.send_message(b, "same"), session.Sent)
+  should.equal(thread.send_message(b, "same"), thread.Sent)
   let _ = expect_event(sub_b)
   let _ = expect_event(sub_b)
   let _ = expect_event(sub_b)
   let _ = expect_event(sub_b)
 
-  session.describe(a).metrics |> list.length |> should.equal(2)
-  session.describe(b).metrics |> list.length |> should.equal(1)
+  thread.describe(a).metrics |> list.length |> should.equal(2)
+  thread.describe(b).metrics |> list.length |> should.equal(1)
   tr_a
   |> transcript.length
-  |> should.equal(session.snapshot(b) |> transcript.length)
+  |> should.equal(thread.snapshot(b) |> transcript.length)
 
-  // Two sessions with different metric histories encode identically.
+  // Two threads with different metric histories encode identically.
   let opts = transcript.Options(..transcript.default_options(), stream: True)
   transcript.request_body(tr_a, opts)
-  |> should.equal(transcript.request_body(session.snapshot(b), opts))
+  |> should.equal(transcript.request_body(thread.snapshot(b), opts))
 }
 
 /// `Describe` reports `streaming` while a turn is in flight.
@@ -758,13 +749,13 @@ pub fn describe_reports_streaming_test() {
   let sess = start_with(blocking_runner)
   let sub = join(sess)
   let _ = expect_event(sub)
-  should.equal(session.send_message(sess, "slow"), session.Sent)
+  should.equal(thread.send_message(sess, "slow"), thread.Sent)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
-  session.describe(sess).streaming |> should.be_true
-  session.stop(sess)
+  thread.describe(sess).streaming |> should.be_true
+  thread.stop(sess)
   let _ = expect_event(sub)
-  session.describe(sess).streaming |> should.be_false
+  thread.describe(sess).streaming |> should.be_false
 }
 
 // ---------------------------------------------------------------------------
@@ -778,7 +769,7 @@ fn tool_round_runner(
   tr,
   _cancel,
   on_event: fn(loop.LoopEvent) -> Nil,
-) -> session.TurnOutcome {
+) -> thread.TurnOutcome {
   on_event(loop.LoopStatus(1, 8, "request"))
   on_event(
     loop.StreamEvent(openai.ToolCallDelta(
@@ -802,7 +793,7 @@ fn tool_round_runner(
     "{\"status\":200}",
   ))
   on_event(loop.StreamEvent(openai.TokenDelta("based on the fetch: fine")))
-  session.StreamDone(
+  thread.StreamDone(
     stats(),
     tr
       |> transcript.append_assistant_tool_calls(
@@ -827,22 +818,22 @@ pub fn tool_events_are_broadcast_test() {
   let sub = join(sess)
   let _ = expect_event(sub)
 
-  should.equal(session.send_message(sess, "fetch it"), session.Sent)
+  should.equal(thread.send_message(sess, "fetch it"), thread.Sent)
   expect_user_echo(sub, "fetch it")
-  expect_event(sub) |> should.equal(scoped(session.LoopStatus(1, 8, "request")))
+  expect_event(sub) |> should.equal(scoped(thread.LoopStatus(1, 8, "request")))
   expect_event(sub)
   |> should.equal(
-    scoped(session.ToolCallDelta(
+    scoped(thread.ToolCallDelta(
       0,
       Some("call_1"),
       Some("http_fetch"),
       "{\"url\":\"https://example.invalid/\"}",
     )),
   )
-  expect_event(sub) |> should.equal(scoped(session.LoopStatus(1, 8, "tools")))
+  expect_event(sub) |> should.equal(scoped(thread.LoopStatus(1, 8, "tools")))
   expect_event(sub)
   |> should.equal(
-    scoped(session.ToolCallAssembled(
+    scoped(thread.ToolCallAssembled(
       "call_1",
       "http_fetch",
       "{\"url\":\"https://example.invalid/\"}",
@@ -851,16 +842,15 @@ pub fn tool_events_are_broadcast_test() {
   )
   expect_event(sub)
   |> should.equal(
-    scoped(session.ToolResult("call_1", "http_fetch", True, "{\"status\":200}")),
+    scoped(thread.ToolResult("call_1", "http_fetch", True, "{\"status\":200}")),
   )
   expect_event(sub)
-  |> should.equal(scoped(session.Token("based on the fetch: fine")))
-  let assert session.SessionEvent(_, 1, session.TurnDone(_, _)) =
-    expect_event(sub)
+  |> should.equal(scoped(thread.Token("based on the fetch: fine")))
+  let assert thread.ThreadEvent(_, 1, thread.TurnDone(_, _)) = expect_event(sub)
 
   // The full tool history is committed: system, user, assistant(call),
   // tool result, assistant text.
-  transcript.length(session.snapshot(sess)) |> should.equal(5)
+  transcript.length(thread.snapshot(sess)) |> should.equal(5)
 }
 
 pub fn failed_tool_result_replays_as_failed_test() {
@@ -877,7 +867,7 @@ pub fn failed_tool_result_replays_as_failed_test() {
         False,
         "{\"error\":\"ssrf guard\"}",
       ))
-      session.StreamDone(
+      thread.StreamDone(
         stats(),
         tr
           |> transcript.append_assistant_tool_calls(
@@ -896,39 +886,38 @@ pub fn failed_tool_result_replays_as_failed_test() {
     })
   let sub = join(sess)
   let _ = expect_event(sub)
-  should.equal(session.send_message(sess, "fetch it"), session.Sent)
+  should.equal(thread.send_message(sess, "fetch it"), thread.Sent)
   // Live events (UserEcho, LoopStatus, ToolCallAssembled, ToolResult,
   // TurnDone) — the ToolResult carries ok=False exactly as the loop said.
   expect_user_echo(sub, "fetch it")
-  expect_event(sub) |> should.equal(scoped(session.LoopStatus(1, 8, "tools")))
+  expect_event(sub) |> should.equal(scoped(thread.LoopStatus(1, 8, "tools")))
   expect_event(sub)
   |> should.equal(
-    scoped(session.ToolCallAssembled("call_9", "http_fetch", "{}", None)),
+    scoped(thread.ToolCallAssembled("call_9", "http_fetch", "{}", None)),
   )
   expect_event(sub)
   |> should.equal(
-    scoped(session.ToolResult(
+    scoped(thread.ToolResult(
       "call_9",
       "http_fetch",
       False,
       "{\"error\":\"ssrf guard\"}",
     )),
   )
-  let assert session.SessionEvent(_, 1, session.TurnDone(_, _)) =
-    expect_event(sub)
+  let assert thread.ThreadEvent(_, 1, thread.TurnDone(_, _)) = expect_event(sub)
 
   // A fresh subscriber (the reload path) sees the failure too.
   let sub2 = join(sess)
-  let assert session.SessionEvent(_, 1, session.Hello(_, _, _)) =
+  let assert thread.ThreadEvent(_, 1, thread.Hello(_, _, _)) =
     expect_event(sub2)
   expect_user_echo(sub2, "fetch it")
   expect_event(sub2)
   |> should.equal(
-    scoped(session.ToolCallAssembled("call_9", "http_fetch", "{}", None)),
+    scoped(thread.ToolCallAssembled("call_9", "http_fetch", "{}", None)),
   )
   expect_event(sub2)
   |> should.equal(
-    scoped(session.ToolResult(
+    scoped(thread.ToolResult(
       "call_9",
       "http_fetch",
       False,
@@ -942,7 +931,7 @@ pub fn tool_history_replays_on_rejoin_test() {
   let sess = start_with(tool_round_runner)
   let sub = join(sess)
   let _ = expect_event(sub)
-  should.equal(session.send_message(sess, "fetch it"), session.Sent)
+  should.equal(thread.send_message(sess, "fetch it"), thread.Sent)
   // Drain the live events (UserEcho, LoopStatus, ToolCallDelta, LoopStatus,
   // ToolCallAssembled, ToolResult, Token, TurnDone).
   let _ = expect_event(sub)
@@ -957,13 +946,13 @@ pub fn tool_history_replays_on_rejoin_test() {
   // A fresh subscriber gets the tool history reconstructed from the
   // transcript, with tool names resolved from the assistant message.
   let sub2 = join(sess)
-  let assert session.SessionEvent(_, 1, session.Hello(_, messages, _)) =
+  let assert thread.ThreadEvent(_, 1, thread.Hello(_, messages, _)) =
     expect_event(sub2)
   messages |> should.equal(5)
   expect_user_echo(sub2, "fetch it")
   expect_event(sub2)
   |> should.equal(
-    scoped(session.ToolCallAssembled(
+    scoped(thread.ToolCallAssembled(
       "call_1",
       "http_fetch",
       "{\"url\":\"https://example.invalid/\"}",
@@ -972,7 +961,7 @@ pub fn tool_history_replays_on_rejoin_test() {
   )
   expect_event(sub2)
   |> should.equal(
-    scoped(session.ToolResult("call_1", "http_fetch", True, "{\"status\":200}")),
+    scoped(thread.ToolResult("call_1", "http_fetch", True, "{\"status\":200}")),
   )
   expect_assistant_full(sub2, "based on the fetch: fine")
 }
@@ -982,9 +971,9 @@ fn guard_runner(
   tr,
   _cancel,
   on_event: fn(loop.LoopEvent) -> Nil,
-) -> session.TurnOutcome {
+) -> thread.TurnOutcome {
   on_event(loop.LoopStatus(4, 4, "guard"))
-  session.StreamGuard(4, tr)
+  thread.StreamGuard(4, tr)
 }
 
 /// Streams a full tool round (reasoning + text + two calls + results),
@@ -995,7 +984,7 @@ fn guard_runner(
 /// through a request subject the test owns.
 fn gated_runner(
   gate_request: process.Subject(process.Subject(Nil)),
-) -> session.TurnRunner {
+) -> thread.TurnRunner {
   fn(_endpoint, tr, _cancel, on_event) {
     // A fixed flush stamp: the loop stamps the round at append time and
     // broadcasts the same value on every assembled event — the tests pin
@@ -1026,7 +1015,7 @@ fn gated_runner(
     let gate = process.new_subject()
     process.send(gate_request, gate)
     let _ = process.receive(gate, 5000)
-    session.StreamDone(
+    thread.StreamDone(
       stats(),
       transcript.append_assistant(tr, "Final answer")
         |> transcript.stamp(timing.wall_now_s()),
@@ -1035,7 +1024,7 @@ fn gated_runner(
 }
 
 pub fn midturn_rejoin_replays_in_flight_rounds_test() {
-  // The reload/session-switch regression: mid-turn, the session actor's
+  // The reload/thread-switch regression: mid-turn, the thread actor's
   // committed transcript does not yet hold the running turn's rounds (the
   // worker installs them at WorkerDone), so a Join replayed nothing of the
   // turn — chips and reasoning vanished until it finished. The in-flight
@@ -1045,17 +1034,17 @@ pub fn midturn_rejoin_replays_in_flight_rounds_test() {
   let sub = join(sess)
   let _ = expect_event(sub)
 
-  should.equal(session.send_message(sess, "research it"), session.Sent)
+  should.equal(thread.send_message(sess, "research it"), thread.Sent)
   // Drain the live events up to the freeze point.
   expect_user_echo(sub, "research it")
-  expect_event(sub) |> should.equal(scoped(session.LoopStatus(1, 8, "request")))
-  expect_event(sub) |> should.equal(scoped(session.Reasoning("weighing ")))
-  expect_event(sub) |> should.equal(scoped(session.Reasoning("options")))
-  expect_event(sub) |> should.equal(scoped(session.Token("\n\nLet me check.")))
-  expect_event(sub) |> should.equal(scoped(session.LoopStatus(1, 8, "tools")))
+  expect_event(sub) |> should.equal(scoped(thread.LoopStatus(1, 8, "request")))
+  expect_event(sub) |> should.equal(scoped(thread.Reasoning("weighing ")))
+  expect_event(sub) |> should.equal(scoped(thread.Reasoning("options")))
+  expect_event(sub) |> should.equal(scoped(thread.Token("\n\nLet me check.")))
+  expect_event(sub) |> should.equal(scoped(thread.LoopStatus(1, 8, "tools")))
   expect_event(sub)
   |> should.equal(
-    scoped(session.ToolCallAssembled(
+    scoped(thread.ToolCallAssembled(
       "call_1",
       "http_fetch",
       "{\"url\":\"a\"}",
@@ -1064,11 +1053,11 @@ pub fn midturn_rejoin_replays_in_flight_rounds_test() {
   )
   expect_event(sub)
   |> should.equal(
-    scoped(session.ToolResult("call_1", "http_fetch", True, "{\"ok\":true}")),
+    scoped(thread.ToolResult("call_1", "http_fetch", True, "{\"ok\":true}")),
   )
   expect_event(sub)
   |> should.equal(
-    scoped(session.ToolCallAssembled(
+    scoped(thread.ToolCallAssembled(
       "call_2",
       "web_search",
       "{\"q\":\"x\"}",
@@ -1077,28 +1066,28 @@ pub fn midturn_rejoin_replays_in_flight_rounds_test() {
   )
   expect_event(sub)
   |> should.equal(
-    scoped(session.ToolResult("call_2", "web_search", True, "{\"r\":1}")),
+    scoped(thread.ToolResult("call_2", "web_search", True, "{\"r\":1}")),
   )
-  expect_event(sub) |> should.equal(scoped(session.LoopStatus(2, 8, "request")))
-  expect_event(sub) |> should.equal(scoped(session.Reasoning("final thinking")))
-  expect_event(sub) |> should.equal(scoped(session.Token("Final answer")))
+  expect_event(sub) |> should.equal(scoped(thread.LoopStatus(2, 8, "request")))
+  expect_event(sub) |> should.equal(scoped(thread.Reasoning("final thinking")))
+  expect_event(sub) |> should.equal(scoped(thread.Token("Final answer")))
 
   // The worker is now parked mid-iteration-2. A fresh subscriber — the
   // reload path — replays the finished round from the mirror: reasoning
   // rides the text message, calls/results land in broadcast order.
   let sub2 = join(sess)
-  let assert session.SessionEvent(_, 1, session.Hello(_, _, _)) =
+  let assert thread.ThreadEvent(_, 1, thread.Hello(_, _, _)) =
     expect_event(sub2)
   expect_user_echo(sub2, "research it")
   expect_event(sub2)
-  |> should.equal(scoped(session.ReasoningFull("weighing options")))
+  |> should.equal(scoped(thread.ReasoningFull("weighing options")))
   // The mirror round carries the worker's flush stamp: the replayed
   // text and assembled events pin it exactly.
   expect_assistant_full(sub2, "\n\nLet me check.")
   |> should.equal(1_729_000_000)
   expect_event(sub2)
   |> should.equal(
-    scoped(session.ToolCallAssembled(
+    scoped(thread.ToolCallAssembled(
       "call_1",
       "http_fetch",
       "{\"url\":\"a\"}",
@@ -1107,11 +1096,11 @@ pub fn midturn_rejoin_replays_in_flight_rounds_test() {
   )
   expect_event(sub2)
   |> should.equal(
-    scoped(session.ToolResult("call_1", "http_fetch", True, "{\"ok\":true}")),
+    scoped(thread.ToolResult("call_1", "http_fetch", True, "{\"ok\":true}")),
   )
   expect_event(sub2)
   |> should.equal(
-    scoped(session.ToolCallAssembled(
+    scoped(thread.ToolCallAssembled(
       "call_2",
       "web_search",
       "{\"q\":\"x\"}",
@@ -1120,7 +1109,7 @@ pub fn midturn_rejoin_replays_in_flight_rounds_test() {
   )
   expect_event(sub2)
   |> should.equal(
-    scoped(session.ToolResult("call_2", "web_search", True, "{\"r\":1}")),
+    scoped(thread.ToolResult("call_2", "web_search", True, "{\"r\":1}")),
   )
 
   // Iteration 2's still-streaming text/reasoning are NOT replayed: no
@@ -1128,16 +1117,15 @@ pub fn midturn_rejoin_replays_in_flight_rounds_test() {
   // the next thing either subscriber sees is the terminal event.
   let assert Ok(gate) = process.receive(gate_request, 2000)
   process.send(gate, Nil)
-  let assert session.SessionEvent(_, 1, session.TurnDone(_, _)) =
+  let assert thread.ThreadEvent(_, 1, thread.TurnDone(_, _)) =
     expect_event(sub2)
-  let assert session.SessionEvent(_, 1, session.TurnDone(_, _)) =
-    expect_event(sub)
+  let assert thread.ThreadEvent(_, 1, thread.TurnDone(_, _)) = expect_event(sub)
 
   // After the turn the mirror is gone: a post-turn join replays the
   // committed transcript only — no reasoning or tool residue from the
   // mirror (the fake runner commits a plain text reply).
   let sub3 = join(sess)
-  let assert session.SessionEvent(_, 1, session.Hello(_, messages, _)) =
+  let assert thread.ThreadEvent(_, 1, thread.Hello(_, messages, _)) =
     expect_event(sub3)
   messages |> should.equal(3)
   expect_user_echo(sub3, "research it")
@@ -1149,18 +1137,18 @@ pub fn guard_hit_renders_terminal_failure_test() {
   let sub = join(sess)
   let _ = expect_event(sub)
 
-  should.equal(session.send_message(sess, "keep calling"), session.Sent)
+  should.equal(thread.send_message(sess, "keep calling"), thread.Sent)
   let _ = expect_event(sub)
-  expect_event(sub) |> should.equal(scoped(session.LoopStatus(4, 4, "guard")))
-  let assert session.SessionEvent(_, 1, session.TurnFailed(reason, _)) =
+  expect_event(sub) |> should.equal(scoped(thread.LoopStatus(4, 4, "guard")))
+  let assert thread.ThreadEvent(_, 1, thread.TurnFailed(reason, _)) =
     expect_event(sub)
   should.be_true(string.contains(reason, "iteration guard"))
 
   // The turn still commits its transcript (tool rounds happened), and the
   // guard is visible as a Failed metric sample.
-  let status = session.describe(sess)
+  let status = thread.describe(sess)
   let assert Ok(sample) = list.first(status.metrics)
-  sample.outcome |> should.equal(session.Failed)
+  sample.outcome |> should.equal(thread.Failed)
   should.be_true(string.contains(
     option.unwrap(sample.failure_reason, ""),
     "guard",
@@ -1177,11 +1165,11 @@ fn reasoning_runner(
   tr,
   _cancel,
   on_event: fn(loop.LoopEvent) -> Nil,
-) -> session.TurnOutcome {
+) -> thread.TurnOutcome {
   on_event(loop.StreamEvent(openai.ReasoningDelta("pondering ")))
   on_event(loop.StreamEvent(openai.ReasoningDelta("deeply")))
   on_event(loop.StreamEvent(openai.TokenDelta("answer")))
-  session.StreamDone(
+  thread.StreamDone(
     stats(),
     transcript.append_assistant_with_reasoning(
       tr,
@@ -1196,22 +1184,21 @@ pub fn reasoning_streams_live_and_replays_on_rejoin_test() {
   let sess = start_with(reasoning_runner)
   let sub = join(sess)
   let _ = expect_event(sub)
-  should.equal(session.send_message(sess, "think"), session.Sent)
+  should.equal(thread.send_message(sess, "think"), thread.Sent)
   expect_user_echo(sub, "think")
-  expect_event(sub) |> should.equal(scoped(session.Reasoning("pondering ")))
-  expect_event(sub) |> should.equal(scoped(session.Reasoning("deeply")))
-  expect_event(sub) |> should.equal(scoped(session.Token("answer")))
-  let assert session.SessionEvent(_, 1, session.TurnDone(_, _)) =
-    expect_event(sub)
+  expect_event(sub) |> should.equal(scoped(thread.Reasoning("pondering ")))
+  expect_event(sub) |> should.equal(scoped(thread.Reasoning("deeply")))
+  expect_event(sub) |> should.equal(scoped(thread.Token("answer")))
+  let assert thread.ThreadEvent(_, 1, thread.TurnDone(_, _)) = expect_event(sub)
 
   // A fresh subscriber replays the committed reasoning just before the
   // assistant message it preceded.
   let sub2 = join(sess)
-  let assert session.SessionEvent(_, 1, session.Hello(_, 3, _)) =
+  let assert thread.ThreadEvent(_, 1, thread.Hello(_, 3, _)) =
     expect_event(sub2)
   expect_user_echo(sub2, "think")
   expect_event(sub2)
-  |> should.equal(scoped(session.ReasoningFull("pondering deeply")))
+  |> should.equal(scoped(thread.ReasoningFull("pondering deeply")))
   expect_assistant_full(sub2, "answer")
 }
 
@@ -1266,18 +1253,18 @@ fn expect_utility_step(
 }
 
 /// No utility (or apply) activity within `ms` — the negative half of the
-/// trigger rules (failed turns, disabled config, once-per-session).
+/// trigger rules (failed turns, disabled config, once-per-thread).
 fn expect_no_utility(events: process.Subject(UtilityEvent), ms: Int) -> Nil {
   let assert Error(_) = process.receive(events, ms)
   Nil
 }
 
-fn expect_no_event(sub: process.Subject(session.SessionEvent), ms: Int) -> Nil {
+fn expect_no_event(sub: process.Subject(thread.ThreadEvent), ms: Int) -> Nil {
   let assert Error(_) = process.receive(sub, ms)
   Nil
 }
 
-/// The session config with the side-call knob turned up for fast tests.
+/// The thread config with the side-call knob turned up for fast tests.
 fn utility_config(delay_ms: Int) -> config.Config {
   config.Config(
     ..test_config(),
@@ -1291,21 +1278,21 @@ fn utility_config(delay_ms: Int) -> config.Config {
 fn ok_utility(
   events: process.Subject(UtilityEvent),
   title: String,
-) -> session.UtilityRunner {
+) -> thread.UtilityRunner {
   fn(_endpoint, tr, _cancel, _allow_pass) {
     process.send(events, UtilCalled(transcript.length(tr)))
     Ok(utility.Title(title: title, tags: []))
   }
 }
 
-/// The greeting-session model: it PASSes every attempt that offers the
+/// The greeting-thread model: it PASSes every attempt that offers the
 /// sentinel. Paired with the apply seam it lets tests pin both halves of
 /// the one-pass policy — the re-armed attempt must arrive forced
 /// (`UtilForcedAttempt`), and a PASS under the forced instruction must
 /// consume the attempt like any failure.
 fn passing_utility(
   events: process.Subject(UtilityEvent),
-) -> session.UtilityRunner {
+) -> thread.UtilityRunner {
   fn(_endpoint, tr, _cancel, allow_pass) {
     process.send(events, UtilCalled(transcript.length(tr)))
     case allow_pass {
@@ -1319,11 +1306,11 @@ fn passing_utility(
 }
 
 /// Like `passing_utility`, but the forced attempt produces a real title —
-/// the converging session: pass once, then the forced instruction lands
+/// the converging thread: pass once, then the forced instruction lands
 /// the title.
 fn pass_once_then_title_utility(
   events: process.Subject(UtilityEvent),
-) -> session.UtilityRunner {
+) -> thread.UtilityRunner {
   fn(_endpoint, tr, _cancel, allow_pass) {
     process.send(events, UtilCalled(transcript.length(tr)))
     case allow_pass {
@@ -1348,7 +1335,7 @@ fn pass_once_then_title_utility(
 fn blocking_utility(
   events: process.Subject(UtilityEvent),
   ready: process.Subject(AttemptHandles),
-) -> session.UtilityRunner {
+) -> thread.UtilityRunner {
   fn(_endpoint, tr, cancel, _allow_pass) {
     process.send(events, UtilCalled(transcript.length(tr)))
     let handles =
@@ -1384,12 +1371,12 @@ fn blocking_utility(
 fn ok_apply(
   events: process.Subject(UtilityEvent),
   title: String,
-) -> session.UtilityApply {
+) -> thread.UtilityApply {
   fn(t, _tags) {
     process.send(events, UtilAppliedNote(t))
     case t == title {
-      True -> Ok(session.UtilityMeta(title, ["auto-tag"]))
-      False -> Ok(session.UtilityMeta(t, []))
+      True -> Ok(thread.UtilityMeta(title, ["auto-tag"]))
+      False -> Ok(thread.UtilityMeta(t, []))
     }
   }
 }
@@ -1399,7 +1386,7 @@ fn ok_apply(
 /// that was never reached.
 fn refusing_apply(
   events: process.Subject(UtilityEvent),
-) -> session.UtilityApply {
+) -> thread.UtilityApply {
   fn(t, _tags) {
     process.send(events, UtilRefusedNote(t))
     Error(Nil)
@@ -1408,13 +1395,13 @@ fn refusing_apply(
 
 fn start_with_utility(
   cfg: config.Config,
-  runner: session.TurnRunner,
-  u_runner: session.UtilityRunner,
-  u_apply: session.UtilityApply,
-) -> process.Subject(session.Msg) {
+  runner: thread.TurnRunner,
+  u_runner: thread.UtilityRunner,
+  u_apply: thread.UtilityApply,
+) -> process.Subject(thread.Msg) {
   let assert Ok(started) =
-    session.start_with_spec(session.SessionSpec(
-      id: test_session_id,
+    thread.start_with_spec(thread.ThreadSpec(
+      id: test_thread_id,
       cfg: cfg,
       model: "test-alias",
       endpoint: test_endpoint(),
@@ -1430,7 +1417,7 @@ fn start_with_utility(
 /// Fires ONCE, after the FIRST COMMITTED exchange: the runner receives
 /// the 3-message snapshot (system + user + assistant), the applied title
 /// broadcasts MetaUpdated, and the second exchange never re-arms. The
-/// branch (Y and the reply) never enters the session's transcript.
+/// branch (Y and the reply) never enters the thread's transcript.
 pub fn utility_fires_once_after_first_exchange_test() {
   let events = process.new_subject()
   let sess =
@@ -1443,7 +1430,7 @@ pub fn utility_fires_once_after_first_exchange_test() {
   let sub = join(sess)
   let _ = expect_event(sub)
 
-  should.equal(session.send_message(sess, "first"), session.Sent)
+  should.equal(thread.send_message(sess, "first"), thread.Sent)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
@@ -1456,12 +1443,10 @@ pub fn utility_fires_once_after_first_exchange_test() {
   // broadcast the fresh metadata to subscribers.
   UtilAppliedNote("Model Title") |> should.equal(expect_utility(events))
   expect_event(sub)
-  |> should.equal(
-    scoped(session.MetaUpdated(Some("Model Title"), ["auto-tag"])),
-  )
+  |> should.equal(scoped(thread.MetaUpdated(Some("Model Title"), ["auto-tag"])))
 
-  // The second exchange does not re-arm: once per session.
-  should.equal(session.send_message(sess, "second"), session.Sent)
+  // The second exchange does not re-arm: once per thread.
+  should.equal(thread.send_message(sess, "second"), thread.Sent)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
@@ -1470,8 +1455,8 @@ pub fn utility_fires_once_after_first_exchange_test() {
   expect_no_event(sub, 400)
 
   // The throwaway branch is structurally unable to change a request
-  // byte: Y never entered the session's transcript.
-  let tr = session.snapshot(sess)
+  // byte: Y never entered the thread's transcript.
+  let tr = thread.snapshot(sess)
   transcript.length(tr) |> should.equal(5)
   let opts = transcript.Options(..transcript.default_options(), stream: True)
   should.be_false(string.contains(
@@ -1484,7 +1469,7 @@ pub fn utility_fires_once_after_first_exchange_test() {
 /// line-2 tags ride the widened apply seam BESIDE the title, and the
 /// apply's fresh display tags ride the `MetaUpdated` broadcast. The
 /// fake runner's signature is the UNCHANGED 4-arg `UtilityRunner` —
-/// corpus plumbing lives registry-side only (§3.3), so session-actor
+/// corpus plumbing lives registry-side only (§3.3), so thread-actor
 /// fakes were never touched by it.
 pub fn utility_apply_receives_parsed_tags_test() {
   let events = process.new_subject()
@@ -1499,13 +1484,13 @@ pub fn utility_apply_receives_parsed_tags_test() {
         // The registry-shaped apply: replies with the fresh display set —
         // the incoming tags normalized, as the real merge would deliver.
         process.send(events, UtilAppliedTags(tags))
-        Ok(session.UtilityMeta(title, utility.normalize_tags(tags)))
+        Ok(thread.UtilityMeta(title, utility.normalize_tags(tags)))
       },
     )
   let sub = join(sess)
   let _ = expect_event(sub)
 
-  should.equal(session.send_message(sess, "first"), session.Sent)
+  should.equal(thread.send_message(sess, "first"), thread.Sent)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
@@ -1518,16 +1503,16 @@ pub fn utility_apply_receives_parsed_tags_test() {
   // …and the broadcast carries the apply's fresh display set.
   expect_event(sub)
   |> should.equal(
-    scoped(session.MetaUpdated(Some("Model Title"), ["login-bug", "auth"])),
+    scoped(thread.MetaUpdated(Some("Model Title"), ["login-bug", "auth"])),
   )
 
   // The branch never entered the transcript: one committed exchange —
   // system + user + assistant — and nothing else.
-  transcript.length(session.snapshot(sess)) |> should.equal(3)
+  transcript.length(thread.snapshot(sess)) |> should.equal(3)
 }
 
-/// A greeting-session model that PASSes: the pass does NOT consume the
-/// once-per-session attempt (no apply, no MetaUpdated), the next
+/// A greeting-thread model that PASSes: the pass does NOT consume the
+/// once-per-thread attempt (no apply, no MetaUpdated), the next
 /// turn-commit point re-arms, and the re-armed attempt arrives FORCED
 /// (`allow_pass = False`) — its title applies, and only then is the flag
 /// spent: the third exchange never re-arms.
@@ -1543,7 +1528,7 @@ pub fn utility_pass_postpones_once_then_forced_title_applies_test() {
   let sub = join(sess)
   let _ = expect_event(sub)
 
-  should.equal(session.send_message(sess, "hi"), session.Sent)
+  should.equal(thread.send_message(sess, "hi"), thread.Sent)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
@@ -1555,7 +1540,7 @@ pub fn utility_pass_postpones_once_then_forced_title_applies_test() {
 
   // The second exchange re-arms the attempt — FORCED this time — and its
   // title applies.
-  should.equal(session.send_message(sess, "a real question"), session.Sent)
+  should.equal(thread.send_message(sess, "a real question"), thread.Sent)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
@@ -1564,12 +1549,10 @@ pub fn utility_pass_postpones_once_then_forced_title_applies_test() {
   UtilForcedAttempt |> should.equal(expect_utility(events))
   UtilAppliedNote("Model Title") |> should.equal(expect_utility(events))
   expect_event(sub)
-  |> should.equal(
-    scoped(session.MetaUpdated(Some("Model Title"), ["auto-tag"])),
-  )
+  |> should.equal(scoped(thread.MetaUpdated(Some("Model Title"), ["auto-tag"])))
 
   // The forced attempt COMPLETED: the once-flag is spent now.
-  should.equal(session.send_message(sess, "third"), session.Sent)
+  should.equal(thread.send_message(sess, "third"), thread.Sent)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
@@ -1580,7 +1563,7 @@ pub fn utility_pass_postpones_once_then_forced_title_applies_test() {
 
 /// A model that PASSes even under the forced instruction: that reply is
 /// an unusable title, not a postpone — it consumes the attempt like any
-/// failure, so the session cannot defer twice (it keeps its heuristic
+/// failure, so the thread cannot defer twice (it keeps its heuristic
 /// placeholder) instead of re-arming forever.
 pub fn utility_pass_on_forced_attempt_consumes_test() {
   let events = process.new_subject()
@@ -1594,7 +1577,7 @@ pub fn utility_pass_on_forced_attempt_consumes_test() {
   let sub = join(sess)
   let _ = expect_event(sub)
 
-  should.equal(session.send_message(sess, "hi"), session.Sent)
+  should.equal(thread.send_message(sess, "hi"), thread.Sent)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
@@ -1605,7 +1588,7 @@ pub fn utility_pass_on_forced_attempt_consumes_test() {
 
   // Forced attempt: arrives with allow_pass = False, PASSes anyway, and
   // the once-flag is spent.
-  should.equal(session.send_message(sess, "still here"), session.Sent)
+  should.equal(thread.send_message(sess, "still here"), thread.Sent)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
@@ -1616,7 +1599,7 @@ pub fn utility_pass_on_forced_attempt_consumes_test() {
   expect_no_event(sub, 400)
 
   // No third attempt, ever.
-  should.equal(session.send_message(sess, "third"), session.Sent)
+  should.equal(thread.send_message(sess, "third"), thread.Sent)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
@@ -1638,7 +1621,7 @@ pub fn utility_not_fired_on_failed_turn_test() {
   let sub = join(sess)
   let _ = expect_event(sub)
 
-  should.equal(session.send_message(sess, "will fail"), session.Sent)
+  should.equal(thread.send_message(sess, "will fail"), thread.Sent)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
@@ -1647,10 +1630,10 @@ pub fn utility_not_fired_on_failed_turn_test() {
   expect_no_event(sub, 400)
 }
 
-/// A utility side call in flight is invisible to callers: the session is
+/// A utility side call in flight is invisible to callers: the thread is
 /// never Busy because of it (fairness on serialized backends), a `Send`
 /// cancels it instead, and the cancelled attempt does NOT consume the
-/// once-per-session flag — the debounce re-arms at the next commit point
+/// once-per-thread flag — the debounce re-arms at the next commit point
 /// and the title still lands.
 pub fn utility_cancels_on_send_and_rearms_test() {
   let events = process.new_subject()
@@ -1665,7 +1648,7 @@ pub fn utility_cancels_on_send_and_rearms_test() {
   let sub = join(sess)
   let _ = expect_event(sub)
 
-  should.equal(session.send_message(sess, "first"), session.Sent)
+  should.equal(thread.send_message(sess, "first"), thread.Sent)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
@@ -1676,8 +1659,8 @@ pub fn utility_cancels_on_send_and_rearms_test() {
   let assert Ok(cancelled_handles) = process.receive(ready, 2000)
 
   // The side call runs BESIDE the turn machinery: not streaming, not busy.
-  session.describe(sess).streaming |> should.be_false
-  should.equal(session.send_message(sess, "second"), session.Sent)
+  thread.describe(sess).streaming |> should.be_false
+  should.equal(thread.send_message(sess, "second"), thread.Sent)
 
   // The in-flight attempt was cancelled by the send…
   UtilCancelled |> should.equal(expect_utility(events))
@@ -1689,7 +1672,7 @@ pub fn utility_cancels_on_send_and_rearms_test() {
   let _ = expect_event(sub)
   // …and ONLY NOW does the held attempt report its cancellation: the
   // arm-while-unreported order is deterministic. The once-flag is intact:
-  // the owed trigger is delivered and the session's ONLY attempt runs
+  // the owed trigger is delivered and the thread's ONLY attempt runs
   // again.
   process.send(cancelled_handles.resume, Nil)
   UtilCalled(5)
@@ -1703,9 +1686,7 @@ pub fn utility_cancels_on_send_and_rearms_test() {
   UtilAppliedNote("Model Title")
   |> should.equal(expect_utility_step(events, "applied"))
   expect_event(sub)
-  |> should.equal(
-    scoped(session.MetaUpdated(Some("Model Title"), ["auto-tag"])),
-  )
+  |> should.equal(scoped(thread.MetaUpdated(Some("Model Title"), ["auto-tag"])))
   expect_no_utility(events, 400)
 }
 
@@ -1724,7 +1705,7 @@ pub fn utility_no_broadcast_when_guard_refuses_test() {
   let sub = join(sess)
   let _ = expect_event(sub)
 
-  should.equal(session.send_message(sess, "first"), session.Sent)
+  should.equal(thread.send_message(sess, "first"), thread.Sent)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
@@ -1742,7 +1723,7 @@ pub fn utility_no_broadcast_when_guard_refuses_test() {
   expect_no_utility(events, 400)
 }
 
-/// A FAILED follow-up turn must not strand the session's only attempt:
+/// A FAILED follow-up turn must not strand the thread's only attempt:
 /// the turn commits nothing, so its commit point delivers no trigger —
 /// the cancelled in-flight attempt's completion records the trigger as
 /// owed and re-arms, and the title still lands.
@@ -1762,7 +1743,7 @@ pub fn utility_rearms_when_followup_turn_fails_test() {
   let sub = join(sess)
   let _ = expect_event(sub)
 
-  should.equal(session.send_message(sess, "first"), session.Sent)
+  should.equal(thread.send_message(sess, "first"), thread.Sent)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
@@ -1772,12 +1753,12 @@ pub fn utility_rearms_when_followup_turn_fails_test() {
 
   // The follow-up send cancels the side call and its turn then FAILS
   // (flaky's failing turn streams two tokens before erroring).
-  should.equal(session.send_message(sess, "second"), session.Sent)
+  should.equal(thread.send_message(sess, "second"), thread.Sent)
   UtilCancelled |> should.equal(expect_utility(events))
   let _ = expect_event(sub)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
-  let assert session.SessionEvent(_, 1, session.TurnFailed(_, _)) =
+  let assert thread.ThreadEvent(_, 1, thread.TurnFailed(_, _)) =
     expect_event(sub)
 
   // Nothing has re-armed yet — a failed turn commits nothing. The held
@@ -1797,9 +1778,7 @@ pub fn utility_rearms_when_followup_turn_fails_test() {
   UtilAppliedNote("Model Title")
   |> should.equal(expect_utility_step(events, "applied"))
   expect_event(sub)
-  |> should.equal(
-    scoped(session.MetaUpdated(Some("Model Title"), ["auto-tag"])),
-  )
+  |> should.equal(scoped(thread.MetaUpdated(Some("Model Title"), ["auto-tag"])))
   expect_no_utility(events, 400)
 }
 
@@ -1816,7 +1795,7 @@ pub fn utility_disabled_never_runs_test() {
   let sub = join(sess)
   let _ = expect_event(sub)
 
-  should.equal(session.send_message(sess, "first"), session.Sent)
+  should.equal(thread.send_message(sess, "first"), thread.Sent)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
   let _ = expect_event(sub)

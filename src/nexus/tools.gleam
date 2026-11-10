@@ -2,11 +2,11 @@
 //// executors.
 ////
 //// The list is built **once per process start** from the global config
-//// (loaded from the environment before any session exists — the M3 plan's
-//// pre-creation requirement) and handed to the session runner at boot, so
-//// the tool schema sent with every request of every session is frozen for
+//// (loaded from the environment before any thread exists — the M3 plan's
+//// pre-creation requirement) and handed to the thread runner at boot, so
+//// the tool schema sent with every request of every thread is frozen for
 //// the lifetime of the VM. That keeps request prefixes byte-identical
-//// across a session's turns (KV-cache contract rule 4).
+//// across a thread's turns (KV-cache contract rule 4).
 
 import gleam/dynamic/decode
 import gleam/erlang/process.{type Subject}

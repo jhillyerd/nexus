@@ -13,8 +13,8 @@ import gleeunit/should
 import nexus/page as nexus_page
 import nexus/provider
 import nexus/provider_registry
-import nexus/session
-import nexus/session_registry
+import nexus/thread
+import nexus/thread_registry
 import nexus/ui_runtime
 import nexus/web
 
@@ -58,10 +58,10 @@ pub fn models_json_test() {
   |> should.equal("{\"models\":[\"alias-a\",\"alias-b\"]}")
 }
 
-pub fn sessions_json_test() {
+pub fn threads_json_test() {
   let sample =
-    session.MetricSample(
-      outcome: session.Failed,
+    thread.MetricSample(
+      outcome: thread.Failed,
       ttft_ms: None,
       duration_ms: 25,
       token_deltas: 1,
@@ -71,12 +71,12 @@ pub fn sessions_json_test() {
       failure_reason: Some("upstream"),
     )
   let summary =
-    session.SessionSummary(
+    thread.ThreadSummary(
       id: "s-2",
       provider_id: "p1",
       model: "alias-b",
       title: "renamed by hand",
-      title_source: session.ManualTitle,
+      title_source: thread.ManualTitle,
       pinned: True,
       tags: ["work", "notes"],
       archived: False,
@@ -86,8 +86,8 @@ pub fn sessions_json_test() {
       last_active_at: 1_729_003_600,
       metrics: [sample],
     )
-  let data = json.to_string(web.sessions_json([summary]))
-  should.be_true(string.contains(data, "\"sessions\":["))
+  let data = json.to_string(web.threads_json([summary]))
+  should.be_true(string.contains(data, "\"threads\":["))
   should.be_true(string.contains(data, "\"id\":\"s-2\""))
   // The pinned provider is part of the summary wire shape (multi-provider
   // §11): the id is the stable key — display names resolve caller-side.
@@ -117,13 +117,13 @@ pub fn sessions_json_test() {
 
 pub fn auto_title_test() {
   // Short message: trimmed, whitespace collapsed, no ellipsis.
-  session_registry.title_from_first_message("  hello   there  ")
+  thread_registry.title_from_first_message("  hello   there  ")
   |> should.equal("hello there")
-  session_registry.title_from_first_message("line one\nline two\tand\r\ntabs")
+  thread_registry.title_from_first_message("line one\nline two\tand\r\ntabs")
   |> should.equal("line one line two and tabs")
   // Truncation at 60 characters with an ellipsis.
   let long = string.repeat("ab ", 50)
-  let titled = session_registry.title_from_first_message(long)
+  let titled = thread_registry.title_from_first_message(long)
   should.be_true(string.length(titled) == 61)
   should.be_true(string.ends_with(titled, "…"))
   // The collapsed prefix survives intact.
@@ -138,13 +138,13 @@ pub fn filter_archived_test() {
   web.filter_archived(all, True) |> should.equal([archived])
 }
 
-fn summary_with_archived(id: String, archived: Bool) -> session.SessionSummary {
-  session.SessionSummary(
+fn summary_with_archived(id: String, archived: Bool) -> thread.ThreadSummary {
+  thread.ThreadSummary(
     id: id,
     provider_id: "p1",
     model: "alias-b",
     title: "",
-    title_source: session.AutoTitle,
+    title_source: thread.AutoTitle,
     pinned: False,
     tags: [],
     archived: archived,
@@ -183,7 +183,7 @@ pub fn patch_body_decoders_test() {
 pub fn request_body_decoders_test() {
   web.parse_text_json("{\"text\":\"hello\"}")
   |> should.equal(Ok("hello"))
-  // POST /sessions now pins provider + model (multi-provider §11).
+  // POST /threads now pins provider + model (multi-provider §11).
   web.parse_create_json("{\"provider\":\"p1\",\"model\":\"alias-a\"}")
   |> should.equal(Ok(web.CreateFields(provider: "p1", model: "alias-a")))
   web.parse_text_json("{\"model\":\"alias-a\"}")
@@ -298,7 +298,7 @@ pub fn registry_error_fields_test() {
   web.registry_error_fields(provider_registry.StillReferenced)
   |> should.equal(#(
     409,
-    "provider is still pinned by sessions; disable it instead",
+    "provider is still pinned by threads; disable it instead",
   ))
   web.registry_error_fields(provider_registry.DecryptFailed)
   |> should.equal(#(
@@ -319,13 +319,13 @@ pub fn registry_error_fields_test() {
 pub fn protected_route_matrix_test() {
   [
     #(Get, []),
-    #(Get, ["sessions"]),
-    #(Post, ["sessions"]),
-    #(Post, ["sessions", "s-1", "send"]),
-    #(Post, ["sessions", "s-1", "stop"]),
+    #(Get, ["threads"]),
+    #(Post, ["threads"]),
+    #(Post, ["threads", "s-1", "send"]),
+    #(Post, ["threads", "s-1", "stop"]),
     // M3 organization: metadata + deletion sit behind the same gate.
-    #(Patch, ["sessions", "s-1"]),
-    #(Delete, ["sessions", "s-1"]),
+    #(Patch, ["threads", "s-1"]),
+    #(Delete, ["threads", "s-1"]),
     // P4: the whole provider management surface (§11 — all provider
     // routes require NEXUS_UI_TOKEN when set).
     #(Get, ["providers"]),
@@ -397,9 +397,9 @@ pub fn m3_page_autoscroll_script_test() {
   should.be_true(string.contains(html, "getElementById('log')"))
   should.be_true(string.contains(html, "getElementById('jump-latest')"))
   // Streaming grows text nodes in place, so the observer must watch
-  // characterData, and session switches ride #layout[data-selected].
+  // characterData, and thread switches ride #layout[data-selected].
   should.be_true(string.contains(html, "characterData: true"))
-  // Both shell scripts watch data-selected (session_js persists the
+  // Both shell scripts watch data-selected (thread_js persists the
   // selection, the autoscroll script force-jumps on a switch) — count it
   // so this test fails if the autoscroll half silently loses its
   // observer, which a plain contains would never catch.
@@ -470,13 +470,13 @@ pub fn pico_asset_served_from_priv_test() {
   |> should.equal(Ok("private, max-age=86400"))
 }
 
-/// Sidebar-density contract (ui-polish F2): session-row controls are
+/// Sidebar-density contract (ui-polish F2): thread-row controls are
 /// hidden until the row is hovered, keyboard-focused, or selected, and
-/// the rule must stay scoped to `.session-row` — Settings' provider rows
+/// the rule must stay scoped to `.thread-row` — Settings' provider rows
 /// share `.row-controls` and must never lose their controls. The touch
 /// guard (`@media (hover: hover)`) keeps the hover half off devices with
 /// no pointer, where `:focus-within`/`.selected` carry the reveal.
-pub fn m3_session_row_controls_reveal_css_test() {
+pub fn m3_thread_row_controls_reveal_css_test() {
   let css = nexus_page.html(None)
   // Hidden by default, revealed on the three reachable states. The whole
   // block is asserted as ONE contiguous fragment: checking the media
@@ -484,16 +484,16 @@ pub fn m3_session_row_controls_reveal_css_test() {
   // rule drifts out of the guard, which would re-expose hover on touch.
   should.be_true(string.contains(
     css,
-    ".session-row .row-controls { display: none; }\n"
-      <> ".session-row.selected .row-controls,\n"
-      <> ".session-row:focus-within .row-controls { display: flex; }\n"
+    ".thread-row .row-controls { display: none; }\n"
+      <> ".thread-row.selected .row-controls,\n"
+      <> ".thread-row:focus-within .row-controls { display: flex; }\n"
       <> "@media (hover: hover) {\n"
-      <> "  .session-row:hover .row-controls { display: flex; }\n"
+      <> "  .thread-row:hover .row-controls { display: flex; }\n"
       <> "}",
   ))
   // Scoped: a bare `.row-controls` reveal would also hide the provider
   // rows' Disable/Enable/Edit/Test/Delete. The rule may never appear at
-  // the start of a line without the `.session-row` prefix in front.
+  // the start of a line without the `.thread-row` prefix in front.
   should.be_false(string.contains(css, "\n.row-controls { display: none; }"))
 }
 

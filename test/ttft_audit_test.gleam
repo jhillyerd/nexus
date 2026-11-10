@@ -14,7 +14,7 @@ pub fn deterministic_transcript_test() {
     |> transcript.new("test-model", _)
     |> transcript.append_user(ttft.user_prompt(1))
     |> transcript.request_body(transcript.default_options())
-  should.be_true(string.contains(body, "Session nonce: 123"))
+  should.be_true(string.contains(body, "Thread nonce: 123"))
   should.be_true(string.contains(body, "Cache audit turn"))
 }
 
@@ -37,7 +37,7 @@ pub fn summarize_cold_and_warm_test() {
 pub fn csv_row_test() {
   should.equal(
     ttft.csv_header(),
-    "session,turn,ttft_ms,duration_ms,token_deltas,events_parsed,prompt_tokens,cached_tokens,prompt_tokens_estimated,tokens_per_second",
+    "thread,turn,ttft_ms,duration_ms,token_deltas,events_parsed,prompt_tokens,cached_tokens,prompt_tokens_estimated,tokens_per_second",
   )
   should.equal(
     ttft.csv_row(turn(1, 10, 20, usage(75))),
@@ -60,13 +60,13 @@ pub fn validity_rejects_incomplete_streams_test() {
 }
 
 fn turn(
-  session: Int,
+  thread: Int,
   turn_number: Int,
   ttft_ms: Int,
   usage: option.Option(shared.CompletionUsage),
 ) -> ttft.TurnResult {
   ttft.TurnResult(
-    session: session,
+    thread: thread,
     turn: turn_number,
     prompt_chars: 400,
     stats: openai.StreamStats(
