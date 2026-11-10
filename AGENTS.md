@@ -93,7 +93,7 @@ Unit tests: `test/migrate_test.gleam`.
 
 ## UI and agent-loop invariants (hard constraints — do not break)
 
-Pinned by the M3 browser suite (`docs/plans/completed/m3-verification.md`);
+Pinned by the e2e browser suite (`docs/plans/completed/m3-verification.md`);
 `test/ui_test.gleam` keeps most of them green offline.
 
 - **Model and tool output is hostile text.** Everything the UI renders is

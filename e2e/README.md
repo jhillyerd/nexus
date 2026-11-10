@@ -1,8 +1,8 @@
-# M3 browser suite (validation only)
+# e2e test suite (validation only)
 
-Headless-Chromium (Playwright) checks for the complete M3 flow: tool calls,
-results, loop state, replay, stop, and the iteration guard in the real
-Lustre/WebSocket UI. **This directory is not a Nexus runtime dependency** —
+Headless-Chromium (Playwright) checks for the complete tool-loop flow:
+tool calls, results, loop state, replay, stop, and the iteration guard in the
+real Lustre/WebSocket UI. **This directory is not a Nexus runtime dependency** —
 nothing here affects `gleam run` / `gleam test` / the project devShell.
 
 ## What it exercises

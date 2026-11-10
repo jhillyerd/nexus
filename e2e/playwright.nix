@@ -1,4 +1,4 @@
-# Minimal Nixpkgs expression for the nexus M3 browser suite.
+# Minimal Nixpkgs expression for the nexus e2e browser suite.
 #
 # Validation-only: this file provides Playwright driving headless Chromium on
 # NixOS. It must never alter Nexus runtime dependencies — nothing here feeds
