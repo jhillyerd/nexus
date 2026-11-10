@@ -1,16 +1,21 @@
-//// Boot: load config (loudly), then bring up the M3 supervision tree —
-//// root supervisor (OneForAll) with the thread **factory supervisor**
-//// first, the **thread registry** second, and the mist server third, so
-//// HTTP traffic always finds a live registry and the registry always finds
-//// its factory (M2 plan §2/§7 step 3).
+//// Boot: load config (loudly), then bring up the supervision tree — one
+//// OneForAll root, started in the order ARCHITECTURE.md §2 maps: the
+//// **store** first (persistence is mandatory — an unreachable database
+//// fails boot), the **provider registry** second (it loads and
+//// decrypt-validates every provider row), the thread **factory
+//// supervisor** third, the **thread registry** fourth (it hydrates the
+//// dormant set from the store before serving), and the mist server last,
+//// so HTTP traffic always finds a live registry.
 ////
 //// Thread actors are started dynamically as temporary children of the
-//// factory; only the registry replaces them (same ID, empty transcript).
+//// factory; the registry replaces them by restarting through the factory
+//// and rehydrating their transcript from the store.
 ////
 //// Restart recovery (PRD acceptance): the supervisor is linked to this
 //// process; if it gives up (crash loop) the VM halts and the *outer*
-//// supervisor (Nomad job / run script) restarts us into a clean, empty
-//// registry — history loss on restart is accepted by the PRD for the MVP.
+//// supervisor (Nomad job / run script) restarts us — persisted history
+//// rehydrates from the store, so only turn commits still queued in the
+//// write-behind lane are lost (the PRD accepts this window for the MVP).
 
 import gleam/erlang/process
 import gleam/int
