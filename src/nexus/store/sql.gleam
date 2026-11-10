@@ -41,9 +41,9 @@ pub fn append_plain_message(
 -- sentinel inserts NULL the same way (to_timestamp(NULL) is NULL), so
 -- unstamped rows stay honestly unstamped instead of borrowing the write
 -- instant as a fake append time.
-insert into session_message (session_id, seq, role, content, reasoning, created_at)
+insert into thread_message (thread_id, seq, role, content, reasoning, created_at)
 values ($1, $2, $3, $4, nullif($5, ''::text), to_timestamp(nullif($6, 0::bigint)))
-on conflict (session_id, seq) do nothing
+on conflict (thread_id, seq) do nothing
 "
   |> pog.query
   |> pog.parameter(pog.text(arg_1))
@@ -87,9 +87,9 @@ pub fn append_tool_call(
 -- created_at is display-only and follows the same first-row rule as
 -- content/reasoning; the 0 sentinel inserts NULL (see
 -- append_plain_message.sql).
-insert into session_message (session_id, seq, role, content, tool_call_id, tool_name, tool_args, reasoning, created_at)
+insert into thread_message (thread_id, seq, role, content, tool_call_id, tool_name, tool_args, reasoning, created_at)
 values ($1, $2, 'assistant', $3, $4, $5, $6, nullif($7, ''::text), to_timestamp(nullif($8, 0::bigint)))
-on conflict (session_id, seq) do nothing
+on conflict (thread_id, seq) do nothing
 "
   |> pog.query
   |> pog.parameter(pog.text(arg_1))
@@ -126,9 +126,9 @@ pub fn append_tool_result(
   "-- Append one tool-result row.
 -- created_at is display-only (the chat log's per-message ages); the 0
 -- sentinel inserts NULL (see append_plain_message.sql).
-insert into session_message (session_id, seq, role, content, tool_call_id, tool_name, tool_ok, created_at)
+insert into thread_message (thread_id, seq, role, content, tool_call_id, tool_name, tool_ok, created_at)
 values ($1, $2, 'tool', $3, $4, $5, $6, to_timestamp(nullif($7, 0::bigint)))
-on conflict (session_id, seq) do nothing
+on conflict (thread_id, seq) do nothing
 "
   |> pog.query
   |> pog.parameter(pog.text(arg_1))
@@ -154,7 +154,7 @@ pub fn archive(
 ) -> Result(pog.Returned(Nil), pog.QueryError) {
   let decoder = decode.map(decode.dynamic, fn(_) { Nil })
 
-  "update session set archived_at = now(), pinned = false
+  "update thread set archived_at = now(), pinned = false
 where id = $1
 "
   |> pog.query
@@ -191,7 +191,7 @@ pub fn auto_meta_upgrade(
 -- and a manual save racing an in-flight apply is refused here
 -- atomically. Twin of the registry's in-memory UpgradeAutoTitle guard.
 -- Rowcount is the guard outcome.
-update session set title = $1, tags = $3
+update thread set title = $1, tags = $3
 where id = $2
   and title_source = 'auto'
   and tags_source = 'auto'
@@ -217,7 +217,7 @@ pub fn auto_title(
   let decoder = decode.map(decode.dynamic, fn(_) { Nil })
 
   "-- Auto-title only while the title is still the untouched auto default.
-update session set title = $1
+update thread set title = $1
 where id = $2 and title_source = 'auto' and title = ''
 "
   |> pog.query
@@ -240,7 +240,7 @@ pub fn bump_activity(
   let decoder = decode.map(decode.dynamic, fn(_) { Nil })
 
   "-- Turn commit: recency + denormalized count (absolute, idempotent).
-update session set last_active_at = now(), message_count = $1
+update thread set last_active_at = now(), message_count = $1
 where id = $2
 "
   |> pog.query
@@ -250,35 +250,35 @@ where id = $2
   |> pog.execute(db)
 }
 
-/// A row you get from running the `count_sessions_for_provider` query
-/// defined in `./src/nexus/store/sql/count_sessions_for_provider.sql`.
+/// A row you get from running the `count_threads_for_provider` query
+/// defined in `./src/nexus/store/sql/count_threads_for_provider.sql`.
 ///
 /// > 🐿️ This type definition was generated automatically using v4.7.0 of the
 /// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
 ///
-pub type CountSessionsForProviderRow {
-  CountSessionsForProviderRow(sessions: Int)
+pub type CountThreadsForProviderRow {
+  CountThreadsForProviderRow(threads: Int)
 }
 
-/// How many sessions pin this provider — the registry's delete guard
+/// How many threads pin this provider — the registry's delete guard
 /// (409 while > 0; prefer disabling).
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
 ///
-pub fn count_sessions_for_provider(
+pub fn count_threads_for_provider(
   db: pog.Connection,
   provider_id: String,
-) -> Result(pog.Returned(CountSessionsForProviderRow), pog.QueryError) {
+) -> Result(pog.Returned(CountThreadsForProviderRow), pog.QueryError) {
   let decoder = {
-    use sessions <- decode.field(0, decode.int)
-    decode.success(CountSessionsForProviderRow(sessions:))
+    use threads <- decode.field(0, decode.int)
+    decode.success(CountThreadsForProviderRow(threads:))
   }
 
-  "-- How many sessions pin this provider — the registry's delete guard
+  "-- How many threads pin this provider — the registry's delete guard
 -- (409 while > 0; prefer disabling).
-select count(*)::int8 as sessions
-from session
+select count(*)::int8 as threads
+from thread
 where provider_id = $1
 "
   |> pog.query
@@ -287,8 +287,8 @@ where provider_id = $1
   |> pog.execute(db)
 }
 
-/// Hard delete of an unreferenced provider. While any session pins it,
-/// the session_provider_id FK (ON DELETE RESTRICT) refuses the delete —
+/// Hard delete of an unreferenced provider. While any thread pins it,
+/// the thread_provider_id FK (ON DELETE RESTRICT) refuses the delete —
 /// the registry's count-based 409 pre-check is the friendly copy of that
 /// guard, this is the enforcement.
 ///
@@ -301,8 +301,8 @@ pub fn delete_provider(
 ) -> Result(pog.Returned(Nil), pog.QueryError) {
   let decoder = decode.map(decode.dynamic, fn(_) { Nil })
 
-  "-- Hard delete of an unreferenced provider. While any session pins it,
--- the session_provider_id FK (ON DELETE RESTRICT) refuses the delete —
+  "-- Hard delete of an unreferenced provider. While any thread pins it,
+-- the thread_provider_id FK (ON DELETE RESTRICT) refuses the delete —
 -- the registry's count-based 409 pre-check is the friendly copy of that
 -- guard, this is the enforcement.
 delete from provider where id = $1
@@ -313,19 +313,19 @@ delete from provider where id = $1
   |> pog.execute(db)
 }
 
-/// Runs the `delete_session` query
-/// defined in `./src/nexus/store/sql/delete_session.sql`.
+/// Runs the `delete_thread` query
+/// defined in `./src/nexus/store/sql/delete_thread.sql`.
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
 ///
-pub fn delete_session(
+pub fn delete_thread(
   db: pog.Connection,
   id: String,
 ) -> Result(pog.Returned(Nil), pog.QueryError) {
   let decoder = decode.map(decode.dynamic, fn(_) { Nil })
 
-  "delete from session where id = $1
+  "delete from thread where id = $1
 "
   |> pog.query
   |> pog.parameter(pog.text(id))
@@ -409,14 +409,14 @@ where id = $1
   |> pog.execute(db)
 }
 
-/// A row you get from running the `get_session` query
-/// defined in `./src/nexus/store/sql/get_session.sql`.
+/// A row you get from running the `get_thread` query
+/// defined in `./src/nexus/store/sql/get_thread.sql`.
 ///
 /// > 🐿️ This type definition was generated automatically using v4.7.0 of the
 /// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
 ///
-pub type GetSessionRow {
-  GetSessionRow(
+pub type GetThreadRow {
+  GetThreadRow(
     id: String,
     provider_id: String,
     title: String,
@@ -434,17 +434,17 @@ pub type GetSessionRow {
   )
 }
 
-/// One stored session row (lazy hydration of a dormant session). The
+/// One stored thread row (lazy hydration of a dormant thread). The
 /// provenance columns ride along (utility-tags plan §3.5): rehydration
 /// must never lack them.
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
 ///
-pub fn get_session(
+pub fn get_thread(
   db: pog.Connection,
   id: String,
-) -> Result(pog.Returned(GetSessionRow), pog.QueryError) {
+) -> Result(pog.Returned(GetThreadRow), pog.QueryError) {
   let decoder = {
     use id <- decode.field(0, decode.string)
     use provider_id <- decode.field(1, decode.string)
@@ -460,7 +460,7 @@ pub fn get_session(
     use created_s <- decode.field(11, decode.int)
     use last_active_s <- decode.field(12, decode.int)
     use message_count <- decode.field(13, decode.int)
-    decode.success(GetSessionRow(
+    decode.success(GetThreadRow(
       id:,
       provider_id:,
       title:,
@@ -478,7 +478,7 @@ pub fn get_session(
     ))
   }
 
-  "-- One stored session row (lazy hydration of a dormant session). The
+  "-- One stored thread row (lazy hydration of a dormant thread). The
 -- provenance columns ride along (utility-tags plan §3.5): rehydration
 -- must never lack them.
 select
@@ -496,7 +496,7 @@ select
   extract(epoch from created_at)::int8 as created_s,
   extract(epoch from last_active_at)::int8 as last_active_s,
   message_count
-from session
+from thread
 where id = $1
 "
   |> pog.query
@@ -546,17 +546,17 @@ values ($1, $2, $3, nullif($4, ''::bytea), $5, $6, $7, to_timestamp($8), to_time
   |> pog.execute(db)
 }
 
-/// A new session row: created/last_active from the registry's epoch
+/// A new thread row: created/last_active from the registry's epoch
 /// seconds; message_count is the transcript length (1 = system prompt).
 /// provider_id is frozen at creation with the model (contract rule 2).
 /// tags_manual is '{}' literally and tags_source is left to its column
-/// default 'auto' (utility-tags plan §3.5): a new session has no tags and
+/// default 'auto' (utility-tags plan §3.5): a new thread has no tags and
 /// an open auto path.
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
 ///
-pub fn insert_session(
+pub fn insert_thread(
   db: pog.Connection,
   arg_1: String,
   arg_2: String,
@@ -571,13 +571,13 @@ pub fn insert_session(
 ) -> Result(pog.Returned(Nil), pog.QueryError) {
   let decoder = decode.map(decode.dynamic, fn(_) { Nil })
 
-  "-- A new session row: created/last_active from the registry's epoch
+  "-- A new thread row: created/last_active from the registry's epoch
 -- seconds; message_count is the transcript length (1 = system prompt).
 -- provider_id is frozen at creation with the model (contract rule 2).
 -- tags_manual is '{}' literally and tags_source is left to its column
--- default 'auto' (utility-tags plan §3.5): a new session has no tags and
+-- default 'auto' (utility-tags plan §3.5): a new thread has no tags and
 -- an open auto path.
-insert into session (id, provider_id, title, title_source, model, system_prompt, pinned, tags, tags_manual, created_at, last_active_at, message_count)
+insert into thread (id, provider_id, title, title_source, model, system_prompt, pinned, tags, tags_manual, created_at, last_active_at, message_count)
 values ($1, $2, $3, $4, $5, $6, $7, $8, '{}', to_timestamp($9), to_timestamp($9), $10)
 "
   |> pog.query
@@ -693,7 +693,7 @@ pub type ListSummariesRow {
   )
 }
 
-/// All stored session summaries, ordered by id (the registry re-sorts).
+/// All stored thread summaries, ordered by id (the registry re-sorts).
 /// The provenance columns ride along (utility-tags plan §3.5): the boot
 /// load must never lack them.
 ///
@@ -734,7 +734,7 @@ pub fn list_summaries(
     ))
   }
 
-  "-- All stored session summaries, ordered by id (the registry re-sorts).
+  "-- All stored thread summaries, ordered by id (the registry re-sorts).
 -- The provenance columns ride along (utility-tags plan §3.5): the boot
 -- load must never lack them.
 select
@@ -751,7 +751,7 @@ select
   extract(epoch from created_at)::int8 as created_s,
   extract(epoch from last_active_at)::int8 as last_active_s,
   message_count
-from session
+from thread
 order by id
 "
   |> pog.query
@@ -780,7 +780,7 @@ pub type LoadMessagesRow {
   )
 }
 
-/// One session's messages in append-only order, with the session's
+/// One thread's messages in append-only order, with the thread's
 /// denormalized message_count (the authoritative persisted transcript
 /// length, including the system prompt — a multi-call assistant message is
 /// one message but several rows, so rows alone would undercount).
@@ -798,7 +798,7 @@ pub type LoadMessagesRow {
 ///
 pub fn load_messages(
   db: pog.Connection,
-  m_session_id: String,
+  m_thread_id: String,
 ) -> Result(pog.Returned(LoadMessagesRow), pog.QueryError) {
   let decoder = {
     use seq <- decode.field(0, decode.int)
@@ -825,7 +825,7 @@ pub fn load_messages(
     ))
   }
 
-  "-- One session's messages in append-only order, with the session's
+  "-- One thread's messages in append-only order, with the thread's
 -- denormalized message_count (the authoritative persisted transcript
 -- length, including the system prompt — a multi-call assistant message is
 -- one message but several rows, so rows alone would undercount).
@@ -838,13 +838,13 @@ pub fn load_messages(
 -- decoder for a bare extract(...) and crash on NULL rows — the same
 -- sentinel workaround as the '' text sentinel (insert_provider.sql).
 select m.seq, m.role, m.content, m.tool_call_id, m.tool_name, m.tool_args, m.tool_ok, m.reasoning, coalesce(extract(epoch from m.created_at)::int8, 0) as created_s, s.message_count
-from session_message m
-join session s on s.id = m.session_id
-where m.session_id = $1
+from thread_message m
+join thread s on s.id = m.thread_id
+where m.thread_id = $1
 order by m.seq
 "
   |> pog.query
-  |> pog.parameter(pog.text(m_session_id))
+  |> pog.parameter(pog.text(m_thread_id))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }
@@ -859,7 +859,7 @@ pub type PruneNeverUsedRow {
   PruneNeverUsedRow(id: String)
 }
 
-/// Boot sweep: hard-delete never-used sessions older than the grace
+/// Boot sweep: hard-delete never-used threads older than the grace
 /// window, in ONE statement (bounded startup work — the registry runs
 /// this inside its actor-initialiser deadline).
 ///
@@ -869,7 +869,7 @@ pub type PruneNeverUsedRow {
 /// manual rename is intent and survives), never pinned (also intent).
 /// Archived or not: an archived empty is still litter.
 ///
-/// The grace window protects a session another concurrently-running
+/// The grace window protects a thread another concurrently-running
 /// server created moments ago and still holds live — it stays empty
 /// until its first turn commits. 15 minutes is far past any first turn.
 ///
@@ -884,7 +884,7 @@ pub fn prune_never_used(
     decode.success(PruneNeverUsedRow(id:))
   }
 
-  "-- Boot sweep: hard-delete never-used sessions older than the grace
+  "-- Boot sweep: hard-delete never-used threads older than the grace
 -- window, in ONE statement (bounded startup work — the registry runs
 -- this inside its actor-initialiser deadline).
 --
@@ -894,10 +894,10 @@ pub fn prune_never_used(
 -- manual rename is intent and survives), never pinned (also intent).
 -- Archived or not: an archived empty is still litter.
 --
--- The grace window protects a session another concurrently-running
+-- The grace window protects a thread another concurrently-running
 -- server created moments ago and still holds live — it stays empty
 -- until its first turn commits. 15 minutes is far past any first turn.
-delete from session
+delete from thread
 where message_count <= 1
   and title_source = 'auto'
   and pinned = false
@@ -922,7 +922,7 @@ pub fn set_pinned(
 ) -> Result(pog.Returned(Nil), pog.QueryError) {
   let decoder = decode.map(decode.dynamic, fn(_) { Nil })
 
-  "update session set pinned = $1
+  "update thread set pinned = $1
 where id = $2
 "
   |> pog.query
@@ -953,7 +953,7 @@ pub fn set_tags(
 -- closes — one statement, so the freeze itself is atomic (all three
 -- fields or nothing; the tags_source flip is what auto_meta_upgrade's
 -- guard reads).
-update session set tags = $1, tags_manual = $1, tags_source = 'manual'
+update thread set tags = $1, tags_manual = $1, tags_source = 'manual'
 where id = $2
 "
   |> pog.query
@@ -976,7 +976,7 @@ pub fn set_title(
 ) -> Result(pog.Returned(Nil), pog.QueryError) {
   let decoder = decode.map(decode.dynamic, fn(_) { Nil })
 
-  "update session set title = $1, title_source = 'manual'
+  "update thread set title = $1, title_source = 'manual'
 where id = $2
 "
   |> pog.query
@@ -998,7 +998,7 @@ pub fn unarchive(
 ) -> Result(pog.Returned(Nil), pog.QueryError) {
   let decoder = decode.map(decode.dynamic, fn(_) { Nil })
 
-  "update session set archived_at = null
+  "update thread set archived_at = null
 where id = $1
 "
   |> pog.query
@@ -1014,7 +1014,7 @@ where id = $1
 /// true  → envelope := nullif($5, ''::bytea) — a real value replaces
 /// it, the '' sentinel goes keyless (NULL) — and key_version
 /// := $6. (Sentinel for the same reason as insert_provider.)
-/// updated_at is server-side now(), like the session metadata writes.
+/// updated_at is server-side now(), like the thread metadata writes.
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
@@ -1038,7 +1038,7 @@ pub fn update_provider(
 --   true  → envelope := nullif($5, ''::bytea) — a real value replaces
 --           it, the '' sentinel goes keyless (NULL) — and key_version
 --           := $6. (Sentinel for the same reason as insert_provider.)
--- updated_at is server-side now(), like the session metadata writes.
+-- updated_at is server-side now(), like the thread metadata writes.
 update provider set
   name = $2,
   base_url = $3,

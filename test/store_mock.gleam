@@ -13,15 +13,15 @@ import gleam/list
 import gleam/option.{None}
 import gleam/otp/actor
 import gleam/string
-import nexus/session
 import nexus/store.{type Store, type StoredProvider, type StoredSummary}
+import nexus/thread
 import nexus/timing
 import nexus/transcript.{type Transcript}
 
 /// Recorded seam calls, oldest first — for write-behind ordering and
 /// metadata write-through assertions.
 pub type Event {
-  EvInsertSession(id: String)
+  EvInsertThread(id: String)
   EvCommit(id: String, messages: Int)
   EvSetTitle(id: String, title: String)
   EvAutoTitle(id: String, title: String)
@@ -30,7 +30,7 @@ pub type Event {
   EvSetPinned(id: String, pinned: Bool)
   EvArchive(id: String)
   EvUnarchive(id: String)
-  EvDeleteSession(id: String)
+  EvDeleteThread(id: String)
   /// One boot sweep: the ids it deleted (sorted).
   EvPruneNeverUsed(ids: List(String))
   EvInsertProvider(id: String)
@@ -41,12 +41,12 @@ pub type Event {
 pub type MockMsg {
   // ---- seam operations (synchronous, Result replies) ----
   ListSummaries(reply: Subject(Result(List(StoredSummary), String)))
-  GetSession(id: String, reply: Subject(Result(store.StoredSession, String)))
+  GetThread(id: String, reply: Subject(Result(store.StoredThread, String)))
   LoadMessages(
     id: String,
     reply: Subject(Result(List(store.MessageRow), String)),
   )
-  InsertSession(
+  InsertThread(
     summary: StoredSummary,
     system_prompt: String,
     reply: Subject(Result(Nil, String)),
@@ -67,7 +67,7 @@ pub type MockMsg {
   SetPinned(id: String, pinned: Bool, reply: Subject(Result(Nil, String)))
   Archive(id: String, reply: Subject(Result(Nil, String)))
   Unarchive(id: String, reply: Subject(Result(Nil, String)))
-  DeleteSession(id: String, reply: Subject(Result(Nil, String)))
+  DeleteThread(id: String, reply: Subject(Result(Nil, String)))
   /// Mirrors `prune_never_used.sql` (see the seam's docs in
   /// `nexus/store`): bulk boot sweep, replying with the deleted ids.
   PruneNeverUsed(reply: Subject(Result(List(String), String)))
@@ -80,14 +80,14 @@ pub type MockMsg {
     replace_key: Bool,
     reply: Subject(Result(Nil, String)),
   )
-  CountSessionsForProvider(id: String, reply: Subject(Result(Int, String)))
+  CountThreadsForProvider(id: String, reply: Subject(Result(Int, String)))
   DeleteProvider(id: String, reply: Subject(Result(Nil, String)))
   // ---- test-only introspection ----
   Events(reply: Subject(List(Event)))
   Rows(reply: Subject(List(#(String, List(store.MessageRow)))))
   /// Every stored provider, id-sorted — for direct row assertions.
   Providers(reply: Subject(List(StoredProvider)))
-  /// Test-only: truncate a session's stored rows back to `keep_rows` and
+  /// Test-only: truncate a thread's stored rows back to `keep_rows` and
   /// its persisted message count to `messages` to model a crash between
   /// commits — the next Commit re-emits the delta, which is exactly the
   /// crash-recovery replay the real store makes idempotent.
@@ -95,7 +95,7 @@ pub type MockMsg {
   /// Test-only: overwrite a stored row's `last_active_at` (epoch
   /// seconds). `Commit` stamps recency with the wall clock, so a test
   /// that lays down message rows through the seam cannot also present
-  /// the session as previously active — this restores the age afterwards.
+  /// the thread as previously active — this restores the age afterwards.
   SetLastActive(id: String, at: Int, reply: Subject(Nil))
 }
 
@@ -108,22 +108,22 @@ type Stored {
     /// Persisted chronological transcript length INCLUDING the system
     /// prompt — the write-behind watermark. Message count, not row count:
     /// an assistant message with N tool calls is one message but N rows
-    /// (mirrors sessions.message_count in the real schema).
+    /// (mirrors threads.message_count in the real schema).
     messages: Int,
   )
 }
 
 type State {
   State(
-    sessions: Dict(String, Stored),
+    threads: Dict(String, Stored),
     providers: Dict(String, store.StoredProvider),
     events: List(Event),
   )
 }
 
-/// The provider id that test fixtures pin their sessions to — the
-/// P1 stand-in for a real provider source (`session.provider_id` is NOT
-/// NULL, so every stored session needs one).
+/// The provider id that test fixtures pin their threads to — the
+/// P1 stand-in for a real provider source (`thread.provider_id` is NOT
+/// NULL, so every stored thread needs one).
 pub const fixture_provider_id = "p-test"
 
 /// A keyless fixture provider row (ciphertext in, ciphertext out: the
@@ -144,8 +144,8 @@ pub fn fixture_provider() -> StoredProvider {
 }
 
 /// Idempotently create the fixture provider through the seam — call
-/// before seeding sessions or booting a registry over the mock, since
-/// `insert_session` enforces the provider FK like the real store.
+/// before seeding threads or booting a registry over the mock, since
+/// `insert_thread` enforces the provider FK like the real store.
 pub fn ensure_fixture_provider(seam: Store) -> Nil {
   case seam.get_provider(fixture_provider_id) {
     Ok(_) -> Nil
@@ -161,7 +161,7 @@ pub fn start() -> Subject(MockMsg) {
   let assert Ok(started) =
     actor.new_with_initialiser(1000, fn(self) {
       actor.initialised(
-        State(sessions: dict.new(), providers: dict.new(), events: []),
+        State(threads: dict.new(), providers: dict.new(), events: []),
       )
       |> actor.returning(self)
       |> Ok
@@ -175,10 +175,10 @@ pub fn start() -> Subject(MockMsg) {
 pub fn seam(mock: Subject(MockMsg)) -> Store {
   store.Store(
     list_summaries: fn() { call(mock, 5000, ListSummaries) },
-    get_session: fn(id) { call(mock, 5000, fn(r) { GetSession(id, r) }) },
+    get_thread: fn(id) { call(mock, 5000, fn(r) { GetThread(id, r) }) },
     load_messages: fn(id) { call(mock, 5000, fn(r) { LoadMessages(id, r) }) },
-    insert_session: fn(summary, system_prompt) {
-      call(mock, 5000, fn(r) { InsertSession(summary, system_prompt, r) })
+    insert_thread: fn(summary, system_prompt) {
+      call(mock, 5000, fn(r) { InsertThread(summary, system_prompt, r) })
     },
     commit: fn(id, transcript) { process.send(mock, Commit(id, transcript)) },
     set_title: fn(id, title) {
@@ -196,7 +196,7 @@ pub fn seam(mock: Subject(MockMsg)) -> Store {
     },
     archive: fn(id) { call(mock, 5000, fn(r) { Archive(id, r) }) },
     unarchive: fn(id) { call(mock, 5000, fn(r) { Unarchive(id, r) }) },
-    delete_session: fn(id) { call(mock, 5000, fn(r) { DeleteSession(id, r) }) },
+    delete_thread: fn(id) { call(mock, 5000, fn(r) { DeleteThread(id, r) }) },
     prune_never_used: fn() { call(mock, 5000, PruneNeverUsed) },
     list_providers: fn() { call(mock, 5000, ListProviders) },
     get_provider: fn(id) { call(mock, 5000, fn(r) { GetProvider(id, r) }) },
@@ -206,8 +206,8 @@ pub fn seam(mock: Subject(MockMsg)) -> Store {
     update_provider: fn(provider, replace_key) {
       call(mock, 5000, fn(r) { UpdateProvider(provider, replace_key, r) })
     },
-    count_sessions_for_provider: fn(id) {
-      call(mock, 5000, fn(r) { CountSessionsForProvider(id, r) })
+    count_threads_for_provider: fn(id) {
+      call(mock, 5000, fn(r) { CountThreadsForProvider(id, r) })
     },
     delete_provider: fn(id) {
       call(mock, 5000, fn(r) { DeleteProvider(id, r) })
@@ -224,7 +224,7 @@ pub fn events(mock: Subject(MockMsg)) -> List(Event) {
   call(mock, 5000, Events)
 }
 
-/// Every session's rows, id-sorted — for direct row assertions.
+/// Every thread's rows, id-sorted — for direct row assertions.
 pub fn rows(mock: Subject(MockMsg)) -> List(#(String, List(store.MessageRow))) {
   call(mock, 5000, Rows)
 }
@@ -235,7 +235,7 @@ pub fn providers(mock: Subject(MockMsg)) -> List(store.StoredProvider) {
   call(mock, 5000, Providers)
 }
 
-/// Truncate a session's stored rows (models a crash between commits so
+/// Truncate a thread's stored rows (models a crash between commits so
 /// the next Commit replays).
 pub fn rewind(
   mock: Subject(MockMsg),
@@ -294,7 +294,7 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
   case msg {
     ListSummaries(reply) -> {
       let summaries =
-        state.sessions
+        state.threads
         |> dict.values
         |> list.map(fn(stored) { stored.summary })
         |> list.sort(fn(a, b) { string.compare(a.id, b.id) })
@@ -302,12 +302,12 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
       actor.continue(state)
     }
 
-    GetSession(id, reply) ->
-      case dict.get(state.sessions, id) {
+    GetThread(id, reply) ->
+      case dict.get(state.threads, id) {
         Ok(stored) -> {
           process.send(
             reply,
-            Ok(store.StoredSession(
+            Ok(store.StoredThread(
               summary: stored.summary,
               system_prompt: stored.system_prompt,
             )),
@@ -315,25 +315,25 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
           actor.continue(state)
         }
         Error(_) -> {
-          process.send(reply, Error("no stored session " <> id))
+          process.send(reply, Error("no stored thread " <> id))
           actor.continue(state)
         }
       }
 
     LoadMessages(id, reply) ->
-      case dict.get(state.sessions, id) {
+      case dict.get(state.threads, id) {
         Ok(stored) -> {
           process.send(reply, Ok(stored.rows))
           actor.continue(state)
         }
         Error(_) -> {
-          process.send(reply, Error("no stored session " <> id))
+          process.send(reply, Error("no stored thread " <> id))
           actor.continue(state)
         }
       }
 
-    InsertSession(summary, system_prompt, reply) ->
-      // session_provider_id_fkey: the pinned provider must exist, like
+    InsertThread(summary, system_prompt, reply) ->
+      // thread_provider_id_fkey: the pinned provider must exist, like
       // the real store's FK refuses unknown ids.
       case dict.get(state.providers, summary.provider_id) {
         Error(_) -> {
@@ -345,10 +345,10 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
           actor.continue(
             State(
               ..state,
-              sessions: dict.insert(
-                state.sessions,
+              threads: dict.insert(
+                state.threads,
                 summary.id,
-                // insert_session.sql: tags_manual '{}' literally and
+                // insert_thread.sql: tags_manual '{}' literally and
                 // tags_source DEFAULT 'auto' — a new row's auto path is
                 // open, regardless of what the passed summary carried
                 // (a fresh insert never inherits provenance).
@@ -356,14 +356,14 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
                   store.StoredSummary(
                     ..summary,
                     tags_manual: [],
-                    tags_source: session.AutoTags,
+                    tags_source: thread.AutoTags,
                   ),
                   system_prompt,
                   [],
                   summary.message_count,
                 ),
               ),
-              events: [EvInsertSession(summary.id), ..state.events],
+              events: [EvInsertThread(summary.id), ..state.events],
             ),
           )
         }
@@ -371,20 +371,20 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
 
     Commit(id, transcript) -> {
       let events = [EvCommit(id, transcript.length(transcript)), ..state.events]
-      let sessions = case dict.get(state.sessions, id) {
-        Error(_) -> state.sessions
+      let threads = case dict.get(state.threads, id) {
+        Error(_) -> state.threads
         Ok(stored) -> {
           // The delta past what is stored, in seq order; an unchanged or
           // older transcript yields nothing (matching the real store,
           // which does not even bump recency without a delta).
           let already = stored.messages
           case store.has_delta(transcript, already) {
-            False -> state.sessions
+            False -> state.threads
             True -> {
               let delta = store.transcript_rows(transcript, already)
               let total = transcript.length(transcript)
               dict.insert(
-                state.sessions,
+                state.threads,
                 id,
                 Stored(
                   ..stored,
@@ -402,7 +402,7 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
           }
         }
       }
-      actor.continue(State(..state, sessions: sessions, events: events))
+      actor.continue(State(..state, threads: threads, events: events))
     }
 
     SetTitle(id, title, reply) -> {
@@ -413,7 +413,7 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
             store.StoredSummary(
               ..summary,
               title: title,
-              title_source: session.ManualTitle,
+              title_source: thread.ManualTitle,
             )
           }),
           events: [EvSetTitle(id, title), ..state.events],
@@ -422,14 +422,14 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
     }
 
     AutoTitle(id, title, reply) ->
-      case dict.get(state.sessions, id) {
+      case dict.get(state.threads, id) {
         Error(_) -> {
-          process.send(reply, Error("no stored session " <> id))
+          process.send(reply, Error("no stored thread " <> id))
           actor.continue(state)
         }
         Ok(stored) ->
           case stored.summary.title_source, stored.summary.title {
-            session.AutoTitle, "" -> {
+            thread.AutoTitle, "" -> {
               process.send(reply, Ok(True))
               actor.continue(
                 State(
@@ -453,14 +453,14 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
       // replaced and the display tags written while `title_source` AND
       // `tags_source` are 'auto'; a manual rename OR a manual tag save
       // refuses the whole write, atomically.
-      case dict.get(state.sessions, id) {
+      case dict.get(state.threads, id) {
         Error(_) -> {
-          process.send(reply, Error("no stored session " <> id))
+          process.send(reply, Error("no stored thread " <> id))
           actor.continue(state)
         }
         Ok(stored) ->
           case stored.summary.title_source, stored.summary.tags_source {
-            session.AutoTitle, session.AutoTags -> {
+            thread.AutoTitle, thread.AutoTags -> {
               process.send(reply, Ok(True))
               actor.continue(
                 State(
@@ -493,7 +493,7 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
                 ..stored.summary,
                 tags: tags,
                 tags_manual: tags,
-                tags_source: session.ManualTags,
+                tags_source: thread.ManualTags,
               ),
             )
           }),
@@ -538,11 +538,11 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
       )
     }
 
-    DeleteSession(id, reply) -> {
+    DeleteThread(id, reply) -> {
       process.send(reply, Ok(Nil))
       actor.continue(
-        State(..state, sessions: dict.delete(state.sessions, id), events: [
-          EvDeleteSession(id),
+        State(..state, threads: dict.delete(state.threads, id), events: [
+          EvDeleteThread(id),
           ..state.events
         ]),
       )
@@ -554,14 +554,14 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
       // window that protects a concurrent server's fresh empty.
       let cutoff = timing.wall_now_s() - prune_grace_s
       let ids =
-        state.sessions
+        state.threads
         |> dict.values
         |> list.filter(fn(stored) { never_used(stored.summary, cutoff) })
         |> list.map(fn(stored) { stored.summary.id })
         |> list.sort(string.compare)
-      let sessions =
-        list.fold(ids, state.sessions, fn(sessions, id) {
-          dict.delete(sessions, id)
+      let threads =
+        list.fold(ids, state.threads, fn(threads, id) {
+          dict.delete(threads, id)
         })
       process.send(reply, Ok(ids))
       // An empty sweep is a no-op — not an observable store event (the
@@ -570,7 +570,7 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
         [] -> state.events
         _ -> [EvPruneNeverUsed(ids), ..state.events]
       }
-      actor.continue(State(..state, sessions: sessions, events: events))
+      actor.continue(State(..state, threads: threads, events: events))
     }
 
     Events(reply) -> {
@@ -580,7 +580,7 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
 
     Rows(reply) -> {
       let rows =
-        state.sessions
+        state.threads
         |> dict.to_list
         |> list.map(fn(pair) { #(pair.0, pair.1.rows) })
         |> list.sort(fn(a, b) { string.compare(a.0, b.0) })
@@ -708,9 +708,9 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
         }
       }
 
-    CountSessionsForProvider(id, reply) -> {
+    CountThreadsForProvider(id, reply) -> {
       let count =
-        state.sessions
+        state.threads
         |> dict.values
         |> list.filter(fn(stored) { stored.summary.provider_id == id })
         |> list.length
@@ -719,10 +719,10 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
     }
 
     DeleteProvider(id, reply) -> {
-      // ON DELETE RESTRICT: the FK refuses while any session pins the
+      // ON DELETE RESTRICT: the FK refuses while any thread pins the
       // provider (the count is the registry's friendly 409 pre-check).
       let referenced =
-        state.sessions
+        state.threads
         |> dict.values
         |> list.any(fn(stored) { stored.summary.provider_id == id })
       case dict.has_key(state.providers, id), referenced {
@@ -733,7 +733,7 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
         True, True -> {
           process.send(
             reply,
-            Error("provider " <> id <> " still pinned by sessions"),
+            Error("provider " <> id <> " still pinned by threads"),
           )
           actor.continue(state)
         }
@@ -788,9 +788,9 @@ fn update(
 }
 
 fn update_stored(state: State, id: String, f: fn(Stored) -> Stored) -> State {
-  case dict.get(state.sessions, id) {
+  case dict.get(state.threads, id) {
     Ok(stored) ->
-      State(..state, sessions: dict.insert(state.sessions, id, f(stored)))
+      State(..state, threads: dict.insert(state.threads, id, f(stored)))
     Error(_) -> state
   }
 }
@@ -801,7 +801,7 @@ const prune_grace_s = 900
 
 fn never_used(summary: StoredSummary, cutoff_s: Int) -> Bool {
   summary.message_count <= 1
-  && summary.title_source == session.AutoTitle
+  && summary.title_source == thread.AutoTitle
   && !summary.pinned
   && summary.last_active_at < cutoff_s
 }

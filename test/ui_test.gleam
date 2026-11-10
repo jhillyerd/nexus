@@ -18,9 +18,9 @@ import nexus/loop
 import nexus/openai
 import nexus/provider
 import nexus/provider_registry
-import nexus/session
-import nexus/session_registry
 import nexus/store
+import nexus/thread
+import nexus/thread_registry
 import nexus/timing
 import nexus/transcript
 import nexus/ui
@@ -33,19 +33,19 @@ fn new_model() -> ui.Model {
     ui.init(ui.Flags(
       registry: process.new_subject(),
       providers: process.new_subject(),
-      session: None,
+      thread: None,
     ))
   model
 }
 
-/// A model whose connection supplied a last-selected session (the /ws
-/// route's `session` parameter, persisted by the page shell).
-fn new_model_with_session(id: Option(String)) -> ui.Model {
+/// A model whose connection supplied a last-selected thread (the /ws
+/// route's `thread` parameter, persisted by the page shell).
+fn new_model_with_thread(id: Option(String)) -> ui.Model {
   let #(model, _effect) =
     ui.init(ui.Flags(
       registry: process.new_subject(),
       providers: process.new_subject(),
-      session: id,
+      thread: id,
     ))
   model
 }
@@ -55,13 +55,13 @@ fn step(model: ui.Model, msg: ui.Msg) -> ui.Model {
   next
 }
 
-fn summary(id: String, streaming: Bool) -> session.SessionSummary {
-  session.SessionSummary(
+fn summary(id: String, streaming: Bool) -> thread.ThreadSummary {
+  thread.ThreadSummary(
     id: id,
     provider_id: "p1",
     model: "smart",
     title: "",
-    title_source: session.AutoTitle,
+    title_source: thread.AutoTitle,
     pinned: False,
     tags: [],
     archived: False,
@@ -79,7 +79,7 @@ fn summary(id: String, streaming: Bool) -> session.SessionSummary {
 
 pub fn init_starts_empty_test() {
   let model = new_model()
-  model.sessions |> should.equal([])
+  model.threads |> should.equal([])
   model.aliases |> should.equal([])
   model.selected |> should.equal(None)
   model.bubble |> should.equal(None)
@@ -89,11 +89,11 @@ pub fn init_starts_empty_test() {
 }
 
 // ---------------------------------------------------------------------------
-// Session list / selection
+// Thread list / selection
 // ---------------------------------------------------------------------------
 
-pub fn sessions_auto_select_first_test() {
-  let model = new_model() |> step(ui.SessionsLoaded([summary("s-1", False)]))
+pub fn threads_auto_select_first_test() {
+  let model = new_model() |> step(ui.ThreadsLoaded([summary("s-1", False)]))
   model.selected |> should.equal(Some("s-1"))
   model.create_open |> should.be_false
 }
@@ -103,10 +103,10 @@ pub fn sessions_auto_select_first_test() {
 /// applies when the model's generation matches, so a bump that lives only
 /// in the join effect leaves the model one generation behind — deaf to
 /// the whole Hello + replay. That was the blank-chat-on-boot bug: the
-/// top-most session showed selected while the pane stayed empty until the
+/// top-most thread showed selected while the pane stayed empty until the
 /// user switched away and back (#58 regression).
-pub fn sessions_loaded_auto_select_bumps_visit_test() {
-  let model = new_model() |> step(ui.SessionsLoaded([summary("s-1", False)]))
+pub fn threads_loaded_auto_select_bumps_visit_test() {
+  let model = new_model() |> step(ui.ThreadsLoaded([summary("s-1", False)]))
   let visit = model.visit
   // The fresh harness model sits at generation 0 (its GotEvents effect is
   // dropped), so the auto-switch must have bumped to 1 — the same value
@@ -114,11 +114,11 @@ pub fn sessions_loaded_auto_select_bumps_visit_test() {
   visit |> should.equal(1)
   // A replay delivery stamped with the join's generation APPLIES — this
   // is the assertion that failed while the bump was shadowed.
-  let model = step(model, ui.SessionScoped("s-1", visit, ui.Token("kept")))
+  let model = step(model, ui.ThreadScoped("s-1", visit, ui.Token("kept")))
   model.bubble |> should.equal(Some("kept"))
 }
 
-/// Archiving the OPEN session ends the visit: the selection clears and
+/// Archiving the OPEN thread ends the visit: the selection clears and
 /// the chat pane goes blank (the row is soft-hidden, so keeping the
 /// selection highlighted nothing while the pane still showed the archived
 /// content — the ghost-selection bug). The refresh that the registry
@@ -127,19 +127,19 @@ pub fn sessions_loaded_auto_select_bumps_visit_test() {
 pub fn archive_of_selection_clears_selection_test() {
   let model =
     new_model()
-    |> step(ui.SessionsLoaded([summary("s-1", False), summary("s-2", False)]))
+    |> step(ui.ThreadsLoaded([summary("s-1", False), summary("s-2", False)]))
     |> step(ui.Select("s-1"))
     |> step(ui.UserEcho("hi", None))
     |> step(ui.Archived("s-1", True))
   model.selected |> should.equal(None)
   model.log |> should.equal([])
-  model.model_label |> should.equal("no session selected")
-  // The post-write refresh (active sessions available) must NOT
+  model.model_label |> should.equal("no thread selected")
+  // The post-write refresh (active threads available) must NOT
   // auto-select: the empty state is deliberate.
   let model =
     step(
       model,
-      ui.SessionsLoaded([summary("s-1", False), summary("s-2", False)]),
+      ui.ThreadsLoaded([summary("s-1", False), summary("s-2", False)]),
     )
   model.selected |> should.equal(None)
   // An explicit pick re-arms normal selection behaviour.
@@ -147,17 +147,17 @@ pub fn archive_of_selection_clears_selection_test() {
   model.selected |> should.equal(Some("s-2"))
 }
 
-/// The New button can be clicked BEFORE the first session list arrives
+/// The New button can be clicked BEFORE the first thread list arrives
 /// (the sidebar renders immediately on a fresh connection). The hand-opened
 /// panel must mark the no-selection state as deliberate, or the arriving
 /// list auto-selects right over the open panel.
-pub fn new_session_before_first_load_suppresses_autoselect_test() {
-  let model = new_model() |> step(ui.NewSessionToggled)
+pub fn new_thread_before_first_load_suppresses_autoselect_test() {
+  let model = new_model() |> step(ui.NewThreadToggled)
   model.create_open |> should.be_true
   model.selected |> should.equal(None)
   // The first (or any later) list load must not auto-select over the
   // hand-opened panel.
-  let model = step(model, ui.SessionsLoaded([summary("s-1", False)]))
+  let model = step(model, ui.ThreadsLoaded([summary("s-1", False)]))
   model.selected |> should.equal(None)
   model.create_open |> should.be_true
   // A row pick recovers normally.
@@ -165,49 +165,49 @@ pub fn new_session_before_first_load_suppresses_autoselect_test() {
   model.selected |> should.equal(Some("s-1"))
 }
 
-/// Archiving a session that is NOT the open one leaves the selection
+/// Archiving a thread that is NOT the open one leaves the selection
 /// alone — the pane keeps showing what the user is reading.
-pub fn archive_of_other_session_keeps_selection_test() {
+pub fn archive_of_other_thread_keeps_selection_test() {
   let model =
     new_model()
-    |> step(ui.SessionsLoaded([summary("s-1", False), summary("s-2", False)]))
+    |> step(ui.ThreadsLoaded([summary("s-1", False), summary("s-2", False)]))
     |> step(ui.Select("s-1"))
     |> step(ui.Archived("s-2", True))
   model.selected |> should.equal(Some("s-1"))
   model.log |> should.equal([])
 }
 
-/// The New-session button enters the same deliberate no-selection state:
-/// the create panel opens AND the open session's view clears, so the
-/// user composes the new session against a blank pane. The panel toggle
+/// The New-thread button enters the same deliberate no-selection state:
+/// the create panel opens AND the open thread's view clears, so the
+/// user composes the new thread against a blank pane. The panel toggle
 /// still works, and the state holds across refreshes until a row is
 /// picked.
-pub fn new_session_button_clears_selection_test() {
+pub fn new_thread_button_clears_selection_test() {
   let model =
     new_model()
-    |> step(ui.SessionsLoaded([summary("s-1", False)]))
+    |> step(ui.ThreadsLoaded([summary("s-1", False)]))
     |> step(ui.Select("s-1"))
     |> step(ui.UserEcho("hi", None))
-    |> step(ui.NewSessionToggled)
+    |> step(ui.NewThreadToggled)
   model.create_open |> should.be_true
   model.selected |> should.equal(None)
   model.log |> should.equal([])
-  model.model_label |> should.equal("no session selected")
-  // A refresh (title upgrade from any session) keeps the state: no
+  model.model_label |> should.equal("no thread selected")
+  // A refresh (title upgrade from any thread) keeps the state: no
   // auto-select, panel stays open.
-  let model = step(model, ui.SessionsLoaded([summary("s-1", False)]))
+  let model = step(model, ui.ThreadsLoaded([summary("s-1", False)]))
   model.selected |> should.equal(None)
   model.create_open |> should.be_true
   // Closing the panel leaves the no-selection state; a row pick recovers.
-  let model = step(model, ui.NewSessionToggled)
+  let model = step(model, ui.NewThreadToggled)
   model.create_open |> should.be_false
   model.selected |> should.equal(None)
   let model = step(model, ui.Select("s-1"))
   model.selected |> should.equal(Some("s-1"))
 }
 
-pub fn sessions_empty_opens_create_panel_test() {
-  let model = new_model() |> step(ui.SessionsLoaded([]))
+pub fn threads_empty_opens_create_panel_test() {
+  let model = new_model() |> step(ui.ThreadsLoaded([]))
   model.selected |> should.equal(None)
   model.create_open |> should.be_true
 }
@@ -215,7 +215,7 @@ pub fn sessions_empty_opens_create_panel_test() {
 pub fn select_resets_log_and_streams_test() {
   let model =
     new_model()
-    |> step(ui.SessionsLoaded([summary("s-1", False), summary("s-2", False)]))
+    |> step(ui.ThreadsLoaded([summary("s-1", False), summary("s-2", False)]))
     |> step(ui.Hello("smart"))
     |> step(ui.UserEcho("hi", None))
     |> step(ui.Select("s-2"))
@@ -226,98 +226,98 @@ pub fn select_resets_log_and_streams_test() {
   model.model_label |> should.equal("connecting…")
 }
 
-/// Every fan-out delivery carries the emitting session's id AND the
-/// subscriber's visit generation (`session.SessionEvent`), and the update
+/// Every fan-out delivery carries the emitting thread's id AND the
+/// subscriber's visit generation (`thread.ThreadEvent`), and the update
 /// applies a delivery only when BOTH match: the id drops deliveries from
-/// other sessions; the generation drops leftovers from an EARLIER visit
-/// to the same session (rapid A→B→A). `Leave` cannot stop broadcasts
+/// other threads; the generation drops leftovers from an EARLIER visit
+/// to the same thread (rapid A→B→A). `Leave` cannot stop broadcasts
 /// already in the mailbox when it lands, so without these filters a
-/// session that kept streaming after being switched away from rendered
-/// into the OTHER session's view, and stale same-session events
+/// thread that kept streaming after being switched away from rendered
+/// into the OTHER thread's view, and stale same-thread events
 /// duplicated history on top of the second visit's replay.
-pub fn events_from_other_session_are_dropped_test() {
+pub fn events_from_other_thread_are_dropped_test() {
   let model =
     new_model()
-    |> step(ui.SessionsLoaded([summary("s-1", False), summary("s-2", False)]))
+    |> step(ui.ThreadsLoaded([summary("s-1", False), summary("s-2", False)]))
     |> step(ui.Select("s-2"))
   let visit = model.visit
 
-  // The selected session's CURRENT-visit events flow normally.
-  let model = step(model, ui.SessionScoped("s-2", visit, ui.Token("kept")))
+  // The selected thread's CURRENT-visit events flow normally.
+  let model = step(model, ui.ThreadScoped("s-2", visit, ui.Token("kept")))
   model.bubble |> should.equal(Some("kept"))
   model.streaming |> should.be_true
 
-  // The same payload from the session this connection LEFT is dropped
+  // The same payload from the thread this connection LEFT is dropped
   // whole: no bubble growth, no streaming flag, no log lines.
   let model =
     model
-    |> step(ui.SessionScoped("s-1", visit, ui.Token("dropped")))
-    |> step(ui.SessionScoped(
+    |> step(ui.ThreadScoped("s-1", visit, ui.Token("dropped")))
+    |> step(ui.ThreadScoped(
       "s-1",
       visit,
       ui.ToolCallAssembled("c1", "web_search", "{}", None),
     ))
-    |> step(ui.SessionScoped("s-1", visit, ui.TurnDone(None)))
+    |> step(ui.ThreadScoped("s-1", visit, ui.TurnDone(None)))
   model.bubble |> should.equal(Some("kept"))
   model.log |> should.equal([])
   model.pending |> should.equal([])
   model.streaming |> should.be_true
 
-  // So are SAME-session deliveries from an earlier visit (the id now
+  // So are SAME-thread deliveries from an earlier visit (the id now
   // matches; only the stale generation saves us).
   let model =
-    step(model, ui.SessionScoped("s-2", visit - 1, ui.Token("stale visit")))
+    step(model, ui.ThreadScoped("s-2", visit - 1, ui.Token("stale visit")))
   model.bubble |> should.equal(Some("kept"))
   model.streaming |> should.be_true
 }
 
 /// Offline shape of the pass-through rule: a `MetaUpdated` from a foreign
-/// session (id and generation both foreign) reaches the update arm, whose
+/// thread (id and generation both foreign) reaches the update arm, whose
 /// only observable here is the refresh effect this harness drops. The
 /// end-to-end pass-through — refresh actually landing on the client — is
-/// pinned by `meta_updated_from_other_session_refreshes_sidebar_test`
+/// pinned by `meta_updated_from_other_thread_refreshes_sidebar_test`
 /// below.
-pub fn meta_updated_from_other_session_passes_filter_test() {
+pub fn meta_updated_from_other_thread_passes_filter_test() {
   let model =
     new_model()
-    |> step(ui.SessionsLoaded([summary("s-1", False)]))
+    |> step(ui.ThreadsLoaded([summary("s-1", False)]))
     |> step(ui.Select("s-1"))
   let model =
     step(
       model,
-      ui.SessionScoped(
+      ui.ThreadScoped(
         "s-9",
         model.visit + 7,
         ui.MetaUpdated(Some("Other"), ["tag"]),
       ),
     )
-  model.sessions |> list.map(fn(s) { s.id }) |> should.equal(["s-1"])
+  model.threads |> list.map(fn(s) { s.id }) |> should.equal(["s-1"])
   model.selected |> should.equal(Some("s-1"))
 }
 
-pub fn select_same_session_is_noop_test() {
+pub fn select_same_thread_is_noop_test() {
   let model = new_model() |> step(ui.Select("s-1"))
   let again = step(model, ui.Select("s-1"))
   again.log |> should.equal(model.log)
   again.model_label |> should.equal(model.model_label)
 }
 
-pub fn vanished_selection_ends_session_test() {
+pub fn vanished_selection_ends_thread_test() {
   let model =
     new_model()
-    |> step(ui.SessionsLoaded([summary("s-1", False)]))
+    |> step(ui.ThreadsLoaded([summary("s-1", False)]))
     |> step(ui.Hello("smart"))
     |> step(ui.UserEcho("hi", None))
     |> step(ui.Token("par"))
-  let model = model |> step(ui.SessionsLoaded([]))
+  let model = model |> step(ui.ThreadsLoaded([]))
   model.selected |> should.equal(None)
   model.log |> should.equal([])
   model.bubble |> should.equal(None)
   model.streaming |> should.be_false
-  model.model_label |> should.equal("session ended")
+  model.model_label |> should.equal("thread ended")
   model.create_open |> should.be_true
   // The hidden flag resets with the bubble it belonged to: a stale False
-  // (the ended session's bubble was visible) would let the NEXT session's
+  // (the ended thread's bubble was visible) would let the NEXT thread's
   // first streamed token — even whitespace-only — render, bypassing the
   // render-empty rule.
   model.bubble_hidden |> should.equal(True)
@@ -330,7 +330,7 @@ pub fn vanished_selection_ends_session_test() {
 pub fn hello_sets_label_and_busy_state_test() {
   let model =
     new_model()
-    |> step(ui.SessionsLoaded([summary("s-1", True)]))
+    |> step(ui.ThreadsLoaded([summary("s-1", True)]))
     |> step(ui.Hello("smart"))
   model.model_label |> should.equal("smart")
   model.streaming |> should.be_true
@@ -419,7 +419,7 @@ pub fn send_requested_with_blank_text_is_noop_test() {
   model.streaming |> should.be_false
 }
 
-pub fn send_requested_without_session_is_noop_test() {
+pub fn send_requested_without_thread_is_noop_test() {
   let model = new_model() |> step(ui.SendRequested("hi"))
   model.composer |> should.equal(0)
   model.streaming |> should.be_false
@@ -447,57 +447,57 @@ pub fn stop_visible_only_while_streaming_test() {
 // Per-client connect (the runtime break)
 // ---------------------------------------------------------------------------
 
-/// A first-time visitor supplies no session: nothing is selected until the
+/// A first-time visitor supplies no thread: nothing is selected until the
 /// loaded list auto-selects (or the user picks one).
-pub fn init_without_client_session_selects_nothing_test() {
+pub fn init_without_client_thread_selects_nothing_test() {
   new_model().selected |> should.equal(None)
 }
 
-/// A reload supplies the client's last-selected session: the fresh
+/// A reload supplies the client's last-selected thread: the fresh
 /// per-connection model re-opens exactly that one.
-pub fn init_with_client_session_preselects_it_test() {
-  new_model_with_session(Some("s1")).selected
+pub fn init_with_client_thread_preselects_it_test() {
+  new_model_with_thread(Some("s1")).selected
   |> should.equal(Some("s1"))
 }
 
-/// The supplied session survives the session-list load: the auto-selection
+/// The supplied thread survives the thread-list load: the auto-selection
 /// rule (first active) must not clobber it.
-pub fn sessions_loaded_keeps_client_session_test() {
+pub fn threads_loaded_keeps_client_thread_test() {
   let model =
-    new_model_with_session(Some("s2"))
-    |> step(ui.SessionsLoaded([summary("s1", False), summary("s2", False)]))
+    new_model_with_thread(Some("s2"))
+    |> step(ui.ThreadsLoaded([summary("s1", False), summary("s2", False)]))
   model.selected |> should.equal(Some("s2"))
 }
 
-/// A stale supplied session (deleted server-side while the tab was away)
+/// A stale supplied thread (deleted server-side while the tab was away)
 /// drops out and the auto-selection rules take over — same as any other
 /// vanished selection.
-pub fn sessions_loaded_drops_stale_client_session_test() {
+pub fn threads_loaded_drops_stale_client_thread_test() {
   let model =
-    new_model_with_session(Some("gone"))
-    |> step(ui.SessionsLoaded([summary("s1", False), summary("s2", False)]))
+    new_model_with_thread(Some("gone"))
+    |> step(ui.ThreadsLoaded([summary("s1", False), summary("s2", False)]))
   model.selected |> should.equal(Some("s1"))
 }
 
 /// A fresh model can see Hello (replay) before the summaries land; Hello
-/// then finds an empty session list and reports `streaming: False`. The
+/// then finds an empty thread list and reports `streaming: False`. The
 /// loaded summary must reconcile the busy state — otherwise the composer
 /// looks idle and a send is rejected with "busy" mid-stream.
-pub fn sessions_loaded_reconciles_streaming_after_hello_test() {
+pub fn threads_loaded_reconciles_streaming_after_hello_test() {
   let model =
-    new_model_with_session(Some("s1"))
+    new_model_with_thread(Some("s1"))
     |> step(ui.Hello("smart"))
-    |> step(ui.SessionsLoaded([summary("s1", True)]))
+    |> step(ui.ThreadsLoaded([summary("s1", True)]))
   model.streaming |> should.be_true
 }
 
 /// The reconcile only fires for the unchanged selection: a vanished or
-/// switched selection keeps the state `after_sessions` computed.
-pub fn sessions_loaded_reconcile_skips_changed_selection_test() {
+/// switched selection keeps the state `after_threads` computed.
+pub fn threads_loaded_reconcile_skips_changed_selection_test() {
   let model =
-    new_model_with_session(Some("gone"))
+    new_model_with_thread(Some("gone"))
     |> step(ui.Hello("smart"))
-    |> step(ui.SessionsLoaded([summary("s1", True)]))
+    |> step(ui.ThreadsLoaded([summary("s1", True)]))
   model.selected |> should.equal(Some("s1"))
   model.streaming |> should.be_false
 }
@@ -507,17 +507,17 @@ pub fn sessions_loaded_reconcile_skips_changed_selection_test() {
 // ---------------------------------------------------------------------------
 
 pub fn event_translation_test() {
-  ui.from_session_event(session.Hello("smart", 3, []))
+  ui.from_thread_event(thread.Hello("smart", 3, []))
   |> should.equal(ui.Hello("smart"))
-  ui.from_session_event(session.UserEcho("hi", Some(1_700_000_000)))
+  ui.from_thread_event(thread.UserEcho("hi", Some(1_700_000_000)))
   |> should.equal(ui.UserEcho("hi", Some(1_700_000_000)))
-  ui.from_session_event(session.AssistantFull("full", None))
+  ui.from_thread_event(thread.AssistantFull("full", None))
   |> should.equal(ui.AssistantFull("full", None))
-  ui.from_session_event(session.Token("t"))
+  ui.from_thread_event(thread.Token("t"))
   |> should.equal(ui.Token("t"))
-  ui.from_session_event(session.TurnStopped(4, Some(1_700_000_000)))
+  ui.from_thread_event(thread.TurnStopped(4, Some(1_700_000_000)))
   |> should.equal(ui.TurnStopped(Some(1_700_000_000)))
-  ui.from_session_event(session.TurnFailed("x", None))
+  ui.from_thread_event(thread.TurnFailed("x", None))
   |> should.equal(ui.TurnFailed("x", None))
 }
 
@@ -935,15 +935,15 @@ pub fn view_popup_unknown_call_renders_nothing_test() {
   view_string(model) |> should_not_contain("<dialog")
 }
 
-// Selecting a different session drops the popup with the rest of the
-// per-session display state.
-pub fn view_popup_cleared_on_session_switch_test() {
+// Selecting a different thread drops the popup with the rest of the
+// per-thread display state.
+pub fn view_popup_cleared_on_thread_switch_test() {
   let model =
     new_model()
     |> step(ui.ToolCallAssembled("call_1", "http_fetch", "{}", None))
     |> step(ui.ToolViewOpened(ui.CallPop("call_1")))
   should_contain(view_string(model), "<dialog open>")
-  let switched = step(model, ui.Select("other-session"))
+  let switched = step(model, ui.Select("other-thread"))
   view_string(switched) |> should_not_contain("<dialog")
 }
 
@@ -1160,7 +1160,7 @@ pub fn view_omits_timestamps_for_unstamped_lines_test() {
 }
 
 pub fn turn_done_stamps_committed_bubble_test() {
-  // The terminal event carries the session's committed stamp
+  // The terminal event carries the thread's committed stamp
   // (`transcript.last_text_stamp`, sourced by the actor) — the live
   // bubble before TurnDone renders no timestamp at all, and the commit
   // carries EXACTLY the event's value: one clock, no UI-side read.
@@ -1283,37 +1283,37 @@ fn view_string(model: ui.Model) -> String {
   element.to_string(ui.view(model))
 }
 
-pub fn view_create_panel_precedes_session_list_test() {
+pub fn view_create_panel_precedes_thread_list_test() {
   // ui-polish F4: "New" used to open the create panel below the whole
-  // session list, i.e. below the fold. Markup order is the fix, so the
+  // thread list, i.e. below the fold. Markup order is the fix, so the
   // panel must come FIRST inside the sidebar — and it must still be the
   // same `#create-panel` section with the same pickers, since the browser
   // suite drives this flow by those ids.
   let html =
     new_model()
     |> step(ui.AliasesLoaded("p1", ["smart", "fast"]))
-    |> step(ui.SessionsLoaded([summary("s-1", False)]))
+    |> step(ui.ThreadsLoaded([summary("s-1", False)]))
     |> view_string
   // Everything rendered before the list's id must include the panel's id:
   // that is the order assertion, without pinning a byte offset.
   let assert Ok(#(before_list, _)) =
-    string.split_once(html, "id=\"session-list\"")
+    string.split_once(html, "id=\"thread-list\"")
   should.be_true(string.contains(before_list, "id=\"create-panel\""))
   should.be_true(string.contains(html, "id=\"provider-picker\""))
-  should.be_true(string.contains(html, "id=\"create-session\""))
+  should.be_true(string.contains(html, "id=\"create-thread\""))
 }
 
 pub fn view_renders_shell_and_sidebar_test() {
   let model =
     new_model()
     |> step(ui.AliasesLoaded("p1", ["smart", "fast"]))
-    |> step(ui.SessionsLoaded([summary("s-1", False)]))
+    |> step(ui.ThreadsLoaded([summary("s-1", False)]))
   let html = view_string(model)
   should.be_true(string.contains(html, "id=\"app\""))
-  should.be_true(string.contains(html, "id=\"session-list\""))
-  // M3 organization: the row carries the session id and the model alias as
+  should.be_true(string.contains(html, "id=\"thread-list\""))
+  // M3 organization: the row carries the thread id and the model alias as
   // its subtitle (title falls back to the alias until auto-titled).
-  should.be_true(string.contains(html, "data-session-id=\"s-1\""))
+  should.be_true(string.contains(html, "data-thread-id=\"s-1\""))
   should.be_true(string.contains(html, "smart · "))
   should.be_true(string.contains(html, "aria-current=\"true\""))
   should.be_true(string.contains(html, "id=\"model-picker\""))
@@ -1326,25 +1326,25 @@ pub fn view_renders_shell_and_sidebar_test() {
 
 pub fn view_renders_empty_states_test() {
   let html = new_model() |> view_string
-  should.be_true(string.contains(html, "No sessions yet."))
+  should.be_true(string.contains(html, "No threads yet."))
   should.be_true(string.contains(html, "disabled"))
 }
 
 // ui-polish F5: an empty transcript renders an intentional muted hint, not
 // a blank void; the hint disappears the moment there is anything to show.
 pub fn view_empty_transcript_note_test() {
-  // No session selected (the deliberate no-selection state): the hint
+  // No thread selected (the deliberate no-selection state): the hint
   // points at the sidebar — the composer is disabled, so a send hint
   // would invite a failing submit.
   let html = new_model() |> view_string
   should.be_true(string.contains(
     html,
-    "No session selected — pick one from the list or create a new one.",
+    "No thread selected — pick one from the list or create a new one.",
   ))
   // With a selection and an empty transcript the hint invites a send.
   let html =
     new_model()
-    |> step(ui.SessionsLoaded([summary("s-1", False)]))
+    |> step(ui.ThreadsLoaded([summary("s-1", False)]))
     |> step(ui.Select("s-1"))
     |> view_string
   should.be_true(string.contains(
@@ -1355,32 +1355,32 @@ pub fn view_empty_transcript_note_test() {
   // alike: both make log_lines non-empty).
   let html =
     new_model()
-    |> step(ui.SessionsLoaded([summary("s-1", False)]))
+    |> step(ui.ThreadsLoaded([summary("s-1", False)]))
     |> step(ui.Select("s-1"))
     |> step(ui.UserEcho("hi", None))
     |> view_string
   should.be_false(string.contains(html, "Send a message to start"))
 }
 
-// ui-polish F8: the header's context span shows the selected session's
+// ui-polish F8: the header's context span shows the selected thread's
 // title, not the bare model alias. The alias stays as the untitled
 // fallback (the row-title rule), and model_label's "connecting…" /
-// "session ended" keep their roles while nothing is selected.
-pub fn view_header_shows_session_title_test() {
+// "thread ended" keep their roles while nothing is selected.
+pub fn view_header_shows_thread_title_test() {
   let titled =
-    session.SessionSummary(..summary("s-1", False), title: "Renamed session")
+    thread.ThreadSummary(..summary("s-1", False), title: "Renamed thread")
   let html =
     new_model()
-    |> step(ui.SessionsLoaded([titled]))
+    |> step(ui.ThreadsLoaded([titled]))
     |> step(ui.Select("s-1"))
     |> view_string
   should.be_true(string.contains(html, "id=\"model\""))
-  should.be_true(string.contains(html, "Renamed session"))
+  should.be_true(string.contains(html, "Renamed thread"))
 
-  // Untitled session: the alias is the fallback, matching the row title.
+  // Untitled thread: the alias is the fallback, matching the row title.
   let html =
     new_model()
-    |> step(ui.SessionsLoaded([summary("s-1", False)]))
+    |> step(ui.ThreadsLoaded([summary("s-1", False)]))
     |> step(ui.Select("s-1"))
     |> view_string
   should.be_true(string.contains(html, ">smart<"))
@@ -1390,14 +1390,14 @@ pub fn view_header_fallback_labels_test() {
   // No selection yet: the boot label.
   let html = new_model() |> view_string
   should.be_true(string.contains(html, "connecting…"))
-  // Selection dropped (session vanished): the terminal label.
+  // Selection dropped (thread vanished): the terminal label.
   let html =
     new_model()
-    |> step(ui.SessionsLoaded([summary("s-1", False)]))
+    |> step(ui.ThreadsLoaded([summary("s-1", False)]))
     |> step(ui.Select("s-1"))
-    |> step(ui.SessionsLoaded([]))
+    |> step(ui.ThreadsLoaded([]))
     |> view_string
-  should.be_true(string.contains(html, "session ended"))
+  should.be_true(string.contains(html, "thread ended"))
 }
 
 // ui-polish F8: the connection state is a labelled group — the dot plus
@@ -1454,7 +1454,7 @@ pub fn view_renders_streaming_bubble_test() {
 }
 
 // ---------------------------------------------------------------------------
-// M3 session organization: buckets, relative time, filter, update flows
+// M3 thread organization: buckets, relative time, filter, update flows
 // ---------------------------------------------------------------------------
 
 /// 1970-01-03T00:00:10Z — a frozen "now" so bucket edges are exact.
@@ -1530,13 +1530,13 @@ fn meta_summary(
   tags: List(String),
   archived: Bool,
   last_active_at: Int,
-) -> session.SessionSummary {
-  session.SessionSummary(
+) -> thread.ThreadSummary {
+  thread.ThreadSummary(
     id: id,
     provider_id: "p1",
     model: "smart",
     title: title,
-    title_source: session.AutoTitle,
+    title_source: thread.AutoTitle,
     pinned: pinned,
     tags: tags,
     archived: archived,
@@ -1548,12 +1548,12 @@ fn meta_summary(
   )
 }
 
-pub fn sessions_auto_select_first_active_test() {
+pub fn threads_auto_select_first_active_test() {
   let archived = meta_summary("s-1", "Old", False, [], True, 0)
   let active = meta_summary("s-2", "New", False, [], False, 0)
   let model =
     new_model()
-    |> step(ui.SessionsLoaded([archived, active]))
+    |> step(ui.ThreadsLoaded([archived, active]))
   // The archived row is soft-hidden, so auto-selection skips it.
   model.selected |> should.equal(Some("s-2"))
   model.create_open |> should.be_false
@@ -1564,10 +1564,10 @@ pub fn archived_selection_survives_refresh_test() {
   let model =
     new_model()
     |> step(ui.Select("s-1"))
-    |> step(ui.SessionsLoaded([archived]))
-  // A selection POINTING at an archived session (e.g. the user re-opened
+    |> step(ui.ThreadsLoaded([archived]))
+  // A selection POINTING at an archived thread (e.g. the user re-opened
   // the row via Show archived) survives a refresh — only a real
-  // disappearance ends it. (Archiving the open session is different: the
+  // disappearance ends it. (Archiving the open thread is different: the
   // `Archived` arm clears the selection itself — see
   // archive_of_selection_clears_selection_test.)
   model.selected |> should.equal(Some("s-1"))
@@ -1576,9 +1576,9 @@ pub fn archived_selection_survives_refresh_test() {
 
 pub fn all_archived_opens_create_panel_test() {
   let archived = meta_summary("s-1", "Old", False, [], True, 0)
-  let model = new_model() |> step(ui.SessionsLoaded([archived]))
+  let model = new_model() |> step(ui.ThreadsLoaded([archived]))
   model.selected |> should.equal(None)
-  // No active session to select: the create panel opens so the sidebar is
+  // No active thread to select: the create panel opens so the sidebar is
   // never a dead end.
   model.create_open |> should.be_true
 }
@@ -1588,9 +1588,9 @@ pub fn delete_of_selection_reselects_first_active_test() {
   let b = meta_summary("s-2", "B", False, [], False, 0)
   let model =
     new_model()
-    |> step(ui.SessionsLoaded([a, b]))
+    |> step(ui.ThreadsLoaded([a, b]))
     |> step(ui.Select("s-2"))
-    |> step(ui.SessionsLoaded([a]))
+    |> step(ui.ThreadsLoaded([a]))
   model.selected |> should.equal(Some("s-1"))
   model.log |> should.equal([])
 }
@@ -1616,7 +1616,7 @@ pub fn tag_filter_update_test() {
 pub fn archived_toggle_and_row_editors_test() {
   let model =
     new_model()
-    |> step(ui.SessionsLoaded([summary("s-1", False)]))
+    |> step(ui.ThreadsLoaded([summary("s-1", False)]))
     |> step(ui.ArchivedToggled)
   model.show_archived |> should.be_true
 
@@ -1653,7 +1653,7 @@ pub fn view_renders_pinned_and_buckets_test() {
     meta_summary("s-3", "Old chat", False, [], False, now - 30 * 86_400)
   let html =
     new_model()
-    |> step(ui.SessionsLoaded([pinned, today, older]))
+    |> step(ui.ThreadsLoaded([pinned, today, older]))
     |> view_string
   should.be_true(string.contains(html, "Pinned"))
   should.be_true(string.contains(html, "Pinned one"))
@@ -1679,22 +1679,22 @@ pub fn view_renders_archived_only_when_shown_test() {
   let archived = meta_summary("s-9", "Shelved", False, [], True, 1_700_000_000)
   let hidden =
     new_model()
-    |> step(ui.SessionsLoaded([archived]))
+    |> step(ui.ThreadsLoaded([archived]))
     |> view_string
   // Soft-hidden by default: the row is absent, the empty state shows.
   should.be_false(string.contains(hidden, "Shelved"))
-  should.be_true(string.contains(hidden, "No sessions yet."))
+  should.be_true(string.contains(hidden, "No threads yet."))
 
   let shown =
     new_model()
-    |> step(ui.SessionsLoaded([archived]))
+    |> step(ui.ThreadsLoaded([archived]))
     |> step(ui.ArchivedToggled)
     |> view_string
   should.be_true(string.contains(shown, "Archived"))
   should.be_true(string.contains(shown, "Shelved"))
   should.be_true(string.contains(shown, "Restore"))
   // Invariant: archived rows carry no pin control (archiving unpins;
-  // the registry refuses pins on archived sessions).
+  // the registry refuses pins on archived threads).
   should.be_false(string.contains(shown, ">Pin<"))
   should.be_false(string.contains(shown, ">Unpin<"))
 }
@@ -1705,7 +1705,7 @@ pub fn view_hides_rows_failing_the_filter_test() {
   let b = meta_summary("s-2", "Cooking", False, [], False, 1_700_000_000)
   let html =
     new_model()
-    |> step(ui.SessionsLoaded([a, b]))
+    |> step(ui.ThreadsLoaded([a, b]))
     |> step(ui.TagFilterChanged("dep"))
     |> view_string
   should.be_true(string.contains(html, "Deploy notes"))
@@ -1719,21 +1719,21 @@ pub fn view_inline_editors_hidden_until_opened_test() {
     meta_summary("s-1", "Deploy notes", False, ["ops"], False, 1_700_000_000)
   let base =
     new_model()
-    |> step(ui.SessionsLoaded([a]))
+    |> step(ui.ThreadsLoaded([a]))
     |> view_string
   // Editors and the delete confirm render but are hidden (attr.hidden).
   should.be_true(string.contains(base, "inline-editor"))
   should.be_true(string.contains(base, "confirm-delete"))
   let opened =
     new_model()
-    |> step(ui.SessionsLoaded([a]))
+    |> step(ui.ThreadsLoaded([a]))
     |> step(ui.RenameToggled("s-1"))
     |> view_string
   // The rename input carries the current title as its starting value.
   should.be_true(string.contains(opened, "value=\"Deploy notes\""))
   let tags_open =
     new_model()
-    |> step(ui.SessionsLoaded([a]))
+    |> step(ui.ThreadsLoaded([a]))
     |> step(ui.TagsToggled("s-1"))
     |> view_string
   should.be_true(string.contains(tags_open, "value=\"ops\""))
@@ -1832,7 +1832,7 @@ pub fn providers_loaded_notes_only_when_load_concludes_empty_test() {
     |> step(ui.ProvidersLoaded([]))
   note_count(refreshed.log) |> should.equal(1)
 
-  // Losing the last enabled provider mid-session still notes: the
+  // Losing the last enabled provider mid-thread still notes: the
   // Some -> None transition is new information, not a repeat.
   let lost =
     new_model()
@@ -1981,7 +1981,7 @@ pub fn view_renders_providers_panel_test() {
   should.be_true(string.contains(html, ">key<"))
   should.be_true(string.contains(html, ">keyless<"))
   should.be_true(string.contains(html, ">disabled<"))
-  // Controls mirror the session rows' compact pattern — plus the
+  // Controls mirror the thread rows' compact pattern — plus the
   // on-demand connection test.
   should.be_true(string.contains(html, ">Disable<"))
   should.be_true(string.contains(html, ">Enable<"))
@@ -2040,7 +2040,7 @@ pub fn view_provider_forms_hidden_until_opened_test() {
     |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
     |> step(ui.SettingsToggled)
     |> view_string
-  // Both forms render but are hidden (the session-editor pattern).
+  // Both forms render but are hidden (the thread-editor pattern).
   should.be_true(string.contains(base, "add-provider-form"))
   should.be_true(string.contains(base, "provider-form"))
   let adding =
@@ -2090,11 +2090,11 @@ pub fn view_provider_picker_lists_enabled_only_test() {
   should.be_true(string.contains(none, "no providers — add one in Settings"))
 }
 
-pub fn view_session_subtitle_pins_provider_test() {
+pub fn view_thread_subtitle_pins_provider_test() {
   let html =
     new_model()
     |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
-    |> step(ui.SessionsLoaded([summary("s-1", False)]))
+    |> step(ui.ThreadsLoaded([summary("s-1", False)]))
     |> view_string
   // Subtitle: provider/model · age (§11). The summary pins p1, whose
   // display name resolves from the masked list.
@@ -2102,7 +2102,7 @@ pub fn view_session_subtitle_pins_provider_test() {
   // While the list lags, the id stands in — never blank.
   let lagging =
     new_model()
-    |> step(ui.SessionsLoaded([summary("s-1", False)]))
+    |> step(ui.ThreadsLoaded([summary("s-1", False)]))
     |> view_string
   should.be_true(string.contains(lagging, "p1/smart · "))
 }
@@ -2138,11 +2138,11 @@ pub fn view_jump_latest_button_test() {
   // bottom; Lustre SSR sorts attributes), no event handler, and none of
   // the old repo's inline `onclick` script. It is a sibling AFTER #log,
   // inside #log-wrap, so it never lands in the log's aria-live region
-  // (with a session selected and an empty transcript the log renders the
+  // (with a thread selected and an empty transcript the log renders the
   // F5 empty-state note inside the centered `.conversation` column F6
   // puts in #log, which is why the log is no longer bare).
   new_model()
-  |> step(ui.SessionsLoaded([summary("s-1", False)]))
+  |> step(ui.ThreadsLoaded([summary("s-1", False)]))
   |> step(ui.Select("s-1"))
   |> view_string
   |> should_contain(
@@ -2592,10 +2592,10 @@ pub fn view_escapes_reasoning_content_test() {
   should_contain(html, "&lt;script&gt;")
 }
 
-pub fn from_session_event_maps_reasoning_test() {
-  ui.from_session_event(session.Reasoning("bit"))
+pub fn from_thread_event_maps_reasoning_test() {
+  ui.from_thread_event(thread.Reasoning("bit"))
   |> should.equal(ui.Reasoning("bit"))
-  ui.from_session_event(session.ReasoningFull("whole"))
+  ui.from_thread_event(thread.ReasoningFull("whole"))
   |> should.equal(ui.ReasoningFull("whole"))
 }
 
@@ -2607,13 +2607,13 @@ pub fn from_session_event_maps_reasoning_test() {
 /// Lustre TEXT node in the sidebar row — escaped, never markup.
 pub fn view_escapes_hostile_title_test() {
   let hostile =
-    session.SessionSummary(
+    thread.ThreadSummary(
       ..summary("s-1", False),
       title: "<script>alert(1)</script>",
     )
   let html =
     new_model()
-    |> step(ui.SessionsLoaded([hostile]))
+    |> step(ui.ThreadsLoaded([hostile]))
     |> view_string
   should_contain(html, "&lt;script&gt;")
   should_not_contain(html, "<script>alert")
@@ -2628,13 +2628,13 @@ pub fn view_escapes_hostile_title_test() {
 /// refresh re-reads the registry, so the summary's tags are what render.
 pub fn view_escapes_hostile_model_tags_in_chips_test() {
   let hostile =
-    session.SessionSummary(..summary("s-1", False), title: "ok title", tags: [
+    thread.ThreadSummary(..summary("s-1", False), title: "ok title", tags: [
       "<script>alert(1)</script>",
       "work",
     ])
   let html =
     new_model()
-    |> step(ui.SessionsLoaded([hostile]))
+    |> step(ui.ThreadsLoaded([hostile]))
     |> step(
       ui.MetaUpdated(Some("<b>ignored</b>"), ["<script>payload</script>"]),
     )
@@ -2651,7 +2651,7 @@ pub fn view_escapes_hostile_model_tags_in_chips_test() {
   should_contain(html, "Filter by work")
 }
 
-/// `MetaUpdated` nudges the sidebar through the SAME sessions_effect a
+/// `MetaUpdated` nudges the sidebar through the SAME threads_effect a
 /// `TurnDone` uses — asserted against a REAL Lustre server-component
 /// runtime over REAL (offline) registries: after the nudge, a reconcile
 /// carrying the registry's CURRENT title reaches the socket. The event's
@@ -2674,9 +2674,9 @@ pub fn meta_updated_refreshes_sidebar_test() {
   let providers = started_providers.data
   let factory_name = process.new_name("nexus_ui_factory")
   let assert Ok(_factory) =
-    factory_supervisor.start(session_registry.factory_builder(factory_name))
+    factory_supervisor.start(thread_registry.factory_builder(factory_name))
   let assert Ok(started_registry) =
-    session_registry.start_with_runner(
+    thread_registry.start_with_runner(
       test_config(),
       factory_supervisor.get_by_name(factory_name),
       process.new_name("nexus_ui_registry"),
@@ -2692,22 +2692,22 @@ pub fn meta_updated_refreshes_sidebar_test() {
     )
   let registry = started_registry.data
 
-  // A titled session, so the sidebar has something to refresh.
+  // A titled thread, so the sidebar has something to refresh.
   let assert Ok(record) =
-    session_registry.create_with_runner(
+    thread_registry.create_with_runner(
       registry,
       store_mock.fixture_provider_id,
       "alias-1",
       unused_turn_runner,
     )
-  should.be_true(session_registry.auto_title(registry, record.id, "Before"))
+  should.be_true(thread_registry.auto_title(registry, record.id, "Before"))
 
   // One per-connection runtime, started exactly like the /ws socket
   // handler does, with a test-owned client subject as the socket.
   let assert Ok(runtime) =
     lustre.start_server_component(
       ui_runtime.app(),
-      ui.Flags(registry: registry, providers: providers, session: None),
+      ui.Flags(registry: registry, providers: providers, thread: None),
     )
   let client = process.new_subject()
   server_component.register_subject(client)
@@ -2717,7 +2717,7 @@ pub fn meta_updated_refreshes_sidebar_test() {
   let _ = wait_for_patch(client, "Before", 40)
 
   // The title changes server-side, BEHIND this client's back.
-  should.be_true(session_registry.set_title(registry, record.id, "After"))
+  should.be_true(thread_registry.set_title(registry, record.id, "After"))
 
   lustre.send(
     to: runtime,
@@ -2732,7 +2732,7 @@ pub fn meta_updated_refreshes_sidebar_test() {
 
 /// A send into a previous-day conversation must move its sidebar row up
 /// to Today the MOMENT the message lands — not when the reply finishes.
-/// The session bumps its activity at the send itself (the user message
+/// The thread bumps its activity at the send itself (the user message
 /// commits on append, even if the turn later fails), and the send path
 /// refreshes the sidebar from the registry, so the row re-buckets while
 /// the turn is still running. Pinned over a REAL runtime and registries:
@@ -2756,18 +2756,18 @@ pub fn send_moves_previous_day_row_into_today_immediately_test() {
   // boundary back at any wall-clock time and still renders "1d".
   let yesterday = timing.wall_now_s() - 86_400
   let assert Ok(Nil) =
-    seam.insert_session(
+    seam.insert_thread(
       store.StoredSummary(
         id: "s-old",
         provider_id: store_mock.fixture_provider_id,
         title: "Resumed chat",
-        title_source: session.ManualTitle,
+        title_source: thread.ManualTitle,
         model: "alias-1",
         pinned: False,
         archived: False,
         tags: [],
         tags_manual: [],
-        tags_source: session.AutoTags,
+        tags_source: thread.AutoTags,
         created_at: yesterday,
         last_active_at: yesterday,
         message_count: 1,
@@ -2794,9 +2794,9 @@ pub fn send_moves_previous_day_row_into_today_immediately_test() {
   let providers = started_providers.data
   let factory_name = process.new_name("nexus_ui_factory_row")
   let assert Ok(_factory) =
-    factory_supervisor.start(session_registry.factory_builder(factory_name))
+    factory_supervisor.start(thread_registry.factory_builder(factory_name))
   let assert Ok(started_registry) =
-    session_registry.start_with_runner(
+    thread_registry.start_with_runner(
       test_config(),
       factory_supervisor.get_by_name(factory_name),
       process.new_name("nexus_ui_registry_row"),
@@ -2812,17 +2812,17 @@ pub fn send_moves_previous_day_row_into_today_immediately_test() {
     )
   let registry = started_registry.data
 
-  // A today session, so the Today bucket exists before the send: the old
+  // A today thread, so the Today bucket exists before the send: the old
   // row must move INTO it, jumping above it by recency.
   let assert Ok(_today) =
-    session_registry.create(registry, store_mock.fixture_provider_id, "alias-1")
+    thread_registry.create(registry, store_mock.fixture_provider_id, "alias-1")
 
-  // The connection re-opens the previous-day session (the /ws route's
+  // The connection re-opens the previous-day thread (the /ws route's
   // persisted selection).
   let assert Ok(runtime) =
     lustre.start_server_component(
       ui_runtime.app(),
-      ui.Flags(registry: registry, providers: providers, session: Some("s-old")),
+      ui.Flags(registry: registry, providers: providers, thread: Some("s-old")),
     )
   let client = process.new_subject()
   server_component.register_subject(client)
@@ -2872,9 +2872,9 @@ pub fn connect_with_configured_provider_never_notes_no_provider_test() {
   let providers = started_providers.data
   let factory_name = process.new_name("nexus_ui_factory")
   let assert Ok(_factory) =
-    factory_supervisor.start(session_registry.factory_builder(factory_name))
+    factory_supervisor.start(thread_registry.factory_builder(factory_name))
   let assert Ok(started_registry) =
-    session_registry.start_with_runner(
+    thread_registry.start_with_runner(
       test_config(),
       factory_supervisor.get_by_name(factory_name),
       process.new_name("nexus_ui_registry"),
@@ -2896,13 +2896,13 @@ pub fn connect_with_configured_provider_never_notes_no_provider_test() {
   let assert Ok(runtime) =
     lustre.start_server_component(
       ui_runtime.app(),
-      ui.Flags(registry: registry, providers: providers, session: None),
+      ui.Flags(registry: registry, providers: providers, thread: None),
     )
   let client = process.new_subject()
   server_component.register_subject(client)
   |> lustre.send(to: runtime)
 
-  // The whole connect cascade (provider load, session load, alias
+  // The whole connect cascade (provider load, thread load, alias
   // fetch) settles before anything is asserted. The create panel's
   // provider select is rendered (hidden) in every chat view, so the
   // fixture row in the SAME stream proves `ProvidersLoaded` landed —
@@ -2921,33 +2921,33 @@ fn unused_turn_runner(
   _tr,
   _cancel,
   _on_event,
-) -> session.TurnOutcome {
-  session.StreamErrored("no turn expected in this test")
+) -> thread.TurnOutcome {
+  thread.StreamErrored("no turn expected in this test")
 }
 
-/// Parks on the session's cancel subject until long after any test ends —
+/// Parks on the thread's cancel subject until long after any test ends —
 /// the stand-in for a reply that is still streaming. Whatever a test
 /// observes while a turn runs this runner cannot have come from the
 /// turn's own commit.
-fn parked_runner(_endpoint, tr, cancel, _on_event) -> session.TurnOutcome {
+fn parked_runner(_endpoint, tr, cancel, _on_event) -> thread.TurnOutcome {
   let selector =
     process.new_selector()
     |> process.select_map(cancel, fn(_) { Nil })
   let _ = process.selector_receive(selector, 60_000)
-  session.StreamStopped(tr)
+  thread.StreamStopped(tr)
 }
 
 /// Emits one distinctive token delta then completes. The stream the
-/// session-switch regression test must prove never reaches the client
-/// after the client switched away from its session.
+/// thread-switch regression test must prove never reaches the client
+/// after the client switched away from its thread.
 fn leak_runner(
   _endpoint,
   tr,
   _cancel,
   on_event: fn(loop.LoopEvent) -> Nil,
-) -> session.TurnOutcome {
+) -> thread.TurnOutcome {
   on_event(loop.StreamEvent(openai.TokenDelta("LEAK-TOKEN")))
-  session.StreamDone(
+  thread.StreamDone(
     stream_stats(),
     transcript.append_assistant(tr, "LEAK-TOKEN"),
   )
@@ -2967,13 +2967,10 @@ fn stream_stats() -> openai.StreamStats {
   )
 }
 
-/// Poll until the session's turn is over, so a "never reached the client"
+/// Poll until the thread's turn is over, so a "never reached the client"
 /// assertion is a verdict on the whole turn rather than a race.
-fn wait_until_idle(
-  subject: process.Subject(session.Msg),
-  attempts: Int,
-) -> Nil {
-  case session.describe(subject).streaming {
+fn wait_until_idle(subject: process.Subject(thread.Msg), attempts: Int) -> Nil {
+  case thread.describe(subject).streaming {
     False -> Nil
     True if attempts <= 0 -> Nil
     True -> {
@@ -2983,15 +2980,15 @@ fn wait_until_idle(
   }
 }
 
-/// Regression (cross-session stream contamination): the component keeps
-/// ONE session-event subject per connection, and a session switch used to
-/// Join that subject to the new session WITHOUT detaching it from the old
-/// one — so a turn streamed into the old session kept fanning out to the
-/// shared subject and rendered its tokens into the new session's view.
+/// Regression (cross-thread stream contamination): the component keeps
+/// ONE thread-event subject per connection, and a thread switch used to
+/// Join that subject to the new thread WITHOUT detaching it from the old
+/// one — so a turn streamed into the old thread kept fanning out to the
+/// shared subject and rendered its tokens into the new thread's view.
 /// Asserted against a REAL per-connection runtime over REAL (offline)
 /// registries: switch A -> B, then stream a whole turn into A and prove
 /// nothing of it reaches the client.
-pub fn session_switch_drops_left_session_stream_test() {
+pub fn thread_switch_drops_left_thread_stream_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
   store_mock.ensure_fixture_provider(seam)
@@ -3006,9 +3003,9 @@ pub fn session_switch_drops_left_session_stream_test() {
   let providers = started_providers.data
   let factory_name = process.new_name("nexus_ui_factory_leak")
   let assert Ok(_factory) =
-    factory_supervisor.start(session_registry.factory_builder(factory_name))
+    factory_supervisor.start(thread_registry.factory_builder(factory_name))
   let assert Ok(started_registry) =
-    session_registry.start_with_runner(
+    thread_registry.start_with_runner(
       test_config(),
       factory_supervisor.get_by_name(factory_name),
       process.new_name("nexus_ui_registry_leak"),
@@ -3023,16 +3020,16 @@ pub fn session_switch_drops_left_session_stream_test() {
   let registry = started_registry.data
 
   let assert Ok(a) =
-    session_registry.create(registry, store_mock.fixture_provider_id, "smart")
+    thread_registry.create(registry, store_mock.fixture_provider_id, "smart")
   let assert Ok(b) =
-    session_registry.create(registry, store_mock.fixture_provider_id, "smart")
+    thread_registry.create(registry, store_mock.fixture_provider_id, "smart")
 
-  // The connection boots bound to session A (the /ws route's persisted
-  // selection), exactly like a reload into a streaming session.
+  // The connection boots bound to thread A (the /ws route's persisted
+  // selection), exactly like a reload into a streaming thread.
   let assert Ok(runtime) =
     lustre.start_server_component(
       ui_runtime.app(),
-      ui.Flags(registry: registry, providers: providers, session: Some(a.id)),
+      ui.Flags(registry: registry, providers: providers, thread: Some(a.id)),
     )
   let client = process.new_subject()
   server_component.register_subject(client)
@@ -3046,9 +3043,9 @@ pub fn session_switch_drops_left_session_stream_test() {
   lustre.send(to: runtime, message: lustre.dispatch(ui.Select(b.id)))
   let _ = collect_until_quiet(client, 4, 4, "")
 
-  // Stream a whole turn into A — the session the client just left.
-  let assert Ok(subject_a) = session_registry.get(registry, a.id)
-  should.equal(session.send_message(subject_a, "leak"), session.Sent)
+  // Stream a whole turn into A — the thread the client just left.
+  let assert Ok(subject_a) = thread_registry.get(registry, a.id)
+  should.equal(thread.send_message(subject_a, "leak"), thread.Sent)
   wait_until_idle(subject_a, 40)
 
   // Nothing of A's stream reaches the client: with the bug, A's UserEcho
@@ -3059,14 +3056,14 @@ pub fn session_switch_drops_left_session_stream_test() {
 }
 
 /// The `MetaUpdated` pass-through, end to end. A delivery from a foreign
-/// session (id AND generation foreign to the current visit) must reach
+/// thread (id AND generation foreign to the current visit) must reach
 /// the update and trigger the sidebar refresh. The refresh is observable
 /// because the registry's truth changed WITHOUT any broadcast first — a
 /// registry rename fans nothing out (the acting client refreshes via its
 /// own reply path) — so the only way "FRESH-TITLE" can reach the client
 /// is the foreign delivery's refresh. The event's own decoy title must
 /// never appear: the arm re-fetches truth, it does not trust payloads.
-pub fn meta_updated_from_other_session_refreshes_sidebar_test() {
+pub fn meta_updated_from_other_thread_refreshes_sidebar_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
   store_mock.ensure_fixture_provider(seam)
@@ -3081,9 +3078,9 @@ pub fn meta_updated_from_other_session_refreshes_sidebar_test() {
   let providers = started_providers.data
   let factory_name = process.new_name("nexus_ui_factory_meta")
   let assert Ok(_factory) =
-    factory_supervisor.start(session_registry.factory_builder(factory_name))
+    factory_supervisor.start(thread_registry.factory_builder(factory_name))
   let assert Ok(started_registry) =
-    session_registry.start_with_runner(
+    thread_registry.start_with_runner(
       test_config(),
       factory_supervisor.get_by_name(factory_name),
       process.new_name("nexus_ui_registry_meta"),
@@ -3098,12 +3095,12 @@ pub fn meta_updated_from_other_session_refreshes_sidebar_test() {
   let registry = started_registry.data
 
   let assert Ok(a) =
-    session_registry.create(registry, store_mock.fixture_provider_id, "smart")
+    thread_registry.create(registry, store_mock.fixture_provider_id, "smart")
 
   let assert Ok(runtime) =
     lustre.start_server_component(
       ui_runtime.app(),
-      ui.Flags(registry: registry, providers: providers, session: Some(a.id)),
+      ui.Flags(registry: registry, providers: providers, thread: Some(a.id)),
     )
   let client = process.new_subject()
   server_component.register_subject(client)
@@ -3112,13 +3109,13 @@ pub fn meta_updated_from_other_session_refreshes_sidebar_test() {
   // Let the connect cascade settle, then change the sidebar's truth
   // silently: no refresh has run, so the client still shows the old view.
   let _ = collect_until_quiet(client, 4, 4, "")
-  should.be_true(session_registry.set_title(registry, a.id, "FRESH-TITLE"))
+  should.be_true(thread_registry.set_title(registry, a.id, "FRESH-TITLE"))
 
-  // A foreign session's MetaUpdated passes the filter and triggers the
+  // A foreign thread's MetaUpdated passes the filter and triggers the
   // refresh that carries the new truth to the client.
   lustre.send(
     to: runtime,
-    message: lustre.dispatch(ui.SessionScoped(
+    message: lustre.dispatch(ui.ThreadScoped(
       "s-other",
       999,
       ui.MetaUpdated(Some("HACKED"), []),
@@ -3133,7 +3130,7 @@ pub fn meta_updated_from_other_session_refreshes_sidebar_test() {
 }
 
 /// The offline stand-in for the boot resolver (same as the golden suite).
-fn fixture_resolver() -> session_registry.ResolveProvider {
+fn fixture_resolver() -> thread_registry.ResolveProvider {
   fn(id) {
     case id == store_mock.fixture_provider_id {
       True ->
@@ -3143,7 +3140,7 @@ fn fixture_resolver() -> session_registry.ResolveProvider {
           sse_first_response_timeout_ms: 1000,
           stream_idle_timeout_ms: 1000,
         ))
-      False -> Error(session_registry.ProviderUnknown)
+      False -> Error(thread_registry.ProviderUnknown)
     }
   }
 }

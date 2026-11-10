@@ -17,7 +17,7 @@ const default_system_prompt =
   <> "Gleam/BEAM harness. Answer directly and briefly."
 
 /// Appended to the default system prompt while codemode is enabled.
-/// Manual testing showed models tripping over this in every new session
+/// Manual testing showed models tripping over this in every new thread
 /// (em-dash in a string literal -> compile failure): Luerl's tokenizer
 /// rejects non-ASCII in Lua source (both binary and codepoint forms -
 /// upstream, see codemode plan / issue #54), so the warning belongs in
@@ -47,7 +47,7 @@ pub type Config {
     http_port: Int,
     /// Optional single-user bearer token; `None` disables auth (dev).
     ui_token: Option(String),
-    /// System prompt, frozen at session creation (contract rule 2).
+    /// System prompt, frozen at thread creation (contract rule 2).
     system_prompt: String,
     /// M3 tool loop: maximum model round-trips per user turn (the guard).
     max_tool_iterations: Int,
@@ -75,7 +75,7 @@ pub type Config {
     pg_user: String,
     /// Phase 2 persistence: optional password; never logged or echoed.
     pg_password: Option(String),
-    /// Utility calls (utility-titles plan §4.6): the once-per-session
+    /// Utility calls (utility-titles plan §4.6): the once-per-thread
     /// model-generated title upgrade, branched off the committed
     /// transcript's cached prefix. Off switches the feature entirely —
     /// the heuristic first-message title then stays forever.
@@ -188,8 +188,8 @@ pub fn from_env(
   // codemode is enabled: an explicitly set NEXUS_SYSTEM_PROMPT is the
   // operator's own text and is never amended (enable codemode with a
   // custom prompt and you add the note yourself - see README). The
-  // system prompt is frozen per session at creation, so this stays
-  // byte-stable within a session (KV-cache contract).
+  // system prompt is frozen per thread at creation, so this stays
+  // byte-stable within a thread (KV-cache contract).
   let system_prompt = case optional_string(get, "NEXUS_SYSTEM_PROMPT") {
     option.Some(explicit) -> explicit
     option.None ->

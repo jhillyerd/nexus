@@ -20,27 +20,27 @@ The suite starts everything it needs on loopback:
   (`NEXUS_MAX_TOOL_ITERATIONS=8`, bearer auth on) and a guard instance
   (`NEXUS_MAX_TOOL_ITERATIONS=2`).
 
-Checks: bearer auth (401/200), alias + session lists, session create/switch,
+Checks: bearer auth (401/200), alias + thread lists, thread create/switch,
 text-only turn, stop mid-stream with partial commit, `http_fetch` and
 `web_search` tool cards (name, stable call id, argument preview, status,
 compact result preview, no script injection), iteration chip, reload →
 replay of the complete tool history as completed cards, iteration-guard
-terminal rendering, byte-identical request-prefix growth per session
+terminal rendering, byte-identical request-prefix growth per thread
 (including after title/tag/pin/archive mutations) plus the utility
-branch's own contract (the once-per-session title+tags side call:
+branch's own contract (the once-per-thread title+tags side call:
 suffix-only branch growth off the committed transcript, envelope delta
 exactly `max_completion_tokens`, the two-line reply landing as inert
 tag chips, and a manual tags save freezing the set against the racing
 model apply), a full
-session-organization pass (auto-title from the first message, manual rename,
+thread-organization pass (auto-title from the first message, manual rename,
 tag chips + filter, pin to the pinned section, archive/restore behind the
 toggle, two-step delete), the connection dot going red while the backend is
 down and green again on auto-reconnect, a mobile-viewport second-context
 check (per-client runtimes: a fresh context owns its selection and panels,
-reload restores its own session, no horizontal overflow with tool cards),
+reload restores its own thread, no horizontal overflow with tool cards),
 and (multi-provider P5) provider management end-to-end: a provider created
 in the Providers panel, picked in the create panel with its model aliases
-reloading, a session pinned to it streaming a turn, and the delete-guard /
+reloading, a thread pinned to it streaming a turn, and the delete-guard /
 disable-picker rails.
 
 ## Preconditions
@@ -50,7 +50,7 @@ disable-picker rails.
   without it: `docker compose up -d` then
   `DATABASE_URL=postgres://nexus@127.0.0.1:5433/nexus gleam run -m nexus/store/migrate`.
 - Each suite **resets the database first** (`psql -c 'truncate
-  session_message, session, provider cascade'` against
+  thread_message, thread, provider cascade'` against
   `E2E_DATABASE_URL`, default `postgres://nexus@127.0.0.1:5433/nexus`)
   so reruns and interleaved runs are deterministic, then seeds its own
   provider row (`gleam run -m nexus/dev_seed`) before booting the server — the provider table is the only provider
@@ -96,12 +96,12 @@ node e2e/integration.spec.mjs
 #      SEARXNG_BASE_URL (default: https://search.bytemonkey.org/)
 ```
 
-It writes `e2e/integration-report.json` and `e2e/cache-session.json`. The
+It writes `e2e/integration-report.json` and `e2e/cache-thread.json`. The
 multi-turn cache check enforces the PRD KV-cache gate — warm/cold TTFT
 median ratio ≤ 0.3 (one retry after node settle if the first attempt is
 above the gate). Its final `capture` step archives the replayed cache
-session; the committed offline golden fixture
-`test/fixtures/m3_cache_session.json` (driving
+thread; the committed offline golden fixture
+`test/fixtures/m3_cache_thread.json` (driving
 `test/m3_prefix_test.gleam`) is a copy of that capture. When the
 request-encoding path legitimately changes, re-capture the fixture through
 this step — never hand-edit the JSON.

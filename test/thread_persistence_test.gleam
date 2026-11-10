@@ -3,7 +3,7 @@
 //// byte-identically, write-behind commits land in order, metadata writes
 //// through, replays are idempotent, and a full registry teardown +
 //// re-boot (the mock store playing the external Postgres) restores a
-//// session whose request prefix is byte-identical and grows by suffix
+//// thread whose request prefix is byte-identical and grows by suffix
 //// only. No database, no network — plain `gleam test`.
 
 import gleam/erlang/process.{type Pid, type Subject}
@@ -15,9 +15,9 @@ import gleeunit/should
 import nexus/config
 import nexus/loop
 import nexus/openai
-import nexus/session
-import nexus/session_registry
 import nexus/store
+import nexus/thread
+import nexus/thread_registry
 import nexus/timing
 import nexus/tools
 import nexus/transcript.{type Options, type Transcript}
@@ -76,11 +76,11 @@ const args_b = "{\"q\": \"gleam  BEAM\",\"page\": 2}"
 
 /// The production resolver's offline stand-in (same as the registry
 /// suite's): the fixture provider resolves, anything else is unknown.
-fn fixture_resolver() -> session_registry.ResolveProvider {
+fn fixture_resolver() -> thread_registry.ResolveProvider {
   fn(id) {
     case id == store_mock.fixture_provider_id {
       True -> Ok(test_endpoint())
-      False -> Error(session_registry.ProviderUnknown)
+      False -> Error(thread_registry.ProviderUnknown)
     }
   }
 }
@@ -99,9 +99,9 @@ fn happy_runner(
   tr,
   _cancel,
   on_event: fn(loop.LoopEvent) -> Nil,
-) -> session.TurnOutcome {
+) -> thread.TurnOutcome {
   on_event(loop.StreamEvent(openai.TokenDelta("hi")))
-  session.StreamDone(stats(), transcript.append_assistant(tr, "hi"))
+  thread.StreamDone(stats(), transcript.append_assistant(tr, "hi"))
 }
 
 /// A turn shaped like the real agent loop: one assistant message with
@@ -111,7 +111,7 @@ fn tool_round_runner(
   tr,
   _cancel,
   on_event: fn(loop.LoopEvent) -> Nil,
-) -> session.TurnOutcome {
+) -> thread.TurnOutcome {
   on_event(loop.ToolCallAssembled("call_a", "http_fetch", args_a, None))
   on_event(loop.ToolCallAssembled("call_b", "web_search", args_b, None))
   on_event(loop.ToolResultEvent("call_a", "http_fetch", True, "fetched body"))
@@ -129,7 +129,7 @@ fn tool_round_runner(
     |> transcript.append_tool_result("call_a", "fetched body", ok: True)
     |> transcript.append_tool_result("call_b", "search body", ok: True)
     |> transcript.append_assistant("all done")
-  session.StreamDone(stats(), tr)
+  thread.StreamDone(stats(), tr)
 }
 
 /// The encoding options the agent loop uses (stream on, frozen tools).
@@ -272,7 +272,7 @@ pub fn failed_tool_result_round_trips_through_rows_test() {
 
 type Boot {
   Boot(
-    registry: Subject(session_registry.Msg),
+    registry: Subject(thread_registry.Msg),
     registry_pid: Pid,
     factory_pid: Pid,
   )
@@ -281,14 +281,14 @@ type Boot {
 /// Boot a factory + registry over a given store seam, keeping the pids so
 /// a test can tear the whole "VM" down while the store survives.
 fn boot(seam: store.Store) -> Boot {
-  // Sessions created through the registry pin the fixture provider.
+  // Threads created through the registry pin the fixture provider.
   store_mock.ensure_fixture_provider(seam)
   let factory_name = process.new_name("nexus_persist_factory")
   let registry_name = process.new_name("nexus_persist_registry")
   let assert Ok(factory) =
-    factory_supervisor.start(session_registry.factory_builder(factory_name))
+    factory_supervisor.start(thread_registry.factory_builder(factory_name))
   let assert Ok(started) =
-    session_registry.start_with_runner(
+    thread_registry.start_with_runner(
       test_config(),
       factory_supervisor.get_by_name(factory_name),
       registry_name,
@@ -309,7 +309,7 @@ fn boot(seam: store.Store) -> Boot {
   )
 }
 
-/// Simulate a whole-VM restart: the registry and its session factory die;
+/// Simulate a whole-VM restart: the registry and its thread factory die;
 /// the store (the external database) survives. Unlink first — the test
 /// process started (and is therefore linked to) both supervisors, and a
 /// plain kill would drag the test runner down with them.
@@ -322,12 +322,12 @@ fn restart_vm(booted: Boot) -> Nil {
 }
 
 fn create(
-  registry: Subject(session_registry.Msg),
+  registry: Subject(thread_registry.Msg),
   model: String,
-  runner: session.TurnRunner,
-) -> session_registry.SessionRecord {
+  runner: thread.TurnRunner,
+) -> thread_registry.ThreadRecord {
   let assert Ok(record) =
-    session_registry.create_with_runner(
+    thread_registry.create_with_runner(
       registry,
       store_mock.fixture_provider_id,
       model,
@@ -338,12 +338,12 @@ fn create(
 
 /// Run one turn and wait for its commit to land in the store.
 fn run_turn(
-  subject: Subject(session.Msg),
+  subject: Subject(thread.Msg),
   text: String,
   mock: Subject(store_mock.MockMsg),
   commits_before: Int,
 ) -> Nil {
-  should.equal(session.send_message(subject, text), session.Sent)
+  should.equal(thread.send_message(subject, text), thread.Sent)
   store_mock.await_commits(mock, commits_before + 2)
 }
 
@@ -378,7 +378,7 @@ pub fn write_behind_persists_in_order_test() {
     store.transcript_from_rows("alias-1", test_config().system_prompt, rows)
   should.equal(
     transcript.request_body(rebuilt, loop_options()),
-    transcript.request_body(session.snapshot(record.subject), loop_options()),
+    transcript.request_body(thread.snapshot(record.subject), loop_options()),
   )
 }
 
@@ -389,40 +389,40 @@ pub fn metadata_writes_through_test() {
   let record = create(booted.registry, "alias-1", happy_runner)
 
   // Auto-title applies once and is guarded in the store too.
-  should.be_true(session_registry.auto_title(
+  should.be_true(thread_registry.auto_title(
     booted.registry,
     record.id,
     "first msg",
   ))
-  should.be_false(session_registry.auto_title(
+  should.be_false(thread_registry.auto_title(
     booted.registry,
     record.id,
     "sneaky",
   ))
-  should.be_true(session_registry.set_title(
+  should.be_true(thread_registry.set_title(
     booted.registry,
     record.id,
     "renamed",
   ))
   should.be_true(
-    session_registry.set_tags(booted.registry, record.id, ["work", "notes"]),
+    thread_registry.set_tags(booted.registry, record.id, ["work", "notes"]),
   )
-  should.be_true(session_registry.set_pinned(booted.registry, record.id, True))
-  should.be_true(session_registry.set_archived(booted.registry, record.id, True))
+  should.be_true(thread_registry.set_pinned(booted.registry, record.id, True))
+  should.be_true(thread_registry.set_archived(booted.registry, record.id, True))
 
   // The store saw the same sequence (write-through), archive included.
   let events =
     store_mock.events(mock)
     |> list.filter(fn(event) {
       case event {
-        store_mock.EvInsertSession(_)
+        store_mock.EvInsertThread(_)
         | store_mock.EvCommit(_, _)
         | store_mock.EvAutoTitle(_, _) -> True
         _ -> False
       }
     })
   should.equal(events, [
-    store_mock.EvInsertSession(record.id),
+    store_mock.EvInsertThread(record.id),
     store_mock.EvAutoTitle(record.id, "first msg"),
   ])
   let tail =
@@ -450,10 +450,10 @@ pub fn metadata_writes_through_test() {
   restart_vm(booted)
   let booted2 = boot(store_mock.seam(mock))
   let assert Ok(summary) =
-    session_registry.list_sessions(booted2.registry)
+    thread_registry.list_threads(booted2.registry)
     |> list.find(fn(summary) { summary.id == record.id })
   should.equal(summary.title, "renamed")
-  should.equal(summary.title_source, session.ManualTitle)
+  should.equal(summary.title_source, thread.ManualTitle)
   should.equal(summary.tags, ["work", "notes"])
   should.be_true(summary.archived)
   // Archiving cleared the pin in the stored row as well.
@@ -465,7 +465,7 @@ pub fn restart_hydrates_byte_identical_prefix_test() {
   let seam = store_mock.seam(mock)
   let booted = boot(seam)
   let record = create(booted.registry, "alias-1", tool_round_runner)
-  should.be_true(session_registry.auto_title(
+  should.be_true(thread_registry.auto_title(
     booted.registry,
     record.id,
     "first question",
@@ -475,15 +475,15 @@ pub fn restart_hydrates_byte_identical_prefix_test() {
   run_turn(record.subject, "second question", mock, 2)
   let opts = loop_options()
   let body_before =
-    transcript.request_body(session.snapshot(record.subject), opts)
+    transcript.request_body(thread.snapshot(record.subject), opts)
 
   // ---- the "VM" restarts; only the store survives ---------------------
   restart_vm(booted)
   let booted2 = boot(store_mock.seam(mock))
 
-  // The session is listed from the store (dormant), with its stored
+  // The thread is listed from the store (dormant), with its stored
   // metadata and message count (turn 1: 6 messages; turn 2 adds 5).
-  let summaries = session_registry.list_sessions(booted2.registry)
+  let summaries = thread_registry.list_threads(booted2.registry)
   should.equal(list.length(summaries), 1)
   let assert Ok(summary) = list.first(summaries)
   should.equal(summary.id, record.id)
@@ -494,17 +494,17 @@ pub fn restart_hydrates_byte_identical_prefix_test() {
   should.equal(summary.metrics, [])
 
   // Lazily start it: the first Get hydrates from the store.
-  let assert Ok(subject2) = session_registry.get(booted2.registry, record.id)
-  let snapshot2 = session.snapshot(subject2)
+  let assert Ok(subject2) = thread_registry.get(booted2.registry, record.id)
+  let snapshot2 = thread.snapshot(subject2)
   should.equal(transcript.model(snapshot2), "alias-1")
   // BYTE-IDENTICAL across the restart — the KV-cache contract.
   let body_after = transcript.request_body(snapshot2, opts)
   should.equal(body_after, body_before)
 
-  // Continuing the session grows the body by suffix only.
-  should.equal(session.send_message(subject2, "third question"), session.Sent)
+  // Continuing the thread grows the body by suffix only.
+  should.equal(thread.send_message(subject2, "third question"), thread.Sent)
   store_mock.await_commits(mock, 6)
-  let body_next = transcript.request_body(session.snapshot(subject2), opts)
+  let body_next = transcript.request_body(thread.snapshot(subject2), opts)
   should.be_true(extends(body_before, body_next))
 }
 
@@ -527,22 +527,22 @@ fn extends(prev: String, next: String) -> Bool {
 pub fn lazy_start_is_one_shot_and_continues_ids_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
-  // Pre-populate the "database" with two stored sessions.
+  // Pre-populate the "database" with two stored threads.
   store_mock.ensure_fixture_provider(seam)
-  let assert Ok(_) = seam.insert_session(stored("s1"), "sys-1")
-  let assert Ok(_) = seam.insert_session(stored("s2"), "sys-2")
+  let assert Ok(_) = seam.insert_thread(stored("s1"), "sys-1")
+  let assert Ok(_) = seam.insert_thread(stored("s2"), "sys-2")
 
   let booted = boot(seam)
-  let summaries = session_registry.list_sessions(booted.registry)
+  let summaries = thread_registry.list_threads(booted.registry)
   should.equal(summaries |> list.map(fn(summary) { summary.id }), ["s1", "s2"])
 
   // The first Get hydrates; the second returns the SAME actor (one
-  // session, one commit lane: both sends' commits land on the one id,
+  // thread, one commit lane: both sends' commits land on the one id,
   // and the snapshot grows monotonically).
-  let assert Ok(subject_a) = session_registry.get(booted.registry, "s2")
-  let assert Ok(subject_b) = session_registry.get(booted.registry, "s2")
-  should.equal(session.send_message(subject_a, "hi"), session.Sent)
-  should.equal(session.send_message(subject_b, "again"), session.Sent)
+  let assert Ok(subject_a) = thread_registry.get(booted.registry, "s2")
+  let assert Ok(subject_b) = thread_registry.get(booted.registry, "s2")
+  should.equal(thread.send_message(subject_a, "hi"), thread.Sent)
+  should.equal(thread.send_message(subject_b, "again"), thread.Sent)
   store_mock.await_commits(mock, 4)
   should.equal(
     store_mock.events(mock)
@@ -557,8 +557,8 @@ pub fn lazy_start_is_one_shot_and_continues_ids_test() {
   )
   // Both subjects address one transcript: sys + two complete tool rounds
   // (each: user, assistant-with-2-calls, 2 tool results, final).
-  should.equal(transcript.length(session.snapshot(subject_a)), 11)
-  should.equal(transcript.length(session.snapshot(subject_b)), 11)
+  should.equal(transcript.length(thread.snapshot(subject_a)), 11)
+  should.equal(transcript.length(thread.snapshot(subject_b)), 11)
 
   // A fresh create mints past the stored ids: s3, not a collision.
   let created = create(booted.registry, "alias-x", happy_runner)
@@ -573,13 +573,13 @@ fn stored(id: String) -> store.StoredSummary {
     // is user intent, unlike a never-used empty). message_count stays 1 —
     // system prompt only, consistent with the empty row list.
     title: "stored",
-    title_source: session.ManualTitle,
+    title_source: thread.ManualTitle,
     model: "alias-1",
     pinned: False,
     archived: False,
     tags: [],
     tags_manual: [],
-    tags_source: session.AutoTags,
+    tags_source: thread.AutoTags,
     created_at: timing.wall_now_s(),
     last_active_at: timing.wall_now_s(),
     message_count: 1,
@@ -594,7 +594,7 @@ pub fn duplicate_commit_is_idempotent_test() {
   run_turn(record.subject, "first question", mock, 0)
 
   let assert Ok([#(_, rows_before)]) = Ok(store_mock.rows(mock))
-  let snapshot = session.snapshot(record.subject)
+  let snapshot = thread.snapshot(record.subject)
 
   // Crash-recovery replay: the same commit arrives twice.
   seam.commit(record.id, snapshot)
@@ -619,7 +619,7 @@ pub fn replay_after_missed_commit_repair_rows_test() {
   run_turn(record.subject, "second question", mock, 2)
 
   let assert Ok([#(_, rows_full)]) = Ok(store_mock.rows(mock))
-  let snapshot = session.snapshot(record.subject)
+  let snapshot = thread.snapshot(record.subject)
 
   // A crash loses the last flush: the store only has the first turn's
   // rows. The next commit (the retry) re-emits the missing delta.
@@ -639,25 +639,25 @@ pub fn delete_removes_stored_rows_and_dormant_test() {
   // (the store is single-writer: rows appear there only through this
   // registry's create path or a previous boot).
   store_mock.ensure_fixture_provider(seam)
-  let assert Ok(_) = seam.insert_session(stored("s99"), "sys")
+  let assert Ok(_) = seam.insert_thread(stored("s99"), "sys")
   let booted = boot(seam)
   let live = create(booted.registry, "alias-1", happy_runner)
 
-  // Deleting a dormant session (no live actor) removes the stored row.
-  should.be_true(session_registry.delete_session(booted.registry, "s99"))
-  should.equal(seam.get_session("s99") |> result_is_error, True)
+  // Deleting a dormant thread (no live actor) removes the stored row.
+  should.be_true(thread_registry.delete_thread(booted.registry, "s99"))
+  should.equal(seam.get_thread("s99") |> result_is_error, True)
 
   // Deleting a live one stops the actor and removes the row + records.
   run_turn(live.subject, "hello", mock, 0)
-  should.be_true(session_registry.delete_session(booted.registry, live.id))
-  should.equal(seam.get_session(live.id) |> result_is_error, True)
+  should.be_true(thread_registry.delete_thread(booted.registry, live.id))
+  should.equal(seam.get_thread(live.id) |> result_is_error, True)
   should.equal(store_mock.rows(mock), [])
 
   // And it stays gone across a restart.
   restart_vm(booted)
   let booted2 = boot(store_mock.seam(mock))
-  should.equal(session_registry.list_sessions(booted2.registry), [])
-  should.equal(session_registry.get(booted2.registry, live.id), Error(Nil))
+  should.equal(thread_registry.list_threads(booted2.registry), [])
+  should.equal(thread_registry.get(booted2.registry, live.id), Error(Nil))
 }
 
 fn result_is_error(result: Result(a, e)) -> Bool {
@@ -671,22 +671,22 @@ pub fn dormant_metadata_writes_through_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
   store_mock.ensure_fixture_provider(seam)
-  let assert Ok(_) = seam.insert_session(stored("s1"), "sys")
+  let assert Ok(_) = seam.insert_thread(stored("s1"), "sys")
   let booted = boot(seam)
 
-  // Metadata mutations on a DORMANT session apply to the stored row and
+  // Metadata mutations on a DORMANT thread apply to the stored row and
   // are visible to the next boot — no live actor needed.
-  should.be_true(session_registry.set_title(booted.registry, "s1", "named"))
-  should.be_true(session_registry.set_tags(booted.registry, "s1", ["a"]))
-  should.be_true(session_registry.set_pinned(booted.registry, "s1", True))
+  should.be_true(thread_registry.set_title(booted.registry, "s1", "named"))
+  should.be_true(thread_registry.set_tags(booted.registry, "s1", ["a"]))
+  should.be_true(thread_registry.set_pinned(booted.registry, "s1", True))
 
   restart_vm(booted)
   let booted2 = boot(store_mock.seam(mock))
   let assert Ok(summary) =
-    session_registry.list_sessions(booted2.registry)
+    thread_registry.list_threads(booted2.registry)
     |> list.find(fn(summary) { summary.id == "s1" })
   should.equal(summary.title, "named")
-  should.equal(summary.title_source, session.ManualTitle)
+  should.equal(summary.title_source, thread.ManualTitle)
   should.equal(summary.tags, ["a"])
   should.be_true(summary.pinned)
 }
@@ -700,9 +700,9 @@ pub fn boot_fails_when_store_unreachable_test() {
     })
   let factory_name = process.new_name("nexus_broken_factory")
   let assert Ok(_factory) =
-    factory_supervisor.start(session_registry.factory_builder(factory_name))
+    factory_supervisor.start(thread_registry.factory_builder(factory_name))
   let started =
-    session_registry.start(
+    thread_registry.start(
       test_config(),
       factory_supervisor.get_by_name(factory_name),
       process.new_name("nexus_broken_registry"),
@@ -789,7 +789,7 @@ pub fn timestamp_rows_round_trip_test() {
     store.AssistantRow("done", None, Some(4000)),
   ])
   // Hydration restores the stamps at the same chronological indexes, so
-  // a reloaded session renders the same per-message ages.
+  // a reloaded thread renders the same per-message ages.
   let rebuilt =
     store.transcript_from_rows("alias-1", test_config().system_prompt, rows)
   transcript.stamped_at(rebuilt, 1) |> should.equal(Some(1000))
@@ -842,7 +842,7 @@ fn auto_stored(id: String, title: String) -> store.StoredSummary {
   store.StoredSummary(
     ..stored(id),
     title: title,
-    title_source: session.AutoTitle,
+    title_source: thread.AutoTitle,
   )
 }
 
@@ -853,16 +853,16 @@ pub fn auto_meta_upgrade_replaces_auto_title_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
   store_mock.ensure_fixture_provider(seam)
-  let assert Ok(_) = seam.insert_session(auto_stored("s1", "heuristic"), "sys")
+  let assert Ok(_) = seam.insert_thread(auto_stored("s1", "heuristic"), "sys")
 
   should.equal(seam.auto_meta_upgrade("s1", "Model Title", []), Ok(True))
-  let assert Ok(stored) = seam.get_session("s1")
+  let assert Ok(stored) = seam.get_thread("s1")
   should.equal(stored.summary.title, "Model Title")
-  should.equal(stored.summary.title_source, session.AutoTitle)
+  should.equal(stored.summary.title_source, thread.AutoTitle)
 
   // An upgraded title is still auto-generated: it may be replaced again.
   should.equal(seam.auto_meta_upgrade("s1", "Better Title", []), Ok(True))
-  let assert Ok(stored) = seam.get_session("s1")
+  let assert Ok(stored) = seam.get_thread("s1")
   should.equal(stored.summary.title, "Better Title")
 }
 
@@ -873,13 +873,13 @@ pub fn auto_meta_upgrade_refuses_manual_title_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
   store_mock.ensure_fixture_provider(seam)
-  let assert Ok(_) = seam.insert_session(auto_stored("s2", "heuristic"), "sys")
+  let assert Ok(_) = seam.insert_thread(auto_stored("s2", "heuristic"), "sys")
 
   should.equal(seam.set_title("s2", "renamed"), Ok(Nil))
   should.equal(seam.auto_meta_upgrade("s2", "Sneaky", []), Ok(False))
-  let assert Ok(stored) = seam.get_session("s2")
+  let assert Ok(stored) = seam.get_thread("s2")
   should.equal(stored.summary.title, "renamed")
-  should.equal(stored.summary.title_source, session.ManualTitle)
+  should.equal(stored.summary.title_source, thread.ManualTitle)
 
   should.be_error(seam.auto_meta_upgrade("nope", "X", []))
 }
@@ -892,19 +892,19 @@ pub fn auto_meta_upgrade_refuses_after_manual_tag_save_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
   store_mock.ensure_fixture_provider(seam)
-  let assert Ok(_) = seam.insert_session(auto_stored("s3", "heuristic"), "sys")
+  let assert Ok(_) = seam.insert_thread(auto_stored("s3", "heuristic"), "sys")
 
   should.equal(seam.set_tags("s3", ["mine"]), Ok(Nil))
   should.equal(
     seam.auto_meta_upgrade("s3", "Model Title", ["model-tag"]),
     Ok(False),
   )
-  let assert Ok(stored) = seam.get_session("s3")
+  let assert Ok(stored) = seam.get_thread("s3")
   // Refused WHOLE: the title stays untouched too, not just the tags.
   should.equal(stored.summary.title, "heuristic")
   should.equal(stored.summary.tags, ["mine"])
   should.equal(stored.summary.tags_manual, ["mine"])
-  should.equal(stored.summary.tags_source, session.ManualTags)
+  should.equal(stored.summary.tags_source, thread.ManualTags)
 
   // The mock recorded the manual save; no upgrade was written.
   store_mock.events(mock)
@@ -924,18 +924,18 @@ pub fn auto_meta_upgrade_applies_and_records_tags_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
   store_mock.ensure_fixture_provider(seam)
-  let assert Ok(_) = seam.insert_session(auto_stored("s4", "heuristic"), "sys")
+  let assert Ok(_) = seam.insert_thread(auto_stored("s4", "heuristic"), "sys")
 
   should.equal(
     seam.auto_meta_upgrade("s4", "Model Title", ["login", "auth"]),
     Ok(True),
   )
-  let assert Ok(stored) = seam.get_session("s4")
+  let assert Ok(stored) = seam.get_thread("s4")
   should.equal(stored.summary.title, "Model Title")
   should.equal(stored.summary.tags, ["login", "auth"])
   // Both provenance columns stay 'auto': a later attempt may merge again.
-  should.equal(stored.summary.title_source, session.AutoTitle)
-  should.equal(stored.summary.tags_source, session.AutoTags)
+  should.equal(stored.summary.title_source, thread.AutoTitle)
+  should.equal(stored.summary.tags_source, thread.AutoTags)
   store_mock.events(mock)
   |> list.filter(fn(event) {
     case event {
@@ -949,7 +949,7 @@ pub fn auto_meta_upgrade_applies_and_records_tags_test() {
 }
 
 /// The registry's UpgradeAutoTitle — what the utility worker's apply step
-/// calls — applies for a LIVE session with an auto title, writes through
+/// calls — applies for a LIVE thread with an auto title, writes through
 /// to the store, and refuses (without touching the store) once a manual
 /// rename landed. Across a restart the store's answer stands.
 pub fn upgrade_auto_title_writes_through_and_survives_restart_test() {
@@ -957,7 +957,7 @@ pub fn upgrade_auto_title_writes_through_and_survives_restart_test() {
   let seam = store_mock.seam(mock)
   let booted = boot(seam)
   let record = create(booted.registry, "alias-1", happy_runner)
-  should.be_true(session_registry.auto_title(
+  should.be_true(thread_registry.auto_title(
     booted.registry,
     record.id,
     "first msg",
@@ -966,19 +966,19 @@ pub fn upgrade_auto_title_writes_through_and_survives_restart_test() {
   // The utility worker's apply step: the heuristic placeholder is
   // upgraded to the model title, in memory and in the store.
   should.equal(
-    session_registry.upgrade_auto_title(
+    thread_registry.upgrade_auto_title(
       booted.registry,
       record.id,
       "Model Title",
       [],
     ),
-    session_registry.UpgradeApplied("Model Title", []),
+    thread_registry.UpgradeApplied("Model Title", []),
   )
   let assert Ok(summary) =
-    session_registry.list_sessions(booted.registry)
+    thread_registry.list_threads(booted.registry)
     |> list.find(fn(summary) { summary.id == record.id })
   should.equal(summary.title, "Model Title")
-  should.equal(summary.title_source, session.AutoTitle)
+  should.equal(summary.title_source, thread.AutoTitle)
   should.equal(
     store_mock.events(mock)
       |> list.filter(fn(event) {
@@ -991,19 +991,14 @@ pub fn upgrade_auto_title_writes_through_and_survives_restart_test() {
   )
 
   // A manual rename wins forever: refused, and the store is never asked.
-  should.be_true(session_registry.set_title(
+  should.be_true(thread_registry.set_title(
     booted.registry,
     record.id,
     "renamed",
   ))
   should.equal(
-    session_registry.upgrade_auto_title(
-      booted.registry,
-      record.id,
-      "Sneaky",
-      [],
-    ),
-    session_registry.UpgradeRefused,
+    thread_registry.upgrade_auto_title(booted.registry, record.id, "Sneaky", []),
+    thread_registry.UpgradeRefused,
   )
   should.equal(
     store_mock.events(mock)
@@ -1021,10 +1016,10 @@ pub fn upgrade_auto_title_writes_through_and_survives_restart_test() {
   restart_vm(booted)
   let booted2 = boot(store_mock.seam(mock))
   let assert Ok(summary) =
-    session_registry.list_sessions(booted2.registry)
+    thread_registry.list_threads(booted2.registry)
     |> list.find(fn(summary) { summary.id == record.id })
   should.equal(summary.title, "renamed")
-  should.equal(summary.title_source, session.ManualTitle)
+  should.equal(summary.title_source, thread.ManualTitle)
 }
 
 /// The store guard has the final word (twin-invariant): a concurrent
@@ -1037,7 +1032,7 @@ pub fn upgrade_auto_title_honors_store_refusal_test() {
   let seam = store_mock.seam(mock)
   let booted = boot(seam)
   let record = create(booted.registry, "alias-1", happy_runner)
-  should.be_true(session_registry.auto_title(
+  should.be_true(thread_registry.auto_title(
     booted.registry,
     record.id,
     "first msg",
@@ -1050,19 +1045,19 @@ pub fn upgrade_auto_title_honors_store_refusal_test() {
   // The registry's memory still says AutoTitle, but the store refuses —
   // and the registry honors it: nothing applied, nothing changed.
   should.equal(
-    session_registry.upgrade_auto_title(
+    thread_registry.upgrade_auto_title(
       booted.registry,
       record.id,
       "Model Title",
       [],
     ),
-    session_registry.UpgradeRefused,
+    thread_registry.UpgradeRefused,
   )
   let assert Ok(summary) =
-    session_registry.list_sessions(booted.registry)
+    thread_registry.list_threads(booted.registry)
     |> list.find(fn(summary) { summary.id == record.id })
   should.equal(summary.title, "first msg")
-  should.equal(summary.title_source, session.AutoTitle)
+  should.equal(summary.title_source, thread.AutoTitle)
   should.equal(
     store_mock.events(mock)
       |> list.filter(fn(event) {
@@ -1075,31 +1070,26 @@ pub fn upgrade_auto_title_honors_store_refusal_test() {
   )
 }
 
-/// The upgrade also reaches a DORMANT (stored-but-not-live) session —
+/// The upgrade also reaches a DORMANT (stored-but-not-live) thread —
 /// the registry branch for ids with no live actor.
-pub fn upgrade_auto_title_on_dormant_session_test() {
+pub fn upgrade_auto_title_on_dormant_thread_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
   store_mock.ensure_fixture_provider(seam)
-  let assert Ok(_) = seam.insert_session(auto_stored("s9", "heuristic"), "sys")
+  let assert Ok(_) = seam.insert_thread(auto_stored("s9", "heuristic"), "sys")
   let booted = boot(seam)
 
   should.equal(
-    session_registry.upgrade_auto_title(
-      booted.registry,
-      "s9",
-      "Model Title",
-      [],
-    ),
-    session_registry.UpgradeApplied("Model Title", []),
+    thread_registry.upgrade_auto_title(booted.registry, "s9", "Model Title", []),
+    thread_registry.UpgradeApplied("Model Title", []),
   )
   restart_vm(booted)
   let booted2 = boot(store_mock.seam(mock))
   let assert Ok(summary) =
-    session_registry.list_sessions(booted2.registry)
+    thread_registry.list_threads(booted2.registry)
     |> list.find(fn(summary) { summary.id == "s9" })
   should.equal(summary.title, "Model Title")
-  should.equal(summary.title_source, session.AutoTitle)
+  should.equal(summary.title_source, thread.AutoTitle)
 }
 
 /// The tags ride the SAME write as the title (§5): the registry's
@@ -1111,23 +1101,18 @@ pub fn upgrade_auto_title_merges_tags_and_survives_restart_test() {
   let seam = store_mock.seam(mock)
   let booted = boot(seam)
   let record = create(booted.registry, "alias-1", happy_runner)
-  should.be_true(session_registry.auto_title(
+  should.be_true(thread_registry.auto_title(
     booted.registry,
     record.id,
     "first msg",
   ))
 
-  session_registry.upgrade_auto_title(
-    booted.registry,
-    record.id,
-    "Model Title",
-    [
-      "Login Bug",
-      "auth",
-    ],
-  )
+  thread_registry.upgrade_auto_title(booted.registry, record.id, "Model Title", [
+    "Login Bug",
+    "auth",
+  ])
   |> should.equal(
-    session_registry.UpgradeApplied("Model Title", ["login-bug", "auth"]),
+    thread_registry.UpgradeApplied("Model Title", ["login-bug", "auth"]),
   )
   store_mock.events(mock)
   |> list.filter(fn(event) {
@@ -1143,7 +1128,7 @@ pub fn upgrade_auto_title_merges_tags_and_survives_restart_test() {
   restart_vm(booted)
   let booted2 = boot(store_mock.seam(mock))
   let assert Ok(summary) =
-    session_registry.list_sessions(booted2.registry)
+    thread_registry.list_threads(booted2.registry)
     |> list.find(fn(summary) { summary.id == record.id })
   should.equal(summary.title, "Model Title")
   should.equal(summary.tags, ["login-bug", "auth"])

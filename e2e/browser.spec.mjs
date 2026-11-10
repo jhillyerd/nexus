@@ -6,8 +6,8 @@
 // M3 flow end-to-end through the real WebSocket UI:
 //
 //   1. bearer auth (401 without token, page with token)
-//   2. model list (picker) and session list
-//   3. create / switch sessions
+//   2. model list (picker) and thread list
+//   3. create / switch threads
 //   4. text-only turn (streaming → completed)
 //   5. stop during streaming (partial commit)
 //   6. reconnect/replay: full tool history re-rendered after reload
@@ -16,12 +16,12 @@
 //   9. byte-identical request prefixes turn-over-turn (fake records them)
 //  10. mobile viewport: a second context gets an independent per-client
 //      runtime (own selection, non-mirroring panels, reload restores its
-//      own session) with no horizontal overflow with tool cards
+//      own thread) with no horizontal overflow with tool cards
 //  11. connection dot: red while the backend is down, green on reconnect
 //  12. provider management end-to-end (multi-provider P5, now in the
 //      Settings view): create a provider in Settings, test its
 //      connection (live model aliases), pick it in the create panel
-//      (aliases reload per provider), pin a session to it, stream a turn,
+//      (aliases reload per provider), pin a thread to it, stream a turn,
 //      and hit the delete/disable guard rails
 //  13. utility branch (utility-titles §4.1 / utility-tags §3.1): the
 //      model's two-line reply (line 1 title, line 2 tags) lands through
@@ -155,7 +155,7 @@ const ENC_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
 const DATABASE_URL = process.env.E2E_DATABASE_URL ?? "postgres://nexus@127.0.0.1:5433/nexus";
 
 /// Reset the shared e2e database so the suite starts from nothing —
-/// reruns and interleaved integration runs must not leave sessions
+/// reruns and interleaved integration runs must not leave threads
 /// (breaking the empty-list assertions) or extra providers (the create
 /// panel auto-targets the FIRST enabled provider by name, and e.g. an
 /// integration run's "bifrost" would sort before this suite's "fake").
@@ -164,7 +164,7 @@ function resetDatabase() {
   return new Promise((resolve, reject) => {
     const child = spawn(
       "psql",
-      ["-q", DATABASE_URL, "-c", "truncate session_message, session, provider cascade;"],
+      ["-q", DATABASE_URL, "-c", "truncate thread_message, thread, provider cascade;"],
       { stdio: ["ignore", "pipe", "pipe"] },
     );
     let out = "";
@@ -286,7 +286,7 @@ async function selectedId(p) {
   return await p.locator("#layout").evaluate((el) => el.getAttribute("data-selected") || "");
 }
 
-/// Reveal a session row's hover controls (ui-polish F2) before driving
+/// Reveal a thread row's hover controls (ui-polish F2) before driving
 /// them. Playwright's `click()` waits for visibility *before* hovering,
 /// so a control that only exists on `:hover`/`:focus-within` must be
 /// revealed first — the same thing a real pointer user does by moving
@@ -308,7 +308,7 @@ async function revealRowControls(row) {
 /// so a control dropping out of the tab order would pass unnoticed.
 async function tab_to_row_main(page, row) {
   await page.locator("#show-archived").focus();
-  const want = row.locator(".session-main");
+  const want = row.locator(".thread-main");
   for (let i = 0; i < 40; i++) {
     await page.keyboard.press("Tab");
     const hit = await want.evaluate((el) => el === document.activeElement || el.getRootNode().activeElement === el).catch(() => false);
@@ -407,7 +407,7 @@ async function main() {
       eq(res.status(), 200, "authenticated status");
       assert((await res.text()).includes("lustre-server-component"), "component host element");
     });
-    await test("auth: session create pins provider + model (no token → 401)", async () => {
+    await test("auth: thread create pins provider + model (no token → 401)", async () => {
       // GET /models is gone (P3 hard cut: no default provider); the
       // create route is the scripted surface now.
       // The route is gone entirely: the router's catch-all answers 404
@@ -422,29 +422,29 @@ async function main() {
         404,
         "models gone (with token)",
       );
-      const no = await page.request.post(`${base}/sessions`, {
+      const no = await page.request.post(`${base}/threads`, {
         data: { provider: "fake", model: "smart" },
       });
       eq(no.status(), 401, "no-token create");
-      const res = await page.request.post(`${base}/sessions`, {
+      const res = await page.request.post(`${base}/threads`, {
         headers: { authorization: `Bearer ${TOKEN}` },
         data: { provider: "fake", model: "smart" },
       });
       eq(res.status(), 201, "bearer create pins fake/smart");
-      const unknown = await page.request.post(`${base}/sessions`, {
+      const unknown = await page.request.post(`${base}/threads`, {
         headers: { authorization: `Bearer ${TOKEN}` },
         data: { provider: "nope", model: "smart" },
       });
       eq(unknown.status(), 400, "unknown provider refused");
-      // Leave no row behind: the next test asserts an empty session list.
+      // Leave no row behind: the next test asserts an empty thread list.
       const created = await res.json();
-      const gone = await page.request.delete(`${base}/sessions/${created.id}`, {
+      const gone = await page.request.delete(`${base}/threads/${created.id}`, {
         headers: { authorization: `Bearer ${TOKEN}` },
       });
-      eq(gone.status(), 204, "created session cleaned up");
+      eq(gone.status(), 204, "created thread cleaned up");
     });
 
-    // -- 2. page load: shell, websocket, aliases, empty session list -------
+    // -- 2. page load: shell, websocket, aliases, empty thread list -------
     await test("page: loads, connects websocket, opens the create panel", async () => {
       await page.goto(`${base}/?token=${TOKEN}`);
       await connected(page);
@@ -462,16 +462,16 @@ async function main() {
         providerOptions.length === 1 && providerOptions[0].includes("fake") && providerOptions[0].includes("keyless"),
         `provider options: ${providerOptions}`,
       );
-      // No session is minted for the visitor: the list stays empty and the
+      // No thread is minted for the visitor: the list stays empty and the
       // create panel auto-opens, so the model is the user's choice.
       await poll(
         async () => page.locator("#create-panel").evaluate((el) => !el.hidden),
         { timeout: 15_000, message: "create panel auto-opened" },
       );
-      eq(await page.locator("#session-list .session-main").count(), 0, "no sessions yet");
+      eq(await page.locator("#thread-list .thread-main").count(), 0, "no threads yet");
       assert(
         (await page.getAttribute("#input", "disabled")) !== null,
-        "composer disabled without a session",
+        "composer disabled without a thread",
       );
       // ui-polish F5: an empty transcript renders an intentional muted
       // hint, not a blank void.
@@ -484,75 +484,75 @@ async function main() {
       );
     });
 
-    // -- 3. create + switch sessions ----------------------------------------
-    await test("sessions: create on both aliases and switch back", async () => {
+    // -- 3. create + switch threads ----------------------------------------
+    await test("threads: create on both aliases and switch back", async () => {
       // The panel may be open (auto-opened on the empty list) or closed;
       // make it open.
       const panelOpen = () =>
         page.locator("#create-panel").evaluate((el) => !el.hidden);
       if (!(await panelOpen().catch(() => false))) {
-        await page.click("#new-session");
+        await page.click("#new-thread");
       }
       await poll(panelOpen, { timeout: 10_000, message: "create panel open" });
       await page.selectOption("#model-picker", "smart");
-      await page.click("#create-session");
+      await page.click("#create-thread");
       await poll(
-        async () => (await page.locator("#session-list .session-main").count()) === 1,
-        { timeout: 15_000, message: "first session appears" },
+        async () => (await page.locator("#thread-list .thread-main").count()) === 1,
+        { timeout: 15_000, message: "first thread appears" },
       );
-      // A second session on the other alias.
+      // A second thread on the other alias.
       if (!(await panelOpen().catch(() => false))) {
-        await page.click("#new-session");
+        await page.click("#new-thread");
       }
       await poll(panelOpen, { timeout: 10_000, message: "create panel reopened" });
       await page.selectOption("#model-picker", "fast");
-      await page.click("#create-session");
+      await page.click("#create-thread");
       await poll(
-        async () => (await page.locator("#session-list .session-main").count()) === 2,
-        { timeout: 15_000, message: "second session appears" },
+        async () => (await page.locator("#thread-list .thread-main").count()) === 2,
+        { timeout: 15_000, message: "second thread appears" },
       );
-      const labels = await page.$$eval("#session-list .session-main", (els) => els.map((e) => e.textContent));
+      const labels = await page.$$eval("#thread-list .thread-main", (els) => els.map((e) => e.textContent));
       // Subtitles are `provider/model · age` (P5), so the label carries
       // the seeded provider's name before the alias.
-      assert(labels.some((l) => l.includes("fake/fast")), `new session label: ${labels}`);
+      assert(labels.some((l) => l.includes("fake/fast")), `new thread label: ${labels}`);
       const currentLabels = await page.$$eval(
-        "#session-list .session-main[aria-current='true']",
+        "#thread-list .thread-main[aria-current='true']",
         (els) => els.map((e) => e.textContent),
       );
-      eq(currentLabels.length, 1, "exactly one current session");
-      assert(currentLabels[0].includes("fake/fast"), `current is the new session: ${currentLabels}`);
-      // Switch back to the original smart session (Created prepends, so
+      eq(currentLabels.length, 1, "exactly one current thread");
+      assert(currentLabels[0].includes("fake/fast"), `current is the new thread: ${currentLabels}`);
+      // Switch back to the original smart thread (Created prepends, so
       // match by label rather than DOM position).
       await page
-        .locator("#session-list .session-main", { hasText: "fake/smart ·" })
+        .locator("#thread-list .thread-main", { hasText: "fake/smart ·" })
         .first()
         .click();
       await poll(
         () => page.locator("#model").evaluate((el) => el.textContent === "smart"),
         { timeout: 15_000, message: "header label after switch" },
       );
-      // ui-polish F8: the header context is the session's TITLE; "smart"
-      // here is the alias fallback (the fresh session is untitled), the
+      // ui-polish F8: the header context is the thread's TITLE; "smart"
+      // here is the alias fallback (the fresh thread is untitled), the
       // same rule the row title uses. The real title is asserted in the
       // organize test after its manual rename.
       const smartCurrent = await page
-        .locator("#session-list .session-main", { hasText: "fake/smart ·" })
+        .locator("#thread-list .thread-main", { hasText: "fake/smart ·" })
         .first()
         .getAttribute("aria-current");
-      eq(smartCurrent, "true", "smart session current again");
+      eq(smartCurrent, "true", "smart thread current again");
     });
 
-    // -- 3b. session organization --------------------------------------------
+    // -- 3b. thread organization --------------------------------------------
     await test("organize: auto-title, rename, tags, pin, filter, archive, delete", async () => {
       const headers = { authorization: `Bearer ${TOKEN}` };
-      const sessions = async (query = "") =>
-        (await (await page.request.get(`${base}/sessions${query}`, { headers })).json()).sessions;
+      const threads = async (query = "") =>
+        (await (await page.request.get(`${base}/threads${query}`, { headers })).json()).threads;
       const byModel = async (m, query = "") =>
-        (await sessions(query)).find((s) => s.model === m);
+        (await threads(query)).find((s) => s.model === m);
       const smart = await byModel("smart");
       const fast = await byModel("fast");
-      const smartRow = page.locator(`.session-row[data-session-id="${smart.id}"]`);
-      const fastRow = page.locator(`.session-row[data-session-id="${fast.id}"]`);
+      const smartRow = page.locator(`.thread-row[data-thread-id="${smart.id}"]`);
+      const fastRow = page.locator(`.thread-row[data-thread-id="${fast.id}"]`);
 
       // Sidebar density (ui-polish F2): an unselected row keeps its five
       // controls out of the way until you actually want them. Pinned here
@@ -575,7 +575,7 @@ async function main() {
         // sidebar's own `#show-archived` button is the last focusable
         // before the list, so starting there and pressing Tab walks the
         // actual order: every hidden control is out of the order until its
-        // row has focus, so the row's `.session-main` is the stop that
+        // row has focus, so the row's `.thread-main` is the stop that
         // opens it.
         await page.mouse.move(0, 0); // leave the list: no hover help
         const reached = await tab_to_row_main(page, fastRow);
@@ -589,7 +589,7 @@ async function main() {
         });
         // And it is the *focus* that did it: leaving the row hides them
         // again, with the pointer still off the list.
-        await page.locator("#new-session").focus();
+        await page.locator("#new-thread").focus();
         await poll(async () => !(await controls.isVisible()), {
           timeout: 5000,
           message: "controls hide again once focus leaves the row",
@@ -603,7 +603,7 @@ async function main() {
       eq(s.title_source, "auto", "auto title source");
       await poll(
         async () =>
-          (await smartRow.locator(".session-title").textContent()).includes(
+          (await smartRow.locator(".thread-title").textContent()).includes(
             "hello organize world",
           ),
         { timeout: 10_000, message: "auto title in row" },
@@ -615,29 +615,29 @@ async function main() {
       // reachable, not merely present in the DOM.
       await revealRowControls(smartRow);
       await smartRow.getByRole("button", { name: "Rename", exact: true }).click();
-      await smartRow.locator('input[name="title"]').fill("Renamed session");
+      await smartRow.locator('input[name="title"]').fill("Renamed thread");
       await smartRow
         .locator(".inline-editor:not([hidden])")
         .getByRole("button", { name: "Save", exact: true })
         .click();
       await poll(
         async () =>
-          (await smartRow.locator(".session-title").textContent()).includes(
-            "Renamed session",
+          (await smartRow.locator(".thread-title").textContent()).includes(
+            "Renamed thread",
           ),
         { timeout: 10_000, message: "renamed row" },
       );
       s = await byModel("smart");
-      eq(s.title, "Renamed session", "manual title in API");
+      eq(s.title, "Renamed thread", "manual title in API");
       eq(s.title_source, "manual", "manual title source");
-      // ui-polish F8: the header context follows the session's title, not
+      // ui-polish F8: the header context follows the thread's title, not
       // just the alias fallback.
       await poll(
         () =>
           page
             .locator("#model")
-            .evaluate((el) => el.textContent === "Renamed session"),
-        { timeout: 10_000, message: "header shows the session title" },
+            .evaluate((el) => el.textContent === "Renamed thread"),
+        { timeout: 10_000, message: "header shows the thread title" },
       );
 
       // Tags through the inline editor render as chips.
@@ -687,10 +687,10 @@ async function main() {
       await smartRow.getByRole("button", { name: "Pin", exact: true }).click();
       await poll(
         async () => {
-          const pinned = page.locator(".pinned-group .session-row");
+          const pinned = page.locator(".pinned-group .thread-row");
           return (
             (await pinned.count()) === 1 &&
-            (await pinned.first().getAttribute("data-session-id")) === smart.id
+            (await pinned.first().getAttribute("data-thread-id")) === smart.id
           );
         },
         { timeout: 10_000, message: "pinned section" },
@@ -707,14 +707,14 @@ async function main() {
       await poll(
         async () =>
           (await page
-            .locator(".archive-group .session-row")
+            .locator(".archive-group .thread-row")
             .first()
             .isVisible()),
         { timeout: 10_000, message: "archive group shown" },
       );
       s = await byModel("smart", "?archived=1");
       eq(s.archived, true, "archived in API");
-      // Invariant: an archived session is never pinned — archiving cleared
+      // Invariant: an archived thread is never pinned — archiving cleared
       // the pin and the archived row carries no pin control at all.
       eq(s.pinned, false, "archiving cleared the pin in API");
       eq(
@@ -724,11 +724,11 @@ async function main() {
       );
       await revealRowControls(smartRow);
       await smartRow.getByRole("button", { name: "Restore", exact: true }).click();
-      await poll(async () => await smartRow.locator(".session-main").isVisible(), {
+      await poll(async () => await smartRow.locator(".thread-main").isVisible(), {
         timeout: 10_000,
         message: "restored row back in the list",
       });
-      // Restored sessions are active again: the pin control is back (the
+      // Restored threads are active again: the pin control is back (the
       // pin itself stays cleared until re-pinned). Reveal first — the
       // restored row is neither selected nor hovered yet.
       await revealRowControls(smartRow);
@@ -738,7 +738,7 @@ async function main() {
         { timeout: 10_000, message: "pin control back after restore" },
       );
 
-      // Delete the fast session: two-step confirm, hard removal.
+      // Delete the fast thread: two-step confirm, hard removal.
       await revealRowControls(fastRow);
       await fastRow.getByRole("button", { name: "Delete", exact: true }).click();
       await fastRow
@@ -748,14 +748,14 @@ async function main() {
         timeout: 10_000,
         message: "deleted row gone",
       });
-      const after = await sessions();
-      assert(!after.some((x) => x.id === fast.id), "deleted session gone from API");
-      eq(after.length, 1, "only the smart session remains");
+      const after = await threads();
+      assert(!after.some((x) => x.id === fast.id), "deleted thread gone from API");
+      eq(after.length, 1, "only the smart thread remains");
     });
 
     // -- 3c. utility tags: manual freeze refuses the racing apply --------
-    // The organize test's first exchange armed the smart session's
-    // once-per-session utility attempt; the branch request left at the
+    // The organize test's first exchange armed the smart thread's
+    // once-per-thread utility attempt; the branch request left at the
     // debounce and the fake HOLDS its reply UTILITY_REPLY_DELAY_MS, so
     // the manual rename + tags save above had already flipped both
     // provenance columns to 'manual' while the apply was still in
@@ -764,9 +764,9 @@ async function main() {
     // stay exactly the manual set (utility-tags plan §3.5).
     await test("utility: manual tags freeze refuses the racing model apply", async () => {
       const headers = { authorization: `Bearer ${TOKEN}` };
-      // The smart session's is the suite's FIRST utility request — its
+      // The smart thread's is the suite's FIRST utility request — its
       // exchange is the first committed turn of the run (the guard and
-      // ui-made sessions have not sent one yet).
+      // ui-made threads have not sent one yet).
       await poll(
         async () =>
           services.requests.filter(
@@ -783,11 +783,11 @@ async function main() {
       const manualAt = await poll(
         async () => {
           const s = (
-            await (await page.request.get(`${base}/sessions`, { headers })).json()
-          ).sessions.find((x) => x.model === "smart");
+            await (await page.request.get(`${base}/threads`, { headers })).json()
+          ).threads.find((x) => x.model === "smart");
           return s &&
             s.title_source === "manual" &&
-            s.title === "Renamed session" &&
+            s.title === "Renamed thread" &&
             s.tags.join(",") === "ops,infra"
             ? Date.now()
             : false;
@@ -808,14 +808,14 @@ async function main() {
           `increase UTILITY_REPLY_DELAY_MS`,
       );
       const smart = (
-        await (await page.request.get(`${base}/sessions`, { headers })).json()
-      ).sessions.find((s) => s.model === "smart");
-      eq(smart.title, "Renamed session", "manual title survived the utility apply");
+        await (await page.request.get(`${base}/threads`, { headers })).json()
+      ).threads.find((s) => s.model === "smart");
+      eq(smart.title, "Renamed thread", "manual title survived the utility apply");
       eq(smart.title_source, "manual", "title still manual");
       eq(smart.tags.join(","), "ops,infra", `manual tags survived the apply: ${smart.tags}`);
       // The sidebar agrees: exactly the two manual chips — no model tag
       // (hostile or plain) ever landed on the row.
-      const row = page.locator(`.session-row[data-session-id="${smart.id}"]`);
+      const row = page.locator(`.thread-row[data-thread-id="${smart.id}"]`);
       await poll(async () => (await row.locator(".tag-chip").count()) === 2, {
         timeout: 10_000,
         message: "exactly the two manual chips",
@@ -1115,7 +1115,7 @@ async function main() {
       // the stream open (fetchslow). Reloading mid-hold used to drop every
       // already-broadcast round: the committed transcript did not hold them
       // until WorkerDone, so Join replayed nothing of the running turn.
-      // This session already carries earlier tests' turns, so the new turn's
+      // This thread already carries earlier tests' turns, so the new turn's
       // cards are identified positionally (the DOM renders oldest-first).
       const cardsBefore = await page.$$eval(".turn.tool[data-call-id]", (els) => els.length);
       await page.fill(
@@ -1141,11 +1141,11 @@ async function main() {
         },
         { timeout: 30_000, interval: 100, message: "round 1 chip completed" },
       );
-      // Reload while the final round holds the stream open. The session
+      // Reload while the final round holds the stream open. The thread
       // re-opens via the route query (page shell persistence).
       await page.reload();
       await connected(page);
-      // The finished round replays from the session's in-flight mirror:
+      // The finished round replays from the thread's in-flight mirror:
       // same single completed chip. Its popup carries the result.
       await poll(
         async () => {
@@ -1183,16 +1183,16 @@ async function main() {
     await test("guard: max-iteration turn renders terminal state", async () => {
       await page.goto(`${guardBase}/?token=${TOKEN}`);
       await connected(page);
-      // No session is minted at boot (the model is the user's choice), so
+      // No thread is minted at boot (the model is the user's choice), so
       // create one here — the panel auto-opens on the empty list.
       await poll(
         async () => page.locator("#create-panel").evaluate((el) => !el.hidden),
         { timeout: 15_000, message: "guard create panel open" },
       );
-      await page.click("#create-session");
+      await page.click("#create-thread");
       await poll(
-        async () => (await page.locator("#session-list .session-main").count()) === 1,
-        { timeout: 15_000, message: "guard session appears" },
+        async () => (await page.locator("#thread-list .thread-main").count()) === 1,
+        { timeout: 15_000, message: "guard thread appears" },
       );
       await sendAndWaitIdle(page, "case:loop never stop calling tools");
       // Guard terminal: chip reached guard phase, note rendered, send re-enabled.
@@ -1221,14 +1221,14 @@ async function main() {
         JSON.stringify(chats.map((c) => c.body), null, 2),
       );
       // Utility-title branches (utility-titles plan §4.1) reuse the
-      // session's frozen envelope plus exactly the UTILITY_DELTA above, so
+      // thread's frozen envelope plus exactly the UTILITY_DELTA above, so
       // they are not suffix-growths of the chat chain; they are judged by
       // their own contract after the chain scan, not lumped into it.
       const isUtility = (chat) => chat.body.includes(UTILITY_DELTA);
       const turnChats = chats.filter((c) => !isUtility(c));
       // Requests from the two nexus instances interleave in one log; a
       // request that does not extend the previous one starts a new chain
-      // (one chain per session). Every chain must grow by suffix only.
+      // (one chain per thread). Every chain must grow by suffix only.
       const chains = [];
       for (const chat of turnChats) {
         const last = chains[chains.length - 1];
@@ -1238,7 +1238,7 @@ async function main() {
           chains.push([chat]);
         }
       }
-      eq(chains.length, 2, `session chains (main + guard): ${chains.map((c) => c.length)}`);
+      eq(chains.length, 2, `thread chains (main + guard): ${chains.map((c) => c.length)}`);
       for (const [i, chain] of chains.entries()) {
         assert(chain.length >= 2, `chain ${i} too short: ${chain.length}`);
         for (let j = 1; j < chain.length; j++) {
@@ -1248,7 +1248,7 @@ async function main() {
           );
         }
       }
-      // Each utility branch must extend its session's committed transcript
+      // Each utility branch must extend its thread's committed transcript
       // byte-for-byte (the branch point is the last committed turn), and
       // its envelope must be the frozen one with exactly the documented
       // delta at exactly the documented spot — no other byte may move.
@@ -1279,8 +1279,8 @@ async function main() {
     // model: a second context gets a fresh runtime (its own auto-selection
     // and Hello replay, never an inherited view), panels no longer mirror
     // between contexts, and a reload re-opens the context's own
-    // last-selected session (persisted client-side, re-supplied on the
-    // /ws route). A second session created in the mobile context makes
+    // last-selected thread (persisted client-side, re-supplied on the
+    // /ws route). A second thread created in the mobile context makes
     // the divergence real: the two contexts hold DIFFERENT selections at
     // the same time, which a shared runtime could never show. The mobile
     // overflow check stays.
@@ -1290,14 +1290,14 @@ async function main() {
       track(dpage);
       await dpage.goto(`${base}/?token=${TOKEN}`);
       await connected(dpage);
-      await dpage.waitForSelector("#session-list .session-main", { timeout: 30_000 });
+      await dpage.waitForSelector("#thread-list .thread-main", { timeout: 30_000 });
 
       const mobile = await browser.newContext({ viewport: { width: 390, height: 844 } });
       const mpage = await mobile.newPage();
       track(mpage);
       await mpage.goto(`${base}/?token=${TOKEN}`);
       await connected(mpage);
-      // Fresh runtime, fresh model: the session re-opens through this
+      // Fresh runtime, fresh model: the thread re-opens through this
       // connection's own auto-selection and Hello replay, not an
       // inherited view (the shared runtime used to mirror the first
       // context's state into every later context).
@@ -1312,7 +1312,7 @@ async function main() {
 
       // Panels are per-client: opening the create panel on mobile must
       // not open it on the desktop context.
-      await mpage.click("#new-session");
+      await mpage.click("#new-thread");
       await poll(
         async () => await mpage.locator("#create-panel").evaluate((el) => !el.hidden),
         { timeout: 15_000, message: "mobile create panel open" },
@@ -1330,7 +1330,7 @@ async function main() {
       assert(overflow.scrollWidth <= overflow.innerWidth + 1, `overflow: ${JSON.stringify(overflow)}`);
 
       // ui-polish F3(a): stacked, the sidebar is capped so the transcript
-      // keeps the rest of the viewport — without the cap three sessions
+      // keeps the rest of the viewport — without the cap three threads
       // pushed #chat into a ~100px sliver clipped under the composer.
       const mobileBox = await mpage.evaluate(() => {
         const sr = document.querySelector("lustre-server-component")?.shadowRoot;
@@ -1359,7 +1359,7 @@ async function main() {
         `transcript is crushed or the composer is off-screen: ${JSON.stringify(mobileBox)}`,
       );
 
-      // ui-polish F4: the create panel opens ABOVE the session list, so it
+      // ui-polish F4: the create panel opens ABOVE the thread list, so it
       // lands on screen — previously it opened below the fold, which is what
       // made the create flow unusable on a phone. The panel is already open
       // here (the per-client check above), so measure it as-is and only
@@ -1369,7 +1369,7 @@ async function main() {
         .evaluate((el) => !el.hidden)
         .catch(() => false);
       if (!panelVisible) {
-        await mpage.click("#new-session");
+        await mpage.click("#new-thread");
         await poll(
           async () => await mpage.locator("#create-panel").evaluate((el) => !el.hidden),
           { timeout: 15_000, message: "create panel open before measuring" },
@@ -1464,30 +1464,30 @@ async function main() {
         `column became a containing block for the jump button: ${JSON.stringify(column)}`,
       );
 
-      // Diverge the contexts for real: create a second session in the
+      // Diverge the contexts for real: create a second thread in the
       // mobile context (its model learns it; the desktop context's model
-      // never does), so mobile holds the new session while desktop keeps
+      // never does), so mobile holds the new thread while desktop keeps
       // the original — two live connections, two different selections.
       await mpage.selectOption("#model-picker", "fast");
-      await mpage.click("#create-session");
+      await mpage.click("#create-thread");
       await poll(
-        async () => (await mpage.locator("#session-list .session-main").count()) === 2,
-        { timeout: 15_000, message: "second session appears on mobile" },
+        async () => (await mpage.locator("#thread-list .thread-main").count()) === 2,
+        { timeout: 15_000, message: "second thread appears on mobile" },
       );
       const second = await selectedId(mpage);
-      assert(second && second !== first, `mobile moved to its new session: ${second} vs ${first}`);
+      assert(second && second !== first, `mobile moved to its new thread: ${second} vs ${first}`);
       eq(
         await selectedId(dpage),
         first,
         "desktop keeps its own selection while mobile diverges",
       );
       eq(
-        await dpage.locator("#session-list .session-main").count(),
+        await dpage.locator("#thread-list .thread-main").count(),
         1,
-        "desktop model never sees the other context's session",
+        "desktop model never sees the other context's thread",
       );
 
-      // Reload: the context's own last-selected session (the second one —
+      // Reload: the context's own last-selected thread (the second one —
       // not the auto-selected first) comes back through the client-
       // supplied route parameter, and the opened panel — per-connection
       // state — does not survive.
@@ -1521,12 +1521,12 @@ async function main() {
       track(tpage);
       await tpage.goto(`${base}/?token=${TOKEN}`);
       await connected(tpage);
-      await tpage.waitForSelector(".session-row", { timeout: 15_000 });
+      await tpage.waitForSelector(".thread-row", { timeout: 15_000 });
       const touchState = await tpage.evaluate(() => {
         const sr = document
           .querySelector("lustre-server-component")
           ?.shadowRoot;
-        const rows = [...sr.querySelectorAll(".session-row")];
+        const rows = [...sr.querySelectorAll(".thread-row")];
         return {
           hoverHover: matchMedia("(hover: hover)").matches,
           rows: rows.map((r) => ({
@@ -1552,14 +1552,14 @@ async function main() {
       );
       // And a tap selects: the row you are in is the row you can act on.
       const untapped = tpage
-        .locator(".session-row:not(.selected) .session-main")
+        .locator(".thread-row:not(.selected) .thread-main")
         .first();
       if (await untapped.count()) {
         await untapped.tap();
         await poll(
           async () =>
             await tpage
-              .locator(".session-row.selected .row-controls")
+              .locator(".thread-row.selected .row-controls")
               .first()
               .isVisible(),
           { timeout: 10_000, message: "tap selects and reveals the controls" },
@@ -1567,9 +1567,9 @@ async function main() {
       }
       await touch.close();
 
-      // Leave one session behind, as the suite found it: later tests
+      // Leave one thread behind, as the suite found it: later tests
       // count rows and chat-request chains.
-      await mpage.request.delete(`${base}/sessions/${second}`, {
+      await mpage.request.delete(`${base}/threads/${second}`, {
         headers: { authorization: `Bearer ${TOKEN}` },
       });
       await desktop.close();
@@ -1625,10 +1625,10 @@ async function main() {
     // management moved off the sidebar): create a provider in Settings,
     // test the seeded provider's connection (live model aliases), pick
     // it in the create panel (model aliases reload per provider), create
-    // a session pinned to it, and stream a turn. Then the guard rails:
-    // the delete is refused while the new session pins the provider, and
+    // a thread pinned to it, and stream a turn. Then the guard rails:
+    // the delete is refused while the new thread pins the provider, and
     // disable/enable flip the picker.
-    await test("providers: create in UI, pick, pin a session, stream a turn", async () => {
+    await test("providers: create in UI, pick, pin a thread, stream a turn", async () => {
       // Back on the MAIN instance: test 10 navigated `page` to the guard
       // instance, and the indicator test used its own context.
       await page.goto(`${base}/?token=${TOKEN}`);
@@ -1705,13 +1705,13 @@ async function main() {
 
       // Back to chat for the create-panel flow: pick it in the create
       // panel, the model aliases reload scoped to the selection, and the
-      // session pins (provider, model).
+      // thread pins (provider, model).
       await backToChat(page);
-      const sessionsBefore = await page.locator("#session-list .session-main").count();
+      const threadsBefore = await page.locator("#thread-list .thread-main").count();
       const panelOpen = () =>
         page.locator("#create-panel").evaluate((el) => !el.hidden);
       if (!(await panelOpen().catch(() => false))) {
-        await page.click("#new-session");
+        await page.click("#new-thread");
       }
       await poll(panelOpen, { timeout: 10_000, message: "create panel open" });
       await poll(
@@ -1724,18 +1724,18 @@ async function main() {
         { timeout: 15_000, message: "aliases reloaded for the picked provider" },
       );
       await page.selectOption("#model-picker", "smart");
-      await page.click("#create-session");
+      await page.click("#create-thread");
       await poll(
-        async () => (await page.locator("#session-list .session-main").count()) === sessionsBefore + 1,
-        { timeout: 15_000, message: "pinned session appears" },
+        async () => (await page.locator("#thread-list .thread-main").count()) === threadsBefore + 1,
+        { timeout: 15_000, message: "pinned thread appears" },
       );
       // The row subtitle names the pinned provider (provider/model · age).
-      const madeSessionRow = page
-        .locator("#session-list .session-main", { hasText: "ui-made/smart ·" })
+      const madeThreadRow = page
+        .locator("#thread-list .thread-main", { hasText: "ui-made/smart ·" })
         .first();
-      await poll(async () => await madeSessionRow.isVisible(), {
+      await poll(async () => await madeThreadRow.isVisible(), {
         timeout: 10_000,
-        message: "session subtitle pins provider/model",
+        message: "thread subtitle pins provider/model",
       });
 
       // Stream a turn end-to-end through the new provider.
@@ -1743,7 +1743,7 @@ async function main() {
       const assistant = await page.$$eval(".turn.assistant", (els) => els.map((e) => e.textContent));
       assert(assistant.some((t) => t.includes("Plain answer")), `assistant turn via ui-made: ${assistant}`);
 
-      // Guard rail: deleting a provider its session pins is refused (the
+      // Guard rail: deleting a provider its thread pins is refused (the
       // 409 semantics) — the refusal note lands in the chat log, so the
       // row-survival is asserted in Settings and the note back in chat.
       await openSettings(page);
@@ -1758,14 +1758,14 @@ async function main() {
       await poll(
         async () =>
           (await page.locator(".settings-error").textContent())
-            ?.includes("provider is still pinned by sessions"),
+            ?.includes("provider is still pinned by threads"),
         { timeout: 15_000, message: "409 guard error visible in settings" },
       );
       await backToChat(page);
       await poll(
         async () =>
           (await page.locator(".note.err").last().textContent())
-            ?.includes("provider is still pinned by sessions"),
+            ?.includes("provider is still pinned by threads"),
         { timeout: 15_000, message: "409 guard note after pinned delete" },
       );
 
@@ -1782,8 +1782,8 @@ async function main() {
         async () => (await page.locator("#provider-picker option").count()) === 1,
         { timeout: 15_000, message: "picker drops disabled provider" },
       );
-      // Disabling blocks new resolutions, not the already-frozen session
-      // endpoint — the pinned session keeps streaming either way.
+      // Disabling blocks new resolutions, not the already-frozen thread
+      // endpoint — the pinned thread keeps streaming either way.
       await openSettings(page);
       await madeRow.getByRole("button", { name: "Enable", exact: true }).click();
       await poll(
@@ -1798,7 +1798,7 @@ async function main() {
     });
 
     // -- 18. utility tags: model title + tags land as inert chips --------
-    // The ui-made session's first exchange (providers test, above) armed
+    // The ui-made thread's first exchange (providers test, above) armed
     // its utility attempt, and nothing manual ever touched that row, so
     // the two-line reply applies through the open auto path: line 1
     // upgrades the title, line 2 lands as tag chips — including a
@@ -1812,10 +1812,10 @@ async function main() {
       const headers = { authorization: `Bearer ${TOKEN}` };
       const tagged = await poll(
         async () => {
-          const sessions = (
-            await (await page.request.get(`${base}/sessions`, { headers })).json()
-          ).sessions;
-          return sessions.find((s) => s.title === "Fix login redirect loop") ?? false;
+          const threads = (
+            await (await page.request.get(`${base}/threads`, { headers })).json()
+          ).threads;
+          return threads.find((s) => s.title === "Fix login redirect loop") ?? false;
         },
         { timeout: 30_000, message: "utility title applied" },
       );
@@ -1829,7 +1829,7 @@ async function main() {
       // verbatim, innerHTML carries it ESCAPED (no markup was parsed),
       // and no script element exists anywhere inside the component's
       // shadow root — where rendered model output lives.
-      const row = page.locator(`.session-row[data-session-id="${tagged.id}"]`);
+      const row = page.locator(`.thread-row[data-thread-id="${tagged.id}"]`);
       await poll(async () => (await row.locator(".tag-chip").count()) === 2, {
         timeout: 10_000,
         message: "model tag chips in sidebar",

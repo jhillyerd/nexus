@@ -1,8 +1,8 @@
 //// The M3 production-cache golden prefix test (workstream C).
 ////
-//// The integration smoke archives a REAL multi-turn tool session (live
+//// The integration smoke archives a REAL multi-turn tool thread (live
 //// Bifrost + llama.cpp + SearxNG — see `e2e/integration.spec.mjs`) as
-//// `test/fixtures/m3_cache_session.json`: the exact system prompt (with
+//// `test/fixtures/m3_cache_thread.json`: the exact system prompt (with
 //// its cache nonce), user texts, assistant tool-call ids/names/arguments,
 //// tool results, and final answers.
 ////
@@ -35,8 +35,8 @@ import glopenai/config as oai_config
 import nexus/config.{type Config}
 import nexus/loop
 import nexus/openai
-import nexus/session
-import nexus/session_registry
+import nexus/thread
+import nexus/thread_registry
 import nexus/tools
 import nexus/transcript.{type Options, type Transcript}
 import store_mock
@@ -44,7 +44,7 @@ import store_mock
 @external(erlang, "nexus_loop_test_ffi", "read_file")
 fn read_file(path: String) -> BitArray
 
-const fixture_path = "test/fixtures/m3_cache_session.json"
+const fixture_path = "test/fixtures/m3_cache_thread.json"
 
 // ---------------------------------------------------------------------------
 // Fixture decoding
@@ -235,7 +235,7 @@ fn extends(prev: String, next: String) -> Bool {
   && prev_envelope == next_envelope
 }
 
-pub fn golden_real_session_deterministic_encode_test() {
+pub fn golden_real_thread_deterministic_encode_test() {
   let fixture = load_fixture()
   let opts = loop_options()
   let tr =
@@ -251,7 +251,7 @@ pub fn golden_real_session_deterministic_encode_test() {
   )
 }
 
-pub fn golden_real_session_turn_by_turn_test() {
+pub fn golden_real_thread_turn_by_turn_test() {
   let fixture = load_fixture()
   let opts = loop_options()
   // Bodies at each turn boundary, oldest first.
@@ -280,7 +280,7 @@ pub fn golden_real_session_turn_by_turn_test() {
 }
 
 // ---------------------------------------------------------------------------
-// M3 session organization vs. the cache contract
+// M3 thread organization vs. the cache contract
 // ---------------------------------------------------------------------------
 
 /// The registry holds organizational metadata (title, pin, tags, archive)
@@ -293,7 +293,7 @@ pub fn golden_metadata_never_alters_request_bytes_test() {
   let opts = loop_options()
   let registry = start_registry()
   let assert Ok(record) =
-    session_registry.create_with_runner(
+    thread_registry.create_with_runner(
       registry,
       store_mock.fixture_provider_id,
       fixture.alias,
@@ -303,30 +303,30 @@ pub fn golden_metadata_never_alters_request_bytes_test() {
   // The first user message, exactly like the HTTP send boundary: auto-title
   // from its text (never an LLM call, never into the body).
   should.equal(
-    session.send_message(record.subject, "ZZ-FIRST-MSG-ZZ"),
-    session.Sent,
+    thread.send_message(record.subject, "ZZ-FIRST-MSG-ZZ"),
+    thread.Sent,
   )
   drain_turn(record.subject)
-  should.be_true(session_registry.auto_title(registry, record.id, "ZZ-TITLE-ZZ"))
+  should.be_true(thread_registry.auto_title(registry, record.id, "ZZ-TITLE-ZZ"))
 
   let body_before =
-    transcript.request_body(session.snapshot(record.subject), opts)
+    transcript.request_body(thread.snapshot(record.subject), opts)
 
   // Mutate every organizational field.
-  should.be_true(session_registry.set_title(
+  should.be_true(thread_registry.set_title(
     registry,
     record.id,
     "ZZ-MANUAL-TITLE-ZZ",
   ))
   should.be_true(
-    session_registry.set_tags(registry, record.id, ["ZZ-TAG-ZZ", "ZZ-TAG2-ZZ"]),
+    thread_registry.set_tags(registry, record.id, ["ZZ-TAG-ZZ", "ZZ-TAG2-ZZ"]),
   )
-  should.be_true(session_registry.set_pinned(registry, record.id, True))
-  should.be_true(session_registry.set_archived(registry, record.id, True))
+  should.be_true(thread_registry.set_pinned(registry, record.id, True))
+  should.be_true(thread_registry.set_archived(registry, record.id, True))
 
   // Byte-identical re-encode after the metadata churn.
   let body_after =
-    transcript.request_body(session.snapshot(record.subject), opts)
+    transcript.request_body(thread.snapshot(record.subject), opts)
   should.equal(body_after, body_before)
 
   // No metadata marker (or metadata key name) appears in the body.
@@ -347,19 +347,19 @@ pub fn golden_metadata_never_alters_request_bytes_test() {
 
   // And a follow-up turn still grows the body by suffix only.
   let tr2 =
-    session.snapshot(record.subject)
+    thread.snapshot(record.subject)
     |> transcript.append_user("ZZ-SECOND-MSG-ZZ")
   should.be_true(extends(body_before, transcript.request_body(tr2, opts)))
 }
 
-fn start_registry() -> process.Subject(session_registry.Msg) {
+fn start_registry() -> process.Subject(thread_registry.Msg) {
   let factory_name = process.new_name("nexus_m3_factory")
   let assert Ok(_factory) =
-    factory_supervisor.start(session_registry.factory_builder(factory_name))
+    factory_supervisor.start(thread_registry.factory_builder(factory_name))
   let persistence = store_mock.seam(store_mock.start())
   store_mock.ensure_fixture_provider(persistence)
   let assert Ok(started) =
-    session_registry.start(
+    thread_registry.start(
       smoke_config(),
       factory_supervisor.get_by_name(factory_name),
       process.new_name("nexus_m3_registry"),
@@ -371,16 +371,16 @@ fn start_registry() -> process.Subject(session_registry.Msg) {
 
 /// The offline stand-in for the boot resolver: the fixture provider
 /// resolves to a fixed endpoint, anything else is unknown.
-fn fixture_resolver() -> session_registry.ResolveProvider {
+fn fixture_resolver() -> thread_registry.ResolveProvider {
   fn(id) {
     case id == store_mock.fixture_provider_id {
       True -> Ok(test_endpoint())
-      False -> Error(session_registry.ProviderUnknown)
+      False -> Error(thread_registry.ProviderUnknown)
     }
   }
 }
 
-/// The endpoint shape the smoke session streams through. The base URL and
+/// The endpoint shape the smoke thread streams through. The base URL and
 /// key material never enter the request body — see the key-invariance
 /// golden test at the bottom of this suite.
 fn test_endpoint() -> openai.Endpoint {
@@ -403,9 +403,9 @@ fn happy_runner(
   tr,
   _cancel,
   on_event: fn(loop.LoopEvent) -> Nil,
-) -> session.TurnOutcome {
+) -> thread.TurnOutcome {
   on_event(loop.StreamEvent(openai.TokenDelta("hi")))
-  session.StreamDone(fake_stats(), transcript.append_assistant(tr, "hi"))
+  thread.StreamDone(fake_stats(), transcript.append_assistant(tr, "hi"))
 }
 
 fn fake_stats() -> openai.StreamStats {
@@ -424,9 +424,9 @@ fn fake_stats() -> openai.StreamStats {
 
 /// Subscribe and wait for the fake runner's terminal event, so the turn's
 /// commits have landed before the snapshot.
-fn drain_turn(subject: process.Subject(session.Msg)) -> Nil {
+fn drain_turn(subject: process.Subject(thread.Msg)) -> Nil {
   let sub = process.new_subject()
-  process.send(subject, session.Join(sub, 0))
+  process.send(subject, thread.Join(sub, 0))
   let _ = process.receive(sub, 2000)
   // hello + user echo + assistant full + turn done
   let _ = drain(sub, 4)
@@ -434,9 +434,9 @@ fn drain_turn(subject: process.Subject(session.Msg)) -> Nil {
 }
 
 fn drain(
-  sub: process.Subject(session.SessionEvent),
+  sub: process.Subject(thread.ThreadEvent),
   n: Int,
-) -> List(session.SessionEvent) {
+) -> List(thread.ThreadEvent) {
   case n {
     0 -> []
     _ ->
@@ -456,7 +456,7 @@ fn drain(
 /// `Authorization` header, and are omitted entirely for keyless
 /// endpoints (`openai.drop_empty_bearer`). This is the multi-provider
 /// twin of the prefix goldens: re-keying a provider must not invalidate
-/// any session's cache prefix.
+/// any thread's cache prefix.
 pub fn golden_key_change_never_alters_request_bytes_test() {
   let fixture = load_fixture()
   let opts = loop_options()

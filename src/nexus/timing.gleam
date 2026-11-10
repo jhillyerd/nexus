@@ -13,7 +13,7 @@ import gleam/result
 pub fn now_us() -> Int
 
 /// Wall-clock epoch seconds (`os:system_time`). **Display metadata only** —
-/// session ordering and the sidebar's relative timestamps. Never used for
+/// thread ordering and the sidebar's relative timestamps. Never used for
 /// metrics (monotonic above) and never allowed into a request body (the
 /// KV-cache contract forbids volatile timestamps above the tail; these live
 /// beside the transcript in the registry, not in it).

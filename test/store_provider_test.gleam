@@ -3,7 +3,7 @@
 //// The `provider` table's seam contract against the in-memory mock:
 //// ciphertext round-trips (the store never sees plaintext — an envelope
 //// from `nexus/crypto` survives unchanged and decrypts on the other
-//// side), the keep-vs-replace PATCH key semantics, the session FK, and
+//// side), the keep-vs-replace PATCH key semantics, the thread FK, and
 //// the delete guard. The pog-backed implementation is drift-gated in CI
 //// by `squirrel check`; these tests pin the seam's semantics.
 
@@ -12,8 +12,8 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleeunit/should
 import nexus/crypto
-import nexus/session
 import nexus/store
+import nexus/thread
 import store_mock
 
 /// Fixed 32-byte test key. Public test material — the real master key
@@ -49,13 +49,13 @@ fn summary(id: String, provider_id: String) -> store.StoredSummary {
     id: id,
     provider_id: provider_id,
     title: "",
-    title_source: session.AutoTitle,
+    title_source: thread.AutoTitle,
     model: "alias-1",
     pinned: False,
     archived: False,
     tags: [],
     tags_manual: [],
-    tags_source: session.AutoTags,
+    tags_source: thread.AutoTags,
     created_at: 1_700_000_000,
     last_active_at: 1_700_000_000,
     message_count: 1,
@@ -213,14 +213,14 @@ pub fn update_preserves_server_controlled_fields_test() {
   should.be_true(stored.updated_at < 9_999_999_999)
 }
 
-pub fn session_pin_and_delete_guard_test() {
+pub fn thread_pin_and_delete_guard_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
   let assert Ok(Nil) = seam.insert_provider(provider("p1", "one", None, 1))
 
-  // The pin is part of the session row, visible in summaries.
-  let assert Ok(Nil) = seam.insert_session(summary("s1", "p1"), "sys")
-  let assert Ok(count) = seam.count_sessions_for_provider("p1")
+  // The pin is part of the thread row, visible in summaries.
+  let assert Ok(Nil) = seam.insert_thread(summary("s1", "p1"), "sys")
+  let assert Ok(count) = seam.count_threads_for_provider("p1")
   count |> should.equal(1)
   let assert Ok([stored]) = seam.list_summaries()
   stored.provider_id |> should.equal("p1")
@@ -229,16 +229,16 @@ pub fn session_pin_and_delete_guard_test() {
   // enforcement; the count is the registry's friendly 409 pre-check).
   seam.delete_provider("p1") |> should.be_error
 
-  // Unreferenced after the session's own delete: the delete lands.
-  let assert Ok(Nil) = seam.delete_session("s1")
-  let assert Ok(0) = seam.count_sessions_for_provider("p1")
+  // Unreferenced after the thread's own delete: the delete lands.
+  let assert Ok(Nil) = seam.delete_thread("s1")
+  let assert Ok(0) = seam.count_threads_for_provider("p1")
   let assert Ok(Nil) = seam.delete_provider("p1")
   seam.get_provider("p1") |> should.be_error
 }
 
-pub fn insert_session_with_unknown_provider_fails_test() {
+pub fn insert_thread_with_unknown_provider_fails_test() {
   let seam = store_mock.seam(store_mock.start())
-  // session_provider_id_fkey: no provider row, no session row.
-  seam.insert_session(summary("s1", "ghost"), "sys") |> should.be_error
+  // thread_provider_id_fkey: no provider row, no thread row.
+  seam.insert_thread(summary("s1", "ghost"), "sys") |> should.be_error
   seam.list_summaries() |> should.equal(Ok([]))
 }

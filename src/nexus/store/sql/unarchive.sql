@@ -1,2 +1,2 @@
-update session set archived_at = null
+update thread set archived_at = null
 where id = $1

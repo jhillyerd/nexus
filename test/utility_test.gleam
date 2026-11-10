@@ -2,8 +2,8 @@
 //// plan §6, item 1):
 ////
 ////   * *Prefix property* — the branch request is built from the SAME
-////     `nexus/transcript` encode path over the REAL archived M3 session
-////     (`test/fixtures/m3_cache_session.json`): its body is the turn
+////     `nexus/transcript` encode path over the REAL archived M3 thread
+////     (`test/fixtures/m3_cache_thread.json`): its body is the turn
 ////     body with exactly one appended user message (the instruction Y)
 ////     and exactly one envelope delta, the generation-side
 ////     `max_completion_tokens` cap. The `body_parts` / fixture-replay
@@ -16,7 +16,7 @@
 ////   * *Instruction* — Y forbids tool calls and is ONE user message.
 ////
 //// `utility.run` itself is the one network-touching piece; it is never
-//// called here — the session actor tests drive it through the fake
+//// called here — the thread actor tests drive it through the fake
 //// `utility_runner` seam instead. Everything in this file is pure.
 
 import gleam/bit_array
@@ -36,7 +36,7 @@ import nexus/utility
 @external(erlang, "nexus_loop_test_ffi", "read_file")
 fn read_file(path: String) -> BitArray
 
-const fixture_path = "test/fixtures/m3_cache_session.json"
+const fixture_path = "test/fixtures/m3_cache_thread.json"
 
 // ---------------------------------------------------------------------------
 // Fixture decoding (duplicated verbatim from test/m3_prefix_test.gleam)
@@ -495,7 +495,7 @@ pub fn parse_pass_requires_whole_string_match_test() {
 
 /// Under the forced instruction the model was never offered the sentinel:
 /// a PASS reply is an unusable title (a failure), not a postpone — the
-/// session cannot defer twice.
+/// thread cannot defer twice.
 pub fn parse_pass_rejected_under_forced_instruction_test() {
   utility.parse(False, [], "PASS") |> should.equal(Error(Nil))
   utility.parse(False, [], "Real Title")
@@ -580,7 +580,7 @@ pub fn parse_truncates_each_tag_at_twenty_four_chars_test() {
 /// §3.5): existing display entries keep their order VERBATIM, the
 /// attempt's tags append normalized after them, duplicates through the
 /// SHARED normalization never append, and the union caps at 5 per
-/// session.
+/// thread.
 pub fn merge_tags_unions_preserve_order_verbatim_and_cap_test() {
   utility.merge_tags([], ["login", "auth"])
   |> should.equal(["login", "auth"])

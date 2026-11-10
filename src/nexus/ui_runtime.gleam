@@ -9,16 +9,16 @@
 //// itself is going away. gleam_otp's `actor.start` spawns the runtime
 //// linked to the calling process — the socket handler — and the runtime
 //// does not trap exits, so the pair die together: a closed or crashed
-//// socket takes its runtime (and session subscription) down, and a crashed
+//// socket takes its runtime (and thread subscription) down, and a crashed
 //// runtime takes the socket down so the browser reconnects into a fresh
 //// runtime. Nothing is shared between browsers, so tabs no longer mirror
-//// each other's selected session or panels; sessions themselves are
+//// each other's selected thread or panels; threads themselves are
 //// server-global, so every client still sees the same sidebar.
 ////
 //// A reload therefore boots a fresh model: the page shell (`nexus/page`)
-//// persists the client's last-selected session and re-supplies it as the
-//// `/ws` route's `session` query parameter, which lands in
-//// `ui.Flags.session` so `init` re-opens that session (Hello + replay
+//// persists the client's last-selected thread and re-supplies it as the
+//// `/ws` route's `thread` query parameter, which lands in
+//// `ui.Flags.thread` so `init` re-opens that thread (Hello + replay
 //// re-render the transcript).
 
 import gleam/erlang/application
@@ -33,7 +33,7 @@ import lustre/component
 import lustre/server_component.{type ClientMessage}
 import mist
 import nexus/provider_registry
-import nexus/session_registry
+import nexus/thread_registry
 import nexus/ui
 
 pub type Flags =
@@ -69,7 +69,7 @@ type SocketState {
 /// from `/lustre/runtime.mjs`) connects here.
 pub fn websocket(
   req: Request(mist.Connection),
-  registry: Subject(session_registry.Msg),
+  registry: Subject(thread_registry.Msg),
   providers: Subject(provider_registry.Msg),
 ) -> Response(mist.ResponseData) {
   mist.websocket(
@@ -81,17 +81,17 @@ pub fn websocket(
 }
 
 /// The per-connection flags: the registry/provider subjects plus the
-/// client-supplied last-selected session from the route's query string
+/// client-supplied last-selected thread from the route's query string
 /// (the page shell persists it; see `nexus/page`).
 fn runtime_flags(
   req: Request(mist.Connection),
-  registry: Subject(session_registry.Msg),
+  registry: Subject(thread_registry.Msg),
   providers: Subject(provider_registry.Msg),
 ) -> Flags {
   ui.Flags(
     registry: registry,
     providers: providers,
-    session: query_param(req, "session"),
+    thread: query_param(req, "thread"),
   )
 }
 

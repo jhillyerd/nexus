@@ -180,7 +180,7 @@ pub fn uescape_string_test() {
 /// (trimmed, lowercased — catches any `DO $$` block, tagged or not, and
 /// any `ALTER`, however spelled or wrapped), and the
 /// tags provenance columns (`tags_manual`, `tags_source`, utility-tags
-/// plan §3.4) must live INLINE in the `session` CREATE TABLE — a
+/// plan §3.4) must live INLINE in the `thread` CREATE TABLE — a
 /// reintroduced DO-block shim fails here. The splitter's dollar-quote
 /// handling (an inner `;` inside `$$` bodies) stays covered
 /// synthetically by `semicolon_in_literal_inside_dollar_quote_test`.
@@ -192,11 +192,11 @@ pub fn schema_is_the_entire_schema_test() {
     list.filter(statements, fn(stmt) {
       !string.starts_with(string.trim(string.lowercase(stmt)), "create")
     })
-  let assert [session_create] =
+  let assert [thread_create] =
     list.filter(statements, fn(stmt) { string.contains(stmt, "tags_manual") })
-  should.be_true(string.contains(session_create, "tags_source"))
+  should.be_true(string.contains(thread_create, "tags_source"))
   should.be_true(string.contains(
-    string.lowercase(session_create),
+    string.lowercase(thread_create),
     "create table",
   ))
 }

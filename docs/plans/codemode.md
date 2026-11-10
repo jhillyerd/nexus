@@ -71,7 +71,7 @@ EYG and ports documented as future alternatives behind the same seam.
   convention) while the model still sees every byte of the failure detail.
 - **Process model & cancellation**: `codemode.run` executes inside the
   per-turn worker process, which spawns a dedicated engine child **linked to
-  the worker**. Today `Stop` cannot reach tool execution — the session's
+  the worker**. Today `Stop` cannot reach tool execution — the thread's
   `Stop` handler only signals the *stream* cancel subject or sets a
   stop-pending flag; nothing interrupts the worker while it runs a tool. So
   the seam must pass the turn's cancel subject down (see step 4): while the
@@ -82,7 +82,7 @@ EYG and ports documented as future alternatives behind the same seam.
   worker as they happen, so partial output survives timeouts and cancels.
 - **Envelope**: the tools array is frozen per boot. Codemode registers only
   when enabled (`web_search` precedent). Enabling it mid-deployment diverges
-  existing sessions' prefixes once (full re-prefill) — documented, accepted.
+  existing threads' prefixes once (full re-prefill) — documented, accepted.
   The offline golden test and e2e fixture keep codemode **off** in the smoke
   config, so no fixture recapture in these phases.
 
@@ -207,9 +207,9 @@ before the wall-clock kill — see `batch_deadline_margin_us`):
 
 ## Invariant checklist (what this plan must not break)
 
-- Frozen per-boot toolset / identical `tools` envelope across sessions
+- Frozen per-boot toolset / identical `tools` envelope across threads
   (config-gated registration; registry unchanged while off).
-- `session_message.tool_args` stays `text` — codemode args are a JSON string
+- `thread_message.tool_args` stays `text` — codemode args are a JSON string
   stored byte-exact, no schema change.
 - Offline `gleam test` — engine is pure BEAM; tests use mock tool specs.
 - Hostile text — script source and output render as Lustre text nodes only.

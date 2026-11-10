@@ -102,7 +102,7 @@ pub fn load_overrides_test() {
 
 /// The ASCII-only codemode warning rides the DEFAULT prompt only while
 /// codemode is on: manual testing showed models writing em dashes into
-/// Lua string literals in every new session, and the tool description
+/// Lua string literals in every new thread, and the tool description
 /// alone was not being read first.
 pub fn system_prompt_gains_codemode_ascii_note_test() {
   set_all([

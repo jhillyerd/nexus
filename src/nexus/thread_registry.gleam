@@ -1,34 +1,34 @@
-//// M2 session registry: a supervised actor that owns the user-visible
-//// session IDs, the model aliases pinned per session, the session subjects
+//// M2 thread registry: a supervised actor that owns the user-visible
+//// thread IDs, the model aliases pinned per thread, the thread subjects
 //// and their monitors, and the child-start specification handed to the
 //// factory supervisor.
 ////
-//// Multi-provider P3: creation and lazy hydration resolve each session's
+//// Multi-provider P3: creation and lazy hydration resolve each thread's
 //// provider id into a FROZEN `openai.Endpoint` through an injected
 //// resolver (boot maps `nexus/provider_registry`; tests inject a pure
-//// fn) — a session only ever exists with its (provider, model) pin in
+//// fn) — a thread only ever exists with its (provider, model) pin in
 //// place, and the endpoint rides the spec for the actor's whole life.
 ////
-//// Supervision model (M2 §4.1): session children run under the named
+//// Supervision model (M2 §4.1): thread children run under the named
 //// factory supervisor with a **temporary** restart strategy, so the factory
 //// never silently replaces a PID behind our back. The registry owns the
 //// monitors and asks the factory to start the *same* specification again
-//// when a session actor exits — the replacement reuses the registered name
+//// when a thread actor exits — the replacement reuses the registered name
 //// and keeps the user-visible ID.
 ////
-//// Dependency direction is strictly registry → session: the registry calls
-//// `session.describe`, and no session code path ever calls back into the
+//// Dependency direction is strictly registry → thread: the registry calls
+//// `thread.describe`, and no thread code path ever calls back into the
 //// registry (that would deadlock). Phase 2 persistence keeps this: the
-//// session actor only sees an injected `commit_hook` closure (the store's
+//// thread actor only sees an injected `commit_hook` closure (the store's
 //// write-behind lane), exactly like the injected turn runner.
 ////
 //// Phase 2 (durable persistence): the registry hydrates the **dormant**
-//// set (stored-but-not-live sessions) from the store seam at boot and
-//// mints ids past every stored id. Never-used sessions (system prompt
+//// set (stored-but-not-live threads) from the store seam at boot and
+//// mints ids past every stored id. Never-used threads (system prompt
 //// only, untitled, unpinned) past a grace window do not survive a boot:
 //// one bulk delete (the seam's `prune_never_used`) runs before
 //// hydration, so abandoned empties cannot accumulate in the sidebar —
-//// sessions exist because someone put a message in them. The
+//// threads exist because someone put a message in them. The
 //// first `Get` of a dormant id lazily
 //// starts a hydrated actor — the transcript is rebuilt through
 //// `nexus/transcript.new(model, system_prompt)` + the existing `append_*`
@@ -36,7 +36,7 @@
 //// restart (KV-cache contract). Turn commits persist write-behind through
 //// the hook; metadata mutations write through synchronously. A dead
 //// actor's replacement rehydrates from the store instead of starting
-//// empty (Phase 1 semantics survive only for sessions whose row insert
+//// empty (Phase 1 semantics survive only for threads whose row insert
 //// failed at create).
 
 import gleam/dict.{type Dict}
@@ -53,25 +53,25 @@ import gleam/result
 import gleam/string
 import nexus/config.{type Config}
 import nexus/openai
-import nexus/session
 import nexus/store.{type Store, type StoredSummary}
+import nexus/thread
 import nexus/timing
 import nexus/tools
 import nexus/transcript.{type Transcript}
 import nexus/utility
 
 /// The factory's child-start argument: everything needed to (re)start one
-/// session actor identically.
+/// thread actor identically.
 pub type ChildArgument {
-  ChildArgument(spec: session.SessionSpec, name: process.Name(session.Msg))
+  ChildArgument(spec: thread.ThreadSpec, name: process.Name(thread.Msg))
 }
 
-/// A live session as the registry hands it to callers (the HTTP layer).
-pub type SessionRecord {
-  SessionRecord(
+/// A live thread as the registry hands it to callers (the HTTP layer).
+pub type ThreadRecord {
+  ThreadRecord(
     id: String,
     model: String,
-    subject: Subject(session.Msg),
+    subject: Subject(thread.Msg),
     /// The live actor's PID. Exposed so callers (and tests) can observe the
     /// restart: the replacement keeps `id` and `name` but is a new PID.
     pid: Pid,
@@ -97,22 +97,22 @@ pub type ProviderError {
   ProviderUnknown
   ProviderDisabled
   /// The stored envelope failed authentication (a rotated-away master
-  /// key or a tampered row): the session cannot stream until an operator
+  /// key or a tampered row): the thread cannot stream until an operator
   /// intervenes. Surfaced as a server-side failure, not a client error.
   ProviderKeyUnavailable
 }
 
-/// The provider seam: `provider_id` → the endpoint a session freezes for
+/// The provider seam: `provider_id` → the endpoint a thread freezes for
 /// its lifetime. Production resolves through `nexus/provider_registry`;
 /// tests inject a pure fn.
 pub type ResolveProvider =
   fn(String) -> Result(openai.Endpoint, ProviderError)
 
 /// Reply payload for `UpgradeAutoTitle`: what the guard decided. Carries
-/// the fresh display metadata on success so the session actor can broadcast
+/// the fresh display metadata on success so the thread actor can broadcast
 /// `MetaUpdated` truthfully without a second round-trip.
 pub type UpgradeOutcome {
-  /// Applied: the session's fresh title + merged display tags.
+  /// Applied: the thread's fresh title + merged display tags.
   UpgradeApplied(title: String, tags: List(String))
   /// Refused: `title_source` OR `tags_source` is manual (a rename or a
   /// manual tag edit each win forever), the id is unknown, or the title
@@ -121,29 +121,29 @@ pub type UpgradeOutcome {
 }
 
 pub type Msg {
-  /// Start a new session pinned to `provider_id` + `model` using the
+  /// Start a new thread pinned to `provider_id` + `model` using the
   /// registry's frozen tool runner (built once at registry start, so the
-  /// tool schema is identical in every request of every session).
+  /// tool schema is identical in every request of every thread).
   Create(
     provider_id: String,
     model: String,
-    reply: Subject(Result(SessionRecord, CreateError)),
+    reply: Subject(Result(ThreadRecord, CreateError)),
   )
-  /// Test seam: start a session with an injected runner.
+  /// Test seam: start a thread with an injected runner.
   CreateWithRunner(
     provider_id: String,
     model: String,
-    runner: session.TurnRunner,
-    reply: Subject(Result(SessionRecord, CreateError)),
+    runner: thread.TurnRunner,
+    reply: Subject(Result(ThreadRecord, CreateError)),
   )
-  /// Resolve a session subject — live, or a stored-but-not-live id
+  /// Resolve a thread subject — live, or a stored-but-not-live id
   /// (Phase 2: which lazily starts a hydrated actor). `Error(Nil)` for
-  /// unknown ids or for sessions whose restart failed.
-  Get(id: String, reply: Subject(Result(Subject(session.Msg), Nil)))
-  /// All sessions (live + dormant), pinned first then most-recently-active
-  /// first. Archiving does not hide a session from the list — callers
+  /// unknown ids or for threads whose restart failed.
+  Get(id: String, reply: Subject(Result(Subject(thread.Msg), Nil)))
+  /// All threads (live + dormant), pinned first then most-recently-active
+  /// first. Archiving does not hide a thread from the list — callers
   /// (HTTP, UI) filter by the `archived` flag.
-  List(reply: Subject(List(session.SessionSummary)))
+  List(reply: Subject(List(thread.ThreadSummary)))
   /// Manual rename: always wins and marks the title `ManualTitle` so no
   /// later auto-generation can clobber it.
   SetTitle(id: String, title: String, reply: Subject(Bool))
@@ -167,7 +167,7 @@ pub type Msg {
     reply: Subject(UpgradeOutcome),
   )
   /// The reuse-vocabulary ask (utility-tags plan §3.3): the top tags
-  /// across every session the registry knows (active + dormant),
+  /// across every thread the registry knows (active + dormant),
   /// normalized before counting, frequency-floored, count-ordered with
   /// alphabetical tie-break. Asked by the utility WORKER through the
   /// real runner's corpus closure — never by the registry's own process.
@@ -179,7 +179,7 @@ pub type Msg {
   /// and the registry owns the monitors), delete the stored rows, then
   /// drop the record. `False` for unknown IDs.
   Delete(id: String, reply: Subject(Bool))
-  /// Monitor plumbing (internal): a monitored session actor exited.
+  /// Monitor plumbing (internal): a monitored thread actor exited.
   Down(pid: Pid, monitor: Monitor)
   /// Selector plumbing for non-process monitors; always ignored.
   MonitorNoise
@@ -192,13 +192,13 @@ type Record {
     /// summaries can report it without reaching into the spec's endpoint.
     provider_id: String,
     model: String,
-    subject: Subject(session.Msg),
+    subject: Subject(thread.Msg),
     pid: Pid,
     monitor: Monitor,
     /// Retained so a dead actor can be restarted identically.
-    spec: session.SessionSpec,
-    name: process.Name(session.Msg),
-    /// Set when a restart failed: the session stays listed but reports as
+    spec: thread.ThreadSpec,
+    name: process.Name(thread.Msg),
+    /// Set when a restart failed: the thread stays listed but reports as
     /// unavailable, rather than the registry looping on start attempts.
     start_error: Option(String),
     // ---- Organizational metadata (beside the transcript, never in it) ----
@@ -206,7 +206,7 @@ type Record {
     title: String,
     /// Auto titles are generated once from the first user message; a
     /// manual rename pins the title forever.
-    title_source: session.TitleSource,
+    title_source: thread.TitleSource,
     pinned: Bool,
     /// Normalized on write through the ONE shared rule
     /// (`utility.normalize_tags`): trimmed, lowercased, kebab-cased,
@@ -219,12 +219,12 @@ type Record {
     /// Auto: model tags may still merge into the display set. Manual: a
     /// manual tag edit froze the set forever — the in-memory half of the
     /// twin invariant (the store's `tags_source` column is the other).
-    tags_source: session.TagsSource,
-    /// Soft-hide flag: archived sessions stay restorable until deleted.
+    tags_source: thread.TagsSource,
+    /// Soft-hide flag: archived threads stay restorable until deleted.
     archived: Bool,
     /// Wall-clock epoch seconds at creation (display ordering only).
     created_at: Int,
-    /// Phase 2: the session row was persisted. Unpersisted sessions (the
+    /// Phase 2: the thread row was persisted. Unpersisted threads (the
     /// insert failed at create) keep Phase 1 restart semantics — empty
     /// transcript, no rehydration attempts.
     persisted: Bool,
@@ -235,25 +235,25 @@ type State {
   State(
     cfg: Config,
     /// The M3 agent-loop runner with the registry's frozen tool set —
-    /// every session this registry starts (create, restart, replacement)
+    /// every thread this registry starts (create, restart, replacement)
     /// gets the identical tool schema.
-    runner: session.TurnRunner,
+    runner: thread.TurnRunner,
     /// The utility side-call runner over the SAME frozen tool set —
     /// built once at boot beside `runner`, so the title branch's envelope
     /// is byte-identical to a turn request's by construction.
-    utility_runner: session.UtilityRunner,
+    utility_runner: thread.UtilityRunner,
     /// This actor's own subject: the utility apply closures ask the
     /// UpgradeAutoTitle guard through it from the (unlinked) utility
     /// worker process.
     self: Subject(Msg),
-    /// The provider seam: resolves the endpoint frozen into each session
+    /// The provider seam: resolves the endpoint frozen into each thread
     /// spec at create and lazy-hydration time.
     resolve_provider: ResolveProvider,
     factory: Factory,
-    sessions: Dict(String, Record),
-    /// Phase 2: stored-but-not-live sessions (boot hydration). The first
+    threads: Dict(String, Record),
+    /// Phase 2: stored-but-not-live threads (boot hydration). The first
     /// Get of such an id lazily starts a hydrated actor and promotes the
-    /// entry to `sessions`.
+    /// entry to `threads`.
     dormant: Dict(String, StoredSummary),
     /// ID minting only — list order is computed at list time (pinned
     /// first, then last activity, newest ties first). Boot-seeded past
@@ -267,44 +267,44 @@ type State {
 /// The outcome of resolving a Get: either a subject to reply with, or a
 /// state transition the caller must install (lazy start / retry).
 type Resolved {
-  Subject(subject: Subject(session.Msg))
+  Subject(subject: Subject(thread.Msg))
   Missing
   Started(next: State)
 }
 
 pub type Factory =
-  factory_supervisor.Supervisor(ChildArgument, Subject(session.Msg))
+  factory_supervisor.Supervisor(ChildArgument, Subject(thread.Msg))
 
-/// The named factory supervisor's child template: start one session actor
+/// The named factory supervisor's child template: start one thread actor
 /// under its own registered name.
-pub fn session_child(
+pub fn thread_child(
   argument: ChildArgument,
-) -> actor.StartResult(Subject(session.Msg)) {
-  session.supervised(argument.spec, argument.name)
+) -> actor.StartResult(Subject(thread.Msg)) {
+  thread.supervised(argument.spec, argument.name)
 }
 
-/// Builder for the boot-time factory supervisor: session actors are started
+/// Builder for the boot-time factory supervisor: thread actors are started
 /// dynamically as temporary children, so only the registry replaces them.
 pub fn factory_builder(
   name: process.Name(
-    factory_supervisor.Message(ChildArgument, Subject(session.Msg)),
+    factory_supervisor.Message(ChildArgument, Subject(thread.Msg)),
   ),
-) -> factory_supervisor.Builder(ChildArgument, Subject(session.Msg)) {
-  factory_builder_with_child(name, session_child)
+) -> factory_supervisor.Builder(ChildArgument, Subject(thread.Msg)) {
+  factory_builder_with_child(name, thread_child)
 }
 
 /// Test seam: build the factory with a custom child starter so a startup
-/// failure can be produced without touching the real session constructor.
+/// failure can be produced without touching the real thread constructor.
 pub fn factory_builder_with_child(
   name: process.Name(
-    factory_supervisor.Message(ChildArgument, Subject(session.Msg)),
+    factory_supervisor.Message(ChildArgument, Subject(thread.Msg)),
   ),
-  child: fn(ChildArgument) -> actor.StartResult(Subject(session.Msg)),
-) -> factory_supervisor.Builder(ChildArgument, Subject(session.Msg)) {
+  child: fn(ChildArgument) -> actor.StartResult(Subject(thread.Msg)),
+) -> factory_supervisor.Builder(ChildArgument, Subject(thread.Msg)) {
   factory_supervisor.worker_child(child)
   |> factory_supervisor.restart_strategy(supervision.Temporary)
   // The registry — not the factory — drives replacements, so give it room:
-  // a burst of session churn must not take the factory itself down.
+  // a burst of thread churn must not take the factory itself down.
   |> factory_supervisor.restart_tolerance(intensity: 20, period: 60)
   |> factory_supervisor.named(name)
 }
@@ -323,7 +323,7 @@ pub fn start(
   resolve_provider: ResolveProvider,
 ) -> actor.StartResult(Subject(Msg)) {
   // The tool registry is built once, here, from the global config — before
-  // any session exists — so every request any session of this VM ever
+  // any thread exists — so every request any thread of this VM ever
   // sends carries the identical (byte-stable) tool schema. The SAME specs
   // build the utility side-call runner, so the title branch's envelope is
   // the turn envelope by construction (KV-cache contract). The runner's
@@ -338,8 +338,8 @@ pub fn start(
     factory,
     name,
     persistence,
-    session.agent_runner(cfg.max_tool_iterations, specs),
-    session.utility_runner(specs, corpus),
+    thread.agent_runner(cfg.max_tool_iterations, specs),
+    thread.utility_runner(specs, corpus),
     corpus,
     resolve_provider,
   )
@@ -347,7 +347,7 @@ pub fn start(
 
 /// Test seam: the same registry with injected turn + utility runners —
 /// hydration (boot, lazy start, restart recovery) then uses them for every
-/// session it starts, exactly like production uses the frozen boot-built
+/// thread it starts, exactly like production uses the frozen boot-built
 /// runners. `_corpus` is the TagCorpus seam the real utility runner asks
 /// (§3.3): accepted beside the runners so the seam mirrors `start`'s
 /// plumbing (a test booting the real runner closes over its corpus the
@@ -358,8 +358,8 @@ pub fn start_with_runner(
   factory: Factory,
   name: process.Name(Msg),
   persistence: Store,
-  runner: session.TurnRunner,
-  utility_runner: session.UtilityRunner,
+  runner: thread.TurnRunner,
+  utility_runner: thread.UtilityRunner,
   _corpus: fn() -> List(String),
   resolve_provider: ResolveProvider,
 ) -> actor.StartResult(Subject(Msg)) {
@@ -373,7 +373,7 @@ pub fn start_with_runner(
       let pruned = boot_sweep(persistence)
       case persistence.list_summaries() {
         Error(error) ->
-          Error("session store unreachable, cannot hydrate: " <> error)
+          Error("thread store unreachable, cannot hydrate: " <> error)
         Ok(summaries) -> {
           let dormant =
             list.fold(summaries, dict.new(), fn(dormant, summary) {
@@ -386,13 +386,13 @@ pub fn start_with_runner(
             self: self,
             resolve_provider: resolve_provider,
             factory: factory,
-            sessions: dict.new(),
+            threads: dict.new(),
             dormant: dormant,
             // Seeded past the survivors AND the pruned ids: the bulk
             // prune is atomic, so reuse of a pruned id could not
             // collide — but minted ids stay monotonically increasing
             // across sweeps anyway (a deleted s5 must not come back as
-            // a different session).
+            // a different thread).
             counter: int.max(
               max_stored_counter(summaries),
               max_id_suffix(pruned),
@@ -420,7 +420,7 @@ pub fn start_with_runner(
 }
 
 /// The highest numeric suffix among stored `s<N>` ids, so freshly minted
-/// ids never collide with dormant (stored-but-not-live) sessions.
+/// ids never collide with dormant (stored-but-not-live) threads.
 fn max_stored_counter(summaries: List(StoredSummary)) -> Int {
   max_id_suffix(list.map(summaries, fn(summary) { summary.id }))
 }
@@ -440,19 +440,19 @@ fn max_id_suffix(ids: List(String)) -> Int {
   })
 }
 
-/// The boot sweep: delete every stored never-used session older than
+/// The boot sweep: delete every stored never-used thread older than
 /// the grace window (see `prune_never_used.sql` for the full contract),
 /// returning the ids it deleted ([] when the store had none or the
 /// prune failed — a failure deletes nothing).
 ///
-/// Why a boot-time sweep: sessions used to be minted unconditionally at
+/// Why a boot-time sweep: threads used to be minted unconditionally at
 /// every server start, so restarts (and nothing else) accumulated empty
 /// rows forever. Creation is now always user-initiated, and this sweep
 /// retires whatever empties earlier runs left behind — including one
 /// created and abandoned mid-run, which is indistinguishable from those
 /// rows and costs nothing (there is no content to lose; a first message
 /// only counts once its turn committed). The grace window is what keeps
-/// a session another concurrently-running server created moments ago
+/// a thread another concurrently-running server created moments ago
 /// (still empty until its first commit) from being deleted under its
 /// live actor — 15 minutes is far past any first turn.
 fn boot_sweep(persistence: Store) -> List(String) {
@@ -462,7 +462,7 @@ fn boot_sweep(persistence: Store) -> List(String) {
       io.println(
         "boot sweep: deleted "
         <> int.to_string(list.length(ids))
-        <> " never-used session(s): "
+        <> " never-used thread(s): "
         <> string.join(ids, ", "),
       )
       ids
@@ -490,8 +490,8 @@ fn handle_create(
   state: State,
   provider_id: String,
   model: String,
-  runner: session.TurnRunner,
-  reply: Subject(Result(SessionRecord, CreateError)),
+  runner: thread.TurnRunner,
+  reply: Subject(Result(ThreadRecord, CreateError)),
 ) -> actor.Next(State, Msg) {
   case string.trim(model) {
     "" -> {
@@ -499,7 +499,7 @@ fn handle_create(
       actor.continue(state)
     }
     alias ->
-      // Resolve the endpoint FIRST: a session is only ever created with
+      // Resolve the endpoint FIRST: a thread is only ever created with
       // its frozen (provider, model) pin in place — there is no
       // create-then-attach path (multi-provider plan §8).
       case state.resolve_provider(provider_id) {
@@ -510,9 +510,9 @@ fn handle_create(
         Ok(endpoint) -> {
           let counter = state.counter + 1
           let id = "s" <> int.to_string(counter)
-          let name = process.new_name("nexus_session_" <> id)
+          let name = process.new_name("nexus_thread_" <> id)
           let spec =
-            session.SessionSpec(
+            thread.ThreadSpec(
               id: id,
               cfg: state.cfg,
               model: alias,
@@ -531,25 +531,25 @@ fn handle_create(
           {
             Ok(started) -> {
               let created_at = timing.wall_now_s()
-              // Write-through: the session row lands now, with the frozen
+              // Write-through: the thread row lands now, with the frozen
               // alias and the frozen system prompt (contract rule 2), so
               // hydration can rebuild the frozen prefix byte-identically.
               let persisted = case
-                state.store.insert_session(
+                state.store.insert_thread(
                   store.StoredSummary(
                     id: id,
                     provider_id: provider_id,
                     title: "",
-                    title_source: session.AutoTitle,
+                    title_source: thread.AutoTitle,
                     model: alias,
                     pinned: False,
                     archived: False,
                     tags: [],
-                    // insert_session.sql: tags_manual '{}' literally and
+                    // insert_thread.sql: tags_manual '{}' literally and
                     // tags_source left to its column default 'auto' — a
-                    // new session has no tags and an open auto path.
+                    // new thread has no tags and an open auto path.
                     tags_manual: [],
-                    tags_source: session.AutoTags,
+                    tags_source: thread.AutoTags,
                     created_at: created_at,
                     last_active_at: created_at,
                     // 1 = the system prompt (Phase 1 message_count).
@@ -560,7 +560,7 @@ fn handle_create(
               {
                 Ok(_) -> True
                 Error(error) -> {
-                  log_store_error("insert_session " <> id, error)
+                  log_store_error("insert_thread " <> id, error)
                   False
                 }
               }
@@ -576,11 +576,11 @@ fn handle_create(
                   name: name,
                   start_error: None,
                   title: "",
-                  title_source: session.AutoTitle,
+                  title_source: thread.AutoTitle,
                   pinned: False,
                   tags: [],
                   tags_manual: [],
-                  tags_source: session.AutoTags,
+                  tags_source: thread.AutoTags,
                   archived: False,
                   created_at: created_at,
                   persisted: persisted,
@@ -589,7 +589,7 @@ fn handle_create(
               actor.continue(
                 State(
                   ..state,
-                  sessions: dict.insert(state.sessions, id, record),
+                  threads: dict.insert(state.threads, id, record),
                   counter: counter,
                 ),
               )
@@ -607,11 +607,11 @@ fn handle_create(
 fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
   case msg {
     Get(id, reply) -> {
-      let resolved = case dict.get(state.sessions, id) {
+      let resolved = case dict.get(state.threads, id) {
         Ok(record) ->
           case record.start_error {
             Some(_) ->
-              // A persisted session whose rehydrating restart failed:
+              // A persisted thread whose rehydrating restart failed:
               // retry now rather than staying unavailable (the store may
               // have come back). Unpersisted ones stay Phase 1.
               case record.persisted {
@@ -637,7 +637,7 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
           actor.continue(state)
         }
         Started(next) -> {
-          case dict.get(next.sessions, id) {
+          case dict.get(next.threads, id) {
             Ok(record) -> process.send(reply, Ok(record.subject))
             Error(_) -> process.send(reply, Error(Nil))
           }
@@ -648,22 +648,22 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
 
     List(reply) -> {
       let live =
-        state.sessions
+        state.threads
         |> dict.values()
         |> list.filter_map(fn(record) {
           case record.start_error {
             Some(_) -> Error(Nil)
             None ->
-              // A session killed a moment ago may still be listed with
+              // A thread killed a moment ago may still be listed with
               // its down message queued; skip it rather than blocking
               // the whole list on a dead subject.
               case process.is_alive(record.pid) {
-                True -> Ok(summarise(record, session.describe(record.subject)))
+                True -> Ok(summarise(record, thread.describe(record.subject)))
                 False -> Error(Nil)
               }
           }
         })
-      // Dormant (stored-but-not-live) sessions are listed too: metadata
+      // Dormant (stored-but-not-live) threads are listed too: metadata
       // comes from the store; metrics are in-memory only by design, so
       // they resume empty.
       let dormant =
@@ -686,14 +686,14 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
           Record(
             ..record,
             title: string.trim(title),
-            title_source: session.ManualTitle,
+            title_source: thread.ManualTitle,
           )
         },
         fn(summary) {
           store.StoredSummary(
             ..summary,
             title: string.trim(title),
-            title_source: session.ManualTitle,
+            title_source: thread.ManualTitle,
           )
         },
         fn() { state.store.set_title(id, string.trim(title)) },
@@ -710,7 +710,7 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
         reply,
         fn(record) {
           case record.title_source, record.title {
-            session.AutoTitle, "" -> {
+            thread.AutoTitle, "" -> {
               write_through_or_log(id, fn() {
                 state.store.auto_title(id, string.trim(title))
                 |> result.map(fn(_) { Nil })
@@ -722,7 +722,7 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
         },
         fn(summary) {
           case summary.title_source, summary.title {
-            session.AutoTitle, "" -> {
+            thread.AutoTitle, "" -> {
               write_through_or_log(id, fn() {
                 state.store.auto_title(id, string.trim(title))
                 |> result.map(fn(_) { Nil })
@@ -760,10 +760,10 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
       let #(state, outcome) = case title {
         "" -> #(state, UpgradeRefused)
         _ ->
-          case dict.get(state.sessions, id) {
+          case dict.get(state.threads, id) {
             Ok(record) ->
               case record.title_source, record.tags_source {
-                session.AutoTitle, session.AutoTags -> {
+                thread.AutoTitle, thread.AutoTags -> {
                   let merged = utility.merge_tags(record.tags, tags)
                   // The store guard has the final word (twin-invariant):
                   // `Ok(False)` means a concurrent write changed the row's
@@ -775,8 +775,8 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
                     Ok(True) -> #(
                       State(
                         ..state,
-                        sessions: dict.insert(
-                          state.sessions,
+                        threads: dict.insert(
+                          state.threads,
                           id,
                           Record(..record, title: title, tags: merged),
                         ),
@@ -789,8 +789,8 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
                       #(
                         State(
                           ..state,
-                          sessions: dict.insert(
-                            state.sessions,
+                          threads: dict.insert(
+                            state.threads,
                             id,
                             Record(..record, title: title, tags: merged),
                           ),
@@ -808,9 +808,9 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
               case dict.get(state.dormant, id) {
                 Ok(summary) ->
                   case summary.title_source, summary.tags_source {
-                    session.AutoTitle, session.AutoTags -> {
+                    thread.AutoTitle, thread.AutoTags -> {
                       // Same twin-invariant: the stored row is a dormant
-                      // session's ONLY state, so its refusal is final.
+                      // thread's ONLY state, so its refusal is final.
                       let merged = utility.merge_tags(summary.tags, tags)
                       case state.store.auto_meta_upgrade(id, title, merged) {
                         Ok(True) -> #(
@@ -860,7 +860,7 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
     }
 
     SetPinned(id, pinned, reply) ->
-      // Invariant: an archived session is never pinned. Pinning is
+      // Invariant: an archived thread is never pinned. Pinning is
       // refused (reply False, record untouched) so a pin can never
       // resurface from behind the archive toggle — pairing with
       // `SetArchived`, which clears the pin when archiving.
@@ -918,7 +918,7 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
             ..record,
             tags: normalized,
             tags_manual: normalized,
-            tags_source: session.ManualTags,
+            tags_source: thread.ManualTags,
           )
         },
         fn(summary) {
@@ -926,7 +926,7 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
             ..summary,
             tags: normalized,
             tags_manual: normalized,
-            tags_source: session.ManualTags,
+            tags_source: thread.ManualTags,
           )
         },
         fn() { state.store.set_tags(id, normalized) },
@@ -941,7 +941,7 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
         fn(record) {
           case archived {
             // Archiving implicitly unpins — the pinned section only ever
-            // holds active sessions (the twin of the SetPinned refusal
+            // holds active threads (the twin of the SetPinned refusal
             // above; together they keep `archived ⇒ ¬pinned` true).
             True -> Record(..record, archived: True, pinned: False)
             False -> Record(..record, archived: False)
@@ -963,17 +963,17 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
       )
 
     Delete(id, reply) -> {
-      let known = case dict.get(state.sessions, id) {
+      let known = case dict.get(state.threads, id) {
         Ok(record) -> {
           // Drop the monitor BEFORE the kill so the actor's DOWN cannot
           // trigger a replacement (factory children are Temporary; only
-          // the registry restarts them, and a deleted session must stay
+          // the registry restarts them, and a deleted thread must stay
           // dead). demonitor flushes, so no stale DOWN can loop later.
           let _ = process.demonitor_process(record.monitor)
           // Ask the actor to cancel any in-flight turn (the cancel path
           // commits partial text server-side), then take it down. The
           // stored rows go with the record either way.
-          process.send(record.subject, session.Stop)
+          process.send(record.subject, thread.Stop)
           process.kill(record.pid)
           True
         }
@@ -989,17 +989,17 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
           actor.continue(state)
         }
         True -> {
-          // Hard delete in the store; Postgres cascades to the session's
+          // Hard delete in the store; Postgres cascades to the thread's
           // message rows.
-          case state.store.delete_session(id) {
+          case state.store.delete_thread(id) {
             Ok(_) -> Nil
-            Error(error) -> log_store_error("delete_session " <> id, error)
+            Error(error) -> log_store_error("delete_thread " <> id, error)
           }
           process.send(reply, True)
           actor.continue(
             State(
               ..state,
-              sessions: dict.delete(state.sessions, id),
+              threads: dict.delete(state.threads, id),
               dormant: dict.delete(state.dormant, id),
             ),
           )
@@ -1008,21 +1008,21 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
     }
 
     Down(pid, monitor) -> {
-      case find_by_pid(state.sessions, pid) {
+      case find_by_pid(state.threads, pid) {
         None -> actor.continue(state)
         Some(record) -> {
           // Drop the stale monitor before restarting so a duplicate down
           // for the dead actor cannot loop the restart.
           let _ = process.demonitor_process(monitor)
-          // Phase 2: a persisted session's replacement rehydrates from the
+          // Phase 2: a persisted thread's replacement rehydrates from the
           // store (its commits were persisted write-behind, in order,
-          // before this DOWN was processed). Unpersisted sessions keep
+          // before this DOWN was processed). Unpersisted threads keep
           // the Phase 1 empty-restart semantics.
           let spec = case record.persisted {
             True ->
               case rebuild_transcript(state, record.id) {
                 Ok(transcript) ->
-                  session.SessionSpec(..record.spec, hydrate: Some(transcript))
+                  thread.ThreadSpec(..record.spec, hydrate: Some(transcript))
                 Error(error) -> {
                   log_store_error("rehydrate " <> record.id, error)
                   record.spec
@@ -1044,19 +1044,19 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
               actor.continue(
                 State(
                   ..state,
-                  sessions: dict.insert(state.sessions, record.id, restarted),
+                  threads: dict.insert(state.threads, record.id, restarted),
                 ),
               )
             }
             Error(reason) -> {
               // Keep the record so the failure is visible (HTTP 503) rather
-              // than silently dropping the session.
+              // than silently dropping the thread.
               let failed =
                 Record(..record, start_error: Some(string.inspect(reason)))
               actor.continue(
                 State(
                   ..state,
-                  sessions: dict.insert(state.sessions, record.id, failed),
+                  threads: dict.insert(state.threads, record.id, failed),
                 ),
               )
             }
@@ -1067,9 +1067,9 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
 
     TagCorpus(reply) -> {
       // The reuse-vocabulary ask (§3.3): answered from registry state
-      // alone — the registry never calls into a session, so the worker's
+      // alone — the registry never calls into a thread, so the worker's
       // ask cannot deadlock.
-      process.send(reply, compute_tag_corpus(state.sessions, state.dormant))
+      process.send(reply, compute_tag_corpus(state.threads, state.dormant))
       actor.continue(state)
     }
 
@@ -1084,39 +1084,39 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
 // Phase 2: hydration, lazy start, write-through plumbing
 // ---------------------------------------------------------------------------
 
-/// The store's write-behind lane for one session — the injected commit
+/// The store's write-behind lane for one thread — the injected commit
 /// hook. A closure over the seam and the id, exactly like the injected
-/// turn runner: the session module never learns about the registry or the
+/// turn runner: the thread module never learns about the registry or the
 /// store.
 fn commit_hook_for(persistence: Store, id: String) -> fn(Transcript) -> Nil {
   fn(transcript) { persistence.commit(id, transcript) }
 }
 
-/// The utility apply seam for one session — the injected `UtilityApply`.
+/// The utility apply seam for one thread — the injected `UtilityApply`.
 /// A closure over this actor's subject and the id (exactly like the
 /// commit hook), performing the `UpgradeAutoTitle` ask with the parsed
 /// title AND tags. It runs inside the unlinked utility WORKER process —
-/// never the session actor — so the ask cannot deadlock: the registry
-/// answers it without ever calling back into a session. The outcome's
-/// fresh metadata (title + the merged display set) feeds the session's
+/// never the thread actor — so the ask cannot deadlock: the registry
+/// answers it without ever calling back into a thread. The outcome's
+/// fresh metadata (title + the merged display set) feeds the thread's
 /// `MetaUpdated` broadcast.
 fn utility_apply_for(
   registry: Subject(Msg),
   id: String,
-) -> fn(String, List(String)) -> Result(session.UtilityMeta, Nil) {
+) -> fn(String, List(String)) -> Result(thread.UtilityMeta, Nil) {
   fn(title, tags) {
     case upgrade_auto_title(registry, id, title, tags) {
-      UpgradeApplied(title, tags) -> Ok(session.UtilityMeta(title, tags))
+      UpgradeApplied(title, tags) -> Ok(thread.UtilityMeta(title, tags))
       UpgradeRefused -> Error(Nil)
     }
   }
 }
 
-/// Rebuild a stored session's transcript through the one construction
+/// Rebuild a stored thread's transcript through the one construction
 /// path: `transcript.new(model, system_prompt)` + `append_*` over the rows
 /// in seq order.
 fn rebuild_transcript(state: State, id: String) -> Result(Transcript, String) {
-  use stored <- result.try(state.store.get_session(id))
+  use stored <- result.try(state.store.get_thread(id))
   use rows <- result.try(state.store.load_messages(id))
   Ok(store.transcript_from_rows(
     stored.summary.model,
@@ -1125,13 +1125,13 @@ fn rebuild_transcript(state: State, id: String) -> Result(Transcript, String) {
   ))
 }
 
-/// Lazily start a dormant (stored-but-not-live) session, hydrated from the
+/// Lazily start a dormant (stored-but-not-live) thread, hydrated from the
 /// store. Replies through the returned state transition; unknown-store
-/// failures keep the session dormant (the next Get retries).
+/// failures keep the thread dormant (the next Get retries).
 fn lazy_start(state: State, summary: StoredSummary) -> Resolved {
   // The dormant row pins its provider: resolve the endpoint by the
   // persisted id, exactly like create did. A provider that went away
-  // (disabled, or its envelope no longer decrypts) keeps the session
+  // (disabled, or its envelope no longer decrypts) keeps the thread
   // dormant rather than starting an actor that cannot stream — the same
   // Get later (e.g. after re-enabling) retries it.
   case state.resolve_provider(summary.provider_id) {
@@ -1147,7 +1147,7 @@ fn lazy_start(state: State, summary: StoredSummary) -> Resolved {
           ProviderDisabled -> "disabled"
           ProviderKeyUnavailable -> "key unavailable"
         }
-        <> "); session stays dormant",
+        <> "); thread stays dormant",
       )
       Missing
     }
@@ -1159,7 +1159,7 @@ fn lazy_start(state: State, summary: StoredSummary) -> Resolved {
         }
         Ok(transcript) -> {
           let spec =
-            session.SessionSpec(
+            thread.ThreadSpec(
               id: summary.id,
               cfg: state.cfg,
               model: summary.model,
@@ -1173,7 +1173,7 @@ fn lazy_start(state: State, summary: StoredSummary) -> Resolved {
           let argument =
             ChildArgument(
               spec: spec,
-              name: process.new_name("nexus_session_" <> summary.id),
+              name: process.new_name("nexus_thread_" <> summary.id),
             )
           case restart(state.factory, argument) {
             Ok(started) -> {
@@ -1201,7 +1201,7 @@ fn lazy_start(state: State, summary: StoredSummary) -> Resolved {
               Started(
                 State(
                   ..state,
-                  sessions: dict.insert(state.sessions, summary.id, record),
+                  threads: dict.insert(state.threads, summary.id, record),
                   dormant: dict.delete(state.dormant, summary.id),
                 ),
               )
@@ -1219,7 +1219,7 @@ fn lazy_start(state: State, summary: StoredSummary) -> Resolved {
   }
 }
 
-/// Retry the rehydrating restart of a persisted session whose last attempt
+/// Retry the rehydrating restart of a persisted thread whose last attempt
 /// failed (its record carries `start_error`).
 fn retry_rehydrate(state: State, record: Record) -> Resolved {
   case rebuild_transcript(state, record.id) {
@@ -1228,7 +1228,7 @@ fn retry_rehydrate(state: State, record: Record) -> Resolved {
       Missing
     }
     Ok(transcript) -> {
-      let spec = session.SessionSpec(..record.spec, hydrate: Some(transcript))
+      let spec = thread.ThreadSpec(..record.spec, hydrate: Some(transcript))
       let argument = ChildArgument(spec: spec, name: record.name)
       case restart(state.factory, argument) {
         Ok(started) -> {
@@ -1243,7 +1243,7 @@ fn retry_rehydrate(state: State, record: Record) -> Resolved {
           Started(
             State(
               ..state,
-              sessions: dict.insert(state.sessions, record.id, restarted),
+              threads: dict.insert(state.threads, record.id, restarted),
             ),
           )
         }
@@ -1270,13 +1270,13 @@ fn apply_meta(
   on_summary: fn(StoredSummary) -> StoredSummary,
   write_through: fn() -> Result(Nil, String),
 ) -> actor.Next(State, Msg) {
-  let #(next, applied) = case dict.get(state.sessions, id) {
+  let #(next, applied) = case dict.get(state.threads, id) {
     Ok(record) -> {
       write_through_or_log(id, write_through)
       #(
         State(
           ..state,
-          sessions: dict.insert(state.sessions, id, on_record(record)),
+          threads: dict.insert(state.threads, id, on_record(record)),
         ),
         True,
       )
@@ -1301,7 +1301,7 @@ fn apply_meta(
 }
 
 /// Like `apply_meta`, but the mutator can refuse (e.g. pinning an archived
-/// session, auto-title with an existing title): a `None` result replies
+/// thread, auto-title with an existing title): a `None` result replies
 /// `False` and mutates nothing. The mutators perform their own guarded
 /// write-through.
 fn apply_meta_guarded(
@@ -1311,11 +1311,11 @@ fn apply_meta_guarded(
   on_record: fn(Record) -> Result(Record, Nil),
   on_summary: fn(StoredSummary) -> Result(StoredSummary, Nil),
 ) -> actor.Next(State, Msg) {
-  let #(next, applied) = case dict.get(state.sessions, id) {
+  let #(next, applied) = case dict.get(state.threads, id) {
     Ok(record) ->
       case on_record(record) {
         Ok(updated) -> #(
-          State(..state, sessions: dict.insert(state.sessions, id, updated)),
+          State(..state, threads: dict.insert(state.threads, id, updated)),
           True,
         )
         Error(Nil) -> #(state, False)
@@ -1363,34 +1363,34 @@ fn normalize_tags(tags: List(String)) -> List(String) {
 // ---------------------------------------------------------------------------
 
 /// The frequency floor: a tag becomes reuse vocabulary once at least 2
-/// sessions carry it. A singleton tag is not yet vocabulary — it stays
-/// out of Y, so one session's fresh tag does not immediately promote
+/// threads carry it. A singleton tag is not yet vocabulary — it stays
+/// out of Y, so one thread's fresh tag does not immediately promote
 /// itself to a reuse candidate for the next.
 const corpus_floor = 2
 
-/// The corpus cap: top entries by session count, ties broken
+/// The corpus cap: top entries by thread count, ties broken
 /// alphabetically — deterministic for a given registry state. With the
 /// per-tag cap in `nexus/utility` this bounds Y's corpus share at
 /// 30 × 24 characters, whatever older rows contain.
 const corpus_size = 30
 
-/// The reuse vocabulary across every session the registry knows — active
-/// records plus dormant summaries (both hold their sessions' display
+/// The reuse vocabulary across every thread the registry knows — active
+/// records plus dormant summaries (both hold their threads' display
 /// tags in memory). Every candidate is normalized with the SAME rule as
 /// manual and model tags BEFORE counting — `utility.normalize_tags` also
-/// dedupes within a session, so the floor counts SESSIONS, not mentions —
+/// dedupes within a thread, so the floor counts THREADS, not mentions —
 /// and counting pools case-insensitively (after normalization a legacy
 /// `Work Notes` and a canonical `work-notes` are one entry; the display
 /// sets themselves are never rewritten). Tags used by ≥ `corpus_floor`
-/// sessions survive, ordered by count descending, alphabetical tie-break,
+/// threads survive, ordered by count descending, alphabetical tie-break,
 /// capped at `corpus_size`.
 fn compute_tag_corpus(
-  sessions: Dict(String, Record),
+  threads: Dict(String, Record),
   dormant: Dict(String, StoredSummary),
 ) -> List(String) {
-  let per_session =
+  let per_thread =
     list.append(
-      list.map(dict.values(sessions), fn(record) {
+      list.map(dict.values(threads), fn(record) {
         utility.normalize_tags(record.tags)
       }),
       list.map(dict.values(dormant), fn(summary) {
@@ -1398,7 +1398,7 @@ fn compute_tag_corpus(
       }),
     )
   let counts =
-    list.fold(per_session, dict.new(), fn(counts, tags) {
+    list.fold(per_thread, dict.new(), fn(counts, tags) {
       list.fold(tags, counts, fn(counts, tag) {
         let count = case dict.get(counts, tag) {
           Ok(n) -> n + 1
@@ -1434,7 +1434,7 @@ fn tag_corpus_for(name: process.Name(Msg)) -> fn() -> List(String) {
 /// LLM call — organizational metadata that lives beside the transcript and
 /// never enters a request body. Shared by the HTTP send boundary and the
 /// UI component's send effect (both are places that already hold the
-/// outgoing text; message content never crosses session→registry).
+/// outgoing text; message content never crosses thread→registry).
 ///
 /// The shaping rule lives in `nexus/utility.shape_title` — the SAME rule
 /// caps a model-generated title, so the two can never drift apart.
@@ -1445,8 +1445,8 @@ pub fn title_from_first_message(text: String) -> String {
 /// Sidebar order: pinned first, then most recently active first; ties break
 /// newest-created first, then by ID — deterministic and stable.
 fn compare_summaries(
-  a: session.SessionSummary,
-  b: session.SessionSummary,
+  a: thread.ThreadSummary,
+  b: thread.ThreadSummary,
 ) -> Order {
   case a.pinned, b.pinned {
     True, False -> Lt
@@ -1463,8 +1463,8 @@ fn compare_summaries(
   }
 }
 
-fn as_public(record: Record) -> SessionRecord {
-  SessionRecord(
+fn as_public(record: Record) -> ThreadRecord {
+  ThreadRecord(
     id: record.id,
     model: record.model,
     subject: record.subject,
@@ -1474,9 +1474,9 @@ fn as_public(record: Record) -> SessionRecord {
 
 fn summarise(
   record: Record,
-  status: session.SessionStatus,
-) -> session.SessionSummary {
-  session.SessionSummary(
+  status: thread.ThreadStatus,
+) -> thread.ThreadSummary {
+  thread.ThreadSummary(
     id: record.id,
     provider_id: record.provider_id,
     model: record.model,
@@ -1488,7 +1488,7 @@ fn summarise(
     message_count: status.message_count,
     streaming: status.streaming,
     created_at: record.created_at,
-    // Until the first commit, a session's activity is its creation.
+    // Until the first commit, a thread's activity is its creation.
     last_active_at: case status.last_commit_at {
       0 -> record.created_at
       committed -> committed
@@ -1497,10 +1497,10 @@ fn summarise(
   )
 }
 
-/// A dormant session's summary: stored metadata, never streaming, and
+/// A dormant thread's summary: stored metadata, never streaming, and
 /// metrics empty by design (MetricSample history is in-memory only).
-fn stored_summary_as(summary: StoredSummary) -> session.SessionSummary {
-  session.SessionSummary(
+fn stored_summary_as(summary: StoredSummary) -> thread.ThreadSummary {
+  thread.ThreadSummary(
     id: summary.id,
     provider_id: summary.provider_id,
     model: summary.model,
@@ -1517,9 +1517,9 @@ fn stored_summary_as(summary: StoredSummary) -> session.SessionSummary {
   )
 }
 
-fn find_by_pid(sessions: Dict(String, Record), pid: Pid) -> Option(Record) {
+fn find_by_pid(threads: Dict(String, Record), pid: Pid) -> Option(Record) {
   let found =
-    sessions
+    threads
     |> dict.values()
     |> list.filter(fn(record: Record) { record.pid == pid })
     |> list.first
@@ -1529,14 +1529,14 @@ fn find_by_pid(sessions: Dict(String, Record), pid: Pid) -> Option(Record) {
   }
 }
 
-/// Start a session child, retrying once after a short pause. A killed
+/// Start a thread child, retrying once after a short pause. A killed
 /// actor's registered name frees asynchronously, so the first attempt can
 /// hit `already_started` even though the process is gone (M2 §9 restart
 /// races). One retry keeps the loop bounded and the failure visible.
 fn restart(
   factory: Factory,
   argument: ChildArgument,
-) -> Result(actor.Started(Subject(session.Msg)), actor.StartError) {
+) -> Result(actor.Started(Subject(thread.Msg)), actor.StartError) {
   case factory_supervisor.start_child(factory, argument) {
     Error(already_started) -> {
       process.sleep(50)
@@ -1558,17 +1558,17 @@ pub fn create(
   registry: Subject(Msg),
   provider_id: String,
   model: String,
-) -> Result(SessionRecord, CreateError) {
+) -> Result(ThreadRecord, CreateError) {
   actor.call(registry, 5000, fn(reply) { Create(provider_id:, model:, reply:) })
 }
 
-/// Test seam: create a session with an injected turn runner.
+/// Test seam: create a thread with an injected turn runner.
 pub fn create_with_runner(
   registry: Subject(Msg),
   provider_id: String,
   model: String,
-  runner: session.TurnRunner,
-) -> Result(SessionRecord, CreateError) {
+  runner: thread.TurnRunner,
+) -> Result(ThreadRecord, CreateError) {
   actor.call(registry, 5000, fn(reply) {
     CreateWithRunner(provider_id:, model:, runner:, reply:)
   })
@@ -1577,11 +1577,11 @@ pub fn create_with_runner(
 pub fn get(
   registry: Subject(Msg),
   id: String,
-) -> Result(Subject(session.Msg), Nil) {
+) -> Result(Subject(thread.Msg), Nil) {
   actor.call(registry, 5000, fn(reply) { Get(id:, reply:) })
 }
 
-pub fn list_sessions(registry: Subject(Msg)) -> List(session.SessionSummary) {
+pub fn list_threads(registry: Subject(Msg)) -> List(thread.ThreadSummary) {
   actor.call(registry, 5000, List)
 }
 
@@ -1613,7 +1613,7 @@ pub fn upgrade_auto_title(
   })
 }
 
-/// The reuse-vocabulary ask (§3.3): the top tags across every session
+/// The reuse-vocabulary ask (§3.3): the top tags across every thread
 /// the registry knows. In production this is called from inside the
 /// utility worker (the real runner's corpus closure); tests call it
 /// directly against a booted registry.
@@ -1643,6 +1643,6 @@ pub fn set_archived(
 
 /// Hard removal: stops the child actor, deletes the stored rows, and drops
 /// the record.
-pub fn delete_session(registry: Subject(Msg), id: String) -> Bool {
+pub fn delete_thread(registry: Subject(Msg), id: String) -> Bool {
   actor.call(registry, 5000, fn(reply) { Delete(id:, reply:) })
 }

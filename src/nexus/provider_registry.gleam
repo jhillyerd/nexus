@@ -14,7 +14,7 @@
 ////
 //// Guard rails mirrored from the schema: duplicate names are refused
 //// (the `provider_name_key` pre-check), deletes are refused while any
-//// session pins the provider (`count_sessions_for_provider` — the
+//// thread pins the provider (`count_threads_for_provider` — the
 //// friendly copy of the `ON DELETE RESTRICT` FK), and updates are
 //// existence-checked in state because the SQL `update ... where id`'
 //// empty match is a silent no-op by design.
@@ -22,7 +22,7 @@
 //// `ListModels` is the one network-touching message: it resolves the
 //// endpoint synchronously (state-only, fast) and then runs the live
 //// fetch in an unlinked process so a slow provider can never stall the
-//// actor — `Resolve` sits on the session-create path. The fetch
+//// actor — `Resolve` sits on the thread-create path. The fetch
 //// transport is injected at start (`openai.list_models` in
 //// production) so offline tests can hold a fetch and prove that
 //// guarantee.
@@ -64,7 +64,7 @@ pub type RegistryError {
   InvalidBaseUrl
   /// Create/rename onto an existing provider's name (unique).
   DuplicateName
-  /// Delete while sessions still pin the provider (the 409 guard).
+  /// Delete while threads still pin the provider (the 409 guard).
   StillReferenced
   /// An envelope failed authentication at resolve time. Boot already
   /// validated every stored envelope, so this means the row (or the
@@ -88,8 +88,7 @@ pub fn describe(error: RegistryError) -> String {
     InvalidName -> provider.describe(provider.InvalidName)
     InvalidBaseUrl -> provider.describe(provider.InvalidBaseUrl)
     DuplicateName -> "provider name already exists"
-    StillReferenced ->
-      "provider is still pinned by sessions; disable it instead"
+    StillReferenced -> "provider is still pinned by threads; disable it instead"
     DecryptFailed -> crypto.describe(crypto.AuthenticationFailed)
     KeyOperationFailed -> "provider key operation failed"
     StoreFailed(reason) -> reason
@@ -120,7 +119,7 @@ pub type Msg {
     patch: provider.ProviderUpdate,
     reply: Subject(Result(Provider, RegistryError)),
   )
-  /// Hard delete, guarded: refused while any session pins the provider.
+  /// Hard delete, guarded: refused while any thread pins the provider.
   Delete(id: String, reply: Subject(Result(Nil, RegistryError)))
   /// Toggle the reversible off-switch. Resolve/ListModels refuse
   /// disabled providers; reads keep showing them.
@@ -219,7 +218,7 @@ pub fn start_with_model_fetcher(
 
 /// Decrypt every stored envelope (result discarded): a swapped, copied,
 /// or tampered envelope — or a rotated-away master key — fails BOOT,
-/// before any session can pin the provider. The memo stays empty; it
+/// before any thread can pin the provider. The memo stays empty; it
 /// fills on first Resolve per the plan's caching design.
 fn validate_envelopes(
   key: BitArray,
@@ -240,7 +239,7 @@ fn rows_by_id(rows: List(StoredProvider)) -> Dict(String, StoredProvider) {
 
 /// The highest numeric suffix among `p<N>`-shaped ids, so freshly
 /// minted ids never collide with stored providers (same scheme as the
-/// session registry's `s<N>` minting).
+/// thread registry's `s<N>` minting).
 fn max_provider_counter(rows: List(StoredProvider)) -> Int {
   rows
   |> list.fold(0, fn(max, row) {
@@ -395,7 +394,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           actor.continue(state)
         }
         Ok(_) ->
-          case state.store.count_sessions_for_provider(id) {
+          case state.store.count_threads_for_provider(id) {
             Error(error) -> {
               process.send(reply, Error(StoreFailed(error)))
               actor.continue(state)
@@ -409,7 +408,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
               // count was its friendly pre-check.
               case state.store.delete_provider(id) {
                 Error(error) -> {
-                  // A session landing after the pre-check (another
+                  // A thread landing after the pre-check (another
                   // instance, mid-delete) trips the FK HERE — recheck
                   // so the caller still gets the dedicated conflict
                   // answer, never a raw store failure for that race.
@@ -466,7 +465,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
 
     ListModels(id, reply) ->
       // Resolve from state (fast), then fetch off-loop: a hanging
-      // provider must not stall Resolve on the session-create path.
+      // provider must not stall Resolve on the thread-create path.
       case dict.get(state.rows, id) {
         Error(_) -> {
           process.send(reply, Error(Unknown))
@@ -500,12 +499,12 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
   }
 }
 
-/// After a refused delete, is the FK story confirmed? A session that
+/// After a refused delete, is the FK story confirmed? A thread that
 /// landed between the pre-check and the delete (the multi-instance
 /// race) shows up on the recheck; a zero or unavailable count keeps
 /// the ORIGINAL delete error rather than guessing a conflict.
 fn still_pinned(state: State, id: String) -> Bool {
-  case state.store.count_sessions_for_provider(id) {
+  case state.store.count_threads_for_provider(id) {
     Ok(n) -> n > 0
     Error(_) -> False
   }
@@ -669,7 +668,7 @@ pub fn describe_stream_error(error: openai.StreamError) -> String {
 const crud_call_timeout_ms = 20_000
 
 /// Resolve a provider id to its runtime endpoint. The one call on the
-/// session-create path; refuses unknown and disabled providers.
+/// thread-create path; refuses unknown and disabled providers.
 pub fn resolve(
   registry: Subject(Msg),
   id: String,
@@ -713,7 +712,7 @@ pub fn update(
   })
 }
 
-/// Hard delete, guarded: 409-shaped `StillReferenced` while any session
+/// Hard delete, guarded: 409-shaped `StillReferenced` while any thread
 /// pins the provider.
 pub fn delete(
   registry: Subject(Msg),

@@ -1,10 +1,10 @@
 //// The HTTP surface: a JSON scripting API (provider CRUD, provider-
-//// scoped model listing, session CRUD, send, stop), the Lustre shell
+//// scoped model listing, thread CRUD, send, stop), the Lustre shell
 //// page with its WebSocket transport (`/ws`, `/lustre/runtime.mjs`),
 //// and a health check.
 ////
 //// Mist remains sufficient: the WebSocket upgrade bypasses wisp, and the
-//// scripting surface is still small and explicit. The session actor is
+//// scripting surface is still small and explicit. The thread actor is
 //// resolved through the registry at request time, so HTTP traffic
 //// reaches the live subject after a registry-owned restart. The browser
 //// UI does not use these routes — it talks to the Lustre server
@@ -27,20 +27,20 @@ import nexus/config.{type Config}
 import nexus/page
 import nexus/provider
 import nexus/provider_registry
-import nexus/session
-import nexus/session_registry
+import nexus/thread
+import nexus/thread_registry
 import nexus/timing
 import nexus/ui_runtime
 
-/// Registry-backed handler. Sessions are resolved by ID at request time so
+/// Registry-backed handler. Threads are resolved by ID at request time so
 /// HTTP traffic reaches the live actor after a registry-owned restart.
-/// `providers_name` resolves the provider registry the session-create
+/// `providers_name` resolves the provider registry the thread-create
 /// path validates against (multi-provider plan §11). The `/ws` route
 /// starts a dedicated component runtime per connection from these same
 /// subjects (see `nexus/ui_runtime`).
 pub fn handler(
   cfg: Config,
-  registry_name: process.Name(session_registry.Msg),
+  registry_name: process.Name(thread_registry.Msg),
   providers_name: process.Name(provider_registry.Msg),
 ) -> fn(Request(mist.Connection)) -> Response(mist.ResponseData) {
   let registry = process.named_subject(registry_name)
@@ -48,16 +48,16 @@ pub fn handler(
   fn(req: Request(mist.Connection)) -> Response(mist.ResponseData) {
     case req.method, request.path_segments(req) {
       Get, [] -> protected(cfg, req, fn() { page_response(cfg.ui_token) })
-      Get, ["sessions"] ->
-        protected(cfg, req, fn() { sessions_response(registry, req) })
-      Post, ["sessions"] ->
+      Get, ["threads"] ->
+        protected(cfg, req, fn() { threads_response(registry, req) })
+      Post, ["threads"] ->
         protected(cfg, req, fn() {
-          create_session_response(cfg, req, registry, providers)
+          create_thread_response(cfg, req, registry, providers)
         })
-      Patch, ["sessions", id] ->
-        protected(cfg, req, fn() { patch_session_response(req, registry, id) })
-      Delete, ["sessions", id] ->
-        protected(cfg, req, fn() { delete_session_response(registry, id) })
+      Patch, ["threads", id] ->
+        protected(cfg, req, fn() { patch_thread_response(req, registry, id) })
+      Delete, ["threads", id] ->
+        protected(cfg, req, fn() { delete_thread_response(registry, id) })
       Get, ["providers"] ->
         protected(cfg, req, fn() { providers_response(providers) })
       Post, ["providers"] ->
@@ -70,12 +70,12 @@ pub fn handler(
         protected(cfg, req, fn() { patch_provider_response(req, providers, id) })
       Delete, ["providers", id] ->
         protected(cfg, req, fn() { delete_provider_response(providers, id) })
-      Post, ["sessions", id, "send"] ->
+      Post, ["threads", id, "send"] ->
         protected(cfg, req, fn() {
-          with_session(registry, id, send_response(req, registry, id, _))
+          with_thread(registry, id, send_response(req, registry, id, _))
         })
-      Post, ["sessions", id, "stop"] ->
-        protected(cfg, req, fn() { with_session(registry, id, stop_response) })
+      Post, ["threads", id, "stop"] ->
+        protected(cfg, req, fn() { with_thread(registry, id, stop_response) })
       Get, ["healthz"] ->
         json_response(200, json.object([#("ok", json.bool(True))]))
       Get, ["lustre", "runtime.mjs"] ->
@@ -126,18 +126,18 @@ fn pico_asset_response() -> Response(mist.ResponseData) {
   }
 }
 
-fn with_session(
-  registry: process.Subject(session_registry.Msg),
+fn with_thread(
+  registry: process.Subject(thread_registry.Msg),
   id: String,
-  then: fn(process.Subject(session.Msg)) -> Response(mist.ResponseData),
+  then: fn(process.Subject(thread.Msg)) -> Response(mist.ResponseData),
 ) -> Response(mist.ResponseData) {
-  let summaries = session_registry.list_sessions(registry)
+  let summaries = thread_registry.list_threads(registry)
   case list.any(summaries, fn(summary) { summary.id == id }) {
-    False -> json_response(404, err_json("session not found"))
+    False -> json_response(404, err_json("thread not found"))
     True ->
-      case session_registry.get(registry, id) {
+      case thread_registry.get(registry, id) {
         Ok(subject) -> then(subject)
-        Error(_) -> json_response(503, err_json("session unavailable"))
+        Error(_) -> json_response(503, err_json("thread unavailable"))
       }
   }
 }
@@ -146,22 +146,22 @@ fn with_session(
 // no "default" endpoint to answer it — callers ask the provider-scoped
 // `GET /providers/<id>/models` below.
 
-fn sessions_response(
-  registry: process.Subject(session_registry.Msg),
+fn threads_response(
+  registry: process.Subject(thread_registry.Msg),
   req: Request(mist.Connection),
 ) -> Response(mist.ResponseData) {
   let summaries =
-    session_registry.list_sessions(registry)
+    thread_registry.list_threads(registry)
     |> filter_archived(wants_archived(req))
-  json_response(200, sessions_json(summaries))
+  json_response(200, threads_json(summaries))
 }
 
 /// `?archived=1` (or `true`) flips the list from the default active-only
 /// view to archived-only. Pure — offline-testable.
 pub fn filter_archived(
-  summaries: List(session.SessionSummary),
+  summaries: List(thread.ThreadSummary),
   want_archived: Bool,
-) -> List(session.SessionSummary) {
+) -> List(thread.ThreadSummary) {
   list.filter(summaries, fn(summary) { summary.archived == want_archived })
 }
 
@@ -172,13 +172,13 @@ fn wants_archived(req: Request(a)) -> Bool {
   }
 }
 
-fn create_session_response(
+fn create_thread_response(
   cfg: Config,
   req: Request(mist.Connection),
-  registry: process.Subject(session_registry.Msg),
+  registry: process.Subject(thread_registry.Msg),
   providers: process.Subject(provider_registry.Msg),
 ) -> Response(mist.ResponseData) {
-  // Multi-provider §11: the body pins BOTH halves of the session's
+  // Multi-provider §11: the body pins BOTH halves of the thread's
   // identity — `provider` (id or name) and `model` (alias). There is no
   // default provider to fall back to; both fields are required.
   case read_create(req) {
@@ -215,7 +215,7 @@ fn create_session_response(
                       )
                     True ->
                       case
-                        session_registry.create(
+                        thread_registry.create(
                           registry,
                           found.id,
                           trimmed_model,
@@ -225,13 +225,13 @@ fn create_session_response(
                           let now = timing.wall_now_s()
                           json_response(
                             201,
-                            session_summary_json(
-                              session.SessionSummary(
+                            thread_summary_json(
+                              thread.ThreadSummary(
                                 id: record.id,
                                 provider_id: found.id,
                                 model: record.model,
                                 title: "",
-                                title_source: session.AutoTitle,
+                                title_source: thread.AutoTitle,
                                 pinned: False,
                                 tags: [],
                                 archived: False,
@@ -244,9 +244,9 @@ fn create_session_response(
                             ),
                           )
                         }
-                        Error(session_registry.EmptyModel) ->
+                        Error(thread_registry.EmptyModel) ->
                           json_response(400, err_json("empty model"))
-                        Error(session_registry.ProviderFailed(_)) ->
+                        Error(thread_registry.ProviderFailed(_)) ->
                           // Pre-validation above owned the 400s; landing
                           // here means the provider went away between
                           // validation and create — a server-side race.
@@ -254,10 +254,10 @@ fn create_session_response(
                             502,
                             err_json("provider became unusable"),
                           )
-                        Error(session_registry.StartFailed(reason)) ->
+                        Error(thread_registry.StartFailed(reason)) ->
                           json_response(
                             503,
-                            err_json("session unavailable: " <> reason),
+                            err_json("thread unavailable: " <> reason),
                           )
                       }
                   }
@@ -300,8 +300,8 @@ fn read_json(req: Request(mist.Connection)) -> Result(String, Nil) {
   read_body_json(req, text_decoder())
 }
 
-/// The POST /sessions body: `{"provider": …, "model": …}` (both
-/// required — a session always pins its provider explicitly).
+/// The POST /threads body: `{"provider": …, "model": …}` (both
+/// required — a thread always pins its provider explicitly).
 pub type CreateFields {
   CreateFields(provider: String, model: String)
 }
@@ -460,9 +460,9 @@ fn read_body_json(
 
 fn send_response(
   req: Request(mist.Connection),
-  registry: process.Subject(session_registry.Msg),
+  registry: process.Subject(thread_registry.Msg),
   id: String,
-  session: process.Subject(session.Msg),
+  thread: process.Subject(thread.Msg),
 ) -> Response(mist.ResponseData) {
   case read_json(req) {
     Error(_) -> json_response(400, err_json("unreadable body"))
@@ -472,21 +472,21 @@ fn send_response(
         trimmed -> {
           // Auto-title at the send boundary: this is the only place that
           // sees the outgoing text, so message content never has to cross
-          // the session→registry path. The transcript always carries the
+          // the thread→registry path. The transcript always carries the
           // system prompt, so "no user message yet" is a count of 1; only
-          // the first-ever message titles the session, and the registry
+          // the first-ever message titles the thread, and the registry
           // additionally refuses to clobber a manual (or already
           // generated) title.
-          let is_first = session.describe(session).message_count <= 1
-          case session.send_message(session, trimmed) {
-            session.Sent -> {
+          let is_first = thread.describe(thread).message_count <= 1
+          case thread.send_message(thread, trimmed) {
+            thread.Sent -> {
               case is_first {
                 True -> {
                   let _ =
-                    session_registry.auto_title(
+                    thread_registry.auto_title(
                       registry,
                       id,
-                      session_registry.title_from_first_message(trimmed),
+                      thread_registry.title_from_first_message(trimmed),
                     )
                   Nil
                 }
@@ -494,7 +494,7 @@ fn send_response(
               }
               json_response(202, json.object([#("ok", json.bool(True))]))
             }
-            session.Busy ->
+            thread.Busy ->
               json_response(409, err_json("a reply is already streaming"))
           }
         }
@@ -590,7 +590,7 @@ fn provider_models_response(
   providers: process.Subject(provider_registry.Msg),
   id: String,
 ) -> Response(mist.ResponseData) {
-  // Same budget as the session-create preflight: the live fetch mirrors
+  // Same budget as the thread-create preflight: the live fetch mirrors
   // the endpoint's first-response timeout, plus round-trip headroom.
   case
     provider_registry.list_models(
@@ -633,10 +633,10 @@ fn registry_error_response(
 }
 
 // ---------------------------------------------------------------------------
-// Session metadata routes (PATCH / DELETE)
+// Thread metadata routes (PATCH / DELETE)
 // ---------------------------------------------------------------------------
 
-/// The PATCH /sessions/<id> body: present keys are applied, absent keys
+/// The PATCH /threads/<id> body: present keys are applied, absent keys
 /// untouched. Presence of `title` implies a manual rename.
 pub type PatchFields {
   PatchFields(
@@ -694,9 +694,9 @@ fn read_patch(req: Request(mist.Connection)) -> Result(PatchFields, Nil) {
   }
 }
 
-fn patch_session_response(
+fn patch_thread_response(
   req: Request(mist.Connection),
-  registry: process.Subject(session_registry.Msg),
+  registry: process.Subject(thread_registry.Msg),
   id: String,
 ) -> Response(mist.ResponseData) {
   case read_patch(req) {
@@ -719,19 +719,19 @@ fn patch_session_response(
 
 /// Apply the present fields, then answer with the refreshed summary.
 fn apply_patch(
-  registry: process.Subject(session_registry.Msg),
+  registry: process.Subject(thread_registry.Msg),
   id: String,
   fields: PatchFields,
 ) -> Response(mist.ResponseData) {
-  // Invariant: an archived session is never pinned. A patch that pins an
-  // archived session without restoring it in the same call is rejected
+  // Invariant: an archived thread is never pinned. A patch that pins an
+  // archived thread without restoring it in the same call is rejected
   // wholesale (409) — one that restores *and* pins is fine, because the
   // archive state applies before the pin below.
   let find =
-    session_registry.list_sessions(registry)
+    thread_registry.list_threads(registry)
     |> list.find(fn(summary) { summary.id == id })
   case find {
-    Error(_) -> json_response(404, err_json("session not found"))
+    Error(_) -> json_response(404, err_json("thread not found"))
     Ok(current) -> {
       let restores = fields.archived == Some(False)
       let pin_conflicts = case fields.pinned {
@@ -739,40 +739,39 @@ fn apply_patch(
         _ -> False
       }
       case pin_conflicts {
-        True -> json_response(409, err_json("cannot pin an archived session"))
+        True -> json_response(409, err_json("cannot pin an archived thread"))
         False -> {
           let applied =
             [
               // Archive state first, so a restore+pin patch applies cleanly.
               case fields.archived {
                 Some(archived) ->
-                  session_registry.set_archived(registry, id, archived)
+                  thread_registry.set_archived(registry, id, archived)
                 None -> True
               },
               case fields.title {
-                Some(title) -> session_registry.set_title(registry, id, title)
+                Some(title) -> thread_registry.set_title(registry, id, title)
                 None -> True
               },
               case fields.tags {
-                Some(tags) -> session_registry.set_tags(registry, id, tags)
+                Some(tags) -> thread_registry.set_tags(registry, id, tags)
                 None -> True
               },
               case fields.pinned {
-                Some(pinned) ->
-                  session_registry.set_pinned(registry, id, pinned)
+                Some(pinned) -> thread_registry.set_pinned(registry, id, pinned)
                 None -> True
               },
             ]
             |> list.all(fn(ok) { ok })
           case applied {
-            False -> json_response(404, err_json("session not found"))
+            False -> json_response(404, err_json("thread not found"))
             True ->
               case
-                session_registry.list_sessions(registry)
+                thread_registry.list_threads(registry)
                 |> list.find(fn(summary) { summary.id == id })
               {
-                Ok(summary) -> json_response(200, session_summary_json(summary))
-                Error(_) -> json_response(404, err_json("session not found"))
+                Ok(summary) -> json_response(200, thread_summary_json(summary))
+                Error(_) -> json_response(404, err_json("thread not found"))
               }
           }
         }
@@ -781,25 +780,25 @@ fn apply_patch(
   }
 }
 
-fn delete_session_response(
-  registry: process.Subject(session_registry.Msg),
+fn delete_thread_response(
+  registry: process.Subject(thread_registry.Msg),
   id: String,
 ) -> Response(mist.ResponseData) {
-  case session_registry.delete_session(registry, id) {
+  case thread_registry.delete_thread(registry, id) {
     // Hard removal: the registry stopped the child actor first, so a
     // streaming turn is cancelled (partial reply committed) and the row
     // disappears.
     True ->
       response.new(204)
       |> response.set_body(mist.Bytes(bytes_tree.new()))
-    False -> json_response(404, err_json("session not found"))
+    False -> json_response(404, err_json("thread not found"))
   }
 }
 
 fn stop_response(
-  session: process.Subject(session.Msg),
+  thread: process.Subject(thread.Msg),
 ) -> Response(mist.ResponseData) {
-  session.stop(session)
+  thread.stop(thread)
   json_response(202, json.object([#("ok", json.bool(True))]))
 }
 
@@ -838,11 +837,11 @@ fn query_param(req: Request(a), name: String) -> Result(String, Nil) {
 
 /// Wire shape for one stored metric sample. Display-only data:
 /// it never crosses into `nexus/transcript`.
-fn metric_sample_json(sample: session.MetricSample) -> Json {
+fn metric_sample_json(sample: thread.MetricSample) -> Json {
   let outcome = case sample.outcome {
-    session.Completed -> "completed"
-    session.Stopped -> "stopped"
-    session.Failed -> "failed"
+    thread.Completed -> "completed"
+    thread.Stopped -> "stopped"
+    thread.Failed -> "failed"
   }
   json.object([
     #("outcome", json.string(outcome)),
@@ -859,7 +858,7 @@ fn metric_sample_json(sample: session.MetricSample) -> Json {
   ])
 }
 
-fn metrics_json(samples: List(session.MetricSample)) -> Json {
+fn metrics_json(samples: List(thread.MetricSample)) -> Json {
   json.array(samples, metric_sample_json)
 }
 
@@ -903,7 +902,7 @@ pub fn provider_json(p: provider.Provider) -> Json {
     #("dialect", json.string(p.dialect)),
     #("enabled", json.bool(p.enabled)),
     #("has_key", json.bool(p.has_key)),
-    // Same epoch + RFC3339 twin convention as session summaries.
+    // Same epoch + RFC3339 twin convention as thread summaries.
     #("created_at", json.int(p.created_at)),
     #("created_at_rfc3339", json.string(timing.wall_to_rfc3339(p.created_at))),
     #("updated_at", json.int(p.updated_at)),
@@ -911,19 +910,19 @@ pub fn provider_json(p: provider.Provider) -> Json {
   ])
 }
 
-pub fn sessions_json(summaries: List(session.SessionSummary)) -> Json {
-  json.object([#("sessions", json.array(summaries, session_summary_json))])
+pub fn threads_json(summaries: List(thread.ThreadSummary)) -> Json {
+  json.object([#("threads", json.array(summaries, thread_summary_json))])
 }
 
-pub fn session_summary_json(summary: session.SessionSummary) -> Json {
+pub fn thread_summary_json(summary: thread.ThreadSummary) -> Json {
   json.object([
     #("id", json.string(summary.id)),
     #("provider_id", json.string(summary.provider_id)),
     #("model", json.string(summary.model)),
     #("title", json.string(summary.title)),
     #("title_source", case summary.title_source {
-      session.AutoTitle -> json.string("auto")
-      session.ManualTitle -> json.string("manual")
+      thread.AutoTitle -> json.string("auto")
+      thread.ManualTitle -> json.string("manual")
     }),
     #("pinned", json.bool(summary.pinned)),
     #("tags", json.array(summary.tags, json.string)),
@@ -958,20 +957,20 @@ fn text_decoder() -> decode.Decoder(String) {
 pub fn requires_auth(method: Method, segments: List(String)) -> Bool {
   case method, segments {
     Get, []
-    | Get, ["sessions"]
+    | Get, ["threads"]
     | Get, ["providers"]
     | Get, ["providers", _, "models"]
     | Get, ["lustre", "runtime.mjs"]
     | Get, ["css", "pico.min.css"]
     | Get, ["ws"]
     -> True
-    Post, ["sessions"]
-    | Post, ["sessions", _, "send"]
-    | Post, ["sessions", _, "stop"]
+    Post, ["threads"]
+    | Post, ["threads", _, "send"]
+    | Post, ["threads", _, "stop"]
     | Post, ["providers"]
     -> True
-    Patch, ["sessions", _]
-    | Delete, ["sessions", _]
+    Patch, ["threads", _]
+    | Delete, ["threads", _]
     | Patch, ["providers", _]
     | Delete, ["providers", _]
     -> True

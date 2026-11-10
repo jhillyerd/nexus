@@ -21,9 +21,9 @@ pub type AuditConfig {
     api_key: Option(String),
     /// Model alias under audit.
     model: String,
-    /// Turns per measured session (turn 1 is the cold sample).
+    /// Turns per measured thread (turn 1 is the cold sample).
     turns: Int,
-    /// Session repeats; each repeat is a fresh cold start.
+    /// Thread repeats; each repeat is a fresh cold start.
     repeats: Int,
     /// SSE first-response (status/headers) timeout in ms.
     sse_first_response_timeout_ms: Int,

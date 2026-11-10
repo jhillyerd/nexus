@@ -1,2 +1,2 @@
-update session set pinned = $1
+update thread set pinned = $1
 where id = $2

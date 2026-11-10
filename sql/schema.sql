@@ -1,32 +1,32 @@
--- Nexus session persistence (Phase 2).
+-- Nexus thread persistence (Phase 2).
 --
--- Tables are singular and explicit (`session`, `session_message`): each
--- row is one entity, and the messages table's link to its session stays
+-- Tables are singular and explicit (`thread`, `thread_message`): each
+-- row is one entity, and the messages table's link to its thread stays
 -- obvious as the schema grows.
 --
--- The schema maps 1:1 onto the Phase 1 `SessionSummary` field set
--- (src/nexus/session.gleam): id, title, title_source, model, system_prompt,
+-- The schema maps 1:1 onto the Phase 1 `ThreadSummary` field set
+-- (src/nexus/thread.gleam): id, title, title_source, model, system_prompt,
 -- pinned, archived, tags, created_at, last_active_at, message_count —
 -- plus the multi-provider link `provider_id`
 -- (docs/plans/multi-provider.md).
 --
 -- Timestamps are `timestamptz` (the Phase 2 round-trip spike measured a
 -- naive `timestamp` column shifting +9h when `now()` was cast under a
--- non-UTC session timezone): the app reads them as epoch seconds via
+-- non-UTC thread timezone): the app reads them as epoch seconds via
 -- `extract(epoch from x)::int8` (matching Phase 1's wire format) and writes
 -- them through server-side `now()`; explicit params are rare and cast
 -- `$1::timestamptz` from text.
 --
 -- Design notes (approved plan):
 -- - tags as text[] + GIN — no join table.
--- - delete is a hard DELETE cascading to session_message; `archived_at`
+-- - delete is a hard DELETE cascading to thread_message; `archived_at`
 --   is the only soft state.
 -- - message bodies stay plain text so FTS can be added later as a
 --   tsvector generated column + index — no FTS now.
 -- - MetricSample history stays in memory; persisting it is out of scope.
 --
 -- Provider design notes (docs/plans/multi-provider.md §5):
--- - `provider` is declared BEFORE `session`: the `session.provider_id`
+-- - `provider` is declared BEFORE `thread`: the `thread.provider_id`
 --   FK target must exist first.
 -- - `api_key_encrypted` is the nexus/crypto AES-256-GCM envelope
 --   (`0x01 || nonce(12) || tag(16) || ciphertext`, AAD = provider id);
@@ -53,8 +53,8 @@ CREATE TABLE IF NOT EXISTS provider (
 
 CREATE INDEX IF NOT EXISTS provider_enabled ON provider (enabled);
 
-CREATE TABLE IF NOT EXISTS session (
-  id             text PRIMARY KEY,             -- existing user-visible session id
+CREATE TABLE IF NOT EXISTS thread (
+  id             text PRIMARY KEY,             -- existing user-visible thread id
   provider_id    text NOT NULL REFERENCES provider(id) ON DELETE RESTRICT,
                                                 -- frozen at creation with the model (contract rule 2)
   title          text NOT NULL,
@@ -71,12 +71,12 @@ CREATE TABLE IF NOT EXISTS session (
   message_count  int NOT NULL DEFAULT 0        -- denormalized for list queries
 );
 
-CREATE INDEX IF NOT EXISTS session_recency ON session (archived_at, last_active_at DESC);
-CREATE INDEX IF NOT EXISTS session_tags ON session USING gin (tags);
+CREATE INDEX IF NOT EXISTS thread_recency ON thread (archived_at, last_active_at DESC);
+CREATE INDEX IF NOT EXISTS thread_tags ON thread USING gin (tags);
 
-CREATE TABLE IF NOT EXISTS session_message (
+CREATE TABLE IF NOT EXISTS thread_message (
   id           bigserial PRIMARY KEY,
-  session_id   text NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+  thread_id   text NOT NULL REFERENCES thread(id) ON DELETE CASCADE,
   seq          int NOT NULL,                   -- append-only order
   role         text NOT NULL,                  -- 'user' | 'assistant' | 'tool' (transcript roles)
   content      text NOT NULL,                  -- exact transcript content, never mutated
@@ -86,6 +86,6 @@ CREATE TABLE IF NOT EXISTS session_message (
   tool_ok      boolean,
   reasoning    text,                           -- display-only chain-of-thought emitted before an assistant message; NULL for user/tool rows and reasoning-free messages. Plain text for the same byte-stability rationale as tool_args. Never sent back to the model.
   created_at   timestamptz,                    -- display-only wall-clock stamp of the message (drives the chat log's relative ages). Deliberately nullable: the store's 0 sentinel writes NULL for unstamped rows (to_timestamp(nullif($n, 0))) instead of borrowing the write instant as a fake append time; unstamped rows render without a timestamp. Never sent back to the model.
-  UNIQUE (session_id, seq)
+  UNIQUE (thread_id, seq)
 );
 

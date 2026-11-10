@@ -4,7 +4,7 @@
 //// Design (from the M0 plan, §5):
 ////
 //// - Requests are always built through `nexus/transcript.to_request`, so
-////   every caller (the TTFT audit tool, and the session server) encodes
+////   every caller (the TTFT audit tool, and the thread server) encodes
 ////   identically — the precondition for the audit's byte-stability evidence.
 //// - Streaming uses hackney's async messages directly so the request can set
 ////   `recv_timeout` above `NEXUS_STREAM_IDLE_TIMEOUT_MS`; the buffered
@@ -16,7 +16,7 @@
 ////   parsed events is re-sent **buffered once** to capture the true
 ////   status/body before failing.
 //// - First-response and idle timeouts are enforced by one selector that also
-////   receives cancellation, preserving the session stop mechanism.
+////   receives cancellation, preserving the thread stop mechanism.
 
 import gleam/bit_array
 import gleam/bytes_tree
@@ -94,8 +94,8 @@ pub type StreamError {
 
 /// Runtime identity of one OpenAI-compatible endpoint: where to send, how
 /// to authenticate, and the stream timeouts to enforce. Deliberately
-/// narrow — the server resolves one per session from the provider
-/// registry (frozen at session creation), while standalone tools (the
+/// narrow — the server resolves one per thread from the provider
+/// registry (frozen at thread creation), while standalone tools (the
 /// TTFT audit harness) build it from their own configuration and never
 /// touch the server config surface.
 pub type Endpoint {
@@ -181,7 +181,7 @@ pub fn stream(
 }
 
 /// Outcome of a cancellable stream: success with stats, a clean stop, or a
-/// typed failure. M1's session turn workers consume this directly.
+/// typed failure. M1's thread turn workers consume this directly.
 pub type StreamOutcome {
   Completed(StreamStats)
   Cancelled

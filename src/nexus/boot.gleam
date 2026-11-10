@@ -1,10 +1,10 @@
 //// Boot: load config (loudly), then bring up the M3 supervision tree —
-//// root supervisor (OneForAll) with the session **factory supervisor**
-//// first, the **session registry** second, and the mist server third, so
+//// root supervisor (OneForAll) with the thread **factory supervisor**
+//// first, the **thread registry** second, and the mist server third, so
 //// HTTP traffic always finds a live registry and the registry always finds
 //// its factory (M2 plan §2/§7 step 3).
 ////
-//// Session actors are started dynamically as temporary children of the
+//// Thread actors are started dynamically as temporary children of the
 //// factory; only the registry replaces them (same ID, empty transcript).
 ////
 //// Restart recovery (PRD acceptance): the supervisor is linked to this
@@ -23,8 +23,8 @@ import gleam/string
 import mist
 import nexus/config
 import nexus/provider_registry
-import nexus/session_registry
 import nexus/store/persist
+import nexus/thread_registry
 import nexus/web
 
 @external(erlang, "nexus_boot_ffi", "halt")
@@ -47,7 +47,7 @@ pub fn main() -> Nil {
       let provider_registry_name = process.new_name("nexus_provider_registry")
       let factory_name = process.new_name("nexus_factory")
       let registry_name = process.new_name("nexus_registry")
-      // The provider seam handed to the session registry: every session
+      // The provider seam handed to the thread registry: every thread
       // freezes the endpoint this resolves at create/hydration time
       // (multi-provider plan §8). Mapping lives here so neither registry
       // depends on the other.
@@ -56,10 +56,10 @@ pub fn main() -> Nil {
         case provider_registry.resolve(providers, id) {
           Ok(resolved) -> Ok(resolved.endpoint)
           Error(provider_registry.Unknown) ->
-            Error(session_registry.ProviderUnknown)
+            Error(thread_registry.ProviderUnknown)
           Error(provider_registry.Disabled) ->
-            Error(session_registry.ProviderDisabled)
-          Error(_) -> Error(session_registry.ProviderKeyUnavailable)
+            Error(thread_registry.ProviderDisabled)
+          Error(_) -> Error(thread_registry.ProviderKeyUnavailable)
         }
       }
       let root =
@@ -74,7 +74,7 @@ pub fn main() -> Nil {
           // Provider registry second (multi-provider plan §7): after the
           // store (it loads and decrypt-validates every provider row at
           // start — a bad envelope or key fails boot here), before the
-          // factory/session registry (sessions resolve endpoints through
+          // factory/thread registry (threads resolve endpoints through
           // it once P3 pins providers into the turn runner).
           supervision.supervisor(fn() {
             provider_registry.start(
@@ -85,17 +85,17 @@ pub fn main() -> Nil {
           }),
         )
         |> supervisor.add(
-          // Factory third: the session registry resolves it by name at
+          // Factory third: the thread registry resolves it by name at
           // startup.
           supervision.supervisor(fn() {
-            factory_supervisor.start(session_registry.factory_builder(
+            factory_supervisor.start(thread_registry.factory_builder(
               factory_name,
             ))
           }),
         )
         |> supervisor.add(
           supervision.supervisor(fn() {
-            session_registry.start(
+            thread_registry.start(
               cfg,
               factory_supervisor.get_by_name(factory_name),
               registry_name,
@@ -109,7 +109,7 @@ pub fn main() -> Nil {
           // break): the /ws handler starts one linked component runtime
           // per connection, so a UI crash costs one socket — the browser
           // reconnects into a fresh runtime — instead of restarting this
-          // OneForAll tree (and every session actor with it).
+          // OneForAll tree (and every thread actor with it).
           supervision.supervisor(fn() {
             mist.new(web.handler(cfg, registry_name, provider_registry_name))
             |> mist.bind(cfg.http_bind)
@@ -119,12 +119,12 @@ pub fn main() -> Nil {
         )
       case supervisor.start(root) {
         Ok(_) -> {
-          // No session is minted at boot: creation is user-initiated (the
-          // sidebar's create panel auto-opens whenever no active session is
-          // selectable), so a restart never adds an empty session — and the
+          // No thread is minted at boot: creation is user-initiated (the
+          // sidebar's create panel auto-opens whenever no active thread is
+          // selectable), so a restart never adds an empty thread — and the
           // registry's boot sweep retired any never-used leftovers from
           // earlier runs while hydrating. The tool schema is still frozen
-          // before any session can exist: the registry built it from the
+          // before any thread can exist: the registry built it from the
           // global config at its own start.
           io.println(
             "listening on http://"

@@ -198,8 +198,8 @@ async function playScenario(res, request, state) {
     res.end();
   };
 
-  // Nexus's once-per-session utility branch (utility-titles plan §4.1,
-  // utility-tags plan §3.1): the request is a session's frozen turn
+  // Nexus's once-per-thread utility branch (utility-titles plan §4.1,
+  // utility-tags plan §3.1): the request is a thread's frozen turn
   // envelope plus exactly one generation-side delta —
   // max_completion_tokens: 512, browser.spec.mjs's UTILITY_DELTA — so
   // that is how the fake recognizes it. The scripted reply speaks the
@@ -276,7 +276,7 @@ async function playScenario(res, request, state) {
     case "fetchslow": {
       // fetch with a long pause before the final round's text, so the
       // browser can reload MID-TURN with round 1's tool card already
-      // broadcast — the in-flight replay (session display mirror) case.
+      // broadcast — the in-flight replay (thread display mirror) case.
       const target = /https?:\/\/\S+/.exec(userText)?.[0] ?? "http://127.0.0.1/doc.json";
       if (!hasToolResult) {
         await streamText("Checking that URL now.");

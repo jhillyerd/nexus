@@ -22,7 +22,7 @@
 //// Streamed fragments are accumulated per iteration through the process
 //// dictionary (`nexus_loop_ffi`): the transport seam pushes events through
 //// a plain callback, and this module only ever runs inside the per-turn
-//// worker process, never the session actor.
+//// worker process, never the thread actor.
 
 import gleam/erlang/process.{type Subject}
 import gleam/int
@@ -75,7 +75,7 @@ pub type LoopEvent {
   /// the flushed round's stamp — the wall-clock epoch the round's
   /// assistant message was appended (and its text committed) at — so
   /// subscribers can timestamp the text they committed at first-delta
-  /// time with the session's own clock (see `nexus/ui`'s restamp).
+  /// time with the thread's own clock (see `nexus/ui`'s restamp).
   ToolCallAssembled(
     id: String,
     name: String,
@@ -99,8 +99,8 @@ pub type LoopOutcome {
 }
 
 /// Production stream seam over the transport module. The endpoint is the
-/// session's frozen one (resolved from the provider registry at creation
-/// and never swapped — the multi-provider plan §8): one session, one
+/// thread's frozen one (resolved from the provider registry at creation
+/// and never swapped — the multi-provider plan §8): one thread, one
 /// endpoint, for every round-trip of every turn.
 pub fn endpoint_stream(endpoint: openai.Endpoint) -> StreamFn {
   fn(tr, opts, on_event, cancel) {
@@ -112,7 +112,7 @@ pub fn endpoint_stream(endpoint: openai.Endpoint) -> StreamFn {
 /// auto tool choice. This is the ONE construction site — both the agent
 /// loop and the utility runner consume it, so their envelopes are
 /// byte-identical by construction (KV-cache contract): the tool schema is
-/// built once at boot from the global config, never per session, and
+/// built once at boot from the global config, never per thread, and
 /// generation-side params (the utility's only delta,
 /// `max_completion_tokens`) do not tokenize into the prompt.
 pub fn frozen_options(specs: List(ToolSpec)) -> Options {
@@ -421,7 +421,7 @@ fn cancel_pending(cancel: Subject(Nil)) -> Bool {
 
 /// Answer one assembled call with a synthetic failed result instead of
 /// running it. The wire protocol requires a tool result for every
-/// assistant tool call, so the transcript (and the session's mirrored
+/// assistant tool call, so the transcript (and the thread's mirrored
 /// `turn_view`) stay a valid request shape. The paired
 /// `ToolCallAssembled` is still emitted — with the round's own stamp, as
 /// everywhere: the mirror builds each call's entry from it, and the UI

@@ -5,6 +5,6 @@
 -- created_at is display-only and follows the same first-row rule as
 -- content/reasoning; the 0 sentinel inserts NULL (see
 -- append_plain_message.sql).
-insert into session_message (session_id, seq, role, content, tool_call_id, tool_name, tool_args, reasoning, created_at)
+insert into thread_message (thread_id, seq, role, content, tool_call_id, tool_name, tool_args, reasoning, created_at)
 values ($1, $2, 'assistant', $3, $4, $5, $6, nullif($7, ''::text), to_timestamp(nullif($8, 0::bigint)))
-on conflict (session_id, seq) do nothing
+on conflict (thread_id, seq) do nothing

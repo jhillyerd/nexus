@@ -11,7 +11,7 @@
 //// never request bodies. Hydration rebuilds a transcript exclusively
 //// through `nexus/transcript.new(model, system_prompt)` + the existing
 //// `append_*` functions — there is no second encoding or construction
-//// path anywhere — so a hydrated session re-encodes byte-identically
+//// path anywhere — so a hydrated thread re-encodes byte-identically
 //// (guarded by the golden restart tests).
 ////
 //// Row model (messages table, `sql/schema.sql`):
@@ -27,34 +27,34 @@
 ////   assistant call (display metadata, like the SSE replay does) and
 ////   `ok` is persisted as the replay value (the transcript itself does
 ////   not carry an ok flag). Each row's `at` carries the display-only
-////   wall-clock stamp (`session_message.created_at`) so the chat log's
+////   wall-clock stamp (`thread_message.created_at`) so the chat log's
 ////   per-message ages survive a reload; on a call run it follows the
 ////   same first-row-only rule as `content`.
-//// - The system prompt is NOT a row: it lives in `sessions.system_prompt`
+//// - The system prompt is NOT a row: it lives in `threads.system_prompt`
 ////   and hydration refreezes it via `transcript.new`.
-//// - `seq` is the 0-based index of the row within the session
+//// - `seq` is the 0-based index of the row within the thread
 ////   (transcript message index minus one, skipping the system message).
-////   `message_count` on the session row counts messages INCLUDING the
-////   system prompt, matching Phase 1's `SessionSummary.message_count`.
+////   `message_count` on the thread row counts messages INCLUDING the
+////   system prompt, matching Phase 1's `ThreadSummary.message_count`.
 
 import gleam/dict
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import glopenai/chat.{type ChatMessage}
-import nexus/session
+import nexus/thread
 import nexus/transcript.{type Transcript}
 
-/// A stored session's organizational metadata — exactly the Phase 1
-/// `SessionSummary` field set minus live state (streaming, metrics).
+/// A stored thread's organizational metadata — exactly the Phase 1
+/// `ThreadSummary` field set minus live state (streaming, metrics).
 pub type StoredSummary {
   StoredSummary(
     id: String,
     /// The pinned provider (frozen at creation with the model, contract
-    /// rule 2; `session.provider_id` → `provider.id`).
+    /// rule 2; `thread.provider_id` → `provider.id`).
     provider_id: String,
     title: String,
-    title_source: session.TitleSource,
+    title_source: thread.TitleSource,
     model: String,
     pinned: Bool,
     archived: Bool,
@@ -67,7 +67,7 @@ pub type StoredSummary {
     /// edit froze the set forever (`ManualTags`). The seam's
     /// `auto_meta_upgrade` refuses on `ManualTags` — the store-side twin
     /// of the registry's in-memory guard.
-    tags_source: session.TagsSource,
+    tags_source: thread.TagsSource,
     /// Epoch seconds (Phase 1 wire format).
     created_at: Int,
     /// Epoch seconds; bumped on turn commit.
@@ -77,12 +77,12 @@ pub type StoredSummary {
   )
 }
 
-/// A stored session including the frozen system prompt — everything needed
+/// A stored thread including the frozen system prompt — everything needed
 /// to rebuild its transcript. `system_prompt` is contract rule 2: frozen at
 /// creation, stored so hydration refreezes the identical prefix even if
 /// `NEXUS_SYSTEM_PROMPT` changed between runs.
-pub type StoredSession {
-  StoredSession(summary: StoredSummary, system_prompt: String)
+pub type StoredThread {
+  StoredThread(summary: StoredSummary, system_prompt: String)
 }
 
 /// A stored provider row — **ciphertext only**. `api_key_encrypted` is
@@ -116,7 +116,7 @@ pub type StoredProvider {
 /// One append-only message row. The write shape and the read shape are the
 /// same type; `seq` is assigned by the store, not carried here. `at` is
 /// the row's display-only wall-clock epoch stamp (the transcript's
-/// timestamp sidecar round-tripped through `session_message.created_at`);
+/// timestamp sidecar round-tripped through `thread_message.created_at`);
 /// `None` for rows persisted before the column existed. On ToolCallRow —
 /// like `content` and `reasoning` — it is set on the FIRST row of a run
 /// only: a call run is one assistant message, so it carries one stamp.
@@ -159,19 +159,19 @@ pub type StoreError =
   String
 
 /// The swappable seam. Every function is synchronous except `commit`,
-/// which must never block the caller (it rides the session actor's commit
+/// which must never block the caller (it rides the thread actor's commit
 /// path): implementations enqueue and persist write-behind, in order.
 pub type Store {
   Store(
-    /// Every stored session (boot hydration of the dormant set).
+    /// Every stored thread (boot hydration of the dormant set).
     list_summaries: fn() -> Result(List(StoredSummary), StoreError),
-    /// One stored session incl. system prompt. `Error` for unknown ids.
-    get_session: fn(String) -> Result(StoredSession, StoreError),
-    /// All rows of one session in seq order (lazy start / restart
-    /// hydration). Also teaches the store the session's persisted length.
+    /// One stored thread incl. system prompt. `Error` for unknown ids.
+    get_thread: fn(String) -> Result(StoredThread, StoreError),
+    /// All rows of one thread in seq order (lazy start / restart
+    /// hydration). Also teaches the store the thread's persisted length.
     load_messages: fn(String) -> Result(List(MessageRow), StoreError),
-    /// Persist a new session row (write-through at create).
-    insert_session: fn(StoredSummary, String) -> Result(Nil, StoreError),
+    /// Persist a new thread row (write-through at create).
+    insert_thread: fn(StoredSummary, String) -> Result(Nil, StoreError),
     /// Write-behind turn commit: enqueue the (full, immutable) committed
     /// transcript. The store appends the delta past what it already
     /// persisted, in seq order, then bumps recency + count. Replay of an
@@ -200,12 +200,12 @@ pub type Store {
     /// Archiving clears the pin (Phase 1 invariant, enforced in SQL too).
     archive: fn(String) -> Result(Nil, StoreError),
     unarchive: fn(String) -> Result(Nil, StoreError),
-    /// Hard delete; cascades to the session's message rows.
-    delete_session: fn(String) -> Result(Nil, StoreError),
-    /// Boot sweep: delete every never-used stored session older than the
+    /// Hard delete; cascades to the thread's message rows.
+    delete_thread: fn(String) -> Result(Nil, StoreError),
+    /// Boot sweep: delete every never-used stored thread older than the
     /// grace window — one statement, so the work is bounded wherever it
     /// runs (the registry calls it inside its actor-initialiser
-    /// deadline). The grace window keeps an empty session another
+    /// deadline). The grace window keeps an empty thread another
     /// concurrently-running server just created (still empty until its
     /// first commit) from being deleted under its live actor. Returns
     /// the deleted ids; an error leaves the store untouched.
@@ -224,9 +224,9 @@ pub type Store {
     /// null the key; `True` writes `api_key_encrypted` from the record,
     /// where `None` means become keyless.
     update_provider: fn(StoredProvider, Bool) -> Result(Nil, StoreError),
-    /// Sessions pinning this provider — the registry's delete guard.
-    count_sessions_for_provider: fn(String) -> Result(Int, StoreError),
-    /// Hard delete; refused (`Error`) while any session references the
+    /// Threads pinning this provider — the registry's delete guard.
+    count_threads_for_provider: fn(String) -> Result(Int, StoreError),
+    /// Hard delete; refused (`Error`) while any thread references the
     /// provider (the FK is the enforcement). Disabling is the
     /// reversible path.
     delete_provider: fn(String) -> Result(Nil, StoreError),
@@ -363,7 +363,7 @@ fn messages_to_rows_with(
           names,
           index + 1,
         )
-        // System prompts are not rows (sessions.system_prompt); the other
+        // System prompts are not rows (threads.system_prompt); the other
         // shapes have no constructor in nexus — skipping is losing nothing
         // that can exist.
         _ -> #(rows, names, index + 1)

@@ -16,7 +16,7 @@ import glopenai/chat.{type ChatMessage}
 import glopenai/shared
 
 /// Options applied on top of the transcript when building a request.
-/// Everything here must stay constant across a session's turns except where
+/// Everything here must stay constant across a thread's turns except where
 /// the cache contract allows tail-only changes.
 pub type Options {
   Options(
@@ -249,7 +249,7 @@ pub fn stamped_at(transcript: Transcript, index: Int) -> Option(Int) {
 }
 
 /// The stamped epoch of the NEWEST assistant text message — the terminal
-/// turn's bubble text. The session actor attaches this to the terminal
+/// turn's bubble text. The thread actor attaches this to the terminal
 /// event (TurnDone/TurnStopped/guard-committed TurnFailed), so the UI's
 /// live bubble commit carries exactly the value a post-reload replay
 /// attaches to that message's AssistantFull: one clock, not two. `None`

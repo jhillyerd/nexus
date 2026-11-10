@@ -1,10 +1,10 @@
 //// Prefix-cache piggybacking (utility-titles plan §4.1, extended by
-//// the utility-tags plan): after a session's first committed exchange,
+//// the utility-tags plan): after a thread's first committed exchange,
 //// one background completion — branched off the committed transcript's
-//// cached prefix — proposes a session title AND a handful of tags. The
-//// request reuses the session's frozen envelope (same model, system
+//// cached prefix — proposes a thread title AND a handful of tags. The
+//// request reuses the thread's frozen envelope (same model, system
 //// prompt, tool schemas) so cache-capable backends reprocess only the
-//// instruction message; the reply becomes the session's organizational
+//// instruction message; the reply becomes the thread's organizational
 //// metadata while both provenance columns are 'auto' and is otherwise
 //// discarded (best-effort).
 ////
@@ -24,24 +24,24 @@
 //// Tag vocabulary is shaped structurally, not just prompted: at most
 //// `max_new_tags` tags absent from the supplied corpus survive the
 //// parse (reuse dominates; growth is bounded per attempt), and the
-//// union with a session's existing display set is capped at
-//// `tags_per_session` entries (`merge_tags` — what the registry applies).
+//// union with a thread's existing display set is capped at
+//// `tags_per_thread` entries (`merge_tags` — what the registry applies).
 //// Every tag — manual or model — passes through the ONE normalization
 //// rule below, so the two paths can never drift apart.
 ////
 //// PASS postpone: when the first exchange gives the model too little to
 //// title specifically (a greeting-only opener, say), it may reply
 //// exactly PASS instead. A PASS is not a failure and not a title: the
-//// session actor treats it as "not yet" — the once-per-session attempt
+//// thread actor treats it as "not yet" — the once-per-thread attempt
 //// stays available and re-arms at the next turn-commit point. Exactly
-//// one pass is honored per session; after that the forced instruction
+//// one pass is honored per thread; after that the forced instruction
 //// (no PASS option) demands the best title available, so the forced
 //// attempt cannot defer again. A PASS under the forced instruction is an
 //// unusable title, not a postpone — it defers title AND tags together.
 ////
 //// Structure: pure request/parse helpers plus one blocking runner — no
-//// actor of its own. The runner executes inside the session's unlinked
-//// utility worker (like the turn worker), never the session actor.
+//// actor of its own. The runner executes inside the thread's unlinked
+//// utility worker (like the turn worker), never the thread actor.
 ////
 //// Cache contract: the request is built by the SAME `nexus/transcript`
 //// encoder from the committed transcript with the SAME envelope as every
@@ -49,11 +49,11 @@
 //// exactly one delta — `max_completion_tokens` — which is generation-side
 //// only and never tokenizes into the prompt. The transcript this module
 //// branches from is a throwaway snapshot: the instruction (Y) and reply
-//// (B) never enter the session's transcript, so conversation re-encoding
+//// (B) never enter the thread's transcript, so conversation re-encoding
 //// stays byte-identical turn over turn.
 ////
 //// Hostile text: the reply is model output. It is display data only —
-//// it becomes a session title string that the UI renders as a Lustre
+//// it becomes a thread title string that the UI renders as a Lustre
 //// text node (no `innerHTML` anywhere), and it never rides back into a
 //// request body (the branch is never committed).
 
@@ -66,7 +66,7 @@ import nexus/openai
 import nexus/transcript.{type Options, type Transcript}
 
 /// Reply length cap — the same rule as the heuristic first-message title
-/// (`session_registry.title_from_first_message`): collapse whitespace,
+/// (`thread_registry.title_from_first_message`): collapse whitespace,
 /// truncate (with an ellipsis) at 60 characters.
 const title_limit = 60
 
@@ -77,10 +77,10 @@ const title_limit = 60
 /// × 24 chars is a hard ceiling.
 const tag_limit = 24
 
-/// Maximum tags one session may carry (§3.1): the union of existing
+/// Maximum tags one thread may carry (§3.1): the union of existing
 /// display tags and one attempt's new tags preserves existing order,
 /// appends the new, then truncates here.
-const tags_per_session = 5
+const tags_per_thread = 5
 
 /// Maximum NEW tags one attempt may introduce (§3.1, the K cap): tags
 /// already present in the supplied corpus survive freely — reuse
@@ -93,7 +93,7 @@ const max_new_tags = 2
 /// untouched. Deliberately generous headroom over the one-line title:
 /// reasoning models emit their chain of thought INSIDE this completion
 /// budget, so a tight cap lets a thinking model exhaust it before any
-/// title text arrives — wasting the session's only attempt. The reply
+/// title text arrives — wasting the thread's only attempt. The reply
 /// itself stays bounded by `shape_title`'s 60-character cap.
 const utility_token_cap = 512
 
@@ -148,7 +148,7 @@ pub fn instruction(allow_pass: Bool, corpus: List(String)) -> String {
 }
 
 /// The utility transcript: the committed snapshot plus the instruction as
-/// one user message (Y). Never committed back into the session.
+/// one user message (Y). Never committed back into the thread.
 pub fn prepare(
   tr: Transcript,
   allow_pass: Bool,
@@ -166,8 +166,8 @@ pub fn options(base: Options) -> Options {
 
 /// A parsed utility reply: a display title plus its attempt's surviving
 /// tags (already normalized and corpus-capped; the registry merges them
-/// into the session's display set), or the model's PASS — its "not enough
-/// signal yet" verdict, honored once per session (the session actor owns
+/// into the thread's display set), or the model's PASS — its "not enough
+/// signal yet" verdict, honored once per thread (the thread actor owns
 /// that policy; this module only reports it). A PASS defers title AND
 /// tags together.
 pub type Verdict {
@@ -266,7 +266,7 @@ fn strip_label(label: String, line: String) -> String {
 /// each tag through the shared rule, drop empties and duplicates
 /// (first wins), then enforce the structural K cap — at most
 /// `max_new_tags` tags NOT present in `corpus` survive, in reply
-/// order. The per-session cap is NOT applied here: it governs the
+/// order. The per-thread cap is NOT applied here: it governs the
 /// union with the existing display set (`merge_tags`), which only the
 /// registry can compute.
 pub fn parse_tags(corpus: List(String), line: String) -> List(String) {
@@ -313,7 +313,7 @@ fn opens_like_json(bare: String) -> Bool {
 }
 
 /// The ONE tag normalization rule (utility-tags plan §3.1), shared by
-/// manual tag saves (`session_registry` delegates here) and model tags:
+/// manual tag saves (`thread_registry` delegates here) and model tags:
 /// trim, lowercase, collapse internal whitespace runs to a single `-`
 /// (kebab-case), drop empties and duplicates (first occurrence wins —
 /// insertion order is display order), truncate each tag at `tag_limit`.
@@ -340,7 +340,7 @@ fn normalize_tag(tag: String) -> String {
   }
 }
 
-/// The model-tags merge into a session's display set (utility-tags plan
+/// The model-tags merge into a thread's display set (utility-tags plan
 /// §3.5 — what the registry's UpgradeAutoTitle applies): existing
 /// display entries pass through VERBATIM, never re-canonicalized (a
 /// legacy `Work Notes` stays `Work Notes`, so display − manual
@@ -349,7 +349,7 @@ fn normalize_tag(tag: String) -> String {
 /// check compares through the SAME normalization — the kebab shape —
 /// not bare lowercasing, so `Work Notes` and `work-notes` are one tag
 /// and do not duplicate); the union preserves existing order, appends
-/// the new, then truncates at `tags_per_session`.
+/// the new, then truncates at `tags_per_thread`.
 pub fn merge_tags(existing: List(String), new: List(String)) -> List(String) {
   // The presence key is the full shared normalization (`normalize_tag`,
   // below) — never the raw display spelling: only the comparison is
@@ -368,7 +368,7 @@ pub fn merge_tags(existing: List(String), new: List(String)) -> List(String) {
   // Existing entries keep their order VERBATIM; the appended arrive in
   // reply order (the fold prepended, so reverse them); the union caps.
   list.append(existing, list.reverse(appended))
-  |> list.take(tags_per_session)
+  |> list.take(tags_per_thread)
 }
 
 /// The PASS sentinel test: exact match on the shaped reply, case
@@ -441,7 +441,7 @@ type Fragment {
 }
 
 /// One blocking, non-loop utility stream. The base options must be the
-/// session's frozen envelope (`loop.frozen_options`); the delta applied
+/// thread's frozen envelope (`loop.frozen_options`); the delta applied
 /// here is generation-side only. Accumulates text deltas, fails on any
 /// tool-call assembly or transport error (best-effort: no retry), and
 /// parses the reply. `cancel` must be owned by the calling process — the
