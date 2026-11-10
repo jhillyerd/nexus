@@ -191,7 +191,7 @@ before the wall-clock kill — see `batch_deadline_margin_us`):
 4. Acceptance: a script fans out three `http_fetch` calls concurrently and
    folds the results; wall time demonstrably sub-serial. (Offline overlap
    test pins the mechanism; live http_fetch acceptance rides the next
-   codemode-enabled e2e pass — the m3 smoke keeps codemode off.)
+   codemode-enabled e2e pass — the integration smoke keeps codemode off.)
 
 ## Later / non-goals (recorded, not planned)
 

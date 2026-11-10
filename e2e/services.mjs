@@ -1,4 +1,4 @@
-//// Controlled services for the M3 browser suite (validation only — never
+//// Controlled services for the e2e browser suite (validation only — never
 //// part of the Nexus runtime):
 ////
 ////   1. fake Bifrost  — an OpenAI-compatible SSE server playing scripted

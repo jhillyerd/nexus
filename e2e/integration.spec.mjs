@@ -1,4 +1,4 @@
-// M3 Workstream C — integration smoke against REAL services.
+// e2e integration smoke against REAL services.
 //
 // Unlike browser.spec.mjs (controlled fakes), this suite runs Nexus in its
 // production posture against:

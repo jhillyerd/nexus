@@ -2,7 +2,7 @@
   "name": "nexus-e2e",
   "private": true,
   "type": "module",
-  "description": "Validation-only browser suite for the nexus M3 UI (Playwright + headless Chromium). Not a Nexus runtime dependency.",
+  "description": "Validation-only e2e browser suite for nexus (Playwright + headless Chromium). Not a Nexus runtime dependency.",
   "scripts": {
     "test": "node browser.spec.mjs"
   },

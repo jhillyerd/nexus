@@ -1,9 +1,9 @@
-// M3 Workstream C — browser suite.
+// e2e browser suite.
 //
 // Drives headless Chromium (Playwright) against a real Nexus server whose
 // model backend is the controlled fake Bifrost (see services.mjs) and whose
 // tools run against the controlled doc/searxng stubs. Verifies the complete
-// M3 flow end-to-end through the real WebSocket UI:
+// tool-loop flow end-to-end through the real WebSocket UI:
 //
 //   1. bearer auth (401 without token, page with token)
 //   2. model list (picker) and thread list
