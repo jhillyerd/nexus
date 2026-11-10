@@ -53,11 +53,15 @@ plan builds, and the vocabulary the session→thread rename aligned with).
   user accounts later).
 - **thread** — the chat entity, exactly as today. Unchanged semantics;
   gains `bot_id` provenance and (P2) a `toolset` snapshot.
-- **toolset** — an ordered list of tool names. `NULL` = the default set
+- **toolset** — an ordered list of tool names. On `bot`: `NULL` = the
+  *current* default, resolved when a thread is created
   (`tools.default(cfg)`); `'{}'` = deliberately empty (a chat-only bot
   is legitimate — its envelope is defined in P2); a non-empty array =
-  explicit list. The distinction between NULL and `'{}'` must survive
-  everywhere it is stored.
+  explicit list. On `thread`: always the **resolved names persisted at
+  creation** — never NULL-for-default — so neither a config change nor
+  a bot edit can re-aim an existing thread's envelope (decision 2; the
+  same rationale as the persisted `system_prompt`). Pre-P2 rows with
+  `NULL` hydrate as the default set.
 
 ## Design summary
 
@@ -107,9 +111,11 @@ No contract changes — every thread still runs `tools.default(cfg)`.
 Schema (pre-deployment rule: edit the base `CREATE`s in
 `sql/schema.sql`, keep them idempotent). These are base-`CREATE` edits,
 not upgrade statements — `schema.sql` carries no `ALTER TABLE`s, and
-`CREATE TABLE IF NOT EXISTS` skips an already-existing `thread`, so a
-database created before this phase would silently lack `bot` and
-`thread.bot_id` while `migrate` reports success. Pre-deployment means
+`CREATE TABLE IF NOT EXISTS` skips an already-existing `thread`. On a
+database created before this phase the failure is loud but partial:
+`bot` and `bot_name` apply, then `thread_bot` fails (`thread.bot_id`
+does not exist) and `apply_schema` panics mid-file, leaving a
+half-applied schema. Pre-deployment means
 dev databases are **recreated** (`docker compose down -v && docker
 compose up -d`), never upgraded; no backfill statements are kept.
 
@@ -172,14 +178,18 @@ browser-suite coverage for the picker and settings section.
 
 ## Phase 2 — per-bot toolsets (invariant amendment)
 
-**Scope:** `bot.tools text[] NULL` and `thread.toolset text[] NULL`
-snapshot-copied at creation. This is the phase that touches a hard
-invariant, so it lands alone, with its AGENTS.md rewrite in the same PR.
+**Scope:** `bot.tools text[] NULL` on the bot (NULL = current
+default), and `thread.toolset text[]` always populated at creation
+with the resolved names — plain threads snapshot the default set,
+bot threads snapshot the bot-resolved list. This is the phase that
+touches a hard invariant, so it lands alone, with its AGENTS.md
+rewrite in the same PR.
 
 The amended invariant (AGENTS.md "One frozen toolset for every thread"):
 
-> One frozen toolset **per thread**, chosen at creation: the default set
-> or the creating bot's snapshot. Runners are built per toolset and
+> One frozen toolset **per thread**, persisted at creation as resolved
+> tool names (the default set's, or the creating bot's). Runners are
+> built per toolset and
 > cached by toolset identity. `tools` / `tool_choice` never vary
 > mid-thread — that is the part the KV-cache byte contract needs.
 
@@ -208,11 +218,19 @@ Mechanics:
   form. The omitted-fields envelope is frozen at creation like any
   other.
 - `thread_registry` builds specs once per distinct toolset (cache keyed
-  by the name tuple; the default set keeps today's boot-built runner).
-  The existing `start_with_runner` test seam extends to per-toolset
-  runners.
-- `thread.toolset` is the snapshot — editing a bot's tool list never
-  re-aims existing threads (decision 2).
+  by the name tuple — the default snapshot resolves to today's boot
+  tuple, so it shares the boot-built runner). The existing
+  `start_with_runner` test seam extends to per-toolset runners.
+- **`thread.toolset` is always a resolved snapshot** (coderabbit
+  review, PR #71): plain threads persist the default set's names at
+  creation, bot threads persist the bot-resolved list (`bot.tools`
+  NULL = the current default, so the bot stays a live template for
+  NEW threads). A NULL-for-default column would have re-aimed every
+  default thread's envelope on a config change + restart — exactly
+  what the persisted `system_prompt` exists to prevent. Hydration
+  resolves names through the boot registry (`tools.by_names`); a name
+  removed by an upgrade is skipped with a warning — the same envelope
+  shift a default-set change causes today.
 
 Verification:
 - `test/m3_prefix_test.gleam` passes **unchanged** — the golden's
@@ -222,6 +240,10 @@ Verification:
   across turns. A chat-only (`'{}'`) thread is covered too — its
   requests stay byte-stable with both `tools` and `tool_choice`
   absent.
+- Snapshot stability: a thread's persisted `toolset` keeps its
+  envelope byte-identical across a simulated restart with a changed
+  default config — the rejected NULL-for-default design would fail
+  this test.
 - `e2e/integration.spec.mjs` cache gate re-run: warm/cold TTFT median
   ratio ≤ 0.3 on default-toolset threads (numbers comparable to today).
 
