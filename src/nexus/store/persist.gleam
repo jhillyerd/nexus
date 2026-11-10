@@ -764,7 +764,8 @@ fn key_param(key: option.Option(BitArray)) -> BitArray {
 fn message_row_from_row(row: sql.LoadMessagesRow) -> store.MessageRow {
   let name = row.tool_name |> option.unwrap("tool")
   // The stamp rides the 0 sentinel (see load_messages.sql): 0 decodes
-  // back to None, so unstamped legacy rows render without a timestamp.
+  // back to None, so unstamped rows — continuation rows of a multi-call
+  // assistant message — render without a timestamp.
   let at = case row.created_s {
     0 -> None
     seconds -> Some(seconds)

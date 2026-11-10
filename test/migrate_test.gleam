@@ -171,25 +171,34 @@ pub fn uescape_string_test() {
   |> should.equal(["select U&'d\\0061t\\'s;ok'", "select 2"])
 }
 
-/// The utility-tags schema shape (§3.4): the two provenance columns
-/// land in ONE `do $$ … $$` block whose `pg_attribute` existence checks
-/// make re-runs no-ops. The REAL `sql/schema.sql` runs through the
+/// The squashed schema shape (pre-deploy squash): `sql/schema.sql` is
+/// the ENTIRE schema — plain idempotent CREATEs, no ALTER/DO migration
+/// shims (nothing is deployed anywhere, so a shape change is an edit to
+/// the CREATEs, not a new shim). The REAL file runs through the
 /// splitter — not a pasted copy, which could drift from the schema
-/// without failing this test. The `attname = 'tags_manual'` probe is
-/// unique to the DO block; that one statement must also carry
-/// `tags_source` (the inner `;` never split it), and splitting must
-/// resume after the closing `$$` (the rest of the schema still arrives
-/// statement by statement).
-pub fn tags_provenance_do_block_is_one_statement_test() {
+/// without failing this test. Every statement must LEAD with `create`
+/// (trimmed, lowercased — catches any `DO $$` block, tagged or not, and
+/// any `ALTER`, however spelled or wrapped), and the
+/// tags provenance columns (`tags_manual`, `tags_source`, utility-tags
+/// plan §3.4) must live INLINE in the `session` CREATE TABLE — a
+/// reintroduced DO-block shim fails here. The splitter's dollar-quote
+/// handling (an inner `;` inside `$$` bodies) stays covered
+/// synthetically by `semicolon_in_literal_inside_dollar_quote_test`.
+pub fn schema_is_the_entire_schema_test() {
   let assert Ok(schema) = read_file("sql/schema.sql") |> bit_array.to_string
   let statements = migrate.statements(schema)
-  let assert [block] =
+  should.equal(list.length(statements), 6)
+  let assert [] =
     list.filter(statements, fn(stmt) {
-      string.contains(stmt, "attname = 'tags_manual'")
+      !string.starts_with(string.trim(string.lowercase(stmt)), "create")
     })
-  should.be_true(string.contains(block, "do $$"))
-  should.be_true(string.contains(block, "attname = 'tags_source'"))
-  should.be_true(list.length(statements) > 1)
+  let assert [session_create] =
+    list.filter(statements, fn(stmt) { string.contains(stmt, "tags_manual") })
+  should.be_true(string.contains(session_create, "tags_source"))
+  should.be_true(string.contains(
+    string.lowercase(session_create),
+    "create table",
+  ))
 }
 
 /// …and the one trap that shape adds beyond the existing `$$` coverage:
