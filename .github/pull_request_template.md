@@ -40,7 +40,7 @@ Closes # <!-- issue number, or delete the line; GitHub closes it on merge -->
      squirrel check, and gleam format --check. Report the two things CI can't:
      what coverage changed, and what you verified outside the regular suites. -->
 
-**Coverage** — <base> → <head> tests. What the new tests pin, by behaviour,
+**Coverage** — `<base>` → `<head>` tests. What the new tests pin, by behaviour,
 naming the invariant each holds. Changes pinned by existing tests: name them.
 Docs-only: say so here, and put what you verified under Beyond CI.
 
