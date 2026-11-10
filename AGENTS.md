@@ -57,8 +57,10 @@ The persistence layer lives in `sql/schema.sql` + `src/nexus/store/sql/`.
   wire protocol reports expression columns as NOT NULL —
   `load_messages.sql`). It rides the transcript's timestamp sidecar
   (`transcript.stamp` / `transcript.stamped_at`), never `messages`, and
-  drives the chat log's per-message ages. Legacy rows are NULL (no
-  honest backfill exists) and render without a timestamp.
+  drives the chat log's per-message ages. NULL is a live state, not
+  legacy: continuation rows of a multi-call assistant message are
+  unstamped by design (the stamp rides the message's first row, like
+  content/reasoning) and render without their own timestamp.
 - **One clock for message timestamps.** The sidecar stamp set at
   append time is the ONLY source: terminal events carry
   `transcript.last_text_stamp`, the loop broadcasts the flush stamp on

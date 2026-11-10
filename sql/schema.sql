@@ -1,5 +1,6 @@
 -- Nexus session persistence (Phase 2).
 --
+--
 -- Tables are singular and explicit (`session`, `session_message`): each
 -- row is one entity, and the messages table's link to its session stays
 -- obvious as the schema grows.
@@ -63,7 +64,9 @@ CREATE TABLE IF NOT EXISTS session (
   system_prompt  text NOT NULL,                -- frozen at creation (contract rule 2); stored so hydration rebuilds the frozen prefix byte-identically
   pinned         boolean NOT NULL DEFAULT false,
   archived_at    timestamptz,                  -- NULL = active
-  tags           text[] NOT NULL DEFAULT '{}',
+  tags           text[] NOT NULL DEFAULT '{}', -- display set: manual ∪ auto, recomputed on write (utility-tags plan §3.4)
+  tags_manual    text[] NOT NULL DEFAULT '{}', -- the user's exact set; display − manual is the auto contribution. No join table; GIN-indexed via `tags`
+  tags_source    text NOT NULL DEFAULT 'auto', -- 'auto' | 'manual' (mirrors title_source): the first manual tag save (set_tags.sql) flips it to 'manual' forever — the guard IS the tombstone a future refresh policy reads
   created_at     timestamptz NOT NULL,
   last_active_at timestamptz NOT NULL,         -- bumped on turn commit; drives recency + buckets
   message_count  int NOT NULL DEFAULT 0        -- denormalized for list queries
@@ -83,61 +86,7 @@ CREATE TABLE IF NOT EXISTS session_message (
   tool_args    text,                           -- raw argument JSON as the model emitted it. NOTE: deliberately text, not jsonb: jsonb normalizes (sorts keys, strips whitespace, dedupes), which would break the byte-identical hydration contract for tool-call arguments that sit above the request tail (see the `tool_args` invariant in AGENTS.md)
   tool_ok      boolean,
   reasoning    text,                           -- display-only chain-of-thought emitted before an assistant message; NULL for user/tool rows and reasoning-free messages. Plain text for the same byte-stability rationale as tool_args. Never sent back to the model.
-  created_at   timestamptz,                    -- display-only wall-clock stamp of the message (drives the chat log's relative ages). NULL for rows persisted before the column existed; those render without a timestamp. Never sent back to the model.
+  created_at   timestamptz,                    -- display-only wall-clock stamp of the message (drives the chat log's relative ages). Deliberately nullable: the store's 0 sentinel writes NULL for unstamped rows (to_timestamp(nullif($n, 0))) instead of borrowing the write instant as a fake append time; unstamped rows render without a timestamp. Never sent back to the model.
   UNIQUE (session_id, seq)
 );
 
--- Reasoning column for databases created before it existed (the CREATE
--- TABLE above already includes it for fresh ones; both are idempotent).
-ALTER TABLE session_message ADD COLUMN IF NOT EXISTS reasoning text;
-
--- created_at for databases created before it existed (see the reasoning
--- ALTER above for the pattern). Deliberately nullable: there is no honest
--- backfill for pre-existing rows (DEFAULT now() would stamp every legacy
--- message with the migration instant), so they stay NULL and the UI omits
--- the timestamp for them. Writes always supply it via to_timestamp($n).
-ALTER TABLE session_message ADD COLUMN IF NOT EXISTS created_at timestamptz;
-
--- Tags provenance columns (docs/plans/completed/utility-tags.md §3.4),
--- added for databases created before they existed. Both live in ONE DO
--- block whose pg_attribute checks make re-runs no-ops (the migrate
--- runner's splitter understands $$-quoted bodies, so the inner `;` stay
--- inside the
--- statement):
---
--- - `tags_manual text[] NOT NULL DEFAULT '{}'` — the user's exact set.
---   `tags` stays the DISPLAY set (the union); `display − manual` is the
---   auto contribution, recomputed on write. Backfill: `tags_manual =
---   tags` VERBATIM — every pre-existing tag is manual, and the union
---   rule never rewrites existing display entries, so verbatim spellings
---   cannot skew the bookkeeping.
--- - `tags_source text NOT NULL DEFAULT 'auto'` ('auto' | 'manual',
---   mirroring `title_source`) — the per-side provenance guard. Backfill
---   `'manual'` for every pre-existing row, codifying the no-retro-
---   tagging decision (§1): sessions that predate this feature can never
---   be auto-tagged, exactly as their spent title attempts already
---   prevent re-titling. New inserts default 'auto'; the first manual
---   tag save (`set_tags.sql`) flips the row to 'manual' forever — the
---   guard IS the tombstone a future refresh policy reads.
-do $$
-begin
-  if not exists (
-    select 1 from pg_attribute
-    where attrelid = 'session'::regclass
-      and attname = 'tags_manual'
-      and not attisdropped
-  ) then
-    alter table session add column tags_manual text[] not null default '{}';
-    update session set tags_manual = tags;
-  end if;
-  if not exists (
-    select 1 from pg_attribute
-    where attrelid = 'session'::regclass
-      and attname = 'tags_source'
-      and not attisdropped
-  ) then
-    alter table session add column tags_source text not null default 'auto';
-    update session set tags_source = 'manual';
-  end if;
-end
-$$;
