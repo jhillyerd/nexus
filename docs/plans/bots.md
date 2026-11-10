@@ -55,8 +55,9 @@ plan builds, and the vocabulary the session→thread rename aligned with).
   gains `bot_id` provenance and (P2) a `toolset` snapshot.
 - **toolset** — an ordered list of tool names. `NULL` = the default set
   (`tools.default(cfg)`); `'{}'` = deliberately empty (a chat-only bot
-  is legitimate); a non-empty array = explicit list. The distinction
-  between NULL and `'{}'` must survive everywhere it is stored.
+  is legitimate — its envelope is defined in P2); a non-empty array =
+  explicit list. The distinction between NULL and `'{}'` must survive
+  everywhere it is stored.
 
 ## Design summary
 
@@ -104,7 +105,13 @@ completed plan docs kept as historical records under their old names.
 No contract changes — every thread still runs `tools.default(cfg)`.
 
 Schema (pre-deployment rule: edit the base `CREATE`s in
-`sql/schema.sql`, keep them idempotent):
+`sql/schema.sql`, keep them idempotent). These are base-`CREATE` edits,
+not upgrade statements — `schema.sql` carries no `ALTER TABLE`s, and
+`CREATE TABLE IF NOT EXISTS` skips an already-existing `thread`, so a
+database created before this phase would silently lack `bot` and
+`thread.bot_id` while `migrate` reports success. Pre-deployment means
+dev databases are **recreated** (`docker compose down -v && docker
+compose up -d`), never upgraded; no backfill statements are kept.
 
 ```sql
 CREATE TABLE IF NOT EXISTS bot (
@@ -119,15 +126,25 @@ CREATE TABLE IF NOT EXISTS bot (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS bot_name ON bot (name);
 
--- on thread:
-bot_id text REFERENCES bot(id) ON DELETE SET NULL
+-- new final column inside the existing CREATE TABLE thread:
+CREATE TABLE IF NOT EXISTS thread (
+  -- …existing columns unchanged…
+  message_count  int NOT NULL DEFAULT 0,
+  bot_id         text REFERENCES bot(id) ON DELETE SET NULL
+);
+
 CREATE INDEX IF NOT EXISTS thread_bot ON thread (bot_id);
 ```
 
-`system_prompt` NULL-resolution happens at creation exactly the way
-`thread_registry` resolves `cfg.system_prompt` today (including the
-codemode ASCII note when codemode is enabled) — the stored thread value
-is the full frozen prompt, so hydration is unchanged.
+`system_prompt` NULL-resolution happens at creation: `NULL` resolves
+to `cfg.system_prompt` **verbatim** — whatever `config.from_env`
+computed, which includes the codemode ASCII note only when the value
+is the built-in default (the note rides the default prompt only; an
+explicit prompt is never amended). An explicit `bot.system_prompt`
+follows the same default-versus-explicit rule as an explicit
+`NEXUS_SYSTEM_PROMPT`: used verbatim, never amended. Either way the
+stored thread value is the full frozen prompt, so hydration is
+unchanged.
 
 Store (squirrel, one query per file, then `gleam run -m squirrel`):
 `insert_bot`, `get_bot`, `list_bots`, `update_bot`, `delete_bot`,
@@ -182,6 +199,14 @@ Mechanics:
 - `tools.by_names(cfg, names)` resolver in the tool registry; unknown
   name at bot save or thread create → 400 (validated against the same
   registry that builds schemas).
+- **The no-tools envelope is omission.** A `'{}'`-toolset thread sends
+  neither `tools` nor `tool_choice`: the single encode path already
+  branches this way (`transcript.request_body` skips `with_tools` for
+  `[]` and `with_tool_choice` for `None`), so no encoder change is
+  needed — only `loop.gleam`'s turn Options, which today always carry
+  non-empty schemas and `Some(ToolChoiceAuto)`, gain the per-thread
+  form. The omitted-fields envelope is frozen at creation like any
+  other.
 - `thread_registry` builds specs once per distinct toolset (cache keyed
   by the name tuple; the default set keeps today's boot-built runner).
   The existing `start_with_runner` test seam extends to per-toolset
@@ -194,7 +219,9 @@ Verification:
   contract is per-thread envelope stability, which this phase preserves.
 - New offline test: two threads with different toolsets get different
   envelopes by design; one thread's envelope stays byte-identical
-  across turns.
+  across turns. A chat-only (`'{}'`) thread is covered too — its
+  requests stay byte-stable with both `tools` and `tool_choice`
+  absent.
 - `e2e/integration.spec.mjs` cache gate re-run: warm/cold TTFT median
   ratio ≤ 0.3 on default-toolset threads (numbers comparable to today).
 
