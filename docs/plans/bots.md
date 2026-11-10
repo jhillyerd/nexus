@@ -61,7 +61,10 @@ plan builds, and the vocabulary the session→thread rename aligned with).
   creation** — never NULL-for-default — so neither a config change nor
   a bot edit can re-aim an existing thread's envelope (decision 2; the
   same rationale as the persisted `system_prompt`). Pre-P2 rows with
-  `NULL` hydrate as the default set.
+  `NULL` are **materialized once**: the first post-P2 boot stamps the
+  boot-resolved default names into the column, after which they are
+  ordinary snapshot rows — no code path ever resolves `NULL` against
+  live config.
 
 ## Design summary
 
@@ -228,9 +231,13 @@ Mechanics:
   NEW threads). A NULL-for-default column would have re-aimed every
   default thread's envelope on a config change + restart — exactly
   what the persisted `system_prompt` exists to prevent. Hydration
-  resolves names through the boot registry (`tools.by_names`); a name
-  removed by an upgrade is skipped with a warning — the same envelope
-  shift a default-set change causes today.
+  resolves names via `tools.by_names` against a **config-independent**
+  catalog — a snapshot pins its tools past later config gating (the
+  freeze overrides the gate: disabling codemode globally cannot brick
+  threads that pinned it). A name absent from the compiled code
+  entirely (removed by an upgrade) **fails hydration loudly** — no
+  silent skip, matching the repo's no-silent-fallback boot philosophy;
+  the remedy is recreating the thread or hand-editing its row.
 
 Verification:
 - `test/m3_prefix_test.gleam` passes **unchanged** — the golden's
@@ -243,7 +250,8 @@ Verification:
 - Snapshot stability: a thread's persisted `toolset` keeps its
   envelope byte-identical across a simulated restart with a changed
   default config — the rejected NULL-for-default design would fail
-  this test.
+  this test. A toolset naming a tool absent from the codebase fails
+  hydration — no silent envelope change.
 - `e2e/integration.spec.mjs` cache gate re-run: warm/cold TTFT median
   ratio ≤ 0.3 on default-toolset threads (numbers comparable to today).
 
