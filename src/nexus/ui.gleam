@@ -77,7 +77,7 @@ pub type ToolStatus {
 /// One completed line in the chat log. The in-flight assistant bubble is
 /// kept separately (like M2) so tokens can be appended cheaply. `at` on
 /// the text lines is the message's display stamp (wall-clock epoch
-/// seconds; None = unstamped legacy history) — display metadata like the
+/// seconds; None = unstamped history) — display metadata like the
 /// reasoning sidecar it mirrors, never a request byte.
 pub type Line {
   UserLine(text: String, at: Option(Int))
@@ -243,7 +243,7 @@ pub type Model {
     /// round, so a round may flush MORE THAN ONE segment — all are tracked,
     /// newest-first. Cleared when the selection changes or the session
     /// ends: a stale entry must never stamp another session's (possibly
-    /// legacy-unstamped) line that happens to carry the same text.
+    /// unstamped) line that happens to carry the same text.
     flushed: List(String),
     picker: String,
     create_open: Bool,
@@ -373,7 +373,7 @@ pub type Msg {
   Hello(model: String)
   /// A committed user line. `at` is its display stamp — wall-clock epoch
   /// seconds from the session's echo (live and replay carry the same
-  /// value); None = unstamped legacy history, rendered without a time.
+  /// value); None = unstamped history, rendered without a time.
   UserEcho(String, Option(Int))
   /// A committed assistant line, replayed from history (or seen by a
   /// second tab). `at` mirrors UserEcho's display stamp.
@@ -388,7 +388,7 @@ pub type Msg {
   /// assistant-text stamp from the session actor (`transcript
   /// .last_text_stamp` — the SAME value a post-reload replay attaches to
   /// that message), so the live bubble commit renders the same absolute
-  /// timestamp as replay; None = nothing committed (or unstamped legacy).
+  /// timestamp as replay; None = nothing committed (or unstamped).
   TurnDone(Option(Int))
   TurnStopped(Option(Int))
   TurnFailed(String, Option(Int))
@@ -409,7 +409,7 @@ pub type Msg {
   /// round's committed stamp from the loop: the wall-clock epoch the
   /// round's assistant message (and the text the UI committed at
   /// first-fragment time) was appended at — the authoritative value for
-  /// the pending-flush restamp. None = legacy replay (nothing to stamp).
+  /// the pending-flush restamp. None = a replay with no committed stamp.
   ToolCallAssembled(
     id: String,
     name: String,
@@ -1093,7 +1093,7 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     ToolCallAssembled(id, name, arguments, at) -> {
       // The loop's flush stamp has arrived: first restamp the line the
       // delta arm committed ahead of the append (matching by text — the
-      // exact string this connection committed — so a legacy unstamped
+      // exact string this connection committed — so an older unstamped
       // line can never be hit), then commit anything still in the bubble
       // (the empty-arguments case: no fragments ever fired, so this is
       // its first commit) with the stamp directly.
@@ -1411,8 +1411,8 @@ fn settle_flushed(model: Model, at: Option(Int)) -> Model {
 }
 
 /// Restamp every pending flush text (see the `flushed` field) with `at`.
-/// Matching is by the exact committed text — it cannot hit a legacy
-/// unstamped line, and within one session rounds are serial, so the
+/// Matching is by the exact committed text — it cannot hit an unrelated
+/// line, and within one session rounds are serial, so the
 /// first (newest) match per text is the right line. A text that is
 /// already restamped (or absent — replay, where no delta-time commit
 /// happens) is a no-op.
@@ -1477,8 +1477,8 @@ fn commit_bubble(model: Model, at: Option(Int)) -> Model {
             // the transcript sidecar — the exact value a post-reload
             // replay attaches to that message's AssistantFull. One clock
             // end to end; the UI never stamps from its own read. None =
-            // unstamped (legacy), rendering without a timestamp — same
-            // as the replay it mirrors.
+            // unstamped, rendering without a timestamp — same as the
+            // replay it mirrors.
             log: [AssistantLine(text, at), ..model.log],
             md_cache: dict.insert(model.md_cache, text, elements),
           )
@@ -1676,8 +1676,8 @@ fn after_sessions(
       False -> model.log
     },
     // The pending flushes belong to the ended session's log; a stale
-    // entry must never stamp another session's (possibly legacy-
-    // unstamped) line that happens to carry the same text.
+    // entry must never stamp another session's (possibly unstamped)
+    // line that happens to carry the same text.
     flushed: case ended {
       True -> []
       False -> model.flushed
@@ -2729,7 +2729,7 @@ fn assistant_turn(
 /// as the hover tooltip — the absolute half of the display, server-side
 /// and no-JS). `data-epoch` lets the page shell's `timestamps_js` re-age
 /// the labels as time passes and localize `title` to the viewer's
-/// timezone; unstamped (legacy) messages render no element at all.
+/// timezone; unstamped messages render no element at all.
 fn time_stamp(at: Option(Int)) -> Element(Msg) {
   case at {
     None -> element.none()

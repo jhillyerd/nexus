@@ -1,6 +1,5 @@
 -- Nexus session persistence (Phase 2).
 --
---
 -- Tables are singular and explicit (`session`, `session_message`): each
 -- row is one entity, and the messages table's link to its session stays
 -- obvious as the schema grows.

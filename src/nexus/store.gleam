@@ -276,7 +276,7 @@ pub fn messages_to_rows(messages: List(ChatMessage)) -> List(MessageRow) {
 /// rows carry it without it ever existing as a message; `tool_ok_at`
 /// resolves a tool message's outcome the same way (True when unknown);
 /// `stamped_at` resolves the wall-clock epoch the message was appended
-/// at (None = unstamped, e.g. legacy rows).
+/// at (None = unstamped).
 fn messages_to_rows_with(
   messages: List(ChatMessage),
   base: Int,
@@ -389,7 +389,7 @@ fn append_rows(tr: Transcript, rows: List(MessageRow)) -> Transcript {
     [] -> tr
     // Stamps restore through the same construction path as the sidecars
     // they mirror: append, then stamp the newest message. `stamp_opt` is
-    // the no-op for unstamped (legacy) rows.
+    // the no-op for unstamped rows.
     [UserRow(content, at), ..rest] ->
       append_rows(
         tr |> transcript.append_user(content) |> transcript.stamp_opt(at),

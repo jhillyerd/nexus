@@ -218,10 +218,9 @@ pub fn tool_result_at(transcript: Transcript, index: Int) -> Option(Bool) {
 /// is `stamped_at`). Call immediately after the append that created the
 /// message — the chronological index is derived from the message count,
 /// so a stamp applied before an append would silently land on the wrong
-/// message. Never stamped messages (unstamped legacy rows, messages
-/// built before this sidecar existed) simply have no entry, which the UI
-/// renders as no timestamp. Pure display metadata: never enters a
-/// request body.
+/// message. Never stamped messages (the system prompt at index 0) simply
+/// have no entry, which the UI renders as no timestamp. Pure display
+/// metadata: never enters a request body.
 pub fn stamp(transcript: Transcript, at: Int) -> Transcript {
   Transcript(
     ..transcript,

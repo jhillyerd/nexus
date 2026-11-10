@@ -176,7 +176,9 @@ pub fn uescape_string_test() {
 /// shims (nothing is deployed anywhere, so a shape change is an edit to
 /// the CREATEs, not a new shim). The REAL file runs through the
 /// splitter — not a pasted copy, which could drift from the schema
-/// without failing this test. Every statement must be a CREATE, and the
+/// without failing this test. Every statement must LEAD with `create`
+/// (trimmed, lowercased — catches any `DO $$` block, tagged or not, and
+/// any `ALTER`, however spelled or wrapped), and the
 /// tags provenance columns (`tags_manual`, `tags_source`, utility-tags
 /// plan §3.4) must live INLINE in the `session` CREATE TABLE — a
 /// reintroduced DO-block shim fails here. The splitter's dollar-quote
@@ -186,18 +188,17 @@ pub fn schema_is_the_entire_schema_test() {
   let assert Ok(schema) = read_file("sql/schema.sql") |> bit_array.to_string
   let statements = migrate.statements(schema)
   should.equal(list.length(statements), 6)
-  let shimmed =
-    list.any(statements, fn(stmt) {
-      let lower = string.lowercase(stmt)
-      string.contains(lower, "alter table") || string.contains(lower, "do $$")
+  let assert [] =
+    list.filter(statements, fn(stmt) {
+      !string.starts_with(string.trim(string.lowercase(stmt)), "create")
     })
-  should.be_false(shimmed)
   let assert [session_create] =
     list.filter(statements, fn(stmt) { string.contains(stmt, "tags_manual") })
   should.be_true(string.contains(session_create, "tags_source"))
-  should.be_true(
-    string.contains(string.lowercase(session_create), "create table"),
-  )
+  should.be_true(string.contains(
+    string.lowercase(session_create),
+    "create table",
+  ))
 }
 
 /// …and the one trap that shape adds beyond the existing `$$` coverage:

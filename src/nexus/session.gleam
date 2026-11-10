@@ -71,8 +71,8 @@ pub type EventKind {
   Hello(model: String, messages: Int, metrics: List(MetricSample))
   /// A user turn, echoed so every tab sees it. Also used for history replay.
   /// `at` is the message's display stamp — wall-clock epoch seconds from
-  /// the transcript's timestamp sidecar (None for unstamped legacy
-  /// history) — so every tab and a post-reload replay render the same age.
+  /// the transcript's timestamp sidecar (None for unstamped history) —
+  /// so every tab and a post-reload replay render the same age.
   UserEcho(text: String, at: Option(Int))
   /// A complete assistant turn, used for history replay on (re)connect.
   /// `at` mirrors UserEcho's display stamp.
@@ -115,7 +115,7 @@ pub type EventKind {
   /// round's committed stamp — the wall-clock epoch the round's assistant
   /// message was appended at — so the UI can timestamp the text it
   /// committed at first-fragment time with the session's own clock
-  /// (None in legacy replays).
+  /// (None when the replay carries no committed stamp).
   ToolCallAssembled(
     id: String,
     name: String,
