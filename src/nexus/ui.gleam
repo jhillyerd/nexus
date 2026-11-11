@@ -45,6 +45,7 @@ import nexus/bot.{type Bot}
 import nexus/bot_registry
 import nexus/provider.{type Provider}
 import nexus/provider_registry
+import nexus/rescue
 import nexus/thread.{type ThreadEvent}
 import nexus/thread_create
 import nexus/thread_registry
@@ -2061,6 +2062,12 @@ fn create_effect(model: Model, alias: String) -> Effect(Msg) {
     // The pending guard in `update` keeps the single-slot honest: no
     // second create can start before this one's reply lands.
     process.spawn_unlinked(fn() {
+      // EVERY exit path dispatches (Created / CreateFailed): the create
+      // outcome routes through `rescue` so a worker crash — e.g. an
+      // `actor.call` panic when a registry dies mid-preflight — lands on
+      // the failure path too, instead of leaving `create_pending` stuck
+      // True and Create disabled for this connection (#90 review).
+      //
       // The registry builds the M3 agent-loop runner itself, from the tool
       // registry frozen at its boot — threads created here get the full
       // toolset, pinned to the create panel's selected provider + model
@@ -2070,26 +2077,38 @@ fn create_effect(model: Model, alias: String) -> Effect(Msg) {
       // model-alias validation outside the registry's loop — the UI used to
       // skip the check, silently accepting a stale alias. The reply IS the
       // summary; this component never hand-builds one.
-      case provider {
-        None -> dispatch(CreateFailed("no provider configured"))
-        Some(provider_id) -> {
-          let requested =
-            thread_registry.NewThread(
-              provider_id: provider_id,
-              model: alias,
-              // The create panel pins the config default; a bot-sourced
-              // create runs through create_from_bot_effect instead.
-              system_prompt: None,
-              bot_id: None,
-            )
-          case
-            thread_create.create_thread(providers, registry, timeout, requested)
-          {
-            Ok(summary) -> dispatch(Created(summary))
-            Error(problem) ->
-              dispatch(CreateFailed(thread_create.describe(problem)))
+      let outcome =
+        rescue.rescue(fn() {
+          case provider {
+            None -> Error("no provider configured")
+            Some(provider_id) -> {
+              let requested =
+                thread_registry.NewThread(
+                  provider_id: provider_id,
+                  model: alias,
+                  // The create panel pins the config default; a bot-sourced
+                  // create runs through create_from_bot_effect instead.
+                  system_prompt: None,
+                  bot_id: None,
+                )
+              case
+                thread_create.create_thread(
+                  providers,
+                  registry,
+                  timeout,
+                  requested,
+                )
+              {
+                Ok(summary) -> Ok(summary)
+                Error(problem) -> Error(thread_create.describe(problem))
+              }
+            }
           }
-        }
+        })
+      case outcome {
+        Ok(Ok(summary)) -> dispatch(Created(summary))
+        Ok(Error(reason)) -> dispatch(CreateFailed(reason))
+        Error(crash) -> dispatch(CreateFailed(crash))
       }
     })
     Nil
@@ -2113,18 +2132,28 @@ fn create_from_bot_effect(model: Model, bot_id: String) -> Effect(Msg) {
     // model-list re-validation blocks for up to the shared timeout,
     // and the connection's UI must keep serving events meanwhile.
     process.spawn_unlinked(fn() {
-      case
-        thread_create.create_thread_from_bot(
-          bots,
-          providers,
-          registry,
-          timeout,
-          bot_id,
-        )
-      {
-        Ok(summary) -> dispatch(Created(summary))
-        Error(problem) ->
-          dispatch(CreateFailed(thread_create.describe(problem)))
+      // Same rescue contract as `create_effect` above: every exit
+      // dispatches, so a crashed worker releases the pending guard
+      // (#90 review).
+      let outcome =
+        rescue.rescue(fn() {
+          case
+            thread_create.create_thread_from_bot(
+              bots,
+              providers,
+              registry,
+              timeout,
+              bot_id,
+            )
+          {
+            Ok(summary) -> Ok(summary)
+            Error(problem) -> Error(thread_create.describe(problem))
+          }
+        })
+      case outcome {
+        Ok(Ok(summary)) -> dispatch(Created(summary))
+        Ok(Error(reason)) -> dispatch(CreateFailed(reason))
+        Error(crash) -> dispatch(CreateFailed(crash))
       }
     })
     Nil

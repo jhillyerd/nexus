@@ -3843,3 +3843,68 @@ pub fn create_from_bot_worker_lands_provenance_test() {
   only.bot_id |> should.equal(Some("b7"))
   only.model |> should.equal("alias-1")
 }
+
+/// A worker CRASH (not a refusal) must still release the pending guard:
+/// with the provider registry dead, the create's first registry call
+/// panics inside the unlinked worker — the rescue maps that crash onto
+/// the create-failure path (note reaches the client, nothing lands
+/// server-side) instead of leaving `create_pending` True and Create
+/// disabled for the connection until a reload (#90 review).
+pub fn create_worker_crash_releases_guard_test() {
+  let started = process.new_subject()
+  let #(registry, providers, bots) =
+    start_offline_registries(fn(_seam) { Ok(Nil) }, fn(_endpoint) {
+      let gate = process.new_subject()
+      process.send(started, gate)
+      let assert Ok(answer) = process.receive(gate, 60_000)
+      answer
+    })
+  let #(runtime, client) = boot_create_runtime(registry, providers, bots)
+
+  // The first fetch signal proves the boot provider load landed; answer
+  // it so the cascade drains.
+  let assert Ok(gate_1) = process.receive(started, 10_000)
+  process.send(gate_1, Ok(["alias-1"]))
+
+  // Kill the provider registry (unlinked first: it is linked to this
+  // test process). The worker's very next registry call now panics.
+  let assert Ok(pid) = process.subject_owner(providers)
+  process.unlink(pid)
+  process.kill(pid)
+
+  lustre.send(
+    to: runtime,
+    message: lustre.dispatch(ui.PickerChanged("alias-1")),
+  )
+  lustre.send(to: runtime, message: lustre.dispatch(ui.CreateRequested))
+
+  // The crash surfaces as a create-failure note (the guard clears with
+  // it — pinned offline by create_failed_clears_guard_and_allows_retry).
+  let _ = wait_for_patch_prefix(client, "could not create thread: ", 40)
+  thread_registry.list_threads(registry) |> should.equal([])
+}
+
+/// Like `wait_for_patch`, but matching a PREFIX — the crash note's
+/// reason is the rescued crash term, not fixed vocabulary.
+fn wait_for_patch_prefix(
+  client: process.Subject(server_component.ClientMessage(ui.Msg)),
+  prefix: String,
+  attempts: Int,
+) -> String {
+  case attempts {
+    0 -> panic as { "patch never arrived: " <> prefix }
+    _ ->
+      case process.receive(client, 200) {
+        Error(_) -> wait_for_patch_prefix(client, prefix, attempts - 1)
+        Ok(message) -> {
+          let text =
+            server_component.client_message_to_json(message)
+            |> json.to_string
+          case string.contains(text, prefix) {
+            True -> text
+            False -> wait_for_patch_prefix(client, prefix, attempts - 1)
+          }
+        }
+      }
+  }
+}
