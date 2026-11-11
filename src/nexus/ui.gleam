@@ -719,7 +719,12 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       // signals (picker re-aim / list reload / log note) into this
       // model. The sub-effect rides along mapped back into `Settings`.
       let #(settings, inner_eff, signals) =
-        ui_settings.update(model.settings, msg, model.providers)
+        ui_settings.update(
+          model.settings,
+          msg,
+          model.providers,
+          model.models_timeout_ms,
+        )
       let #(model, signal_effs) =
         list.fold(
           signals,

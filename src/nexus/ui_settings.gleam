@@ -121,13 +121,17 @@ pub fn init() -> State {
 }
 
 /// The sub-update. `providers` is the registry subject for this
-/// connection's runtime (passed down from the parent model). Returns
+/// connection's runtime (passed down from the parent model), and
+/// `models_timeout_ms` the shared live-model budget
+/// (`thread_create.models_timeout`) — every `list_models` call this
+/// connection makes uses it, the Test control included. Returns
 /// the next state, the sub-effect (already typed to `Msg`; the parent
 /// maps it), and the signals the parent must fold.
 pub fn update(
   state: State,
   msg: Msg,
   providers: Subject(provider_registry.Msg),
+  models_timeout_ms: Int,
 ) -> #(State, Effect(Msg), List(Signal)) {
   case msg {
     Ignored -> #(state, effect.none(), [])
@@ -198,7 +202,7 @@ pub fn update(
 
     TestRequested(id) -> #(
       State(..state, models: ModelsLoading(id)),
-      models_effect(providers, id),
+      models_effect(providers, id, models_timeout_ms),
       [],
     )
 
@@ -596,15 +600,17 @@ fn delete_provider_effect(
 /// out its timeout when the endpoint hangs (the registry replies from
 /// an unlinked fetch process) — so the call must NOT run on the
 /// runtime: spawn it unlinked and dispatch the reply back (the same
-/// off-loop shape the registry itself uses for the fetch). The
-/// generous timeout mirrors the create-panel aliases path.
+/// off-loop shape the registry itself uses for the fetch). The timeout
+/// is the shared live-model budget, same rule as the create-panel
+/// aliases path and the create preflight.
 fn models_effect(
   providers: Subject(provider_registry.Msg),
   id: String,
+  models_timeout_ms: Int,
 ) -> Effect(Msg) {
   effect.from(fn(dispatch) {
     process.spawn_unlinked(fn() {
-      case provider_registry.list_models(providers, id, 60_000) {
+      case provider_registry.list_models(providers, id, models_timeout_ms) {
         Ok(aliases) -> dispatch(ModelsLoaded(id, aliases))
         Error(error) ->
           dispatch(TestFailed(id, provider_registry.describe(error)))

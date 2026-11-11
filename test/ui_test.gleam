@@ -3183,8 +3183,6 @@ fn fixture_resolver() -> thread_registry.ResolveProvider {
   }
 }
 
-/// Config for the real registries: valid key material (the provider
-/// registry decrypt-validates at boot), otherwise test defaults.
 /// The common creation request shape: pin provider + model,
 /// config-default prompt.
 fn new_thread(provider_id: String, model: String) -> thread_registry.NewThread {
@@ -3195,6 +3193,8 @@ fn new_thread(provider_id: String, model: String) -> thread_registry.NewThread {
   )
 }
 
+/// Config for the real registries: valid key material (the provider
+/// registry decrypt-validates at boot), otherwise test defaults.
 fn test_config() -> config.Config {
   config.Config(
     encryption_key: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",

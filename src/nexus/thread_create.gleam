@@ -25,10 +25,10 @@ import nexus/thread
 import nexus/thread_registry
 
 /// The live model-list budget: the endpoint's first-response timeout plus
-/// round-trip headroom. ONE rule for every `list_models` call — the
-/// create preflight below, web's models routes, and the UI's picker
-/// (which previously hard-coded 60_000 while web derived the value from
-/// config).
+/// round-trip headroom. ONE rule for every `list_models` call in the app
+/// — the create preflight below, web's models routes, the UI's create
+/// panel picker, and the settings page's connection Test (all of which
+/// previously hard-coded or re-derived the value per surface).
 pub fn models_timeout(cfg: Config) -> Int {
   cfg.sse_first_response_timeout_ms + 5000
 }
