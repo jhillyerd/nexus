@@ -2,7 +2,7 @@
 title: Nexus — bots and profiles (named thread templates, per-bot toolsets, bot-to-bot messaging)
 status: active
 tags: [nexus, bots, threads, agents, kv-cache, gleam, beam]
-updated: 2026-11-10
+updated: 2026-11-11
 ---
 
 # Bots and profiles
@@ -43,6 +43,13 @@ plan builds, and the vocabulary the session→thread rename aligned with).
 >    vestigial column would be schema debt.
 > 6. Bot-generated content is **hostile text** under the existing UI
 >    contract — rendered as Lustre text nodes, never `innerHTML`.
+> 7. **Bot CRUD is owned by a separate `bot_registry` actor** (issue
+>    #74), not folded into the provider registry — the provider
+>    registry's identity is the key-material boundary, and secret-free
+>    bots on a growth path through P3 would only bloat it. Registries
+>    stay mutually ignorant; orchestration lives with the callers — web
+>    and UI runtime, through `nexus/thread_create` (Phase 1, "Process
+>    ownership").
 
 ## Vocabulary
 
@@ -159,6 +166,79 @@ Store (squirrel, one query per file, then `gleam run -m squirrel`):
 `insert_bot`, `get_bot`, `list_bots`, `update_bot`, `delete_bot`,
 `count_bots_for_provider`; `insert_thread.sql` grows a `bot_id` column;
 `get_thread`/`list_threads` return it.
+
+### Process ownership — the bot registry (#74)
+
+All store access other than the thread commit hook goes through a
+registry (ARCHITECTURE.md §8 rule 2), so bot rows get their own small
+actor: `nexus/bot_registry`, a `gleam_otp` actor around the store seam
+following the provider-registry pattern **minus its security machinery**
+— bots carry no key material, so there is no envelope to
+decrypt-validate at boot and no resolve memo, and no network call ever
+runs inside it (nothing `ListModels`-like to quarantine).
+
+- **Messages** mirror provider CRUD — `List`, `Get`, `Create(params)`,
+  `Update(id, patch)`, `Delete(id)`, the patch a present-fields-replace
+  `BotUpdate` record like `provider.ProviderUpdate` — with a closed
+  error vocabulary
+  (`Unknown`, `InvalidName`, `DuplicateName`, `StoreFailed`) the HTTP
+  layer maps exactly like `provider_registry.RegistryError`.
+- **State**: the whole table loaded once at start (uniform with the
+  provider registry, so the duplicate-name pre-check answers from
+  state; `bot_name` stays the backstop), write-through on CRUD. Unlike
+  providers there is nothing to validate at load — a bot row cannot
+  be invalid at rest, and a stale model alias is legitimate (it is
+  caught at thread create, below). The load itself still fails boot on
+  an unreachable store, exactly as the provider registry's does.
+- **Boot slot**: after the provider registry, before the factory —
+  start order becomes store → provider registry → **bot registry** →
+  factory → thread registry → mist. Strictly the actor needs only the
+  store; the slot groups the settings entities. Under the OneForAll
+  root the split buys no isolation and folding would buy none either
+  — this decision is about message surface and state ownership.
+- **No registry→registry edges** (the §8-shaped rule to record):
+  - `delete_provider`'s bot guard is a **store count** —
+    `count_bots_for_provider` inside the provider registry, exactly
+    like `count_threads_for_provider` today, riding both halves of the
+    guard (the pre-check and the post-error `still_pinned` recheck) —
+    never a call into the bot registry.
+  - `POST`/`PATCH /bots` validate `provider_id` against the
+    provider-registry subject the web layer already holds (friendly
+    400 — a PATCH can move a bot between providers); the
+    `ON DELETE RESTRICT` FK is the backstop.
+  - Create-from-bot orchestration extends `nexus/thread_create` (#73),
+    the path both callers already share (web routes and the UI
+    runtime's create effect): resolve the bot → re-validate the
+    model alias against the provider's live list →
+    `thread_registry.create` with
+    `NewThread(provider_id, model, system_prompt)` (#72 — `None` already
+    resolves to `cfg.system_prompt` at the one creation point). The bot
+    registry never resolves providers; the thread registry never sees
+    bots beyond the `bot_id` column.
+  - P3 keeps it CRUD-only: bot-to-bot delivery goes through the thread
+    registry (Phase 3), so the bot registry's consumers are web/UI,
+    never turn machinery — if P3's delivery tool needs bot identity,
+    it reads the registry worker-side (the §8 rule-1 exception class,
+    like the utility worker's asks), never from an actor loop.
+- **Rejected alternative** — folding bots into the provider registry
+  ("both are settings entities"): that is a UI-similarity argument, not
+  an ownership one. The provider registry's contract is key custody at
+  stable scope, while bots grow through P2/P3; folding's one advantage
+  (validating `bot.provider_id` against the in-state provider list) is
+  had instead by the web-layer check above.
+- **ARCHITECTURE.md** rides in the Phase 1 implementation PR, landed
+  together with the code, never in a doc-only PR ahead of it (the
+  file's header has it track HEAD, so it must not describe the actor
+  before the actor exists): §2 supervision tree (new
+  child after the provider registry; start steps renumbered), §3
+  inventory row, §4 communication map (`rt → bot registry` for the
+  Settings Bots section AND the create-from-bot flow, `api → bot
+  registry` for `/bots`; create-from-bot fans out from the callers
+  through `thread_create`, so it adds no registry-to-registry edge), §6 "Bot registry" subsection after Provider
+  registry recording the no-cross-edges rule (store counts, not actor
+  calls). Coverage: a bot-registry actor test against the store mock
+  (CRUD round-trip, in-state name pre-check, unknown-id update/delete),
+  plus the provider-side `delete_provider` 409 while bots pin.
 
 Wire (`web.gleam`, following the `/providers` pattern):
 `GET/POST/PATCH/DELETE /bots`. `POST /threads` accepts either
