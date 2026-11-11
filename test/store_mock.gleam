@@ -355,8 +355,11 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
                 Stored(
                   store.StoredSummary(
                     ..summary,
-                    tags_manual: [],
-                    tags_source: thread.AutoTags,
+                    meta: thread.ThreadMeta(
+                      ..summary.meta,
+                      tags_manual: [],
+                      tags_source: thread.AutoTags,
+                    ),
                   ),
                   system_prompt,
                   [],
@@ -412,8 +415,11 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
           ..update(state, id, fn(summary) {
             store.StoredSummary(
               ..summary,
-              title: title,
-              title_source: thread.ManualTitle,
+              meta: thread.ThreadMeta(
+                ..summary.meta,
+                title: title,
+                title_source: thread.ManualTitle,
+              ),
             )
           }),
           events: [EvSetTitle(id, title), ..state.events],
@@ -428,13 +434,16 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
           actor.continue(state)
         }
         Ok(stored) ->
-          case stored.summary.title_source, stored.summary.title {
+          case stored.summary.meta.title_source, stored.summary.meta.title {
             thread.AutoTitle, "" -> {
               process.send(reply, Ok(True))
               actor.continue(
                 State(
                   ..update(state, id, fn(summary) {
-                    store.StoredSummary(..summary, title: title)
+                    store.StoredSummary(
+                      ..summary,
+                      meta: thread.ThreadMeta(..summary.meta, title: title),
+                    )
                   }),
                   events: [EvAutoTitle(id, title), ..state.events],
                 ),
@@ -459,13 +468,23 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
           actor.continue(state)
         }
         Ok(stored) ->
-          case stored.summary.title_source, stored.summary.tags_source {
+          case
+            stored.summary.meta.title_source,
+            stored.summary.meta.tags_source
+          {
             thread.AutoTitle, thread.AutoTags -> {
               process.send(reply, Ok(True))
               actor.continue(
                 State(
                   ..update(state, id, fn(summary) {
-                    store.StoredSummary(..summary, title: title, tags: tags)
+                    store.StoredSummary(
+                      ..summary,
+                      meta: thread.ThreadMeta(
+                        ..summary.meta,
+                        title: title,
+                        tags: tags,
+                      ),
+                    )
                   }),
                   events: [EvAutoMetaUpgrade(id, title, tags), ..state.events],
                 ),
@@ -491,9 +510,12 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
               ..stored,
               summary: store.StoredSummary(
                 ..stored.summary,
-                tags: tags,
-                tags_manual: tags,
-                tags_source: thread.ManualTags,
+                meta: thread.ThreadMeta(
+                  ..stored.summary.meta,
+                  tags: tags,
+                  tags_manual: tags,
+                  tags_source: thread.ManualTags,
+                ),
               ),
             )
           }),
@@ -507,7 +529,10 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
       actor.continue(
         State(
           ..update(state, id, fn(summary) {
-            store.StoredSummary(..summary, pinned: pinned)
+            store.StoredSummary(
+              ..summary,
+              meta: thread.ThreadMeta(..summary.meta, pinned: pinned),
+            )
           }),
           events: [EvSetPinned(id, pinned), ..state.events],
         ),
@@ -519,7 +544,14 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
       actor.continue(
         State(
           ..update(state, id, fn(summary) {
-            store.StoredSummary(..summary, archived: True, pinned: False)
+            store.StoredSummary(
+              ..summary,
+              meta: thread.ThreadMeta(
+                ..summary.meta,
+                archived: True,
+                pinned: False,
+              ),
+            )
           }),
           events: [EvArchive(id), ..state.events],
         ),
@@ -531,7 +563,10 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
       actor.continue(
         State(
           ..update(state, id, fn(summary) {
-            store.StoredSummary(..summary, archived: False)
+            store.StoredSummary(
+              ..summary,
+              meta: thread.ThreadMeta(..summary.meta, archived: False),
+            )
           }),
           events: [EvUnarchive(id), ..state.events],
         ),
@@ -801,7 +836,7 @@ const prune_grace_s = 900
 
 fn never_used(summary: StoredSummary, cutoff_s: Int) -> Bool {
   summary.message_count <= 1
-  && summary.title_source == thread.AutoTitle
-  && !summary.pinned
+  && summary.meta.title_source == thread.AutoTitle
+  && !summary.meta.pinned
   && summary.last_active_at < cutoff_s
 }

@@ -333,11 +333,56 @@ pub type TitleSource {
 /// `ManualTags` — a manual tag edit froze the set forever (the guard IS
 /// the tombstone: a user-deleted auto tag can never resurrect). Mirrors
 /// `tags_source` in the schema ('auto' | 'manual'). Organizational
-/// metadata beside the transcript; the UI-facing `ThreadSummary`
-/// deliberately does not carry it — chips are provenance-indistinguishable.
+/// metadata beside the transcript; carried on `ThreadMeta` (registry
+/// `Record` + store `StoredSummary` — the two types whose update guards
+/// need it) but NOT on the UI-facing `ThreadSummary` — chips are
+/// provenance-indistinguishable.
 pub type TagsSource {
   AutoTags
   ManualTags
+}
+
+/// The organizational metadata a thread carries beside its transcript,
+/// shared verbatim by the registry's live `Record` and the store's
+/// `StoredSummary` (issue #75): ONE type so a new metadata column (the
+/// bots plan's `bot_id`, later `toolset`) is one field added here, not
+/// paired edits across ~40 constructions plus twin update guards.
+/// Never enters a request body — KV-cache contract (guarded by the
+/// golden metadata-isolation test). The UI-facing `ThreadSummary`
+/// deliberately stays flat: it is derived FROM this type by the
+/// registry's `summarise`/`stored_summary_as`, minus the provenance
+/// half (`tags_manual`, `tags_source`) the UI must not see.
+pub type ThreadMeta {
+  ThreadMeta(
+    /// Display title; "" until the first user message auto-titles it.
+    title: String,
+    /// Auto titles are generated once from the first user message; a
+    /// manual rename pins the title forever.
+    title_source: TitleSource,
+    pinned: Bool,
+    /// The display union (auto ∪ manual). Manual saves are normalized
+    /// on write through the ONE shared rule (`utility.normalize_tags`):
+    /// trimmed, lowercased, kebab-cased, empties and duplicates dropped,
+    /// each tag capped at 24 characters. Auto merges
+    /// (`utility.merge_tags`) deliberately pass existing entries through
+    /// VERBATIM — a legacy `Work Notes` stays — and normalize only the
+    /// newly appended model tags, so the union's spellings are not all
+    /// guaranteed canonical.
+    tags: List(String),
+    /// The user's exact (normalized) set — the manual half of the
+    /// display union (utility-tags plan §3.4): `tags − tags_manual` is
+    /// the auto contribution. Written verbatim by `set_tags`, never by
+    /// a merge.
+    tags_manual: List(String),
+    /// Auto: model tags may still merge into the display set. Manual: a
+    /// manual tag edit froze the set forever — the in-memory half of the
+    /// twin invariant (the store's `tags_source` column is the other).
+    tags_source: TagsSource,
+    /// Soft-hide flag: archived threads stay restorable until deleted.
+    archived: Bool,
+    /// Wall-clock epoch seconds at creation (display ordering only).
+    created_at: Int,
+  )
 }
 
 /// What a thread reports about itself; the registry fills in the

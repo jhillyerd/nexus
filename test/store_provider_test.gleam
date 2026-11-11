@@ -48,17 +48,23 @@ fn summary(id: String, provider_id: String) -> store.StoredSummary {
   store.StoredSummary(
     id: id,
     provider_id: provider_id,
+    model: "alias-1",
+    meta: fresh_meta(),
+    last_active_at: 1_700_000_000,
+    message_count: 1,
+  )
+}
+
+fn fresh_meta() -> thread.ThreadMeta {
+  thread.ThreadMeta(
     title: "",
     title_source: thread.AutoTitle,
-    model: "alias-1",
     pinned: False,
-    archived: False,
     tags: [],
     tags_manual: [],
     tags_source: thread.AutoTags,
+    archived: False,
     created_at: 1_700_000_000,
-    last_active_at: 1_700_000_000,
-    message_count: 1,
   )
 }
 
