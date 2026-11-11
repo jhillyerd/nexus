@@ -140,19 +140,42 @@ fn drain(
   }
 }
 
+/// What a create hands the tests: the fresh summary's display fields plus
+/// the live actor's identity (subject resolved through the registry, pid
+/// derived from it — the create reply is a `ThreadSummary` now).
+type Created {
+  Created(
+    id: String,
+    model: String,
+    subject: process.Subject(thread.Msg),
+    pid: process.Pid,
+  )
+}
+
 fn create(
   registry: process.Subject(thread_registry.Msg),
   model: String,
   runner: thread.TurnRunner,
-) -> thread_registry.ThreadRecord {
-  let assert Ok(record) =
+) -> Created {
+  let assert Ok(summary) =
     thread_registry.create_with_runner(
       registry,
-      store_mock.fixture_provider_id,
-      model,
+      new_thread(store_mock.fixture_provider_id, model),
       runner,
     )
-  record
+  let assert Ok(subject) = thread_registry.get(registry, summary.id)
+  let assert Ok(pid) = process.subject_owner(subject)
+  Created(id: summary.id, model: summary.model, subject: subject, pid: pid)
+}
+
+/// The common creation request shape: pin provider + model,
+/// config-default prompt.
+fn new_thread(provider_id: String, model: String) -> thread_registry.NewThread {
+  thread_registry.NewThread(
+    provider_id: provider_id,
+    model: model,
+    system_prompt: None,
+  )
 }
 
 /// Block until `pid` is observed down (the registry's own monitor fires
@@ -189,8 +212,7 @@ pub fn create_rejects_empty_model_test() {
   let registry = start_registry()
   thread_registry.create_with_runner(
     registry,
-    store_mock.fixture_provider_id,
-    "   ",
+    new_thread(store_mock.fixture_provider_id, "   "),
     happy_runner,
   )
   |> should.equal(Error(thread_registry.EmptyModel))
@@ -324,8 +346,7 @@ pub fn startup_failure_is_surfaced_not_a_crash_test() {
   case
     thread_registry.create_with_runner(
       registry,
-      store_mock.fixture_provider_id,
-      "alpha",
+      new_thread(store_mock.fixture_provider_id, "alpha"),
       happy_runner,
     )
   {
@@ -1029,7 +1050,11 @@ pub fn boot_sweep_prune_failure_keeps_thread_test() {
 /// (provider, model) pin in place).
 pub fn create_rejects_unknown_provider_test() {
   let registry = start_registry()
-  thread_registry.create_with_runner(registry, "p-nope", "alpha", happy_runner)
+  thread_registry.create_with_runner(
+    registry,
+    new_thread("p-nope", "alpha"),
+    happy_runner,
+  )
   |> should.equal(
     Error(thread_registry.ProviderFailed(thread_registry.ProviderUnknown)),
   )
@@ -1060,8 +1085,7 @@ pub fn create_rejects_disabled_provider_test() {
     )
   thread_registry.create_with_runner(
     started.data,
-    store_mock.fixture_provider_id,
-    "alpha",
+    new_thread(store_mock.fixture_provider_id, "alpha"),
     happy_runner,
   )
   |> should.equal(

@@ -66,20 +66,19 @@ pub type ChildArgument {
   ChildArgument(spec: thread.ThreadSpec, name: process.Name(thread.Msg))
 }
 
-/// A live thread as the registry hands it to callers (the HTTP layer).
-pub type ThreadRecord {
-  ThreadRecord(
-    id: String,
-    model: String,
-    subject: Subject(thread.Msg),
-    /// The live actor's PID. Exposed so callers (and tests) can observe the
-    /// restart: the replacement keeps `id` and `name` but is a new PID.
-    pid: Pid,
-  )
+/// The creation request (bots prep, #73): everything a new thread freezes
+/// at birth. `system_prompt: None` means the global default, resolved HERE
+/// at creation — the one NULL/default resolution point, and the value the
+/// same insert persists, so hydration rebuilds a byte-identical prefix.
+/// (From the bots plan, a bot's prompt arrives explicit or None; the
+/// record grows the bot_id provenance pointer with the bots schema.)
+pub type NewThread {
+  NewThread(provider_id: String, model: String, system_prompt: Option(String))
 }
 
-/// Reply payload for `Create`: a live record, or a failure the HTTP layer
-/// maps onto a status code.
+/// Reply payload for `Create`: a failure the HTTP layer maps onto a
+/// status code. Success carries the fresh `ThreadSummary` directly, so
+/// neither surface (HTTP, UI) ever hand-builds one (#73).
 pub type CreateError {
   EmptyModel
   /// The pinned provider could not be resolved into a streaming
@@ -121,20 +120,20 @@ pub type UpgradeOutcome {
 }
 
 pub type Msg {
-  /// Start a new thread pinned to `provider_id` + `model` using the
-  /// registry's frozen tool runner (built once at registry start, so the
-  /// tool schema is identical in every request of every thread).
+  /// Start a new thread from `NewThread` (provider pin + model + optional
+  /// explicit system prompt) using the registry's frozen tool runner
+  /// (built once at registry start, so the tool schema is identical in
+  /// every request of every thread). Replies with the fresh
+  /// `ThreadSummary`.
   Create(
-    provider_id: String,
-    model: String,
-    reply: Subject(Result(ThreadRecord, CreateError)),
+    requested: NewThread,
+    reply: Subject(Result(thread.ThreadSummary, CreateError)),
   )
   /// Test seam: start a thread with an injected runner.
   CreateWithRunner(
-    provider_id: String,
-    model: String,
+    requested: NewThread,
     runner: thread.TurnRunner,
-    reply: Subject(Result(ThreadRecord, CreateError)),
+    reply: Subject(Result(thread.ThreadSummary, CreateError)),
   )
   /// Resolve a thread subject — live, or a stored-but-not-live id
   /// (Phase 2: which lazily starts a hydrated actor). `Error(Nil)` for
@@ -476,11 +475,11 @@ fn boot_sweep(persistence: Store) -> List(String) {
 
 fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
   case msg {
-    Create(provider_id, model, reply) ->
-      handle_create(state, provider_id, model, state.runner, reply)
+    Create(requested, reply) ->
+      handle_create(state, requested, state.runner, reply)
 
-    CreateWithRunner(provider_id, model, runner, reply) ->
-      handle_create(state, provider_id, model, runner, reply)
+    CreateWithRunner(requested, runner, reply) ->
+      handle_create(state, requested, runner, reply)
 
     _ -> handle_rest(state, msg)
   }
@@ -488,12 +487,11 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
 
 fn handle_create(
   state: State,
-  provider_id: String,
-  model: String,
+  requested: NewThread,
   runner: thread.TurnRunner,
-  reply: Subject(Result(ThreadRecord, CreateError)),
+  reply: Subject(Result(thread.ThreadSummary, CreateError)),
 ) -> actor.Next(State, Msg) {
-  case string.trim(model) {
+  case string.trim(requested.model) {
     "" -> {
       process.send(reply, Error(EmptyModel))
       actor.continue(state)
@@ -502,7 +500,7 @@ fn handle_create(
       // Resolve the endpoint FIRST: a thread is only ever created with
       // its frozen (provider, model) pin in place — there is no
       // create-then-attach path (multi-provider plan §8).
-      case state.resolve_provider(provider_id) {
+      case state.resolve_provider(requested.provider_id) {
         Error(reason) -> {
           process.send(reply, Error(ProviderFailed(reason)))
           actor.continue(state)
@@ -511,15 +509,24 @@ fn handle_create(
           let counter = state.counter + 1
           let id = "s" <> int.to_string(counter)
           let name = process.new_name("nexus_thread_" <> id)
+          // The registry resolves the system prompt at creation: an
+          // explicit request prompt (a bot's, from the bots plan) or the
+          // config default — the ONE NULL/default resolution point (#72).
+          // It is frozen into the transcript here — the ONE construction
+          // path — and the same prompt is persisted by insert_thread
+          // below, so create and hydration always agree byte-identically.
+          let prompt =
+            option.unwrap(requested.system_prompt, state.cfg.system_prompt)
+          let transcript = transcript.new(alias, prompt)
           let spec =
             thread.ThreadSpec(
               id: id,
               cfg: state.cfg,
-              model: alias,
               endpoint: endpoint,
               runner: runner,
               commit_hook: commit_hook_for(state.store, id),
-              hydrate: None,
+              transcript: transcript,
+              hydrated: False,
               utility_runner: state.utility_runner,
               utility_apply: utility_apply_for(state.self, id),
             )
@@ -538,7 +545,7 @@ fn handle_create(
                 state.store.insert_thread(
                   store.StoredSummary(
                     id: id,
-                    provider_id: provider_id,
+                    provider_id: requested.provider_id,
                     title: "",
                     title_source: thread.AutoTitle,
                     model: alias,
@@ -555,7 +562,10 @@ fn handle_create(
                     // 1 = the system prompt (Phase 1 message_count).
                     message_count: 1,
                   ),
-                  state.cfg.system_prompt,
+                  // The RESOLVED prompt — the exact bytes frozen into the
+                  // transcript above, never the config default an explicit
+                  // request may have overridden.
+                  prompt,
                 )
               {
                 Ok(_) -> True
@@ -567,7 +577,7 @@ fn handle_create(
               let record =
                 Record(
                   id: id,
-                  provider_id: provider_id,
+                  provider_id: requested.provider_id,
                   model: alias,
                   subject: started.data,
                   pid: started.pid,
@@ -585,7 +595,30 @@ fn handle_create(
                   created_at: created_at,
                   persisted: persisted,
                 )
-              process.send(reply, Ok(as_public(record)))
+              // The create reply IS the summary (#73): the same shape a
+              // following List would report (message_count 1 = the system
+              // prompt, activity = creation) — web and UI never hand-build
+              // one again.
+              process.send(
+                reply,
+                Ok(thread.ThreadSummary(
+                  id: id,
+                  provider_id: requested.provider_id,
+                  model: alias,
+                  title: "",
+                  title_source: thread.AutoTitle,
+                  pinned: False,
+                  tags: [],
+                  archived: False,
+                  message_count: 1,
+                  streaming: False,
+                  created_at: created_at,
+                  // Until the first commit, a thread's activity is its
+                  // creation.
+                  last_active_at: created_at,
+                  metrics: [],
+                )),
+              )
               actor.continue(
                 State(
                   ..state,
@@ -1022,7 +1055,14 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
             True ->
               case rebuild_transcript(state, record.id) {
                 Ok(transcript) ->
-                  thread.ThreadSpec(..record.spec, hydrate: Some(transcript))
+                  thread.ThreadSpec(
+                    ..record.spec,
+                    transcript: transcript,
+                    // The replacement is a hydrated restart: its first
+                    // exchange predates the new actor, so it never
+                    // attempts the utility-titles upgrade.
+                    hydrated: True,
+                  )
                 Error(error) -> {
                   log_store_error("rehydrate " <> record.id, error)
                   record.spec
@@ -1162,11 +1202,11 @@ fn lazy_start(state: State, summary: StoredSummary) -> Resolved {
             thread.ThreadSpec(
               id: summary.id,
               cfg: state.cfg,
-              model: summary.model,
               endpoint: endpoint,
               runner: state.runner,
               commit_hook: commit_hook_for(state.store, summary.id),
-              hydrate: Some(transcript),
+              transcript: transcript,
+              hydrated: True,
               utility_runner: state.utility_runner,
               utility_apply: utility_apply_for(state.self, summary.id),
             )
@@ -1228,7 +1268,14 @@ fn retry_rehydrate(state: State, record: Record) -> Resolved {
       Missing
     }
     Ok(transcript) -> {
-      let spec = thread.ThreadSpec(..record.spec, hydrate: Some(transcript))
+      let spec =
+        thread.ThreadSpec(
+          ..record.spec,
+          transcript: transcript,
+          // Same rule as the Down replacement: a rehydrating restart
+          // never attempts the utility-titles upgrade.
+          hydrated: True,
+        )
       let argument = ChildArgument(spec: spec, name: record.name)
       case restart(state.factory, argument) {
         Ok(started) -> {
@@ -1463,15 +1510,6 @@ fn compare_summaries(
   }
 }
 
-fn as_public(record: Record) -> ThreadRecord {
-  ThreadRecord(
-    id: record.id,
-    model: record.model,
-    subject: record.subject,
-    pid: record.pid,
-  )
-}
-
 fn summarise(
   record: Record,
   status: thread.ThreadStatus,
@@ -1554,23 +1592,25 @@ fn restart(
 // Client helpers
 // ---------------------------------------------------------------------------
 
+/// Create a thread from the request record. The provider/model validation
+/// (a network call) belongs in `nexus/thread_create`, OUTSIDE this loop —
+/// this ask only resolves the endpoint and starts the child. Replies with
+/// the fresh summary.
 pub fn create(
   registry: Subject(Msg),
-  provider_id: String,
-  model: String,
-) -> Result(ThreadRecord, CreateError) {
-  actor.call(registry, 5000, fn(reply) { Create(provider_id:, model:, reply:) })
+  requested: NewThread,
+) -> Result(thread.ThreadSummary, CreateError) {
+  actor.call(registry, 5000, fn(reply) { Create(requested:, reply:) })
 }
 
 /// Test seam: create a thread with an injected turn runner.
 pub fn create_with_runner(
   registry: Subject(Msg),
-  provider_id: String,
-  model: String,
+  requested: NewThread,
   runner: thread.TurnRunner,
-) -> Result(ThreadRecord, CreateError) {
+) -> Result(thread.ThreadSummary, CreateError) {
   actor.call(registry, 5000, fn(reply) {
-    CreateWithRunner(provider_id:, model:, runner:, reply:)
+    CreateWithRunner(requested:, runner:, reply:)
   })
 }
 

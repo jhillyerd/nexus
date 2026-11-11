@@ -235,14 +235,18 @@ pub type SendResult {
   Busy
 }
 
-/// Everything needed to construct one thread actor. The alias is frozen at
-/// construction (M2 §4.1): the transcript is created from `model`, never
-/// from a config default, and the config itself is never mutated.
+/// Everything needed to construct one thread actor. The starting
+/// transcript is frozen at construction: the REGISTRY resolves the
+/// system prompt (config default today, a bot's prompt from the bots
+/// plan) and builds the transcript through `transcript.new(model,
+/// prompt)` — the one construction path — so this module never reads
+/// `cfg.system_prompt` and the config itself is never mutated.
 ///
 /// Multi-provider P3 adds the second frozen half of the pin: `endpoint`,
 /// the provider transport resolved by the registry at create/hydration
-/// and held for the thread's lifetime. Together `model` + `endpoint`
-/// fix every request byte of the thread (KV-cache contract rule 5).
+/// and held for the thread's lifetime. Together the transcript's model
+/// + `endpoint` fix every request byte of the thread (KV-cache contract
+/// rule 5).
 ///
 /// Phase 2 adds two seams, both injected by the registry so this module
 /// never depends on it (dependency direction stays registry → thread):
@@ -251,10 +255,13 @@ pub type SendResult {
 ///   point (user append, turn completion). It is a non-blocking observer —
 ///   the store's write-behind lane — and must never mutate or encode
 ///   anything; the transcript it receives is the immutable actor state.
-/// - `hydrate` optionally supplies the transcript to start from. It must
-///   have been built through `nexus/transcript.new` + the `append_*`
+/// - `transcript` supplies the transcript to start from — fresh or
+///   rebuilt from the store, both built by the registry. It must have
+///   been built through `nexus/transcript.new` + the `append_*`
 ///   functions (the one construction path); a hydrated actor therefore
-///   re-encodes byte-identically by construction.
+///   re-encodes byte-identically by construction. `hydrated` says which
+///   kind it was (a restored thread never attempts the utility-titles
+///   upgrade — see `utility_attempted` below).
 ///
 /// Utility-titles P2 adds two more injected seams, again built by the
 /// registry so the dependency direction stays registry → thread:
@@ -272,15 +279,19 @@ pub type ThreadSpec {
     /// `ThreadEvent`.
     id: String,
     cfg: Config,
-    model: String,
     /// The frozen provider endpoint — what the runner streams through.
     endpoint: openai.Endpoint,
     runner: TurnRunner,
     /// Write-behind observer; `fn(_) { Nil }` when nobody persists.
     commit_hook: fn(Transcript) -> Nil,
-    /// Starting transcript for a hydrated (restored) thread; `None`
-    /// builds `transcript.new(model, cfg.system_prompt)` as before.
-    hydrate: Option(Transcript),
+    /// The starting transcript, built by the registry through
+    /// `transcript.new` + the `append_*` functions (the one construction
+    /// path), whether fresh or rebuilt from the store.
+    transcript: Transcript,
+    /// Whether `transcript` was restored from the store: a hydrated
+    /// thread's first exchange predates this actor, so it never attempts
+    /// the utility-titles upgrade.
+    hydrated: Bool,
     /// The utility side-call (title branch) — see `UtilityRunner`.
     utility_runner: UtilityRunner,
     /// Guarded title application — see `UtilityApply`.
@@ -589,11 +600,11 @@ fn start_builder(spec: ThreadSpec) {
   let ThreadSpec(
     id: id,
     cfg: cfg,
-    model: model,
     endpoint: endpoint,
     runner: runner,
     commit_hook: commit_hook,
-    hydrate: hydrate,
+    transcript: transcript,
+    hydrated: hydrated,
     utility_runner: utility_runner,
     utility_apply: utility_apply,
   ) = spec
@@ -603,15 +614,12 @@ fn start_builder(spec: ThreadSpec) {
       cfg: cfg,
       endpoint: endpoint,
       runner: runner,
-      // The selected alias is frozen into the transcript (M2 §4.1);
-      // the provider endpoint is frozen beside it (multi-provider §8).
-      // A hydrated thread starts from the rebuilt transcript — built by
-      // the very same `transcript.new` + `append_*` path, so the actor
-      // re-encodes byte-identically (KV-cache contract).
-      transcript: case hydrate {
-        Some(restored) -> restored
-        None -> transcript.new(model, cfg.system_prompt)
-      },
+      // The starting transcript is the registry's, verbatim — fresh
+      // threads get `transcript.new(model, prompt)` built at create,
+      // hydrated ones a store-rebuilt twin of the same construction
+      // path, so the actor re-encodes byte-identically either way
+      // (KV-cache contract).
+      transcript: transcript,
       subs: dict.new(),
       turn: Idle,
       turn_view: None,
@@ -623,10 +631,7 @@ fn start_builder(spec: ThreadSpec) {
       // restart therefore never re-titles an already-upgraded thread (the
       // upgrade leaves title_source = 'auto', so the store alone cannot
       // tell "upgraded" from "still the heuristic placeholder").
-      utility_attempted: case hydrate {
-        Some(_) -> True
-        None -> False
-      },
+      utility_attempted: hydrated,
       // A hydrated thread never attempts anyway (above), so the pass
       // count starts at zero in both cases and never moves.
       utility_passes: 0,

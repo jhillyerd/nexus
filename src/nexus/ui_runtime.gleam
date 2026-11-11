@@ -71,26 +71,33 @@ pub fn websocket(
   req: Request(mist.Connection),
   registry: Subject(thread_registry.Msg),
   providers: Subject(provider_registry.Msg),
+  models_timeout_ms: Int,
 ) -> Response(mist.ResponseData) {
   mist.websocket(
     request: req,
-    on_init: fn(_conn) { init_socket(runtime_flags(req, registry, providers)) },
+    on_init: fn(_conn) {
+      init_socket(runtime_flags(req, registry, providers, models_timeout_ms))
+    },
     handler: loop_socket,
     on_close: close_socket,
   )
 }
 
-/// The per-connection flags: the registry/provider subjects plus the
-/// client-supplied last-selected thread from the route's query string
-/// (the page shell persists it; see `nexus/page`).
+/// The per-connection flags: the registry/provider subjects, the shared
+/// live-model budget (the ONE `list_models` timeout rule — the UI's
+/// picker and its create path both use it), plus the client-supplied
+/// last-selected thread from the route's query string (the page shell
+/// persists it; see `nexus/page`).
 fn runtime_flags(
   req: Request(mist.Connection),
   registry: Subject(thread_registry.Msg),
   providers: Subject(provider_registry.Msg),
+  models_timeout_ms: Int,
 ) -> Flags {
   ui.Flags(
     registry: registry,
     providers: providers,
+    models_timeout_ms: models_timeout_ms,
     thread: query_param(req, "thread"),
   )
 }

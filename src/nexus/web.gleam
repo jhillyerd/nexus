@@ -28,6 +28,7 @@ import nexus/page
 import nexus/provider
 import nexus/provider_registry
 import nexus/thread
+import nexus/thread_create
 import nexus/thread_registry
 import nexus/timing
 import nexus/ui_runtime
@@ -84,7 +85,12 @@ pub fn handler(
         protected(cfg, req, fn() { pico_asset_response() })
       Get, ["ws"] ->
         protected(cfg, req, fn() {
-          ui_runtime.websocket(req, registry, providers)
+          ui_runtime.websocket(
+            req,
+            registry,
+            providers,
+            thread_create.models_timeout(cfg),
+          )
         })
       _, _ -> json_response(404, err_json("not found"))
     }
@@ -187,112 +193,54 @@ fn create_thread_response(
       case string.trim(fields.model), string.trim(fields.provider) {
         _, "" -> json_response(400, err_json("empty provider"))
         "", _ -> json_response(400, err_json("empty model"))
-        trimmed_model, ident ->
-          case resolve_provider(providers, ident) {
-            Error(#(status, reason)) -> json_response(status, err_json(reason))
-            Ok(found) ->
-              // Validate the alias against the provider's own live model
-              // list — the same preflight the old single-provider route
-              // did, now scoped to the pinned provider.
-              case
-                provider_registry.list_models(
-                  providers,
-                  found.id,
-                  cfg.sse_first_response_timeout_ms + 5000,
-                )
-              {
-                Error(_) ->
-                  json_response(
-                    502,
-                    err_json("unable to list models from provider"),
-                  )
-                Ok(models) ->
-                  case list.contains(models, trimmed_model) {
-                    False ->
-                      json_response(
-                        400,
-                        err_json("unknown model: " <> trimmed_model),
-                      )
-                    True ->
-                      case
-                        thread_registry.create(
-                          registry,
-                          found.id,
-                          trimmed_model,
-                        )
-                      {
-                        Ok(record) -> {
-                          let now = timing.wall_now_s()
-                          json_response(
-                            201,
-                            thread_summary_json(
-                              thread.ThreadSummary(
-                                id: record.id,
-                                provider_id: found.id,
-                                model: record.model,
-                                title: "",
-                                title_source: thread.AutoTitle,
-                                pinned: False,
-                                tags: [],
-                                archived: False,
-                                message_count: 0,
-                                streaming: False,
-                                created_at: now,
-                                last_active_at: now,
-                                metrics: [],
-                              ),
-                            ),
-                          )
-                        }
-                        Error(thread_registry.EmptyModel) ->
-                          json_response(400, err_json("empty model"))
-                        Error(thread_registry.ProviderFailed(_)) ->
-                          // Pre-validation above owned the 400s; landing
-                          // here means the provider went away between
-                          // validation and create — a server-side race.
-                          json_response(
-                            502,
-                            err_json("provider became unusable"),
-                          )
-                        Error(thread_registry.StartFailed(reason)) ->
-                          json_response(
-                            503,
-                            err_json("thread unavailable: " <> reason),
-                          )
-                      }
-                  }
-              }
+        trimmed_model, ident -> {
+          // The shared orchestration (#73): provider resolution + live
+          // model-alias validation outside the registry's loop, then the
+          // create. The reply IS the summary — this layer never
+          // hand-builds one.
+          let requested =
+            thread_registry.NewThread(
+              provider_id: ident,
+              model: trimmed_model,
+              // POST /threads pins the config default today; the bots
+              // plan's create-from-bot sends the bot's prompt here.
+              system_prompt: None,
+            )
+          case
+            thread_create.create_thread(
+              providers,
+              registry,
+              thread_create.models_timeout(cfg),
+              requested,
+            )
+          {
+            Ok(summary) -> json_response(201, thread_summary_json(summary))
+            Error(problem) ->
+              json_response(
+                create_problem_status(problem),
+                err_json(thread_create.describe(problem)),
+              )
           }
+        }
       }
   }
 }
 
-/// Resolve the request's provider identifier (id or name) to registry
-/// metadata, refusing unknown and disabled providers with the plan's
-/// status mapping (§11: unknown → 400, disabled → 400). An exact ID match
-/// is checked FIRST: names are free-form, so a provider may be *named*
-/// after another provider's id — the id is the unambiguous key and must
-/// win when the two disagree.
-fn resolve_provider(
-  providers: process.Subject(provider_registry.Msg),
-  ident: String,
-) -> Result(provider.Provider, #(Int, String)) {
-  case provider_registry.list_providers(providers) {
-    Error(_) -> Error(#(502, "provider registry unavailable"))
-    Ok(all) -> {
-      let found = case list.find(all, fn(p) { p.id == ident }) {
-        Ok(by_id) -> Ok(by_id)
-        Error(_) -> list.find(all, fn(p) { p.name == ident })
-      }
-      case found {
-        Error(_) -> Error(#(400, "unknown provider: " <> ident))
-        Ok(found) ->
-          case found.enabled {
-            False -> Error(#(400, "provider is disabled: " <> found.name))
-            True -> Ok(found)
-          }
-      }
-    }
+/// The shared create vocabulary onto the plan's status codes (§11):
+/// pre-validation refusals are client errors (400), provider-side
+/// failures are server errors (502/503).
+fn create_problem_status(problem: thread_create.CreateProblem) -> Int {
+  case problem {
+    thread_create.ProvidersUnavailable -> 502
+    thread_create.ProviderNotFound(_) -> 400
+    thread_create.ProviderDisabled(_) -> 400
+    thread_create.ModelsUnavailable -> 502
+    thread_create.ModelUnknown(_) -> 400
+    // Post-validation registry refusals are races: the provider passed
+    // the live check, then could not stream when the thread pinned it.
+    thread_create.CreateFailed(thread_registry.EmptyModel) -> 400
+    thread_create.CreateFailed(thread_registry.ProviderFailed(_)) -> 502
+    thread_create.CreateFailed(thread_registry.StartFailed(_)) -> 503
   }
 }
 
@@ -590,13 +538,14 @@ fn provider_models_response(
   providers: process.Subject(provider_registry.Msg),
   id: String,
 ) -> Response(mist.ResponseData) {
-  // Same budget as the thread-create preflight: the live fetch mirrors
-  // the endpoint's first-response timeout, plus round-trip headroom.
+  // Same budget as the thread-create preflight (the shared rule in
+  // thread_create): the live fetch mirrors the endpoint's first-response
+  // timeout, plus round-trip headroom.
   case
     provider_registry.list_models(
       providers,
       id,
-      cfg.sse_first_response_timeout_ms + 5000,
+      thread_create.models_timeout(cfg),
     )
   {
     Ok(models) -> json_response(200, models_json(models))

@@ -292,41 +292,36 @@ pub fn golden_metadata_never_alters_request_bytes_test() {
   let fixture = load_fixture()
   let opts = loop_options()
   let registry = start_registry()
-  let assert Ok(record) =
+  let assert Ok(summary) =
     thread_registry.create_with_runner(
       registry,
-      store_mock.fixture_provider_id,
-      fixture.alias,
+      new_thread(store_mock.fixture_provider_id, fixture.alias),
       happy_runner,
     )
+  let assert Ok(sess) = thread_registry.get(registry, summary.id)
 
   // The first user message, exactly like the HTTP send boundary: auto-title
   // from its text (never an LLM call, never into the body).
-  should.equal(
-    thread.send_message(record.subject, "ZZ-FIRST-MSG-ZZ"),
-    thread.Sent,
-  )
-  drain_turn(record.subject)
-  should.be_true(thread_registry.auto_title(registry, record.id, "ZZ-TITLE-ZZ"))
+  should.equal(thread.send_message(sess, "ZZ-FIRST-MSG-ZZ"), thread.Sent)
+  drain_turn(sess)
+  should.be_true(thread_registry.auto_title(registry, summary.id, "ZZ-TITLE-ZZ"))
 
-  let body_before =
-    transcript.request_body(thread.snapshot(record.subject), opts)
+  let body_before = transcript.request_body(thread.snapshot(sess), opts)
 
   // Mutate every organizational field.
   should.be_true(thread_registry.set_title(
     registry,
-    record.id,
+    summary.id,
     "ZZ-MANUAL-TITLE-ZZ",
   ))
   should.be_true(
-    thread_registry.set_tags(registry, record.id, ["ZZ-TAG-ZZ", "ZZ-TAG2-ZZ"]),
+    thread_registry.set_tags(registry, summary.id, ["ZZ-TAG-ZZ", "ZZ-TAG2-ZZ"]),
   )
-  should.be_true(thread_registry.set_pinned(registry, record.id, True))
-  should.be_true(thread_registry.set_archived(registry, record.id, True))
+  should.be_true(thread_registry.set_pinned(registry, summary.id, True))
+  should.be_true(thread_registry.set_archived(registry, summary.id, True))
 
   // Byte-identical re-encode after the metadata churn.
-  let body_after =
-    transcript.request_body(thread.snapshot(record.subject), opts)
+  let body_after = transcript.request_body(thread.snapshot(sess), opts)
   should.equal(body_after, body_before)
 
   // No metadata marker (or metadata key name) appears in the body.
@@ -347,9 +342,19 @@ pub fn golden_metadata_never_alters_request_bytes_test() {
 
   // And a follow-up turn still grows the body by suffix only.
   let tr2 =
-    thread.snapshot(record.subject)
+    thread.snapshot(sess)
     |> transcript.append_user("ZZ-SECOND-MSG-ZZ")
   should.be_true(extends(body_before, transcript.request_body(tr2, opts)))
+}
+
+/// The common creation request shape: pin provider + model, config-default
+/// prompt.
+fn new_thread(provider_id: String, model: String) -> thread_registry.NewThread {
+  thread_registry.NewThread(
+    provider_id: provider_id,
+    model: model,
+    system_prompt: None,
+  )
 }
 
 fn start_registry() -> process.Subject(thread_registry.Msg) {
