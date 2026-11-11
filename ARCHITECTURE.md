@@ -33,6 +33,7 @@ flowchart TB
         subgraph shared["shared — one per VM"]
             reg["thread registry"]
             prov["provider registry"]
+            bots["bot registry"]
             store["store actor"]
         end
         subgraph perthread["per live thread"]
@@ -45,9 +46,11 @@ flowchart TB
     js <-- "WebSocket /ws" --> rt
     rt --> reg
     rt --> prov
+    rt --> bots
     reg --> sa
     sa --> store
     prov --> store
+    bots --> store
     store --> pg
     sa --> llm
 ```
@@ -59,7 +62,7 @@ The rest of this document names every process, its lifetime, and its edges.
 ## 2. The supervision tree
 
 `nexus/boot` builds one `OneForAll` root. Start order matters and is
-commented in the code: the registry hydrates from the store, threads
+commented in the code: the registries hydrate from the store, threads
 resolve providers through the provider registry, and HTTP traffic must find
 a live registry.
 
@@ -68,9 +71,10 @@ flowchart TB
     ROOT["root supervisor (OneForAll)<br/>nexus/boot"]
     ROOT -->|"1 — persistence is mandatory;<br/>unreachable DB fails boot"| STORE["store actor<br/>nexus/store/persist"]
     ROOT -->|"2 — loads + decrypt-validates<br/>every provider row"| PROV["provider registry<br/>nexus/provider_registry"]
-    ROOT -->|"3"| FACT["thread factory supervisor<br/>(temporary children)"]
-    ROOT -->|"4 — hydrates dormant threads,<br/>then starts serving"| REG["thread registry<br/>nexus/thread_registry"]
-    ROOT -->|"5 — no shared UI child:<br/>runtimes are per-connection"| MIST["mist HTTP + WS server<br/>nexus/web"]
+    ROOT -->|"3 — loads every bot row"| BOT["bot registry<br/>nexus/bot_registry"]
+    ROOT -->|"4"| FACT["thread factory supervisor<br/>(temporary children)"]
+    ROOT -->|"5 — hydrates dormant threads,<br/>then starts serving"| REG["thread registry<br/>nexus/thread_registry"]
+    ROOT -->|"6 — no shared UI child:<br/>runtimes are per-connection"| MIST["mist HTTP + WS server<br/>nexus/web"]
     FACT -.->|"starts on demand"| SA["thread actors<br/>nexus/thread"]
     REG -.->|"monitors; restarts a dead<br/>actor via the factory,<br/>rehydrating from the store"| SA
 ```
@@ -96,6 +100,7 @@ what is tied to what**.
 |---|---|---|---|---|
 | store actor (`nexus/store/persist`) | y | 1 per VM | boot → shutdown | shared by everything; owns the Postgres pool |
 | provider registry (`nexus/provider_registry`) | y | 1 per VM | boot → shutdown | shared; owns provider rows + plaintext keys |
+| bot registry (`nexus/bot_registry`) | y | 1 per VM | boot → shutdown | shared; owns bot rows (no secrets — the stored row is the public shape) |
 | thread registry (`nexus/thread_registry`) | y | 1 per VM | boot → shutdown | shared; owns thread IDs → live subjects |
 | mist server (`nexus/web`) | y (listener) | 1 listener per VM | boot → shutdown | shared; spawns one bare handler process per HTTP request / WS connection |
 | UI component runtime (`nexus/ui_runtime` → `nexus/ui`) | y | 1 per WebSocket | **linked to the socket handler** — the pair dies together | browser connection |
@@ -146,6 +151,7 @@ flowchart TB
     rt["UI runtime<br/>(1 per connection)"]
     reg["thread registry"]
     prov["provider registry"]
+    bots["bot registry"]
     api["HTTP JSON scripting API<br/>(NEXUS_UI_TOKEN bearer auth)"]
     sa["thread actor(s)"]
     tw["turn worker"]
@@ -161,6 +167,7 @@ flowchart TB
     ws --- rt
     rt -->|"Join / Leave / Send / Stop /<br/>Snapshot / Describe / create"| reg
     rt -->|"provider CRUD, ListModels<br/>(Settings view)"| prov
+    rt -->|"bot CRUD + from-bot resolve<br/>(Settings view, create panel)"| bots
     reg -->|"resolve, hydrate, Describe,<br/>metadata writes"| sa
     sa -.->|"ThreadEvent fan-out<br/>(id + visit filtered)"| rt
     sa -->|"spawn unlinked + monitor"| tw
@@ -174,8 +181,10 @@ flowchart TB
     sa -.->|"commit_hook<br/>(write-behind Commit)"| store
     reg -->|"sync reads + metadata"| store
     prov -->|"boot load + CRUD"| store
+    bots -->|"boot load + CRUD"| store
     api --> reg
     api --> prov
+    api --> bots
     store --> pg
 ```
 
@@ -205,7 +214,24 @@ flowchart TB
   from its state + the store, never calling into any thread (§8 rule 1).
 - **Scripting API → registries**: the same registry subjects the UI uses,
   over bearer-token-authenticated JSON routes (`/threads` CRUD + send/stop,
-  `/providers` CRUD + model listing; `/healthz` is the one open route).
+  `/providers` CRUD + model listing, `/bots` CRUD and the `{"bot": id}`
+  half of `POST /threads`; `/healthz` is the one open route).
+- **No registry-to-registry edges.** The bot registry and the provider
+  registry are mutually ignorant; orchestration lives with the callers
+  (web and the UI runtime, through `nexus/thread_create` — the one
+  creation path both surfaces share):
+  - `POST`/`PATCH /bots` validate `provider_id` against the
+    provider-registry subject the web layer already holds (friendly
+    400; the `ON DELETE RESTRICT` FK is the backstop);
+  - the provider registry's delete guard counts bots through the
+    STORE (`count_bots_for_provider`, riding both halves of the guard
+    alongside `count_threads_for_provider`) — never a call into the
+    bot registry;
+  - create-from-bot resolves the bot in `thread_create`, copies its
+    frozen values into the creation request, and re-validates the
+    model alias against the provider's LIVE list (a stale bot must
+    400, never silently succeed); the thread registry never sees
+    bots beyond the `bot_id` provenance column.
 
 ---
 
@@ -294,7 +320,7 @@ One pog-backed actor owning the single Postgres pool. Two lanes:
   `on conflict (thread_id, seq) do nothing`, so crash-recovery replays
   are idempotent.
 - **Write-through (synchronous)**: reads and metadata mutations, called by
-  the thread registry and provider registry.
+  the thread registry and both settings registries (provider, bot).
 
 The `nexus/store` module above it is the mockable seam (record of
 functions) plus pure transcript⇄row mappers — `gleam test` never touches a
@@ -307,7 +333,20 @@ or unreachable store fails boot loudly). Plaintext keys exist only inside
 `ResolvedProvider` handed to callers; reads reply with masked metadata.
 Resolve decrypts lazily into a memo invalidated by update/delete. CRUD
 pre-checks existence/name-uniqueness in state; deletes are refused while
-threads pin the provider (`ON DELETE RESTRICT`).
+threads OR BOTS pin the provider (`ON DELETE RESTRICT` — both halves of
+the guard are store counts; see the no-cross-edges rule in §4).
+
+### Bot registry
+
+Owns the `bot` rows (named creation-time thread templates: default
+provider + model + system prompt, no secrets — the stored row IS the
+public shape). Loads the whole table at boot (an unreachable store fails
+boot); write-through CRUD with the in-state duplicate-name pre-check;
+deletes are unguarded because `thread.bot_id` is `ON DELETE SET NULL`
+provenance — a bot's threads keep their frozen columns. A stale model
+alias is legitimate at rest: thread create re-validates it against the
+provider's live list. Never resolves providers (§4's no-edges rule) and
+never touches the network.
 
 ### Thread registry
 
@@ -356,7 +395,10 @@ utility-attempt bookkeeping.
    all other store access goes through the registries.
 3. **threads never call the provider registry.** Boot injects a resolver
    into the thread registry; endpoints are frozen into the thread spec
-   before the actor exists.
+   before the actor exists. The bot registry follows the same shape: no
+   registry-to-registry edges at all — caller-side validation and
+   cross-entity guards go through the store or the orchestrating caller
+   (`thread_create`), never actor-to-actor calls.
 4. **`nexus/codemode` is a leaf** — it must not import `nexus/tools`, or the
    codemode tool could invoke itself.
 5. **`nexus/transcript` is the single request-encoding path.** No volatile

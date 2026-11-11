@@ -17,7 +17,9 @@
 
 import gleam/erlang/process.{type Subject}
 import gleam/list
+import gleam/option.{Some}
 import gleam/result
+import nexus/bot_registry
 import nexus/config.{type Config}
 import nexus/provider.{type Provider}
 import nexus/provider_registry
@@ -49,6 +51,16 @@ pub type CreateProblem {
   /// The alias is not on the provider's live list — a stale alias (the
   /// bots plan's required 400 on create-from-bot).
   ModelUnknown(alias: String)
+  /// The bot registry itself could not be asked — server-side.
+  /// Defensive exhaustiveness arm: `get_bot` in practice only refuses
+  /// with `Unknown` (the registry serves reads from its boot-loaded
+  /// state, and a dead registry crashes the `actor.call` rather than
+  /// erroring), but `RegistryError` is a closed vocabulary — this arm
+  /// keeps the match honest and maps any future store-reading failure
+  /// onto the server-side 502.
+  BotsUnavailable
+  /// No bot with that id (bots plan P1: `POST {"bot": id}`).
+  BotUnknown(id: String)
   /// The registry refused. After the pre-validation above, these are
   /// races (provider vanished mid-flight) or start failures — the caller
   /// still maps them (400 empty model, 502 provider, 503 start).
@@ -72,6 +84,48 @@ pub fn create_thread(
   let pinned = thread_registry.NewThread(..requested, provider_id: found.id)
   thread_registry.create(registry, pinned)
   |> result.map_error(CreateFailed)
+}
+
+/// Create a thread FROM a bot (bots plan P1): resolve the bot, copy its
+/// provider/model/system prompt into the creation request (the bot is a
+/// creation-time template — the values freeze into the thread's columns
+/// and `bot_id` rides along as provenance), then run the SAME shared
+/// create. The bot registry is only asked HERE, in the orchestration both
+/// surfaces share — it never resolves providers, and the thread registry
+/// never sees bots beyond the `bot_id` column. A bot's model alias is
+/// re-validated against the provider's LIVE list inside `create_thread`:
+/// a bot can go stale, and the create must not silently succeed on a
+/// dead alias.
+pub fn create_thread_from_bot(
+  bots: Subject(bot_registry.Msg),
+  providers: Subject(provider_registry.Msg),
+  registry: Subject(thread_registry.Msg),
+  models_timeout_ms: Int,
+  bot_id: String,
+) -> Result(thread.ThreadSummary, CreateProblem) {
+  case bot_registry.get_bot(bots, bot_id) {
+    Error(bot_registry.Unknown) -> Error(BotUnknown(bot_id))
+    Error(_) -> Error(BotsUnavailable)
+    Ok(bot) ->
+      create_thread(
+        providers,
+        registry,
+        models_timeout_ms,
+        thread_registry.NewThread(
+          // The bot's provider id is canonical (the registry-validated
+          // `provider_id` the bot was saved with), so `resolve_provider`'s
+          // id-first lookup pins the same row.
+          provider_id: bot.provider_id,
+          model: bot.model,
+          // `None` (the bot's default-prompt sentinel) resolves to the
+          // config default at the one creation point, exactly like a
+          // plain create; an explicit prompt is used VERBATIM, never
+          // amended (the same rule as an explicit NEXUS_SYSTEM_PROMPT).
+          system_prompt: bot.system_prompt,
+          bot_id: Some(bot.id),
+        ),
+      )
+  }
 }
 
 /// Resolve the request's provider identifier (id or name) to registry
@@ -135,6 +189,8 @@ pub fn describe(problem: CreateProblem) -> String {
     ProviderDisabled(name) -> "provider is disabled: " <> name
     ModelsUnavailable -> "unable to list models from provider"
     ModelUnknown(alias) -> "unknown model: " <> alias
+    BotsUnavailable -> "bot registry unavailable"
+    BotUnknown(id) -> "unknown bot: " <> id
     CreateFailed(thread_registry.EmptyModel) -> "empty model"
     CreateFailed(thread_registry.ProviderFailed(_)) ->
       "provider became unusable"

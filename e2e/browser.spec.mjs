@@ -28,6 +28,11 @@
 //      the auto path as sidebar chips — inert text nodes, <script>
 //      payloads included — while a manual tags save freezes the set so
 //      the racing model apply is refused by the both-provenance guard
+//  14. bots (bots plan P1): create a bot in Settings (provider +
+//      model + prompt template), start a thread FROM it in the create
+//      panel (the provider/model pickers stand down, the row subtitle
+//      leads with the bot name), and delete the bot — the thread keeps
+//      its frozen pin and the provenance name falls away
 //
 // Usage: node e2e/browser.spec.mjs   (see e2e/README.md)
 
@@ -164,7 +169,7 @@ function resetDatabase() {
   return new Promise((resolve, reject) => {
     const child = spawn(
       "psql",
-      ["-q", DATABASE_URL, "-c", "truncate thread_message, thread, provider cascade;"],
+      ["-q", DATABASE_URL, "-c", "truncate thread_message, thread, bot, provider cascade;"],
       { stdio: ["ignore", "pipe", "pipe"] },
     );
     let out = "";
@@ -1795,6 +1800,123 @@ async function main() {
         async () => (await page.locator("#provider-picker option").count()) === 2,
         { timeout: 15_000, message: "re-enabled provider back in picker" },
       );
+    });
+
+    // -- 17b. bots: create in Settings, start-from-bot, delete keeps the
+    // frozen pin (bots plan P1) -----------------------------------------
+    await test("bots: create in Settings, start a thread from it, delete unorphan", async () => {
+      const headers = { authorization: `Bearer ${TOKEN}` };
+      await page.goto(`${base}/?token=${TOKEN}`);
+      await connected(page);
+
+      // The Bots section sits beside Providers; the add form carries the
+      // template fields (provider select, model, optional prompt).
+      await openSettings(page);
+      await page.click("#add-bot");
+      await page.fill('#add-bot-form input[name="name"]', "Writer");
+      await page.fill('#add-bot-form input[name="description"]', "prose drafts");
+      await page.fill('#add-bot-form input[name="model"]', "smart");
+      await page.fill('#add-bot-form textarea[name="system_prompt"]', "be terse");
+      await page.locator('#add-bot-form button[type="submit"]').click();
+
+      const botRow = page.locator("#bots-panel .bot-row", { hasText: "Writer" }).first();
+      await poll(async () => await botRow.isVisible(), {
+        timeout: 15_000,
+        message: "created bot row appears",
+      });
+      const botId = await botRow.getAttribute("data-bot-id");
+      // The row shows the identity line (provider/model) and the
+      // explicit prompt preview.
+      assert(
+        (await botRow.locator(".provider-sub").first().textContent())
+          ?.includes("fake/smart"),
+        "bot row identity line",
+      );
+      const botsApi = await (
+        await page.request.get(`${base}/bots`, { headers })
+      ).json();
+      const made = botsApi.bots.find((b) => b.id === botId);
+      eq(made.name, "Writer", "created bot in API");
+      eq(made.system_prompt, "be terse", "bot prompt in API");
+
+      // Back to chat: the create panel gains the start-from-bot picker.
+      await backToChat(page);
+      const panelOpen = () =>
+        page.locator("#create-panel").evaluate((el) => !el.hidden);
+      if (!(await panelOpen().catch(() => false))) {
+        await page.click("#new-thread");
+      }
+      await poll(panelOpen, { timeout: 10_000, message: "create panel open" });
+      await poll(
+        async () => (await page.locator("#bot-picker option").count()) === 2,
+        { timeout: 15_000, message: "bot picker lists the bot + the none option" },
+      );
+      await page.selectOption("#bot-picker", botId);
+      // The plain pickers stand down while a bot is selected.
+      await poll(
+        async () =>
+          await page.locator(".plain-create").evaluate((el) => el.hidden),
+        { timeout: 10_000, message: "provider/model pickers stood down" },
+      );
+      const threadsBefore = await page.locator("#thread-list .thread-main").count();
+      await page.click("#create-thread");
+      await poll(
+        async () =>
+          (await page.locator("#thread-list .thread-main").count())
+            === threadsBefore + 1,
+        { timeout: 15_000, message: "bot-sourced thread appears" },
+      );
+      // The row subtitle leads with the bot name (provenance), then the
+      // frozen pin.
+      const botThreadRow = page
+        .locator("#thread-list .thread-main", { hasText: "Writer · fake/smart ·" })
+        .first();
+      await poll(async () => await botThreadRow.isVisible(), {
+        timeout: 10_000,
+        message: "thread subtitle leads with bot provenance",
+      });
+      // The API agrees: the new thread carries the provenance pointer.
+      const threadsApi = await (
+        await page.request.get(`${base}/threads`, { headers })
+      ).json();
+      assert(
+        threadsApi.threads.some((s) => s.bot_id === botId),
+        "thread summary carries bot_id",
+      );
+
+      // Delete the bot (two-step, unguarded): the thread keeps its
+      // frozen pin, and the provenance name falls away from the row.
+      await openSettings(page);
+      await botRow.getByRole("button", { name: "Delete", exact: true }).click();
+      await botRow
+        .getByRole("button", { name: "Delete forever", exact: true })
+        .click();
+      await poll(async () => !(await botRow.isVisible().catch(() => false)), {
+        timeout: 15_000,
+        message: "bot row gone after delete",
+      });
+      await backToChat(page);
+      await poll(
+        async () => {
+          const rows = await page.locator("#thread-list .thread-main").allInnerTexts();
+          return rows.some((t) => t.includes("fake/smart ·"))
+            && !rows.some((t) => t.includes("Writer · fake/smart"));
+        },
+        { timeout: 15_000, message: "thread keeps pin, provenance name gone",
+        },
+      );
+      // A bot-less panel is today's panel again: no picker markup.
+      await poll(
+        async () => (await page.locator("#bot-picker").count()) === 0,
+        { timeout: 15_000, message: "bot picker gone with the last bot" },
+      );
+      // Leave the client freshly connected on the server's current
+      // truth (the utility test below reads the sidebar this page
+      // leaves behind; a reload guarantees a fresh thread list with
+      // every existing row's chips, regardless of what this test's
+      // create/delete churn touched).
+      await page.goto(`${base}/?token=${TOKEN}`);
+      await connected(page);
     });
 
     // -- 18. utility tags: model title + tags land as inert chips --------

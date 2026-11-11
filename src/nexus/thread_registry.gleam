@@ -70,10 +70,17 @@ pub type ChildArgument {
 /// at birth. `system_prompt: None` means the global default, resolved HERE
 /// at creation — the one NULL/default resolution point, and the value the
 /// same insert persists, so hydration rebuilds a byte-identical prefix.
-/// (From the bots plan, a bot's prompt arrives explicit or None; the
-/// record grows the bot_id provenance pointer with the bots schema.)
+/// `bot_id` is the bots plan's provenance pointer (P1): the bot a
+/// create-from-bot sourced these values from, persisted onto the row and
+/// projected into summaries. Display-only — the frozen columns are the
+/// thread's truth; the bot row is never read back.
 pub type NewThread {
-  NewThread(provider_id: String, model: String, system_prompt: Option(String))
+  NewThread(
+    provider_id: String,
+    model: String,
+    system_prompt: Option(String),
+    bot_id: Option(String),
+  )
 }
 
 /// Reply payload for `Create`: a failure the HTTP layer maps onto a
@@ -178,6 +185,11 @@ pub type Msg {
   /// and the registry owns the monitors), delete the stored rows, then
   /// drop the record. `False` for unknown IDs.
   Delete(id: String, reply: Subject(Bool))
+  /// A bot was deleted (bots plan P1): scrub that id from every summary
+  /// half's provenance pointer. The caller orchestrates — registries
+  /// never call each other. No store write (the FK's SET NULL already
+  /// fixed every row inside the delete itself).
+  BotDeleted(id: String, reply: Subject(Nil))
   /// Monitor plumbing (internal): a monitored thread actor exited.
   Down(pid: Pid, monitor: Monitor)
   /// Selector plumbing for non-process monitors; always ignored.
@@ -535,6 +547,9 @@ fn handle_create(
                   tags_manual: [],
                   tags_source: thread.AutoTags,
                   archived: False,
+                  // Provenance only (bots plan P1): never read back — the
+                  // frozen columns above are the thread's truth.
+                  bot_id: requested.bot_id,
                   created_at: created_at,
                 )
               // Write-through: the thread row lands now, with the frozen
@@ -562,6 +577,19 @@ fn handle_create(
                   log_store_error("insert_thread " <> id, error)
                   False
                 }
+              }
+              // The provenance pointer mirrors a STORED row's
+              // FK-maintained column, so an unpersisted create (the insert
+              // failed — store down, or the bot deleted between the
+              // orchestration's lookup and this insert) must not claim one:
+              // the bot-delete scrub cannot reach this record (it did not
+              // exist at delete time), making this the one place a dead id
+              // could otherwise ride a summary for the session's whole
+              // life. The insert ATTEMPT above still carries the pointer —
+              // the FK is what rejects a dead one.
+              let meta = case persisted {
+                True -> meta
+                False -> thread.ThreadMeta(..meta, bot_id: None)
               }
               let record =
                 Record(
@@ -592,6 +620,7 @@ fn handle_create(
                   pinned: False,
                   tags: [],
                   archived: False,
+                  bot_id: meta.bot_id,
                   message_count: 1,
                   streaming: False,
                   created_at: created_at,
@@ -934,6 +963,44 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
           )
         }
       }
+    }
+
+    BotDeleted(id, reply) -> {
+      // One guard over the shared meta (issue #75 shape): the
+      // live-record half and the dormant-summary half differ only in
+      // WHICH dict they write back to. Everything but the pointer is
+      // preserved; a stale pointer would otherwise ride both summary
+      // paths until the next rehydration (`bot_display`'s missing-name
+      // fallback hides it in the UI, but GET /threads would still
+      // report a dead id). bot_id rides no query but insert_thread, so
+      // nothing can write the dead pointer back behind this scrub.
+      let scrub = fn(meta: thread.ThreadMeta) -> thread.ThreadMeta {
+        case meta.bot_id {
+          Some(bot_id) if bot_id == id -> thread.ThreadMeta(..meta, bot_id: None)
+          _ -> meta
+        }
+      }
+      let scrub_record = fn(record: Record) {
+        Record(..record, meta: scrub(record.meta))
+      }
+      let threads =
+        state.threads
+        |> dict.to_list
+        |> list.map(fn(pair) {
+          let #(id, record) = pair
+          #(id, scrub_record(record))
+        })
+        |> dict.from_list
+      let dormant =
+        state.dormant
+        |> dict.to_list
+        |> list.map(fn(pair) {
+          let #(id, summary) = pair
+          #(id, store.StoredSummary(..summary, meta: scrub(summary.meta)))
+        })
+        |> dict.from_list
+      process.send(reply, Nil)
+      actor.continue(State(..state, threads: threads, dormant: dormant))
     }
 
     Down(pid, monitor) -> {
@@ -1434,6 +1501,7 @@ fn summarise(
     pinned: record.meta.pinned,
     tags: record.meta.tags,
     archived: record.meta.archived,
+    bot_id: record.meta.bot_id,
     message_count: status.message_count,
     streaming: status.streaming,
     created_at: record.meta.created_at,
@@ -1458,6 +1526,7 @@ fn stored_summary_as(summary: StoredSummary) -> thread.ThreadSummary {
     pinned: summary.meta.pinned,
     tags: summary.meta.tags,
     archived: summary.meta.archived,
+    bot_id: summary.meta.bot_id,
     message_count: summary.message_count,
     streaming: False,
     created_at: summary.meta.created_at,
@@ -1596,4 +1665,12 @@ pub fn set_archived(
 /// the record.
 pub fn delete_thread(registry: Subject(Msg), id: String) -> Bool {
   actor.call(registry, 5000, fn(reply) { Delete(id:, reply:) })
+}
+
+/// A bot was deleted (bots plan P1): scrub its provenance pointer from both
+/// summary halves. The bot delete's caller orchestrates (the registries
+/// stay mutually ignorant) — the store needs nothing, `thread.bot_id` is
+/// ON DELETE SET NULL and bot_id rides no query but insert_thread.
+pub fn bot_deleted(registry: Subject(Msg), id: String) -> Nil {
+  actor.call(registry, 5000, fn(reply) { BotDeleted(id:, reply:) })
 }

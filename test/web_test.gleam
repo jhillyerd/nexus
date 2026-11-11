@@ -80,6 +80,7 @@ pub fn threads_json_test() {
       pinned: True,
       tags: ["work", "notes"],
       archived: False,
+      bot_id: None,
       message_count: 4,
       streaming: True,
       created_at: 1_729_000_000,
@@ -113,6 +114,12 @@ pub fn threads_json_test() {
     data,
     "\"last_active_rfc3339\":\"2024-10-15T14:46:40Z\"",
   ))
+  // Bots plan P1: provenance rides the same wire shape — null for plain
+  // creates, the bot id when the thread was started from one.
+  should.be_true(string.contains(data, "\"bot_id\":null"))
+  let from_bot = thread.ThreadSummary(..summary, id: "s-3", bot_id: Some("b1"))
+  let bot_data = json.to_string(web.threads_json([from_bot]))
+  should.be_true(string.contains(bot_data, "\"bot_id\":\"b1\""))
 }
 
 pub fn auto_title_test() {
@@ -148,6 +155,7 @@ fn summary_with_archived(id: String, archived: Bool) -> thread.ThreadSummary {
     pinned: False,
     tags: [],
     archived: archived,
+    bot_id: None,
     message_count: 0,
     streaming: False,
     created_at: 0,
@@ -183,14 +191,41 @@ pub fn patch_body_decoders_test() {
 pub fn request_body_decoders_test() {
   web.parse_text_json("{\"text\":\"hello\"}")
   |> should.equal(Ok("hello"))
-  // POST /threads now pins provider + model (multi-provider §11).
+  // POST /threads pins provider + model (multi-provider §11), or names
+  // a bot (bots plan P1). The decoder is TOTAL over the field shapes —
+  // blanks are the ROUTE's 400s ("empty provider"/"empty model"), not
+  // decode failures, so the bot body parses with the same decoder.
   web.parse_create_json("{\"provider\":\"p1\",\"model\":\"alias-a\"}")
-  |> should.equal(Ok(web.CreateFields(provider: "p1", model: "alias-a")))
+  |> should.equal(Ok(web.PlainCreate(provider: "p1", model: "alias-a")))
   web.parse_text_json("{\"model\":\"alias-a\"}")
   |> should.equal(Error(Nil))
   web.parse_create_json("{\"model\":\"alias-a\"}")
-  |> should.equal(Error(Nil))
+  |> should.equal(Ok(web.PlainCreate(provider: "", model: "alias-a")))
   web.parse_create_json("{\"provider\":\"p1\"}")
+  |> should.equal(Ok(web.PlainCreate(provider: "p1", model: "")))
+  // The create-from-bot shape, and its conflict with provider/model —
+  // the conflict rule is about KEYS, so a blank provider/model value
+  // still conflicts (presence-aware classification).
+  web.parse_create_json("{\"bot\":\"b1\"}")
+  |> should.equal(Ok(web.BotCreate("b1")))
+  web.parse_create_json("{\"bot\":\"b1\",\"model\":\"alias-a\"}")
+  |> should.equal(Ok(web.ConflictingCreate))
+  web.parse_create_json("{\"bot\":\"b1\",\"provider\":\"\"}")
+  |> should.equal(Ok(web.ConflictingCreate))
+  web.parse_create_json("{\"bot\":\"b1\",\"provider\":\"\",\"model\":\"\"}")
+  |> should.equal(Ok(web.ConflictingCreate))
+  // An explicit JSON null is NOT absent (coderabbit review, PR #87):
+  // the null fails the decode — the whole body 400s — instead of
+  // blurring {"bot": null} into a plain create or {"bot": "b1",
+  // "provider": null} into a bot create. Send the key with a string
+  // or omit it.
+  web.parse_create_json(
+    "{\"bot\":null,\"provider\":\"p1\",\"model\":\"alias-a\"}",
+  )
+  |> should.equal(Error(Nil))
+  web.parse_create_json("{\"bot\":\"b1\",\"provider\":null}")
+  |> should.equal(Error(Nil))
+  web.parse_create_json("not json")
   |> should.equal(Error(Nil))
 }
 
@@ -298,7 +333,7 @@ pub fn registry_error_fields_test() {
   web.registry_error_fields(provider_registry.StillReferenced)
   |> should.equal(#(
     409,
-    "provider is still pinned by threads; disable it instead",
+    "provider is still pinned by threads or bots; disable it instead",
   ))
   web.registry_error_fields(provider_registry.DecryptFailed)
   |> should.equal(#(

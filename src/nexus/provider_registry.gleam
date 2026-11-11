@@ -14,10 +14,11 @@
 ////
 //// Guard rails mirrored from the schema: duplicate names are refused
 //// (the `provider_name_key` pre-check), deletes are refused while any
-//// thread pins the provider (`count_threads_for_provider` — the
-//// friendly copy of the `ON DELETE RESTRICT` FK), and updates are
-//// existence-checked in state because the SQL `update ... where id`'
-//// empty match is a silent no-op by design.
+//// thread OR BOT pins the provider (`count_threads_for_provider` +
+//// `count_bots_for_provider` — the friendly copy of the `ON DELETE
+//// RESTRICT` FK; both are store COUNTs, never calls into the bot
+//// registry), and updates are existence-checked in state because the
+//// SQL `update ... where id`'s empty match is a silent no-op by design.
 ////
 //// `ListModels` is the one network-touching message: it resolves the
 //// endpoint synchronously (state-only, fast) and then runs the live
@@ -64,7 +65,8 @@ pub type RegistryError {
   InvalidBaseUrl
   /// Create/rename onto an existing provider's name (unique).
   DuplicateName
-  /// Delete while threads still pin the provider (the 409 guard).
+  /// Delete while threads or bots still pin the provider (the 409
+  /// guard).
   StillReferenced
   /// An envelope failed authentication at resolve time. Boot already
   /// validated every stored envelope, so this means the row (or the
@@ -88,7 +90,8 @@ pub fn describe(error: RegistryError) -> String {
     InvalidName -> provider.describe(provider.InvalidName)
     InvalidBaseUrl -> provider.describe(provider.InvalidBaseUrl)
     DuplicateName -> "provider name already exists"
-    StillReferenced -> "provider is still pinned by threads; disable it instead"
+    StillReferenced ->
+      "provider is still pinned by threads or bots; disable it instead"
     DecryptFailed -> crypto.describe(crypto.AuthenticationFailed)
     KeyOperationFailed -> "provider key operation failed"
     StoreFailed(reason) -> reason
@@ -119,7 +122,8 @@ pub type Msg {
     patch: provider.ProviderUpdate,
     reply: Subject(Result(Provider, RegistryError)),
   )
-  /// Hard delete, guarded: refused while any thread pins the provider.
+  /// Hard delete, guarded: refused while any thread or bot pins the
+  /// provider.
   Delete(id: String, reply: Subject(Result(Nil, RegistryError)))
   /// Toggle the reversible off-switch. Resolve/ListModels refuse
   /// disabled providers; reads keep showing them.
@@ -394,21 +398,21 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           actor.continue(state)
         }
         Ok(_) ->
-          case state.store.count_threads_for_provider(id) {
+          case pinned_counts(state, id) {
             Error(error) -> {
               process.send(reply, Error(StoreFailed(error)))
               actor.continue(state)
             }
-            Ok(n) if n > 0 -> {
+            Ok(#(threads, bots)) if threads > 0 || bots > 0 -> {
               process.send(reply, Error(StillReferenced))
               actor.continue(state)
             }
             Ok(_) ->
-              // The FK's ON DELETE RESTRICT is the enforcement; this
-              // count was its friendly pre-check.
+              // The FK's ON DELETE RESTRICT is the enforcement; the
+              // counts were its friendly pre-check.
               case state.store.delete_provider(id) {
                 Error(error) -> {
-                  // A thread landing after the pre-check (another
+                  // A thread or bot landing after the pre-check (another
                   // instance, mid-delete) trips the FK HERE — recheck
                   // so the caller still gets the dedicated conflict
                   // answer, never a raw store failure for that race.
@@ -499,13 +503,23 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
   }
 }
 
-/// After a refused delete, is the FK story confirmed? A thread that
-/// landed between the pre-check and the delete (the multi-instance
-/// race) shows up on the recheck; a zero or unavailable count keeps
-/// the ORIGINAL delete error rather than guessing a conflict.
+/// The delete guard's pre-check: how many threads and bots point at
+/// this provider. Both are store COUNTs — the §8-shaped rule: no edge
+/// from the provider registry into the bot registry, ever.
+fn pinned_counts(state: State, id: String) -> Result(#(Int, Int), String) {
+  use threads <- result.try(state.store.count_threads_for_provider(id))
+  use bots <- result.try(state.store.count_bots_for_provider(id))
+  Ok(#(threads, bots))
+}
+
+/// After a refused delete, is the FK story confirmed? A thread or bot
+/// that landed between the pre-check and the delete (the
+/// multi-instance race) shows up on the recheck; zero or unavailable
+/// counts keep the ORIGINAL delete error rather than guessing a
+/// conflict.
 fn still_pinned(state: State, id: String) -> Bool {
-  case state.store.count_threads_for_provider(id) {
-    Ok(n) -> n > 0
+  case pinned_counts(state, id) {
+    Ok(#(threads, bots)) -> threads > 0 || bots > 0
     Error(_) -> False
   }
 }
@@ -713,7 +727,7 @@ pub fn update(
 }
 
 /// Hard delete, guarded: 409-shaped `StillReferenced` while any thread
-/// pins the provider.
+/// or bot pins the provider.
 pub fn delete(
   registry: Subject(Msg),
   id: String,

@@ -10,6 +10,7 @@ import gleam/otp/actor
 import gleam/otp/factory_supervisor
 import gleam/string
 import gleeunit/should
+import nexus/bot
 import nexus/config
 import nexus/loop
 import nexus/openai
@@ -86,23 +87,7 @@ fn start_registry_with(
   child: fn(thread_registry.ChildArgument) ->
     actor.StartResult(process.Subject(thread.Msg)),
 ) -> process.Subject(thread_registry.Msg) {
-  let factory_name = process.new_name("nexus_test_factory")
-  let assert Ok(_factory) =
-    factory_supervisor.start(thread_registry.factory_builder_with_child(
-      factory_name,
-      child,
-    ))
-  let persistence = store_mock.seam(store_mock.start())
-  store_mock.ensure_fixture_provider(persistence)
-  let assert Ok(started) =
-    thread_registry.start(
-      test_config(),
-      factory_supervisor.get_by_name(factory_name),
-      process.new_name("nexus_test_registry"),
-      persistence,
-      fixture_resolver(),
-    )
-  started.data
+  start_registry_keeping_seam_with(child, store_mock.seam(store_mock.start())).0
 }
 
 /// The production resolver's offline stand-in: the fixture provider
@@ -175,6 +160,7 @@ fn new_thread(provider_id: String, model: String) -> thread_registry.NewThread {
     provider_id: provider_id,
     model: model,
     system_prompt: None,
+    bot_id: None,
   )
 }
 
@@ -582,6 +568,7 @@ fn seed_with_tags(seam: store.Store, id: String, tags: List(String)) -> Nil {
           tags: tags,
           tags_manual: [],
           tags_source: thread.AutoTags,
+          bot_id: None,
           created_at: 1_700_000_000,
         ),
         last_active_at: 1_700_000_000,
@@ -871,21 +858,9 @@ pub fn tag_corpus_truncates_and_pools_legacy_tags_test() {
 fn start_registry_over(
   persistence: store.Store,
 ) -> process.Subject(thread_registry.Msg) {
-  let factory_name = process.new_name("nexus_test_factory")
-  let assert Ok(_factory) =
-    factory_supervisor.start(thread_registry.factory_builder(factory_name))
   // Threads created over this seam pin the fixture provider, and the
   // sweep tests below seed rows directly — both need it to exist.
-  store_mock.ensure_fixture_provider(persistence)
-  let assert Ok(started) =
-    thread_registry.start(
-      test_config(),
-      factory_supervisor.get_by_name(factory_name),
-      process.new_name("nexus_test_registry"),
-      persistence,
-      fixture_resolver(),
-    )
-  started.data
+  start_registry_keeping_seam_with(thread_registry.thread_child, persistence).0
 }
 
 /// Seed one stored thread row directly through the seam.
@@ -939,6 +914,7 @@ fn seed_at(
           tags: [],
           tags_manual: [],
           tags_source: thread.AutoTags,
+          bot_id: None,
           created_at: last_active_at,
         ),
         last_active_at: last_active_at,
@@ -1113,4 +1089,342 @@ pub fn created_thread_runner_gets_resolved_endpoint_test() {
   should.equal(thread.send_message(sess, "hi"), thread.Sent)
   let assert Ok(endpoint) = process.receive(seen, 2000)
   endpoint |> should.equal(test_endpoint())
+}
+
+// ---------------------------------------------------------------------------
+// Bots plan P1: create-from-bot provenance (bots → frozen columns)
+// ---------------------------------------------------------------------------
+
+/// A rig that KEEPS its seam, so tests can seed bot rows and read back
+/// frozen thread columns.
+fn start_registry_keeping_seam() -> #(
+  process.Subject(thread_registry.Msg),
+  store.Store,
+) {
+  start_registry_keeping_seam_with(
+    thread_registry.thread_child,
+    store_mock.seam(store_mock.start()),
+  )
+}
+
+/// The ONE boot body behind the registry rigs: factory + registry over
+/// `persistence`, keeping the seam so callers can seed rows and read
+/// back stored columns.
+fn start_registry_keeping_seam_with(
+  child: fn(thread_registry.ChildArgument) ->
+    actor.StartResult(process.Subject(thread.Msg)),
+  persistence: store.Store,
+) -> #(process.Subject(thread_registry.Msg), store.Store) {
+  let factory_name = process.new_name("nexus_test_factory")
+  let assert Ok(_factory) =
+    factory_supervisor.start(thread_registry.factory_builder_with_child(
+      factory_name,
+      child,
+    ))
+  store_mock.ensure_fixture_provider(persistence)
+  let assert Ok(started) =
+    thread_registry.start(
+      test_config(),
+      factory_supervisor.get_by_name(factory_name),
+      process.new_name("nexus_test_registry"),
+      persistence,
+      fixture_resolver(),
+    )
+  #(started.data, persistence)
+}
+
+fn seed_bot(
+  seam: store.Store,
+  id: String,
+  prompt: option.Option(String),
+) -> Result(Nil, String) {
+  seam.insert_bot(bot.Bot(
+    id: id,
+    name: "bot " <> id,
+    description: "",
+    provider_id: store_mock.fixture_provider_id,
+    model: "alpha",
+    system_prompt: prompt,
+    created_at: 1_700_000_000,
+    updated_at: 1_700_000_000,
+  ))
+}
+
+/// What `thread_create.create_thread_from_bot` asks for once it has
+/// resolved the bot: the bot's explicit prompt, and its id as
+/// provenance. The registry freezes both — the stored row's prompt is
+/// the exact bytes the transcript froze, and `bot_id` is display-only.
+pub fn create_from_bot_freezes_columns_and_provenance_test() {
+  let #(registry, seam) = start_registry_keeping_seam()
+  let assert Ok(Nil) = seed_bot(seam, "b1", Some("be terse"))
+
+  let assert Ok(summary) =
+    thread_registry.create_with_runner(
+      registry,
+      thread_registry.NewThread(
+        provider_id: store_mock.fixture_provider_id,
+        model: "alpha",
+        system_prompt: Some("be terse"),
+        bot_id: Some("b1"),
+      ),
+      happy_runner,
+    )
+  should.equal(summary.bot_id, Some("b1"))
+
+  let assert Ok(stored) = seam.get_thread(summary.id)
+  should.equal(stored.system_prompt, "be terse")
+  should.equal(stored.summary.model, "alpha")
+  should.equal(stored.summary.meta.bot_id, Some("b1"))
+
+  // A plain create stays unprovenanced.
+  let assert Ok(plain) =
+    thread_registry.create_with_runner(
+      registry,
+      new_thread(store_mock.fixture_provider_id, "alpha"),
+      happy_runner,
+    )
+  should.equal(plain.bot_id, None)
+  let assert Ok(plain_stored) = seam.get_thread(plain.id)
+  should.equal(plain_stored.summary.meta.bot_id, None)
+}
+
+/// The bot's NULL prompt is the config default resolved AT CREATION
+/// (#72's one resolution point): a bot without an explicit prompt
+/// creates threads with `cfg.system_prompt` frozen — never a NULL that
+/// hydration would later re-resolve against changed config.
+pub fn create_from_null_prompt_bot_freezes_config_default_test() {
+  let #(registry, seam) = start_registry_keeping_seam()
+  let assert Ok(Nil) = seed_bot(seam, "b2", None)
+
+  let assert Ok(summary) =
+    thread_registry.create_with_runner(
+      registry,
+      thread_registry.NewThread(
+        provider_id: store_mock.fixture_provider_id,
+        model: "alpha",
+        system_prompt: None,
+        bot_id: Some("b2"),
+      ),
+      happy_runner,
+    )
+  should.equal(summary.bot_id, Some("b2"))
+  let assert Ok(stored) = seam.get_thread(summary.id)
+  should.equal(stored.system_prompt, "test system prompt")
+}
+
+/// Provenance survives the boot round trip: a dormant stored thread
+/// with a bot_id lists with it (the sidebar's subtitle source), and a
+/// deleted bot leaves the stored row NULLed (SET NULL) — so the boot
+/// load can never resurrect a dead pointer.
+pub fn dormant_summary_carries_bot_provenance_test() {
+  let #(registry, seam) = start_registry_keeping_seam()
+  let assert Ok(Nil) = seed_bot(seam, "b1", Some("p"))
+
+  let assert Ok(Nil) =
+    seam.insert_thread(
+      store.StoredSummary(
+        id: "s9",
+        provider_id: store_mock.fixture_provider_id,
+        model: "alpha",
+        meta: thread.ThreadMeta(
+          title: "from bot",
+          title_source: thread.AutoTitle,
+          pinned: False,
+          archived: False,
+          tags: [],
+          tags_manual: [],
+          tags_source: thread.AutoTags,
+          bot_id: Some("b1"),
+          created_at: 1_700_000_000,
+        ),
+        last_active_at: 1_700_000_000,
+        message_count: 3,
+      ),
+      "frozen",
+    )
+
+  // Boot a SECOND registry over the same seam (the first is discardable
+  // scaffolding; the mock store is the survivor).
+  let factory_name = process.new_name("nexus_test_factory_boot")
+  let assert Ok(_factory) =
+    factory_supervisor.start(thread_registry.factory_builder_with_child(
+      factory_name,
+      thread_registry.thread_child,
+    ))
+  let assert Ok(booted) =
+    thread_registry.start(
+      test_config(),
+      factory_supervisor.get_by_name(factory_name),
+      process.new_name("nexus_test_registry_boot"),
+      seam,
+      fixture_resolver(),
+    )
+
+  let summaries = thread_registry.list_threads(booted.data)
+  let assert Ok(found) = list.find(summaries, fn(s) { s.id == "s9" })
+  should.equal(found.bot_id, Some("b1"))
+
+  // Deleting the bot NULLs the stored provenance (the mock mirrors SET
+  // NULL): a later boot lists the thread unprovenanced.
+  let assert Ok(Nil) = seam.delete_bot("b1")
+  let factory2 = process.new_name("nexus_test_factory_boot2")
+  let assert Ok(_factory2) =
+    factory_supervisor.start(thread_registry.factory_builder_with_child(
+      factory2,
+      thread_registry.thread_child,
+    ))
+  let assert Ok(rebooted) =
+    thread_registry.start(
+      test_config(),
+      factory_supervisor.get_by_name(factory2),
+      process.new_name("nexus_test_registry_boot2"),
+      seam,
+      fixture_resolver(),
+    )
+  let after = thread_registry.list_threads(rebooted.data)
+  let assert Ok(after_found) = list.find(after, fn(s) { s.id == "s9" })
+  should.equal(after_found.bot_id, None)
+
+  let _ = registry
+  Nil
+}
+
+/// A bot delete must also reach the registry's IN-MEMORY mirror: the FK
+/// fixes the stored rows inside the delete itself, but the live records
+/// and the boot-hydrated dormant dict would keep reporting the dead id
+/// until the next rehydration. The scrub (bot_deleted, the delete
+/// caller's orchestration step) clears exactly that bot's pointer from
+/// both summary halves and preserves every other bot's.
+pub fn bot_delete_scrubs_cached_provenance_test() {
+  // Seed BEFORE the boot: the registry hydrates its dormant dict from
+  // `list_summaries` at start, so rows inserted after boot are invisible
+  // to it. Ids stay clear of the live "s<n>" counter range (the boot
+  // counter only scans ids present at start, so later live creates
+  // would otherwise mint colliding ids).
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  store_mock.ensure_fixture_provider(seam)
+  let assert Ok(Nil) = seed_bot(seam, "b1", Some("p"))
+  // The unrelated bot exists too — the mock enforces the insert-time FK.
+  let assert Ok(Nil) = seed_bot(seam, "b9", Some("p"))
+
+  // Dormant threads: one provenanced by the bot-to-be-deleted, one by
+  // an unrelated bot that must survive the scrub untouched.
+  let dormant = fn(id: String, bot: String) {
+    let assert Ok(Nil) =
+      seam.insert_thread(
+        store.StoredSummary(
+          id: id,
+          provider_id: store_mock.fixture_provider_id,
+          model: "alpha",
+          meta: thread.ThreadMeta(
+            title: "from " <> bot,
+            title_source: thread.AutoTitle,
+            pinned: False,
+            archived: False,
+            tags: [],
+            tags_manual: [],
+            tags_source: thread.AutoTags,
+            bot_id: Some(bot),
+            created_at: 1_700_000_000,
+          ),
+          last_active_at: 1_700_000_000,
+          message_count: 3,
+        ),
+        "frozen",
+      )
+    Nil
+  }
+  dormant("s9", "b1")
+  dormant("s8", "b9")
+
+  // Boot the registry over the prepared seam (keeps it for the
+  // orchestration's store half below).
+  let #(registry, seam) =
+    start_registry_keeping_seam_with(thread_registry.thread_child, seam)
+
+  // And a LIVE thread sourced from b1.
+  let assert Ok(live) =
+    thread_registry.create_with_runner(
+      registry,
+      thread_registry.NewThread(
+        provider_id: store_mock.fixture_provider_id,
+        model: "alpha",
+        system_prompt: Some("p"),
+        bot_id: Some("b1"),
+      ),
+      happy_runner,
+    )
+
+  let bot_of = fn(id: String) {
+    let assert Ok(found) =
+      list.find(thread_registry.list_threads(registry), fn(s) { s.id == id })
+    found.bot_id
+  }
+  should.equal(bot_of(live.id), Some("b1"))
+  should.equal(bot_of("s9"), Some("b1"))
+  should.equal(bot_of("s8"), Some("b9"))
+
+  // The delete orchestration's order: the store NULLs the rows (SET
+  // NULL) inside the bot delete, then the registry mirror is scrubbed.
+  let assert Ok(Nil) = seam.delete_bot("b1")
+  thread_registry.bot_deleted(registry, "b1")
+
+  // Both halves scrubbed; the unrelated pointer preserved.
+  should.equal(bot_of(live.id), None)
+  should.equal(bot_of("s9"), None)
+  should.equal(bot_of("s8"), Some("b9"))
+
+  // The scrub writes nothing: bot_id rides no query but insert_thread,
+  // so the stored rows keep whatever the FK last set (None here — the
+  // delete's SET NULL; scrubbing must not resurrect).
+  let assert Ok(stored) = seam.get_thread(live.id)
+  should.equal(stored.summary.meta.bot_id, None)
+  Nil
+}
+
+/// The residual of the bot-delete race (coderabbit re-review, PR #87):
+/// a create-from-bot that reads the bot BEFORE deletion but reaches the
+/// registry AFTER the scrub fails its insert (the FK rejects the dead
+/// pointer) and lands in the unpersisted lane — the one record the
+/// delete-time scrub could not reach. Provenance mirrors a stored row's
+/// FK-maintained column, so an unpersisted create carries NO pointer:
+/// neither the create reply nor a following List may report one.
+pub fn unpersisted_create_carries_no_provenance_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  store_mock.ensure_fixture_provider(seam)
+  let assert Ok(Nil) = seed_bot(seam, "b1", Some("p"))
+
+  // A store whose thread inserts always fail (the store-down half of
+  // the lane; the FK half fails the same insert with the same shape).
+  let failing =
+    store.Store(..seam, insert_thread: fn(_summary, _prompt) {
+      Error("disk full")
+    })
+  let #(registry, _seam) =
+    start_registry_keeping_seam_with(thread_registry.thread_child, failing)
+
+  let assert Ok(summary) =
+    thread_registry.create_with_runner(
+      registry,
+      thread_registry.NewThread(
+        provider_id: store_mock.fixture_provider_id,
+        model: "alpha",
+        system_prompt: Some("p"),
+        bot_id: Some("b1"),
+      ),
+      happy_runner,
+    )
+  // The create reply strips the pointer (the request asked for Some).
+  should.equal(summary.bot_id, None)
+  // And the registry's own summary path agrees.
+  let assert Ok(listed) =
+    list.find(thread_registry.list_threads(registry), fn(s) {
+      s.id == summary.id
+    })
+  should.equal(listed.bot_id, None)
+  // Nothing was stored, so nothing could resurrect the pointer later.
+  let assert Error(_) = seam.get_thread(summary.id)
+  Nil
 }

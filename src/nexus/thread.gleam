@@ -380,6 +380,13 @@ pub type ThreadMeta {
     tags_source: TagsSource,
     /// Soft-hide flag: archived threads stay restorable until deleted.
     archived: Bool,
+    /// Provenance pointer to the bot this thread's frozen columns were
+    /// sourced from (bots plan P1): `None` = created without a bot.
+    /// Display-only — never joined at request-encoding time, never a
+    /// request byte; the bot row is NOT the thread's truth (editing or
+    /// deleting a bot never changes an existing thread, which is why the
+    /// column is ON DELETE SET NULL in the schema).
+    bot_id: Option(String),
     /// Wall-clock epoch seconds at creation (display ordering only).
     created_at: Int,
   )
@@ -422,6 +429,11 @@ pub type ThreadSummary {
     pinned: Bool,
     tags: List(String),
     archived: Bool,
+    /// The bot this thread was created from (`None` = no bot) — the
+    /// provenance half of `ThreadMeta` the UI DOES see (the sidebar's
+    /// bot-name subtitle). The name resolves against the caller's bot
+    /// list; a bot deleted since creation leaves nothing to resolve.
+    bot_id: Option(String),
     message_count: Int,
     streaming: Bool,
     created_at: Int,

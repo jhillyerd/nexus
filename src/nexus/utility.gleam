@@ -418,8 +418,9 @@ fn strip_code_fences(text: String) -> String {
 /// Collapse every whitespace run (spaces, tabs, newlines) to single spaces
 /// and trim — a multi-line reply still reads as one title line. The CRLF
 /// pair must go first: Erlang's Unicode `string:replace` does not match a
-/// lone "\r" inside "\r\n".
-fn collapse_whitespace(text: String) -> String {
+/// lone "\r" inside "\r\n". Shared shaping: titles AND the settings
+/// page's prompt previews collapse through this one rule.
+pub fn collapse_whitespace(text: String) -> String {
   text
   |> string.replace("\r\n", " ")
   |> string.replace("\r", " ")

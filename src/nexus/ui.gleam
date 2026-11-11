@@ -41,6 +41,8 @@ import lustre/element/html
 import lustre/element/keyed
 import lustre/event
 import lustre/server_component
+import nexus/bot.{type Bot}
+import nexus/bot_registry
 import nexus/provider.{type Provider}
 import nexus/provider_registry
 import nexus/thread.{type ThreadEvent}
@@ -68,6 +70,9 @@ pub type Flags {
   Flags(
     registry: Subject(thread_registry.Msg),
     providers: Subject(provider_registry.Msg),
+    /// The bot registry: the Settings Bots section's CRUD and the
+    /// create panel's start-from-bot both go through it.
+    bots: Subject(bot_registry.Msg),
     models_timeout_ms: Int,
     thread: Option(String),
   )
@@ -194,6 +199,8 @@ pub type Model {
   Model(
     providers: Subject(provider_registry.Msg),
     registry: Subject(thread_registry.Msg),
+    /// The bot registry subject (Settings Bots CRUD, start-from-bot).
+    bots: Subject(bot_registry.Msg),
     /// The shared live-model budget (`thread_create.models_timeout`):
     /// every list_models call this connection makes — the picker reload
     /// AND the create path's alias validation — uses it.
@@ -211,6 +218,14 @@ pub type Model {
     /// options, and provider-name resolution for thread subtitles).
     /// `has_key` only — key material never reaches this model.
     provider_list: List(Provider),
+    /// All bots (the Settings page's Bots section, the create panel's
+    /// start-from-bot picker, and bot-name resolution for thread
+    /// subtitles). Reloaded whenever a bot mutation lands.
+    bot_list: List(Bot),
+    /// The bot selected in the create panel (start-from-bot): when set,
+    /// the provider/model pickers stand down — the bot sources both,
+    /// re-validated live at create.
+    create_bot: Option(String),
     /// Which main view the shell renders (chat vs settings).
     view: UiView,
     /// The Settings sub-component's state (provider editors + the
@@ -356,6 +371,14 @@ pub type Msg {
   /// Masked metadata for every provider (Settings page + picker).
   ProvidersLoaded(List(Provider))
   ProvidersFailed(String)
+  // ---- Bots (bots plan P1) ----
+  /// Every bot (Settings Bots section, start-from-bot picker, thread
+  /// subtitle provenance names).
+  BotsLoaded(List(Bot))
+  BotsFailed(String)
+  /// The create panel's bot select changed: "" deselects (back to the
+  /// provider/model pickers), any other value starts-from-bot.
+  CreateBotChanged(String)
   /// The create panel's provider select changed: aliases reload scoped
   /// to the new provider (multi-provider §12).
   ProviderPicked(id: String)
@@ -494,10 +517,13 @@ pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
     Model(
       providers: flags.providers,
       registry: flags.registry,
+      bots: flags.bots,
       models_timeout_ms: flags.models_timeout_ms,
       events: None,
       provider: None,
       provider_list: [],
+      bot_list: [],
+      create_bot: None,
       view: ChatView,
       settings: ui_settings.init(),
       settings_manual: False,
@@ -599,11 +625,13 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             // Provider metadata refreshes here: the load re-aims the
             // picker and pulls the selected provider's models with it.
             providers_effect(model),
+            bots_effect(model),
             threads_effect(model),
           ])
         None ->
           effect.batch([
             providers_effect(model),
+            bots_effect(model),
             threads_effect(model),
           ])
       }
@@ -685,6 +713,37 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       effect.none(),
     )
 
+    // ---- Bots (bots plan P1) ----
+    BotsLoaded(bots) -> {
+      // A deleted bot must not stay selected in the create panel (its
+      // provider/model pickers stood down for it) — fall back to the
+      // plain flow, exactly like the picker re-aim on a vanished
+      // provider.
+      let create_bot = case model.create_bot {
+        Some(selected) ->
+          case list.any(bots, fn(bot) { bot.id == selected }) {
+            True -> model.create_bot
+            False -> None
+          }
+        None -> None
+      }
+      #(Model(..model, bot_list: bots, create_bot: create_bot), effect.none())
+    }
+
+    BotsFailed(reason) -> #(
+      Model(..model, log: [
+        NoteLine(True, "could not load bots: " <> reason),
+        ..model.log
+      ]),
+      effect.none(),
+    )
+
+    CreateBotChanged(id) ->
+      case string.trim(id) {
+        "" -> #(Model(..model, create_bot: None), effect.none())
+        bot_id -> #(Model(..model, create_bot: Some(bot_id)), effect.none())
+      }
+
     ProviderPicked(id) ->
       case model.provider {
         Some(current) if current == id -> #(model, effect.none())
@@ -723,6 +782,7 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           model.settings,
           msg,
           model.providers,
+          model.bots,
           model.models_timeout_ms,
         )
       let #(model, signal_effs) =
@@ -757,12 +817,25 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
                 providers_effect(model),
                 ..effs
               ])
+              ui_settings.BotsChanged -> #(model, [bots_effect(model), ..effs])
+              ui_settings.BotRemoved(id) -> #(model, [
+                // The bot delete already NULLed the stored rows (the
+                // FK's SET NULL fired inside the delete itself); scrub
+                // the thread registry's in-memory provenance mirror so
+                // both summary halves stop reporting the dead id
+                // before the next rehydration. The list reload rides
+                // the paired BotsChanged signal.
+                effect.from(fn(_dispatch) {
+                  thread_registry.bot_deleted(model.registry, id)
+                }),
+                ..effs
+              ])
               ui_settings.OpFailed(reason) -> #(
                 Model(..model, log: [
-                  // Operation-neutral: this path carries create, edit,
-                  // disable, and delete failures alike (e.g. the
-                  // pinned-delete 409 guard).
-                  NoteLine(True, "provider operation failed: " <> reason),
+                  // Operation-neutral: this path carries provider and bot
+                  // create, edit, and delete failures alike (the
+                  // OpFailed text is prefixed by its surface below).
+                  NoteLine(True, reason),
                   ..model.log
                 ]),
                 effs,
@@ -914,9 +987,18 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     PickerChanged(alias) -> #(Model(..model, picker: alias), effect.none())
 
     CreateRequested ->
-      case model.picker {
-        "" -> #(model, effect.none())
-        alias -> #(model, create_effect(model, alias))
+      // Start-from-bot (bots plan P1): a selected bot sources the
+      // provider/model/system prompt, and `thread_create` re-validates
+      // the alias against the provider's live model list before the
+      // registry ever sees the request; otherwise today's picker flow.
+      // Both paths share the one `thread_create` orchestration.
+      case model.create_bot {
+        Some(bot_id) -> #(model, create_from_bot_effect(model, bot_id))
+        None ->
+          case model.picker {
+            "" -> #(model, effect.none())
+            alias -> #(model, create_effect(model, alias))
+          }
       }
 
     Created(summary) -> {
@@ -1781,6 +1863,18 @@ fn providers_effect(model: Model) -> Effect(Msg) {
   })
 }
 
+/// All bots: the Settings Bots section, the start-from-bot picker, and
+/// subtitle provenance names read this list.
+fn bots_effect(model: Model) -> Effect(Msg) {
+  let bots = model.bots
+  effect.from(fn(dispatch) {
+    case bot_registry.list_bots(bots) {
+      Ok(all) -> dispatch(BotsLoaded(all))
+      Error(error) -> dispatch(BotsFailed(bot_registry.describe(error)))
+    }
+  })
+}
+
 /// The picker's target after a (re)load: the previous selection when it
 /// still exists and is enabled, else the first enabled provider.
 pub fn pick_provider(
@@ -1934,9 +2028,10 @@ fn create_effect(model: Model, alias: String) -> Effect(Msg) {
           thread_registry.NewThread(
             provider_id: provider_id,
             model: alias,
-            // The create panel pins the config default today; the bots
-            // plan's start-from-bot sends the bot's prompt here.
+            // The create panel pins the config default; a bot-sourced
+            // create runs through create_from_bot_effect instead.
             system_prompt: None,
+            bot_id: None,
           )
         case
           thread_create.create_thread(providers, registry, timeout, requested)
@@ -1946,6 +2041,33 @@ fn create_effect(model: Model, alias: String) -> Effect(Msg) {
             dispatch(CreateFailed(thread_create.describe(problem)))
         }
       }
+    }
+  })
+}
+
+/// Start a thread FROM a bot (bots plan P1): the shared create-from-bot
+/// orchestration resolves the bot, copies its frozen values, and
+/// re-validates the alias against the provider's LIVE list — the same
+/// stale-alias refusal the plain flow got from #73. A deleted bot (the
+/// row vanished between the pick and the click) reads as a create
+/// failure note, same vocabulary as every other refusal.
+fn create_from_bot_effect(model: Model, bot_id: String) -> Effect(Msg) {
+  let registry = model.registry
+  let providers = model.providers
+  let bots = model.bots
+  let timeout = model.models_timeout_ms
+  effect.from(fn(dispatch) {
+    case
+      thread_create.create_thread_from_bot(
+        bots,
+        providers,
+        registry,
+        timeout,
+        bot_id,
+      )
+    {
+      Ok(summary) -> dispatch(Created(summary))
+      Error(problem) -> dispatch(CreateFailed(thread_create.describe(problem)))
     }
   })
 }
@@ -2045,7 +2167,11 @@ pub fn view(model: Model) -> Element(Msg) {
           sidebar(model),
           chat(model),
           element.map(
-            ui_settings.view(model.settings, model.provider_list),
+            ui_settings.view(
+              model.settings,
+              model.provider_list,
+              model.bot_list,
+            ),
             Settings,
           ),
         ]
@@ -2065,43 +2191,63 @@ fn sidebar(model: Model) -> Element(Msg) {
     // opened it below the fold. Markup order is the fix — no new state, and
     // the `#create-panel` / `#new-thread` selectors the browser suite drives
     // are unchanged.
-    html.section([attr.id("create-panel"), attr.hidden(!model.create_open)], [
-      html.label([attr.for("provider-picker")], [html.text("Provider")]),
-      html.select(
-        [
-          attr.id("provider-picker"),
-          attr.aria("label", "Provider"),
-          provider_change(),
-        ],
-        provider_options(model),
-      ),
-      html.label([attr.for("model-picker")], [html.text("Model alias")]),
-      html.select(
-        [
-          attr.id("model-picker"),
-          attr.aria("label", "Model alias"),
-          picker_change(),
-        ],
-        list.map(model.aliases, fn(alias) {
-          html.option(
-            [
-              attr.value(alias),
-              attr.selected(alias == model.picker || model.picker == ""),
-            ],
-            alias,
-          )
-        }),
-      ),
-      html.button(
-        [
-          attr.id("create-thread"),
-          attr.type_("button"),
-          attr.disabled(model.aliases == [] || model.provider == None),
-          event.on_click(CreateRequested),
-        ],
-        [html.text("Create thread")],
-      ),
-    ]),
+    html.section(
+      [attr.id("create-panel"), attr.hidden(!model.create_open)],
+      list.append(bot_picker(model), [
+        // The provider/model pickers stand down while a bot is selected:
+        // the bot supplies both halves of the pin (and its prompt); the
+        // controls stay mounted-but-hidden so re-selecting "— pick
+        // provider & model —" restores the flow without a reload.
+        html.div(
+          [
+            attr.class("plain-create"),
+            attr.hidden(option.is_some(model.create_bot)),
+          ],
+          [
+            html.label([attr.for("provider-picker")], [
+              html.text("Provider"),
+            ]),
+            html.select(
+              [
+                attr.id("provider-picker"),
+                attr.aria("label", "Provider"),
+                provider_change(),
+              ],
+              provider_options(model),
+            ),
+            html.label([attr.for("model-picker")], [html.text("Model alias")]),
+            html.select(
+              [
+                attr.id("model-picker"),
+                attr.aria("label", "Model alias"),
+                picker_change(),
+              ],
+              list.map(model.aliases, fn(alias) {
+                html.option(
+                  [
+                    attr.value(alias),
+                    attr.selected(alias == model.picker || model.picker == ""),
+                  ],
+                  alias,
+                )
+              }),
+            ),
+          ],
+        ),
+        html.button(
+          [
+            attr.id("create-thread"),
+            attr.type_("button"),
+            attr.disabled(case model.create_bot {
+              Some(_) -> False
+              None -> model.aliases == [] || model.provider == None
+            }),
+            event.on_click(CreateRequested),
+          ],
+          [html.text("Create thread")],
+        ),
+      ]),
+    ),
     html.section([], [
       html.div([attr.class("section-head")], [
         html.h2([], [html.text("Threads")]),
@@ -2140,6 +2286,39 @@ fn sidebar(model: Model) -> Element(Msg) {
       ),
     ]),
   ])
+}
+
+/// The start-from-bot select (plus its label), or nothing when no bots
+/// exist — a bot-free install sees today's create panel unchanged.
+fn bot_picker(model: Model) -> List(Element(Msg)) {
+  case model.bot_list {
+    [] -> []
+    bots -> [
+      html.label([attr.for("bot-picker")], [html.text("Bot")]),
+      html.select(
+        [
+          attr.id("bot-picker"),
+          attr.aria("label", "Start from bot"),
+          create_bot_change(),
+        ],
+        [
+          html.option(
+            [attr.value(""), attr.selected(option.is_none(model.create_bot))],
+            "— pick provider & model —",
+          ),
+          ..list.map(bots, fn(bot) {
+            html.option(
+              [
+                attr.value(bot.id),
+                attr.selected(model.create_bot == Some(bot.id)),
+              ],
+              bot.name,
+            )
+          })
+        ],
+      ),
+    ]
+  }
 }
 
 /// Options for the create panel's provider select: enabled providers
@@ -2318,9 +2497,15 @@ fn thread_row(model: Model, summary: thread.ThreadSummary) -> Element(Msg) {
   let title = display_title(summary)
   // The subtitle pins the thread's identity: provider/model (both
   // frozen at creation, §8) plus its age. The provider name resolves
-  // from the masked list so renames show at once.
+  // from the masked list so renames show at once. A bot-sourced thread
+  // leads with the bot's name (provenance — bots plan P1); a deleted
+  // bot shows nothing and self-heals on rehydrate (SET NULL).
   let subtitle =
-    provider_display(model, summary.provider_id)
+    case bot_display(model, summary.bot_id) {
+      Some(bot_name) -> bot_name <> " · "
+      None -> ""
+    }
+    <> provider_display(model, summary.provider_id)
     <> "/"
     <> summary.model
     <> " · "
@@ -3128,6 +3313,31 @@ fn provider_change() -> attr.Attribute(Msg) {
     |> decode.map(ProviderPicked)
   event.on("change", decoder)
   |> server_component.include(["target.value"])
+}
+
+/// The create panel's bot select (start-from-bot): the change carries
+/// the picked bot id, "" deselecting back to the plain flow.
+fn create_bot_change() -> attr.Attribute(Msg) {
+  let decoder =
+    decode.at(["target", "value"], decode.string)
+    |> decode.map(CreateBotChanged)
+  event.on("change", decoder)
+  |> server_component.include(["target.value"])
+}
+
+/// The display name for a summary's creating bot, resolved from the
+/// bot list; `None` when the thread has no bot or the bot was deleted
+/// since (provenance only — the thread is self-contained, so the
+/// fallback is to show nothing, and rehydration NULLs the pointer).
+fn bot_display(model: Model, bot_id: Option(String)) -> Option(String) {
+  case bot_id {
+    None -> None
+    Some(id) ->
+      case list.find(model.bot_list, fn(bot) { bot.id == id }) {
+        Ok(bot) -> Some(bot.name)
+        Error(_) -> None
+      }
+  }
 }
 
 /// The display name for a summary's pinned provider, resolved from the

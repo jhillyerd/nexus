@@ -33,6 +33,7 @@ import gleam/option.{None, Some}
 import gleam/otp/actor
 import gleam/result
 import gleam/string
+import nexus/bot
 import nexus/config.{type Config}
 import nexus/store
 import nexus/store/sql
@@ -86,6 +87,13 @@ pub type Msg {
   )
   CountThreadsForProvider(id: String, reply: Subject(Result(Int, String)))
   DeleteProvider(id: String, reply: Subject(Result(Nil, String)))
+  // ---- bot rows (docs/plans/bots.md, Phase 1) ----
+  ListBots(reply: Subject(Result(List(store.StoredBot), String)))
+  GetBot(id: String, reply: Subject(Result(store.StoredBot, String)))
+  InsertBot(bot: store.StoredBot, reply: Subject(Result(Nil, String)))
+  UpdateBot(bot: store.StoredBot, reply: Subject(Result(Nil, String)))
+  DeleteBot(id: String, reply: Subject(Result(Nil, String)))
+  CountBotsForProvider(id: String, reply: Subject(Result(Int, String)))
 }
 
 type State {
@@ -252,6 +260,30 @@ pub fn seam(store_actor: Subject(Msg)) -> store.Store {
         DeleteProvider(id, reply)
       })
     },
+    list_bots: fn() { actor.call(store_actor, call_timeout_ms, ListBots) },
+    get_bot: fn(id) {
+      actor.call(store_actor, call_timeout_ms, fn(reply) { GetBot(id, reply) })
+    },
+    insert_bot: fn(bot) {
+      actor.call(store_actor, call_timeout_ms, fn(reply) {
+        InsertBot(bot, reply)
+      })
+    },
+    update_bot: fn(bot) {
+      actor.call(store_actor, call_timeout_ms, fn(reply) {
+        UpdateBot(bot, reply)
+      })
+    },
+    delete_bot: fn(id) {
+      actor.call(store_actor, call_timeout_ms, fn(reply) {
+        DeleteBot(id, reply)
+      })
+    },
+    count_bots_for_provider: fn(id) {
+      actor.call(store_actor, call_timeout_ms, fn(reply) {
+        CountBotsForProvider(id, reply)
+      })
+    },
   )
 }
 
@@ -287,6 +319,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
                     tags: row.tags,
                     tags_manual: row.tags_manual,
                     tags_source: tags_source(row.tags_source),
+                    bot_id: row.bot_id,
                     created_at: row.created_s,
                   ),
                   last_active_at: row.last_active_s,
@@ -349,6 +382,8 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           summary.meta.tags,
           int.to_float(summary.meta.created_at),
           summary.message_count,
+          // The '' sentinel writes NULL (no bot) — see insert_bot.sql.
+          option.unwrap(summary.meta.bot_id, ""),
         )
         |> result.map(fn(_) { Nil })
         |> result.map_error(query_error)
@@ -527,6 +562,114 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       // Errors (FK restrict while referenced) flow to the caller — the
       // registry maps them to its 409.
       process.send(reply, update(sql.delete_provider(state.db, id)))
+      actor.continue(state)
+    }
+
+    // ---- bot rows (docs/plans/bots.md, Phase 1) ----
+    ListBots(reply) -> {
+      let result =
+        sql.list_bots(state.db)
+        |> result.map(fn(returned) {
+          returned.rows
+          |> list.map(fn(row) {
+            bot_from_row(
+              row.id,
+              row.name,
+              row.description,
+              row.provider_id,
+              row.model,
+              row.system_prompt,
+              row.created_s,
+              row.updated_s,
+            )
+          })
+        })
+        |> result.map_error(query_error)
+      process.send(reply, result)
+      actor.continue(state)
+    }
+
+    GetBot(id, reply) -> {
+      // Empty result = unknown id; the caller decides. The nested
+      // Result is flattened by hand (query error vs unknown id are both
+      // just `Error(String)` to the seam's callers).
+      let result = case sql.get_bot(state.db, id) {
+        Error(error) -> Error(query_error(error))
+        Ok(pog.Returned(_, rows)) ->
+          case rows {
+            [row] ->
+              Ok(bot_from_row(
+                row.id,
+                row.name,
+                row.description,
+                row.provider_id,
+                row.model,
+                row.system_prompt,
+                row.created_s,
+                row.updated_s,
+              ))
+            _ -> Error("no stored bot " <> id)
+          }
+      }
+      process.send(reply, result)
+      actor.continue(state)
+    }
+
+    InsertBot(bot, reply) -> {
+      let result =
+        sql.insert_bot(
+          state.db,
+          bot.id,
+          bot.name,
+          bot.description,
+          bot.provider_id,
+          bot.model,
+          // The '' sentinel writes NULL (default prompt) — the same
+          // workaround as the provider envelope (insert_provider.sql).
+          option.unwrap(bot.system_prompt, ""),
+          int.to_float(bot.created_at),
+        )
+        |> result.map(fn(_) { Nil })
+        |> result.map_error(query_error)
+      process.send(reply, result)
+      actor.continue(state)
+    }
+
+    UpdateBot(bot, reply) -> {
+      // Like update_provider: an empty match is a silent no-op by
+      // design — the registry pre-checks existence in state.
+      let result =
+        sql.update_bot(
+          state.db,
+          bot.id,
+          bot.name,
+          bot.description,
+          bot.provider_id,
+          bot.model,
+          option.unwrap(bot.system_prompt, ""),
+        )
+        |> result.map(fn(_) { Nil })
+        |> result.map_error(query_error)
+      process.send(reply, result)
+      actor.continue(state)
+    }
+
+    DeleteBot(id, reply) -> {
+      process.send(reply, update(sql.delete_bot(state.db, id)))
+      actor.continue(state)
+    }
+
+    CountBotsForProvider(id, reply) -> {
+      let result =
+        sql.count_bots_for_provider(state.db, id)
+        |> result.map(fn(returned) {
+          case returned.rows {
+            [count] -> count.bots
+            _ -> 0
+          }
+        })
+        |> result.map_error(query_error)
+      process.send(reply, result)
       actor.continue(state)
     }
   }
@@ -719,11 +862,37 @@ fn stored_summary_from_row(row: sql.ListSummariesRow) -> store.StoredSummary {
       tags: row.tags,
       tags_manual: row.tags_manual,
       tags_source: tags_source(row.tags_source),
+      // Provenance pointer (bots plan P1): NULL = created without a bot.
+      bot_id: row.bot_id,
       created_at: row.created_s,
     ),
     last_active_at: row.last_active_s,
     // The column already counts the system prompt (Phase 1 semantics).
     message_count: row.message_count,
+  )
+}
+
+/// A stored bot row from either query shape (get/list select the same
+/// columns). Kept as one helper so the two row types cannot drift.
+fn bot_from_row(
+  id: String,
+  name: String,
+  description: String,
+  provider_id: String,
+  model: String,
+  system_prompt: option.Option(String),
+  created_s: Int,
+  updated_s: Int,
+) -> store.StoredBot {
+  bot.Bot(
+    id: id,
+    name: name,
+    description: description,
+    provider_id: provider_id,
+    model: model,
+    system_prompt: system_prompt,
+    created_at: created_s,
+    updated_at: updated_s,
   )
 }
 
