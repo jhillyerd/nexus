@@ -206,20 +206,24 @@ runs inside it (nothing `ListModels`-like to quarantine).
     provider-registry subject the web layer already holds (friendly
     400 — a PATCH can move a bot between providers); the
     `ON DELETE RESTRICT` FK is the backstop.
-  - Create-from-bot orchestration extends `nexus/thread_create` (#73),
-    the path both callers already share (web routes and the UI
-    runtime's create effect): resolve the bot → re-validate the
-    model alias against the provider's live list →
-    `thread_registry.create` with
-    `NewThread(provider_id, model, system_prompt)` (#72 — `None` already
-    resolves to `cfg.system_prompt` at the one creation point). The bot
+  - Create-from-bot orchestration extends `nexus/thread_create` (#73,
+    in flight as PR #83) — the one creation path its two callers
+    share once #72/#73 land (web routes and the UI runtime's create
+    effect each had their own before): resolve the bot → re-validate
+    the model alias against the provider's live list →
+    `thread_registry.create`. #83's `NewThread(provider_id, model,
+    system_prompt)` — `None` resolving to `cfg.system_prompt` at the
+    one creation point — grows by exactly one field here: `bot_id`,
+    persisted as provenance (#83 defers the field for exactly this
+    PR; there is no column to fill before Phase 1's schema). The bot
     registry never resolves providers; the thread registry never sees
     bots beyond the `bot_id` column.
   - P3 keeps it CRUD-only: bot-to-bot delivery goes through the thread
-    registry (Phase 3), so the bot registry's consumers are web/UI,
-    never turn machinery — if P3's delivery tool needs bot identity,
-    it reads the registry worker-side (the §8 rule-1 exception class,
-    like the utility worker's asks), never from an actor loop.
+    registry (Phase 3). The bot registry's callers are the web/UI
+    surfaces and — from P3, if the delivery tool needs the sender's
+    identity — the **unlinked turn worker**, reading worker-side the
+    way the utility worker asks the thread registry (§8 rule 1's
+    exception class); no thread actor's loop ever calls it.
 - **Rejected alternative** — folding bots into the provider registry
   ("both are settings entities"): that is a UI-similarity argument, not
   an ownership one. The provider registry's contract is key custody at
