@@ -586,18 +586,20 @@ fn stored(id: String) -> store.StoredSummary {
   store.StoredSummary(
     id: id,
     provider_id: store_mock.fixture_provider_id,
+    model: "alias-1",
     // Manually titled: a dormant row the boot sweep must KEEP (a rename
     // is user intent, unlike a never-used empty). message_count stays 1 —
     // system prompt only, consistent with the empty row list.
-    title: "stored",
-    title_source: thread.ManualTitle,
-    model: "alias-1",
-    pinned: False,
-    archived: False,
-    tags: [],
-    tags_manual: [],
-    tags_source: thread.AutoTags,
-    created_at: timing.wall_now_s(),
+    meta: thread.ThreadMeta(
+      title: "stored",
+      title_source: thread.ManualTitle,
+      pinned: False,
+      tags: [],
+      tags_manual: [],
+      tags_source: thread.AutoTags,
+      archived: False,
+      created_at: timing.wall_now_s(),
+    ),
     last_active_at: timing.wall_now_s(),
     message_count: 1,
   )
@@ -858,8 +860,11 @@ pub fn tool_call_stamp_rides_first_row_of_run_test() {
 fn auto_stored(id: String, title: String) -> store.StoredSummary {
   store.StoredSummary(
     ..stored(id),
-    title: title,
-    title_source: thread.AutoTitle,
+    meta: thread.ThreadMeta(
+      ..stored(id).meta,
+      title: title,
+      title_source: thread.AutoTitle,
+    ),
   )
 }
 
@@ -874,13 +879,13 @@ pub fn auto_meta_upgrade_replaces_auto_title_test() {
 
   should.equal(seam.auto_meta_upgrade("s1", "Model Title", []), Ok(True))
   let assert Ok(stored) = seam.get_thread("s1")
-  should.equal(stored.summary.title, "Model Title")
-  should.equal(stored.summary.title_source, thread.AutoTitle)
+  should.equal(stored.summary.meta.title, "Model Title")
+  should.equal(stored.summary.meta.title_source, thread.AutoTitle)
 
   // An upgraded title is still auto-generated: it may be replaced again.
   should.equal(seam.auto_meta_upgrade("s1", "Better Title", []), Ok(True))
   let assert Ok(stored) = seam.get_thread("s1")
-  should.equal(stored.summary.title, "Better Title")
+  should.equal(stored.summary.meta.title, "Better Title")
 }
 
 /// `title_source = 'manual'`: the upgrade is REFUSED and replies False —
@@ -895,8 +900,8 @@ pub fn auto_meta_upgrade_refuses_manual_title_test() {
   should.equal(seam.set_title("s2", "renamed"), Ok(Nil))
   should.equal(seam.auto_meta_upgrade("s2", "Sneaky", []), Ok(False))
   let assert Ok(stored) = seam.get_thread("s2")
-  should.equal(stored.summary.title, "renamed")
-  should.equal(stored.summary.title_source, thread.ManualTitle)
+  should.equal(stored.summary.meta.title, "renamed")
+  should.equal(stored.summary.meta.title_source, thread.ManualTitle)
 
   should.be_error(seam.auto_meta_upgrade("nope", "X", []))
 }
@@ -918,10 +923,10 @@ pub fn auto_meta_upgrade_refuses_after_manual_tag_save_test() {
   )
   let assert Ok(stored) = seam.get_thread("s3")
   // Refused WHOLE: the title stays untouched too, not just the tags.
-  should.equal(stored.summary.title, "heuristic")
-  should.equal(stored.summary.tags, ["mine"])
-  should.equal(stored.summary.tags_manual, ["mine"])
-  should.equal(stored.summary.tags_source, thread.ManualTags)
+  should.equal(stored.summary.meta.title, "heuristic")
+  should.equal(stored.summary.meta.tags, ["mine"])
+  should.equal(stored.summary.meta.tags_manual, ["mine"])
+  should.equal(stored.summary.meta.tags_source, thread.ManualTags)
 
   // The mock recorded the manual save; no upgrade was written.
   store_mock.events(mock)
@@ -948,11 +953,11 @@ pub fn auto_meta_upgrade_applies_and_records_tags_test() {
     Ok(True),
   )
   let assert Ok(stored) = seam.get_thread("s4")
-  should.equal(stored.summary.title, "Model Title")
-  should.equal(stored.summary.tags, ["login", "auth"])
+  should.equal(stored.summary.meta.title, "Model Title")
+  should.equal(stored.summary.meta.tags, ["login", "auth"])
   // Both provenance columns stay 'auto': a later attempt may merge again.
-  should.equal(stored.summary.title_source, thread.AutoTitle)
-  should.equal(stored.summary.tags_source, thread.AutoTags)
+  should.equal(stored.summary.meta.title_source, thread.AutoTitle)
+  should.equal(stored.summary.meta.tags_source, thread.AutoTags)
   store_mock.events(mock)
   |> list.filter(fn(event) {
     case event {

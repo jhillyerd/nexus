@@ -573,15 +573,17 @@ fn seed_with_tags(seam: store.Store, id: String, tags: List(String)) -> Nil {
       store.StoredSummary(
         id: id,
         provider_id: store_mock.fixture_provider_id,
-        title: "stored " <> id,
-        title_source: thread.AutoTitle,
         model: "alpha",
-        pinned: False,
-        archived: False,
-        tags: tags,
-        tags_manual: [],
-        tags_source: thread.AutoTags,
-        created_at: 1_700_000_000,
+        meta: thread.ThreadMeta(
+          title: "stored " <> id,
+          title_source: thread.AutoTitle,
+          pinned: False,
+          archived: False,
+          tags: tags,
+          tags_manual: [],
+          tags_source: thread.AutoTags,
+          created_at: 1_700_000_000,
+        ),
         last_active_at: 1_700_000_000,
         message_count: 3,
       ),
@@ -714,9 +716,9 @@ pub fn set_tags_writes_display_manual_and_source_test() {
   find_summary(registry, a.id).tags |> should.equal(["work", "notes"])
 
   let assert Ok(stored) = seam.get_thread(a.id)
-  should.equal(stored.summary.tags, ["work", "notes"])
-  should.equal(stored.summary.tags_manual, ["work", "notes"])
-  should.equal(stored.summary.tags_source, thread.ManualTags)
+  should.equal(stored.summary.meta.tags, ["work", "notes"])
+  should.equal(stored.summary.meta.tags_manual, ["work", "notes"])
+  should.equal(stored.summary.meta.tags_source, thread.ManualTags)
   // The mock recorded exactly the normalized tags write.
   store_mock.events(mock)
   |> list.filter(fn(event) {
@@ -928,15 +930,17 @@ fn seed_at(
       store.StoredSummary(
         id: id,
         provider_id: store_mock.fixture_provider_id,
-        title: title,
-        title_source: title_source,
         model: "alpha",
-        pinned: pinned,
-        archived: archived,
-        tags: [],
-        tags_manual: [],
-        tags_source: thread.AutoTags,
-        created_at: last_active_at,
+        meta: thread.ThreadMeta(
+          title: title,
+          title_source: title_source,
+          pinned: pinned,
+          archived: archived,
+          tags: [],
+          tags_manual: [],
+          tags_source: thread.AutoTags,
+          created_at: last_active_at,
+        ),
         last_active_at: last_active_at,
         message_count: message_count,
       ),

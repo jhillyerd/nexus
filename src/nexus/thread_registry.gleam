@@ -201,28 +201,11 @@ type Record {
     /// unavailable, rather than the registry looping on start attempts.
     start_error: Option(String),
     // ---- Organizational metadata (beside the transcript, never in it) ----
-    /// Display title; "" until the first user message auto-titles it.
-    title: String,
-    /// Auto titles are generated once from the first user message; a
-    /// manual rename pins the title forever.
-    title_source: thread.TitleSource,
-    pinned: Bool,
-    /// Normalized on write through the ONE shared rule
-    /// (`utility.normalize_tags`): trimmed, lowercased, kebab-cased,
-    /// empties and duplicates dropped, each tag capped at 24 characters.
-    tags: List(String),
-    /// The user's exact (normalized) set — the manual half of the display
-    /// union (utility-tags plan §3.4); `tags − tags_manual` is the auto
-    /// contribution.
-    tags_manual: List(String),
-    /// Auto: model tags may still merge into the display set. Manual: a
-    /// manual tag edit froze the set forever — the in-memory half of the
-    /// twin invariant (the store's `tags_source` column is the other).
-    tags_source: thread.TagsSource,
-    /// Soft-hide flag: archived threads stay restorable until deleted.
-    archived: Bool,
-    /// Wall-clock epoch seconds at creation (display ordering only).
-    created_at: Int,
+    /// Shared verbatim with the dormant store summaries
+    /// (`thread.ThreadMeta`, issue #75): one type, so a new metadata
+    /// column is one field in one place and every meta mutation below
+    /// has a single guard instead of twin Record/StoredSummary closures.
+    meta: thread.ThreadMeta,
     /// Phase 2: the thread row was persisted. Unpersisted threads (the
     /// insert failed at create) keep Phase 1 restart semantics — empty
     /// transcript, no rehydration attempts.
@@ -538,6 +521,20 @@ fn handle_create(
           {
             Ok(started) -> {
               let created_at = timing.wall_now_s()
+              // The organizational block, built ONCE and shared by the
+              // stored row, the live record, and the reply summary
+              // (issue #75): "" title, open auto paths, unlisted.
+              let meta =
+                thread.ThreadMeta(
+                  title: "",
+                  title_source: thread.AutoTitle,
+                  pinned: False,
+                  tags: [],
+                  tags_manual: [],
+                  tags_source: thread.AutoTags,
+                  archived: False,
+                  created_at: created_at,
+                )
               // Write-through: the thread row lands now, with the frozen
               // alias and the frozen system prompt (contract rule 2), so
               // hydration can rebuild the frozen prefix byte-identically.
@@ -546,18 +543,8 @@ fn handle_create(
                   store.StoredSummary(
                     id: id,
                     provider_id: requested.provider_id,
-                    title: "",
-                    title_source: thread.AutoTitle,
                     model: alias,
-                    pinned: False,
-                    archived: False,
-                    tags: [],
-                    // insert_thread.sql: tags_manual '{}' literally and
-                    // tags_source left to its column default 'auto' — a
-                    // new thread has no tags and an open auto path.
-                    tags_manual: [],
-                    tags_source: thread.AutoTags,
-                    created_at: created_at,
+                    meta: meta,
                     last_active_at: created_at,
                     // 1 = the system prompt (Phase 1 message_count).
                     message_count: 1,
@@ -585,14 +572,7 @@ fn handle_create(
                   spec: spec,
                   name: name,
                   start_error: None,
-                  title: "",
-                  title_source: thread.AutoTitle,
-                  pinned: False,
-                  tags: [],
-                  tags_manual: [],
-                  tags_source: thread.AutoTags,
-                  archived: False,
-                  created_at: created_at,
+                  meta: meta,
                   persisted: persisted,
                 )
               // The create reply IS the summary (#73): the same shape a
@@ -715,16 +695,9 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
         state,
         id,
         reply,
-        fn(record) {
-          Record(
-            ..record,
-            title: string.trim(title),
-            title_source: thread.ManualTitle,
-          )
-        },
-        fn(summary) {
-          store.StoredSummary(
-            ..summary,
+        fn(meta) {
+          thread.ThreadMeta(
+            ..meta,
             title: string.trim(title),
             title_source: thread.ManualTitle,
           )
@@ -737,49 +710,32 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
       // earlier auto title) must never be clobbered. The reply says whether
       // it actually applied. The store's auto_title carries the same guard
       // in SQL, so the write-through cannot resurrect a clobbered title.
-      apply_meta_guarded(
-        state,
-        id,
-        reply,
-        fn(record) {
-          case record.title_source, record.title {
-            thread.AutoTitle, "" -> {
-              write_through_or_log(id, fn() {
-                state.store.auto_title(id, string.trim(title))
-                |> result.map(fn(_) { Nil })
-              })
-              Ok(Record(..record, title: string.trim(title)))
-            }
-            _, _ -> Error(Nil)
+      apply_meta_guarded(state, id, reply, fn(meta) {
+        case meta.title_source, meta.title {
+          thread.AutoTitle, "" -> {
+            write_through_or_log(id, fn() {
+              state.store.auto_title(id, string.trim(title))
+              |> result.map(fn(_) { Nil })
+            })
+            Ok(thread.ThreadMeta(..meta, title: string.trim(title)))
           }
-        },
-        fn(summary) {
-          case summary.title_source, summary.title {
-            thread.AutoTitle, "" -> {
-              write_through_or_log(id, fn() {
-                state.store.auto_title(id, string.trim(title))
-                |> result.map(fn(_) { Nil })
-              })
-              Ok(store.StoredSummary(..summary, title: string.trim(title)))
-            }
-            _, _ -> Error(Nil)
-          }
-        },
-      )
+          _, _ -> Error(Nil)
+        }
+      })
 
     UpgradeAutoTitle(id, title, tags, reply) -> {
       // Model-metadata upgrade (utility-titles plan §4.3, extended by
-      // utility-tags plan §3.5): the guard is provenance ONLY, on BOTH
-      // sides — the title may upgrade while `title_source = 'auto'`, the
-      // display tags may be written while `tags_source = 'auto'`; a
-      // manual rename OR a manual tag edit refuses the whole ask (one
-      // request, one guard, both writes — the review-caught P1). The
-      // in-memory update and the store write-through carry the same guard
+      // utility-tags plan §3.5): the guard is provenance ONLY — the
+      // title may upgrade while `title_source = 'auto'`, the display
+      // tags may be written while `tags_source = 'auto'`; a manual
+      // rename OR a manual tag edit refuses the whole ask (one request,
+      // one guard, both writes — the review-caught P1). The in-memory
+      // update and the store write-through carry the same guard
       // (twin-invariant pattern of the AutoTitle pair: the SQL refuses
       // what the memory would have refused, so a write-through cannot
-      // resurrect a clobbered title or a frozen tag set). Unlike AutoTitle
-      // there is no empty-title precondition: an auto title may be
-      // REPLACED.
+      // resurrect a clobbered title or a frozen tag set). Unlike
+      // AutoTitle there is no empty-title precondition: an auto title
+      // may be REPLACED.
       //
       // Tags are MERGED, never clobbered: existing display entries pass
       // through VERBATIM (never re-canonicalized — a legacy `Work Notes`
@@ -790,99 +746,74 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
       // the one merge rule. The outcome carries the fresh display set so
       // the caller can broadcast it truthfully.
       let title = string.trim(title)
+      // One guard + merge + store handshake over the shared meta
+      // (issue #75): the live-record half and the dormant-summary half
+      // differ only in WHICH dict they write back to. The store guard
+      // has the final word (twin-invariant): `Ok(False)` means a
+      // concurrent write changed the row's provenance behind this
+      // instance's back — refuse and leave the in-memory state
+      // untouched. An unreachable store keeps the documented degrade
+      // mode: log, and keep the in-memory write so the UI stays
+      // consistent.
+      let upgrade = fn(meta: thread.ThreadMeta) -> Result(
+        thread.ThreadMeta,
+        UpgradeOutcome,
+      ) {
+        case meta.title_source, meta.tags_source {
+          thread.AutoTitle, thread.AutoTags -> {
+            let merged = utility.merge_tags(meta.tags, tags)
+            case state.store.auto_meta_upgrade(id, title, merged) {
+              Ok(True) ->
+                Ok(thread.ThreadMeta(..meta, title: title, tags: merged))
+              Ok(False) -> Error(UpgradeRefused)
+              Error(error) -> {
+                log_store_error("write-through " <> id, error)
+                Ok(thread.ThreadMeta(..meta, title: title, tags: merged))
+              }
+            }
+          }
+          // A manual rename OR a manual tag edit wins forever:
+          // refuse the whole ask, touch nothing. (For a dormant
+          // summary the stored row is its ONLY state, so its refusal
+          // is final.)
+          _, _ -> Error(UpgradeRefused)
+        }
+      }
       let #(state, outcome) = case title {
         "" -> #(state, UpgradeRefused)
         _ ->
           case dict.get(state.threads, id) {
             Ok(record) ->
-              case record.title_source, record.tags_source {
-                thread.AutoTitle, thread.AutoTags -> {
-                  let merged = utility.merge_tags(record.tags, tags)
-                  // The store guard has the final word (twin-invariant):
-                  // `Ok(False)` means a concurrent write changed the row's
-                  // provenance behind this instance's back — refuse and
-                  // leave the in-memory record untouched. An unreachable
-                  // store keeps the documented degrade mode: log, and keep
-                  // the in-memory write so the UI stays consistent.
-                  case state.store.auto_meta_upgrade(id, title, merged) {
-                    Ok(True) -> #(
-                      State(
-                        ..state,
-                        threads: dict.insert(
-                          state.threads,
-                          id,
-                          Record(..record, title: title, tags: merged),
-                        ),
-                      ),
-                      UpgradeApplied(title, merged),
-                    )
-                    Ok(False) -> #(state, UpgradeRefused)
-                    Error(error) -> {
-                      log_store_error("write-through " <> id, error)
-                      #(
-                        State(
-                          ..state,
-                          threads: dict.insert(
-                            state.threads,
-                            id,
-                            Record(..record, title: title, tags: merged),
-                          ),
-                        ),
-                        UpgradeApplied(title, merged),
-                      )
-                    }
-                  }
-                }
-                // A manual rename OR a manual tag edit wins forever:
-                // refuse the whole ask, touch nothing.
-                _, _ -> #(state, UpgradeRefused)
+              case upgrade(record.meta) {
+                Ok(meta) -> #(
+                  State(
+                    ..state,
+                    threads: dict.insert(
+                      state.threads,
+                      id,
+                      Record(..record, meta: meta),
+                    ),
+                  ),
+                  UpgradeApplied(title, meta.tags),
+                )
+                Error(refused) -> #(state, refused)
               }
             Error(_) ->
               case dict.get(state.dormant, id) {
                 Ok(summary) ->
-                  case summary.title_source, summary.tags_source {
-                    thread.AutoTitle, thread.AutoTags -> {
-                      // Same twin-invariant: the stored row is a dormant
-                      // thread's ONLY state, so its refusal is final.
-                      let merged = utility.merge_tags(summary.tags, tags)
-                      case state.store.auto_meta_upgrade(id, title, merged) {
-                        Ok(True) -> #(
-                          State(
-                            ..state,
-                            dormant: dict.insert(
-                              state.dormant,
-                              id,
-                              store.StoredSummary(
-                                ..summary,
-                                title: title,
-                                tags: merged,
-                              ),
-                            ),
-                          ),
-                          UpgradeApplied(title, merged),
-                        )
-                        Ok(False) -> #(state, UpgradeRefused)
-                        Error(error) -> {
-                          log_store_error("write-through " <> id, error)
-                          #(
-                            State(
-                              ..state,
-                              dormant: dict.insert(
-                                state.dormant,
-                                id,
-                                store.StoredSummary(
-                                  ..summary,
-                                  title: title,
-                                  tags: merged,
-                                ),
-                              ),
-                            ),
-                            UpgradeApplied(title, merged),
-                          )
-                        }
-                      }
-                    }
-                    _, _ -> #(state, UpgradeRefused)
+                  case upgrade(summary.meta) {
+                    Ok(meta) -> #(
+                      State(
+                        ..state,
+                        dormant: dict.insert(
+                          state.dormant,
+                          id,
+                          store.StoredSummary(..summary, meta: meta),
+                        ),
+                      ),
+                      UpgradeApplied(title, meta.tags),
+                    )
+                    Error(refused) -> #(state, refused)
                   }
                 Error(_) -> #(state, UpgradeRefused)
               }
@@ -894,40 +825,18 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
 
     SetPinned(id, pinned, reply) ->
       // Invariant: an archived thread is never pinned. Pinning is
-      // refused (reply False, record untouched) so a pin can never
+      // refused (reply False, state untouched) so a pin can never
       // resurface from behind the archive toggle — pairing with
       // `SetArchived`, which clears the pin when archiving.
-      apply_meta_guarded(
-        state,
-        id,
-        reply,
-        fn(record) {
-          let #(record, applied) = case pinned, record.archived {
-            True, True -> #(record, False)
-            _, _ -> #(Record(..record, pinned: pinned), True)
+      apply_meta_guarded(state, id, reply, fn(meta) {
+        case pinned, meta.archived {
+          True, True -> Error(Nil)
+          _, _ -> {
+            let _ = state.store.set_pinned(id, pinned)
+            Ok(thread.ThreadMeta(..meta, pinned: pinned))
           }
-          case applied {
-            True -> {
-              let _ = state.store.set_pinned(id, pinned)
-              Ok(record)
-            }
-            False -> Error(Nil)
-          }
-        },
-        fn(summary) {
-          let #(summary, applied) = case pinned, summary.archived {
-            True, True -> #(summary, False)
-            _, _ -> #(store.StoredSummary(..summary, pinned: pinned), True)
-          }
-          case applied {
-            True -> {
-              let _ = state.store.set_pinned(id, pinned)
-              Ok(summary)
-            }
-            False -> Error(Nil)
-          }
-        },
-      )
+        }
+      })
 
     SetTags(id, tags, reply) -> {
       // The manual tags save (utility-tags plan §3.5): the user's exact
@@ -946,17 +855,9 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
         state,
         id,
         reply,
-        fn(record) {
-          Record(
-            ..record,
-            tags: normalized,
-            tags_manual: normalized,
-            tags_source: thread.ManualTags,
-          )
-        },
-        fn(summary) {
-          store.StoredSummary(
-            ..summary,
+        fn(meta) {
+          thread.ThreadMeta(
+            ..meta,
             tags: normalized,
             tags_manual: normalized,
             tags_source: thread.ManualTags,
@@ -971,20 +872,13 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
         state,
         id,
         reply,
-        fn(record) {
+        fn(meta) {
           case archived {
             // Archiving implicitly unpins — the pinned section only ever
             // holds active threads (the twin of the SetPinned refusal
             // above; together they keep `archived ⇒ ¬pinned` true).
-            True -> Record(..record, archived: True, pinned: False)
-            False -> Record(..record, archived: False)
-          }
-        },
-        fn(summary) {
-          case archived {
-            True ->
-              store.StoredSummary(..summary, archived: True, pinned: False)
-            False -> store.StoredSummary(..summary, archived: False)
+            True -> thread.ThreadMeta(..meta, archived: True, pinned: False)
+            False -> thread.ThreadMeta(..meta, archived: False)
           }
         },
         fn() {
@@ -1228,14 +1122,7 @@ fn lazy_start(state: State, summary: StoredSummary) -> Resolved {
                   spec: spec,
                   name: argument.name,
                   start_error: None,
-                  title: summary.title,
-                  title_source: summary.title_source,
-                  pinned: summary.pinned,
-                  tags: summary.tags,
-                  tags_manual: summary.tags_manual,
-                  tags_source: summary.tags_source,
-                  archived: summary.archived,
-                  created_at: summary.created_at,
+                  meta: summary.meta,
                   persisted: True,
                 )
               Started(
@@ -1306,15 +1193,16 @@ fn retry_rehydrate(state: State, record: Record) -> Resolved {
   }
 }
 
-/// Apply `f` to the live record or the dormant summary (whichever holds
-/// the id) and write the change through to the store. `False` when the id
-/// is unknown.
+/// Apply `f` to the organizational metadata — of the live record or the
+/// dormant summary, whichever holds the id (both carry the SAME
+/// `thread.ThreadMeta`, issue #75, so ONE mutator serves both) — and
+/// write the change through to the store. `False` when the id is
+/// unknown.
 fn apply_meta(
   state: State,
   id: String,
   reply: Subject(Bool),
-  on_record: fn(Record) -> Record,
-  on_summary: fn(StoredSummary) -> StoredSummary,
+  on_meta: fn(thread.ThreadMeta) -> thread.ThreadMeta,
   write_through: fn() -> Result(Nil, String),
 ) -> actor.Next(State, Msg) {
   let #(next, applied) = case dict.get(state.threads, id) {
@@ -1323,7 +1211,11 @@ fn apply_meta(
       #(
         State(
           ..state,
-          threads: dict.insert(state.threads, id, on_record(record)),
+          threads: dict.insert(
+            state.threads,
+            id,
+            Record(..record, meta: on_meta(record.meta)),
+          ),
         ),
         True,
       )
@@ -1335,7 +1227,11 @@ fn apply_meta(
           #(
             State(
               ..state,
-              dormant: dict.insert(state.dormant, id, on_summary(summary)),
+              dormant: dict.insert(
+                state.dormant,
+                id,
+                store.StoredSummary(..summary, meta: on_meta(summary.meta)),
+              ),
             ),
             True,
           )
@@ -1355,14 +1251,20 @@ fn apply_meta_guarded(
   state: State,
   id: String,
   reply: Subject(Bool),
-  on_record: fn(Record) -> Result(Record, Nil),
-  on_summary: fn(StoredSummary) -> Result(StoredSummary, Nil),
+  on_meta: fn(thread.ThreadMeta) -> Result(thread.ThreadMeta, Nil),
 ) -> actor.Next(State, Msg) {
   let #(next, applied) = case dict.get(state.threads, id) {
     Ok(record) ->
-      case on_record(record) {
-        Ok(updated) -> #(
-          State(..state, threads: dict.insert(state.threads, id, updated)),
+      case on_meta(record.meta) {
+        Ok(meta) -> #(
+          State(
+            ..state,
+            threads: dict.insert(
+              state.threads,
+              id,
+              Record(..record, meta: meta),
+            ),
+          ),
           True,
         )
         Error(Nil) -> #(state, False)
@@ -1370,9 +1272,16 @@ fn apply_meta_guarded(
     Error(_) ->
       case dict.get(state.dormant, id) {
         Ok(summary) ->
-          case on_summary(summary) {
-            Ok(updated) -> #(
-              State(..state, dormant: dict.insert(state.dormant, id, updated)),
+          case on_meta(summary.meta) {
+            Ok(meta) -> #(
+              State(
+                ..state,
+                dormant: dict.insert(
+                  state.dormant,
+                  id,
+                  store.StoredSummary(..summary, meta: meta),
+                ),
+              ),
               True,
             )
             Error(Nil) -> #(state, False)
@@ -1438,10 +1347,10 @@ fn compute_tag_corpus(
   let per_thread =
     list.append(
       list.map(dict.values(threads), fn(record) {
-        utility.normalize_tags(record.tags)
+        utility.normalize_tags(record.meta.tags)
       }),
       list.map(dict.values(dormant), fn(summary) {
-        utility.normalize_tags(summary.tags)
+        utility.normalize_tags(summary.meta.tags)
       }),
     )
   let counts =
@@ -1518,17 +1427,17 @@ fn summarise(
     id: record.id,
     provider_id: record.provider_id,
     model: record.model,
-    title: record.title,
-    title_source: record.title_source,
-    pinned: record.pinned,
-    tags: record.tags,
-    archived: record.archived,
+    title: record.meta.title,
+    title_source: record.meta.title_source,
+    pinned: record.meta.pinned,
+    tags: record.meta.tags,
+    archived: record.meta.archived,
     message_count: status.message_count,
     streaming: status.streaming,
-    created_at: record.created_at,
+    created_at: record.meta.created_at,
     // Until the first commit, a thread's activity is its creation.
     last_active_at: case status.last_commit_at {
-      0 -> record.created_at
+      0 -> record.meta.created_at
       committed -> committed
     },
     metrics: status.metrics,
@@ -1542,14 +1451,14 @@ fn stored_summary_as(summary: StoredSummary) -> thread.ThreadSummary {
     id: summary.id,
     provider_id: summary.provider_id,
     model: summary.model,
-    title: summary.title,
-    title_source: summary.title_source,
-    pinned: summary.pinned,
-    tags: summary.tags,
-    archived: summary.archived,
+    title: summary.meta.title,
+    title_source: summary.meta.title_source,
+    pinned: summary.meta.pinned,
+    tags: summary.meta.tags,
+    archived: summary.meta.archived,
     message_count: summary.message_count,
     streaming: False,
-    created_at: summary.created_at,
+    created_at: summary.meta.created_at,
     last_active_at: summary.last_active_at,
     metrics: [],
   )
