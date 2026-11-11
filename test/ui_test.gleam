@@ -3434,6 +3434,10 @@ pub fn view_create_panel_bot_picker_test() {
     |> step(ui.CreateBotChanged(""))
     |> view_string
   should.be_false(string.contains(restored, "bot-picker\" hidden"))
+  // …and the plain-create block itself is visible again (hidden elements
+  // still render into the string, so provider-picker presence alone
+  // proves nothing).
+  should.be_false(string.contains(restored, "plain-create\" hidden"))
   should.be_true(string.contains(restored, "provider-picker"))
 }
 
