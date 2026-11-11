@@ -18,6 +18,7 @@ import nexus/store
 import nexus/thread
 import nexus/thread_registry
 import nexus/timing
+import nexus/tools
 import nexus/transcript
 import store_mock
 
@@ -143,10 +144,10 @@ fn create(
   runner: thread.TurnRunner,
 ) -> Created {
   let assert Ok(summary) =
-    thread_registry.create_with_runner(
+    thread_registry.create_with_toolset(
       registry,
       new_thread(store_mock.fixture_provider_id, model),
-      runner,
+      toolset(runner),
     )
   let assert Ok(subject) = thread_registry.get(registry, summary.id)
   let assert Ok(pid) = process.subject_owner(subject)
@@ -161,6 +162,22 @@ fn new_thread(provider_id: String, model: String) -> thread_registry.NewThread {
     model: model,
     system_prompt: None,
     bot_id: None,
+  )
+}
+
+/// Wrap a fake turn runner in the toolset bundle the create seam now
+/// carries (#76): the default specs of the test config, named by their
+/// own wire names. The utility side refuses — no test here expects a
+/// utility call from an injected runner.
+fn toolset(runner: thread.TurnRunner) -> thread.Toolset {
+  let specs = tools.default(test_config())
+  thread.Toolset(
+    names: list.map(specs, tools.tool_name),
+    specs: specs,
+    runner: runner,
+    utility_runner: fn(_endpoint, _tr, _cancel, _allow_pass) {
+      Error("no utility call in this test")
+    },
   )
 }
 
@@ -196,10 +213,10 @@ pub fn create_returns_unique_ids_and_summaries_test() {
 
 pub fn create_rejects_empty_model_test() {
   let registry = start_registry()
-  thread_registry.create_with_runner(
+  thread_registry.create_with_toolset(
     registry,
     new_thread(store_mock.fixture_provider_id, "   "),
-    happy_runner,
+    toolset(happy_runner),
   )
   |> should.equal(Error(thread_registry.EmptyModel))
   thread_registry.list_threads(registry) |> should.equal([])
@@ -330,10 +347,10 @@ pub fn startup_failure_is_surfaced_not_a_crash_test() {
     })
 
   case
-    thread_registry.create_with_runner(
+    thread_registry.create_with_toolset(
       registry,
       new_thread(store_mock.fixture_provider_id, "alpha"),
-      happy_runner,
+      toolset(happy_runner),
     )
   {
     Error(thread_registry.StartFailed(_reason)) -> Nil
@@ -1030,10 +1047,10 @@ pub fn boot_sweep_prune_failure_keeps_thread_test() {
 /// (provider, model) pin in place).
 pub fn create_rejects_unknown_provider_test() {
   let registry = start_registry()
-  thread_registry.create_with_runner(
+  thread_registry.create_with_toolset(
     registry,
     new_thread("p-nope", "alpha"),
-    happy_runner,
+    toolset(happy_runner),
   )
   |> should.equal(
     Error(thread_registry.ProviderFailed(thread_registry.ProviderUnknown)),
@@ -1063,10 +1080,10 @@ pub fn create_rejects_disabled_provider_test() {
       persistence,
       disabled,
     )
-  thread_registry.create_with_runner(
+  thread_registry.create_with_toolset(
     started.data,
     new_thread(store_mock.fixture_provider_id, "alpha"),
-    happy_runner,
+    toolset(happy_runner),
   )
   |> should.equal(
     Error(thread_registry.ProviderFailed(thread_registry.ProviderDisabled)),
@@ -1159,7 +1176,7 @@ pub fn create_from_bot_freezes_columns_and_provenance_test() {
   let assert Ok(Nil) = seed_bot(seam, "b1", Some("be terse"))
 
   let assert Ok(summary) =
-    thread_registry.create_with_runner(
+    thread_registry.create_with_toolset(
       registry,
       thread_registry.NewThread(
         provider_id: store_mock.fixture_provider_id,
@@ -1167,7 +1184,7 @@ pub fn create_from_bot_freezes_columns_and_provenance_test() {
         system_prompt: Some("be terse"),
         bot_id: Some("b1"),
       ),
-      happy_runner,
+      toolset(happy_runner),
     )
   should.equal(summary.bot_id, Some("b1"))
 
@@ -1178,10 +1195,10 @@ pub fn create_from_bot_freezes_columns_and_provenance_test() {
 
   // A plain create stays unprovenanced.
   let assert Ok(plain) =
-    thread_registry.create_with_runner(
+    thread_registry.create_with_toolset(
       registry,
       new_thread(store_mock.fixture_provider_id, "alpha"),
-      happy_runner,
+      toolset(happy_runner),
     )
   should.equal(plain.bot_id, None)
   let assert Ok(plain_stored) = seam.get_thread(plain.id)
@@ -1197,7 +1214,7 @@ pub fn create_from_null_prompt_bot_freezes_config_default_test() {
   let assert Ok(Nil) = seed_bot(seam, "b2", None)
 
   let assert Ok(summary) =
-    thread_registry.create_with_runner(
+    thread_registry.create_with_toolset(
       registry,
       thread_registry.NewThread(
         provider_id: store_mock.fixture_provider_id,
@@ -1205,11 +1222,63 @@ pub fn create_from_null_prompt_bot_freezes_config_default_test() {
         system_prompt: None,
         bot_id: Some("b2"),
       ),
-      happy_runner,
+      toolset(happy_runner),
     )
   should.equal(summary.bot_id, Some("b2"))
   let assert Ok(stored) = seam.get_thread(summary.id)
   should.equal(stored.system_prompt, "test system prompt")
+}
+
+/// The create seam carries the WHOLE toolset bundle (#76): the created
+/// thread turns through the bundle's turn runner and its utility branch
+/// calls the bundle's utility runner — not the registry default's. Before
+/// the bundling, the utility side always came from the registry state, so
+/// the bundle's own pinging fake is the observable that per-toolset
+/// carriage is real (the default's fake refuses silently, which would be
+/// indistinguishable from a lost call).
+pub fn create_with_toolset_carries_the_whole_bundle_test() {
+  // The utility branch is config-gated OFF in this suite's test_config
+  // (keeps `gleam test` offline); this pin asserts the side call itself,
+  // so this one registry boots with it on — the bundle's fake keeps it
+  // offline regardless.
+  let factory_name = process.new_name("nexus_bundle_factory")
+  let assert Ok(_factory) =
+    factory_supervisor.start(thread_registry.factory_builder(factory_name))
+  let persistence = store_mock.seam(store_mock.start())
+  store_mock.ensure_fixture_provider(persistence)
+  let assert Ok(started) =
+    thread_registry.start(
+      config.Config(..test_config(), utility_enabled: True),
+      factory_supervisor.get_by_name(factory_name),
+      process.new_name("nexus_bundle_registry"),
+      persistence,
+      fixture_resolver(),
+    )
+  let registry = started.data
+  let ping = process.new_subject()
+  let specs = tools.default(test_config())
+  let bundle =
+    thread.Toolset(
+      names: list.map(specs, tools.tool_name),
+      specs: specs,
+      runner: happy_runner,
+      utility_runner: fn(_endpoint, _tr, _cancel, _allow_pass) {
+        process.send(ping, Nil)
+        Error("asserted by the ping, not the verdict")
+      },
+    )
+  let assert Ok(summary) =
+    thread_registry.create_with_toolset(
+      registry,
+      new_thread(store_mock.fixture_provider_id, "alpha"),
+      bundle,
+    )
+  let assert Ok(subject) = thread_registry.get(registry, summary.id)
+
+  // The first committed exchange arms the utility branch (utility-titles
+  // plan §8): the call must land on the bundle's utility runner.
+  should.equal(thread.send_message(subject, "hello"), thread.Sent)
+  let assert Ok(Nil) = process.receive(ping, 5000)
 }
 
 /// Provenance survives the boot round trip: a dormant stored thread
@@ -1345,7 +1414,7 @@ pub fn bot_delete_scrubs_cached_provenance_test() {
 
   // And a LIVE thread sourced from b1.
   let assert Ok(live) =
-    thread_registry.create_with_runner(
+    thread_registry.create_with_toolset(
       registry,
       thread_registry.NewThread(
         provider_id: store_mock.fixture_provider_id,
@@ -1353,7 +1422,7 @@ pub fn bot_delete_scrubs_cached_provenance_test() {
         system_prompt: Some("p"),
         bot_id: Some("b1"),
       ),
-      happy_runner,
+      toolset(happy_runner),
     )
 
   let bot_of = fn(id: String) {
@@ -1406,7 +1475,7 @@ pub fn unpersisted_create_carries_no_provenance_test() {
     start_registry_keeping_seam_with(thread_registry.thread_child, failing)
 
   let assert Ok(summary) =
-    thread_registry.create_with_runner(
+    thread_registry.create_with_toolset(
       registry,
       thread_registry.NewThread(
         provider_id: store_mock.fixture_provider_id,
@@ -1414,7 +1483,7 @@ pub fn unpersisted_create_carries_no_provenance_test() {
         system_prompt: Some("p"),
         bot_id: Some("b1"),
       ),
-      happy_runner,
+      toolset(happy_runner),
     )
   // The create reply strips the pointer (the request asked for Some).
   should.equal(summary.bot_id, None)

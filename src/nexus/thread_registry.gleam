@@ -136,10 +136,12 @@ pub type Msg {
     requested: NewThread,
     reply: Subject(Result(thread.ThreadSummary, CreateError)),
   )
-  /// Test seam: start a thread with an injected runner.
-  CreateWithRunner(
+  /// Test seam: start a thread with an injected toolset bundle — its own
+  /// specs and turn + utility runners, carried verbatim into the thread
+  /// spec (no cache consult: an injected bundle means "use THIS one").
+  CreateWithToolset(
     requested: NewThread,
-    runner: thread.TurnRunner,
+    toolset: thread.Toolset,
     reply: Subject(Result(thread.ThreadSummary, CreateError)),
   )
   /// Resolve a thread subject — live, or a stored-but-not-live id
@@ -228,14 +230,20 @@ type Record {
 type State {
   State(
     cfg: Config,
-    /// The M3 agent-loop runner with the registry's frozen tool set —
-    /// every thread this registry starts (create, restart, replacement)
-    /// gets the identical tool schema.
-    runner: thread.TurnRunner,
-    /// The utility side-call runner over the SAME frozen tool set —
-    /// built once at boot beside `runner`, so the title branch's envelope
-    /// is byte-identical to a turn request's by construction.
-    utility_runner: thread.UtilityRunner,
+    /// The default toolset's resolved names — the key under which the
+    /// boot-built bundle is cached below, and what plain creates resolve
+    /// through the cache (the default snapshot IS the boot bundle).
+    default_names: List(String),
+    /// Per-toolset runner bundles, cached by the name tuple (bots plan
+    /// P2 prep, #76). Seeded at boot with the default bundle — today the
+    /// only entry, since plain creates all resolve through it. P2's
+    /// create-from-bot path is the first WRITER: a new name tuple builds
+    /// its bundle once (specs via `tools.by_names`, turn + utility
+    /// runners over them) and every later thread of that toolset shares
+    /// it, so threads of one toolset keep byte-identical
+    /// `tools` / `tool_choice` envelopes and each bundle's utility
+    /// side-call rides its own turn envelope by construction.
+    toolsets: Dict(List(String), thread.Toolset),
     /// This actor's own subject: the utility apply closures ask the
     /// UpgradeAutoTitle guard through it from the (unlinked) utility
     /// worker process.
@@ -317,43 +325,50 @@ pub fn start(
   resolve_provider: ResolveProvider,
 ) -> actor.StartResult(Subject(Msg)) {
   // The tool registry is built once, here, from the global config — before
-  // any thread exists — so every request any thread of this VM ever
-  // sends carries the identical (byte-stable) tool schema. The SAME specs
-  // build the utility side-call runner, so the title branch's envelope is
-  // the turn envelope by construction (KV-cache contract). The runner's
-  // corpus closure asks THIS registry (by name) for the reuse vocabulary
-  // from inside the utility worker — Y is the tail message,
+  // any thread exists — so every request any thread of the default toolset
+  // ever sends carries the identical (byte-stable) tool schema. The SAME
+  // specs build the utility side-call runner, so the title branch's
+  // envelope is the turn envelope by construction (KV-cache contract);
+  // bundling them into one Toolset keeps that property per toolset. The
+  // runner's corpus closure asks THIS registry (by name) for the reuse
+  // vocabulary from inside the utility worker — Y is the tail message,
   // generation-side only, so the dynamic corpus can never touch the
   // cached prefix (utility-tags plan §3.3).
-  let specs = tools.default(cfg)
+  let names = tools.default_names(cfg)
+  let assert Ok(specs) = tools.by_names(cfg, names)
   let corpus = tag_corpus_for(name)
-  start_with_runner(
+  let default_toolset =
+    thread.Toolset(
+      names: names,
+      specs: specs,
+      runner: thread.agent_runner(cfg.max_tool_iterations, specs),
+      utility_runner: thread.utility_runner(specs, corpus),
+    )
+  start_with_toolset(
     cfg,
     factory,
     name,
     persistence,
-    thread.agent_runner(cfg.max_tool_iterations, specs),
-    thread.utility_runner(specs, corpus),
+    default_toolset,
     corpus,
     resolve_provider,
   )
 }
 
-/// Test seam: the same registry with injected turn + utility runners —
-/// hydration (boot, lazy start, restart recovery) then uses them for every
-/// thread it starts, exactly like production uses the frozen boot-built
-/// runners. `_corpus` is the TagCorpus seam the real utility runner asks
-/// (§3.3): accepted beside the runners so the seam mirrors `start`'s
-/// plumbing (a test booting the real runner closes over its corpus the
-/// same way), and deliberately unused here — whether a corpus is asked
-/// at all is the injected runner's business, and fakes never ask.
-pub fn start_with_runner(
+/// Test seam: the same registry with an injected default toolset bundle —
+/// hydration (boot, lazy start, restart recovery) then uses it for every
+/// thread it starts, exactly like production uses the boot-built bundle.
+/// `_corpus` is the TagCorpus seam the real utility runner asks (§3.3):
+/// accepted beside the bundle so the seam mirrors `start`'s plumbing (a
+/// test booting the real runner closes over its corpus the same way), and
+/// deliberately unused here — whether a corpus is asked at all is the
+/// injected runner's business, and fakes never ask.
+pub fn start_with_toolset(
   cfg: Config,
   factory: Factory,
   name: process.Name(Msg),
   persistence: Store,
-  runner: thread.TurnRunner,
-  utility_runner: thread.UtilityRunner,
+  default_toolset: thread.Toolset,
   _corpus: fn() -> List(String),
   resolve_provider: ResolveProvider,
 ) -> actor.StartResult(Subject(Msg)) {
@@ -375,8 +390,10 @@ pub fn start_with_runner(
             })
           actor.initialised(State(
             cfg: cfg,
-            runner: runner,
-            utility_runner: utility_runner,
+            default_names: default_toolset.names,
+            toolsets: dict.from_list([
+              #(default_toolset.names, default_toolset),
+            ]),
             self: self,
             resolve_provider: resolve_provider,
             factory: factory,
@@ -471,19 +488,27 @@ fn boot_sweep(persistence: Store) -> List(String) {
 fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
   case msg {
     Create(requested, reply) ->
-      handle_create(state, requested, state.runner, reply)
+      handle_create(state, requested, default_toolset(state), reply)
 
-    CreateWithRunner(requested, runner, reply) ->
-      handle_create(state, requested, runner, reply)
+    CreateWithToolset(requested, toolset, reply) ->
+      handle_create(state, requested, toolset, reply)
 
     _ -> handle_rest(state, msg)
   }
 }
 
+/// The registry's default toolset bundle: resolved through the boot-seeded
+/// cache, so the default snapshot IS the boot-built bundle (#76). A miss
+/// would mean the seed was dropped — a programmer error, crashed loudly.
+fn default_toolset(state: State) -> thread.Toolset {
+  let assert Ok(toolset) = dict.get(state.toolsets, state.default_names)
+  toolset
+}
+
 fn handle_create(
   state: State,
   requested: NewThread,
-  runner: thread.TurnRunner,
+  toolset: thread.Toolset,
   reply: Subject(Result(thread.ThreadSummary, CreateError)),
 ) -> actor.Next(State, Msg) {
   case string.trim(requested.model) {
@@ -518,11 +543,10 @@ fn handle_create(
               id: id,
               cfg: state.cfg,
               endpoint: endpoint,
-              runner: runner,
+              toolset: toolset,
               commit_hook: commit_hook_for(state.store, id),
               transcript: transcript,
               hydrated: False,
-              utility_runner: state.utility_runner,
               utility_apply: utility_apply_for(state.self, id),
             )
           case
@@ -1079,7 +1103,7 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
     MonitorNoise -> actor.continue(state)
 
     // Create cases are handled in `handle` before delegating here.
-    Create(..) | CreateWithRunner(..) -> actor.continue(state)
+    Create(..) | CreateWithToolset(..) -> actor.continue(state)
   }
 }
 
@@ -1166,11 +1190,10 @@ fn lazy_start(state: State, summary: StoredSummary) -> Resolved {
               id: summary.id,
               cfg: state.cfg,
               endpoint: endpoint,
-              runner: state.runner,
+              toolset: default_toolset(state),
               commit_hook: commit_hook_for(state.store, summary.id),
               transcript: transcript,
               hydrated: True,
-              utility_runner: state.utility_runner,
               utility_apply: utility_apply_for(state.self, summary.id),
             )
           let argument =
@@ -1583,14 +1606,16 @@ pub fn create(
   actor.call(registry, 5000, fn(reply) { Create(requested:, reply:) })
 }
 
-/// Test seam: create a thread with an injected turn runner.
-pub fn create_with_runner(
+/// Test seam: create a thread with an injected toolset bundle — its own
+/// specs and turn + utility runners, carried verbatim into the thread spec
+/// (see `CreateWithToolset`).
+pub fn create_with_toolset(
   registry: Subject(Msg),
   requested: NewThread,
-  runner: thread.TurnRunner,
+  toolset: thread.Toolset,
 ) -> Result(thread.ThreadSummary, CreateError) {
   actor.call(registry, 5000, fn(reply) {
-    CreateWithRunner(requested:, runner:, reply:)
+    CreateWithToolset(requested:, toolset:, reply:)
   })
 }
 

@@ -24,6 +24,7 @@ import nexus/store
 import nexus/thread
 import nexus/thread_registry
 import nexus/timing
+import nexus/tools
 import nexus/transcript
 import nexus/ui
 import nexus/ui_runtime
@@ -2687,15 +2688,12 @@ pub fn meta_updated_refreshes_sidebar_test() {
   let assert Ok(_factory) =
     factory_supervisor.start(thread_registry.factory_builder(factory_name))
   let assert Ok(started_registry) =
-    thread_registry.start_with_runner(
+    thread_registry.start_with_toolset(
       test_config(),
       factory_supervisor.get_by_name(factory_name),
       process.new_name("nexus_ui_registry"),
       seam,
-      unused_turn_runner,
-      fn(_endpoint, _tr, _cancel, _allow_pass) {
-        Error("no utility call in this test")
-      },
+      toolset(unused_turn_runner),
       // The corpus seam: never asked here (the fake runner refuses), pure
       // so the boot stays offline.
       fn() { [] },
@@ -2705,10 +2703,10 @@ pub fn meta_updated_refreshes_sidebar_test() {
 
   // A titled thread, so the sidebar has something to refresh.
   let assert Ok(record) =
-    thread_registry.create_with_runner(
+    thread_registry.create_with_toolset(
       registry,
       new_thread(store_mock.fixture_provider_id, "alias-1"),
-      unused_turn_runner,
+      toolset(unused_turn_runner),
     )
   should.be_true(thread_registry.auto_title(registry, record.id, "Before"))
 
@@ -2818,15 +2816,12 @@ pub fn send_moves_previous_day_row_into_today_immediately_test() {
   let assert Ok(_factory) =
     factory_supervisor.start(thread_registry.factory_builder(factory_name))
   let assert Ok(started_registry) =
-    thread_registry.start_with_runner(
+    thread_registry.start_with_toolset(
       test_config(),
       factory_supervisor.get_by_name(factory_name),
       process.new_name("nexus_ui_registry_row"),
       seam,
-      parked_runner,
-      fn(_endpoint, _tr, _cancel, _allow_pass) {
-        Error("no utility call in this test")
-      },
+      toolset(parked_runner),
       // The corpus seam: never asked here (the fake runner refuses), pure
       // so the boot stays offline.
       fn() { [] },
@@ -2908,15 +2903,12 @@ pub fn connect_with_configured_provider_never_notes_no_provider_test() {
   let assert Ok(_factory) =
     factory_supervisor.start(thread_registry.factory_builder(factory_name))
   let assert Ok(started_registry) =
-    thread_registry.start_with_runner(
+    thread_registry.start_with_toolset(
       test_config(),
       factory_supervisor.get_by_name(factory_name),
       process.new_name("nexus_ui_registry"),
       seam,
-      unused_turn_runner,
-      fn(_endpoint, _tr, _cancel, _allow_pass) {
-        Error("no utility call in this test")
-      },
+      toolset(unused_turn_runner),
       // The corpus seam: never asked here (the fake runner refuses), pure
       // so the boot stays offline.
       fn() { [] },
@@ -3048,15 +3040,12 @@ pub fn thread_switch_drops_left_thread_stream_test() {
   let assert Ok(_factory) =
     factory_supervisor.start(thread_registry.factory_builder(factory_name))
   let assert Ok(started_registry) =
-    thread_registry.start_with_runner(
+    thread_registry.start_with_toolset(
       test_config(),
       factory_supervisor.get_by_name(factory_name),
       process.new_name("nexus_ui_registry_leak"),
       seam,
-      leak_runner,
-      fn(_endpoint, _tr, _cancel, _allow_pass) {
-        Error("no utility call in this test")
-      },
+      toolset(leak_runner),
       fn() { [] },
       fixture_resolver(),
     )
@@ -3138,15 +3127,12 @@ pub fn meta_updated_from_other_thread_refreshes_sidebar_test() {
   let assert Ok(_factory) =
     factory_supervisor.start(thread_registry.factory_builder(factory_name))
   let assert Ok(started_registry) =
-    thread_registry.start_with_runner(
+    thread_registry.start_with_toolset(
       test_config(),
       factory_supervisor.get_by_name(factory_name),
       process.new_name("nexus_ui_registry_meta"),
       seam,
-      unused_turn_runner,
-      fn(_endpoint, _tr, _cancel, _allow_pass) {
-        Error("no utility call in this test")
-      },
+      toolset(unused_turn_runner),
       fn() { [] },
       fixture_resolver(),
     )
@@ -3225,6 +3211,22 @@ fn new_thread(provider_id: String, model: String) -> thread_registry.NewThread {
 
 /// Config for the real registries: valid key material (the provider
 /// registry decrypt-validates at boot), otherwise test defaults.
+/// Wrap a fake turn runner in the toolset bundle the registry seams now
+/// carry (#76): the default specs of the test config, named by their own
+/// wire names. The utility side refuses — these tests drive turns through
+/// the turn runner only.
+fn toolset(runner: thread.TurnRunner) -> thread.Toolset {
+  let specs = tools.default(test_config())
+  thread.Toolset(
+    names: list.map(specs, tools.tool_name),
+    specs: specs,
+    runner: runner,
+    utility_runner: fn(_endpoint, _tr, _cancel, _allow_pass) {
+      Error("no utility call in this test")
+    },
+  )
+}
+
 fn test_config() -> config.Config {
   config.Config(
     encryption_key: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
@@ -3626,15 +3628,12 @@ fn start_offline_registries(
   let assert Ok(_factory) =
     factory_supervisor.start(thread_registry.factory_builder(factory_name))
   let assert Ok(started_registry) =
-    thread_registry.start_with_runner(
+    thread_registry.start_with_toolset(
       test_config(),
       factory_supervisor.get_by_name(factory_name),
       process.new_name("nexus_ui_create_registry"),
       seam,
-      unused_turn_runner,
-      fn(_endpoint, _tr, _cancel, _allow_pass) {
-        Error("no utility call in this test")
-      },
+      toolset(unused_turn_runner),
       fn() { [] },
       fixture_resolver(),
     )

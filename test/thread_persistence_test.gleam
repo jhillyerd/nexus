@@ -288,15 +288,12 @@ fn boot(seam: store.Store) -> Boot {
   let assert Ok(factory) =
     factory_supervisor.start(thread_registry.factory_builder(factory_name))
   let assert Ok(started) =
-    thread_registry.start_with_runner(
+    thread_registry.start_with_toolset(
       test_config(),
       factory_supervisor.get_by_name(factory_name),
       registry_name,
       seam,
-      tool_round_runner,
-      fn(_endpoint, _tr, _cancel, _allow_pass) {
-        Error("no utility call in this test")
-      },
+      toolset(tool_round_runner),
       // The corpus seam: never asked in these tests (the fake runner
       // above refuses before any request), pure to stay offline.
       fn() { [] },
@@ -328,16 +325,32 @@ type Created {
   Created(id: String, subject: Subject(thread.Msg))
 }
 
+/// Wrap a fake turn runner in the toolset bundle the registry seams now
+/// carry (#76): the default specs of the test config, named by their own
+/// wire names. The utility side refuses — these tests drive turns through
+/// the turn runner only.
+fn toolset(runner: thread.TurnRunner) -> thread.Toolset {
+  let specs = tools.default(test_config())
+  thread.Toolset(
+    names: list.map(specs, tools.tool_name),
+    specs: specs,
+    runner: runner,
+    utility_runner: fn(_endpoint, _tr, _cancel, _allow_pass) {
+      Error("no utility call in this test")
+    },
+  )
+}
+
 fn create(
   registry: Subject(thread_registry.Msg),
   model: String,
   runner: thread.TurnRunner,
 ) -> Created {
   let assert Ok(summary) =
-    thread_registry.create_with_runner(
+    thread_registry.create_with_toolset(
       registry,
       new_thread(store_mock.fixture_provider_id, model),
-      runner,
+      toolset(runner),
     )
   let assert Ok(subject) = thread_registry.get(registry, summary.id)
   Created(id: summary.id, subject: subject)

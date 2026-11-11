@@ -11,6 +11,7 @@ import nexus/loop
 import nexus/openai
 import nexus/thread
 import nexus/timing
+import nexus/tools
 import nexus/transcript
 import nexus/utility
 
@@ -302,21 +303,35 @@ fn no_utility_apply(
   Error(Nil)
 }
 
+/// Wrap fake turn + utility runners in the toolset bundle ThreadSpec now
+/// carries (#76): the default specs of the test config, named by their
+/// own wire names. One value, so a thread's turn and utility branches
+/// demonstrably ride one toolset.
+fn toolset(
+  runner: thread.TurnRunner,
+  utility_runner: thread.UtilityRunner,
+) -> thread.Toolset {
+  let specs = tools.default(test_config())
+  thread.Toolset(
+    names: list.map(specs, tools.tool_name),
+    specs: specs,
+    runner: runner,
+    utility_runner: utility_runner,
+  )
+}
+
 fn start_with(runner: thread.TurnRunner) -> process.Subject(thread.Msg) {
   let assert Ok(started) =
     thread.start_with_spec(thread.ThreadSpec(
       id: test_thread_id,
       cfg: test_config(),
       endpoint: test_endpoint(),
-      runner: runner,
+      toolset: toolset(runner, no_utility_runner),
       commit_hook: fn(_) { Nil },
       // The registry normally builds this; tests build it directly
       // through the same one construction path.
       transcript: transcript.new("test-alias", ""),
       hydrated: False,
-      // No utility attempt is expected in these tests: the fake refuses,
-      // and a failed attempt broadcasts nothing.
-      utility_runner: no_utility_runner,
       utility_apply: no_utility_apply,
     ))
   started.data
@@ -553,11 +568,10 @@ pub fn selected_alias_is_frozen_test() {
       id: test_thread_id,
       cfg: test_config(),
       endpoint: test_endpoint(),
-      runner: happy_runner,
+      toolset: toolset(happy_runner, no_utility_runner),
       commit_hook: fn(_) { Nil },
       transcript: transcript.new("chosen-alias", ""),
       hydrated: False,
-      utility_runner: no_utility_runner,
       utility_apply: no_utility_apply,
     )
   let assert Ok(started) = thread.start_with_spec(spec)
@@ -596,11 +610,10 @@ pub fn runner_receives_frozen_endpoint_test() {
       id: test_thread_id,
       cfg: test_config(),
       endpoint: test_endpoint(),
-      runner: capturing,
+      toolset: toolset(capturing, no_utility_runner),
       commit_hook: fn(_) { Nil },
       transcript: transcript.new("test-alias", ""),
       hydrated: False,
-      utility_runner: no_utility_runner,
       utility_apply: no_utility_apply,
     )
   let assert Ok(started) = thread.start_with_spec(spec)
@@ -1406,11 +1419,10 @@ fn start_with_utility(
       id: test_thread_id,
       cfg: cfg,
       endpoint: test_endpoint(),
-      runner: runner,
+      toolset: toolset(runner, u_runner),
       commit_hook: fn(_) { Nil },
       transcript: transcript.new("test-alias", ""),
       hydrated: False,
-      utility_runner: u_runner,
       utility_apply: u_apply,
     ))
   started.data

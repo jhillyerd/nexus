@@ -293,10 +293,10 @@ pub fn golden_metadata_never_alters_request_bytes_test() {
   let opts = loop_options()
   let registry = start_registry()
   let assert Ok(summary) =
-    thread_registry.create_with_runner(
+    thread_registry.create_with_toolset(
       registry,
       new_thread(store_mock.fixture_provider_id, fixture.alias),
-      happy_runner,
+      toolset(happy_runner),
     )
   let assert Ok(sess) = thread_registry.get(registry, summary.id)
 
@@ -355,6 +355,22 @@ fn new_thread(provider_id: String, model: String) -> thread_registry.NewThread {
     model: model,
     system_prompt: None,
     bot_id: None,
+  )
+}
+
+/// Wrap a fake turn runner in the toolset bundle the create seam now
+/// carries (#76): the default specs of the smoke config, named by their
+/// own wire names. The utility side refuses — the golden asserts request
+/// bytes, which a utility side-call can never touch.
+fn toolset(runner: thread.TurnRunner) -> thread.Toolset {
+  let specs = tools.default(smoke_config())
+  thread.Toolset(
+    names: list.map(specs, tools.tool_name),
+    specs: specs,
+    runner: runner,
+    utility_runner: fn(_endpoint, _tr, _cancel, _allow_pass) {
+      Error("no utility call in this test")
+    },
   )
 }
 

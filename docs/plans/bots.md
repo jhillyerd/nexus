@@ -296,6 +296,16 @@ Mechanics:
 - `tools.by_names(cfg, names)` resolver in the tool registry; unknown
   name at bot save or thread create → 400 (validated against the same
   registry that builds schemas).
+- **codemode's host list is per-toolset** (surfaced by #76, not
+  previously stated here): `tools.by_names` builds codemode LAST
+  capturing its siblings, and under per-toolset resolution those
+  siblings are exactly the thread's own toolset minus codemode, in
+  toolset order. A codemode script can reach only the tools of the
+  thread (bot) it runs on — the global boot registry no longer exists
+  to leak from — and a bot whose toolset omits codemode simply has no
+  bridge. Validation note: a toolset of ONLY codemode resolves fine
+  (zero hosts) but is useless; the save-time validation MAY reject it
+  as a UX nicety, not a correctness need.
 - **The no-tools envelope is omission.** A `'{}'`-toolset thread sends
   neither `tools` nor `tool_choice`: the single encode path already
   branches this way (`transcript.request_body` skips `with_tools` for
@@ -306,8 +316,9 @@ Mechanics:
   other.
 - `thread_registry` builds specs once per distinct toolset (cache keyed
   by the name tuple — the default snapshot resolves to today's boot
-  tuple, so it shares the boot-built runner). The existing
-  `start_with_runner` test seam extends to per-toolset runners.
+  tuple, so it shares the boot-built runner). The `start_with_runner`
+  test seam extended to per-toolset bundles (`start_with_toolset` /
+  `CreateWithToolset` / `create_with_toolset`, #76).
 - **`thread.toolset` is always a resolved snapshot** (coderabbit
   review, PR #71): plain threads persist the default set's names at
   creation, bot threads persist the bot-resolved list (`bot.tools`

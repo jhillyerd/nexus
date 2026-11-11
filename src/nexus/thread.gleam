@@ -172,6 +172,26 @@ pub type UtilityRunner =
   fn(openai.Endpoint, Transcript, Subject(Nil), Bool) ->
     Result(utility.Verdict, String)
 
+/// One frozen toolset bundle (bots plan P2 prep, #76): the resolved tool
+/// names, the specs built from them, and the turn + utility runners built
+/// over THOSE specs. One value per toolset, so a thread's turn requests
+/// and its utility side-calls ride one identical `tools` / `tool_choice`
+/// envelope by construction (KV-cache contract) — the property the boot
+/// path always had (`agent_runner` + `utility_runner` over the same
+/// `specs`), preserved per toolset. The registry caches bundles keyed by
+/// the name tuple and hands every thread of one toolset the SAME bundle;
+/// the boot-built default is the default snapshot's entry. `names` is the
+/// identity — what a create persists and what a later hydration resolves
+/// through `tools.by_names` — and must agree with `specs`.
+pub type Toolset {
+  Toolset(
+    names: List(String),
+    specs: List(tools.ToolSpec),
+    runner: TurnRunner,
+    utility_runner: UtilityRunner,
+  )
+}
+
 /// Fresh display metadata as the apply step reports it: what actually
 /// landed, carried to the `MetaUpdated` broadcast.
 pub type UtilityMeta {
@@ -266,9 +286,12 @@ pub type SendResult {
 /// Utility-titles P2 adds two more injected seams, again built by the
 /// registry so the dependency direction stays registry → thread:
 ///
-/// - `utility_runner` performs the one side-call (title branch) over a
-///   committed transcript snapshot; the real one is `utility_runner`
-///   below, tests inject fakes.
+/// - `toolset` carries the thread's frozen toolset bundle (see
+///   `Toolset`): the turn runner AND the utility side-call runner over
+///   the same specs. The registry resolves it — the boot-built default
+///   bundle for plain creates, a cached per-toolset bundle for the bots
+///   plan — so the dependency direction stays registry → thread; tests
+///   inject bundles with fake runners through the same field.
 /// - `utility_apply` lands the parsed title + tags behind the registry's
 ///   provenance guards (`title_source` AND `tags_source` both 'auto'; a
 ///   manual rename or manual tag edit wins forever).
@@ -281,7 +304,9 @@ pub type ThreadSpec {
     cfg: Config,
     /// The frozen provider endpoint — what the runner streams through.
     endpoint: openai.Endpoint,
-    runner: TurnRunner,
+    /// The frozen toolset bundle: specs + turn + utility runners over
+    /// them (see `Toolset`).
+    toolset: Toolset,
     /// Write-behind observer; `fn(_) { Nil }` when nobody persists.
     commit_hook: fn(Transcript) -> Nil,
     /// The starting transcript, built by the registry through
@@ -292,8 +317,6 @@ pub type ThreadSpec {
     /// thread's first exchange predates this actor, so it never attempts
     /// the utility-titles upgrade.
     hydrated: Bool,
-    /// The utility side-call (title branch) — see `UtilityRunner`.
-    utility_runner: UtilityRunner,
     /// Guarded title application — see `UtilityApply`.
     utility_apply: UtilityApply,
   )
@@ -658,11 +681,10 @@ fn start_builder(spec: ThreadSpec) {
     id: id,
     cfg: cfg,
     endpoint: endpoint,
-    runner: runner,
+    toolset: toolset,
     commit_hook: commit_hook,
     transcript: transcript,
     hydrated: hydrated,
-    utility_runner: utility_runner,
     utility_apply: utility_apply,
   ) = spec
   actor.new_with_initialiser(1000, fn(self) {
@@ -670,7 +692,11 @@ fn start_builder(spec: ThreadSpec) {
       id: id,
       cfg: cfg,
       endpoint: endpoint,
-      runner: runner,
+      // The bundle unpacks into the flat runtime fields: the turn loop
+      // and the utility worker read them independently, but they came
+      // from ONE toolset value, so both ride the same specs.
+      runner: toolset.runner,
+      utility_runner: toolset.utility_runner,
       // The starting transcript is the registry's, verbatim — fresh
       // threads get `transcript.new(model, prompt)` built at create,
       // hydrated ones a store-rebuilt twin of the same construction
@@ -696,7 +722,6 @@ fn start_builder(spec: ThreadSpec) {
       metrics: [],
       last_commit_s: 0,
       commit_hook: commit_hook,
-      utility_runner: utility_runner,
       utility_apply: utility_apply,
     ))
     |> actor.returning(self)
