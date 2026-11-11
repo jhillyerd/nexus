@@ -52,6 +52,12 @@ pub type CreateProblem {
   /// bots plan's required 400 on create-from-bot).
   ModelUnknown(alias: String)
   /// The bot registry itself could not be asked — server-side.
+  /// Defensive exhaustiveness arm: `get_bot` in practice only refuses
+  /// with `Unknown` (the registry serves reads from its boot-loaded
+  /// state, and a dead registry crashes the `actor.call` rather than
+  /// erroring), but `RegistryError` is a closed vocabulary — this arm
+  /// keeps the match honest and maps any future store-reading failure
+  /// onto the server-side 502.
   BotsUnavailable
   /// No bot with that id (bots plan P1: `POST {"bot": id}`).
   BotUnknown(id: String)

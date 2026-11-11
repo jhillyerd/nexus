@@ -28,7 +28,7 @@ import gleam/dict.{type Dict}
 import gleam/erlang/process.{type Subject}
 import gleam/int
 import gleam/list
-import gleam/option.{type Option, None, Some}
+
 import gleam/order
 import gleam/otp/actor
 import gleam/result
@@ -286,34 +286,21 @@ fn update_row(
   row: StoredBot,
   patch: bot.BotUpdate,
 ) -> Result(StoredBot, RegistryError) {
-  use name <- result.try(
-    bot.validate_name(option_blank_or(patch.name, row.name))
+  // `apply_update` implements the identity fields' blank-keep rule, so
+  // the merged row already carries the EFFECTIVE name/model — validation
+  // sees exactly what would be stored.
+  let merged = bot.apply_update(row, patch, timing.wall_now_s())
+  use _name <- result.try(
+    bot.validate_name(merged.name)
     |> result.replace_error(InvalidName),
   )
-  use model <- result.try(
-    bot.validate_model(option_blank_or(patch.model, row.model))
+  use _model <- result.try(
+    bot.validate_model(merged.model)
     |> result.replace_error(InvalidModel),
   )
-  case name_taken(state.rows, row.id, name) {
+  case name_taken(state.rows, row.id, merged.name) {
     True -> Error(DuplicateName)
-    False -> {
-      let merged = bot.apply_update(row, patch, timing.wall_now_s())
-      Ok(bot.Bot(..merged, name: name, model: model))
-    }
-  }
-}
-
-/// The PATCH keep-rule for identity fields: a blank present value keeps
-/// the stored one (a prefilled form's untouched field resubmits the
-/// stored value), so validation sees the EFFECTIVE value.
-fn option_blank_or(field: Option(String), fallback: String) -> String {
-  case field {
-    Some(value) ->
-      case string.trim(value) {
-        "" -> fallback
-        _ -> value
-      }
-    None -> fallback
+    False -> Ok(merged)
   }
 }
 

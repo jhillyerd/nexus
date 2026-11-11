@@ -299,9 +299,12 @@ fn read_json(req: Request(mist.Connection)) -> Result(String, Nil) {
 /// The POST /threads body, already split into its two shapes (bots plan
 /// P1): `PlainCreate(provider, model)` (both required — a thread always
 /// pins its provider explicitly) or `BotCreate(bot)` (provider/model/
-/// system prompt copied from the bot at creation). `bot` alongside
-/// `provider`/`model` is a conflict — the bot's frozen values must not
-/// be quietly overridden.
+/// system prompt copied from the bot at creation). A present `bot` KEY
+/// alongside a present `provider`/`model` KEY — blank or not — is a
+/// conflict: the bot's frozen values must not be quietly overridden.
+/// Classification is presence-aware (a trimmed-blank value is still a
+/// value the caller sent); trimming happens after, so the plain path's
+/// blank halves stay the empty-field 400s.
 pub type CreateFields {
   PlainCreate(provider: String, model: String)
   BotCreate(bot: String)
@@ -323,17 +326,15 @@ pub fn create_fields_decoder() -> decode.Decoder(CreateFields) {
     decode.optional(decode.string),
   )
   use bot <- decode.optional_field("bot", None, decode.optional(decode.string))
-  decode.success(
-    case
-      string.trim(option.unwrap(bot, "")),
-      string.trim(option.unwrap(provider, "")),
-      string.trim(option.unwrap(model, ""))
-    {
-      "", provider, model -> PlainCreate(provider:, model:)
-      bot, "", "" -> BotCreate(bot)
-      _, _, _ -> ConflictingCreate
-    },
-  )
+  decode.success(case bot, provider, model {
+    Some(bot), None, None -> BotCreate(string.trim(bot))
+    None, provider, model ->
+      PlainCreate(
+        provider: string.trim(option.unwrap(provider, "")),
+        model: string.trim(option.unwrap(model, "")),
+      )
+    Some(_), _, _ -> ConflictingCreate
+  })
 }
 
 pub fn parse_create_json(body: String) -> Result(CreateFields, Nil) {
@@ -803,8 +804,9 @@ fn create_bot_response(
     Error(_) -> json_response(400, err_json("unreadable body"))
     Ok(fields) ->
       case resolve_bot_provider(providers, string.trim(fields.provider_id)) {
-        None -> json_response(400, err_json("unknown provider"))
-        Some(provider_id) ->
+        Error(_) -> providers_unavailable_response()
+        Ok(None) -> json_response(400, err_json("unknown provider"))
+        Ok(Some(provider_id)) ->
           case
             bot_registry.create_bot(
               bots,
@@ -852,8 +854,9 @@ fn patch_bot_response(
           case fields.provider_id {
             Some(ident) ->
               case resolve_bot_provider(providers, string.trim(ident)) {
-                None -> json_response(400, err_json("unknown provider"))
-                Some(provider_id) ->
+                Error(_) -> providers_unavailable_response()
+                Ok(None) -> json_response(400, err_json("unknown provider"))
+                Ok(Some(provider_id)) ->
                   apply_bot_patch(
                     bots,
                     id,
@@ -897,27 +900,38 @@ fn delete_bot_response(
 /// identifier may be an id or a name — the id checked first — but
 /// unlike a thread create, a DISABLED provider is acceptable (a bot is
 /// a template, not a runtime pin: it only blocks NEW threads, and
-/// re-aiming the bot is the cure). Returns the CANONICAL id, or `None`
-/// when no provider matches (also covering an unreachable registry —
-/// the honest 400 beats a 502 here because the FK backstop would
-/// refuse the write anyway).
+/// re-aiming the bot is the cure). `Ok(None)` is no matching provider
+/// (the friendly 400); `Error(Nil)` is an unreachable registry — a
+/// server-side failure the caller maps to 502 like thread create's
+/// `ProvidersUnavailable`, never a client 400 (the FK backstop cannot
+/// distinguish "no such provider" from "could not ask").
 fn resolve_bot_provider(
   providers: process.Subject(provider_registry.Msg),
   ident: String,
-) -> Option(String) {
+) -> Result(Option(String), Nil) {
   case provider_registry.list_providers(providers) {
-    Error(_) -> None
+    Error(_) -> Error(Nil)
     Ok(all) -> {
       let found = case list.find(all, fn(p) { p.id == ident }) {
         Ok(by_id) -> Ok(by_id)
         Error(_) -> list.find(all, fn(p) { p.name == ident })
       }
-      case found {
+      Ok(case found {
         Ok(found) -> Some(found.id)
         Error(_) -> None
-      }
+      })
     }
   }
+}
+
+/// The unreachable-provider-registry 502, shared by bot create and
+/// PATCH — same status and text as thread create's
+/// `ProvidersUnavailable`.
+fn providers_unavailable_response() -> Response(mist.ResponseData) {
+  json_response(
+    502,
+    err_json(thread_create.describe(thread_create.ProvidersUnavailable)),
+  )
 }
 
 /// The bot registry's closed error vocabulary onto status codes —

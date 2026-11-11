@@ -65,7 +65,8 @@ pub type RegistryError {
   InvalidBaseUrl
   /// Create/rename onto an existing provider's name (unique).
   DuplicateName
-  /// Delete while threads still pin the provider (the 409 guard).
+  /// Delete while threads or bots still pin the provider (the 409
+  /// guard).
   StillReferenced
   /// An envelope failed authentication at resolve time. Boot already
   /// validated every stored envelope, so this means the row (or the
@@ -121,7 +122,8 @@ pub type Msg {
     patch: provider.ProviderUpdate,
     reply: Subject(Result(Provider, RegistryError)),
   )
-  /// Hard delete, guarded: refused while any thread pins the provider.
+  /// Hard delete, guarded: refused while any thread or bot pins the
+  /// provider.
   Delete(id: String, reply: Subject(Result(Nil, RegistryError)))
   /// Toggle the reversible off-switch. Resolve/ListModels refuse
   /// disabled providers; reads keep showing them.
@@ -725,7 +727,7 @@ pub fn update(
 }
 
 /// Hard delete, guarded: 409-shaped `StillReferenced` while any thread
-/// pins the provider.
+/// or bot pins the provider.
 pub fn delete(
   registry: Subject(Msg),
   id: String,

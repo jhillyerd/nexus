@@ -329,7 +329,8 @@ where provider_id = $1
 /// Hard delete. No guard: `thread.bot_id` is ON DELETE SET NULL
 /// (provenance only — a bot's threads are self-contained frozen columns),
 /// so deleting a bot orphans nothing. The provider RESTRICT is the other
-/// direction and lives on delete_provider.
+/// direction: `bot.provider_id` is ON DELETE RESTRICT (sql/schema.sql),
+/// and delete_provider's 409 pre-check mirrors it.
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
@@ -343,7 +344,8 @@ pub fn delete_bot(
   "-- Hard delete. No guard: `thread.bot_id` is ON DELETE SET NULL
 -- (provenance only — a bot's threads are self-contained frozen columns),
 -- so deleting a bot orphans nothing. The provider RESTRICT is the other
--- direction and lives on delete_provider.
+-- direction: `bot.provider_id` is ON DELETE RESTRICT (sql/schema.sql),
+-- and delete_provider's 409 pre-check mirrors it.
 delete from bot where id = $1
 "
   |> pog.query
@@ -352,10 +354,11 @@ delete from bot where id = $1
   |> pog.execute(db)
 }
 
-/// Hard delete of an unreferenced provider. While any thread pins it,
-/// the thread_provider_id FK (ON DELETE RESTRICT) refuses the delete —
-/// the registry's count-based 409 pre-check is the friendly copy of that
-/// guard, this is the enforcement.
+/// Hard delete of an unreferenced provider. While any thread or bot
+/// pins it, the thread_provider_id / bot.provider_id FKs (ON DELETE
+/// RESTRICT) refuse the delete — the registry's count-based 409
+/// pre-check is the friendly copy of that guard, this is the
+/// enforcement.
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
@@ -366,10 +369,11 @@ pub fn delete_provider(
 ) -> Result(pog.Returned(Nil), pog.QueryError) {
   let decoder = decode.map(decode.dynamic, fn(_) { Nil })
 
-  "-- Hard delete of an unreferenced provider. While any thread pins it,
--- the thread_provider_id FK (ON DELETE RESTRICT) refuses the delete —
--- the registry's count-based 409 pre-check is the friendly copy of that
--- guard, this is the enforcement.
+  "-- Hard delete of an unreferenced provider. While any thread or bot
+-- pins it, the thread_provider_id / bot.provider_id FKs (ON DELETE
+-- RESTRICT) refuse the delete — the registry's count-based 409
+-- pre-check is the friendly copy of that guard, this is the
+-- enforcement.
 delete from provider where id = $1
 "
   |> pog.query

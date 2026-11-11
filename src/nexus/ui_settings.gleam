@@ -35,6 +35,7 @@ import nexus/bot.{type Bot}
 import nexus/bot_registry
 import nexus/provider.{type Provider}
 import nexus/provider_registry
+import nexus/utility
 
 /// On-demand connection-test state for the row Test control: idle,
 /// fetching, or the settled result (model aliases / fixed failure text)
@@ -346,6 +347,11 @@ pub fn update(
         bot_edit: toggle_open(state.bot_edit, id),
         bots_open: False,
         bot_confirm: None,
+        // One form section-wide, like the provider forms: opening one
+        // closes the other section's open form/editor/confirm.
+        open: False,
+        edit: None,
+        confirm: None,
       ),
       effect.none(),
       [],
@@ -366,7 +372,17 @@ pub fn update(
     )
 
     BotDeleteRequested(id) -> #(
-      State(..state, bot_confirm: Some(id), bot_edit: None, bots_open: False),
+      State(
+        ..state,
+        bot_confirm: Some(id),
+        bot_edit: None,
+        bots_open: False,
+        // One form section-wide: the provider section's form/editor/
+        // confirm stand down with the bots section's own.
+        open: False,
+        edit: None,
+        confirm: None,
+      ),
       effect.none(),
       [],
     )
@@ -518,7 +534,13 @@ fn bots_section(
           list.map(bots, bot_row(state, _, provider_list)),
         )
     },
-    add_bot_form(state, provider_list),
+    // Without a provider there is nothing to template (the empty state
+    // above says so): the add form stays down rather than offering a
+    // toggle whose form could only attempt an invalid write.
+    case provider_list {
+      [] -> element.none()
+      _ -> add_bot_form(state, provider_list)
+    },
   ])
 }
 
@@ -1285,15 +1307,12 @@ fn bot_edit_submitted(id: String) -> attr.Attribute(Msg) {
 }
 
 /// One-line preview of a bot's prompt for the row's subtitle: collapse
-/// whitespace runs, then truncate with an ellipsis at `limit`
-/// characters — the same shaping idea as `utility.shape_title`, applied
-/// locally because this is presentation, not stored metadata.
+/// whitespace runs (tabs and newlines too — the shared
+/// `utility.collapse_whitespace`), then truncate with an ellipsis at
+/// `limit` characters — the same shaping as `utility.shape_title`,
+/// applied to presentation, not stored metadata.
 fn truncate_preview(text: String, limit: Int) -> String {
-  let collapsed =
-    text
-    |> string.split(" ")
-    |> list.filter(fn(part) { part != "" })
-    |> string.join(" ")
+  let collapsed = utility.collapse_whitespace(text)
   case string.length(collapsed) > limit {
     True -> string.slice(collapsed, 0, limit) <> "…"
     False -> collapsed

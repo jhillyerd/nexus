@@ -224,23 +224,24 @@ pub fn invalid_name_and_model_refused_test() {
   bot_registry.create_bot(registry, bot.BotParams(..params("x"), model: "  "))
   |> should.equal(Error(bot_registry.InvalidModel))
 
-  // A PATCH whose EFFECTIVE name/model (after blank-keeps) is invalid
-  // refuses the same way.
+  // A PATCH whose only identity fields are blank keeps the stored
+  // values: the EFFECTIVE name/model are the stored (valid) ones, so
+  // the patch succeeds — identity refusals come from the create-time
+  // checks above, never from a blank keep.
   let assert Ok(created) = bot_registry.create_bot(registry, params("ok"))
-  bot_registry.update_bot(
-    registry,
-    created.id,
-    bot.BotUpdate(
-      name: Some("   "),
-      description: None,
-      provider_id: None,
-      model: None,
-      system_prompt: None,
-    ),
-  )
-  // Blank name keeps the stored (valid) one — the patch is a no-op on
-  // the name, so it succeeds.
-  |> should.be_ok
+  let assert Ok(kept) =
+    bot_registry.update_bot(
+      registry,
+      created.id,
+      bot.BotUpdate(
+        name: Some("   "),
+        description: None,
+        provider_id: None,
+        model: None,
+        system_prompt: None,
+      ),
+    )
+  should.equal(kept.name, "ok")
 }
 
 /// The provider-side half of the no-cross-edges rule: the provider

@@ -160,24 +160,41 @@ pub fn to_row(
 /// Merge a PATCH onto a row: absent fields keep the stored value, a
 /// present `description`/`system_prompt` replaces (blank clears — see
 /// `BotUpdate`'s two field classes), and `updated_at` moves to `now`.
-/// The merged row is a FULL row — the store's update is a plain
-/// replace (no gated fields, unlike providers' key envelope).
+/// The identity fields implement the blank-keep rule HERE, not just in
+/// the decoders: a blank present value keeps the stored one, so this
+/// function honours `BotUpdate`'s contract standalone (a prefilled
+/// form's untouched field resubmits the stored value). The merged row
+/// is a FULL row — the store's update is a plain replace (no gated
+/// fields, unlike providers' key envelope).
 pub fn apply_update(row: Bot, update: BotUpdate, now: Int) -> Bot {
   Bot(
     ..row,
-    name: option.unwrap(update.name, row.name),
+    name: replace_identity(update.name, row.name),
     description: case update.description {
       Some(text) -> string.trim(text)
       None -> row.description
     },
-    provider_id: option.unwrap(update.provider_id, row.provider_id),
-    model: option.unwrap(update.model, row.model),
+    provider_id: replace_identity(update.provider_id, row.provider_id),
+    model: replace_identity(update.model, row.model),
     system_prompt: case update.system_prompt {
       Some(text) -> normalize_prompt(Some(text))
       None -> row.system_prompt
     },
     updated_at: now,
   )
+}
+
+/// The identity fields' blank-keep rule, in one place: a present value
+/// replaces (trimmed), a blank or absent one keeps the stored value.
+fn replace_identity(update: Option(String), stored: String) -> String {
+  case update {
+    None -> stored
+    Some(text) ->
+      case string.trim(text) {
+        "" -> stored
+        trimmed -> trimmed
+      }
+  }
 }
 
 /// True when a PATCH would change nothing (the HTTP layer's "empty

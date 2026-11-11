@@ -222,8 +222,8 @@ pub type Store {
     update_provider: fn(StoredProvider, Bool) -> Result(Nil, StoreError),
     /// Threads pinning this provider — the registry's delete guard.
     count_threads_for_provider: fn(String) -> Result(Int, StoreError),
-    /// Hard delete; refused (`Error`) while any thread references the
-    /// provider (the FK is the enforcement). Disabling is the
+    /// Hard delete; refused (`Error`) while any thread or bot pins the
+    /// provider (the FKs are the enforcement). Disabling is the
     /// reversible path.
     delete_provider: fn(String) -> Result(Nil, StoreError),
     // ---- bot rows (docs/plans/bots.md, Phase 1) ----

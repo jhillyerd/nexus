@@ -976,9 +976,10 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
 
     CreateRequested ->
       // Start-from-bot (bots plan P1): a selected bot sources the
-      // provider/model/system prompt and the registry re-validates the
-      // alias live; otherwise today's picker flow. Both paths share the
-      // one `thread_create` orchestration.
+      // provider/model/system prompt, and `thread_create` re-validates
+      // the alias against the provider's live model list before the
+      // registry ever sees the request; otherwise today's picker flow.
+      // Both paths share the one `thread_create` orchestration.
       case model.create_bot {
         Some(bot_id) -> #(model, create_from_bot_effect(model, bot_id))
         None ->

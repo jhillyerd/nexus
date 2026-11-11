@@ -87,23 +87,7 @@ fn start_registry_with(
   child: fn(thread_registry.ChildArgument) ->
     actor.StartResult(process.Subject(thread.Msg)),
 ) -> process.Subject(thread_registry.Msg) {
-  let factory_name = process.new_name("nexus_test_factory")
-  let assert Ok(_factory) =
-    factory_supervisor.start(thread_registry.factory_builder_with_child(
-      factory_name,
-      child,
-    ))
-  let persistence = store_mock.seam(store_mock.start())
-  store_mock.ensure_fixture_provider(persistence)
-  let assert Ok(started) =
-    thread_registry.start(
-      test_config(),
-      factory_supervisor.get_by_name(factory_name),
-      process.new_name("nexus_test_registry"),
-      persistence,
-      fixture_resolver(),
-    )
-  started.data
+  start_registry_keeping_seam_with(child, store_mock.seam(store_mock.start())).0
 }
 
 /// The production resolver's offline stand-in: the fixture provider
@@ -874,21 +858,9 @@ pub fn tag_corpus_truncates_and_pools_legacy_tags_test() {
 fn start_registry_over(
   persistence: store.Store,
 ) -> process.Subject(thread_registry.Msg) {
-  let factory_name = process.new_name("nexus_test_factory")
-  let assert Ok(_factory) =
-    factory_supervisor.start(thread_registry.factory_builder(factory_name))
   // Threads created over this seam pin the fixture provider, and the
   // sweep tests below seed rows directly — both need it to exist.
-  store_mock.ensure_fixture_provider(persistence)
-  let assert Ok(started) =
-    thread_registry.start(
-      test_config(),
-      factory_supervisor.get_by_name(factory_name),
-      process.new_name("nexus_test_registry"),
-      persistence,
-      fixture_resolver(),
-    )
-  started.data
+  start_registry_keeping_seam_with(thread_registry.thread_child, persistence).0
 }
 
 /// Seed one stored thread row directly through the seam.
@@ -1129,13 +1101,26 @@ fn start_registry_keeping_seam() -> #(
   process.Subject(thread_registry.Msg),
   store.Store,
 ) {
+  start_registry_keeping_seam_with(
+    thread_registry.thread_child,
+    store_mock.seam(store_mock.start()),
+  )
+}
+
+/// The ONE boot body behind the registry rigs: factory + registry over
+/// `persistence`, keeping the seam so callers can seed rows and read
+/// back stored columns.
+fn start_registry_keeping_seam_with(
+  child: fn(thread_registry.ChildArgument) ->
+    actor.StartResult(process.Subject(thread.Msg)),
+  persistence: store.Store,
+) -> #(process.Subject(thread_registry.Msg), store.Store) {
   let factory_name = process.new_name("nexus_test_factory")
   let assert Ok(_factory) =
     factory_supervisor.start(thread_registry.factory_builder_with_child(
       factory_name,
-      thread_registry.thread_child,
+      child,
     ))
-  let persistence = store_mock.seam(store_mock.start())
   store_mock.ensure_fixture_provider(persistence)
   let assert Ok(started) =
     thread_registry.start(

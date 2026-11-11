@@ -3421,7 +3421,9 @@ pub fn view_create_panel_bot_picker_test() {
     |> step(ui.NewThreadToggled)
     |> step(ui.CreateBotChanged("b1"))
     |> view_string
-  should.be_true(string.contains(from_bot, "hidden"))
+  // The plain flow stands down: the plain-create block itself is hidden,
+  // not just some unrelated hidden attribute.
+  should.be_true(string.contains(from_bot, "plain-create\" hidden"))
   // Deselect restores the plain flow.
   let restored =
     new_model()

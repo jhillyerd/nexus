@@ -223,7 +223,8 @@ All routes except `GET /healthz` require the configured token when
   present keys replace, absent keep; a blank `name`/`model`/`provider`
   keeps the stored value, while a present `description`/
   `system_prompt` replaces (blank clears — back to `""` and back to
-  the default prompt)
+  the default prompt). A body whose keys are all blank or absent is
+  `400 empty patch`.
 - `DELETE /bots/<id>` — hard delete (204), unguarded: threads created
   from a bot keep their frozen settings (`bot_id` provenance is
   `ON DELETE SET NULL`)
@@ -237,8 +238,10 @@ All routes except `GET /healthz` require the configured token when
   `(provider, model)` pair pinned for the thread's lifetime — or
   `{"bot":"id"}` alone, which sources the provider, model, and system
   prompt from the bot at creation (unknown bot → `400`, a stale alias
-  → `400`; mixing `bot` with `provider`/`model` → `400`). Editing or
-  deleting the bot never changes an existing thread.
+  → `400`; mixing `bot` with `provider`/`model` → `400`, even when the
+  provider/model values are blank). Editing a bot never changes an
+  existing thread — its provider/model/prompt were copied at creation —
+  and deleting one only clears the `bot_id` provenance.
   (There is no global `GET /models` — with N providers there is no
   default endpoint to answer it; use `GET /providers/<id>/models`.)
 - `PATCH /threads/<id>` `{"title?","pinned?","tags?","archived?"}` — update

@@ -114,6 +114,12 @@ pub fn threads_json_test() {
     data,
     "\"last_active_rfc3339\":\"2024-10-15T14:46:40Z\"",
   ))
+  // Bots plan P1: provenance rides the same wire shape — null for plain
+  // creates, the bot id when the thread was started from one.
+  should.be_true(string.contains(data, "\"bot_id\":null"))
+  let from_bot = thread.ThreadSummary(..summary, id: "s-3", bot_id: Some("b1"))
+  let bot_data = json.to_string(web.threads_json([from_bot]))
+  should.be_true(string.contains(bot_data, "\"bot_id\":\"b1\""))
 }
 
 pub fn auto_title_test() {
@@ -197,10 +203,16 @@ pub fn request_body_decoders_test() {
   |> should.equal(Ok(web.PlainCreate(provider: "", model: "alias-a")))
   web.parse_create_json("{\"provider\":\"p1\"}")
   |> should.equal(Ok(web.PlainCreate(provider: "p1", model: "")))
-  // The create-from-bot shape, and its conflict with provider/model.
+  // The create-from-bot shape, and its conflict with provider/model —
+  // the conflict rule is about KEYS, so a blank provider/model value
+  // still conflicts (presence-aware classification).
   web.parse_create_json("{\"bot\":\"b1\"}")
   |> should.equal(Ok(web.BotCreate("b1")))
   web.parse_create_json("{\"bot\":\"b1\",\"model\":\"alias-a\"}")
+  |> should.equal(Ok(web.ConflictingCreate))
+  web.parse_create_json("{\"bot\":\"b1\",\"provider\":\"\"}")
+  |> should.equal(Ok(web.ConflictingCreate))
+  web.parse_create_json("{\"bot\":\"b1\",\"provider\":\"\",\"model\":\"\"}")
   |> should.equal(Ok(web.ConflictingCreate))
   web.parse_create_json("not json")
   |> should.equal(Error(Nil))

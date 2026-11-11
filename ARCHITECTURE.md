@@ -33,6 +33,7 @@ flowchart TB
         subgraph shared["shared — one per VM"]
             reg["thread registry"]
             prov["provider registry"]
+            bots["bot registry"]
             store["store actor"]
         end
         subgraph perthread["per live thread"]
@@ -45,9 +46,11 @@ flowchart TB
     js <-- "WebSocket /ws" --> rt
     rt --> reg
     rt --> prov
+    rt --> bots
     reg --> sa
     sa --> store
     prov --> store
+    bots --> store
     store --> pg
     sa --> llm
 ```
@@ -59,7 +62,7 @@ The rest of this document names every process, its lifetime, and its edges.
 ## 2. The supervision tree
 
 `nexus/boot` builds one `OneForAll` root. Start order matters and is
-commented in the code: the registry hydrates from the store, threads
+commented in the code: the registries hydrate from the store, threads
 resolve providers through the provider registry, and HTTP traffic must find
 a live registry.
 
@@ -68,9 +71,10 @@ flowchart TB
     ROOT["root supervisor (OneForAll)<br/>nexus/boot"]
     ROOT -->|"1 — persistence is mandatory;<br/>unreachable DB fails boot"| STORE["store actor<br/>nexus/store/persist"]
     ROOT -->|"2 — loads + decrypt-validates<br/>every provider row"| PROV["provider registry<br/>nexus/provider_registry"]
-    ROOT -->|"3"| FACT["thread factory supervisor<br/>(temporary children)"]
-    ROOT -->|"4 — hydrates dormant threads,<br/>then starts serving"| REG["thread registry<br/>nexus/thread_registry"]
-    ROOT -->|"5 — no shared UI child:<br/>runtimes are per-connection"| MIST["mist HTTP + WS server<br/>nexus/web"]
+    ROOT -->|"3 — loads every bot row"| BOT["bot registry<br/>nexus/bot_registry"]
+    ROOT -->|"4"| FACT["thread factory supervisor<br/>(temporary children)"]
+    ROOT -->|"5 — hydrates dormant threads,<br/>then starts serving"| REG["thread registry<br/>nexus/thread_registry"]
+    ROOT -->|"6 — no shared UI child:<br/>runtimes are per-connection"| MIST["mist HTTP + WS server<br/>nexus/web"]
     FACT -.->|"starts on demand"| SA["thread actors<br/>nexus/thread"]
     REG -.->|"monitors; restarts a dead<br/>actor via the factory,<br/>rehydrating from the store"| SA
 ```
@@ -96,6 +100,7 @@ what is tied to what**.
 |---|---|---|---|---|
 | store actor (`nexus/store/persist`) | y | 1 per VM | boot → shutdown | shared by everything; owns the Postgres pool |
 | provider registry (`nexus/provider_registry`) | y | 1 per VM | boot → shutdown | shared; owns provider rows + plaintext keys |
+| bot registry (`nexus/bot_registry`) | y | 1 per VM | boot → shutdown | shared; owns bot rows (no secrets — the stored row is the public shape) |
 | thread registry (`nexus/thread_registry`) | y | 1 per VM | boot → shutdown | shared; owns thread IDs → live subjects |
 | mist server (`nexus/web`) | y (listener) | 1 listener per VM | boot → shutdown | shared; spawns one bare handler process per HTTP request / WS connection |
 | UI component runtime (`nexus/ui_runtime` → `nexus/ui`) | y | 1 per WebSocket | **linked to the socket handler** — the pair dies together | browser connection |
@@ -146,6 +151,7 @@ flowchart TB
     rt["UI runtime<br/>(1 per connection)"]
     reg["thread registry"]
     prov["provider registry"]
+    bots["bot registry"]
     api["HTTP JSON scripting API<br/>(NEXUS_UI_TOKEN bearer auth)"]
     sa["thread actor(s)"]
     tw["turn worker"]
@@ -161,6 +167,7 @@ flowchart TB
     ws --- rt
     rt -->|"Join / Leave / Send / Stop /<br/>Snapshot / Describe / create"| reg
     rt -->|"provider CRUD, ListModels<br/>(Settings view)"| prov
+    rt -->|"bot CRUD + from-bot resolve<br/>(Settings view, create panel)"| bots
     reg -->|"resolve, hydrate, Describe,<br/>metadata writes"| sa
     sa -.->|"ThreadEvent fan-out<br/>(id + visit filtered)"| rt
     sa -->|"spawn unlinked + monitor"| tw
@@ -174,8 +181,10 @@ flowchart TB
     sa -.->|"commit_hook<br/>(write-behind Commit)"| store
     reg -->|"sync reads + metadata"| store
     prov -->|"boot load + CRUD"| store
+    bots -->|"boot load + CRUD"| store
     api --> reg
     api --> prov
+    api --> bots
     store --> pg
 ```
 

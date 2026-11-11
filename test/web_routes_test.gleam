@@ -515,7 +515,7 @@ pub fn models_route_removed_test() {
   ))
 }
 
-/// A provider may be NAMED after another provider's id — the id is the
+// A provider may be NAMED after another provider's id — the id is the
 // unambiguous key and must win: a request for "p1" pins the provider
 // WITH ID p1, never the provider merely named "p1" (review finding on
 // PR #12).
@@ -1004,6 +1004,18 @@ pub fn create_thread_from_bot_test() {
       Post,
       "/threads",
       "{\"bot\":\"b1\",\"model\":\"alias-a\"}",
+    )),
+    #(400, "{\"error\":\"bot conflicts with provider/model — pick one shape\"}"),
+  )
+
+  // The conflict rule is about KEYS: a blank provider value still
+  // conflicts with the bot instead of being quietly dropped.
+  should.equal(
+    send_authorized(req(
+      port,
+      Post,
+      "/threads",
+      "{\"bot\":\"b1\",\"provider\":\"\"}",
     )),
     #(400, "{\"error\":\"bot conflicts with provider/model — pick one shape\"}"),
   )
