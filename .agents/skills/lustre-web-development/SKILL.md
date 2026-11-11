@@ -733,6 +733,27 @@ With this, a ~150-line raw-socket script verified: mount vdom shape, event
 decoding, and that a key rotation produces a keyed **Replace** patch (the
 clearing mechanism) — before any browser was involved.
 
+### Offline Runtime Testing (`start_server_component` harness)
+
+`test/ui_test.gleam` also exercises the component in-process, with no
+socket at all: `lustre.start_server_component` boots the real runtime and
+`server_component.register_subject(client)` redirects its client traffic
+into a plain `process.Subject`, which helpers (`wait_for_patch`,
+`collect_until_quiet`) drain as concatenated JSON.
+
+**Caveat: `<select>` option patches do not flush reliably.** Patches that
+change a `<select>`'s option children may never appear in the collected
+client stream even when the render definitely happened — during the
+issue #88 session, the boot cascade's `ProvidersLoaded` options never
+showed up in any patch, while a direct `lustre.dispatch` of the same
+message did produce them; attribute and text patches were reliable
+throughout. Do not write `wait_for_patch`-style assertions keyed on
+option content. Settle deterministically instead: dispatch messages
+directly into the runtime, use worker-owned gate subjects the test
+answers through as ordering barriers (see AGENTS.md's Gleam pitfalls for
+the ownership rule), and assert outcomes by polling server-side
+registry/store state.
+
 ### Manual Testing Checklist
 
 1. ✅ HTTP route loads HTML page

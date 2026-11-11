@@ -189,3 +189,31 @@ re-capture the fixture from a real thread via the integration smoke's
 `e2e/cache-thread.json` — the committed fixture is a copy), never
 hand-edit the JSON. The live half of the contract is that suite's cache
 gate: warm/cold TTFT median ratio ≤ 0.3.
+
+## Gleam API pitfalls (training data lags the pinned toolchain)
+
+A flash model hit all three of these repeatedly during the issue #88
+worker migration; each is checkable in seconds against the repo. The
+pinned gleam_stdlib is 1.0.5 (`manifest.toml`) — confirm API existence in
+`build/packages/gleam_stdlib/src/gleam/…`, not in training data.
+
+- **`io.debug` does not exist.** The pinned `gleam/io` exports only
+  `print`/`println` (plus `_error` variants); debug printing moved to the
+  `echo` keyword expression (Gleam v1.9:
+  https://gleam.run/news/hello-echo-hello-git/) — `echo some_expression`
+  prints the value with file:line to stderr. Use `io.println` for
+  deliberate output.
+- **`string.find` does not exist.** Use `string.contains` (Bool) or
+  `string.split_once` instead. (The `string.find` text in
+  `src/nexus/codemode.gleam` is Lua inside generated codemode scripts,
+  not Gleam.) Broader lesson: before using a less-common stdlib function,
+  check it exists under `build/packages/gleam_stdlib/src/gleam/…` first.
+- **`process.receive(subject, timeout)` only works on a Subject owned by
+  the calling process** — the process that created it via
+  `process.new_subject`. A spawned worker (`process.spawn_unlinked`)
+  receiving on the test's subject panics outright (gleam_erlang 1.3.0:
+  "Cannot receive with a subject owned by another process"). Invert the
+  protocol: the worker creates its own gate subject and sends it back to
+  the test, which answers through it — the gate-fetcher pattern in
+  `test/ui_test.gleam` (issue #88's worker migration). This one cost the
+  session ~15 minutes of 60-second timeout panics before diagnosis.
