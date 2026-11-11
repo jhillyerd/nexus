@@ -84,7 +84,7 @@ pub fn handler(
           patch_bot_response(req, bots, id, providers)
         })
       Delete, ["bots", id] ->
-        protected(cfg, req, fn() { delete_bot_response(bots, id) })
+        protected(cfg, req, fn() { delete_bot_response(registry, bots, id) })
       Post, ["threads", id, "send"] ->
         protected(cfg, req, fn() {
           with_thread(registry, id, send_response(req, registry, id, _))
@@ -304,7 +304,11 @@ fn read_json(req: Request(mist.Connection)) -> Result(String, Nil) {
 /// conflict: the bot's frozen values must not be quietly overridden.
 /// Classification is presence-aware (a trimmed-blank value is still a
 /// value the caller sent); trimming happens after, so the plain path's
-/// blank halves stay the empty-field 400s.
+/// blank halves stay the empty-field 400s. Presence is read on the RAW
+/// JSON value: an explicit `null` fails the decode (400) instead of
+/// collapsing into the missing-key default — `decode.optional` would
+/// blur `{"bot": null}` into a plain create and `{"bot": "b1",
+/// "provider": null}` into a bot create (coderabbit review, PR #87).
 pub type CreateFields {
   PlainCreate(provider: String, model: String)
   BotCreate(bot: String)
@@ -314,18 +318,19 @@ pub type CreateFields {
   ConflictingCreate
 }
 
+/// A present JSON string mapped to `Some` — the ONE field decoder for
+/// `create_fields_decoder`. Distinct from `decode.optional(decode.string)`
+/// exactly at explicit `null`: `optional_field` runs the inner decoder on
+/// any PRESENT value, so a null fails the decode (whole-body 400) instead
+/// of decoding to the missing-key `None` (see the CreateFields contract).
+fn present_string() -> decode.Decoder(option.Option(String)) {
+  decode.map(decode.string, option.Some)
+}
+
 pub fn create_fields_decoder() -> decode.Decoder(CreateFields) {
-  use provider <- decode.optional_field(
-    "provider",
-    None,
-    decode.optional(decode.string),
-  )
-  use model <- decode.optional_field(
-    "model",
-    None,
-    decode.optional(decode.string),
-  )
-  use bot <- decode.optional_field("bot", None, decode.optional(decode.string))
+  use provider <- decode.optional_field("provider", None, present_string())
+  use model <- decode.optional_field("model", None, present_string())
+  use bot <- decode.optional_field("bot", None, present_string())
   decode.success(case bot, provider, model {
     Some(bot), None, None -> BotCreate(string.trim(bot))
     None, provider, model ->
@@ -882,14 +887,20 @@ fn apply_bot_patch(
 }
 
 fn delete_bot_response(
+  registry: process.Subject(thread_registry.Msg),
   bots: process.Subject(bot_registry.Msg),
   id: String,
 ) -> Response(mist.ResponseData) {
   case bot_registry.delete_bot(bots, id) {
     // Unguarded by design: threads carry ON DELETE SET NULL provenance,
-    // so deleting a bot orphans nothing.
-    Ok(Nil) ->
+    // so deleting a bot orphans nothing. The FK already NULLed every
+    // stored row inside the delete; this scrub clears the thread
+    // registry's in-memory mirror so summaries stop reporting the dead
+    // id before the next rehydration.
+    Ok(Nil) -> {
+      thread_registry.bot_deleted(registry, id)
       response.new(204) |> response.set_body(mist.Bytes(bytes_tree.new()))
+    }
     Error(error) -> bot_error_response(error)
   }
 }

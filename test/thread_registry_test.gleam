@@ -1288,3 +1288,97 @@ pub fn dormant_summary_carries_bot_provenance_test() {
   let _ = registry
   Nil
 }
+
+/// A bot delete must also reach the registry's IN-MEMORY mirror: the FK
+/// fixes the stored rows inside the delete itself, but the live records
+/// and the boot-hydrated dormant dict would keep reporting the dead id
+/// until the next rehydration. The scrub (bot_deleted, the delete
+/// caller's orchestration step) clears exactly that bot's pointer from
+/// both summary halves and preserves every other bot's.
+pub fn bot_delete_scrubs_cached_provenance_test() {
+  // Seed BEFORE the boot: the registry hydrates its dormant dict from
+  // `list_summaries` at start, so rows inserted after boot are invisible
+  // to it. Ids stay clear of the live "s<n>" counter range (the boot
+  // counter only scans ids present at start, so later live creates
+  // would otherwise mint colliding ids).
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  store_mock.ensure_fixture_provider(seam)
+  let assert Ok(Nil) = seed_bot(seam, "b1", Some("p"))
+  // The unrelated bot exists too — the mock enforces the insert-time FK.
+  let assert Ok(Nil) = seed_bot(seam, "b9", Some("p"))
+
+  // Dormant threads: one provenanced by the bot-to-be-deleted, one by
+  // an unrelated bot that must survive the scrub untouched.
+  let dormant = fn(id: String, bot: String) {
+    let assert Ok(Nil) =
+      seam.insert_thread(
+        store.StoredSummary(
+          id: id,
+          provider_id: store_mock.fixture_provider_id,
+          model: "alpha",
+          meta: thread.ThreadMeta(
+            title: "from " <> bot,
+            title_source: thread.AutoTitle,
+            pinned: False,
+            archived: False,
+            tags: [],
+            tags_manual: [],
+            tags_source: thread.AutoTags,
+            bot_id: Some(bot),
+            created_at: 1_700_000_000,
+          ),
+          last_active_at: 1_700_000_000,
+          message_count: 3,
+        ),
+        "frozen",
+      )
+    Nil
+  }
+  dormant("s9", "b1")
+  dormant("s8", "b9")
+
+  // Boot the registry over the prepared seam (keeps it for the
+  // orchestration's store half below).
+  let #(registry, seam) =
+    start_registry_keeping_seam_with(thread_registry.thread_child, seam)
+
+  // And a LIVE thread sourced from b1.
+  let assert Ok(live) =
+    thread_registry.create_with_runner(
+      registry,
+      thread_registry.NewThread(
+        provider_id: store_mock.fixture_provider_id,
+        model: "alpha",
+        system_prompt: Some("p"),
+        bot_id: Some("b1"),
+      ),
+      happy_runner,
+    )
+
+  let bot_of = fn(id: String) {
+    let assert Ok(found) =
+      list.find(thread_registry.list_threads(registry), fn(s) { s.id == id })
+    found.bot_id
+  }
+  should.equal(bot_of(live.id), Some("b1"))
+  should.equal(bot_of("s9"), Some("b1"))
+  should.equal(bot_of("s8"), Some("b9"))
+
+  // The delete orchestration's order: the store NULLs the rows (SET
+  // NULL) inside the bot delete, then the registry mirror is scrubbed.
+  let assert Ok(Nil) = seam.delete_bot("b1")
+  thread_registry.bot_deleted(registry, "b1")
+
+  // Both halves scrubbed; the unrelated pointer preserved.
+  should.equal(bot_of(live.id), None)
+  should.equal(bot_of("s9"), None)
+  should.equal(bot_of("s8"), Some("b9"))
+
+  // The scrub writes nothing: bot_id rides no query but insert_thread,
+  // so the stored rows keep whatever the FK last set (None here — the
+  // delete's SET NULL; scrubbing must not resurrect).
+  let assert Ok(stored) = seam.get_thread(live.id)
+  should.equal(stored.summary.meta.bot_id, None)
+  Nil
+}

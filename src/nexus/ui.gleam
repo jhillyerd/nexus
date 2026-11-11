@@ -818,6 +818,18 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
                 ..effs
               ])
               ui_settings.BotsChanged -> #(model, [bots_effect(model), ..effs])
+              ui_settings.BotRemoved(id) -> #(model, [
+                // The bot delete already NULLed the stored rows (the
+                // FK's SET NULL fired inside the delete itself); scrub
+                // the thread registry's in-memory provenance mirror so
+                // both summary halves stop reporting the dead id
+                // before the next rehydration. The list reload rides
+                // the paired BotsChanged signal.
+                effect.from(fn(_dispatch) {
+                  thread_registry.bot_deleted(model.registry, id)
+                }),
+                ..effs
+              ])
               ui_settings.OpFailed(reason) -> #(
                 Model(..model, log: [
                   // Operation-neutral: this path carries provider and bot

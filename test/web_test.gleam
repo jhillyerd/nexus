@@ -214,6 +214,17 @@ pub fn request_body_decoders_test() {
   |> should.equal(Ok(web.ConflictingCreate))
   web.parse_create_json("{\"bot\":\"b1\",\"provider\":\"\",\"model\":\"\"}")
   |> should.equal(Ok(web.ConflictingCreate))
+  // An explicit JSON null is NOT absent (coderabbit review, PR #87):
+  // the null fails the decode — the whole body 400s — instead of
+  // blurring {"bot": null} into a plain create or {"bot": "b1",
+  // "provider": null} into a bot create. Send the key with a string
+  // or omit it.
+  web.parse_create_json(
+    "{\"bot\":null,\"provider\":\"p1\",\"model\":\"alias-a\"}",
+  )
+  |> should.equal(Error(Nil))
+  web.parse_create_json("{\"bot\":\"b1\",\"provider\":null}")
+  |> should.equal(Error(Nil))
   web.parse_create_json("not json")
   |> should.equal(Error(Nil))
 }

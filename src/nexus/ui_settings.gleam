@@ -29,6 +29,7 @@ import lustre/attribute as attr
 import lustre/effect.{type Effect}
 import lustre/element.{type Element}
 import lustre/element/html
+import lustre/element/keyed
 import lustre/event
 import lustre/server_component
 import nexus/bot.{type Bot}
@@ -136,8 +137,12 @@ pub type Msg {
   // ---- Bot registry replies ----
   /// A bot was created (the parent reloads the bot list).
   BotCreated(bot: Bot)
-  /// A bot update/delete landed (the parent reloads the bot list).
+  /// A bot update landed (the parent reloads the bot list).
   BotMutated
+  /// A bot DELETED (the parent reloads the bot list AND scrubs the
+  /// thread registry's provenance mirror — deletion is the one mutation
+  /// whose id the parent needs).
+  BotDeletedOk(id: String)
   /// Any bot mutation failed; `reason` is the registry's fixed text —
   /// surfaced here AND as a chat-log note via `OpFailed`.
   BotMutateFailed(reason: String)
@@ -155,6 +160,11 @@ pub type Signal {
   ProvidersChanged
   /// The bot list must be reloaded (a bot mutation landed).
   BotsChanged
+  /// A bot was deleted: besides the list reload (`BotsChanged` also
+  /// rides), the parent scrubs the deleted id from the thread registry's
+  /// in-memory provenance mirror — the store's rows were already fixed
+  /// by the FK's ON DELETE SET NULL inside the delete itself.
+  BotRemoved(id: String)
   /// A mutation failed; `reason` is the ready-to-show note text (the
   /// per-surface prefix included) — the parent notes it in the chat log
   /// (settings has no log surface of its own).
@@ -403,6 +413,11 @@ pub fn update(
       BotsChanged,
     ])
 
+    BotDeletedOk(id) -> #(State(..state, bot_last_error: None), effect.none(), [
+      BotsChanged,
+      BotRemoved(id),
+    ])
+
     BotMutateFailed(reason) -> #(
       State(..state, bot_last_error: Some(reason)),
       effect.none(),
@@ -529,9 +544,18 @@ fn bots_section(
           ),
         ])
       bots, _ ->
-        html.div(
+        // Keyed by bot id (the keyed composer's precedent in ui.gleam):
+        // rows reorder when a rename re-sorts the list, and an unkeyed
+        // positional diff would hand a reused DOM node — dirty textarea
+        // included — to whichever bot now sorts into its slot. A saved
+        // edit could then store one bot's prompt under another bot's
+        // name.
+        keyed.element(
+          "div",
           [attr.class("bot-list")],
-          list.map(bots, bot_row(state, _, provider_list)),
+          list.map(bots, fn(bot) {
+            #(bot.id, bot_row(state, bot, provider_list))
+          }),
         )
     },
     // Without a provider there is nothing to template (the empty state
@@ -1168,7 +1192,9 @@ fn delete_bot_effect(
 ) -> Effect(Msg) {
   effect.from(fn(dispatch) {
     case bot_registry.delete_bot(bots, id) {
-      Ok(_) -> dispatch(BotMutated)
+      // The id rides the reply: the parent scrubs the thread registry's
+      // provenance mirror for exactly this bot (BotRemoved).
+      Ok(_) -> dispatch(BotDeletedOk(id))
       Error(error) -> dispatch(BotMutateFailed(bot_registry.describe(error)))
     }
   })

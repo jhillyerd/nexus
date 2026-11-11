@@ -185,6 +185,11 @@ pub type Msg {
   /// and the registry owns the monitors), delete the stored rows, then
   /// drop the record. `False` for unknown IDs.
   Delete(id: String, reply: Subject(Bool))
+  /// A bot was deleted (bots plan P1): scrub that id from every summary
+  /// half's provenance pointer. The caller orchestrates — registries
+  /// never call each other. No store write (the FK's SET NULL already
+  /// fixed every row inside the delete itself).
+  BotDeleted(id: String, reply: Subject(Nil))
   /// Monitor plumbing (internal): a monitored thread actor exited.
   Down(pid: Pid, monitor: Monitor)
   /// Selector plumbing for non-process monitors; always ignored.
@@ -947,6 +952,44 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
       }
     }
 
+    BotDeleted(id, reply) -> {
+      // One guard over the shared meta (issue #75 shape): the
+      // live-record half and the dormant-summary half differ only in
+      // WHICH dict they write back to. Everything but the pointer is
+      // preserved; a stale pointer would otherwise ride both summary
+      // paths until the next rehydration (`bot_display`'s missing-name
+      // fallback hides it in the UI, but GET /threads would still
+      // report a dead id). bot_id rides no query but insert_thread, so
+      // nothing can write the dead pointer back behind this scrub.
+      let scrub = fn(meta: thread.ThreadMeta) -> thread.ThreadMeta {
+        case meta.bot_id {
+          Some(bot_id) if bot_id == id -> thread.ThreadMeta(..meta, bot_id: None)
+          _ -> meta
+        }
+      }
+      let scrub_record = fn(record: Record) {
+        Record(..record, meta: scrub(record.meta))
+      }
+      let threads =
+        state.threads
+        |> dict.to_list
+        |> list.map(fn(pair) {
+          let #(id, record) = pair
+          #(id, scrub_record(record))
+        })
+        |> dict.from_list
+      let dormant =
+        state.dormant
+        |> dict.to_list
+        |> list.map(fn(pair) {
+          let #(id, summary) = pair
+          #(id, store.StoredSummary(..summary, meta: scrub(summary.meta)))
+        })
+        |> dict.from_list
+      process.send(reply, Nil)
+      actor.continue(State(..state, threads: threads, dormant: dormant))
+    }
+
     Down(pid, monitor) -> {
       case find_by_pid(state.threads, pid) {
         None -> actor.continue(state)
@@ -1609,4 +1652,12 @@ pub fn set_archived(
 /// the record.
 pub fn delete_thread(registry: Subject(Msg), id: String) -> Bool {
   actor.call(registry, 5000, fn(reply) { Delete(id:, reply:) })
+}
+
+/// A bot was deleted (bots plan P1): scrub its provenance pointer from both
+/// summary halves. The bot delete's caller orchestrates (the registries
+/// stay mutually ignorant) — the store needs nothing, `thread.bot_id` is
+/// ON DELETE SET NULL and bot_id rides no query but insert_thread.
+pub fn bot_deleted(registry: Subject(Msg), id: String) -> Nil {
+  actor.call(registry, 5000, fn(reply) { BotDeleted(id:, reply:) })
 }
