@@ -511,15 +511,23 @@ fn handle_create(
           let counter = state.counter + 1
           let id = "s" <> int.to_string(counter)
           let name = process.new_name("nexus_thread_" <> id)
+          // The registry resolves the system prompt at creation (bots
+          // prep #72) and freezes it into the transcript here — the ONE
+          // construction path. The same prompt is persisted by
+          // insert_thread below, so create and hydration always agree
+          // byte-identically. (From the shared-create-path change, the
+          // request may pin an explicit prompt; the config default is the
+          // NULL resolution.)
+          let transcript = transcript.new(alias, state.cfg.system_prompt)
           let spec =
             thread.ThreadSpec(
               id: id,
               cfg: state.cfg,
-              model: alias,
               endpoint: endpoint,
               runner: runner,
               commit_hook: commit_hook_for(state.store, id),
-              hydrate: None,
+              transcript: transcript,
+              hydrated: False,
               utility_runner: state.utility_runner,
               utility_apply: utility_apply_for(state.self, id),
             )
@@ -1022,7 +1030,14 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
             True ->
               case rebuild_transcript(state, record.id) {
                 Ok(transcript) ->
-                  thread.ThreadSpec(..record.spec, hydrate: Some(transcript))
+                  thread.ThreadSpec(
+                    ..record.spec,
+                    transcript: transcript,
+                    // The replacement is a hydrated restart: its first
+                    // exchange predates the new actor, so it never
+                    // attempts the utility-titles upgrade.
+                    hydrated: True,
+                  )
                 Error(error) -> {
                   log_store_error("rehydrate " <> record.id, error)
                   record.spec
@@ -1162,11 +1177,11 @@ fn lazy_start(state: State, summary: StoredSummary) -> Resolved {
             thread.ThreadSpec(
               id: summary.id,
               cfg: state.cfg,
-              model: summary.model,
               endpoint: endpoint,
               runner: state.runner,
               commit_hook: commit_hook_for(state.store, summary.id),
-              hydrate: Some(transcript),
+              transcript: transcript,
+              hydrated: True,
               utility_runner: state.utility_runner,
               utility_apply: utility_apply_for(state.self, summary.id),
             )
@@ -1228,7 +1243,14 @@ fn retry_rehydrate(state: State, record: Record) -> Resolved {
       Missing
     }
     Ok(transcript) -> {
-      let spec = thread.ThreadSpec(..record.spec, hydrate: Some(transcript))
+      let spec =
+        thread.ThreadSpec(
+          ..record.spec,
+          transcript: transcript,
+          // Same rule as the Down replacement: a rehydrating restart
+          // never attempts the utility-titles upgrade.
+          hydrated: True,
+        )
       let argument = ChildArgument(spec: spec, name: record.name)
       case restart(state.factory, argument) {
         Ok(started) -> {

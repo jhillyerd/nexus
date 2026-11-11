@@ -307,11 +307,13 @@ fn start_with(runner: thread.TurnRunner) -> process.Subject(thread.Msg) {
     thread.start_with_spec(thread.ThreadSpec(
       id: test_thread_id,
       cfg: test_config(),
-      model: "test-alias",
       endpoint: test_endpoint(),
       runner: runner,
       commit_hook: fn(_) { Nil },
-      hydrate: None,
+      // The registry normally builds this; tests build it directly
+      // through the same one construction path.
+      transcript: transcript.new("test-alias", ""),
+      hydrated: False,
       // No utility attempt is expected in these tests: the fake refuses,
       // and a failed attempt broadcasts nothing.
       utility_runner: no_utility_runner,
@@ -550,11 +552,11 @@ pub fn selected_alias_is_frozen_test() {
     thread.ThreadSpec(
       id: test_thread_id,
       cfg: test_config(),
-      model: "chosen-alias",
       endpoint: test_endpoint(),
       runner: happy_runner,
       commit_hook: fn(_) { Nil },
-      hydrate: None,
+      transcript: transcript.new("chosen-alias", ""),
+      hydrated: False,
       utility_runner: no_utility_runner,
       utility_apply: no_utility_apply,
     )
@@ -593,11 +595,11 @@ pub fn runner_receives_frozen_endpoint_test() {
     thread.ThreadSpec(
       id: test_thread_id,
       cfg: test_config(),
-      model: "test-alias",
       endpoint: test_endpoint(),
       runner: capturing,
       commit_hook: fn(_) { Nil },
-      hydrate: None,
+      transcript: transcript.new("test-alias", ""),
+      hydrated: False,
       utility_runner: no_utility_runner,
       utility_apply: no_utility_apply,
     )
@@ -1403,11 +1405,11 @@ fn start_with_utility(
     thread.start_with_spec(thread.ThreadSpec(
       id: test_thread_id,
       cfg: cfg,
-      model: "test-alias",
       endpoint: test_endpoint(),
       runner: runner,
       commit_hook: fn(_) { Nil },
-      hydrate: None,
+      transcript: transcript.new("test-alias", ""),
+      hydrated: False,
       utility_runner: u_runner,
       utility_apply: u_apply,
     ))
