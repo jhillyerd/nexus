@@ -578,6 +578,19 @@ fn handle_create(
                   False
                 }
               }
+              // The provenance pointer mirrors a STORED row's
+              // FK-maintained column, so an unpersisted create (the insert
+              // failed — store down, or the bot deleted between the
+              // orchestration's lookup and this insert) must not claim one:
+              // the bot-delete scrub cannot reach this record (it did not
+              // exist at delete time), making this the one place a dead id
+              // could otherwise ride a summary for the session's whole
+              // life. The insert ATTEMPT above still carries the pointer —
+              // the FK is what rejects a dead one.
+              let meta = case persisted {
+                True -> meta
+                False -> thread.ThreadMeta(..meta, bot_id: None)
+              }
               let record =
                 Record(
                   id: id,
@@ -607,7 +620,7 @@ fn handle_create(
                   pinned: False,
                   tags: [],
                   archived: False,
-                  bot_id: requested.bot_id,
+                  bot_id: meta.bot_id,
                   message_count: 1,
                   streaming: False,
                   created_at: created_at,

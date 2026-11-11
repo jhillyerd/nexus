@@ -1382,3 +1382,49 @@ pub fn bot_delete_scrubs_cached_provenance_test() {
   should.equal(stored.summary.meta.bot_id, None)
   Nil
 }
+
+/// The residual of the bot-delete race (coderabbit re-review, PR #87):
+/// a create-from-bot that reads the bot BEFORE deletion but reaches the
+/// registry AFTER the scrub fails its insert (the FK rejects the dead
+/// pointer) and lands in the unpersisted lane — the one record the
+/// delete-time scrub could not reach. Provenance mirrors a stored row's
+/// FK-maintained column, so an unpersisted create carries NO pointer:
+/// neither the create reply nor a following List may report one.
+pub fn unpersisted_create_carries_no_provenance_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  store_mock.ensure_fixture_provider(seam)
+  let assert Ok(Nil) = seed_bot(seam, "b1", Some("p"))
+
+  // A store whose thread inserts always fail (the store-down half of
+  // the lane; the FK half fails the same insert with the same shape).
+  let failing =
+    store.Store(..seam, insert_thread: fn(_summary, _prompt) {
+      Error("disk full")
+    })
+  let #(registry, _seam) =
+    start_registry_keeping_seam_with(thread_registry.thread_child, failing)
+
+  let assert Ok(summary) =
+    thread_registry.create_with_runner(
+      registry,
+      thread_registry.NewThread(
+        provider_id: store_mock.fixture_provider_id,
+        model: "alpha",
+        system_prompt: Some("p"),
+        bot_id: Some("b1"),
+      ),
+      happy_runner,
+    )
+  // The create reply strips the pointer (the request asked for Some).
+  should.equal(summary.bot_id, None)
+  // And the registry's own summary path agrees.
+  let assert Ok(listed) =
+    list.find(thread_registry.list_threads(registry), fn(s) {
+      s.id == summary.id
+    })
+  should.equal(listed.bot_id, None)
+  // Nothing was stored, so nothing could resurrect the pointer later.
+  let assert Error(_) = seam.get_thread(summary.id)
+  Nil
+}
