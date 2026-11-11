@@ -60,7 +60,7 @@ Sources:
 1. **Append-only transcripts.** Never mutate, reorder, or re-format an
    already-sent message. Stored tool-call arguments must stay
    byte-exact (jsonb normalizes — sorted keys, stripped whitespace —
-   which is why `session_message.tool_args` is `text`).
+   which is why `thread_message.tool_args` is `text`).
 2. **Freeze everything that renders into tokens, per session**: model
    alias, system prompt, `tools` array, `tool_choice`. Any change
    diverges the prefix at the head = full re-prefill. Note some chat
@@ -103,10 +103,10 @@ Sources:
   `,"stream"` marker stays byte-identical across turns.
 - `e2e/integration.spec.mjs` — live cache gate on a real llama.cpp
   alias: warm/cold TTFT medians + cached-token capture; fixture
-  `test/fixtures/m3_cache_session.json` (a copy of the capture step's
-  `e2e/cache-session.json`).
-- `sql/schema.sql` — `session_message.tool_args text` (never jsonb) and
-  `session.system_prompt` frozen at creation for byte-identical
+  `test/fixtures/m3_cache_thread.json` (a copy of the capture step's
+  `e2e/cache-thread.json`).
+- `sql/schema.sql` — `thread_message.tool_args text` (never jsonb) and
+  `thread.system_prompt` frozen at creation for byte-identical
   hydration.
 - `docs/plans/completed/utility-titles.md` — the branch-request pattern applied
   to background session titles.
