@@ -1047,14 +1047,10 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       // refused create must not lock the create panel — the note is
       // the user's cue to retry.
       #(
-        Model(
-          ..model,
-          create_pending: False,
-          log: [
-            NoteLine(True, "could not create thread: " <> reason),
-            ..model.log
-          ],
-        ),
+        Model(..model, create_pending: False, log: [
+          NoteLine(True, "could not create thread: " <> reason),
+          ..model.log
+        ]),
         effect.none(),
       )
 
@@ -2127,7 +2123,8 @@ fn create_from_bot_effect(model: Model, bot_id: String) -> Effect(Msg) {
         )
       {
         Ok(summary) -> dispatch(Created(summary))
-        Error(problem) -> dispatch(CreateFailed(thread_create.describe(problem)))
+        Error(problem) ->
+          dispatch(CreateFailed(thread_create.describe(problem)))
       }
     })
     Nil
