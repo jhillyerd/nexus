@@ -4,7 +4,6 @@
 
 import gleam/erlang/process
 import gleam/int
-import gleam/io
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -3871,6 +3870,11 @@ pub fn create_worker_crash_releases_guard_test() {
   let assert Ok(pid) = process.subject_owner(providers)
   process.unlink(pid)
   process.kill(pid)
+  // process.kill is asynchronous: wait until the registry is provably
+  // gone (the signal processed) so the worker's registry call is
+  // guaranteed to panic — otherwise the call could beat the kill and
+  // this test would exercise the success path instead of the crash path.
+  wait_until_dead(pid, 100)
 
   lustre.send(
     to: runtime,
@@ -3906,5 +3910,18 @@ fn wait_for_patch_prefix(
           }
         }
       }
+  }
+}
+
+/// Poll until the pid is provably gone, so a call to it is guaranteed
+/// to panic. Bounded; a still-alive pid past the budget proceeds (the
+/// test then fails loudly instead of hanging).
+fn wait_until_dead(pid: process.Pid, attempts: Int) -> Nil {
+  case process.is_alive(pid) && attempts > 0 {
+    False -> Nil
+    True -> {
+      process.sleep(10)
+      wait_until_dead(pid, attempts - 1)
+    }
   }
 }
