@@ -214,6 +214,8 @@ pinned gleam_stdlib is 1.0.5 (`manifest.toml`) — confirm API existence in
   receiving on the test's subject panics outright (gleam_erlang 1.3.0:
   "Cannot receive with a subject owned by another process"). Invert the
   protocol: the worker creates its own gate subject and sends it back to
-  the test, which answers through it — the gate-fetcher pattern in
-  `test/ui_test.gleam` (issue #88's worker migration). This one cost the
-  session ~15 minutes of 60-second timeout panics before diagnosis.
+  the test, which answers through it — the `gated_runner` pattern in
+  `test/thread_test.gleam` (its doc comment states the rule; the
+  gate-fetcher landing in `test/ui_test.gleam` with issue #88 uses the
+  same protocol). This one cost the session ~15 minutes of 60-second
+  timeout panics before diagnosis.

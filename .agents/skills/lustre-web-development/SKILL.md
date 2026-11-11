@@ -738,8 +738,10 @@ clearing mechanism) — before any browser was involved.
 `test/ui_test.gleam` also exercises the component in-process, with no
 socket at all: `lustre.start_server_component` boots the real runtime and
 `server_component.register_subject(client)` redirects its client traffic
-into a plain `process.Subject`, which helpers (`wait_for_patch`,
-`collect_until_quiet`) drain as concatenated JSON.
+into a plain `process.Subject`. `wait_for_patch` drains until one patch
+carries the needle, returning that patch's JSON (it does not concatenate);
+`collect_until_quiet` drains to a quiet window and returns the
+concatenated stream — for negative assertions across everything sent.
 
 **Caveat: `<select>` option patches do not flush reliably.** Patches that
 change a `<select>`'s option children may never appear in the collected
