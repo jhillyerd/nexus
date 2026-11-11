@@ -226,6 +226,15 @@ pub type Model {
     /// the provider/model pickers stand down — the bot sources both,
     /// re-validated live at create.
     create_bot: Option(String),
+    /// The per-connection pending-creation guard (#88): True from the
+    /// moment a create request (plain OR bot-sourced) is handed to its
+    /// worker until that worker's reply lands. Both paths share ONE
+    /// slot — a duplicate request while one is pending is rejected, so
+    /// a slow (or hung) live model-list preflight cannot accumulate a
+    /// queue of creates behind it. Cleared by `Created`/`CreateFailed`,
+    /// success and failure alike, so a refused create never locks the
+    /// panel.
+    create_pending: Bool,
     /// Which main view the shell renders (chat vs settings).
     view: UiView,
     /// The Settings sub-component's state (provider editors + the
@@ -524,6 +533,7 @@ pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
       provider_list: [],
       bot_list: [],
       create_bot: None,
+      create_pending: False,
       view: ChatView,
       settings: ui_settings.init(),
       settings_manual: False,
@@ -987,33 +997,66 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     PickerChanged(alias) -> #(Model(..model, picker: alias), effect.none())
 
     CreateRequested ->
-      // Start-from-bot (bots plan P1): a selected bot sources the
-      // provider/model/system prompt, and `thread_create` re-validates
-      // the alias against the provider's live model list before the
-      // registry ever sees the request; otherwise today's picker flow.
-      // Both paths share the one `thread_create` orchestration.
-      case model.create_bot {
-        Some(bot_id) -> #(model, create_from_bot_effect(model, bot_id))
-        None ->
-          case model.picker {
-            "" -> #(model, effect.none())
-            alias -> #(model, create_effect(model, alias))
+      // The shared pending guard FIRST (#88): at most one create in
+      // flight per connection, across both paths — while a worker is
+      // waiting out a slow live model-list preflight, further clicks
+      // must not queue more creates. Rejection is a silent no-op, the
+      // same shape as the streaming guard on `SendRequested`; the
+      // worker's reply (Created / CreateFailed) clears the guard.
+      case model.create_pending {
+        True -> #(model, effect.none())
+        False ->
+          // Start-from-bot (bots plan P1): a selected bot sources the
+          // provider/model/system prompt, and `thread_create` re-validates
+          // the alias against the provider's live model list before the
+          // registry ever sees the request; otherwise today's picker flow.
+          // Both paths share the one `thread_create` orchestration.
+          case model.create_bot {
+            Some(bot_id) -> #(
+              Model(..model, create_pending: True),
+              create_from_bot_effect(model, bot_id),
+            )
+            None ->
+              case model.picker {
+                "" -> #(model, effect.none())
+                alias -> #(
+                  Model(..model, create_pending: True),
+                  create_effect(model, alias),
+                )
+              }
           }
       }
 
     Created(summary) -> {
+      // The worker's success reply (#88): the guard opens again before
+      // anything else — a later create must be able to proceed — then
+      // the pre-worker behaviour: add the row, close the panel, select
+      // the new thread.
       let model =
-        Model(..model, threads: [summary, ..model.threads], create_open: False)
+        Model(
+          ..model,
+          threads: [summary, ..model.threads],
+          create_open: False,
+          create_pending: False,
+        )
       update(model, Select(summary.id))
     }
 
-    CreateFailed(reason) -> #(
-      Model(..model, log: [
-        NoteLine(True, "could not create thread: " <> reason),
-        ..model.log
-      ]),
-      effect.none(),
-    )
+    CreateFailed(reason) ->
+      // The worker's failure reply (#88) clears the guard too: a
+      // refused create must not lock the create panel — the note is
+      // the user's cue to retry.
+      #(
+        Model(
+          ..model,
+          create_pending: False,
+          log: [
+            NoteLine(True, "could not create thread: " <> reason),
+            ..model.log
+          ],
+        ),
+        effect.none(),
+      )
 
     SendRequested(text) -> {
       let text = string.trim(text)
@@ -2010,38 +2053,50 @@ fn stop_effect(model: Model) -> Effect(Msg) {
 fn create_effect(model: Model, alias: String) -> Effect(Msg) {
   let registry = model.registry
   let providers = model.providers
+  let provider = model.provider
   let timeout = model.models_timeout_ms
   effect.from(fn(dispatch) {
-    // The registry builds the M3 agent-loop runner itself, from the tool
-    // registry frozen at its boot — threads created here get the full
-    // toolset, pinned to the create panel's selected provider + model
-    // (multi-provider §8: the pin is explicit, never defaulted).
-    //
-    // The SHARED orchestration (#73): provider resolution + live
-    // model-alias validation outside the registry's loop — the UI used to
-    // skip the check, silently accepting a stale alias. The reply IS the
-    // summary; this component never hand-builds one.
-    case model.provider {
-      None -> dispatch(CreateFailed("no provider configured"))
-      Some(provider_id) -> {
-        let requested =
-          thread_registry.NewThread(
-            provider_id: provider_id,
-            model: alias,
-            // The create panel pins the config default; a bot-sourced
-            // create runs through create_from_bot_effect instead.
-            system_prompt: None,
-            bot_id: None,
-          )
-        case
-          thread_create.create_thread(providers, registry, timeout, requested)
-        {
-          Ok(summary) -> dispatch(Created(summary))
-          Error(problem) ->
-            dispatch(CreateFailed(thread_create.describe(problem)))
+    // OFF the runtime loop (#88), per ui_settings' `models_effect`
+    // pattern: `create_thread`'s preflight is a blocking live model-list
+    // actor call that waits out its whole timeout when the endpoint
+    // hangs — run inline, it would freeze this connection's entire UI
+    // (navigation, thread events, everything) for the wait. Spawn
+    // unlinked; the reply dispatches back (`Created` / `CreateFailed`).
+    // The pending guard in `update` keeps the single-slot honest: no
+    // second create can start before this one's reply lands.
+    process.spawn_unlinked(fn() {
+      // The registry builds the M3 agent-loop runner itself, from the tool
+      // registry frozen at its boot — threads created here get the full
+      // toolset, pinned to the create panel's selected provider + model
+      // (multi-provider §8: the pin is explicit, never defaulted).
+      //
+      // The SHARED orchestration (#73): provider resolution + live
+      // model-alias validation outside the registry's loop — the UI used to
+      // skip the check, silently accepting a stale alias. The reply IS the
+      // summary; this component never hand-builds one.
+      case provider {
+        None -> dispatch(CreateFailed("no provider configured"))
+        Some(provider_id) -> {
+          let requested =
+            thread_registry.NewThread(
+              provider_id: provider_id,
+              model: alias,
+              // The create panel pins the config default; a bot-sourced
+              // create runs through create_from_bot_effect instead.
+              system_prompt: None,
+              bot_id: None,
+            )
+          case
+            thread_create.create_thread(providers, registry, timeout, requested)
+          {
+            Ok(summary) -> dispatch(Created(summary))
+            Error(problem) ->
+              dispatch(CreateFailed(thread_create.describe(problem)))
+          }
         }
       }
-    }
+    })
+    Nil
   })
 }
 
@@ -2057,18 +2112,25 @@ fn create_from_bot_effect(model: Model, bot_id: String) -> Effect(Msg) {
   let bots = model.bots
   let timeout = model.models_timeout_ms
   effect.from(fn(dispatch) {
-    case
-      thread_create.create_thread_from_bot(
-        bots,
-        providers,
-        registry,
-        timeout,
-        bot_id,
-      )
-    {
-      Ok(summary) -> dispatch(Created(summary))
-      Error(problem) -> dispatch(CreateFailed(thread_create.describe(problem)))
-    }
+    // OFF the runtime loop (#88), same `models_effect` shape as
+    // `create_effect` above: the shared orchestration's live
+    // model-list re-validation blocks for up to the shared timeout,
+    // and the connection's UI must keep serving events meanwhile.
+    process.spawn_unlinked(fn() {
+      case
+        thread_create.create_thread_from_bot(
+          bots,
+          providers,
+          registry,
+          timeout,
+          bot_id,
+        )
+      {
+        Ok(summary) -> dispatch(Created(summary))
+        Error(problem) -> dispatch(CreateFailed(thread_create.describe(problem)))
+      }
+    })
+    Nil
   })
 }
 
@@ -2238,10 +2300,17 @@ fn sidebar(model: Model) -> Element(Msg) {
           [
             attr.id("create-thread"),
             attr.type_("button"),
-            attr.disabled(case model.create_bot {
-              Some(_) -> False
-              None -> model.aliases == [] || model.provider == None
-            }),
+            // Disabled while a create is pending (#88): the update-level
+            // guard already rejects duplicates, and this keeps the button
+            // honest with it — no clickable Create behind an in-flight
+            // preflight, for either path.
+            attr.disabled(
+              model.create_pending
+              || case model.create_bot {
+                Some(_) -> False
+                None -> model.aliases == [] || model.provider == None
+              },
+            ),
             event.on_click(CreateRequested),
           ],
           [html.text("Create thread")],

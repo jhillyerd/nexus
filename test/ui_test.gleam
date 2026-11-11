@@ -4,6 +4,7 @@
 
 import gleam/erlang/process
 import gleam/int
+import gleam/io
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -3487,4 +3488,358 @@ pub fn bots_load_drops_deleted_selection_test() {
   should.equal(model.create_bot, Some("b1"))
   let reloaded = step(model, ui.BotsLoaded([]))
   should.equal(reloaded.create_bot, None)
+}
+
+// ---------------------------------------------------------------------------
+// #88: creation moved to unlinked workers + the shared pending guard
+// ---------------------------------------------------------------------------
+
+/// A model whose create panel is ready for a PLAIN create: a provider
+/// loaded and auto-aimed, aliases loaded (the first lands in the picker).
+fn plain_ready_model() -> ui.Model {
+  new_model()
+  |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+  |> step(ui.AliasesLoaded("p1", ["smart"]))
+}
+
+/// The plain request latches the shared pending guard, and a duplicate
+/// click while one create is in flight is rejected wholesale.
+pub fn create_request_sets_pending_guard_test() {
+  let model = plain_ready_model()
+  model.create_pending |> should.be_false
+
+  let pending = step(model, ui.CreateRequested)
+  pending.create_pending |> should.be_true
+
+  // A duplicate request starts nothing: the guard rejects it and the
+  // model comes back untouched.
+  let rejected = step(pending, ui.CreateRequested)
+  rejected |> should.equal(pending)
+}
+
+/// ONE guard spans both paths: a pending plain create rejects a request
+/// that switched to start-from-bot, and a pending bot create rejects one
+/// that switched back to the plain picker.
+pub fn create_pending_guard_spans_both_paths_test() {
+  // Plain request pending; switch the panel to a bot mid-flight.
+  let switched =
+    plain_ready_model()
+    |> step(ui.CreateRequested)
+    |> step(ui.BotsLoaded([bot_row("b1", "Writer", "", None)]))
+    |> step(ui.CreateBotChanged("b1"))
+    |> step(ui.CreateRequested)
+  switched.create_pending |> should.be_true
+  switched.create_bot |> should.equal(Some("b1"))
+
+  // Mirror: bot-sourced request pending; switch back to the plain
+  // picker mid-flight and click again.
+  let bot_pending =
+    plain_ready_model()
+    |> step(ui.BotsLoaded([bot_row("b1", "Writer", "", None)]))
+    |> step(ui.CreateBotChanged("b1"))
+    |> step(ui.CreateRequested)
+  bot_pending.create_pending |> should.be_true
+  let back_to_plain = step(bot_pending, ui.CreateBotChanged(""))
+  let rejected = step(back_to_plain, ui.CreateRequested)
+  rejected |> should.equal(back_to_plain)
+}
+
+/// The worker's success reply clears the guard and keeps the pre-worker
+/// behaviour intact: row added, panel closed, new thread selected.
+pub fn created_clears_pending_guard_test() {
+  let pending = plain_ready_model() |> step(ui.CreateRequested)
+  let done = step(pending, ui.Created(summary("s-new", False)))
+  done.create_pending |> should.be_false
+  done.create_open |> should.be_false
+  done.selected |> should.equal(Some("s-new"))
+  list.map(done.threads, fn(t) { t.id }) |> should.equal(["s-new"])
+}
+
+/// The worker's failure reply clears the guard too — a refused create
+/// must not lock the panel — and a later request can proceed.
+pub fn create_failed_clears_guard_and_allows_retry_test() {
+  let pending = plain_ready_model() |> step(ui.CreateRequested)
+  let failed = step(pending, ui.CreateFailed("unknown model: gone"))
+  failed.create_pending |> should.be_false
+  let assert [
+    ui.NoteLine(True, "could not create thread: unknown model: gone"),
+    ..
+  ] = failed.log
+
+  let retried = step(failed, ui.CreateRequested)
+  retried.create_pending |> should.be_true
+}
+
+/// The Create button stays honest with the guard: disabled while any
+/// create is pending, on either path, and enabled when idle (with a
+/// provider + aliases present).
+pub fn view_create_button_disabled_while_pending_test() {
+  let ready =
+    plain_ready_model()
+    |> step(ui.NewThreadToggled)
+    |> view_string
+  should.be_false(string.contains(ready, "disabled id=\"create-thread\""))
+
+  let pending =
+    plain_ready_model()
+    |> step(ui.CreateRequested)
+    |> step(ui.NewThreadToggled)
+    |> view_string
+  should.be_true(string.contains(pending, "disabled id=\"create-thread\""))
+
+  let bot_pending =
+    plain_ready_model()
+    |> step(ui.BotsLoaded([bot_row("b1", "Writer", "", None)]))
+    |> step(ui.CreateBotChanged("b1"))
+    |> step(ui.CreateRequested)
+    |> view_string
+  should.be_true(string.contains(bot_pending, "disabled id=\"create-thread\""))
+}
+
+// --- the worker harness: real runtime over real (offline) registries ---
+
+/// Boot the real per-connection runtime over real registries backed by
+/// the offline store mock, seeding the store first and injecting the
+/// provider registry's live model-list fetch.
+fn start_offline_registries(
+  seed: fn(store.Store) -> Result(Nil, String),
+  fetch: fn(openai.Endpoint) -> Result(List(String), openai.StreamError),
+) -> #(
+  process.Subject(thread_registry.Msg),
+  process.Subject(provider_registry.Msg),
+  process.Subject(bot_registry.Msg),
+) {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  store_mock.ensure_fixture_provider(seam)
+  let _ = seed(seam)
+
+  let assert Ok(started_providers) =
+    provider_registry.start_with_model_fetcher(
+      test_config(),
+      seam,
+      process.new_name("nexus_ui_create_providers"),
+      fetch,
+    )
+  let assert Ok(started_bots) =
+    bot_registry.start(seam, process.new_name("nexus_ui_create_bots"))
+  let factory_name = process.new_name("nexus_ui_create_factory")
+  let assert Ok(_factory) =
+    factory_supervisor.start(thread_registry.factory_builder(factory_name))
+  let assert Ok(started_registry) =
+    thread_registry.start_with_runner(
+      test_config(),
+      factory_supervisor.get_by_name(factory_name),
+      process.new_name("nexus_ui_create_registry"),
+      seam,
+      unused_turn_runner,
+      fn(_endpoint, _tr, _cancel, _allow_pass) {
+        Error("no utility call in this test")
+      },
+      fn() { [] },
+      fixture_resolver(),
+    )
+  #(started_registry.data, started_providers.data, started_bots.data)
+}
+
+/// Start the runtime exactly like the /ws socket handler does, with a
+/// test-owned client subject as the socket.
+fn boot_create_runtime(
+  registry: process.Subject(thread_registry.Msg),
+  providers: process.Subject(provider_registry.Msg),
+  bots: process.Subject(bot_registry.Msg),
+) -> #(
+  lustre.Runtime(ui.Msg),
+  process.Subject(server_component.ClientMessage(ui.Msg)),
+) {
+  let assert Ok(runtime) =
+    lustre.start_server_component(
+      ui_runtime.app(),
+      ui.Flags(
+        registry: registry,
+        providers: providers,
+        bots: bots,
+        models_timeout_ms: 60_000,
+        thread: None,
+      ),
+    )
+  let client = process.new_subject()
+  server_component.register_subject(client)
+  |> lustre.send(to: runtime)
+  #(runtime, client)
+}
+
+/// Poll the registry until exactly `want` threads exist (the create
+/// lands from the worker asynchronously).
+fn wait_for_thread_count(
+  registry: process.Subject(thread_registry.Msg),
+  want: Int,
+  attempts: Int,
+) -> List(thread.ThreadSummary) {
+  let threads = thread_registry.list_threads(registry)
+  case list.length(threads) == want || attempts <= 0 {
+    True -> threads
+    False -> {
+      process.sleep(100)
+      wait_for_thread_count(registry, want, attempts - 1)
+    }
+  }
+}
+
+/// THE #88 freeze, reproduced and pinned: while a create's live
+/// model-list preflight is parked mid-call, the connection must keep
+/// serving other messages, and duplicate create requests — including one
+/// that switches to start-from-bot — must not start a second create.
+/// The parked fetch makes the ordering control-flow-exact: the settings
+/// patch is only released-proof if it lands BEFORE the fetch is released,
+/// so with the old inline effect (runtime blocked inside the preflight)
+/// this test cannot observe it.
+pub fn create_worker_preflight_parked_runtime_stays_live_test() {
+  // Each list_models fetch signals `started` with a gate subject the
+  // fetch process owns, then parks until the test answers through it.
+  // The boot alias load is call #1 (answered at once); the create
+  // preflight is call #2, held parked under the assertions.
+  let started = process.new_subject()
+  let #(registry, providers, bots) =
+    start_offline_registries(fn(_seam) { Ok(Nil) }, fn(_endpoint) {
+      let gate = process.new_subject()
+      process.send(started, gate)
+      let assert Ok(answer) = process.receive(gate, 60_000)
+      answer
+    })
+  let #(runtime, client) = boot_create_runtime(registry, providers, bots)
+
+  // Boot cascade: the alias load parks (call #1); answering it proves
+  // `ProvidersLoaded` has landed (the fetch is fired BY that load), so
+  // everything below is dispatched into a settled model.
+  let assert Ok(gate_1) = process.receive(started, 10_000)
+  process.send(gate_1, Ok(["alias-1"]))
+
+  // Pin the picker (sticks across the alias load's auto-aim), then fire
+  // the create: the worker reaches the preflight and parks (call #2).
+  lustre.send(
+    to: runtime,
+    message: lustre.dispatch(ui.PickerChanged("alias-1")),
+  )
+  lustre.send(to: runtime, message: lustre.dispatch(ui.CreateRequested))
+  let assert Ok(gate_2) = process.receive(started, 10_000)
+
+  // WHILE PARKED, other messages still process: the settings view swap
+  // renders (the header button's title flips — an attribute patch, the
+  // same diff class the create-panel hidden flip rides). Inline, this
+  // dispatch queued behind the blocking preflight and the patch could
+  // only land after the gate opened — the exact freeze #88 describes.
+  lustre.send(to: runtime, message: lustre.dispatch(ui.SettingsToggled))
+  let _ = wait_for_patch(client, "Back to chat", 20)
+
+  // Duplicates are rejected while parked — including after switching the
+  // panel to start-from-bot. One create in flight, ever.
+  lustre.send(to: runtime, message: lustre.dispatch(ui.CreateBotChanged("b1")))
+  lustre.send(to: runtime, message: lustre.dispatch(ui.CreateRequested))
+
+  // Still parked: nothing has landed server-side.
+  thread_registry.list_threads(registry) |> should.equal([])
+
+  // Open the gate: the ONE plain create lands — no bot-sourced second
+  // thread.
+  process.send(gate_2, Ok(["alias-1"]))
+  let threads = wait_for_thread_count(registry, 1, 40)
+  let assert [only] = threads
+  only.model |> should.equal("alias-1")
+  only.bot_id |> should.equal(None)
+}
+
+/// Failure recovery through the real worker: a stale alias is refused by
+/// the live-list preflight (the note reaches the client, nothing lands
+/// server-side), the guard clears, and a corrected request succeeds.
+pub fn create_worker_failure_notes_then_retry_succeeds_test() {
+  // The gate protocol doubles as the settle barrier: the first fetch is
+  // the boot alias load, fired BY `ProvidersLoaded` — receiving its
+  // signal proves the provider load has landed before anything below is
+  // dispatched.
+  let started = process.new_subject()
+  let #(registry, providers, bots) =
+    start_offline_registries(fn(_seam) { Ok(Nil) }, fn(_endpoint) {
+      let gate = process.new_subject()
+      process.send(started, gate)
+      let assert Ok(answer) = process.receive(gate, 60_000)
+      answer
+    })
+  let #(runtime, client) = boot_create_runtime(registry, providers, bots)
+  let assert Ok(gate_1) = process.receive(started, 10_000)
+  process.send(gate_1, Ok(["alias-1"]))
+
+  // First create: an alias that is not on the provider's live list.
+  // (PickerChanged is sticky across the alias load's auto-aim — a
+  // non-empty picker is kept.) The preflight parks on fetch #2; answer.
+  lustre.send(
+    to: runtime,
+    message: lustre.dispatch(ui.PickerChanged("alias-gone")),
+  )
+  lustre.send(to: runtime, message: lustre.dispatch(ui.CreateRequested))
+  let assert Ok(gate_2) = process.receive(started, 10_000)
+  process.send(gate_2, Ok(["alias-1"]))
+  let _ =
+    wait_for_patch(
+      client,
+      "could not create thread: unknown model: alias-gone",
+      40,
+    )
+  thread_registry.list_threads(registry) |> should.equal([])
+
+  // The guard cleared on that failure: the corrected request proceeds
+  // through the same worker path and lands (fetch #3; answer it too).
+  lustre.send(
+    to: runtime,
+    message: lustre.dispatch(ui.PickerChanged("alias-1")),
+  )
+  lustre.send(to: runtime, message: lustre.dispatch(ui.CreateRequested))
+  let assert Ok(gate_3) = process.receive(started, 10_000)
+  process.send(gate_3, Ok(["alias-1"]))
+  let threads = wait_for_thread_count(registry, 1, 40)
+  let assert [only] = threads
+  only.model |> should.equal("alias-1")
+}
+
+/// The bot-sourced path through the real worker: resolve the bot, freeze
+/// its values, land the thread with its `bot_id` provenance intact.
+pub fn create_from_bot_worker_lands_provenance_test() {
+  let started = process.new_subject()
+  let #(registry, providers, bots) =
+    start_offline_registries(
+      fn(seam) {
+        seam.insert_bot(bot.Bot(
+          id: "b7",
+          name: "Writer",
+          description: "",
+          provider_id: store_mock.fixture_provider_id,
+          model: "alias-1",
+          system_prompt: Some("be terse"),
+          created_at: 0,
+          updated_at: 0,
+        ))
+      },
+      fn(_endpoint) {
+        let gate = process.new_subject()
+        process.send(started, gate)
+        let assert Ok(answer) = process.receive(gate, 60_000)
+        answer
+      },
+    )
+  let #(runtime, _client) = boot_create_runtime(registry, providers, bots)
+
+  // The first fetch signal proves the boot provider load landed; then
+  // start-from-bot: the worker resolves the bot, re-validates its alias
+  // against the LIVE list (fetch #2), and creates.
+  let assert Ok(gate_1) = process.receive(started, 10_000)
+  process.send(gate_1, Ok(["alias-1"]))
+  lustre.send(to: runtime, message: lustre.dispatch(ui.CreateBotChanged("b7")))
+  lustre.send(to: runtime, message: lustre.dispatch(ui.CreateRequested))
+  let assert Ok(gate_2) = process.receive(started, 10_000)
+  process.send(gate_2, Ok(["alias-1"]))
+
+  let threads = wait_for_thread_count(registry, 1, 40)
+  let assert [only] = threads
+  only.bot_id |> should.equal(Some("b7"))
+  only.model |> should.equal("alias-1")
 }
