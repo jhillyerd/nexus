@@ -142,20 +142,29 @@ The create panel pins a new thread explicitly: a **provider select**
 (enabled providers only, keyless ones marked) followed by the model
 alias select, whose options are that provider's live `/v1/models` list —
 switching providers reloads it, and *Create thread* stays disabled until
-both halves exist. Below it, the **Providers** panel manages providers
+both halves exist. When bots exist, the panel also offers a **bot
+select** (“start from bot”): picking one stands the provider/model
+pickers down — the bot sources the pin and its system prompt, and the
+sidebar row's subtitle leads with the bot's name as provenance.
+Below it, the **Providers** panel manages providers
 in-UI: add (name, base URL, optional key — keyless is first-class), edit
 (name / base URL / replace key; the key field is write-only and renders
 empty — blank keeps the stored key, `has_key` is the only key fact
 shown), enable/disable (the reversible off-switch — the picker and
 thread creates refuse disabled providers), and delete behind a
 two-step confirmation (refused with `409` semantics while any thread
-pins the provider). Every mutation fails into a note in the log, never
-a silent no-op.
+pins the provider). A **Bots** section mirrors the provider rows: add,
+inline edit (name, description, provider, model, prompt — blank prompt
+= the global default), and a two-step delete that never orphans
+threads (they keep what they froze at creation). Every mutation fails
+into a note in the log, never a silent no-op.
 
 ## Server
 
 `gleam run` starts the store actor (Postgres pool — first, and boot fails
-if it cannot start), a factory supervisor, a thread registry hydrated
+if it cannot start), the provider registry (loads and decrypt-validates
+every provider row), the bot registry (loads the bot table), a factory
+supervisor, a thread registry hydrated
 from the store, and a Mist server at the bound address (default
 `127.0.0.1:8080`). The Lustre server-component runtime is not a boot
 child: each `/ws` connection starts its own runtime, linked to its
@@ -201,15 +210,35 @@ All routes except `GET /healthz` require the configured token when
   replaces the stored key (blank means keep; there is no remove-key
   patch), and `enabled:false` is the reversible off-switch
 - `DELETE /providers/<id>` — hard delete (204); `409` while any thread
-  pins the provider — disable it instead
-- `GET /threads` — summaries (each carrying the pinned `provider_id`),
-  pinned first then most recently active
-  (default: active only)
+  or bot pins the provider — disable it instead
+- `GET /bots` — bot list (named creation-time thread templates:
+  provider + model + system prompt; no secrets)
+- `POST /bots`
+  `{"name","provider","model","description"?,"system_prompt"?}` —
+  create; the provider must exist (unknown → `400`), a blank or absent
+  `system_prompt` means the global default (resolved when a thread is
+  created from the bot)
+- `PATCH /bots/<id>`
+  `{"name"?,"description"?,"provider"?,"model"?,"system_prompt"?}` —
+  present keys replace, absent keep; a blank `name`/`model`/`provider`
+  keeps the stored value, while a present `description`/
+  `system_prompt` replaces (blank clears — back to `""` and back to
+  the default prompt)
+- `DELETE /bots/<id>` — hard delete (204), unguarded: threads created
+  from a bot keep their frozen settings (`bot_id` provenance is
+  `ON DELETE SET NULL`)
+- `GET /threads` — summaries (each carrying the pinned `provider_id`
+  and, when created from a bot, the `bot_id` provenance), pinned first
+  then most recently active (default: active only)
 - `GET /threads?archived=1` — archived summaries only
-- `POST /threads` `{"provider":"id-or-name","model":"alias"}` — both
-  required: the provider is resolved by id or name (unknown/disabled →
-  `400`), the alias validated against that provider's live model list,
-  and the `(provider, model)` pair pinned for the thread's lifetime.
+- `POST /threads` `{"provider":"id-or-name","model":"alias"}` —
+  the provider is resolved by id or name (unknown/disabled → `400`),
+  the alias validated against that provider's live model list, and the
+  `(provider, model)` pair pinned for the thread's lifetime — or
+  `{"bot":"id"}` alone, which sources the provider, model, and system
+  prompt from the bot at creation (unknown bot → `400`, a stale alias
+  → `400`; mixing `bot` with `provider`/`model` → `400`). Editing or
+  deleting the bot never changes an existing thread.
   (There is no global `GET /models` — with N providers there is no
   default endpoint to answer it; use `GET /providers/<id>/models`.)
 - `PATCH /threads/<id>` `{"title?","pinned?","tags?","archived?"}` — update

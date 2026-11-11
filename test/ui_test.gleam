@@ -13,6 +13,8 @@ import gleeunit/should
 import lustre
 import lustre/element
 import lustre/server_component
+import nexus/bot
+import nexus/bot_registry
 import nexus/config
 import nexus/loop
 import nexus/openai
@@ -33,6 +35,7 @@ fn new_model() -> ui.Model {
     ui.init(ui.Flags(
       registry: process.new_subject(),
       providers: process.new_subject(),
+      bots: process.new_subject(),
       models_timeout_ms: 60_000,
       thread: None,
     ))
@@ -46,6 +49,7 @@ fn new_model_with_thread(id: Option(String)) -> ui.Model {
     ui.init(ui.Flags(
       registry: process.new_subject(),
       providers: process.new_subject(),
+      bots: process.new_subject(),
       models_timeout_ms: 60_000,
       thread: id,
     ))
@@ -67,6 +71,7 @@ fn summary(id: String, streaming: Bool) -> thread.ThreadSummary {
     pinned: False,
     tags: [],
     archived: False,
+    bot_id: None,
     message_count: 0,
     streaming: streaming,
     created_at: 0,
@@ -1542,6 +1547,7 @@ fn meta_summary(
     pinned: pinned,
     tags: tags,
     archived: archived,
+    bot_id: None,
     message_count: 2,
     streaming: False,
     created_at: last_active_at,
@@ -2673,6 +2679,9 @@ pub fn meta_updated_refreshes_sidebar_test() {
       process.new_name("nexus_ui_providers"),
       fn(_endpoint) { Error(openai.Transport("offline test")) },
     )
+  let assert Ok(started_bots) =
+    bot_registry.start(seam, process.new_name("nexus_ui_bots"))
+  let bots = started_bots.data
   let providers = started_providers.data
   let factory_name = process.new_name("nexus_ui_factory")
   let assert Ok(_factory) =
@@ -2711,6 +2720,7 @@ pub fn meta_updated_refreshes_sidebar_test() {
       ui.Flags(
         registry: registry,
         providers: providers,
+        bots: bots,
         models_timeout_ms: 60_000,
         thread: None,
       ),
@@ -2775,6 +2785,7 @@ pub fn send_moves_previous_day_row_into_today_immediately_test() {
           tags: [],
           tags_manual: [],
           tags_source: thread.AutoTags,
+          bot_id: None,
           created_at: yesterday,
         ),
         last_active_at: yesterday,
@@ -2799,6 +2810,9 @@ pub fn send_moves_previous_day_row_into_today_immediately_test() {
       process.new_name("nexus_ui_providers_row"),
       fn(_endpoint) { Error(openai.Transport("offline test")) },
     )
+  let assert Ok(started_bots) =
+    bot_registry.start(seam, process.new_name("nexus_ui_bots"))
+  let bots = started_bots.data
   let providers = started_providers.data
   let factory_name = process.new_name("nexus_ui_factory_row")
   let assert Ok(_factory) =
@@ -2836,6 +2850,7 @@ pub fn send_moves_previous_day_row_into_today_immediately_test() {
       ui.Flags(
         registry: registry,
         providers: providers,
+        bots: bots,
         models_timeout_ms: 60_000,
         thread: Some("s-old"),
       ),
@@ -2885,6 +2900,9 @@ pub fn connect_with_configured_provider_never_notes_no_provider_test() {
       process.new_name("nexus_ui_providers"),
       fn(_endpoint) { Error(openai.Transport("offline test")) },
     )
+  let assert Ok(started_bots) =
+    bot_registry.start(seam, process.new_name("nexus_ui_bots"))
+  let bots = started_bots.data
   let providers = started_providers.data
   let factory_name = process.new_name("nexus_ui_factory")
   let assert Ok(_factory) =
@@ -2915,6 +2933,7 @@ pub fn connect_with_configured_provider_never_notes_no_provider_test() {
       ui.Flags(
         registry: registry,
         providers: providers,
+        bots: bots,
         models_timeout_ms: 60_000,
         thread: None,
       ),
@@ -3021,6 +3040,9 @@ pub fn thread_switch_drops_left_thread_stream_test() {
       process.new_name("nexus_ui_providers_leak"),
       fn(_endpoint) { Error(openai.Transport("offline test")) },
     )
+  let assert Ok(started_bots) =
+    bot_registry.start(seam, process.new_name("nexus_ui_bots"))
+  let bots = started_bots.data
   let providers = started_providers.data
   let factory_name = process.new_name("nexus_ui_factory_leak")
   let assert Ok(_factory) =
@@ -3059,6 +3081,7 @@ pub fn thread_switch_drops_left_thread_stream_test() {
       ui.Flags(
         registry: registry,
         providers: providers,
+        bots: bots,
         models_timeout_ms: 60_000,
         thread: Some(a.id),
       ),
@@ -3107,6 +3130,9 @@ pub fn meta_updated_from_other_thread_refreshes_sidebar_test() {
       process.new_name("nexus_ui_providers_meta"),
       fn(_endpoint) { Error(openai.Transport("offline test")) },
     )
+  let assert Ok(started_bots) =
+    bot_registry.start(seam, process.new_name("nexus_ui_bots"))
+  let bots = started_bots.data
   let providers = started_providers.data
   let factory_name = process.new_name("nexus_ui_factory_meta")
   let assert Ok(_factory) =
@@ -3138,6 +3164,7 @@ pub fn meta_updated_from_other_thread_refreshes_sidebar_test() {
       ui.Flags(
         registry: registry,
         providers: providers,
+        bots: bots,
         models_timeout_ms: 60_000,
         thread: Some(a.id),
       ),
@@ -3192,6 +3219,7 @@ fn new_thread(provider_id: String, model: String) -> thread_registry.NewThread {
     provider_id: provider_id,
     model: model,
     system_prompt: None,
+    bot_id: None,
   )
 }
 
@@ -3278,4 +3306,179 @@ fn wait_for_patch(
         }
       }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Bots plan P1: settings Bots section, start-from-bot picker, provenance
+// ---------------------------------------------------------------------------
+
+fn bot_row(
+  id: String,
+  name: String,
+  description: String,
+  prompt: option.Option(String),
+) -> bot.Bot {
+  bot.Bot(
+    id: id,
+    name: name,
+    description: description,
+    provider_id: "p1",
+    model: "smart",
+    system_prompt: prompt,
+    created_at: 0,
+    updated_at: 0,
+  )
+}
+
+/// The Bots section renders beside Providers, mirroring the provider
+/// rows — and everything bot-fed is HOSTILE TEXT: names, descriptions,
+/// and prompt previews escape as Lustre text nodes, never innerHTML.
+pub fn view_settings_bots_section_test() {
+  let html =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(
+      ui.BotsLoaded([
+        bot_row(
+          "b1",
+          "<script>alert(1)</script>",
+          "desc with \"quotes\"",
+          Some("prompt <b>bold</b>"),
+        ),
+      ]),
+    )
+    |> step(ui.SettingsToggled)
+    |> view_string
+  should.be_true(string.contains(html, ">Bots<"))
+  should.be_true(string.contains(html, "bot-row"))
+  // The hostile name and prompt preview are ESCAPED text nodes.
+  should.be_true(string.contains(html, "&lt;script&gt;alert(1)&lt;/script&gt;"))
+  should.be_true(string.contains(html, "prompt &lt;b&gt;bold&lt;/b&gt;"))
+  should_not_contain(html, "<script>alert(1)</script>")
+  // The add form is present-but-hidden until opened; the edit form
+  // carries the stored values.
+  should.be_true(string.contains(html, "add-bot-form"))
+  should.be_true(string.contains(html, ">Add bot<"))
+  let editing =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(ui.BotsLoaded([bot_row("b1", "Writer", "", Some("be terse"))]))
+    |> step(ui.SettingsToggled)
+    |> step(ui.Settings(ui_settings.BotEditToggled("b1")))
+    |> view_string
+  should.be_true(string.contains(editing, ">Edit bot<"))
+  should.be_true(string.contains(editing, "value=\"Writer\""))
+  should.be_true(string.contains(editing, "be terse"))
+}
+
+/// Without bots the section says so; without PROVIDERS it explains the
+/// dependency (there is nothing to template yet).
+pub fn view_settings_bots_empty_states_test() {
+  let no_bots =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(ui.SettingsToggled)
+    |> view_string
+  should.be_true(string.contains(no_bots, "No bots yet."))
+  let no_providers =
+    new_model()
+    |> step(ui.ProvidersLoaded([]))
+    |> view_string
+  should.be_true(string.contains(
+    no_providers,
+    "No providers yet — add one before creating bots.",
+  ))
+}
+
+/// The create panel's start-from-bot picker: rendered only when bots
+/// exist, and selecting one stands the provider/model pickers down (the
+/// bot sources the pin); deselecting restores them.
+pub fn view_create_panel_bot_picker_test() {
+  let no_bots =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(ui.NewThreadToggled)
+    |> view_string
+  // A bot-free install sees today's panel: no picker markup at all.
+  should.be_false(string.contains(no_bots, "bot-picker"))
+
+  let with_bots =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(ui.BotsLoaded([bot_row("b1", "Writer", "", None)]))
+    |> step(ui.NewThreadToggled)
+    |> view_string
+  should.be_true(string.contains(with_bots, "bot-picker"))
+  should.be_true(string.contains(with_bots, ">Writer<"))
+  // The ampersand escapes in the option label (hostile-text rules apply
+  // to our own copy too).
+  should.be_true(string.contains(with_bots, "pick provider &amp; model"))
+
+  let from_bot =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(ui.BotsLoaded([bot_row("b1", "Writer", "", None)]))
+    |> step(ui.NewThreadToggled)
+    |> step(ui.CreateBotChanged("b1"))
+    |> view_string
+  should.be_true(string.contains(from_bot, "hidden"))
+  // Deselect restores the plain flow.
+  let restored =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(ui.BotsLoaded([bot_row("b1", "Writer", "", None)]))
+    |> step(ui.NewThreadToggled)
+    |> step(ui.CreateBotChanged("b1"))
+    |> step(ui.CreateBotChanged(""))
+    |> view_string
+  should.be_false(string.contains(restored, "bot-picker\" hidden"))
+  should.be_true(string.contains(restored, "provider-picker"))
+}
+
+/// A bot-sourced thread's subtitle leads with the bot's name
+/// (provenance). A hostile bot name is escaped; a bot deleted since
+/// (unresolvable id) shows nothing and keeps provider/model · age.
+pub fn view_thread_subtitle_shows_bot_provenance_test() {
+  let html =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(ui.BotsLoaded([bot_row("b1", "<b>Writer</b>", "", None)]))
+    |> step(
+      ui.ThreadsLoaded([
+        thread.ThreadSummary(..summary("s-1", False), bot_id: Some("b1")),
+      ]),
+    )
+    |> view_string
+  should.be_true(string.contains(
+    html,
+    "&lt;b&gt;Writer&lt;/b&gt; · bifrost/smart · ",
+  ))
+  should_not_contain(html, "<b>Writer</b> · bifrost")
+
+  // Deleted bot: the pointer resolves to nothing, the subtitle keeps
+  // its plain shape (self-heals on rehydrate, which NULLs the column).
+  let gone =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(
+      ui.ThreadsLoaded([
+        thread.ThreadSummary(..summary("s-1", False), bot_id: Some("b-gone")),
+      ]),
+    )
+    |> view_string
+  should.be_true(string.contains(gone, "bifrost/smart · "))
+  should.be_false(string.contains(gone, "b-gone · "))
+}
+
+/// A deleted bot falls out of the create panel's selection: the model
+/// drops `create_bot` on the next load (the picker re-aim rule's bot
+/// twin), so a vanished bot can never stay sourced.
+pub fn bots_load_drops_deleted_selection_test() {
+  let model =
+    new_model()
+    |> step(ui.BotsLoaded([bot_row("b1", "Writer", "", None)]))
+    |> step(ui.CreateBotChanged("b1"))
+  should.equal(model.create_bot, Some("b1"))
+  let reloaded = step(model, ui.BotsLoaded([]))
+  should.equal(reloaded.create_bot, None)
 }

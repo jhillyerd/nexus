@@ -250,6 +250,45 @@ where id = $2
   |> pog.execute(db)
 }
 
+/// A row you get from running the `count_bots_for_provider` query
+/// defined in `./src/nexus/store/sql/count_bots_for_provider.sql`.
+///
+/// > 🐿️ This type definition was generated automatically using v4.7.0 of the
+/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub type CountBotsForProviderRow {
+  CountBotsForProviderRow(bots: Int)
+}
+
+/// How many bots point at this provider — the provider registry's delete
+/// guard's bot half (409 while > 0, alongside count_threads_for_provider;
+/// prefer disabling). A store COUNT, never a call into the bot registry.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn count_bots_for_provider(
+  db: pog.Connection,
+  provider_id: String,
+) -> Result(pog.Returned(CountBotsForProviderRow), pog.QueryError) {
+  let decoder = {
+    use bots <- decode.field(0, decode.int)
+    decode.success(CountBotsForProviderRow(bots:))
+  }
+
+  "-- How many bots point at this provider — the provider registry's delete
+-- guard's bot half (409 while > 0, alongside count_threads_for_provider;
+-- prefer disabling). A store COUNT, never a call into the bot registry.
+select count(*)::int8 as bots
+from bot
+where provider_id = $1
+"
+  |> pog.query
+  |> pog.parameter(pog.text(provider_id))
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
 /// A row you get from running the `count_threads_for_provider` query
 /// defined in `./src/nexus/store/sql/count_threads_for_provider.sql`.
 ///
@@ -283,6 +322,32 @@ where provider_id = $1
 "
   |> pog.query
   |> pog.parameter(pog.text(provider_id))
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
+/// Hard delete. No guard: `thread.bot_id` is ON DELETE SET NULL
+/// (provenance only — a bot's threads are self-contained frozen columns),
+/// so deleting a bot orphans nothing. The provider RESTRICT is the other
+/// direction and lives on delete_provider.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn delete_bot(
+  db: pog.Connection,
+  id: String,
+) -> Result(pog.Returned(Nil), pog.QueryError) {
+  let decoder = decode.map(decode.dynamic, fn(_) { Nil })
+
+  "-- Hard delete. No guard: `thread.bot_id` is ON DELETE SET NULL
+-- (provenance only — a bot's threads are self-contained frozen columns),
+-- so deleting a bot orphans nothing. The provider RESTRICT is the other
+-- direction and lives on delete_provider.
+delete from bot where id = $1
+"
+  |> pog.query
+  |> pog.parameter(pog.text(id))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }
@@ -326,6 +391,76 @@ pub fn delete_thread(
   let decoder = decode.map(decode.dynamic, fn(_) { Nil })
 
   "delete from thread where id = $1
+"
+  |> pog.query
+  |> pog.parameter(pog.text(id))
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
+/// A row you get from running the `get_bot` query
+/// defined in `./src/nexus/store/sql/get_bot.sql`.
+///
+/// > 🐿️ This type definition was generated automatically using v4.7.0 of the
+/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub type GetBotRow {
+  GetBotRow(
+    id: String,
+    name: String,
+    description: String,
+    provider_id: String,
+    model: String,
+    system_prompt: Option(String),
+    created_s: Int,
+    updated_s: Int,
+  )
+}
+
+/// One bot row by id. `Error` for unknown ids is decided by the caller
+/// from the empty result.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn get_bot(
+  db: pog.Connection,
+  id: String,
+) -> Result(pog.Returned(GetBotRow), pog.QueryError) {
+  let decoder = {
+    use id <- decode.field(0, decode.string)
+    use name <- decode.field(1, decode.string)
+    use description <- decode.field(2, decode.string)
+    use provider_id <- decode.field(3, decode.string)
+    use model <- decode.field(4, decode.string)
+    use system_prompt <- decode.field(5, decode.optional(decode.string))
+    use created_s <- decode.field(6, decode.int)
+    use updated_s <- decode.field(7, decode.int)
+    decode.success(GetBotRow(
+      id:,
+      name:,
+      description:,
+      provider_id:,
+      model:,
+      system_prompt:,
+      created_s:,
+      updated_s:,
+    ))
+  }
+
+  "-- One bot row by id. `Error` for unknown ids is decided by the caller
+-- from the empty result.
+select
+  id,
+  name,
+  description,
+  provider_id,
+  model,
+  system_prompt,
+  extract(epoch from created_at)::int8 as created_s,
+  extract(epoch from updated_at)::int8 as updated_s
+from bot
+where id = $1
 "
   |> pog.query
   |> pog.parameter(pog.text(id))
@@ -428,6 +563,7 @@ pub type GetThreadRow {
     tags: List(String),
     tags_manual: List(String),
     tags_source: String,
+    bot_id: Option(String),
     created_s: Int,
     last_active_s: Int,
     message_count: Int,
@@ -436,7 +572,8 @@ pub type GetThreadRow {
 
 /// One stored thread row (lazy hydration of a dormant thread). The
 /// provenance columns ride along (utility-tags plan §3.5): rehydration
-/// must never lack them.
+/// must never lack them. bot_id is the bots plan's provenance pointer
+/// (NULL = created without a bot; display only, never request bytes).
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
@@ -457,9 +594,10 @@ pub fn get_thread(
     use tags <- decode.field(8, decode.list(decode.string))
     use tags_manual <- decode.field(9, decode.list(decode.string))
     use tags_source <- decode.field(10, decode.string)
-    use created_s <- decode.field(11, decode.int)
-    use last_active_s <- decode.field(12, decode.int)
-    use message_count <- decode.field(13, decode.int)
+    use bot_id <- decode.field(11, decode.optional(decode.string))
+    use created_s <- decode.field(12, decode.int)
+    use last_active_s <- decode.field(13, decode.int)
+    use message_count <- decode.field(14, decode.int)
     decode.success(GetThreadRow(
       id:,
       provider_id:,
@@ -472,6 +610,7 @@ pub fn get_thread(
       tags:,
       tags_manual:,
       tags_source:,
+      bot_id:,
       created_s:,
       last_active_s:,
       message_count:,
@@ -480,7 +619,8 @@ pub fn get_thread(
 
   "-- One stored thread row (lazy hydration of a dormant thread). The
 -- provenance columns ride along (utility-tags plan §3.5): rehydration
--- must never lack them.
+-- must never lack them. bot_id is the bots plan's provenance pointer
+-- (NULL = created without a bot; display only, never request bytes).
 select
   id,
   provider_id,
@@ -493,6 +633,7 @@ select
   tags,
   tags_manual,
   tags_source,
+  bot_id,
   extract(epoch from created_at)::int8 as created_s,
   extract(epoch from last_active_at)::int8 as last_active_s,
   message_count
@@ -501,6 +642,47 @@ where id = $1
 "
   |> pog.query
   |> pog.parameter(pog.text(id))
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
+/// A new bot row. `system_prompt` is NULL = global default (resolved at
+/// thread creation, never at request time); the '' sentinel inserts NULL —
+/// Postgres exposes no parameter nullability, so squirrel parameters cannot
+/// be nullable and the sentinel is its documented workaround (see
+/// insert_provider.sql).
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn insert_bot(
+  db: pog.Connection,
+  arg_1: String,
+  arg_2: String,
+  arg_3: String,
+  arg_4: String,
+  arg_5: String,
+  arg_6: String,
+  arg_7: Float,
+) -> Result(pog.Returned(Nil), pog.QueryError) {
+  let decoder = decode.map(decode.dynamic, fn(_) { Nil })
+
+  "-- A new bot row. `system_prompt` is NULL = global default (resolved at
+-- thread creation, never at request time); the '' sentinel inserts NULL —
+-- Postgres exposes no parameter nullability, so squirrel parameters cannot
+-- be nullable and the sentinel is its documented workaround (see
+-- insert_provider.sql).
+insert into bot (id, name, description, provider_id, model, system_prompt, created_at, updated_at)
+values ($1, $2, $3, $4, $5, nullif($6, ''), to_timestamp($7), to_timestamp($7))
+"
+  |> pog.query
+  |> pog.parameter(pog.text(arg_1))
+  |> pog.parameter(pog.text(arg_2))
+  |> pog.parameter(pog.text(arg_3))
+  |> pog.parameter(pog.text(arg_4))
+  |> pog.parameter(pog.text(arg_5))
+  |> pog.parameter(pog.text(arg_6))
+  |> pog.parameter(pog.float(arg_7))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }
@@ -549,6 +731,8 @@ values ($1, $2, $3, nullif($4, ''::bytea), $5, $6, $7, to_timestamp($8), to_time
 /// A new thread row: created/last_active from the registry's epoch
 /// seconds; message_count is the transcript length (1 = system prompt).
 /// provider_id is frozen at creation with the model (contract rule 2).
+/// bot_id is provenance only (bots plan P1): the '' sentinel inserts
+/// NULL (see insert_bot.sql) — a thread created without a bot.
 /// tags_manual is '{}' literally and tags_source is left to its column
 /// default 'auto' (utility-tags plan §3.5): a new thread has no tags and
 /// an open auto path.
@@ -568,17 +752,20 @@ pub fn insert_thread(
   arg_8: List(String),
   arg_9: Float,
   arg_10: Int,
+  arg_11: String,
 ) -> Result(pog.Returned(Nil), pog.QueryError) {
   let decoder = decode.map(decode.dynamic, fn(_) { Nil })
 
   "-- A new thread row: created/last_active from the registry's epoch
 -- seconds; message_count is the transcript length (1 = system prompt).
 -- provider_id is frozen at creation with the model (contract rule 2).
+-- bot_id is provenance only (bots plan P1): the '' sentinel inserts
+-- NULL (see insert_bot.sql) — a thread created without a bot.
 -- tags_manual is '{}' literally and tags_source is left to its column
 -- default 'auto' (utility-tags plan §3.5): a new thread has no tags and
 -- an open auto path.
-insert into thread (id, provider_id, title, title_source, model, system_prompt, pinned, tags, tags_manual, created_at, last_active_at, message_count)
-values ($1, $2, $3, $4, $5, $6, $7, $8, '{}', to_timestamp($9), to_timestamp($9), $10)
+insert into thread (id, provider_id, title, title_source, model, system_prompt, pinned, tags, tags_manual, created_at, last_active_at, message_count, bot_id)
+values ($1, $2, $3, $4, $5, $6, $7, $8, '{}', to_timestamp($9), to_timestamp($9), $10, nullif($11, ''))
 "
   |> pog.query
   |> pog.parameter(pog.text(arg_1))
@@ -591,6 +778,75 @@ values ($1, $2, $3, $4, $5, $6, $7, $8, '{}', to_timestamp($9), to_timestamp($9)
   |> pog.parameter(pog.array(fn(value) { pog.text(value) }, arg_8))
   |> pog.parameter(pog.float(arg_9))
   |> pog.parameter(pog.int(arg_10))
+  |> pog.parameter(pog.text(arg_11))
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
+/// A row you get from running the `list_bots` query
+/// defined in `./src/nexus/store/sql/list_bots.sql`.
+///
+/// > 🐿️ This type definition was generated automatically using v4.7.0 of the
+/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub type ListBotsRow {
+  ListBotsRow(
+    id: String,
+    name: String,
+    description: String,
+    provider_id: String,
+    model: String,
+    system_prompt: Option(String),
+    created_s: Int,
+    updated_s: Int,
+  )
+}
+
+/// All bot rows (registry boot load), ordered by id (the registry
+/// re-sorts). Bots carry no secrets — the row IS the public shape.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn list_bots(
+  db: pog.Connection,
+) -> Result(pog.Returned(ListBotsRow), pog.QueryError) {
+  let decoder = {
+    use id <- decode.field(0, decode.string)
+    use name <- decode.field(1, decode.string)
+    use description <- decode.field(2, decode.string)
+    use provider_id <- decode.field(3, decode.string)
+    use model <- decode.field(4, decode.string)
+    use system_prompt <- decode.field(5, decode.optional(decode.string))
+    use created_s <- decode.field(6, decode.int)
+    use updated_s <- decode.field(7, decode.int)
+    decode.success(ListBotsRow(
+      id:,
+      name:,
+      description:,
+      provider_id:,
+      model:,
+      system_prompt:,
+      created_s:,
+      updated_s:,
+    ))
+  }
+
+  "-- All bot rows (registry boot load), ordered by id (the registry
+-- re-sorts). Bots carry no secrets — the row IS the public shape.
+select
+  id,
+  name,
+  description,
+  provider_id,
+  model,
+  system_prompt,
+  extract(epoch from created_at)::int8 as created_s,
+  extract(epoch from updated_at)::int8 as updated_s
+from bot
+order by id
+"
+  |> pog.query
   |> pog.returning(decoder)
   |> pog.execute(db)
 }
@@ -687,6 +943,7 @@ pub type ListSummariesRow {
     tags: List(String),
     tags_manual: List(String),
     tags_source: String,
+    bot_id: Option(String),
     created_s: Int,
     last_active_s: Int,
     message_count: Int,
@@ -695,7 +952,8 @@ pub type ListSummariesRow {
 
 /// All stored thread summaries, ordered by id (the registry re-sorts).
 /// The provenance columns ride along (utility-tags plan §3.5): the boot
-/// load must never lack them.
+/// load must never lack them. bot_id is the bots plan's provenance
+/// pointer (NULL = created without a bot).
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
@@ -714,9 +972,10 @@ pub fn list_summaries(
     use tags <- decode.field(7, decode.list(decode.string))
     use tags_manual <- decode.field(8, decode.list(decode.string))
     use tags_source <- decode.field(9, decode.string)
-    use created_s <- decode.field(10, decode.int)
-    use last_active_s <- decode.field(11, decode.int)
-    use message_count <- decode.field(12, decode.int)
+    use bot_id <- decode.field(10, decode.optional(decode.string))
+    use created_s <- decode.field(11, decode.int)
+    use last_active_s <- decode.field(12, decode.int)
+    use message_count <- decode.field(13, decode.int)
     decode.success(ListSummariesRow(
       id:,
       provider_id:,
@@ -728,6 +987,7 @@ pub fn list_summaries(
       tags:,
       tags_manual:,
       tags_source:,
+      bot_id:,
       created_s:,
       last_active_s:,
       message_count:,
@@ -736,7 +996,8 @@ pub fn list_summaries(
 
   "-- All stored thread summaries, ordered by id (the registry re-sorts).
 -- The provenance columns ride along (utility-tags plan §3.5): the boot
--- load must never lack them.
+-- load must never lack them. bot_id is the bots plan's provenance
+-- pointer (NULL = created without a bot).
 select
   id,
   provider_id,
@@ -748,6 +1009,7 @@ select
   tags,
   tags_manual,
   tags_source,
+  bot_id,
   extract(epoch from created_at)::int8 as created_s,
   extract(epoch from last_active_at)::int8 as last_active_s,
   message_count
@@ -1003,6 +1265,49 @@ where id = $1
 "
   |> pog.query
   |> pog.parameter(pog.text(id))
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
+/// Full-metadata bot update (the registry merges the PATCH onto the row
+/// first, so this is a plain replace). `system_prompt` rides the ''
+/// sentinel for NULL = global default (see insert_bot.sql). `updated_at`
+/// is server-side now(), like the provider/thread metadata writes.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn update_bot(
+  db: pog.Connection,
+  id: String,
+  arg_2: String,
+  arg_3: String,
+  arg_4: String,
+  arg_5: String,
+  arg_6: String,
+) -> Result(pog.Returned(Nil), pog.QueryError) {
+  let decoder = decode.map(decode.dynamic, fn(_) { Nil })
+
+  "-- Full-metadata bot update (the registry merges the PATCH onto the row
+-- first, so this is a plain replace). `system_prompt` rides the ''
+-- sentinel for NULL = global default (see insert_bot.sql). `updated_at`
+-- is server-side now(), like the provider/thread metadata writes.
+update bot set
+  name = $2,
+  description = $3,
+  provider_id = $4,
+  model = $5,
+  system_prompt = nullif($6, ''),
+  updated_at = now()
+where id = $1
+"
+  |> pog.query
+  |> pog.parameter(pog.text(id))
+  |> pog.parameter(pog.text(arg_2))
+  |> pog.parameter(pog.text(arg_3))
+  |> pog.parameter(pog.text(arg_4))
+  |> pog.parameter(pog.text(arg_5))
+  |> pog.parameter(pog.text(arg_6))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }

@@ -15,6 +15,7 @@ import gleam/result
 import gleam/string
 import gleeunit/should
 import mist
+import nexus/bot_registry
 import nexus/config.{type Config}
 import nexus/hackney
 import nexus/loop
@@ -114,6 +115,7 @@ fn start_server_with(
   let factory_name = process.new_name("nexus_routes_factory")
   let registry_name = process.new_name("nexus_routes_registry")
   let providers_name = process.new_name("nexus_routes_providers")
+  let bots_name = process.new_name("nexus_routes_bots")
   let assert Ok(_factory) =
     factory_supervisor.start(thread_registry.factory_builder(factory_name))
   let persistence = store_mock.seam(store_mock.start())
@@ -138,6 +140,9 @@ fn start_server_with(
     )
   let providers = process.named_subject(providers_name)
   extra(providers)
+  // The REAL bot registry over the same mock store (bots plan P1):
+  // plain start — no crypto, no fetcher to fake.
+  let assert Ok(_bots) = bot_registry.start(persistence, bots_name)
   let assert Ok(started) =
     thread_registry.start(
       cfg,
@@ -155,7 +160,7 @@ fn start_server_with(
   // instead of surfacing later as connection-refused noise.
   let bound = process.new_subject()
   let assert Ok(_) =
-    mist.new(web.handler(cfg, registry_name, providers_name))
+    mist.new(web.handler(cfg, registry_name, providers_name, bots_name))
     |> mist.bind("127.0.0.1")
     |> mist.port(0)
     |> mist.after_start(fn(port, _scheme, _ip) { process.send(bound, port) })
@@ -254,6 +259,7 @@ fn create(
         provider_id: store_mock.fixture_provider_id,
         model: model,
         system_prompt: None,
+        bot_id: None,
       ),
       happy_runner,
     )
@@ -470,10 +476,12 @@ pub fn create_thread_validation_test() {
     )),
     #(400, "{\"error\":\"unknown model: nope\"}"),
   )
-  // Missing provider field -> 400 (no default provider exists anymore).
+  // Missing provider field -> 400 (no default provider exists anymore;
+  // the decoder is total over the two body shapes, so the refusal is the
+  // route's "empty provider").
   should.equal(
     send_authorized(req(port, Post, "/threads", "{\"model\":\"alias-a\"}")),
-    #(400, "{\"error\":\"unreadable body\"}"),
+    #(400, "{\"error\":\"empty provider\"}"),
   )
   should.equal(
     send_authorized(req(
@@ -768,7 +776,7 @@ pub fn provider_delete_guard_test() {
     send_authorized(req(port, Delete, "/providers/" <> provider_id, "")),
     #(
       409,
-      "{\"error\":\"provider is still pinned by threads; disable it instead\"}",
+      "{\"error\":\"provider is still pinned by threads or bots; disable it instead\"}",
     ),
   )
   // Disabling is allowed (the reversible path) but does NOT unpin —
@@ -784,7 +792,7 @@ pub fn provider_delete_guard_test() {
     send_authorized(req(port, Delete, "/providers/" <> provider_id, "")),
     #(
       409,
-      "{\"error\":\"provider is still pinned by threads; disable it instead\"}",
+      "{\"error\":\"provider is still pinned by threads or bots; disable it instead\"}",
     ),
   )
 
@@ -849,4 +857,154 @@ pub fn provider_models_route_test() {
     404,
     "{\"error\":\"unknown provider\"}",
   ))
+}
+
+// ---------------------------------------------------------------------------
+// Bots plan P1: /bots CRUD + create-from-bot
+// ---------------------------------------------------------------------------
+
+/// A bot created through the API: 201 with the row's public shape; the
+/// list shows it; PATCH moves/updates; DELETE removes. The provider
+/// existence check (the web layer's friendly 400, FK as backstop) and
+/// the closed error vocabulary are exercised along the way.
+pub fn bots_crud_routes_test() {
+  let #(_registry, port) = start_server()
+
+  // Create with an unknown provider -> the caller-side friendly 400.
+  should.equal(
+    send_authorized(req(
+      port,
+      Post,
+      "/bots",
+      "{\"name\":\"x\",\"provider\":\"p-nope\",\"model\":\"alias-a\"}",
+    )),
+    #(400, "{\"error\":\"unknown provider\"}"),
+  )
+
+  // Create (keyless fixture provider, blank prompt = default).
+  let #(status, body) =
+    send_authorized(req(
+      port,
+      Post,
+      "/bots",
+      "{\"name\":\"Writer\",\"description\":\"prose\",\"provider\":\"p-test\",\"model\":\"alias-a\",\"system_prompt\":\"be terse\"}",
+    ))
+  should.equal(status, 201)
+  should.be_true(string.contains(body, "\"id\":\"b1\""))
+  should.be_true(string.contains(body, "\"name\":\"Writer\""))
+  should.be_true(string.contains(body, "\"system_prompt\":\"be terse\""))
+
+  // List.
+  let assert #(200, list_body) = send_authorized(req(port, Get, "/bots", ""))
+  should.be_true(string.contains(list_body, "\"bots\":["))
+  should.be_true(string.contains(list_body, "\"name\":\"Writer\""))
+
+  // Duplicate name -> 409.
+  should.equal(
+    send_authorized(req(
+      port,
+      Post,
+      "/bots",
+      "{\"name\":\"Writer\",\"provider\":\"p-test\",\"model\":\"alias-a\"}",
+    )),
+    #(409, "{\"error\":\"bot name already exists\"}"),
+  )
+
+  // PATCH: rename + clear the prompt back to the default.
+  let assert #(200, patched) =
+    send_authorized(req(
+      port,
+      Patch,
+      "/bots/b1",
+      "{\"name\":\"Author\",\"system_prompt\":\"\"}",
+    ))
+  should.be_true(string.contains(patched, "\"name\":\"Author\""))
+  should.be_true(string.contains(patched, "\"system_prompt\":null"))
+
+  // PATCH onto an unknown provider -> the same friendly 400.
+  should.equal(
+    send_authorized(req(port, Patch, "/bots/b1", "{\"provider\":\"p-nope\"}")),
+    #(400, "{\"error\":\"unknown provider\"}"),
+  )
+
+  // Unknown id -> 404; empty patch -> 400; unreadable -> 400.
+  should.equal(
+    send_authorized(req(port, Patch, "/bots/b404", "{\"name\":\"x\"}")),
+    #(404, "{\"error\":\"unknown bot\"}"),
+  )
+  should.equal(send_authorized(req(port, Patch, "/bots/b1", "{}")), #(
+    400,
+    "{\"error\":\"empty patch\"}",
+  ))
+  should.equal(send_authorized(req(port, Patch, "/bots/b1", "not json")), #(
+    400,
+    "{\"error\":\"unreadable body\"}",
+  ))
+
+  // Delete (unguarded — threads keep their frozen columns).
+  should.equal(
+    send_authorized(req(port, Delete, "/bots/b1", "")) |> fn(p) { p.0 },
+    204,
+  )
+  should.equal(send_authorized(req(port, Delete, "/bots/b1", "")), #(
+    404,
+    "{\"error\":\"unknown bot\"}",
+  ))
+}
+
+/// `POST /threads {"bot": id}`: the bot sources the frozen pin (and its
+/// prompt), the summary carries the provenance, and the plan's refusal
+/// paths hold — an unknown bot is a 400, a stale alias is a 400 (the
+/// create must never silently succeed on a dead alias), and bot +
+/// provider/model in one body is a conflict.
+pub fn create_thread_from_bot_test() {
+  let #(_registry, port) = start_server()
+
+  // One bot, default prompt: the HTTP surface's visible contract is the
+  // pin + provenance (the prompt BYTES freeze at the registry level —
+  // thread_registry_test pins those).
+  let assert #(201, _created) =
+    send_authorized(req(
+      port,
+      Post,
+      "/bots",
+      "{\"name\":\"Default\",\"provider\":\"p-test\",\"model\":\"alias-a\"}",
+    ))
+
+  let assert #(201, thread) =
+    send_authorized(req(port, Post, "/threads", "{\"bot\":\"b1\"}"))
+  should.be_true(string.contains(thread, "\"bot_id\":\"b1\""))
+  should.be_true(string.contains(thread, "\"model\":\"alias-a\""))
+  should.be_true(string.contains(thread, "\"provider_id\":\"p-test\""))
+
+  // Unknown bot -> 400.
+  should.equal(
+    send_authorized(req(port, Post, "/threads", "{\"bot\":\"b-nope\"}")),
+    #(400, "{\"error\":\"unknown bot: b-nope\"}"),
+  )
+
+  // Stale alias -> 400 (never a silent success): a bot pinned to an
+  // alias the provider no longer lists.
+  let assert #(201, _stale) =
+    send_authorized(req(
+      port,
+      Post,
+      "/bots",
+      "{\"name\":\"Stale\",\"provider\":\"p-test\",\"model\":\"dead-alias\"}",
+    ))
+  should.equal(
+    send_authorized(req(port, Post, "/threads", "{\"bot\":\"b2\"}")),
+    #(400, "{\"error\":\"unknown model: dead-alias\"}"),
+  )
+
+  // Conflict: bot plus provider/model in one body.
+  should.equal(
+    send_authorized(req(
+      port,
+      Post,
+      "/threads",
+      "{\"bot\":\"b1\",\"model\":\"alias-a\"}",
+    )),
+    #(400, "{\"error\":\"bot conflicts with provider/model — pick one shape\"}"),
+  )
 }

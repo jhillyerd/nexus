@@ -205,7 +205,24 @@ flowchart TB
   from its state + the store, never calling into any thread (§8 rule 1).
 - **Scripting API → registries**: the same registry subjects the UI uses,
   over bearer-token-authenticated JSON routes (`/threads` CRUD + send/stop,
-  `/providers` CRUD + model listing; `/healthz` is the one open route).
+  `/providers` CRUD + model listing, `/bots` CRUD and the `{"bot": id}`
+  half of `POST /threads`; `/healthz` is the one open route).
+- **No registry-to-registry edges.** The bot registry and the provider
+  registry are mutually ignorant; orchestration lives with the callers
+  (web and the UI runtime, through `nexus/thread_create` — the one
+  creation path both surfaces share):
+  - `POST`/`PATCH /bots` validate `provider_id` against the
+    provider-registry subject the web layer already holds (friendly
+    400; the `ON DELETE RESTRICT` FK is the backstop);
+  - the provider registry's delete guard counts bots through the
+    STORE (`count_bots_for_provider`, riding both halves of the guard
+    alongside `count_threads_for_provider`) — never a call into the
+    bot registry;
+  - create-from-bot resolves the bot in `thread_create`, copies its
+    frozen values into the creation request, and re-validates the
+    model alias against the provider's LIVE list (a stale bot must
+    400, never silently succeed); the thread registry never sees
+    bots beyond the `bot_id` provenance column.
 
 ---
 
@@ -294,7 +311,7 @@ One pog-backed actor owning the single Postgres pool. Two lanes:
   `on conflict (thread_id, seq) do nothing`, so crash-recovery replays
   are idempotent.
 - **Write-through (synchronous)**: reads and metadata mutations, called by
-  the thread registry and provider registry.
+  the thread registry and both settings registries (provider, bot).
 
 The `nexus/store` module above it is the mockable seam (record of
 functions) plus pure transcript⇄row mappers — `gleam test` never touches a
@@ -307,7 +324,20 @@ or unreachable store fails boot loudly). Plaintext keys exist only inside
 `ResolvedProvider` handed to callers; reads reply with masked metadata.
 Resolve decrypts lazily into a memo invalidated by update/delete. CRUD
 pre-checks existence/name-uniqueness in state; deletes are refused while
-threads pin the provider (`ON DELETE RESTRICT`).
+threads OR BOTS pin the provider (`ON DELETE RESTRICT` — both halves of
+the guard are store counts; see the no-cross-edges rule in §4).
+
+### Bot registry
+
+Owns the `bot` rows (named creation-time thread templates: default
+provider + model + system prompt, no secrets — the stored row IS the
+public shape). Loads the whole table at boot (an unreachable store fails
+boot); write-through CRUD with the in-state duplicate-name pre-check;
+deletes are unguarded because `thread.bot_id` is `ON DELETE SET NULL`
+provenance — a bot's threads keep their frozen columns. A stale model
+alias is legitimate at rest: thread create re-validates it against the
+provider's live list. Never resolves providers (§4's no-edges rule) and
+never touches the network.
 
 ### Thread registry
 
@@ -356,7 +386,10 @@ utility-attempt bookkeeping.
    all other store access goes through the registries.
 3. **threads never call the provider registry.** Boot injects a resolver
    into the thread registry; endpoints are frozen into the thread spec
-   before the actor exists.
+   before the actor exists. The bot registry follows the same shape: no
+   registry-to-registry edges at all — caller-side validation and
+   cross-entity guards go through the store or the orchestrating caller
+   (`thread_create`), never actor-to-actor calls.
 4. **`nexus/codemode` is a leaf** — it must not import `nexus/tools`, or the
    codemode tool could invoke itself.
 5. **`nexus/transcript` is the single request-encoding path.** No volatile

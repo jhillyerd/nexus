@@ -80,6 +80,7 @@ pub fn threads_json_test() {
       pinned: True,
       tags: ["work", "notes"],
       archived: False,
+      bot_id: None,
       message_count: 4,
       streaming: True,
       created_at: 1_729_000_000,
@@ -148,6 +149,7 @@ fn summary_with_archived(id: String, archived: Bool) -> thread.ThreadSummary {
     pinned: False,
     tags: [],
     archived: archived,
+    bot_id: None,
     message_count: 0,
     streaming: False,
     created_at: 0,
@@ -183,14 +185,24 @@ pub fn patch_body_decoders_test() {
 pub fn request_body_decoders_test() {
   web.parse_text_json("{\"text\":\"hello\"}")
   |> should.equal(Ok("hello"))
-  // POST /threads now pins provider + model (multi-provider §11).
+  // POST /threads pins provider + model (multi-provider §11), or names
+  // a bot (bots plan P1). The decoder is TOTAL over the field shapes —
+  // blanks are the ROUTE's 400s ("empty provider"/"empty model"), not
+  // decode failures, so the bot body parses with the same decoder.
   web.parse_create_json("{\"provider\":\"p1\",\"model\":\"alias-a\"}")
-  |> should.equal(Ok(web.CreateFields(provider: "p1", model: "alias-a")))
+  |> should.equal(Ok(web.PlainCreate(provider: "p1", model: "alias-a")))
   web.parse_text_json("{\"model\":\"alias-a\"}")
   |> should.equal(Error(Nil))
   web.parse_create_json("{\"model\":\"alias-a\"}")
-  |> should.equal(Error(Nil))
+  |> should.equal(Ok(web.PlainCreate(provider: "", model: "alias-a")))
   web.parse_create_json("{\"provider\":\"p1\"}")
+  |> should.equal(Ok(web.PlainCreate(provider: "p1", model: "")))
+  // The create-from-bot shape, and its conflict with provider/model.
+  web.parse_create_json("{\"bot\":\"b1\"}")
+  |> should.equal(Ok(web.BotCreate("b1")))
+  web.parse_create_json("{\"bot\":\"b1\",\"model\":\"alias-a\"}")
+  |> should.equal(Ok(web.ConflictingCreate))
+  web.parse_create_json("not json")
   |> should.equal(Error(Nil))
 }
 
@@ -298,7 +310,7 @@ pub fn registry_error_fields_test() {
   web.registry_error_fields(provider_registry.StillReferenced)
   |> should.equal(#(
     409,
-    "provider is still pinned by threads; disable it instead",
+    "provider is still pinned by threads or bots; disable it instead",
   ))
   web.registry_error_fields(provider_registry.DecryptFailed)
   |> should.equal(#(

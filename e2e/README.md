@@ -41,7 +41,10 @@ reload restores its own thread, no horizontal overflow with tool cards),
 and (multi-provider P5) provider management end-to-end: a provider created
 in the Providers panel, picked in the create panel with its model aliases
 reloading, a thread pinned to it streaming a turn, and the delete-guard /
-disable-picker rails.
+disable-picker rails — plus (bots plan P1) the bots surface: a bot created
+in the Bots section, a thread started FROM it through the create panel's
+bot picker (row subtitle carrying the provenance name), and the bot's
+deletion leaving the thread's frozen pin intact.
 
 ## Preconditions
 

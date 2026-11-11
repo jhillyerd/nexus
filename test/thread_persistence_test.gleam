@@ -350,6 +350,7 @@ fn new_thread(provider_id: String, model: String) -> thread_registry.NewThread {
     provider_id: provider_id,
     model: model,
     system_prompt: None,
+    bot_id: None,
   )
 }
 
@@ -598,6 +599,7 @@ fn stored(id: String) -> store.StoredSummary {
       tags_manual: [],
       tags_source: thread.AutoTags,
       archived: False,
+      bot_id: None,
       created_at: timing.wall_now_s(),
     ),
     last_active_at: timing.wall_now_s(),

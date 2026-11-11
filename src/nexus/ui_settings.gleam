@@ -31,6 +31,8 @@ import lustre/element.{type Element}
 import lustre/element/html
 import lustre/event
 import lustre/server_component
+import nexus/bot.{type Bot}
+import nexus/bot_registry
 import nexus/provider.{type Provider}
 import nexus/provider_registry
 
@@ -60,6 +62,16 @@ pub type State {
     /// reason must be visible without switching views (the chat-log
     /// note via `OpFailed` stays for the transcript).
     last_error: Option(String),
+    // ---- Bots (bots plan P1) ----
+    /// The add-bot form is open (at most one form section-wide).
+    bots_open: Bool,
+    /// The bot row whose inline editor is open.
+    bot_edit: Option(String),
+    /// The bot row whose two-step delete confirmation is armed.
+    bot_confirm: Option(String),
+    /// The latest bot-mutation failure, rendered beside the Bots section
+    /// (same rule as `last_error`).
+    bot_last_error: Option(String),
   )
 }
 
@@ -93,6 +105,41 @@ pub type Msg {
   MutateFailed(reason: String)
   ModelsLoaded(id: String, aliases: List(String))
   TestFailed(id: String, reason: String)
+  // ---- Bots (bots plan P1) ----
+  /// The add-bot form toggled.
+  BotAddToggled
+  /// The add-bot form submitted. `system_prompt` blank = the global
+  /// default (resolved when a thread is created from the bot).
+  BotSubmitted(
+    name: String,
+    description: String,
+    provider_id: String,
+    model: String,
+    system_prompt: String,
+  )
+  BotEditToggled(id: String)
+  /// The edit form submitted: blank name/model/provider keep the stored
+  /// values; a blank system prompt CLEARS back to the default (a real
+  /// change — the two field classes in `bot.BotUpdate`).
+  BotEditSubmitted(
+    id: String,
+    name: String,
+    description: String,
+    provider_id: String,
+    model: String,
+    system_prompt: String,
+  )
+  BotDeleteRequested(id: String)
+  BotDeleteCancelled
+  BotDeleteConfirmed(id: String)
+  // ---- Bot registry replies ----
+  /// A bot was created (the parent reloads the bot list).
+  BotCreated(bot: Bot)
+  /// A bot update/delete landed (the parent reloads the bot list).
+  BotMutated
+  /// Any bot mutation failed; `reason` is the registry's fixed text —
+  /// surfaced here AND as a chat-log note via `OpFailed`.
+  BotMutateFailed(reason: String)
 }
 
 /// What the sub-component asks the parent (chat) model to do. Signals
@@ -103,10 +150,13 @@ pub type Signal {
   /// re-aim, and (still in the auto-opened settings view) returns to
   /// chat.
   ProviderCreated(Provider)
-  /// The masked list must be reloaded (a mutation landed).
+  /// The masked list must be reloaded (a provider mutation landed).
   ProvidersChanged
-  /// A mutation failed; the parent notes it in the chat log (settings
-  /// has no log surface of its own).
+  /// The bot list must be reloaded (a bot mutation landed).
+  BotsChanged
+  /// A mutation failed; `reason` is the ready-to-show note text (the
+  /// per-surface prefix included) — the parent notes it in the chat log
+  /// (settings has no log surface of its own).
   OpFailed(String)
 }
 
@@ -117,10 +167,14 @@ pub fn init() -> State {
     confirm: None,
     models: ModelsIdle,
     last_error: None,
+    bots_open: False,
+    bot_edit: None,
+    bot_confirm: None,
+    bot_last_error: None,
   )
 }
 
-/// The sub-update. `providers` is the registry subject for this
+/// The sub-update. `providers`/`bots` are the registry subjects for this
 /// connection's runtime (passed down from the parent model), and
 /// `models_timeout_ms` the shared live-model budget
 /// (`thread_create.models_timeout`) — every `list_models` call this
@@ -131,13 +185,24 @@ pub fn update(
   state: State,
   msg: Msg,
   providers: Subject(provider_registry.Msg),
+  bots: Subject(bot_registry.Msg),
   models_timeout_ms: Int,
 ) -> #(State, Effect(Msg), List(Signal)) {
   case msg {
     Ignored -> #(state, effect.none(), [])
 
     AddToggled -> #(
-      State(..state, open: !state.open, edit: None, confirm: None),
+      State(
+        ..state,
+        open: !state.open,
+        edit: None,
+        confirm: None,
+        // One form section-wide: opening the provider form closes the
+        // Bots section's open form/editor/confirm too.
+        bots_open: False,
+        bot_edit: None,
+        bot_confirm: None,
+      ),
       effect.none(),
       [],
     )
@@ -159,6 +224,9 @@ pub fn update(
         edit: toggle_open(state.edit, id),
         open: False,
         confirm: None,
+        bots_open: False,
+        bot_edit: None,
+        bot_confirm: None,
       ),
       effect.none(),
       [],
@@ -177,7 +245,15 @@ pub fn update(
     )
 
     DeleteRequested(id) -> #(
-      State(..state, confirm: Some(id), edit: None, open: False),
+      State(
+        ..state,
+        confirm: Some(id),
+        edit: None,
+        open: False,
+        bots_open: False,
+        bot_edit: None,
+        bot_confirm: None,
+      ),
       effect.none(),
       [],
     )
@@ -197,7 +273,7 @@ pub fn update(
     MutateFailed(reason) -> #(
       State(..state, last_error: Some(reason)),
       effect.none(),
-      [OpFailed(reason)],
+      [OpFailed("provider operation failed: " <> reason)],
     )
 
     TestRequested(id) -> #(
@@ -229,6 +305,93 @@ pub fn update(
         )
         _ -> #(state, effect.none(), [])
       }
+
+    // ---- Bots (bots plan P1) ----
+    BotAddToggled -> #(
+      State(
+        ..state,
+        bots_open: !state.bots_open,
+        bot_edit: None,
+        bot_confirm: None,
+        // One form section-wide, like the provider forms: opening one
+        // closes the other section's open form/editor/confirm.
+        open: False,
+        edit: None,
+        confirm: None,
+      ),
+      effect.none(),
+      [],
+    )
+
+    BotSubmitted(name, description, provider_id, model, system_prompt) -> #(
+      State(..state, bots_open: False),
+      create_bot_effect(
+        bots,
+        name,
+        description,
+        provider_id,
+        model,
+        system_prompt,
+      ),
+      [],
+    )
+
+    BotCreated(_bot) -> #(State(..state, bot_last_error: None), effect.none(), [
+      BotsChanged,
+    ])
+
+    BotEditToggled(id) -> #(
+      State(
+        ..state,
+        bot_edit: toggle_open(state.bot_edit, id),
+        bots_open: False,
+        bot_confirm: None,
+      ),
+      effect.none(),
+      [],
+    )
+
+    BotEditSubmitted(id, name, description, provider_id, model, system_prompt) -> #(
+      State(..state, bot_edit: None),
+      update_bot_effect(
+        bots,
+        id,
+        name,
+        description,
+        provider_id,
+        model,
+        system_prompt,
+      ),
+      [],
+    )
+
+    BotDeleteRequested(id) -> #(
+      State(..state, bot_confirm: Some(id), bot_edit: None, bots_open: False),
+      effect.none(),
+      [],
+    )
+
+    BotDeleteCancelled -> #(
+      State(..state, bot_confirm: None),
+      effect.none(),
+      [],
+    )
+
+    BotDeleteConfirmed(id) -> #(
+      State(..state, bot_confirm: None),
+      delete_bot_effect(bots, id),
+      [],
+    )
+
+    BotMutated -> #(State(..state, bot_last_error: None), effect.none(), [
+      BotsChanged,
+    ])
+
+    BotMutateFailed(reason) -> #(
+      State(..state, bot_last_error: Some(reason)),
+      effect.none(),
+      [OpFailed("bot operation failed: " <> reason)],
+    )
   }
 }
 
@@ -239,51 +402,340 @@ pub fn update(
 /// The whole settings page. Sectioned so future settings categories
 /// (each a `<section>` with its own `section-head`) slot in under the
 /// Providers section without structural changes.
-pub fn view(state: State, provider_list: List(Provider)) -> Element(Msg) {
+pub fn view(
+  state: State,
+  provider_list: List(Provider),
+  bot_list: List(Bot),
+) -> Element(Msg) {
   html.div([attr.id("settings-page"), attr.class("settings-page")], [
-    html.section([attr.id("providers-panel")], [
-      // One header row: title left, Add right (ui-polish F7). The page
-      // itself is the settings surface the header button toggles, so the
-      // section head names only its category — future categories slot in
-      // as sibling sections with their own heads.
-      html.div([attr.class("section-head")], [
-        html.h2([], [html.text("Providers")]),
+    providers_section(state, provider_list),
+    bots_section(state, provider_list, bot_list),
+  ])
+}
+
+/// The Providers section, verbatim from the pre-bots settings page.
+fn providers_section(
+  state: State,
+  provider_list: List(Provider),
+) -> Element(Msg) {
+  html.section([attr.id("providers-panel")], [
+    // One header row: title left, Add right (ui-polish F7). The page
+    // itself is the settings surface the header button toggles, so the
+    // section head names only its category — future categories slot in
+    // as sibling sections with their own heads.
+    html.div([attr.class("section-head")], [
+      html.h2([], [html.text("Providers")]),
+      html.button(
+        [
+          attr.id("add-provider"),
+          attr.type_("button"),
+          event.on_click(AddToggled),
+        ],
+        [html.text("Add")],
+      ),
+    ]),
+    html.p([attr.class("muted")], [
+      html.text(
+        "Providers are OpenAI-compatible endpoints. Keys are encrypted "
+        <> "at rest and never shown back.",
+      ),
+    ]),
+    // The latest mutation failure renders HERE (the user is on this
+    // page when it happens) — the chat-log note via `OpFailed` is the
+    // durable transcript copy.
+    case state.last_error {
+      Some(reason) ->
+        html.p([attr.class("settings-error")], [
+          html.text("provider operation failed: " <> reason),
+        ])
+      None -> element.none()
+    },
+    add_provider_form(state),
+    ..case provider_list {
+      [] -> [
+        html.p([attr.class("muted")], [
+          html.text("No providers yet. Add one to start chatting."),
+        ]),
+      ]
+      providers -> list.map(providers, provider_row(state, _))
+    }
+  ])
+}
+
+/// The Bots section (bots plan P1): per-row inline editor, add form,
+/// two-step delete — mirroring the provider rows. Everything bot-fed
+/// (names, descriptions, prompts) is hostile text under the UI
+/// contract: Lustre text nodes, never innerHTML.
+fn bots_section(
+  state: State,
+  provider_list: List(Provider),
+  bot_list: List(Bot),
+) -> Element(Msg) {
+  html.section([attr.id("bots-panel")], [
+    html.div([attr.class("section-head")], [
+      html.h2([], [html.text("Bots")]),
+      html.button(
+        [
+          attr.id("add-bot"),
+          attr.type_("button"),
+          event.on_click(BotAddToggled),
+        ],
+        [html.text("Add")],
+      ),
+    ]),
+    html.p([attr.class("muted")], [
+      html.text(
+        "A bot is a named profile — provider, model, system prompt — "
+        <> "that a new thread is created from. Existing threads keep "
+        <> "what they froze at creation.",
+      ),
+    ]),
+    case state.bot_last_error {
+      Some(reason) ->
+        html.p([attr.class("settings-error")], [
+          html.text("bot operation failed: " <> reason),
+        ])
+      None -> element.none()
+    },
+    case bot_list, provider_list {
+      // Without a provider there is nothing to template: the add form
+      // stays unusable, so say so instead of rendering a picker of
+      // nothing (mirrors the provider section's empty state).
+      _, [] ->
+        html.p([attr.class("muted")], [
+          html.text("No providers yet — add one before creating bots."),
+        ])
+      [], _ ->
+        html.p([attr.class("muted")], [
+          html.text(
+            "No bots yet. Add one to start threads from a preset "
+            <> "provider, model, and prompt.",
+          ),
+        ])
+      bots, _ ->
+        html.div(
+          [attr.class("bot-list")],
+          list.map(bots, bot_row(state, _, provider_list)),
+        )
+    },
+    add_bot_form(state, provider_list),
+  ])
+}
+
+/// One bot row: name, description, provider/model identity, the edit +
+/// delete controls, the hidden inline editor, and the two-step delete
+/// confirmation — the provider-row shape. The prompt (explicit or the
+/// default) shows as a truncated preview under the identity line.
+fn bot_row(
+  state: State,
+  b: Bot,
+  provider_list: List(Provider),
+) -> Element(Msg) {
+  let id = b.id
+  let provider_name = case
+    list.find(provider_list, fn(p) { p.id == b.provider_id })
+  {
+    Ok(provider) -> provider.name
+    // The provider cannot be deleted while a bot pins it (RESTRICT), so
+    // this is a list-lag cosmetic fallback only.
+    Error(_) -> b.provider_id
+  }
+  html.div([attr.class("bot-row"), attr.data("bot-id", id)], [
+    html.div([attr.class("provider-main")], [
+      html.div([attr.class("provider-head")], [
+        html.strong([attr.class("provider-name")], [html.text(b.name)]),
+      ]),
+      html.span([attr.class("provider-sub")], [
+        html.text(
+          provider_name
+          <> "/"
+          <> b.model
+          <> case b.description {
+            "" -> ""
+            description -> " · " <> description
+          },
+        ),
+      ]),
+      case b.system_prompt {
+        None ->
+          html.span([attr.class("provider-sub muted")], [
+            html.text("default system prompt"),
+          ])
+        Some(prompt) ->
+          html.span([attr.class("provider-sub muted")], [
+            html.text(truncate_preview(prompt, 120)),
+          ])
+      },
+    ]),
+    html.div([attr.class("row-controls")], [
+      control("Edit", "Edit this bot", BotEditToggled(id)),
+      control("Delete", "Delete this bot forever", BotDeleteRequested(id)),
+    ]),
+    // Inline editor: prefilled name/model/prompt; the provider select
+    // offers every provider (a bot's provider can be disabled — it only
+    // blocks NEW threads, and re-aiming the bot is the cure).
+    html.form(
+      [
+        attr.class("provider-form"),
+        attr.action("#"),
+        attr.hidden(state.bot_edit != Some(id)),
+        bot_edit_submitted(id),
+      ],
+      [
+        html.h3([], [html.text("Edit bot")]),
+        html.input([
+          attr.type_("text"),
+          attr.name("name"),
+          attr.value(b.name),
+          attr.placeholder("Name"),
+          attr.aria("label", "Name for " <> b.name),
+        ]),
+        html.input([
+          attr.type_("text"),
+          attr.name("description"),
+          attr.value(b.description),
+          attr.placeholder("Description (optional)"),
+          attr.aria("label", "Description for " <> b.name),
+        ]),
+        html.label([attr.for("bot-provider-" <> id)], [html.text("Provider")]),
+        html.select(
+          [
+            attr.id("bot-provider-" <> id),
+            attr.name("provider"),
+            attr.aria("label", "Provider for " <> b.name),
+          ],
+          list.map(provider_list, fn(p) {
+            html.option(
+              [attr.value(p.id), attr.selected(p.id == b.provider_id)],
+              p.name,
+            )
+          }),
+        ),
+        html.input([
+          attr.type_("text"),
+          attr.name("model"),
+          attr.value(b.model),
+          attr.placeholder("Model alias"),
+          attr.aria("label", "Model alias for " <> b.name),
+        ]),
+        html.textarea(
+          [
+            attr.name("system_prompt"),
+            attr.rows(3),
+            attr.placeholder("System prompt (blank = default)"),
+            attr.aria("label", "System prompt for " <> b.name),
+          ],
+          case b.system_prompt {
+            Some(prompt) -> prompt
+            None -> ""
+          },
+        ),
+        html.div([attr.class("provider-form-buttons")], [
+          html.button([attr.type_("submit")], [html.text("Save")]),
+          html.button(
+            [attr.type_("button"), event.on_click(BotEditToggled(id))],
+            [html.text("Cancel")],
+          ),
+        ]),
+      ],
+    ),
+    // Two-step delete: no guard behind it — a bot's threads keep their
+    // frozen columns (bot_id SET NULL), which the copy makes explicit.
+    html.div(
+      [
+        attr.class("confirm-delete"),
+        attr.hidden(state.bot_confirm != Some(id)),
+      ],
+      [
+        html.span([], [
+          html.text(
+            "Delete "
+            <> b.name
+            <> "? Threads already created from it keep their settings.",
+          ),
+        ]),
         html.button(
           [
-            attr.id("add-provider"),
             attr.type_("button"),
-            event.on_click(AddToggled),
+            attr.class("danger"),
+            event.on_click(BotDeleteConfirmed(id)),
           ],
-          [html.text("Add")],
+          [html.text("Delete forever")],
         ),
-      ]),
-      html.p([attr.class("muted")], [
-        html.text(
-          "Providers are OpenAI-compatible endpoints. Keys are encrypted "
-          <> "at rest and never shown back.",
-        ),
-      ]),
-      // The latest mutation failure renders HERE (the user is on this
-      // page when it happens) — the chat-log note via `OpFailed` is the
-      // durable transcript copy.
-      case state.last_error {
-        Some(reason) ->
-          html.p([attr.class("settings-error")], [
-            html.text("provider operation failed: " <> reason),
-          ])
-        None -> element.none()
-      },
-      add_provider_form(state),
-      ..case provider_list {
-        [] -> [
-          html.p([attr.class("muted")], [
-            html.text("No providers yet. Add one to start chatting."),
-          ]),
-        ]
-        providers -> list.map(providers, provider_row(state, _))
-      }
-    ]),
+        html.button([attr.type_("button"), event.on_click(BotDeleteCancelled)], [
+          html.text("Keep"),
+        ]),
+      ],
+    ),
   ])
+}
+
+/// The add-bot form: same fields as the editor, blank defaults, the
+/// provider select defaulting to the first provider.
+fn add_bot_form(state: State, provider_list: List(Provider)) -> Element(Msg) {
+  html.form(
+    [
+      attr.id("add-bot-form"),
+      attr.class("provider-form"),
+      attr.action("#"),
+      attr.hidden(!state.bots_open),
+      bot_submitted(),
+    ],
+    [
+      html.h3([], [html.text("Add bot")]),
+      html.input([
+        attr.type_("text"),
+        attr.name("name"),
+        attr.placeholder("Name (e.g. research assistant)"),
+        attr.aria("label", "New bot name"),
+      ]),
+      html.input([
+        attr.type_("text"),
+        attr.name("description"),
+        attr.placeholder("Description (optional)"),
+        attr.aria("label", "New bot description"),
+      ]),
+      html.label([attr.for("add-bot-provider")], [html.text("Provider")]),
+      html.select(
+        [
+          attr.id("add-bot-provider"),
+          attr.name("provider"),
+          attr.aria("label", "Provider"),
+        ],
+        case provider_list {
+          [] -> [html.option([attr.value("")], "no providers")]
+          [first, ..] as providers ->
+            list.map(providers, fn(p) {
+              html.option(
+                [attr.value(p.id), attr.selected(p.id == first.id)],
+                p.name,
+              )
+            })
+        },
+      ),
+      html.input([
+        attr.type_("text"),
+        attr.name("model"),
+        attr.placeholder("Model alias"),
+        attr.aria("label", "New bot model alias"),
+      ]),
+      html.textarea(
+        [
+          attr.name("system_prompt"),
+          attr.rows(3),
+          attr.placeholder("System prompt (blank = default)"),
+          attr.aria("label", "New bot system prompt"),
+        ],
+        "",
+      ),
+      html.div([attr.class("provider-form-buttons")], [
+        html.button([attr.type_("submit")], [html.text("Add bot")]),
+        html.button([attr.type_("button"), event.on_click(BotAddToggled)], [
+          html.text("Cancel"),
+        ]),
+      ]),
+    ],
+  )
 }
 
 /// The add-provider form. The key input is a password field with
@@ -621,6 +1073,86 @@ fn models_effect(
 }
 
 // ---------------------------------------------------------------------------
+// Bot effects (bots plan P1; §bot semantics via the bot registry — no
+// key material anywhere, so nothing to mask)
+// ---------------------------------------------------------------------------
+
+/// Create a bot from the add-form's fields. A blank system prompt is
+/// the global default (resolved when a thread is created from the bot);
+/// `provider_id` arrives from a select built over the parent's provider
+/// list, so it is valid by construction — the FK is the backstop.
+fn create_bot_effect(
+  bots: Subject(bot_registry.Msg),
+  name: String,
+  description: String,
+  provider_id: String,
+  model: String,
+  system_prompt: String,
+) -> Effect(Msg) {
+  let params =
+    bot.BotParams(
+      name: name,
+      description: description,
+      provider_id: provider_id,
+      model: model,
+      system_prompt: case string.trim(system_prompt) {
+        "" -> None
+        prompt -> Some(prompt)
+      },
+    )
+  effect.from(fn(dispatch) {
+    case bot_registry.create_bot(bots, params) {
+      Ok(created) -> dispatch(BotCreated(created))
+      Error(error) -> dispatch(BotMutateFailed(bot_registry.describe(error)))
+    }
+  })
+}
+
+/// Submit the edit form as a PATCH. The identity fields (name, model,
+/// provider) keep their stored value when blank; the free-text fields
+/// (description, system prompt) always replace — blank CLEARS (back to
+/// "" and back to the default prompt), the two field classes in
+/// `bot.BotUpdate`.
+fn update_bot_effect(
+  bots: Subject(bot_registry.Msg),
+  id: String,
+  name: String,
+  description: String,
+  provider_id: String,
+  model: String,
+  system_prompt: String,
+) -> Effect(Msg) {
+  let patch =
+    bot.BotUpdate(
+      name: keep_blank(name),
+      description: Some(description),
+      provider_id: keep_blank(provider_id),
+      model: keep_blank(model),
+      system_prompt: Some(system_prompt),
+    )
+  effect.from(fn(dispatch) {
+    case bot_registry.update_bot(bots, id, patch) {
+      Ok(_) -> dispatch(BotMutated)
+      Error(error) -> dispatch(BotMutateFailed(bot_registry.describe(error)))
+    }
+  })
+}
+
+/// Hard delete (two-step confirmed): no guard — a bot's threads keep
+/// their frozen columns (bot_id SET NULL).
+fn delete_bot_effect(
+  bots: Subject(bot_registry.Msg),
+  id: String,
+) -> Effect(Msg) {
+  effect.from(fn(dispatch) {
+    case bot_registry.delete_bot(bots, id) {
+      Ok(_) -> dispatch(BotMutated)
+      Error(error) -> dispatch(BotMutateFailed(bot_registry.describe(error)))
+    }
+  })
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -696,5 +1228,74 @@ fn form_field(
   case list.find(entries, fn(entry) { entry.0 == name }) {
     Ok(#(_, value)) -> Ok(value)
     Error(_) -> Error(Nil)
+  }
+}
+
+/// The add-bot form submits with its fields riding the form data (the
+/// composer pattern). A select's chosen option rides form data the same
+/// way an input's value does, so the provider picks up from `provider`.
+/// The prompt is optional (blank = the global default).
+fn bot_submitted() -> attr.Attribute(Msg) {
+  event.on_submit(fn(entries) {
+    case
+      form_field(entries, "name"),
+      form_field(entries, "description"),
+      form_field(entries, "provider"),
+      form_field(entries, "model"),
+      form_field(entries, "system_prompt")
+    {
+      Ok(name), description, Ok(provider_id), Ok(model), prompt ->
+        BotSubmitted(
+          name,
+          result.unwrap(description, ""),
+          provider_id,
+          model,
+          result.unwrap(prompt, ""),
+        )
+      _, _, _, _, _ -> Ignored
+    }
+  })
+  |> server_component.include(["detail.formData"])
+}
+
+/// The edit form: blank name/model/provider keep the stored values; a
+/// blank system prompt CLEARS back to the default (a real change).
+fn bot_edit_submitted(id: String) -> attr.Attribute(Msg) {
+  event.on_submit(fn(entries) {
+    case
+      form_field(entries, "name"),
+      form_field(entries, "description"),
+      form_field(entries, "provider"),
+      form_field(entries, "model"),
+      form_field(entries, "system_prompt")
+    {
+      Ok(name), description, provider_id, Ok(model), prompt ->
+        BotEditSubmitted(
+          id,
+          name,
+          result.unwrap(description, ""),
+          result.unwrap(provider_id, ""),
+          model,
+          result.unwrap(prompt, ""),
+        )
+      _, _, _, _, _ -> Ignored
+    }
+  })
+  |> server_component.include(["detail.formData"])
+}
+
+/// One-line preview of a bot's prompt for the row's subtitle: collapse
+/// whitespace runs, then truncate with an ellipsis at `limit`
+/// characters — the same shaping idea as `utility.shape_title`, applied
+/// locally because this is presentation, not stored metadata.
+fn truncate_preview(text: String, limit: Int) -> String {
+  let collapsed =
+    text
+    |> string.split(" ")
+    |> list.filter(fn(part) { part != "" })
+    |> string.join(" ")
+  case string.length(collapsed) > limit {
+    True -> string.slice(collapsed, 0, limit) <> "…"
+    False -> collapsed
   }
 }

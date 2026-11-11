@@ -10,10 +10,12 @@
 import gleam/dict.{type Dict}
 import gleam/erlang/process.{type Subject}
 import gleam/list
-import gleam/option.{None}
+import gleam/option.{None, Some}
 import gleam/otp/actor
 import gleam/string
-import nexus/store.{type Store, type StoredProvider, type StoredSummary}
+import nexus/store.{
+  type Store, type StoredBot, type StoredProvider, type StoredSummary,
+}
 import nexus/thread
 import nexus/timing
 import nexus/transcript.{type Transcript}
@@ -36,6 +38,9 @@ pub type Event {
   EvInsertProvider(id: String)
   EvUpdateProvider(id: String)
   EvDeleteProvider(id: String)
+  EvInsertBot(id: String)
+  EvUpdateBot(id: String)
+  EvDeleteBot(id: String)
 }
 
 pub type MockMsg {
@@ -82,11 +87,20 @@ pub type MockMsg {
   )
   CountThreadsForProvider(id: String, reply: Subject(Result(Int, String)))
   DeleteProvider(id: String, reply: Subject(Result(Nil, String)))
+  // ---- bot rows (docs/plans/bots.md, Phase 1) ----
+  ListBots(reply: Subject(Result(List(StoredBot), String)))
+  GetBot(id: String, reply: Subject(Result(StoredBot, String)))
+  InsertBot(bot: StoredBot, reply: Subject(Result(Nil, String)))
+  UpdateBot(bot: StoredBot, reply: Subject(Result(Nil, String)))
+  DeleteBot(id: String, reply: Subject(Result(Nil, String)))
+  CountBotsForProvider(id: String, reply: Subject(Result(Int, String)))
   // ---- test-only introspection ----
   Events(reply: Subject(List(Event)))
   Rows(reply: Subject(List(#(String, List(store.MessageRow)))))
   /// Every stored provider, id-sorted — for direct row assertions.
   Providers(reply: Subject(List(StoredProvider)))
+  /// Every stored bot, id-sorted — for direct row assertions.
+  Bots(reply: Subject(List(StoredBot)))
   /// Test-only: truncate a thread's stored rows back to `keep_rows` and
   /// its persisted message count to `messages` to model a crash between
   /// commits — the next Commit re-emits the delta, which is exactly the
@@ -117,6 +131,7 @@ type State {
   State(
     threads: Dict(String, Stored),
     providers: Dict(String, store.StoredProvider),
+    bots: Dict(String, StoredBot),
     events: List(Event),
   )
 }
@@ -161,7 +176,12 @@ pub fn start() -> Subject(MockMsg) {
   let assert Ok(started) =
     actor.new_with_initialiser(1000, fn(self) {
       actor.initialised(
-        State(threads: dict.new(), providers: dict.new(), events: []),
+        State(
+          threads: dict.new(),
+          providers: dict.new(),
+          bots: dict.new(),
+          events: [],
+        ),
       )
       |> actor.returning(self)
       |> Ok
@@ -212,6 +232,14 @@ pub fn seam(mock: Subject(MockMsg)) -> Store {
     delete_provider: fn(id) {
       call(mock, 5000, fn(r) { DeleteProvider(id, r) })
     },
+    list_bots: fn() { call(mock, 5000, ListBots) },
+    get_bot: fn(id) { call(mock, 5000, fn(r) { GetBot(id, r) }) },
+    insert_bot: fn(row) { call(mock, 5000, fn(r) { InsertBot(row, r) }) },
+    update_bot: fn(row) { call(mock, 5000, fn(r) { UpdateBot(row, r) }) },
+    delete_bot: fn(id) { call(mock, 5000, fn(r) { DeleteBot(id, r) }) },
+    count_bots_for_provider: fn(id) {
+      call(mock, 5000, fn(r) { CountBotsForProvider(id, r) })
+    },
   )
 }
 
@@ -233,6 +261,11 @@ pub fn rows(mock: Subject(MockMsg)) -> List(#(String, List(store.MessageRow))) {
 /// (envelopes included: the mock holds ciphertext, like the real store).
 pub fn providers(mock: Subject(MockMsg)) -> List(store.StoredProvider) {
   call(mock, 5000, Providers)
+}
+
+/// Every stored bot, id-sorted — for direct row assertions.
+pub fn bots(mock: Subject(MockMsg)) -> List(store.StoredBot) {
+  call(mock, 5000, Bots)
 }
 
 /// Truncate a thread's stored rows (models a crash between commits so
@@ -341,34 +374,50 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
           actor.continue(state)
         }
         Ok(_) -> {
-          process.send(reply, Ok(Nil))
-          actor.continue(
-            State(
-              ..state,
-              threads: dict.insert(
-                state.threads,
-                summary.id,
-                // insert_thread.sql: tags_manual '{}' literally and
-                // tags_source DEFAULT 'auto' — a new row's auto path is
-                // open, regardless of what the passed summary carried
-                // (a fresh insert never inherits provenance).
-                Stored(
-                  store.StoredSummary(
-                    ..summary,
-                    meta: thread.ThreadMeta(
-                      ..summary.meta,
-                      tags_manual: [],
-                      tags_source: thread.AutoTags,
+          // thread_bot_id_fkey: a non-NULL provenance pointer must
+          // reference a stored bot (the insert-time half; the delete-time
+          // half is SET NULL, so no later guard).
+          let bot_ok = case summary.meta.bot_id {
+            None -> True
+            Some(bot_id) -> dict.has_key(state.bots, bot_id)
+          }
+          case bot_ok {
+            False -> {
+              let assert Some(bot_id) = summary.meta.bot_id
+              process.send(reply, Error("unknown bot " <> bot_id))
+              actor.continue(state)
+            }
+            True -> {
+              process.send(reply, Ok(Nil))
+              actor.continue(
+                State(
+                  ..state,
+                  threads: dict.insert(
+                    state.threads,
+                    summary.id,
+                    // insert_thread.sql: tags_manual '{}' literally and
+                    // tags_source DEFAULT 'auto' — a new row's auto path is
+                    // open, regardless of what the passed summary carried
+                    // (a fresh insert never inherits provenance).
+                    Stored(
+                      store.StoredSummary(
+                        ..summary,
+                        meta: thread.ThreadMeta(
+                          ..summary.meta,
+                          tags_manual: [],
+                          tags_source: thread.AutoTags,
+                        ),
+                      ),
+                      system_prompt,
+                      [],
+                      summary.message_count,
                     ),
                   ),
-                  system_prompt,
-                  [],
-                  summary.message_count,
+                  events: [EvInsertThread(summary.id), ..state.events],
                 ),
-              ),
-              events: [EvInsertThread(summary.id), ..state.events],
-            ),
-          )
+              )
+            }
+          }
         }
       }
 
@@ -754,12 +803,18 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
     }
 
     DeleteProvider(id, reply) -> {
-      // ON DELETE RESTRICT: the FK refuses while any thread pins the
-      // provider (the count is the registry's friendly 409 pre-check).
+      // ON DELETE RESTRICT: the FK refuses while any thread OR bot pins
+      // the provider (the counts are the registry's friendly 409
+      // pre-check's halves).
       let referenced =
         state.threads
         |> dict.values
         |> list.any(fn(stored) { stored.summary.provider_id == id })
+        || {
+          state.bots
+          |> dict.values
+          |> list.any(fn(bot) { bot.provider_id == id })
+        }
       case dict.has_key(state.providers, id), referenced {
         False, _ -> {
           process.send(reply, Ok(Nil))
@@ -782,6 +837,163 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
           )
         }
       }
+    }
+
+    // ---- bot rows (docs/plans/bots.md, Phase 1) ----
+    ListBots(reply) -> {
+      let bots =
+        state.bots
+        |> dict.values
+        |> list.sort(fn(a, b) { string.compare(a.id, b.id) })
+      process.send(reply, Ok(bots))
+      actor.continue(state)
+    }
+
+    GetBot(id, reply) ->
+      case dict.get(state.bots, id) {
+        Ok(bot) -> {
+          process.send(reply, Ok(bot))
+          actor.continue(state)
+        }
+        Error(_) -> {
+          process.send(reply, Error("no stored bot " <> id))
+          actor.continue(state)
+        }
+      }
+
+    InsertBot(bot, reply) ->
+      // bot_pkey + bot_name, like the schema's constraints; and the
+      // provider FK (RESTRICT — a bot cannot outlive its provider).
+      case
+        dict.has_key(state.bots, bot.id),
+        list.any(dict.values(state.bots), fn(existing) {
+          existing.name == bot.name
+        }),
+        dict.has_key(state.providers, bot.provider_id)
+      {
+        True, _, _ -> {
+          process.send(reply, Error("bot " <> bot.id <> " exists"))
+          actor.continue(state)
+        }
+        False, True, _ -> {
+          process.send(reply, Error("bot name " <> bot.name <> " exists"))
+          actor.continue(state)
+        }
+        False, False, False -> {
+          process.send(reply, Error("unknown provider " <> bot.provider_id))
+          actor.continue(state)
+        }
+        False, False, True -> {
+          process.send(reply, Ok(Nil))
+          actor.continue(
+            State(..state, bots: dict.insert(state.bots, bot.id, bot), events: [
+              EvInsertBot(bot.id),
+              ..state.events
+            ]),
+          )
+        }
+      }
+
+    UpdateBot(bot, reply) ->
+      case dict.get(state.bots, bot.id) {
+        // Like the SQL `update ... where id = $1`: a missing row is a
+        // silent no-op, not an error.
+        Error(_) -> {
+          process.send(reply, Ok(Nil))
+          actor.continue(state)
+        }
+        Ok(_) ->
+          // bot_name: renaming onto another bot's name is refused, like
+          // the schema's UNIQUE constraint — no state change, no event.
+          // The provider FK applies to the moved provider too.
+          case
+            list.any(dict.values(state.bots), fn(existing) {
+              existing.id != bot.id && existing.name == bot.name
+            }),
+            dict.has_key(state.providers, bot.provider_id)
+          {
+            True, _ -> {
+              process.send(reply, Error("bot name " <> bot.name <> " exists"))
+              actor.continue(state)
+            }
+            False, False -> {
+              process.send(reply, Error("unknown provider " <> bot.provider_id))
+              actor.continue(state)
+            }
+            False, True -> {
+              process.send(reply, Ok(Nil))
+              actor.continue(
+                State(
+                  ..state,
+                  bots: dict.insert(state.bots, bot.id, bot),
+                  events: [EvUpdateBot(bot.id), ..state.events],
+                ),
+              )
+            }
+          }
+      }
+
+    DeleteBot(id, reply) -> {
+      // ON DELETE SET NULL on thread.bot_id: provenance disappears, the
+      // threads keep their frozen columns — mirrored as a metadata
+      // scrub over the stored summaries.
+      case dict.has_key(state.bots, id) {
+        False -> {
+          process.send(reply, Ok(Nil))
+          actor.continue(state)
+        }
+        True -> {
+          // ON DELETE SET NULL, mirrored: every stored summary that
+          // carried this bot as provenance loses the pointer (the
+          // threads keep their frozen columns).
+          let threads =
+            dict.fold(state.threads, dict.new(), fn(acc, thread_id, stored) {
+              let updated = case stored.summary.meta.bot_id {
+                Some(bot_id) if bot_id == id ->
+                  Stored(
+                    ..stored,
+                    summary: store.StoredSummary(
+                      ..stored.summary,
+                      meta: thread.ThreadMeta(
+                        ..stored.summary.meta,
+                        bot_id: None,
+                      ),
+                    ),
+                  )
+                _ -> stored
+              }
+              dict.insert(acc, thread_id, updated)
+            })
+          process.send(reply, Ok(Nil))
+          actor.continue(
+            State(
+              ..state,
+              threads: threads,
+              bots: dict.delete(state.bots, id),
+              events: [EvDeleteBot(id), ..state.events],
+            ),
+          )
+        }
+      }
+    }
+
+    CountBotsForProvider(id, reply) -> {
+      let count =
+        state.bots
+        |> dict.values
+        |> list.filter(fn(bot) { bot.provider_id == id })
+        |> list.length
+      process.send(reply, Ok(count))
+      actor.continue(state)
+    }
+
+    Bots(reply) -> {
+      let bots =
+        state.bots
+        |> dict.values
+        |> list.sort(fn(a, b) { string.compare(a.id, b.id) })
+      process.send(reply, bots)
+      actor.continue(state)
     }
 
     Rewind(id, keep_rows, messages, reply) -> {

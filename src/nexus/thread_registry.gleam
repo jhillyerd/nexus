@@ -70,10 +70,17 @@ pub type ChildArgument {
 /// at birth. `system_prompt: None` means the global default, resolved HERE
 /// at creation — the one NULL/default resolution point, and the value the
 /// same insert persists, so hydration rebuilds a byte-identical prefix.
-/// (From the bots plan, a bot's prompt arrives explicit or None; the
-/// record grows the bot_id provenance pointer with the bots schema.)
+/// `bot_id` is the bots plan's provenance pointer (P1): the bot a
+/// create-from-bot sourced these values from, persisted onto the row and
+/// projected into summaries. Display-only — the frozen columns are the
+/// thread's truth; the bot row is never read back.
 pub type NewThread {
-  NewThread(provider_id: String, model: String, system_prompt: Option(String))
+  NewThread(
+    provider_id: String,
+    model: String,
+    system_prompt: Option(String),
+    bot_id: Option(String),
+  )
 }
 
 /// Reply payload for `Create`: a failure the HTTP layer maps onto a
@@ -535,6 +542,9 @@ fn handle_create(
                   tags_manual: [],
                   tags_source: thread.AutoTags,
                   archived: False,
+                  // Provenance only (bots plan P1): never read back — the
+                  // frozen columns above are the thread's truth.
+                  bot_id: requested.bot_id,
                   created_at: created_at,
                 )
               // Write-through: the thread row lands now, with the frozen
@@ -592,6 +602,7 @@ fn handle_create(
                   pinned: False,
                   tags: [],
                   archived: False,
+                  bot_id: requested.bot_id,
                   message_count: 1,
                   streaming: False,
                   created_at: created_at,
@@ -1434,6 +1445,7 @@ fn summarise(
     pinned: record.meta.pinned,
     tags: record.meta.tags,
     archived: record.meta.archived,
+    bot_id: record.meta.bot_id,
     message_count: status.message_count,
     streaming: status.streaming,
     created_at: record.meta.created_at,
@@ -1458,6 +1470,7 @@ fn stored_summary_as(summary: StoredSummary) -> thread.ThreadSummary {
     pinned: summary.meta.pinned,
     tags: summary.meta.tags,
     archived: summary.meta.archived,
+    bot_id: summary.meta.bot_id,
     message_count: summary.message_count,
     streaming: False,
     created_at: summary.meta.created_at,

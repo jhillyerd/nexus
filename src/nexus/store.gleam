@@ -42,6 +42,7 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import glopenai/chat.{type ChatMessage}
+import nexus/bot
 import nexus/thread
 import nexus/transcript.{type Transcript}
 
@@ -142,6 +143,13 @@ pub type MessageRow {
   )
 }
 
+/// A stored bot row — the whole bot entity, secret-free by nature (see
+/// `nexus/bot`: the stored row IS the public shape, one type shared
+/// verbatim like `thread.ThreadMeta`). `system_prompt: None` = the
+/// global default, resolved at thread CREATION, never at request time.
+pub type StoredBot =
+  bot.Bot
+
 /// Sanitized store error (already safe to log; never contains secrets).
 pub type StoreError =
   String
@@ -218,6 +226,24 @@ pub type Store {
     /// provider (the FK is the enforcement). Disabling is the
     /// reversible path.
     delete_provider: fn(String) -> Result(Nil, StoreError),
+    // ---- bot rows (docs/plans/bots.md, Phase 1) ----
+    /// Every stored bot, ordered by id (registry boot load). No
+    /// secrets: the row is the public shape.
+    list_bots: fn() -> Result(List(StoredBot), StoreError),
+    /// One stored bot. `Error` for unknown ids.
+    get_bot: fn(String) -> Result(StoredBot, StoreError),
+    /// Persist a new bot row (write-through at create). Errors on
+    /// duplicate id or name, like the schema's constraints.
+    insert_bot: fn(StoredBot) -> Result(Nil, StoreError),
+    /// Full-metadata update (the registry merges the PATCH first; the
+    /// statement is a plain replace).
+    update_bot: fn(StoredBot) -> Result(Nil, StoreError),
+    /// Hard delete. No guard: `thread.bot_id` is ON DELETE SET NULL
+    /// (provenance only), so deleting a bot orphans nothing.
+    delete_bot: fn(String) -> Result(Nil, StoreError),
+    /// Bots pointing at this provider — the provider registry's delete
+    /// guard's bot half (a store COUNT, never a bot-registry call).
+    count_bots_for_provider: fn(String) -> Result(Int, StoreError),
   )
 }
 

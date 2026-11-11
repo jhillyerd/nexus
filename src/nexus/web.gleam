@@ -23,6 +23,8 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import mist
+import nexus/bot
+import nexus/bot_registry
 import nexus/config.{type Config}
 import nexus/page
 import nexus/provider
@@ -36,16 +38,19 @@ import nexus/ui_runtime
 /// Registry-backed handler. Threads are resolved by ID at request time so
 /// HTTP traffic reaches the live actor after a registry-owned restart.
 /// `providers_name` resolves the provider registry the thread-create
-/// path validates against (multi-provider plan §11). The `/ws` route
-/// starts a dedicated component runtime per connection from these same
-/// subjects (see `nexus/ui_runtime`).
+/// path validates against (multi-provider plan §11); `bots_name` the bot
+/// registry behind `/bots` and the create-from-bot half of `POST
+/// /threads`. The `/ws` route starts a dedicated component runtime per
+/// connection from these same subjects (see `nexus/ui_runtime`).
 pub fn handler(
   cfg: Config,
   registry_name: process.Name(thread_registry.Msg),
   providers_name: process.Name(provider_registry.Msg),
+  bots_name: process.Name(bot_registry.Msg),
 ) -> fn(Request(mist.Connection)) -> Response(mist.ResponseData) {
   let registry = process.named_subject(registry_name)
   let providers = process.named_subject(providers_name)
+  let bots = process.named_subject(bots_name)
   fn(req: Request(mist.Connection)) -> Response(mist.ResponseData) {
     case req.method, request.path_segments(req) {
       Get, [] -> protected(cfg, req, fn() { page_response(cfg.ui_token) })
@@ -53,7 +58,7 @@ pub fn handler(
         protected(cfg, req, fn() { threads_response(registry, req) })
       Post, ["threads"] ->
         protected(cfg, req, fn() {
-          create_thread_response(cfg, req, registry, providers)
+          create_thread_response(cfg, req, registry, providers, bots)
         })
       Patch, ["threads", id] ->
         protected(cfg, req, fn() { patch_thread_response(req, registry, id) })
@@ -71,6 +76,15 @@ pub fn handler(
         protected(cfg, req, fn() { patch_provider_response(req, providers, id) })
       Delete, ["providers", id] ->
         protected(cfg, req, fn() { delete_provider_response(providers, id) })
+      Get, ["bots"] -> protected(cfg, req, fn() { bots_response(bots) })
+      Post, ["bots"] ->
+        protected(cfg, req, fn() { create_bot_response(req, bots, providers) })
+      Patch, ["bots", id] ->
+        protected(cfg, req, fn() {
+          patch_bot_response(req, bots, id, providers)
+        })
+      Delete, ["bots", id] ->
+        protected(cfg, req, fn() { delete_bot_response(bots, id) })
       Post, ["threads", id, "send"] ->
         protected(cfg, req, fn() {
           with_thread(registry, id, send_response(req, registry, id, _))
@@ -89,6 +103,7 @@ pub fn handler(
             req,
             registry,
             providers,
+            bots,
             thread_create.models_timeout(cfg),
           )
         })
@@ -183,17 +198,47 @@ fn create_thread_response(
   req: Request(mist.Connection),
   registry: process.Subject(thread_registry.Msg),
   providers: process.Subject(provider_registry.Msg),
+  bots: process.Subject(bot_registry.Msg),
 ) -> Response(mist.ResponseData) {
-  // Multi-provider §11: the body pins BOTH halves of the thread's
-  // identity — `provider` (id or name) and `model` (alias). There is no
-  // default provider to fall back to; both fields are required.
+  // Multi-provider §11 + bots plan P1: the body pins the thread's
+  // identity ONE of two ways — `{"provider":…, "model":…}` (both
+  // required) or `{"bot": id}` (provider/model/system prompt copied
+  // from the bot at creation). Specifying both shapes is a conflict.
   case read_create(req) {
     Error(_) -> json_response(400, err_json("unreadable body"))
     Ok(fields) ->
-      case string.trim(fields.model), string.trim(fields.provider) {
-        _, "" -> json_response(400, err_json("empty provider"))
-        "", _ -> json_response(400, err_json("empty model"))
-        trimmed_model, ident -> {
+      case fields {
+        ConflictingCreate ->
+          json_response(
+            400,
+            err_json("bot conflicts with provider/model — pick one shape"),
+          )
+        BotCreate(bot_id) ->
+          // The SHARED create-from-bot orchestration (#73/#74): resolve
+          // the bot, copy its frozen values, re-validate the alias
+          // against the provider's LIVE list, create. A stale bot alias
+          // must 400, never silently succeed.
+          case
+            thread_create.create_thread_from_bot(
+              bots,
+              providers,
+              registry,
+              thread_create.models_timeout(cfg),
+              bot_id,
+            )
+          {
+            Ok(summary) -> json_response(201, thread_summary_json(summary))
+            Error(problem) ->
+              json_response(
+                create_problem_status(problem),
+                err_json(thread_create.describe(problem)),
+              )
+          }
+        PlainCreate(provider: "", model: _) ->
+          json_response(400, err_json("empty provider"))
+        PlainCreate(provider: _, model: "") ->
+          json_response(400, err_json("empty model"))
+        PlainCreate(provider: ident, model: trimmed_model) -> {
           // The shared orchestration (#73): provider resolution + live
           // model-alias validation outside the registry's loop, then the
           // create. The reply IS the summary — this layer never
@@ -202,9 +247,10 @@ fn create_thread_response(
             thread_registry.NewThread(
               provider_id: ident,
               model: trimmed_model,
-              // POST /threads pins the config default today; the bots
-              // plan's create-from-bot sends the bot's prompt here.
+              // POST /threads pins the config default; a bot-sourced
+              // create arrives through the BotCreate arm above instead.
               system_prompt: None,
+              bot_id: None,
             )
           case
             thread_create.create_thread(
@@ -236,6 +282,8 @@ fn create_problem_status(problem: thread_create.CreateProblem) -> Int {
     thread_create.ProviderDisabled(_) -> 400
     thread_create.ModelsUnavailable -> 502
     thread_create.ModelUnknown(_) -> 400
+    thread_create.BotsUnavailable -> 502
+    thread_create.BotUnknown(_) -> 400
     // Post-validation registry refusals are races: the provider passed
     // the live check, then could not stream when the thread pinned it.
     thread_create.CreateFailed(thread_registry.EmptyModel) -> 400
@@ -248,16 +296,44 @@ fn read_json(req: Request(mist.Connection)) -> Result(String, Nil) {
   read_body_json(req, text_decoder())
 }
 
-/// The POST /threads body: `{"provider": …, "model": …}` (both
-/// required — a thread always pins its provider explicitly).
+/// The POST /threads body, already split into its two shapes (bots plan
+/// P1): `PlainCreate(provider, model)` (both required — a thread always
+/// pins its provider explicitly) or `BotCreate(bot)` (provider/model/
+/// system prompt copied from the bot at creation). `bot` alongside
+/// `provider`/`model` is a conflict — the bot's frozen values must not
+/// be quietly overridden.
 pub type CreateFields {
-  CreateFields(provider: String, model: String)
+  PlainCreate(provider: String, model: String)
+  BotCreate(bot: String)
+  /// `bot` alongside `provider` and/or `model` — the shapes cannot both
+  /// be honored, and quietly preferring one would freeze values the
+  /// caller may not expect.
+  ConflictingCreate
 }
 
 pub fn create_fields_decoder() -> decode.Decoder(CreateFields) {
-  use provider_id <- decode.field("provider", decode.string)
-  use model <- decode.field("model", decode.string)
-  decode.success(CreateFields(provider: provider_id, model: model))
+  use provider <- decode.optional_field(
+    "provider",
+    None,
+    decode.optional(decode.string),
+  )
+  use model <- decode.optional_field(
+    "model",
+    None,
+    decode.optional(decode.string),
+  )
+  use bot <- decode.optional_field("bot", None, decode.optional(decode.string))
+  decode.success(
+    case
+      string.trim(option.unwrap(bot, "")),
+      string.trim(option.unwrap(provider, "")),
+      string.trim(option.unwrap(model, ""))
+    {
+      "", provider, model -> PlainCreate(provider:, model:)
+      bot, "", "" -> BotCreate(bot)
+      _, _, _ -> ConflictingCreate
+    },
+  )
 }
 
 pub fn parse_create_json(body: String) -> Result(CreateFields, Nil) {
@@ -356,6 +432,126 @@ pub fn parse_provider_patch_json(
 ) -> Result(ProviderPatchFields, Nil) {
   json.parse(body, using: provider_patch_fields_decoder())
   |> result.map_error(fn(_) { Nil })
+}
+
+/// The POST /bots body: `{"name":…, "provider":…, "model":…,
+/// "description":…?, "system_prompt":…?}` — name/provider/model are
+/// required; a blank or absent `system_prompt` is the global default;
+/// a blank description is "".
+pub type BotCreateFields {
+  BotCreateFields(
+    name: String,
+    description: String,
+    provider_id: String,
+    model: String,
+    system_prompt: Option(String),
+  )
+}
+
+pub fn bot_create_fields_decoder() -> decode.Decoder(BotCreateFields) {
+  use name <- decode.field("name", decode.string)
+  use description <- decode.optional_field("description", "", decode.string)
+  use provider_id <- decode.field("provider", decode.string)
+  use model <- decode.field("model", decode.string)
+  use system_prompt <- decode.optional_field(
+    "system_prompt",
+    None,
+    decode.optional(decode.string),
+  )
+  decode.success(BotCreateFields(
+    name: name,
+    description: description,
+    provider_id: provider_id,
+    model: model,
+    system_prompt: system_prompt,
+  ))
+}
+
+pub fn parse_bot_create_json(body: String) -> Result(BotCreateFields, Nil) {
+  json.parse(body, using: bot_create_fields_decoder())
+  |> result.map_error(fn(_) { Nil })
+}
+
+fn read_bot_create(
+  req: Request(mist.Connection),
+) -> Result(BotCreateFields, Nil) {
+  case mist.read_body(req, max_body_limit: 1_000_000) {
+    Error(_) -> Error(Nil)
+    Ok(read) ->
+      case bit_array.to_string(read.body) {
+        Error(_) -> Error(Nil)
+        Ok(body) -> parse_bot_create_json(body)
+      }
+  }
+}
+
+/// The PATCH /bots/<id> body: present fields replace, absent keep. Two
+/// field classes (see `bot.BotUpdate`): a BLANK present `name`/`model`
+/// keeps the stored value (normalized away here), while a present
+/// `description`/`system_prompt` always replaces (blank CLEARS — back
+/// to "" and back to the default prompt), so absent-vs-blank must stay
+/// distinguishable for exactly those two fields.
+pub type BotPatchFields {
+  BotPatchFields(
+    name: Option(String),
+    description: Option(String),
+    provider_id: Option(String),
+    model: Option(String),
+    system_prompt: Option(String),
+  )
+}
+
+pub fn bot_patch_fields_decoder() -> decode.Decoder(BotPatchFields) {
+  use name <- decode.optional_field(
+    "name",
+    None,
+    decode.optional(decode.string),
+  )
+  use description <- decode.optional_field(
+    "description",
+    None,
+    decode.optional(decode.string),
+  )
+  use provider_id <- decode.optional_field(
+    "provider",
+    None,
+    decode.optional(decode.string),
+  )
+  use model <- decode.optional_field(
+    "model",
+    None,
+    decode.optional(decode.string),
+  )
+  use system_prompt <- decode.optional_field(
+    "system_prompt",
+    None,
+    decode.optional(decode.string),
+  )
+  decode.success(BotPatchFields(
+    name: blank_as_none(name),
+    description: description,
+    provider_id: blank_as_none(provider_id),
+    model: blank_as_none(model),
+    system_prompt: system_prompt,
+  ))
+}
+
+pub fn parse_bot_patch_json(body: String) -> Result(BotPatchFields, Nil) {
+  json.parse(body, using: bot_patch_fields_decoder())
+  |> result.map_error(fn(_) { Nil })
+}
+
+fn read_bot_patch(
+  req: Request(mist.Connection),
+) -> Result(BotPatchFields, Nil) {
+  case mist.read_body(req, max_body_limit: 1_000_000) {
+    Error(_) -> Error(Nil)
+    Ok(read) ->
+      case bit_array.to_string(read.body) {
+        Error(_) -> Error(Nil)
+        Ok(body) -> parse_bot_patch_json(body)
+      }
+  }
 }
 
 fn read_provider_patch(
@@ -578,6 +774,169 @@ fn registry_error_response(
   error: provider_registry.RegistryError,
 ) -> Response(mist.ResponseData) {
   let #(status, message) = registry_error_fields(error)
+  json_response(status, err_json(message))
+}
+
+// ---------------------------------------------------------------------------
+// Bot routes (bots plan P1)
+// ---------------------------------------------------------------------------
+
+/// All bots, name-then-id sorted (the registry's order).
+fn bots_response(
+  bots: process.Subject(bot_registry.Msg),
+) -> Response(mist.ResponseData) {
+  case bot_registry.list_bots(bots) {
+    Ok(all) -> json_response(200, bots_json(all))
+    Error(error) -> bot_error_response(error)
+  }
+}
+
+/// Create: decode, validate `provider_id` against the provider registry
+/// THIS LAYER already holds (the friendly 400 — the bot registry never
+/// resolves providers; the FK is the backstop), then hand off.
+fn create_bot_response(
+  req: Request(mist.Connection),
+  bots: process.Subject(bot_registry.Msg),
+  providers: process.Subject(provider_registry.Msg),
+) -> Response(mist.ResponseData) {
+  case read_bot_create(req) {
+    Error(_) -> json_response(400, err_json("unreadable body"))
+    Ok(fields) ->
+      case resolve_bot_provider(providers, string.trim(fields.provider_id)) {
+        None -> json_response(400, err_json("unknown provider"))
+        Some(provider_id) ->
+          case
+            bot_registry.create_bot(
+              bots,
+              bot.BotParams(
+                name: fields.name,
+                description: fields.description,
+                provider_id: provider_id,
+                model: fields.model,
+                system_prompt: fields.system_prompt,
+              ),
+            )
+          {
+            Ok(created) -> json_response(201, bot_json(created))
+            Error(error) -> bot_error_response(error)
+          }
+      }
+  }
+}
+
+/// PATCH: present fields replace, absent keep. A present `provider_id`
+/// (a PATCH can move a bot between providers) is validated like the
+/// create's.
+fn patch_bot_response(
+  req: Request(mist.Connection),
+  bots: process.Subject(bot_registry.Msg),
+  id: String,
+  providers: process.Subject(provider_registry.Msg),
+) -> Response(mist.ResponseData) {
+  case read_bot_patch(req) {
+    Error(_) -> json_response(400, err_json("unreadable body"))
+    Ok(fields) -> {
+      let patch =
+        bot.BotUpdate(
+          name: fields.name,
+          description: fields.description,
+          provider_id: fields.provider_id,
+          model: fields.model,
+          system_prompt: fields.system_prompt,
+        )
+      case bot.empty_update(patch) {
+        True -> json_response(400, err_json("empty patch"))
+        False ->
+          // A present provider_id (a PATCH can move a bot between
+          // providers) is validated and canonicalized like the create's.
+          case fields.provider_id {
+            Some(ident) ->
+              case resolve_bot_provider(providers, string.trim(ident)) {
+                None -> json_response(400, err_json("unknown provider"))
+                Some(provider_id) ->
+                  apply_bot_patch(
+                    bots,
+                    id,
+                    bot.BotUpdate(..patch, provider_id: Some(provider_id)),
+                  )
+              }
+            None -> apply_bot_patch(bots, id, patch)
+          }
+      }
+    }
+  }
+}
+
+fn apply_bot_patch(
+  bots: process.Subject(bot_registry.Msg),
+  id: String,
+  patch: bot.BotUpdate,
+) -> Response(mist.ResponseData) {
+  case bot_registry.update_bot(bots, id, patch) {
+    Ok(updated) -> json_response(200, bot_json(updated))
+    Error(error) -> bot_error_response(error)
+  }
+}
+
+fn delete_bot_response(
+  bots: process.Subject(bot_registry.Msg),
+  id: String,
+) -> Response(mist.ResponseData) {
+  case bot_registry.delete_bot(bots, id) {
+    // Unguarded by design: threads carry ON DELETE SET NULL provenance,
+    // so deleting a bot orphans nothing.
+    Ok(Nil) ->
+      response.new(204) |> response.set_body(mist.Bytes(bytes_tree.new()))
+    Error(error) -> bot_error_response(error)
+  }
+}
+
+/// Friendly provider existence check against the registry this layer
+/// already holds (the no-cross-registry-edge rule: validation lives with
+/// the CALLER, the FK is the backstop). Like `POST /threads`, the
+/// identifier may be an id or a name — the id checked first — but
+/// unlike a thread create, a DISABLED provider is acceptable (a bot is
+/// a template, not a runtime pin: it only blocks NEW threads, and
+/// re-aiming the bot is the cure). Returns the CANONICAL id, or `None`
+/// when no provider matches (also covering an unreachable registry —
+/// the honest 400 beats a 502 here because the FK backstop would
+/// refuse the write anyway).
+fn resolve_bot_provider(
+  providers: process.Subject(provider_registry.Msg),
+  ident: String,
+) -> Option(String) {
+  case provider_registry.list_providers(providers) {
+    Error(_) -> None
+    Ok(all) -> {
+      let found = case list.find(all, fn(p) { p.id == ident }) {
+        Ok(by_id) -> Ok(by_id)
+        Error(_) -> list.find(all, fn(p) { p.name == ident })
+      }
+      case found {
+        Ok(found) -> Some(found.id)
+        Error(_) -> None
+      }
+    }
+  }
+}
+
+/// The bot registry's closed error vocabulary onto status codes —
+/// mapped exactly like `registry_error_fields`.
+pub fn bot_error_fields(error: bot_registry.RegistryError) -> #(Int, String) {
+  let status = case error {
+    bot_registry.Unknown -> 404
+    bot_registry.InvalidName -> 400
+    bot_registry.InvalidModel -> 400
+    bot_registry.DuplicateName -> 409
+    bot_registry.StoreFailed(_) -> 502
+  }
+  #(status, bot_registry.describe(error))
+}
+
+fn bot_error_response(
+  error: bot_registry.RegistryError,
+) -> Response(mist.ResponseData) {
+  let #(status, message) = bot_error_fields(error)
   json_response(status, err_json(message))
 }
 
@@ -840,6 +1199,31 @@ pub fn providers_json(all: List(provider.Provider)) -> Json {
   json.object([#("providers", json.array(all, provider_json))])
 }
 
+pub fn bots_json(all: List(bot.Bot)) -> Json {
+  json.object([#("bots", json.array(all, bot_json))])
+}
+
+/// The bot wire shape. No masked twin — bots carry no secrets, so the
+/// row IS the public shape (`nexus/bot`). Every field is hostile text
+/// on the client side.
+pub fn bot_json(b: bot.Bot) -> Json {
+  json.object([
+    #("id", json.string(b.id)),
+    #("name", json.string(b.name)),
+    #("description", json.string(b.description)),
+    #("provider_id", json.string(b.provider_id)),
+    #("model", json.string(b.model)),
+    #("system_prompt", case b.system_prompt {
+      Some(prompt) -> json.string(prompt)
+      None -> json.null()
+    }),
+    #("created_at", json.int(b.created_at)),
+    #("created_at_rfc3339", json.string(timing.wall_to_rfc3339(b.created_at))),
+    #("updated_at", json.int(b.updated_at)),
+    #("updated_at_rfc3339", json.string(timing.wall_to_rfc3339(b.updated_at))),
+  ])
+}
+
 /// Masked provider wire shape: `has_key` is the only key fact on the
 /// wire — structurally incapable of carrying key material (the masked
 /// record does not contain it).
@@ -876,6 +1260,12 @@ pub fn thread_summary_json(summary: thread.ThreadSummary) -> Json {
     #("pinned", json.bool(summary.pinned)),
     #("tags", json.array(summary.tags, json.string)),
     #("archived", json.bool(summary.archived)),
+    // Provenance (bots plan P1): the bot this thread was created from,
+    // null for a plain create. Display-only — never a request byte.
+    #("bot_id", case summary.bot_id {
+      Some(bot_id) -> json.string(bot_id)
+      None -> json.null()
+    }),
     #("message_count", json.int(summary.message_count)),
     #("streaming", json.bool(summary.streaming)),
     // Epoch ints are what clients sort and bucket on; the RFC3339 twin is
@@ -909,6 +1299,7 @@ pub fn requires_auth(method: Method, segments: List(String)) -> Bool {
     | Get, ["threads"]
     | Get, ["providers"]
     | Get, ["providers", _, "models"]
+    | Get, ["bots"]
     | Get, ["lustre", "runtime.mjs"]
     | Get, ["css", "pico.min.css"]
     | Get, ["ws"]
@@ -917,11 +1308,14 @@ pub fn requires_auth(method: Method, segments: List(String)) -> Bool {
     | Post, ["threads", _, "send"]
     | Post, ["threads", _, "stop"]
     | Post, ["providers"]
+    | Post, ["bots"]
     -> True
     Patch, ["threads", _]
     | Delete, ["threads", _]
     | Patch, ["providers", _]
     | Delete, ["providers", _]
+    | Patch, ["bots", _]
+    | Delete, ["bots", _]
     -> True
     _, _ -> False
   }
