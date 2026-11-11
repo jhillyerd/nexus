@@ -33,6 +33,7 @@ fn new_model() -> ui.Model {
     ui.init(ui.Flags(
       registry: process.new_subject(),
       providers: process.new_subject(),
+      models_timeout_ms: 60_000,
       thread: None,
     ))
   model
@@ -45,6 +46,7 @@ fn new_model_with_thread(id: Option(String)) -> ui.Model {
     ui.init(ui.Flags(
       registry: process.new_subject(),
       providers: process.new_subject(),
+      models_timeout_ms: 60_000,
       thread: id,
     ))
   model
@@ -2696,8 +2698,7 @@ pub fn meta_updated_refreshes_sidebar_test() {
   let assert Ok(record) =
     thread_registry.create_with_runner(
       registry,
-      store_mock.fixture_provider_id,
-      "alias-1",
+      new_thread(store_mock.fixture_provider_id, "alias-1"),
       unused_turn_runner,
     )
   should.be_true(thread_registry.auto_title(registry, record.id, "Before"))
@@ -2707,7 +2708,12 @@ pub fn meta_updated_refreshes_sidebar_test() {
   let assert Ok(runtime) =
     lustre.start_server_component(
       ui_runtime.app(),
-      ui.Flags(registry: registry, providers: providers, thread: None),
+      ui.Flags(
+        registry: registry,
+        providers: providers,
+        models_timeout_ms: 60_000,
+        thread: None,
+      ),
     )
   let client = process.new_subject()
   server_component.register_subject(client)
@@ -2815,14 +2821,22 @@ pub fn send_moves_previous_day_row_into_today_immediately_test() {
   // A today thread, so the Today bucket exists before the send: the old
   // row must move INTO it, jumping above it by recency.
   let assert Ok(_today) =
-    thread_registry.create(registry, store_mock.fixture_provider_id, "alias-1")
+    thread_registry.create(
+      registry,
+      new_thread(store_mock.fixture_provider_id, "alias-1"),
+    )
 
   // The connection re-opens the previous-day thread (the /ws route's
   // persisted selection).
   let assert Ok(runtime) =
     lustre.start_server_component(
       ui_runtime.app(),
-      ui.Flags(registry: registry, providers: providers, thread: Some("s-old")),
+      ui.Flags(
+        registry: registry,
+        providers: providers,
+        models_timeout_ms: 60_000,
+        thread: Some("s-old"),
+      ),
     )
   let client = process.new_subject()
   server_component.register_subject(client)
@@ -2896,7 +2910,12 @@ pub fn connect_with_configured_provider_never_notes_no_provider_test() {
   let assert Ok(runtime) =
     lustre.start_server_component(
       ui_runtime.app(),
-      ui.Flags(registry: registry, providers: providers, thread: None),
+      ui.Flags(
+        registry: registry,
+        providers: providers,
+        models_timeout_ms: 60_000,
+        thread: None,
+      ),
     )
   let client = process.new_subject()
   server_component.register_subject(client)
@@ -3020,16 +3039,27 @@ pub fn thread_switch_drops_left_thread_stream_test() {
   let registry = started_registry.data
 
   let assert Ok(a) =
-    thread_registry.create(registry, store_mock.fixture_provider_id, "smart")
+    thread_registry.create(
+      registry,
+      new_thread(store_mock.fixture_provider_id, "smart"),
+    )
   let assert Ok(b) =
-    thread_registry.create(registry, store_mock.fixture_provider_id, "smart")
+    thread_registry.create(
+      registry,
+      new_thread(store_mock.fixture_provider_id, "smart"),
+    )
 
   // The connection boots bound to thread A (the /ws route's persisted
   // selection), exactly like a reload into a streaming thread.
   let assert Ok(runtime) =
     lustre.start_server_component(
       ui_runtime.app(),
-      ui.Flags(registry: registry, providers: providers, thread: Some(a.id)),
+      ui.Flags(
+        registry: registry,
+        providers: providers,
+        models_timeout_ms: 60_000,
+        thread: Some(a.id),
+      ),
     )
   let client = process.new_subject()
   server_component.register_subject(client)
@@ -3095,12 +3125,20 @@ pub fn meta_updated_from_other_thread_refreshes_sidebar_test() {
   let registry = started_registry.data
 
   let assert Ok(a) =
-    thread_registry.create(registry, store_mock.fixture_provider_id, "smart")
+    thread_registry.create(
+      registry,
+      new_thread(store_mock.fixture_provider_id, "smart"),
+    )
 
   let assert Ok(runtime) =
     lustre.start_server_component(
       ui_runtime.app(),
-      ui.Flags(registry: registry, providers: providers, thread: Some(a.id)),
+      ui.Flags(
+        registry: registry,
+        providers: providers,
+        models_timeout_ms: 60_000,
+        thread: Some(a.id),
+      ),
     )
   let client = process.new_subject()
   server_component.register_subject(client)
@@ -3147,6 +3185,16 @@ fn fixture_resolver() -> thread_registry.ResolveProvider {
 
 /// Config for the real registries: valid key material (the provider
 /// registry decrypt-validates at boot), otherwise test defaults.
+/// The common creation request shape: pin provider + model,
+/// config-default prompt.
+fn new_thread(provider_id: String, model: String) -> thread_registry.NewThread {
+  thread_registry.NewThread(
+    provider_id: provider_id,
+    model: model,
+    system_prompt: None,
+  )
+}
+
 fn test_config() -> config.Config {
   config.Config(
     encryption_key: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",

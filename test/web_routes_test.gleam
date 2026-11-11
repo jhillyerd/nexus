@@ -237,15 +237,33 @@ fn unwrap(value: Result(String, Nil)) -> String {
   }
 }
 
-pub fn patch_delete_and_archive_routes_test() {
-  let #(registry, port) = start_server()
-  let assert Ok(record) =
+/// A create for route tests: the summary's id plus the live subject
+/// (resolved through the registry — the create reply is a ThreadSummary).
+type Created {
+  Created(id: String, subject: process.Subject(thread.Msg))
+}
+
+fn create(
+  registry: process.Subject(thread_registry.Msg),
+  model: String,
+) -> Created {
+  let assert Ok(summary) =
     thread_registry.create_with_runner(
       registry,
-      store_mock.fixture_provider_id,
-      "alpha",
+      thread_registry.NewThread(
+        provider_id: store_mock.fixture_provider_id,
+        model: model,
+        system_prompt: None,
+      ),
       happy_runner,
     )
+  let assert Ok(subject) = thread_registry.get(registry, summary.id)
+  Created(id: summary.id, subject: subject)
+}
+
+pub fn patch_delete_and_archive_routes_test() {
+  let #(registry, port) = start_server()
+  let record = create(registry, "alpha")
 
   // ---- auth gates the new routes --------------------------------------
   // A PATCH without the token never reaches the handler.

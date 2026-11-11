@@ -321,19 +321,36 @@ fn restart_vm(booted: Boot) -> Nil {
   process.sleep(100)
 }
 
+/// What a create hands the tests: the fresh summary's id plus the live
+/// actor's subject (resolved through the registry — the create reply is a
+/// `ThreadSummary` now, and subjects are always fetched via `Get`).
+type Created {
+  Created(id: String, subject: Subject(thread.Msg))
+}
+
 fn create(
   registry: Subject(thread_registry.Msg),
   model: String,
   runner: thread.TurnRunner,
-) -> thread_registry.ThreadRecord {
-  let assert Ok(record) =
+) -> Created {
+  let assert Ok(summary) =
     thread_registry.create_with_runner(
       registry,
-      store_mock.fixture_provider_id,
-      model,
+      new_thread(store_mock.fixture_provider_id, model),
       runner,
     )
-  record
+  let assert Ok(subject) = thread_registry.get(registry, summary.id)
+  Created(id: summary.id, subject: subject)
+}
+
+/// The common creation request shape: pin provider + model,
+/// config-default prompt.
+fn new_thread(provider_id: String, model: String) -> thread_registry.NewThread {
+  thread_registry.NewThread(
+    provider_id: provider_id,
+    model: model,
+    system_prompt: None,
+  )
 }
 
 /// Run one turn and wait for its commit to land in the store.

@@ -44,6 +44,7 @@ import lustre/server_component
 import nexus/provider.{type Provider}
 import nexus/provider_registry
 import nexus/thread.{type ThreadEvent}
+import nexus/thread_create
 import nexus/thread_registry
 import nexus/timing
 import nexus/ui/markdown
@@ -52,6 +53,11 @@ import nexus/ui_settings
 /// Everything the component needs to talk to the rest of the app. The
 /// registry subjects are resolved from their names at boot and stay
 /// stable across component restarts.
+///
+/// `models_timeout_ms` is the shared live-model budget
+/// (`thread_create.models_timeout`): the ONE `list_models` timeout rule,
+/// used by both the picker reload and the create path — never a
+/// per-surface constant.
 ///
 /// `thread` is the client-supplied last-selected thread (the `/ws`
 /// route's `thread` query parameter, persisted by the page shell): each
@@ -62,6 +68,7 @@ pub type Flags {
   Flags(
     registry: Subject(thread_registry.Msg),
     providers: Subject(provider_registry.Msg),
+    models_timeout_ms: Int,
     thread: Option(String),
   )
 }
@@ -187,6 +194,10 @@ pub type Model {
   Model(
     providers: Subject(provider_registry.Msg),
     registry: Subject(thread_registry.Msg),
+    /// The shared live-model budget (`thread_create.models_timeout`):
+    /// every list_models call this connection makes — the picker reload
+    /// AND the create path's alias validation — uses it.
+    models_timeout_ms: Int,
     // Long-lived subscription to the selected thread's events, owned by
     // this connection's runtime (one runtime per /ws client since the
     // per-client break; a reload is a new subject, and the thread actor
@@ -483,6 +494,7 @@ pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
     Model(
       providers: flags.providers,
       registry: flags.registry,
+      models_timeout_ms: flags.models_timeout_ms,
       events: None,
       provider: None,
       provider_list: [],
@@ -1742,8 +1754,9 @@ fn first_alias(model: Model, aliases: List(String)) -> String {
 /// runs off the registry's loop (see provider_registry `ListModels`).
 fn aliases_for(model: Model, provider_id: String) -> Effect(Msg) {
   let providers = model.providers
+  let timeout = model.models_timeout_ms
   effect.from(fn(dispatch) {
-    case provider_registry.list_models(providers, provider_id, 60_000) {
+    case provider_registry.list_models(providers, provider_id, timeout) {
       Ok(aliases) -> dispatch(AliasesLoaded(provider_id, aliases))
       Error(_) -> dispatch(AliasesFailed)
     }
@@ -1897,55 +1910,39 @@ fn stop_effect(model: Model) -> Effect(Msg) {
 
 fn create_effect(model: Model, alias: String) -> Effect(Msg) {
   let registry = model.registry
+  let providers = model.providers
+  let timeout = model.models_timeout_ms
   effect.from(fn(dispatch) {
     // The registry builds the M3 agent-loop runner itself, from the tool
     // registry frozen at its boot — threads created here get the full
     // toolset, pinned to the create panel's selected provider + model
     // (multi-provider §8: the pin is explicit, never defaulted).
-    let create = case model.provider {
-      Some(provider_id) -> thread_registry.create(registry, provider_id, alias)
-      None ->
-        Error(thread_registry.ProviderFailed(thread_registry.ProviderUnknown))
-    }
-    case create {
-      Ok(record) -> {
-        let now = timing.wall_now_s()
-        dispatch(
-          Created(
-            thread.ThreadSummary(
-              id: record.id,
-              provider_id: option.unwrap(model.provider, ""),
-              model: record.model,
-              title: "",
-              title_source: thread.AutoTitle,
-              pinned: False,
-              tags: [],
-              archived: False,
-              message_count: 0,
-              streaming: False,
-              created_at: now,
-              last_active_at: now,
-              metrics: [],
-            ),
-          ),
-        )
+    //
+    // The SHARED orchestration (#73): provider resolution + live
+    // model-alias validation outside the registry's loop — the UI used to
+    // skip the check, silently accepting a stale alias. The reply IS the
+    // summary; this component never hand-builds one.
+    case model.provider {
+      None -> dispatch(CreateFailed("no provider configured"))
+      Some(provider_id) -> {
+        let requested =
+          thread_registry.NewThread(
+            provider_id: provider_id,
+            model: alias,
+            // The create panel pins the config default today; the bots
+            // plan's start-from-bot sends the bot's prompt here.
+            system_prompt: None,
+          )
+        case
+          thread_create.create_thread(providers, registry, timeout, requested)
+        {
+          Ok(summary) -> dispatch(Created(summary))
+          Error(problem) ->
+            dispatch(CreateFailed(thread_create.describe(problem)))
+        }
       }
-      Error(thread_registry.EmptyModel) -> dispatch(CreateFailed("empty model"))
-      Error(thread_registry.ProviderFailed(reason)) ->
-        dispatch(CreateFailed(describe_provider_error(reason)))
-      Error(thread_registry.StartFailed(reason)) ->
-        dispatch(CreateFailed(reason))
     }
   })
-}
-
-/// Fixed text for a provider resolution failure on the create path.
-fn describe_provider_error(reason: thread_registry.ProviderError) -> String {
-  case reason {
-    thread_registry.ProviderUnknown -> "no provider configured"
-    thread_registry.ProviderDisabled -> "provider is disabled"
-    thread_registry.ProviderKeyUnavailable -> "provider key unavailable"
-  }
 }
 
 /// Run one registry metadata mutation, then refresh the thread list so
