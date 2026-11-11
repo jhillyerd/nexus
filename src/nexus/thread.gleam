@@ -360,10 +360,14 @@ pub type ThreadMeta {
     /// manual rename pins the title forever.
     title_source: TitleSource,
     pinned: Bool,
-    /// The display union (auto ∪ manual). Normalized on write through
-    /// the ONE shared rule (`utility.normalize_tags`): trimmed,
-    /// lowercased, kebab-cased, empties and duplicates dropped, each tag
-    /// capped at 24 characters.
+    /// The display union (auto ∪ manual). Manual saves are normalized
+    /// on write through the ONE shared rule (`utility.normalize_tags`):
+    /// trimmed, lowercased, kebab-cased, empties and duplicates dropped,
+    /// each tag capped at 24 characters. Auto merges
+    /// (`utility.merge_tags`) deliberately pass existing entries through
+    /// VERBATIM — a legacy `Work Notes` stays — and normalize only the
+    /// newly appended model tags, so the union's spellings are not all
+    /// guaranteed canonical.
     tags: List(String),
     /// The user's exact (normalized) set — the manual half of the
     /// display union (utility-tags plan §3.4): `tags − tags_manual` is

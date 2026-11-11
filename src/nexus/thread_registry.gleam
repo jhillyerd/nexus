@@ -522,8 +522,10 @@ fn handle_create(
             Ok(started) -> {
               let created_at = timing.wall_now_s()
               // The organizational block, built ONCE and shared by the
-              // stored row, the live record, and the reply summary
-              // (issue #75): "" title, open auto paths, unlisted.
+              // stored row and the live record (issue #75) — the reply
+              // summary below only projects the same VALUES into the
+              // deliberately flat `ThreadSummary`. "" title, open auto
+              // paths, unlisted.
               let meta =
                 thread.ThreadMeta(
                   title: "",
