@@ -19,7 +19,12 @@ import { createServer } from "node:http";
 /// registry/store both-provenance guard must refuse the late model apply
 /// (the freeze test) — the plain happy path just applies after it. Well
 /// under the server's SSE idle timeout, so the held stream never trips it.
-export const UTILITY_REPLY_DELAY_MS = 4000;
+// Held long enough to cover organize's post-turn steps (rename + tags
+// save, ~seconds) so the freeze race is genuinely staged, and short
+// enough that the freeze test's sleep + the chips test's polls stay
+// quick. Raise it if a run ever records a manual save AFTER the reply
+// completed (the freeze test fails loudly on exactly that).
+export const UTILITY_REPLY_DELAY_MS = 15000;
 
 export function startServices() {
   return new Promise((resolve, reject) => {

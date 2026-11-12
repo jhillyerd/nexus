@@ -47,6 +47,12 @@ const results = [];
 let current = null;
 // Hoisted so failure diagnostics (dumpPageState) can reach the live page.
 let page = null;
+
+// When organize's manual tags save landed (wall clock). The freeze test
+// below needs the REAL save moment to prove it beat the held utility
+// reply — observing it from that test instead would measure everything
+// organize does in between (pin, archive, restore polls), not the save.
+let manualSavedAt = 0;
 // Every page the suite opens contributes here; the final test asserts it
 // is empty. A pageerror means a shell script or the runtime threw in the
 // browser — exactly the class of bug (an undefined function left behind
@@ -478,12 +484,15 @@ async function main() {
         (await page.getAttribute("#input", "disabled")) !== null,
         "composer disabled without a thread",
       );
-      // ui-polish F5: an empty transcript renders an intentional muted
-      // hint, not a blank void.
+      // ui-polish F5 + the #67 no-selection state: with nothing selected
+      // the composer is disabled, so the intentional muted hint points at
+      // the sidebar, not at a send that would fail. (A selected-but-empty
+      // thread gets the send-pointing variant instead — asserted nowhere
+      // here because this test deliberately mints nothing.)
       await poll(
         async () =>
           (await page.locator("#log .note").textContent()).includes(
-            "Send a message to start",
+            "No thread selected",
           ),
         { timeout: 15_000, message: "empty-state note" },
       );
@@ -671,6 +680,11 @@ async function main() {
         timeout: 10_000,
         message: "two tag chips",
       });
+      // Freeze-race premise saved: the utility reply for this thread's
+      // first exchange is still held at the fake (UTILITY_REPLY_DELAY_MS),
+      // so this is the moment the manual columns flipped while the apply
+      // was in flight. The freeze test below asserts against it.
+      manualSavedAt = Date.now();
 
       // Chip click filters the list; the clear button brings rows back.
       await smartRow.locator(".tag-chip", { hasText: "ops" }).first().click();
@@ -733,10 +747,27 @@ async function main() {
         timeout: 10_000,
         message: "restored row back in the list",
       });
+      // #67 contract: archiving the OPEN thread deliberately deselects
+      // (`deselect` + sticky `suppress_autoselect`) and restoring does not
+      // re-select — the chat pane stays blank until a row is picked. Pin
+      // that contract here, then re-select the restored thread: the
+      // always-visible selected-row controls (and every later test's
+      // composer) come back with the pick.
+      eq(await selectedId(page), "", "archive-of-selection cleared the selection");
+      assert(
+        (await page.getAttribute("#input", "disabled")) !== null,
+        "composer disabled after the archive-deselect",
+      );
+      await smartRow.locator(".thread-main").click();
+      await poll(
+        () =>
+          page
+            .locator("#model")
+            .evaluate((el) => el.textContent === "Renamed thread"),
+        { timeout: 10_000, message: "re-selected the restored thread" },
+      );
       // Restored threads are active again: the pin control is back (the
-      // pin itself stays cleared until re-pinned). Reveal first — the
-      // restored row is neither selected nor hovered yet.
-      await revealRowControls(smartRow);
+      // pin itself stays cleared until re-pinned).
       await poll(
         async () =>
           await smartRow.getByRole("button", { name: "Pin", exact: true }).isVisible(),
@@ -779,28 +810,17 @@ async function main() {
           ).length >= 1,
         { timeout: 15_000, message: "utility branch request recorded" },
       );
-      // The premise must be OBSERVED, not assumed: poll the API until
-      // both manual saves are visible (the tags save is the later one)
-      // and remember WHEN. That timestamp must beat the held reply's
-      // completion — proving the freeze was really in place while the
-      // apply was still in flight; if a run ever loses that race, fail
-      // here rather than passing vacuously afterwards.
-      const manualAt = await poll(
-        async () => {
-          const s = (
-            await (await page.request.get(`${base}/threads`, { headers })).json()
-          ).threads.find((x) => x.model === "smart");
-          return s &&
-            s.title_source === "manual" &&
-            s.title === "Renamed thread" &&
-            s.tags.join(",") === "ops,infra"
-            ? Date.now()
-            : false;
-        },
-        {
-          timeout: 15_000,
-          message: "manual title + tags saved while the reply is held",
-        },
+      // The premise was OBSERVED in organize: `manualSavedAt` is when the
+      // manual tags save poll completed — the tags save is the later of
+      // the two saves — while the held reply was still in flight. That
+      // timestamp must beat the held reply's completion — proving the
+      // freeze was really in place while the apply was still in flight;
+      // if a run ever loses that race, fail here rather than passing
+      // vacuously afterwards.
+      const manualAt = manualSavedAt;
+      assert(
+        manualAt > 0,
+        "organize did not record the manual save time",
       );
       // Outlast the held reply plus the worker's parse/apply.
       await sleep(UTILITY_REPLY_DELAY_MS + 2000);
@@ -1031,6 +1051,25 @@ async function main() {
           },
           { timeout: 10_000, message: "#log overflows at the shrunk pane height" },
         );
+        // A single sample can interleave with the observer's pin right as
+        // the content first overflows, so sample until the follow holds;
+        // a genuinely dead follow never recovers and the asserts below
+        // fail with the last sampled state.
+        await poll(
+          async () => {
+            follow = await page.evaluate(() => {
+              const sr = document.querySelector("lustre-server-component")?.shadowRoot;
+              const log = sr?.getElementById("log");
+              const jump = sr?.getElementById("jump-latest");
+              return {
+                fromBottom: log ? log.scrollHeight - log.scrollTop - log.clientHeight : -1,
+                jumpShown: jump ? !jump.hidden : null,
+              };
+            });
+            return follow.fromBottom >= 0 && follow.fromBottom < 80;
+          },
+          { timeout: 5_000, interval: 100, message: "auto-follow settled" },
+        ).catch(() => {});
         assert(follow.fromBottom < 80, `auto-follow died mid-turn: ${JSON.stringify(follow)}`);
         assert(!follow.jumpShown, `jump button surfaced mid-turn: ${JSON.stringify(follow)}`);
       } finally {
@@ -1947,6 +1986,14 @@ async function main() {
         JSON.stringify(["<script>alert('utility-t", "login"]),
         `model tags landed: ${tagged.tags}`,
       );
+      // The sidebar learns about the apply from a MetaUpdated broadcast —
+      // which only reaches clients joined to the thread — or from a fresh
+      // threads load. The bots test's trailing reload raced this apply
+      // (the branch was still held when it re-read the list), so re-load
+      // now that the API confirms it and read the chips from a list that
+      // cannot be stale.
+      await page.goto(`${base}/?token=${TOKEN}`);
+      await connected(page);
       // Chips render as text nodes: textContent carries the payload
       // verbatim, innerHTML carries it ESCAPED (no markup was parsed),
       // and no script element exists anywhere inside the component's

@@ -65,7 +65,10 @@ deletion leaving the thread's frozen provider and model intact.
 ## Run
 
 ```sh
-# any machine with node ≥ 20 (browsers via `nix`/`npx playwright install chromium`):
+# any machine with node ≥ 20 (browsers via nix, or via the pinned
+# CLI on a bare machine — `npm --prefix e2e exec -- playwright
+# install chromium`; never a bare `npx playwright`, which fetches
+# latest and drops a wrong-revision browser into the shared cache):
 npm --prefix e2e install
 node e2e/browser.spec.mjs
 
