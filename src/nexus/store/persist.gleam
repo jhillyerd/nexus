@@ -322,6 +322,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
                     bot_id: row.bot_id,
                     created_at: row.created_s,
                   ),
+                  toolset: row.toolset,
                   last_active_at: row.last_active_s,
                   // The column already counts the system prompt
                   // (Phase 1 semantics).
@@ -382,6 +383,9 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           summary.meta.tags,
           int.to_float(summary.meta.created_at),
           summary.message_count,
+          // The creation-time snapshot (bots plan P2): the resolved
+          // names, always persisted — never NULL-for-default.
+          summary.toolset,
           // The '' sentinel writes NULL (no bot) — see insert_bot.sql.
           option.unwrap(summary.meta.bot_id, ""),
         )
@@ -579,6 +583,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
               row.provider_id,
               row.model,
               row.system_prompt,
+              row.tools,
               row.created_s,
               row.updated_s,
             )
@@ -605,6 +610,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
                 row.provider_id,
                 row.model,
                 row.system_prompt,
+                row.tools,
                 row.created_s,
                 row.updated_s,
               ))
@@ -627,6 +633,11 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           // The '' sentinel writes NULL (default prompt) — the same
           // workaround as the provider envelope (insert_provider.sql).
           option.unwrap(bot.system_prompt, ""),
+          // The toolset's two parameters (bots plan P2): the explicit
+          // list ('{}' = chat-only) + the is-default flag that writes
+          // NULL = resolve the current default at thread creation.
+          option.unwrap(bot.tools, []),
+          option.is_none(bot.tools),
           int.to_float(bot.created_at),
         )
         |> result.map(fn(_) { Nil })
@@ -647,6 +658,9 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           bot.provider_id,
           bot.model,
           option.unwrap(bot.system_prompt, ""),
+          // Same two-parameter toolset scheme as the insert (P2).
+          option.unwrap(bot.tools, []),
+          option.is_none(bot.tools),
         )
         |> result.map(fn(_) { Nil })
         |> result.map_error(query_error)
@@ -866,6 +880,9 @@ fn stored_summary_from_row(row: sql.ListSummariesRow) -> store.StoredSummary {
       bot_id: row.bot_id,
       created_at: row.created_s,
     ),
+    // The creation-time snapshot (bots plan P2): a dormant thread
+    // rehydrates its runner bundle from these names.
+    toolset: row.toolset,
     last_active_at: row.last_active_s,
     // The column already counts the system prompt (Phase 1 semantics).
     message_count: row.message_count,
@@ -881,6 +898,7 @@ fn bot_from_row(
   provider_id: String,
   model: String,
   system_prompt: option.Option(String),
+  tools: option.Option(List(String)),
   created_s: Int,
   updated_s: Int,
 ) -> store.StoredBot {
@@ -891,6 +909,9 @@ fn bot_from_row(
     provider_id: provider_id,
     model: model,
     system_prompt: system_prompt,
+    // NULL = the current default at thread-create time (P2's live
+    // template half); '{}' decodes as Some([]).
+    tools: tools,
     created_at: created_s,
     updated_at: updated_s,
   )

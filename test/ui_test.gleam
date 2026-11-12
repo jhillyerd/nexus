@@ -2681,7 +2681,9 @@ pub fn meta_updated_refreshes_sidebar_test() {
       fn(_endpoint) { Error(openai.Transport("offline test")) },
     )
   let assert Ok(started_bots) =
-    bot_registry.start(seam, process.new_name("nexus_ui_bots"))
+    bot_registry.start(seam, process.new_name("nexus_ui_bots"), fn(names) {
+      Ok(names)
+    })
   let bots = started_bots.data
   let providers = started_providers.data
   let factory_name = process.new_name("nexus_ui_factory")
@@ -2786,6 +2788,7 @@ pub fn send_moves_previous_day_row_into_today_immediately_test() {
           bot_id: None,
           created_at: yesterday,
         ),
+        toolset: tools.default_names(test_config()),
         last_active_at: yesterday,
         message_count: 1,
       ),
@@ -2809,7 +2812,9 @@ pub fn send_moves_previous_day_row_into_today_immediately_test() {
       fn(_endpoint) { Error(openai.Transport("offline test")) },
     )
   let assert Ok(started_bots) =
-    bot_registry.start(seam, process.new_name("nexus_ui_bots"))
+    bot_registry.start(seam, process.new_name("nexus_ui_bots"), fn(names) {
+      Ok(names)
+    })
   let bots = started_bots.data
   let providers = started_providers.data
   let factory_name = process.new_name("nexus_ui_factory_row")
@@ -2896,7 +2901,9 @@ pub fn connect_with_configured_provider_never_notes_no_provider_test() {
       fn(_endpoint) { Error(openai.Transport("offline test")) },
     )
   let assert Ok(started_bots) =
-    bot_registry.start(seam, process.new_name("nexus_ui_bots"))
+    bot_registry.start(seam, process.new_name("nexus_ui_bots"), fn(names) {
+      Ok(names)
+    })
   let bots = started_bots.data
   let providers = started_providers.data
   let factory_name = process.new_name("nexus_ui_factory")
@@ -3033,7 +3040,9 @@ pub fn thread_switch_drops_left_thread_stream_test() {
       fn(_endpoint) { Error(openai.Transport("offline test")) },
     )
   let assert Ok(started_bots) =
-    bot_registry.start(seam, process.new_name("nexus_ui_bots"))
+    bot_registry.start(seam, process.new_name("nexus_ui_bots"), fn(names) {
+      Ok(names)
+    })
   let bots = started_bots.data
   let providers = started_providers.data
   let factory_name = process.new_name("nexus_ui_factory_leak")
@@ -3120,7 +3129,9 @@ pub fn meta_updated_from_other_thread_refreshes_sidebar_test() {
       fn(_endpoint) { Error(openai.Transport("offline test")) },
     )
   let assert Ok(started_bots) =
-    bot_registry.start(seam, process.new_name("nexus_ui_bots"))
+    bot_registry.start(seam, process.new_name("nexus_ui_bots"), fn(names) {
+      Ok(names)
+    })
   let bots = started_bots.data
   let providers = started_providers.data
   let factory_name = process.new_name("nexus_ui_factory_meta")
@@ -3205,6 +3216,7 @@ fn new_thread(provider_id: String, model: String) -> thread_registry.NewThread {
     provider_id: provider_id,
     model: model,
     system_prompt: None,
+    toolset: None,
     bot_id: None,
   )
 }
@@ -3327,9 +3339,21 @@ fn bot_row(
     provider_id: "p1",
     model: "smart",
     system_prompt: prompt,
+    tools: None,
     created_at: 0,
     updated_at: 0,
   )
+}
+
+/// Same row shape with an explicit toolset (bots plan P2's display).
+fn bot_row_with_tools(
+  id: String,
+  name: String,
+  description: String,
+  prompt: option.Option(String),
+  tools: option.Option(List(String)),
+) -> bot.Bot {
+  bot.Bot(..bot_row(id, name, description, prompt), tools: tools)
 }
 
 /// The Bots section renders beside Providers, mirroring the provider
@@ -3371,6 +3395,83 @@ pub fn view_settings_bots_section_test() {
   should.be_true(string.contains(editing, ">Edit bot<"))
   should.be_true(string.contains(editing, "value=\"Writer\""))
   should.be_true(string.contains(editing, "be terse"))
+}
+
+/// The toolset display (bots plan P2): the three states read distinctly
+/// — default, chat-only, explicit list — and a payload-laden "tool name"
+/// (reachable only through an unvalidated store seed, exactly the
+/// hostile-text threat model) escapes as inert text.
+pub fn view_settings_bots_tools_display_test() {
+  let html =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(
+      ui.BotsLoaded([
+        bot_row("b1", "default tools bot", "", None),
+        bot_row_with_tools("b2", "chat only bot", "", None, Some([])),
+        bot_row_with_tools(
+          "b3",
+          "tooled bot",
+          "",
+          None,
+          Some([
+            "http_fetch",
+            "codemode",
+          ]),
+        ),
+        bot_row_with_tools(
+          "b4",
+          "hostile tools bot",
+          "",
+          None,
+          Some([
+            "<script>alert(2)</script>",
+          ]),
+        ),
+      ]),
+    )
+    |> step(ui.SettingsToggled)
+    |> view_string
+  should.be_true(string.contains(html, "default tools"))
+  should.be_true(string.contains(html, "no tools (chat only)"))
+  should.be_true(string.contains(html, "tools: http_fetch, codemode"))
+  // The hostile "name" is escaped text, never markup.
+  should.be_true(string.contains(html, "&lt;script&gt;alert(2)&lt;/script&gt;"))
+  should_not_contain(html, "<script>alert(2)</script>")
+
+  // The edit form prefills the comma-separated field and checks the
+  // chat-only box for an empty set.
+  let editing =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(
+      ui.BotsLoaded([
+        bot_row_with_tools(
+          "b3",
+          "tooled",
+          "",
+          None,
+          Some([
+            "http_fetch",
+          ]),
+        ),
+      ]),
+    )
+    |> step(ui.SettingsToggled)
+    |> step(ui.Settings(ui_settings.BotEditToggled("b3")))
+    |> view_string
+  should.be_true(string.contains(editing, "value=\"http_fetch\""))
+
+  let editing_chat_only =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(
+      ui.BotsLoaded([bot_row_with_tools("b2", "quiet", "", None, Some([]))]),
+    )
+    |> step(ui.SettingsToggled)
+    |> step(ui.Settings(ui_settings.BotEditToggled("b2")))
+    |> view_string
+  should.be_true(string.contains(editing_chat_only, "checked"))
 }
 
 /// Without bots the section says so; without PROVIDERS it explains the
@@ -3623,7 +3724,11 @@ fn start_offline_registries(
       fetch,
     )
   let assert Ok(started_bots) =
-    bot_registry.start(seam, process.new_name("nexus_ui_create_bots"))
+    bot_registry.start(
+      seam,
+      process.new_name("nexus_ui_create_bots"),
+      fn(names) { Ok(names) },
+    )
   let factory_name = process.new_name("nexus_ui_create_factory")
   let assert Ok(_factory) =
     factory_supervisor.start(thread_registry.factory_builder(factory_name))
@@ -3813,6 +3918,7 @@ pub fn create_from_bot_worker_lands_provenance_test() {
           provider_id: store_mock.fixture_provider_id,
           model: "alias-1",
           system_prompt: Some("be terse"),
+          tools: None,
           created_at: 0,
           updated_at: 0,
         ))

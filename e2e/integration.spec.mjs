@@ -374,13 +374,18 @@ async function main() {
       assert(aliases.length >= 2, "Bifrost alias list loaded");
       // Resolve one vLLM and one llama.cpp backend alias for the tool rounds.
       globalThis.VLLM_ALIAS = pickAlias(aliases, ["smart", "qwen3.8-flash"], "vLLM");
+      // The gateway's second backend slot: fractal nodes now serve
+      // qwen3.6-35b-a3b through vLLM too (fractal/fast resolves to the
+      // same weights), so this picks the fractal alias, not a llama.cpp
+      // engine — the rounds below need two distinct aliases, not two
+      // runtimes.
       globalThis.LLAMACPP_ALIAS = pickAlias(
         aliases,
-        ["fractal/fast", "fractal/unsloth/Qwen3.6-35B"],
-        "llama.cpp",
+        ["fractal/fast", "qwen3.6-35b"],
+        "second backend (fractal)",
       );
       console.log(`  vLLM alias: ${VLLM_ALIAS}`);
-      console.log(`  llama.cpp alias: ${LLAMACPP_ALIAS}`);
+      console.log(`  second-backend alias: ${LLAMACPP_ALIAS}`);
     });
 
     await test(`tools: web_search round on vLLM (${VLLM_ALIAS}) via real SearxNG`, async () => {
@@ -404,7 +409,7 @@ async function main() {
       assert(answer.length > 0, "final answer present");
     });
 
-    await test(`tools: http_fetch round on llama.cpp (${LLAMACPP_ALIAS})`, async () => {
+    await test(`tools: http_fetch round on fractal (${LLAMACPP_ALIAS})`, async () => {
       await createThread(LLAMACPP_ALIAS);
       await turn(
         page,
@@ -480,7 +485,7 @@ async function main() {
       const WARMS = 5;
       const cachePort = PORT + 1;
       const options = await page.$$eval("#model-picker option", (els) => els.map((e) => e.value));
-      const cacheAlias = pickAlias(options, [CACHE_ALIAS, "fractal/unsloth/Qwen3.6-35B"], "cache (llama.cpp)");
+      const cacheAlias = pickAlias(options, [CACHE_ALIAS, "qwen3.6-35b"], "cache (fractal)");
       cacheCapture.alias = cacheAlias;
       console.log(`  cache alias: ${cacheAlias} (fresh VM per thread)`);
 

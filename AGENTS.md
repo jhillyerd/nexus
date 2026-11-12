@@ -121,12 +121,19 @@ Pinned by the e2e browser suite (`docs/plans/completed/m3-verification.md`);
   beside tool calls) is skipped by BOTH the live commit and the replay
   (`AssistantFull` / `commit_bubble` in `src/nexus/ui.gleam`) — one
   skipped shape per path, or a reload resurrects the empty pill.
-- **One frozen toolset for every thread.** The registry builds the
-  agent-loop runner once at boot
-  (`thread.agent_runner(cfg.max_tool_iterations, tools.default(cfg))`).
-  Never add per-thread tool configurations — an identical
-  `tools` / `tool_choice` envelope across threads is part of the
-  KV-cache contract.
+- **One frozen toolset per thread** (amended by bots plan P2;
+  `docs/plans/bots.md`). The toolset is persisted at creation as
+  resolved tool names (`thread.toolset` — the default set's, or the
+  creating bot's; never NULL-for-default) and resolved against the
+  config-independent catalog (`tools.by_names`) into runner bundles
+  cached by the name tuple, so the default snapshot shares the
+  boot-built bundle and each distinct toolset builds exactly once.
+  `tools` / `tool_choice` never vary mid-thread — that is the part the
+  KV-cache byte contract needs. Divergent heads across DIFFERENT
+  toolsets are fine (they simply don't share cache spans); a chat-only
+  (`'{}'`) thread's envelope omits both fields, frozen at creation.
+  A snapshot naming a tool absent from the compiled code fails
+  hydration loudly — no silent skip.
 - **The shadow root stays open** (`open_shadow_root(True)` in
   `src/nexus/ui_runtime.gleam`), pierceable by the browser suite and
   devtools. A closed root broke the whole browser suite once

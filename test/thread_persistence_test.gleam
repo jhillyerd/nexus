@@ -363,6 +363,7 @@ fn new_thread(provider_id: String, model: String) -> thread_registry.NewThread {
     provider_id: provider_id,
     model: model,
     system_prompt: None,
+    toolset: None,
     bot_id: None,
   )
 }
@@ -616,6 +617,7 @@ fn stored(id: String) -> store.StoredSummary {
       created_at: timing.wall_now_s(),
     ),
     last_active_at: timing.wall_now_s(),
+    toolset: tools.default_names(test_config()),
     message_count: 1,
   )
 }

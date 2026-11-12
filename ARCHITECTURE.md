@@ -126,9 +126,10 @@ Notes on the "ties":
 - **No actor is tied to an LLM *connection*, because there are none.** Every
   model call is a fresh HTTP + SSE exchange. What is frozen per *thread*
   is the resolved `openai.Endpoint` (provider base URL + key + timeouts,
-  pinned at create/hydration); what is frozen per *VM lifetime* is the tool
-  schema set (built once at boot, `nexus/tools`). Both freezes serve the
-  KV-cache contract.
+  pinned at create/hydration) and the tool schema set (the
+  creation-time `thread.toolset` snapshot, resolved per toolset into
+  cached runner bundles — bots plan P2; the default snapshot shares the
+  boot-built bundle). Both freezes serve the KV-cache contract.
 - **Browser connection** ties: exactly one UI runtime per `/ws` socket.
   Nothing UI-side is shared between connections; threads themselves are
   server-global, so every tab sees the same sidebar.
@@ -373,7 +374,7 @@ utility-attempt bookkeeping.
 
 | Frozen thing | Scope | Why |
 |---|---|---|
-| Tool schemas + `tool_choice` envelope | per VM (built once at boot) | identical request envelope across threads keeps prefixes cacheable |
+| Tool schemas + `tool_choice` envelope | per thread (the creation-time `thread.toolset` snapshot, resolved into bundles cached per toolset; the default snapshot shares the boot-built bundle) | the envelope never varies mid-thread, so prefixes stay cacheable; threads of one toolset still share their tools head |
 | `openai.Endpoint` (base URL, key, timeouts) + model | per thread, pinned at create/hydration | a thread only ever exists with its (provider, model) pin in place |
 | System prompt | per thread (refrozen from `thread.system_prompt` on hydration) | part of the immutable prefix |
 | Request bytes | per prefix — immutable forever (`nexus/transcript.to_request` is the only encode path) | the KV-cache contract |

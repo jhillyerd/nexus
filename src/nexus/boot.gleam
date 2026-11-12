@@ -25,6 +25,7 @@ import gleam/option.{None, Some}
 import gleam/otp/factory_supervisor
 import gleam/otp/static_supervisor as supervisor
 import gleam/otp/supervision
+import gleam/result
 import gleam/string
 import mist
 import nexus/bot_registry
@@ -32,6 +33,7 @@ import nexus/config
 import nexus/provider_registry
 import nexus/store/persist
 import nexus/thread_registry
+import nexus/tools
 import nexus/web
 
 @external(erlang, "nexus_boot_ffi", "halt")
@@ -107,6 +109,12 @@ pub fn main() -> Nil {
             bot_registry.start(
               persist.seam(process.named_subject(store_name)),
               bot_registry_name,
+              // The catalog check (bots plan P2): submitted toolsets are
+              // validated against the SAME registry that builds the wire
+              // schemas — injected as a fn so this actor stays decoupled
+              // from the config and the tool modules. The specs are
+              // built and discarded; only the verdict crosses the seam.
+              fn(names) { tools.by_names(cfg, names) |> result.replace(names) },
             )
           }),
         )

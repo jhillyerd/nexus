@@ -80,6 +80,14 @@ pub type NewThread {
     model: String,
     system_prompt: Option(String),
     bot_id: Option(String),
+    /// The toolset the new thread snapshots (bots plan P2): `None` = the
+    /// default set (the boot-built bundle — plain creates and
+    /// default-toolset bots); `Some(names)` = an explicit list, resolved
+    /// against the config-independent catalog (unknown name →
+    /// `UnknownToolset` — a stale bot is refused, never silently
+    /// narrowed). The RESOLVED names — the bundle's — are what get
+    /// persisted into `thread.toolset`.
+    toolset: Option(List(String)),
   )
 }
 
@@ -92,6 +100,10 @@ pub type CreateError {
   /// endpoint (unknown / disabled / key unavailable). Carries the typed
   /// reason so callers can answer 400 vs 502 without string matching.
   ProviderFailed(ProviderError)
+  /// The requested toolset named a tool outside the compiled-in catalog
+  /// (bots plan P2 — a bot can go stale past an upgrade). A 400-class
+  /// client error: the create is refused, never silently narrowed.
+  UnknownToolset(reason: String)
   StartFailed(reason: String)
 }
 
@@ -128,9 +140,9 @@ pub type UpgradeOutcome {
 
 pub type Msg {
   /// Start a new thread from `NewThread` (provider pin + model + optional
-  /// explicit system prompt) using the registry's frozen tool runner
-  /// (built once at registry start, so the tool schema is identical in
-  /// every request of every thread). Replies with the fresh
+  /// explicit system prompt + optional explicit toolset) — the toolset
+  /// resolves through the per-toolset bundle cache (the default set
+  /// shares the boot-built bundle; bots plan P2). Replies with the fresh
   /// `ThreadSummary`.
   Create(
     requested: NewThread,
@@ -488,7 +500,18 @@ fn boot_sweep(persistence: Store) -> List(String) {
 fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
   case msg {
     Create(requested, reply) ->
-      handle_create(state, requested, default_toolset(state), reply)
+      // Resolve the requested toolset through the bundle cache FIRST
+      // (bots plan P2): the default snapshot shares the boot-built
+      // bundle; an explicit list builds (and caches) on first use and
+      // refuses unknown names with `UnknownToolset` — a stale bot's
+      // create fails loudly, never silently narrowed.
+      case resolve_toolset(state, requested.toolset) {
+        Error(reason) -> {
+          process.send(reply, Error(UnknownToolset(reason)))
+          actor.continue(state)
+        }
+        Ok(#(state, toolset)) -> handle_create(state, requested, toolset, reply)
+      }
 
     CreateWithToolset(requested, toolset, reply) ->
       handle_create(state, requested, toolset, reply)
@@ -503,6 +526,67 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
 fn default_toolset(state: State) -> thread.Toolset {
   let assert Ok(toolset) = dict.get(state.toolsets, state.default_names)
   toolset
+}
+
+/// Resolve a requested toolset's NAMES into the cached bundle, building
+/// and caching on first use (bots plan P2). The cache key is the name
+/// tuple — the default snapshot's names hit the boot-seeded entry, so
+/// default threads share the boot-built runner; every distinct explicit
+/// list builds its own bundle exactly once (specs via `tools.by_names`
+/// against the config-INDEPENDENT catalog, turn + utility runners over
+/// the SAME specs — the same-specs property per toolset, by
+/// construction). Unknown names fail loudly (`UnknownToolset` at
+/// create; hydration refuses to start the thread). Returns the possibly
+/// cache-extended state beside the bundle — the caller threads it
+/// through.
+fn resolve_toolset(
+  state: State,
+  requested: Option(List(String)),
+) -> Result(#(State, thread.Toolset), String) {
+  case requested {
+    None -> Ok(#(state, default_toolset(state)))
+    Some(names) -> {
+      // A toolset is a set: dedupe FIRST so the cache key is stable
+      // regardless of how the caller spelled the list.
+      let names = list.unique(names)
+      case dict.get(state.toolsets, names) {
+        Ok(toolset) -> Ok(#(state, toolset))
+        Error(_) ->
+          case tools.by_names(state.cfg, names) {
+            Error(reason) -> Error(reason)
+            Ok(specs) -> {
+              // Same build recipe as `start`'s boot bundle: the turn
+              // runner AND the utility runner over the same specs, so
+              // each bundle's utility side call shares its turn
+              // envelope. The corpus closure asks THIS registry (its
+              // own subject) from inside the utility worker — the same
+              // §3.3 pattern as `tag_corpus_for`, which cannot run
+              // here: the actor already exists by the time a bundle is
+              // first needed.
+              let toolset =
+                thread.Toolset(
+                  names: names,
+                  specs: specs,
+                  runner: thread.agent_runner(
+                    state.cfg.max_tool_iterations,
+                    specs,
+                  ),
+                  utility_runner: thread.utility_runner(specs, fn() {
+                    tag_corpus(state.self)
+                  }),
+                )
+              Ok(#(
+                State(
+                  ..state,
+                  toolsets: dict.insert(state.toolsets, names, toolset),
+                ),
+                toolset,
+              ))
+            }
+          }
+      }
+    }
+  }
 }
 
 fn handle_create(
@@ -586,6 +670,11 @@ fn handle_create(
                     provider_id: requested.provider_id,
                     model: alias,
                     meta: meta,
+                    // The creation-time snapshot (bots plan P2): the
+                    // RESOLVED names this thread will run with, always
+                    // persisted — never NULL-for-default — so no config
+                    // change or bot edit can re-aim this envelope.
+                    toolset: toolset.names,
                     last_active_at: created_at,
                     // 1 = the system prompt (Phase 1 message_count).
                     message_count: 1,
@@ -1179,61 +1268,85 @@ fn lazy_start(state: State, summary: StoredSummary) -> Resolved {
       Missing
     }
     Ok(endpoint) ->
-      case rebuild_transcript(state, summary.id) {
-        Error(error) -> {
-          log_store_error("lazy_start " <> summary.id, error)
+      // Resolve the dormant thread's PERSISTED toolset snapshot (bots
+      // plan P2) into its bundle — through the same cache a create
+      // uses, so a rehydrated thread's envelope is byte-identical to
+      // the one it was created with. The snapshot wins over today's
+      // config: a name absent from the compiled code entirely (removed
+      // by an upgrade) fails hydration LOUDLY — no silent skip, no
+      // envelope change; the remedy is recreating the thread or
+      // hand-editing its row. The thread stays dormant and a later Get
+      // retries, exactly like the provider-failure path above.
+      case resolve_toolset(state, Some(summary.toolset)) {
+        Error(reason) -> {
+          io.println(
+            "nexus registry: lazy_start "
+            <> summary.id
+            <> " failed: toolset ["
+            <> string.join(summary.toolset, ", ")
+            <> "] is not in the compiled tool catalog ("
+            <> reason
+            <> "); thread stays dormant",
+          )
           Missing
         }
-        Ok(transcript) -> {
-          let spec =
-            thread.ThreadSpec(
-              id: summary.id,
-              cfg: state.cfg,
-              endpoint: endpoint,
-              toolset: default_toolset(state),
-              commit_hook: commit_hook_for(state.store, summary.id),
-              transcript: transcript,
-              hydrated: True,
-              utility_apply: utility_apply_for(state.self, summary.id),
-            )
-          let argument =
-            ChildArgument(
-              spec: spec,
-              name: process.new_name("nexus_thread_" <> summary.id),
-            )
-          case restart(state.factory, argument) {
-            Ok(started) -> {
-              let record =
-                Record(
-                  id: summary.id,
-                  provider_id: summary.provider_id,
-                  model: summary.model,
-                  subject: started.data,
-                  pid: started.pid,
-                  monitor: process.monitor(started.pid),
-                  spec: spec,
-                  name: argument.name,
-                  start_error: None,
-                  meta: summary.meta,
-                  persisted: True,
-                )
-              Started(
-                State(
-                  ..state,
-                  threads: dict.insert(state.threads, summary.id, record),
-                  dormant: dict.delete(state.dormant, summary.id),
-                ),
-              )
-            }
-            Error(reason) -> {
-              log_store_error(
-                "lazy_start " <> summary.id,
-                string.inspect(reason),
-              )
+        Ok(#(state, toolset)) ->
+          case rebuild_transcript(state, summary.id) {
+            Error(error) -> {
+              log_store_error("lazy_start " <> summary.id, error)
               Missing
             }
+            Ok(transcript) -> {
+              let spec =
+                thread.ThreadSpec(
+                  id: summary.id,
+                  cfg: state.cfg,
+                  endpoint: endpoint,
+                  toolset: toolset,
+                  commit_hook: commit_hook_for(state.store, summary.id),
+                  transcript: transcript,
+                  hydrated: True,
+                  utility_apply: utility_apply_for(state.self, summary.id),
+                )
+              let argument =
+                ChildArgument(
+                  spec: spec,
+                  name: process.new_name("nexus_thread_" <> summary.id),
+                )
+              case restart(state.factory, argument) {
+                Ok(started) -> {
+                  let record =
+                    Record(
+                      id: summary.id,
+                      provider_id: summary.provider_id,
+                      model: summary.model,
+                      subject: started.data,
+                      pid: started.pid,
+                      monitor: process.monitor(started.pid),
+                      spec: spec,
+                      name: argument.name,
+                      start_error: None,
+                      meta: summary.meta,
+                      persisted: True,
+                    )
+                  Started(
+                    State(
+                      ..state,
+                      threads: dict.insert(state.threads, summary.id, record),
+                      dormant: dict.delete(state.dormant, summary.id),
+                    ),
+                  )
+                }
+                Error(reason) -> {
+                  log_store_error(
+                    "lazy_start " <> summary.id,
+                    string.inspect(reason),
+                  )
+                  Missing
+                }
+              }
+            }
           }
-        }
       }
   }
 }

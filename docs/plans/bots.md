@@ -2,7 +2,7 @@
 title: Nexus — bots and profiles (named thread templates, per-bot toolsets, bot-to-bot messaging)
 status: active
 tags: [nexus, bots, threads, agents, kv-cache, gleam, beam]
-updated: 2026-11-11
+updated: 2026-11-12
 ---
 
 # Bots and profiles
@@ -263,7 +263,21 @@ columns, NULL system-prompt resolution, stale-alias 400); UI rendering
 of bot-sourced fields with `<script>` payloads in names/descriptions;
 browser-suite coverage for the picker and settings section.
 
-## Phase 2 — per-bot toolsets (invariant amendment)
+## Phase 2 — per-bot toolsets (invariant amendment) — DONE
+
+Landed on `t3/bots-phase-2`: `bot.tools text[] NULL` (the write
+sentinel is an is-default bool — `'{}'` is meaningful, so no
+nullif-style value sentinel can express NULL) and `thread.toolset
+text[] NOT NULL`, always populated at insert with the resolved names.
+The registry resolves toolsets through the per-toolset bundle cache
+(#76 prep), `loop.frozen_options` omits `tools`/`tool_choice` for the
+empty toolset, bot save validates names through the injected catalog
+seam (boot wires `tools.by_names`; the registry stays config-free),
+hydration resolves snapshots with loud failure on absent names, and
+the AGENTS.md invariant carries the amended form. Pre-deployment rule
+held: the snapshot column is NOT NULL in the base CREATE and dev
+databases are recreated — the NULL-materialization clause below is
+vestigial for any future deployed schema.
 
 **Scope:** `bot.tools text[] NULL` on the bot (NULL = current
 default), and `thread.toolset text[]` always populated at creation

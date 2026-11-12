@@ -50,8 +50,16 @@
 -- - `bot.system_prompt` NULL = the global default, resolved AT CREATION
 --   into the thread's frozen `system_prompt` (same rule as an explicit
 --   NEXUS_SYSTEM_PROMPT); never resolved at request time.
--- - No `tools` column yet — per-bot toolsets are Phase 2's deliberate
---   invariant amendment, landed alone with its AGENTS.md rewrite.
+-- - `bot.tools` (bots plan Phase 2) is the LIVE template list: NULL = the
+--   current default set, resolved AT CREATION into the new thread's
+--   snapshot; `'{}'` = deliberately empty (a chat-only bot); a non-empty
+--   array = an explicit list. Validated against the compiled-in catalog
+--   at save time; a stale entry is refused again at thread create.
+--
+-- Phase 2 invariant amendment (landed alone with its AGENTS.md rewrite):
+-- one frozen toolset PER THREAD — `thread.toolset` below is always the
+-- resolved names persisted at creation, never NULL-for-default, so a
+-- config or bot edit can never re-aim an existing thread's envelope.
 
 CREATE TABLE IF NOT EXISTS provider (
   id                 text PRIMARY KEY,
@@ -76,6 +84,7 @@ CREATE TABLE IF NOT EXISTS bot (
                                                 -- the registry's delete pre-check counts bots (count_bots_for_provider)
   model         text NOT NULL,                  -- alias, validated live at thread create (a bot can go stale)
   system_prompt text,                           -- NULL = global default, resolved AT CREATION into the thread's frozen prompt
+  tools         text[],                         -- NULL = the current default set, resolved AT CREATION; '{}' = chat-only; else explicit names (validated against the compiled catalog at save)
   created_at    timestamptz NOT NULL,
   updated_at    timestamptz NOT NULL
 );
@@ -98,6 +107,7 @@ CREATE TABLE IF NOT EXISTS thread (
   created_at     timestamptz NOT NULL,
   last_active_at timestamptz NOT NULL,         -- bumped on turn commit; drives recency + buckets
   message_count  int NOT NULL DEFAULT 0,       -- denormalized for list queries
+  toolset        text[] NOT NULL,              -- bots plan P2: the RESOLVED tool names persisted at creation (default set's, or the creating bot's) — a snapshot, never NULL-for-default, so no config change or bot edit can re-aim this thread's envelope
   bot_id         text REFERENCES bot(id) ON DELETE SET NULL
                                                 -- provenance/display only (bots plan P1): which bot the frozen columns
                                                 -- were sourced from. Never joined at request-encoding time; deleting

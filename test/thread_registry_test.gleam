@@ -161,6 +161,7 @@ fn new_thread(provider_id: String, model: String) -> thread_registry.NewThread {
     provider_id: provider_id,
     model: model,
     system_prompt: None,
+    toolset: None,
     bot_id: None,
   )
 }
@@ -589,6 +590,7 @@ fn seed_with_tags(seam: store.Store, id: String, tags: List(String)) -> Nil {
           created_at: 1_700_000_000,
         ),
         last_active_at: 1_700_000_000,
+        toolset: tools.default_names(test_config()),
         message_count: 3,
       ),
       "test system prompt",
@@ -935,6 +937,7 @@ fn seed_at(
           created_at: last_active_at,
         ),
         last_active_at: last_active_at,
+        toolset: tools.default_names(test_config()),
         message_count: message_count,
       ),
       "test system prompt",
@@ -1155,6 +1158,16 @@ fn seed_bot(
   id: String,
   prompt: option.Option(String),
 ) -> Result(Nil, String) {
+  seed_bot_with_tools(seam, id, prompt, None)
+}
+
+/// Same, with the bot's toolset (bots plan P2's live template field).
+fn seed_bot_with_tools(
+  seam: store.Store,
+  id: String,
+  prompt: option.Option(String),
+  tools: option.Option(List(String)),
+) -> Result(Nil, String) {
   seam.insert_bot(bot.Bot(
     id: id,
     name: "bot " <> id,
@@ -1162,9 +1175,62 @@ fn seed_bot(
     provider_id: store_mock.fixture_provider_id,
     model: "alpha",
     system_prompt: prompt,
+    tools: tools,
     created_at: 1_700_000_000,
     updated_at: 1_700_000_000,
   ))
+}
+
+/// A dormant stored thread with a MANUAL title (survives the boot sweep)
+/// carrying an explicit toolset snapshot — the hydration rigs' fixture.
+fn stored_with_toolset(
+  id: String,
+  toolset: List(String),
+) -> store.StoredSummary {
+  store.StoredSummary(
+    id: id,
+    provider_id: store_mock.fixture_provider_id,
+    model: "alpha",
+    meta: thread.ThreadMeta(
+      title: "stored",
+      title_source: thread.ManualTitle,
+      pinned: False,
+      tags: [],
+      tags_manual: [],
+      tags_source: thread.AutoTags,
+      archived: False,
+      bot_id: None,
+      created_at: timing.wall_now_s(),
+    ),
+    toolset: toolset,
+    last_active_at: timing.wall_now_s(),
+    message_count: 1,
+  )
+}
+
+type Boot {
+  Boot(registry: process.Subject(thread_registry.Msg))
+}
+
+/// Boot a registry over `seam` with the test config's default bundle —
+/// the hydration rigs (dormant threads rehydrate from their snapshots).
+fn boot(seam: store.Store) -> Boot {
+  boot_with_config(seam, test_config())
+}
+
+fn boot_with_config(seam: store.Store, cfg: config.Config) -> Boot {
+  let factory_name = process.new_name("nexus_hydration_factory")
+  let assert Ok(_factory) =
+    factory_supervisor.start(thread_registry.factory_builder(factory_name))
+  let assert Ok(started) =
+    thread_registry.start(
+      cfg,
+      factory_supervisor.get_by_name(factory_name),
+      process.new_name("nexus_hydration_registry"),
+      seam,
+      fixture_resolver(),
+    )
+  Boot(registry: started.data)
 }
 
 /// What `thread_create.create_thread_from_bot` asks for once it has
@@ -1182,6 +1248,7 @@ pub fn create_from_bot_freezes_columns_and_provenance_test() {
         provider_id: store_mock.fixture_provider_id,
         model: "alpha",
         system_prompt: Some("be terse"),
+        toolset: None,
         bot_id: Some("b1"),
       ),
       toolset(happy_runner),
@@ -1220,6 +1287,7 @@ pub fn create_from_null_prompt_bot_freezes_config_default_test() {
         provider_id: store_mock.fixture_provider_id,
         model: "alpha",
         system_prompt: None,
+        toolset: None,
         bot_id: Some("b2"),
       ),
       toolset(happy_runner),
@@ -1227,6 +1295,218 @@ pub fn create_from_null_prompt_bot_freezes_config_default_test() {
   should.equal(summary.bot_id, Some("b2"))
   let assert Ok(stored) = seam.get_thread(summary.id)
   should.equal(stored.system_prompt, "test system prompt")
+}
+
+// ---------------------------------------------------------------------------
+// Per-bot toolsets (bots plan P2): every thread snapshots RESOLVED names
+// at creation; unknown names refuse loudly.
+// ---------------------------------------------------------------------------
+
+/// An explicit toolset persists its resolved names; a plain create
+/// snapshots the DEFAULT names. Neither is ever a NULL-for-default —
+/// that design would re-aim every default thread's envelope on a config
+/// change + restart (the rejected alternative, coderabbit review PR #71).
+pub fn toolset_snapshot_persisted_at_creation_test() {
+  let #(registry, seam) = start_registry_keeping_seam()
+
+  // The explicit list (the same tuple as the boot default here, so this
+  // exercises the boot-bundle cache hit).
+  let assert Ok(explicit) =
+    thread_registry.create(
+      registry,
+      thread_registry.NewThread(
+        provider_id: store_mock.fixture_provider_id,
+        model: "alpha",
+        system_prompt: None,
+        toolset: Some(["http_fetch"]),
+        bot_id: None,
+      ),
+    )
+  let assert Ok(stored) = seam.get_thread(explicit.id)
+  should.equal(stored.summary.toolset, ["http_fetch"])
+
+  // A plain create: the default set's names, persisted verbatim.
+  let assert Ok(plain) =
+    thread_registry.create(
+      registry,
+      new_thread(store_mock.fixture_provider_id, "alpha"),
+    )
+  let assert Ok(plain_stored) = seam.get_thread(plain.id)
+  should.equal(plain_stored.summary.toolset, tools.default_names(test_config()))
+}
+
+/// A `'{}'` (chat-only) toolset builds its own bundle (cache miss on the
+/// boot tuple) and persists the empty snapshot.
+pub fn chat_only_toolset_create_test() {
+  let #(registry, seam) = start_registry_keeping_seam()
+
+  let assert Ok(summary) =
+    thread_registry.create(
+      registry,
+      thread_registry.NewThread(
+        provider_id: store_mock.fixture_provider_id,
+        model: "alpha",
+        system_prompt: None,
+        toolset: Some([]),
+        bot_id: None,
+      ),
+    )
+  let assert Ok(stored) = seam.get_thread(summary.id)
+  should.equal(stored.summary.toolset, [])
+
+  // The chat-only bundle is cached by its own tuple: a second thread of
+  // the same toolset resolves through the shared bundle and starts fine.
+  let assert Ok(second) =
+    thread_registry.create(
+      registry,
+      thread_registry.NewThread(
+        provider_id: store_mock.fixture_provider_id,
+        model: "alpha",
+        system_prompt: None,
+        toolset: Some([]),
+        bot_id: None,
+      ),
+    )
+  let assert Ok(second_stored) = seam.get_thread(second.id)
+  should.equal(second_stored.summary.toolset, [])
+}
+
+/// A toolset naming a tool outside the compiled catalog refuses the
+/// create with `UnknownToolset` (a 400-class client error) and inserts
+/// nothing.
+pub fn unknown_toolset_create_refused_test() {
+  let #(registry, _seam) = start_registry_keeping_seam()
+
+  thread_registry.create(
+    registry,
+    thread_registry.NewThread(
+      provider_id: store_mock.fixture_provider_id,
+      model: "alpha",
+      system_prompt: None,
+      toolset: Some(["nope"]),
+      bot_id: None,
+    ),
+  )
+  |> should.equal(
+    Error(thread_registry.UnknownToolset("unknown tool name: nope")),
+  )
+
+  // Nothing was created.
+  thread_registry.list_threads(registry) |> should.equal([])
+}
+
+/// A bot's toolset snapshots into the threads created from it: the
+/// orchestration passes `bot.tools` as the request's toolset (the same
+/// shape `create_thread_from_bot` builds), and the registry persists the
+/// resolved names.
+pub fn create_from_bot_toolset_snapshot_test() {
+  let #(registry, seam) = start_registry_keeping_seam()
+  let assert Ok(Nil) =
+    seed_bot_with_tools(seam, "b-tools", None, Some(["http_fetch"]))
+
+  let assert Ok(summary) =
+    thread_registry.create(
+      registry,
+      thread_registry.NewThread(
+        provider_id: store_mock.fixture_provider_id,
+        model: "alpha",
+        system_prompt: None,
+        toolset: Some(["http_fetch"]),
+        bot_id: Some("b-tools"),
+      ),
+    )
+  let assert Ok(stored) = seam.get_thread(summary.id)
+  should.equal(stored.summary.toolset, ["http_fetch"])
+  should.equal(stored.summary.meta.bot_id, Some("b-tools"))
+
+  // The NULL-tools bot is the LIVE template half: `None` resolves to
+  // the current default at each create (below, via a plain request).
+  let assert Ok(Nil) = seed_bot_with_tools(seam, "b-default", None, None)
+  let assert Ok(from_default_bot) =
+    thread_registry.create(
+      registry,
+      thread_registry.NewThread(
+        provider_id: store_mock.fixture_provider_id,
+        model: "alpha",
+        system_prompt: None,
+        toolset: None,
+        bot_id: Some("b-default"),
+      ),
+    )
+  let assert Ok(stored) = seam.get_thread(from_default_bot.id)
+  should.equal(stored.summary.toolset, tools.default_names(test_config()))
+}
+
+/// A dormant thread's PERSISTED toolset rehydrates through the same
+/// cache a create uses — the snapshot wins over today's boot default.
+pub fn dormant_toolset_rehydrates_through_snapshot_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  store_mock.ensure_fixture_provider(seam)
+  // A row whose snapshot is a NON-default toolset (the test config's
+  // default is ["http_fetch"]; this thread pinned chat-only).
+  let assert Ok(Nil) =
+    seam.insert_thread(stored_with_toolset("s-chat", []), "sys")
+
+  let booted = boot(seam)
+  // Lazy start resolves [] through by_names (an empty bundle — valid:
+  // a chat-only thread) instead of falling back to the default bundle.
+  thread_registry.get(booted.registry, "s-chat")
+  |> should.be_ok
+}
+
+/// A snapshot naming a tool absent from the compiled code fails
+/// hydration LOUDLY — no silent skip, no envelope change. The thread
+/// stays dormant (a later Get retries, like the provider-failure path);
+/// the remedy is recreating the thread or hand-editing its row.
+pub fn absent_tool_name_hydration_fails_loud_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  store_mock.ensure_fixture_provider(seam)
+  let assert Ok(Nil) =
+    seam.insert_thread(stored_with_toolset("s-gone", ["vanished"]), "sys")
+
+  let booted = boot(seam)
+  thread_registry.get(booted.registry, "s-gone")
+  |> should.equal(Error(Nil))
+  // Still listed (dormant), still refusing.
+  should.be_true(
+    thread_registry.list_threads(booted.registry)
+    |> list.any(fn(summary) { summary.id == "s-gone" }),
+  )
+  thread_registry.get(booted.registry, "s-gone")
+  |> should.equal(Error(Nil))
+}
+
+/// The snapshot keeps its envelope across a restart under a registry
+/// whose DEFAULT config differs: the dormant thread's names resolve
+/// against the config-independent catalog, never against the new boot
+/// default (the rejected NULL-for-default design would re-aim it here).
+pub fn toolset_snapshot_survives_changed_default_config_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  store_mock.ensure_fixture_provider(seam)
+  // Created under a default of ["http_fetch"], the thread pinned a
+  // DIFFERENT explicit toolset.
+  let assert Ok(Nil) =
+    seam.insert_thread(stored_with_toolset("s-pin", ["web_search"]), "sys")
+
+  // The next boot runs with codemode ON — its default tuple is now
+  // ["http_fetch", "codemode"].
+  let codemode_on = config.Config(..test_config(), codemode: True)
+  should.equal(tools.default_names(codemode_on), [
+    "http_fetch",
+    "codemode",
+  ])
+  let booted = boot_with_config(seam, codemode_on)
+
+  // The thread starts — with ITS snapshot ("web_search" resolves
+  // config-independently), not the new default. The bundle's names are
+  // the persisted tuple; the config-independent schemas are pinned by
+  // tools_test, the wire bytes by loop_test.
+  thread_registry.get(booted.registry, "s-pin") |> should.be_ok
+  let assert Ok(stored) = seam.get_thread("s-pin")
+  should.equal(stored.summary.toolset, ["web_search"])
 }
 
 /// The create seam carries the WHOLE toolset bundle (#76): the created
@@ -1307,6 +1587,7 @@ pub fn dormant_summary_carries_bot_provenance_test() {
           created_at: 1_700_000_000,
         ),
         last_active_at: 1_700_000_000,
+        toolset: tools.default_names(test_config()),
         message_count: 3,
       ),
       "frozen",
@@ -1398,6 +1679,7 @@ pub fn bot_delete_scrubs_cached_provenance_test() {
             created_at: 1_700_000_000,
           ),
           last_active_at: 1_700_000_000,
+          toolset: tools.default_names(test_config()),
           message_count: 3,
         ),
         "frozen",
@@ -1420,6 +1702,7 @@ pub fn bot_delete_scrubs_cached_provenance_test() {
         provider_id: store_mock.fixture_provider_id,
         model: "alpha",
         system_prompt: Some("p"),
+        toolset: None,
         bot_id: Some("b1"),
       ),
       toolset(happy_runner),
@@ -1481,6 +1764,7 @@ pub fn unpersisted_create_carries_no_provenance_test() {
         provider_id: store_mock.fixture_provider_id,
         model: "alpha",
         system_prompt: Some("p"),
+        toolset: None,
         bot_id: Some("b1"),
       ),
       toolset(happy_runner),

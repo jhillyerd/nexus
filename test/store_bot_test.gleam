@@ -20,6 +20,7 @@ fn row(id: String, name: String) -> store.StoredBot {
     provider_id: store_mock.fixture_provider_id,
     model: "alias-1",
     system_prompt: None,
+    tools: None,
     created_at: 1_700_000_000,
     updated_at: 1_700_000_000,
   )
@@ -42,6 +43,7 @@ fn summary(id: String, bot_id: option.Option(String)) -> store.StoredSummary {
       created_at: 1_700_000_000,
     ),
     last_active_at: 1_700_000_000,
+    toolset: [],
     message_count: 1,
   )
 }

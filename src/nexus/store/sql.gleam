@@ -416,13 +416,16 @@ pub type GetBotRow {
     provider_id: String,
     model: String,
     system_prompt: Option(String),
+    tools: Option(List(String)),
     created_s: Int,
     updated_s: Int,
   )
 }
 
 /// One bot row by id. `Error` for unknown ids is decided by the caller
-/// from the empty result.
+/// from the empty result. `tools` (bots plan P2): NULL = the default set
+/// at thread-create time, '{}' = chat-only, else the explicit list (see
+/// insert_bot.sql).
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
@@ -438,8 +441,9 @@ pub fn get_bot(
     use provider_id <- decode.field(3, decode.string)
     use model <- decode.field(4, decode.string)
     use system_prompt <- decode.field(5, decode.optional(decode.string))
-    use created_s <- decode.field(6, decode.int)
-    use updated_s <- decode.field(7, decode.int)
+    use tools <- decode.field(6, decode.optional(decode.list(decode.string)))
+    use created_s <- decode.field(7, decode.int)
+    use updated_s <- decode.field(8, decode.int)
     decode.success(GetBotRow(
       id:,
       name:,
@@ -447,13 +451,16 @@ pub fn get_bot(
       provider_id:,
       model:,
       system_prompt:,
+      tools:,
       created_s:,
       updated_s:,
     ))
   }
 
   "-- One bot row by id. `Error` for unknown ids is decided by the caller
--- from the empty result.
+-- from the empty result. `tools` (bots plan P2): NULL = the default set
+-- at thread-create time, '{}' = chat-only, else the explicit list (see
+-- insert_bot.sql).
 select
   id,
   name,
@@ -461,6 +468,7 @@ select
   provider_id,
   model,
   system_prompt,
+  tools,
   extract(epoch from created_at)::int8 as created_s,
   extract(epoch from updated_at)::int8 as updated_s
 from bot
@@ -567,6 +575,7 @@ pub type GetThreadRow {
     tags: List(String),
     tags_manual: List(String),
     tags_source: String,
+    toolset: List(String),
     bot_id: Option(String),
     created_s: Int,
     last_active_s: Int,
@@ -578,6 +587,9 @@ pub type GetThreadRow {
 /// provenance columns ride along (utility-tags plan §3.5): rehydration
 /// must never lack them. bot_id is the bots plan's provenance pointer
 /// (NULL = created without a bot; display only, never request bytes).
+/// toolset is the bots plan P2 snapshot: the resolved names hydration
+/// resolves through the config-independent catalog (loud failure on a
+/// name absent from the compiled code).
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
@@ -598,10 +610,11 @@ pub fn get_thread(
     use tags <- decode.field(8, decode.list(decode.string))
     use tags_manual <- decode.field(9, decode.list(decode.string))
     use tags_source <- decode.field(10, decode.string)
-    use bot_id <- decode.field(11, decode.optional(decode.string))
-    use created_s <- decode.field(12, decode.int)
-    use last_active_s <- decode.field(13, decode.int)
-    use message_count <- decode.field(14, decode.int)
+    use toolset <- decode.field(11, decode.list(decode.string))
+    use bot_id <- decode.field(12, decode.optional(decode.string))
+    use created_s <- decode.field(13, decode.int)
+    use last_active_s <- decode.field(14, decode.int)
+    use message_count <- decode.field(15, decode.int)
     decode.success(GetThreadRow(
       id:,
       provider_id:,
@@ -614,6 +627,7 @@ pub fn get_thread(
       tags:,
       tags_manual:,
       tags_source:,
+      toolset:,
       bot_id:,
       created_s:,
       last_active_s:,
@@ -625,6 +639,9 @@ pub fn get_thread(
 -- provenance columns ride along (utility-tags plan §3.5): rehydration
 -- must never lack them. bot_id is the bots plan's provenance pointer
 -- (NULL = created without a bot; display only, never request bytes).
+-- toolset is the bots plan P2 snapshot: the resolved names hydration
+-- resolves through the config-independent catalog (loud failure on a
+-- name absent from the compiled code).
 select
   id,
   provider_id,
@@ -637,6 +654,7 @@ select
   tags,
   tags_manual,
   tags_source,
+  toolset,
   bot_id,
   extract(epoch from created_at)::int8 as created_s,
   extract(epoch from last_active_at)::int8 as last_active_s,
@@ -655,6 +673,11 @@ where id = $1
 /// Postgres exposes no parameter nullability, so squirrel parameters cannot
 /// be nullable and the sentinel is its documented workaround (see
 /// insert_provider.sql).
+/// `tools` (bots plan P2) has TWO parameters for the same reason: $7 is the
+/// explicit name list ('{}' = chat-only — an EMPTY array is meaningful, so
+/// no nullif-style value sentinel can express NULL) and $8 is the
+/// is-default flag — true inserts NULL = resolve the current default set
+/// at thread creation.
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
@@ -667,7 +690,9 @@ pub fn insert_bot(
   arg_4: String,
   arg_5: String,
   arg_6: String,
-  arg_7: Float,
+  arg_7: List(String),
+  arg_8: Bool,
+  arg_9: Float,
 ) -> Result(pog.Returned(Nil), pog.QueryError) {
   let decoder = decode.map(decode.dynamic, fn(_) { Nil })
 
@@ -676,8 +701,13 @@ pub fn insert_bot(
 -- Postgres exposes no parameter nullability, so squirrel parameters cannot
 -- be nullable and the sentinel is its documented workaround (see
 -- insert_provider.sql).
-insert into bot (id, name, description, provider_id, model, system_prompt, created_at, updated_at)
-values ($1, $2, $3, $4, $5, nullif($6, ''), to_timestamp($7), to_timestamp($7))
+-- `tools` (bots plan P2) has TWO parameters for the same reason: $7 is the
+-- explicit name list ('{}' = chat-only — an EMPTY array is meaningful, so
+-- no nullif-style value sentinel can express NULL) and $8 is the
+-- is-default flag — true inserts NULL = resolve the current default set
+-- at thread creation.
+insert into bot (id, name, description, provider_id, model, system_prompt, tools, created_at, updated_at)
+values ($1, $2, $3, $4, $5, nullif($6, ''), case when $8::boolean then null else $7::text[] end, to_timestamp($9), to_timestamp($9))
 "
   |> pog.query
   |> pog.parameter(pog.text(arg_1))
@@ -686,7 +716,9 @@ values ($1, $2, $3, $4, $5, nullif($6, ''), to_timestamp($7), to_timestamp($7))
   |> pog.parameter(pog.text(arg_4))
   |> pog.parameter(pog.text(arg_5))
   |> pog.parameter(pog.text(arg_6))
-  |> pog.parameter(pog.float(arg_7))
+  |> pog.parameter(pog.array(fn(value) { pog.text(value) }, arg_7))
+  |> pog.parameter(pog.bool(arg_8))
+  |> pog.parameter(pog.float(arg_9))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }
@@ -735,6 +767,10 @@ values ($1, $2, $3, nullif($4, ''::bytea), $5, $6, $7, to_timestamp($8), to_time
 /// A new thread row: created/last_active from the registry's epoch
 /// seconds; message_count is the transcript length (1 = system prompt).
 /// provider_id is frozen at creation with the model (contract rule 2).
+/// toolset is the bots plan P2 snapshot: the RESOLVED tool names persisted
+/// at creation (the default set's, or the creating bot's) — always
+/// populated, never NULL-for-default, so neither a config change nor a
+/// bot edit can re-aim this thread's envelope.
 /// bot_id is provenance only (bots plan P1): the '' sentinel inserts
 /// NULL (see insert_bot.sql) — a thread created without a bot.
 /// tags_manual is '{}' literally and tags_source is left to its column
@@ -756,20 +792,25 @@ pub fn insert_thread(
   arg_8: List(String),
   arg_9: Float,
   arg_10: Int,
-  arg_11: String,
+  arg_11: List(String),
+  arg_12: String,
 ) -> Result(pog.Returned(Nil), pog.QueryError) {
   let decoder = decode.map(decode.dynamic, fn(_) { Nil })
 
   "-- A new thread row: created/last_active from the registry's epoch
 -- seconds; message_count is the transcript length (1 = system prompt).
 -- provider_id is frozen at creation with the model (contract rule 2).
+-- toolset is the bots plan P2 snapshot: the RESOLVED tool names persisted
+-- at creation (the default set's, or the creating bot's) — always
+-- populated, never NULL-for-default, so neither a config change nor a
+-- bot edit can re-aim this thread's envelope.
 -- bot_id is provenance only (bots plan P1): the '' sentinel inserts
 -- NULL (see insert_bot.sql) — a thread created without a bot.
 -- tags_manual is '{}' literally and tags_source is left to its column
 -- default 'auto' (utility-tags plan §3.5): a new thread has no tags and
 -- an open auto path.
-insert into thread (id, provider_id, title, title_source, model, system_prompt, pinned, tags, tags_manual, created_at, last_active_at, message_count, bot_id)
-values ($1, $2, $3, $4, $5, $6, $7, $8, '{}', to_timestamp($9), to_timestamp($9), $10, nullif($11, ''))
+insert into thread (id, provider_id, title, title_source, model, system_prompt, pinned, tags, tags_manual, created_at, last_active_at, message_count, toolset, bot_id)
+values ($1, $2, $3, $4, $5, $6, $7, $8, '{}', to_timestamp($9), to_timestamp($9), $10, $11::text[], nullif($12, ''))
 "
   |> pog.query
   |> pog.parameter(pog.text(arg_1))
@@ -782,7 +823,8 @@ values ($1, $2, $3, $4, $5, $6, $7, $8, '{}', to_timestamp($9), to_timestamp($9)
   |> pog.parameter(pog.array(fn(value) { pog.text(value) }, arg_8))
   |> pog.parameter(pog.float(arg_9))
   |> pog.parameter(pog.int(arg_10))
-  |> pog.parameter(pog.text(arg_11))
+  |> pog.parameter(pog.array(fn(value) { pog.text(value) }, arg_11))
+  |> pog.parameter(pog.text(arg_12))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }
@@ -801,6 +843,7 @@ pub type ListBotsRow {
     provider_id: String,
     model: String,
     system_prompt: Option(String),
+    tools: Option(List(String)),
     created_s: Int,
     updated_s: Int,
   )
@@ -808,6 +851,8 @@ pub type ListBotsRow {
 
 /// All bot rows (registry boot load), ordered by id (the registry
 /// re-sorts). Bots carry no secrets — the row IS the public shape.
+/// `tools` (bots plan P2): NULL = the default set at thread-create time,
+/// '{}' = chat-only, else the explicit list (see insert_bot.sql).
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
@@ -822,8 +867,9 @@ pub fn list_bots(
     use provider_id <- decode.field(3, decode.string)
     use model <- decode.field(4, decode.string)
     use system_prompt <- decode.field(5, decode.optional(decode.string))
-    use created_s <- decode.field(6, decode.int)
-    use updated_s <- decode.field(7, decode.int)
+    use tools <- decode.field(6, decode.optional(decode.list(decode.string)))
+    use created_s <- decode.field(7, decode.int)
+    use updated_s <- decode.field(8, decode.int)
     decode.success(ListBotsRow(
       id:,
       name:,
@@ -831,6 +877,7 @@ pub fn list_bots(
       provider_id:,
       model:,
       system_prompt:,
+      tools:,
       created_s:,
       updated_s:,
     ))
@@ -838,6 +885,8 @@ pub fn list_bots(
 
   "-- All bot rows (registry boot load), ordered by id (the registry
 -- re-sorts). Bots carry no secrets — the row IS the public shape.
+-- `tools` (bots plan P2): NULL = the default set at thread-create time,
+-- '{}' = chat-only, else the explicit list (see insert_bot.sql).
 select
   id,
   name,
@@ -845,6 +894,7 @@ select
   provider_id,
   model,
   system_prompt,
+  tools,
   extract(epoch from created_at)::int8 as created_s,
   extract(epoch from updated_at)::int8 as updated_s
 from bot
@@ -947,6 +997,7 @@ pub type ListSummariesRow {
     tags: List(String),
     tags_manual: List(String),
     tags_source: String,
+    toolset: List(String),
     bot_id: Option(String),
     created_s: Int,
     last_active_s: Int,
@@ -957,7 +1008,8 @@ pub type ListSummariesRow {
 /// All stored thread summaries, ordered by id (the registry re-sorts).
 /// The provenance columns ride along (utility-tags plan §3.5): the boot
 /// load must never lack them. bot_id is the bots plan's provenance
-/// pointer (NULL = created without a bot).
+/// pointer (NULL = created without a bot); toolset is the bots plan P2
+/// snapshot a dormant thread rehydrates its runner bundle from.
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
@@ -976,10 +1028,11 @@ pub fn list_summaries(
     use tags <- decode.field(7, decode.list(decode.string))
     use tags_manual <- decode.field(8, decode.list(decode.string))
     use tags_source <- decode.field(9, decode.string)
-    use bot_id <- decode.field(10, decode.optional(decode.string))
-    use created_s <- decode.field(11, decode.int)
-    use last_active_s <- decode.field(12, decode.int)
-    use message_count <- decode.field(13, decode.int)
+    use toolset <- decode.field(10, decode.list(decode.string))
+    use bot_id <- decode.field(11, decode.optional(decode.string))
+    use created_s <- decode.field(12, decode.int)
+    use last_active_s <- decode.field(13, decode.int)
+    use message_count <- decode.field(14, decode.int)
     decode.success(ListSummariesRow(
       id:,
       provider_id:,
@@ -991,6 +1044,7 @@ pub fn list_summaries(
       tags:,
       tags_manual:,
       tags_source:,
+      toolset:,
       bot_id:,
       created_s:,
       last_active_s:,
@@ -1001,7 +1055,8 @@ pub fn list_summaries(
   "-- All stored thread summaries, ordered by id (the registry re-sorts).
 -- The provenance columns ride along (utility-tags plan §3.5): the boot
 -- load must never lack them. bot_id is the bots plan's provenance
--- pointer (NULL = created without a bot).
+-- pointer (NULL = created without a bot); toolset is the bots plan P2
+-- snapshot a dormant thread rehydrates its runner bundle from.
 select
   id,
   provider_id,
@@ -1013,6 +1068,7 @@ select
   tags,
   tags_manual,
   tags_source,
+  toolset,
   bot_id,
   extract(epoch from created_at)::int8 as created_s,
   extract(epoch from last_active_at)::int8 as last_active_s,
@@ -1275,8 +1331,11 @@ where id = $1
 
 /// Full-metadata bot update (the registry merges the PATCH onto the row
 /// first, so this is a plain replace). `system_prompt` rides the ''
-/// sentinel for NULL = global default (see insert_bot.sql). `updated_at`
-/// is server-side now(), like the provider/thread metadata writes.
+/// sentinel for NULL = global default (see insert_bot.sql). `tools` rides
+/// the same two-parameter scheme as the insert: $7 is the explicit list
+/// ('{}' = chat-only), $8 the is-default flag (true = NULL = the current
+/// default set). `updated_at` is server-side now(), like the
+/// provider/thread metadata writes.
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
@@ -1289,19 +1348,25 @@ pub fn update_bot(
   arg_4: String,
   arg_5: String,
   arg_6: String,
+  arg_7: List(String),
+  arg_8: Bool,
 ) -> Result(pog.Returned(Nil), pog.QueryError) {
   let decoder = decode.map(decode.dynamic, fn(_) { Nil })
 
   "-- Full-metadata bot update (the registry merges the PATCH onto the row
 -- first, so this is a plain replace). `system_prompt` rides the ''
--- sentinel for NULL = global default (see insert_bot.sql). `updated_at`
--- is server-side now(), like the provider/thread metadata writes.
+-- sentinel for NULL = global default (see insert_bot.sql). `tools` rides
+-- the same two-parameter scheme as the insert: $7 is the explicit list
+-- ('{}' = chat-only), $8 the is-default flag (true = NULL = the current
+-- default set). `updated_at` is server-side now(), like the
+-- provider/thread metadata writes.
 update bot set
   name = $2,
   description = $3,
   provider_id = $4,
   model = $5,
   system_prompt = nullif($6, ''),
+  tools = case when $8::boolean then null else $7::text[] end,
   updated_at = now()
 where id = $1
 "
@@ -1312,6 +1377,8 @@ where id = $1
   |> pog.parameter(pog.text(arg_4))
   |> pog.parameter(pog.text(arg_5))
   |> pog.parameter(pog.text(arg_6))
+  |> pog.parameter(pog.array(fn(value) { pog.text(value) }, arg_7))
+  |> pog.parameter(pog.bool(arg_8))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }

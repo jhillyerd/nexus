@@ -122,6 +122,13 @@ pub fn create_thread_from_bot(
           // plain create; an explicit prompt is used VERBATIM, never
           // amended (the same rule as an explicit NEXUS_SYSTEM_PROMPT).
           system_prompt: bot.system_prompt,
+          // The toolset snapshot source (bots plan P2): `None` = the
+          // current default (the bot stays a live template); `Some` =
+          // the bot's explicit list, resolved against the
+          // config-independent catalog — an unknown name (a bot gone
+          // stale past an upgrade) refuses the create (`UnknownToolset`),
+          // never silently narrowed.
+          toolset: bot.tools,
           bot_id: Some(bot.id),
         ),
       )
@@ -194,6 +201,8 @@ pub fn describe(problem: CreateProblem) -> String {
     CreateFailed(thread_registry.EmptyModel) -> "empty model"
     CreateFailed(thread_registry.ProviderFailed(_)) ->
       "provider became unusable"
+    CreateFailed(thread_registry.UnknownToolset(reason)) ->
+      "bot toolset unavailable: " <> reason
     CreateFailed(thread_registry.StartFailed(reason)) ->
       "thread unavailable: " <> reason
   }

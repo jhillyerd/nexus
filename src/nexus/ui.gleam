@@ -2086,9 +2086,11 @@ fn create_effect(model: Model, alias: String) -> Effect(Msg) {
                 thread_registry.NewThread(
                   provider_id: provider_id,
                   model: alias,
-                  // The create panel pins the config default; a bot-sourced
-                  // create runs through create_from_bot_effect instead.
+                  // The create panel pins the config default toolset; a
+                  // bot-sourced create runs through create_from_bot_effect
+                  // instead (bots plan P2).
                   system_prompt: None,
+                  toolset: None,
                   bot_id: None,
                 )
               case
