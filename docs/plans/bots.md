@@ -303,9 +303,10 @@ Mechanics:
   toolset order. A codemode script can reach only the tools of the
   thread (bot) it runs on — the global boot registry no longer exists
   to leak from — and a bot whose toolset omits codemode simply has no
-  bridge. Validation note: a toolset of ONLY codemode resolves fine
-  (zero hosts) but is useless; the save-time validation MAY reject it
-  as a UX nicety, not a correctness need.
+  bridge. Validation note: a toolset of ONLY codemode resolves fine —
+  with zero hosts it cannot call sibling tools, but the script itself
+  still runs pure Lua and emits `text`/`return` output; save-time
+  validation MAY reject it as a UX nicety, not a correctness need.
 - **The no-tools envelope is omission.** A `'{}'`-toolset thread sends
   neither `tools` nor `tool_choice`: the single encode path already
   branches this way (`transcript.request_body` skips `with_tools` for
