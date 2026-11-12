@@ -62,12 +62,22 @@ pub fn bot_crud_round_trips_test() {
   should.equal(got.name, "one")
   should.equal(got.system_prompt, None)
 
+  // The toolset rides the update and survives the read-back (the seam
+  // mapping's new P2 field — persist.gleam marshals it to the two SQL
+  // parameters, NULL sentinel included).
   let assert Ok(Nil) =
-    seam.update_bot(bot.Bot(..row("b1", "renamed"), system_prompt: Some("p")))
+    seam.update_bot(
+      bot.Bot(
+        ..row("b1", "renamed"),
+        system_prompt: Some("p"),
+        tools: Some(["http_fetch"]),
+      ),
+    )
 
   let assert Ok(updated) = seam.get_bot("b1")
   should.equal(updated.name, "renamed")
   should.equal(updated.system_prompt, Some("p"))
+  should.equal(updated.tools, Some(["http_fetch"]))
 
   let assert Ok(all) = seam.list_bots()
   should.equal(all |> list.map(fn(b) { b.id }), ["b1"])

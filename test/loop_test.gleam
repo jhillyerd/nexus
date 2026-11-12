@@ -614,11 +614,9 @@ pub fn frozen_options_nonempty_carries_schemas_and_auto_test() {
     opts.tool_choice,
     Some(chat.ToolChoiceModeChoice(chat.ToolChoiceAuto)),
   )
-  case opts.tools {
-    [_tool] -> Nil
-    other ->
-      panic as { "expected exactly one schema, got " <> string.inspect(other) }
-  }
+  // The exact schema, not just the count: the envelope is the frozen
+  // prefix, so a wrong (or reordered) schema must fail here.
+  should.equal(opts.tools, [echo_tool().tool])
 
   let tr =
     transcript.new("alias-1", "sys")

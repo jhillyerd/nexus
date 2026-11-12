@@ -67,11 +67,14 @@ plan builds, and the vocabulary the session→thread rename aligned with).
   explicit list. On `thread`: always the **resolved names persisted at
   creation** — never NULL-for-default — so neither a config change nor
   a bot edit can re-aim an existing thread's envelope (decision 2; the
-  same rationale as the persisted `system_prompt`). Pre-P2 rows with
-  `NULL` are **materialized once**: the first post-P2 boot stamps the
-  boot-resolved default names into the column, after which they are
-  ordinary snapshot rows — no code path ever resolves `NULL` against
-  live config.
+  same rationale as the persisted `system_prompt`). Landed form: the
+  column is NOT NULL in the base CREATE — under the pre-deployment
+  rule there are no pre-P2 rows anywhere, so no materialization path
+  exists. A future deployment that upgrades a database created before
+  this phase would need one (a first-boot stamp of the boot-resolved
+  default into each NULL row, after which they are ordinary snapshot
+  rows — never a read path resolving `NULL` against live config); that
+  is future work, deliberately not built now.
 
 ## Design summary
 
@@ -276,8 +279,16 @@ seam (boot wires `tools.by_names`; the registry stays config-free),
 hydration resolves snapshots with loud failure on absent names, and
 the AGENTS.md invariant carries the amended form. Pre-deployment rule
 held: the snapshot column is NOT NULL in the base CREATE and dev
-databases are recreated — the NULL-materialization clause below is
-vestigial for any future deployed schema.
+databases are recreated — see the vocabulary note above for what a
+future pre-P2 deployment would need.
+
+Verification outcomes: `m3_prefix_test` passed unchanged; 621 offline
+tests green; the e2e cache gate re-run on default-toolset threads —
+warm/cold TTFT median ratio **0.234 ≤ 0.3** (cold ~3.1s, warm ~0.7s
+medians). The smoke's secondary `cached_tokens` assertion could not
+run: the gateway's vLLM backends do not report `prompt_tokens_details`
+through Bifrost right now (the TTFT ratio is the PRD gate; the token
+check is conditional until usage flows again).
 
 **Scope:** `bot.tools text[] NULL` on the bot (NULL = current
 default), and `thread.toolset text[]` always populated at creation

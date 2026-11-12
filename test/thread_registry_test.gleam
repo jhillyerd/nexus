@@ -8,14 +8,18 @@ import gleam/list
 import gleam/option.{None, Some}
 import gleam/otp/actor
 import gleam/otp/factory_supervisor
+import gleam/result
 import gleam/string
 import gleeunit/should
 import nexus/bot
+import nexus/bot_registry
 import nexus/config
 import nexus/loop
 import nexus/openai
+import nexus/provider_registry
 import nexus/store
 import nexus/thread
+import nexus/thread_create
 import nexus/thread_registry
 import nexus/timing
 import nexus/tools
@@ -1214,14 +1218,33 @@ type Boot {
 
 /// Boot a registry over `seam` with the test config's default bundle —
 /// the hydration rigs (dormant threads rehydrate from their snapshots).
-fn boot(seam: store.Store) -> Boot {
-  boot_with_config(seam, test_config())
+/// `spec_captor` receives every child `ThreadSpec` the factory starts,
+/// so the rigs can assert WHICH toolset bundle a hydration selected
+/// (the persisted snapshot, not the boot default — the distinction a
+/// bare `get → Ok` cannot make).
+fn boot(
+  seam: store.Store,
+  spec_captor: process.Subject(thread.ThreadSpec),
+) -> Boot {
+  boot_with_config(seam, test_config(), spec_captor)
 }
 
-fn boot_with_config(seam: store.Store, cfg: config.Config) -> Boot {
+fn boot_with_config(
+  seam: store.Store,
+  cfg: config.Config,
+  spec_captor: process.Subject(thread.ThreadSpec),
+) -> Boot {
   let factory_name = process.new_name("nexus_hydration_factory")
   let assert Ok(_factory) =
-    factory_supervisor.start(thread_registry.factory_builder(factory_name))
+    factory_supervisor.start(
+      thread_registry.factory_builder_with_child(
+        factory_name,
+        fn(argument: thread_registry.ChildArgument) {
+          process.send(spec_captor, argument.spec)
+          thread_registry.thread_child(argument)
+        },
+      ),
+    )
   let assert Ok(started) =
     thread_registry.start(
       cfg,
@@ -1437,8 +1460,98 @@ pub fn create_from_bot_toolset_snapshot_test() {
   should.equal(stored.summary.toolset, tools.default_names(test_config()))
 }
 
+/// THE shared orchestration (the gap the registry-level snapshot tests
+/// leave): `thread_create.create_thread_from_bot` must carry `bot.tools`
+/// into the creation request — a regression that drops or mis-resolves
+/// the field would otherwise still pass. Real registries over the mock
+/// store, the bot created THROUGH the bot registry (catalog-checked).
+pub fn create_from_bot_orchestration_carries_bot_toolset_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  store_mock.ensure_fixture_provider(seam)
+  let cfg = test_config()
+  let assert Ok(started_bots) =
+    bot_registry.start(seam, process.new_name("nexus_orch_bots"), fn(names) {
+      tools.by_names(cfg, names) |> result.replace(names)
+    })
+  let bots = started_bots.data
+  // The provider registry's live model list, fixed: the orchestration
+  // re-validates the bot's alias against it before the registry runs.
+  let assert Ok(started_providers) =
+    provider_registry.start_with_model_fetcher(
+      cfg,
+      seam,
+      process.new_name("nexus_orch_providers"),
+      fn(_endpoint) { Ok(["alpha"]) },
+    )
+  let providers = started_providers.data
+  let factory_name = process.new_name("nexus_orch_factory")
+  let assert Ok(_factory) =
+    factory_supervisor.start(thread_registry.factory_builder(factory_name))
+  let assert Ok(started_registry) =
+    thread_registry.start(
+      cfg,
+      factory_supervisor.get_by_name(factory_name),
+      process.new_name("nexus_orch_registry"),
+      seam,
+      fixture_resolver(),
+    )
+  let registry = started_registry.data
+
+  // A toolset-carrying bot, created through the bot registry.
+  let assert Ok(bot_row) =
+    bot_registry.create_bot(
+      bots,
+      bot.BotParams(
+        name: "researcher",
+        description: "",
+        provider_id: store_mock.fixture_provider_id,
+        model: "alpha",
+        system_prompt: None,
+        tools: Some(["http_fetch"]),
+      ),
+    )
+  let assert Ok(summary) =
+    thread_create.create_thread_from_bot(
+      bots,
+      providers,
+      registry,
+      5000,
+      bot_row.id,
+    )
+  let assert Ok(stored) = seam.get_thread(summary.id)
+  should.equal(stored.summary.toolset, ["http_fetch"])
+  should.equal(stored.summary.meta.bot_id, Some(bot_row.id))
+
+  // The chat-only bot's empty set survives the same path.
+  let assert Ok(chat_bot) =
+    bot_registry.create_bot(
+      bots,
+      bot.BotParams(
+        name: "quiet",
+        description: "",
+        provider_id: store_mock.fixture_provider_id,
+        model: "alpha",
+        system_prompt: None,
+        tools: Some([]),
+      ),
+    )
+  let assert Ok(chat_summary) =
+    thread_create.create_thread_from_bot(
+      bots,
+      providers,
+      registry,
+      5000,
+      chat_bot.id,
+    )
+  let assert Ok(chat_stored) = seam.get_thread(chat_summary.id)
+  should.equal(chat_stored.summary.toolset, [])
+}
+
 /// A dormant thread's PERSISTED toolset rehydrates through the same
 /// cache a create uses — the snapshot wins over today's boot default.
+/// The captured child spec is the observable: the hydrated actor must
+/// carry the CHAT-ONLY bundle ([]), not the boot default's.
 pub fn dormant_toolset_rehydrates_through_snapshot_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
@@ -1448,11 +1561,14 @@ pub fn dormant_toolset_rehydrates_through_snapshot_test() {
   let assert Ok(Nil) =
     seam.insert_thread(stored_with_toolset("s-chat", []), "sys")
 
-  let booted = boot(seam)
+  let spec_captor = process.new_subject()
+  let booted = boot(seam, spec_captor)
   // Lazy start resolves [] through by_names (an empty bundle — valid:
   // a chat-only thread) instead of falling back to the default bundle.
   thread_registry.get(booted.registry, "s-chat")
   |> should.be_ok
+  let assert Ok(spec) = process.receive(spec_captor, 5000)
+  should.equal(spec.toolset.names, [])
 }
 
 /// A snapshot naming a tool absent from the compiled code fails
@@ -1466,7 +1582,8 @@ pub fn absent_tool_name_hydration_fails_loud_test() {
   let assert Ok(Nil) =
     seam.insert_thread(stored_with_toolset("s-gone", ["vanished"]), "sys")
 
-  let booted = boot(seam)
+  let spec_captor = process.new_subject()
+  let booted = boot(seam, spec_captor)
   thread_registry.get(booted.registry, "s-gone")
   |> should.equal(Error(Nil))
   // Still listed (dormant), still refusing.
@@ -1476,6 +1593,9 @@ pub fn absent_tool_name_hydration_fails_loud_test() {
   )
   thread_registry.get(booted.registry, "s-gone")
   |> should.equal(Error(Nil))
+  // No child was ever started — the loud refusal never silently falls
+  // back to any bundle.
+  let assert Error(Nil) = process.receive(spec_captor, 300)
 }
 
 /// The snapshot keeps its envelope across a restart under a registry
@@ -1498,13 +1618,18 @@ pub fn toolset_snapshot_survives_changed_default_config_test() {
     "http_fetch",
     "codemode",
   ])
-  let booted = boot_with_config(seam, codemode_on)
+  let spec_captor = process.new_subject()
+  let booted = boot_with_config(seam, codemode_on, spec_captor)
 
   // The thread starts — with ITS snapshot ("web_search" resolves
-  // config-independently), not the new default. The bundle's names are
-  // the persisted tuple; the config-independent schemas are pinned by
-  // tools_test, the wire bytes by loop_test.
+  // config-independently), not the new default. The captured child spec
+  // is the observable that the persisted tuple SELECTED the bundle: a
+  // fallback-to-default design would hand the actor
+  // ["http_fetch", "codemode"] here. The config-independent schemas are
+  // pinned by tools_test, the wire bytes by loop_test.
   thread_registry.get(booted.registry, "s-pin") |> should.be_ok
+  let assert Ok(spec) = process.receive(spec_captor, 5000)
+  should.equal(spec.toolset.names, ["web_search"])
   let assert Ok(stored) = seam.get_thread("s-pin")
   should.equal(stored.summary.toolset, ["web_search"])
 }
