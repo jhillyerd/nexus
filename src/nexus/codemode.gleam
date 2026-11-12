@@ -26,10 +26,11 @@
 //// propagate to links.
 ////
 //// This module is deliberately a leaf — it must not import
-//// `nexus/tools`: the registry (`tools.default`) builds the host list
-//// from the sibling specs and appends the codemode tool itself, so
-//// codemode is structurally absent from its own `tools` table (recursion
-//// guard) and the schema list stays frozen per boot (KV-cache contract
+//// `nexus/tools`: the registry (`tools.by_names`; `tools.default` is its
+//// boot wrapper) builds the host list from the sibling specs and appends
+//// the codemode tool itself, so codemode is structurally absent from its
+//// own `tools` table (recursion guard) and the schema list stays frozen
+//// per toolset — per boot for the default snapshot (KV-cache contract
 //// rule 4).
 ////
 //// Bounds (all documented in the tool description):
