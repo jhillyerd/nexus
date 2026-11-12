@@ -24,6 +24,7 @@ import nexus/provider
 import nexus/provider_registry
 import nexus/thread
 import nexus/thread_registry
+import nexus/tools
 import nexus/transcript
 import nexus/web
 import store_mock
@@ -248,12 +249,28 @@ type Created {
   Created(id: String, subject: process.Subject(thread.Msg))
 }
 
+/// Wrap a fake turn runner in the toolset bundle the registry seams now
+/// carry (#76): the default specs of the test config, named by their own
+/// wire names. The utility side refuses — these tests drive turns through
+/// the turn runner only.
+fn toolset(runner: thread.TurnRunner) -> thread.Toolset {
+  let specs = tools.default(test_config())
+  thread.Toolset(
+    names: list.map(specs, tools.tool_name),
+    specs: specs,
+    runner: runner,
+    utility_runner: fn(_endpoint, _tr, _cancel, _allow_pass) {
+      Error("no utility call in this test")
+    },
+  )
+}
+
 fn create(
   registry: process.Subject(thread_registry.Msg),
   model: String,
 ) -> Created {
   let assert Ok(summary) =
-    thread_registry.create_with_runner(
+    thread_registry.create_with_toolset(
       registry,
       thread_registry.NewThread(
         provider_id: store_mock.fixture_provider_id,
@@ -261,7 +278,7 @@ fn create(
         system_prompt: None,
         bot_id: None,
       ),
-      happy_runner,
+      toolset(happy_runner),
     )
   let assert Ok(subject) = thread_registry.get(registry, summary.id)
   Created(id: summary.id, subject: subject)
