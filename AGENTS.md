@@ -190,6 +190,19 @@ re-capture the fixture from a real thread via the integration smoke's
 hand-edit the JSON. The live half of the contract is that suite's cache
 gate: warm/cold TTFT median ratio ≤ 0.3.
 
+## e2e browser suite (per-worktree setup)
+
+`e2e/` is validation-only and its `node_modules` is not committed, so a
+fresh worktree fails with `Cannot find module 'playwright'` until you run
+`PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm --prefix e2e install` — sub-second,
+thanks to npm's global tarball cache. The Chromium binary is never
+per-worktree: it is shared machine-wide by revision at
+`~/.cache/ms-playwright` (the pinned playwright 1.64.1 uses
+`chromium-1248`), or comes from nixpkgs via `NIX_PLAYWRIGHT_CHROMIUM` in
+the `e2e/playwright.nix` shell. Do not `npx playwright ...` ad hoc — it
+fetches latest and drops a second, unpinned browser revision into the
+shared cache. Postgres/migrate preconditions: `e2e/README.md`.
+
 ## Gleam API pitfalls (training data lags the pinned toolchain)
 
 A flash model hit all three of these repeatedly during the issue #88
