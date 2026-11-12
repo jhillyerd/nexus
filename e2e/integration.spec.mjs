@@ -105,9 +105,11 @@ const CACHE_ALIAS = process.env.SMOKE_CACHE_ALIAS ?? "fractal/fast";
 // concrete backend alias from whatever /models actually returns.
 function pickAlias(options, preferences, label) {
   for (const pref of preferences) {
-    const exact = options.find((o) => o === pref);
+    // Resolved ids carry mixed case (Qwen3.6-35B…), the prefs are lowercase.
+    const want = pref.toLowerCase();
+    const exact = options.find((o) => o.toLowerCase() === want);
     if (exact) return exact;
-    const partial = options.find((o) => o.includes(pref));
+    const partial = options.find((o) => o.toLowerCase().includes(want));
     if (partial) return partial;
   }
   throw new Error(`no ${label} alias in [${options.join(", ")}]`);
@@ -526,7 +528,7 @@ async function main() {
       const reported = report.warmSamples.filter((x) => x.cached);
       if (reported.length > 0) {
         assert(
-          report.warmSamples.some(
+          reported.some(
             (x) => x.cached[0] / x.cached[1] >= 0.5,
           ),
           "cached/prompt tokens with a majority cache hit on warm turns",
