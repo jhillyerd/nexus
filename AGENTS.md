@@ -196,12 +196,16 @@ gate: warm/cold TTFT median ratio ≤ 0.3.
 fresh worktree fails with `Cannot find module 'playwright'` until you run
 `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm --prefix e2e install` — sub-second,
 thanks to npm's global tarball cache. The Chromium binary is never
-per-worktree: it is shared machine-wide by revision at
-`~/.cache/ms-playwright` (the pinned playwright 1.64.1 uses
-`chromium-1248`), or comes from nixpkgs via `NIX_PLAYWRIGHT_CHROMIUM` in
-the `e2e/playwright.nix` shell. Do not `npx playwright ...` ad hoc — it
-fetches latest and drops a second, unpinned browser revision into the
-shared cache. Postgres/migrate preconditions: `e2e/README.md`.
+per-worktree: it is shared per-user, revision-keyed, in Playwright's
+cache (`~/.cache/ms-playwright` on Linux, `~/Library/Caches/ms-playwright`
+on macOS; the pinned playwright 1.64.1 uses `chromium-1248`), or comes
+from nixpkgs via `NIX_PLAYWRIGHT_CHROMIUM` in the `e2e/playwright.nix`
+shell. On a machine with no cache yet, provision the browser with the
+pinned package's own CLI: `npm --prefix e2e exec -- playwright install
+chromium`. Never run a bare `npx playwright ...` — outside `e2e/` it
+resolves no local install, fetches latest, and drops a second, unpinned
+browser revision into the shared cache. Postgres/migrate preconditions:
+`e2e/README.md`.
 
 ## Gleam API pitfalls (training data lags the pinned toolchain)
 
