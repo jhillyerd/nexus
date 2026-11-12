@@ -12,3 +12,4 @@ e2e/requests.json
 e2e/failure-*.png
 e2e/integration-report.json
 e2e/cache-session.json
+e2e/cache-thread.json

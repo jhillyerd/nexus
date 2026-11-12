@@ -247,9 +247,11 @@ fn create_thread_response(
             thread_registry.NewThread(
               provider_id: ident,
               model: trimmed_model,
-              // POST /threads pins the config default; a bot-sourced
-              // create arrives through the BotCreate arm above instead.
+              // POST /threads pins the config default toolset; a
+              // bot-sourced create arrives through the BotCreate arm
+              // above instead (bots plan P2).
               system_prompt: None,
+              toolset: None,
               bot_id: None,
             )
           case
@@ -287,6 +289,9 @@ fn create_problem_status(problem: thread_create.CreateProblem) -> Int {
     // Post-validation registry refusals are races: the provider passed
     // the live check, then could not stream when the thread pinned it.
     thread_create.CreateFailed(thread_registry.EmptyModel) -> 400
+    // A stale bot's toolset named a tool outside the compiled catalog
+    // (bots plan P2): a client-data problem, refused like a bad alias.
+    thread_create.CreateFailed(thread_registry.UnknownToolset(_)) -> 400
     thread_create.CreateFailed(thread_registry.ProviderFailed(_)) -> 502
     thread_create.CreateFailed(thread_registry.StartFailed(_)) -> 503
   }
@@ -441,9 +446,12 @@ pub fn parse_provider_patch_json(
 }
 
 /// The POST /bots body: `{"name":…, "provider":…, "model":…,
-/// "description":…?, "system_prompt":…?}` — name/provider/model are
-/// required; a blank or absent `system_prompt` is the global default;
-/// a blank description is "".
+/// "description":…?, "system_prompt":…?, "tools":…?}` — name/provider/
+/// model are required; a blank or absent `system_prompt` is the global
+/// default; `tools` absent or null is the default set (resolved at
+/// thread creation), `[]` is chat-only, a non-empty array is an explicit
+/// list (bots plan P2; the registry validates the names against the
+/// compiled catalog).
 pub type BotCreateFields {
   BotCreateFields(
     name: String,
@@ -451,6 +459,7 @@ pub type BotCreateFields {
     provider_id: String,
     model: String,
     system_prompt: Option(String),
+    tools: Option(List(String)),
   )
 }
 
@@ -464,12 +473,20 @@ pub fn bot_create_fields_decoder() -> decode.Decoder(BotCreateFields) {
     None,
     decode.optional(decode.string),
   )
+  // Absent and null both flatten to None (the default-set sentinel);
+  // there is no create-time "keep the stored list" state to preserve.
+  use tools <- decode.optional_field(
+    "tools",
+    None,
+    decode.optional(decode.list(decode.string)),
+  )
   decode.success(BotCreateFields(
     name: name,
     description: description,
     provider_id: provider_id,
     model: model,
     system_prompt: system_prompt,
+    tools: tools,
   ))
 }
 
@@ -496,7 +513,10 @@ fn read_bot_create(
 /// keeps the stored value (normalized away here), while a present
 /// `description`/`system_prompt` always replaces (blank CLEARS — back
 /// to "" and back to the default prompt), so absent-vs-blank must stay
-/// distinguishable for exactly those two fields.
+/// distinguishable for exactly those two fields. `tools` is three-state
+/// (bots plan P2): absent keeps, null clears back to the default set,
+/// an array replaces — hence the nested Option, passed through to the
+/// registry verbatim.
 pub type BotPatchFields {
   BotPatchFields(
     name: Option(String),
@@ -504,6 +524,7 @@ pub type BotPatchFields {
     provider_id: Option(String),
     model: Option(String),
     system_prompt: Option(String),
+    tools: Option(Option(List(String))),
   )
 }
 
@@ -533,12 +554,29 @@ pub fn bot_patch_fields_decoder() -> decode.Decoder(BotPatchFields) {
     None,
     decode.optional(decode.string),
   )
+  use tools <- decode.optional_field(
+    "tools",
+    None,
+    // Three-state (bots plan P2), decided HERE because the inner
+    // decoder only runs for a PRESENT key: absent → the None default
+    // (keep); present null → decode.optional's None, mapped to
+    // Some(None) (clear back to the default set); present array →
+    // Some(Some(names)) (replace).
+    decode.optional(decode.list(decode.string))
+      |> decode.map(fn(list_or_null) {
+        case list_or_null {
+          None -> Some(None)
+          Some(names) -> Some(Some(names))
+        }
+      }),
+  )
   decode.success(BotPatchFields(
     name: blank_as_none(name),
     description: description,
     provider_id: blank_as_none(provider_id),
     model: blank_as_none(model),
     system_prompt: system_prompt,
+    tools: tools,
   ))
 }
 
@@ -821,6 +859,7 @@ fn create_bot_response(
                 provider_id: provider_id,
                 model: fields.model,
                 system_prompt: fields.system_prompt,
+                tools: fields.tools,
               ),
             )
           {
@@ -850,6 +889,7 @@ fn patch_bot_response(
           provider_id: fields.provider_id,
           model: fields.model,
           system_prompt: fields.system_prompt,
+          tools: fields.tools,
         )
       case bot.empty_update(patch) {
         True -> json_response(400, err_json("empty patch"))
@@ -952,6 +992,7 @@ pub fn bot_error_fields(error: bot_registry.RegistryError) -> #(Int, String) {
     bot_registry.Unknown -> 404
     bot_registry.InvalidName -> 400
     bot_registry.InvalidModel -> 400
+    bot_registry.InvalidTools(_) -> 400
     bot_registry.DuplicateName -> 409
     bot_registry.StoreFailed(_) -> 502
   }
@@ -1240,6 +1281,13 @@ pub fn bot_json(b: bot.Bot) -> Json {
     #("model", json.string(b.model)),
     #("system_prompt", case b.system_prompt {
       Some(prompt) -> json.string(prompt)
+      None -> json.null()
+    }),
+    // The live template's toolset (bots plan P2): null = the current
+    // default at thread-create time; [] = chat-only; else the explicit
+    // names, in wire order.
+    #("tools", case b.tools {
+      Some(names) -> json.array(names, json.string)
       None -> json.null()
     }),
     #("created_at", json.int(b.created_at)),

@@ -583,3 +583,113 @@ pub fn stop_consumed_mid_script_by_codemode_skips_rest_test() {
     }),
   )
 }
+
+// ---------------------------------------------------------------------------
+// The per-toolset envelope (bots plan P2): frozen_options is the ONE
+// construction site; the no-tools envelope is OMISSION.
+// ---------------------------------------------------------------------------
+
+/// A chat-only thread (empty toolset) sends NEITHER `tools` nor
+/// `tool_choice`: the encoder skips empty/None, and the omitted-fields
+/// envelope is frozen at creation like any other.
+pub fn frozen_options_chat_only_omits_tools_test() {
+  let opts = loop.frozen_options([])
+  should.equal(opts.tools, [])
+  should.equal(opts.tool_choice, None)
+
+  let tr =
+    transcript.new("alias-1", "sys")
+    |> transcript.append_user("hello")
+  let body = transcript.request_body(tr, opts)
+  should.be_false(string.contains(body, "\"tools\""))
+  should.be_false(string.contains(body, "\"tool_choice\""))
+}
+
+/// A non-empty toolset carries its schemas and auto tool choice, exactly
+/// as before P2 — the default toolset's envelope is byte-identical to the
+/// pre-phase one.
+pub fn frozen_options_nonempty_carries_schemas_and_auto_test() {
+  let opts = loop.frozen_options([echo_tool()])
+  should.equal(
+    opts.tool_choice,
+    Some(chat.ToolChoiceModeChoice(chat.ToolChoiceAuto)),
+  )
+  // The exact schema, not just the count: the envelope is the frozen
+  // prefix, so a wrong (or reordered) schema must fail here.
+  should.equal(opts.tools, [echo_tool().tool])
+
+  let tr =
+    transcript.new("alias-1", "sys")
+    |> transcript.append_user("hello")
+  let body = transcript.request_body(tr, opts)
+  should.be_true(string.contains(body, "\"tools\""))
+  should.be_true(string.contains(body, "\"tool_choice\""))
+}
+
+/// Split a serialized body at the messages/stream boundary — the m3
+/// golden's own shape: the messages array must grow by suffix only, and
+/// the envelope after it (stream, tools, tool_choice) must stay
+/// byte-identical.
+fn body_parts(body: String) -> #(String, String) {
+  case string.split(body, on: ",\"stream\"") {
+    [messages, envelope] -> #(messages, ",\"stream\"" <> envelope)
+    _ -> panic as "request body has no stream marker"
+  }
+}
+
+/// Per-thread byte stability with the envelope varying BY THREAD, not by
+/// turn: the same specs rebuild the same body, and growth is suffix-only
+/// (the chat-only form included).
+pub fn frozen_options_suffix_only_growth_per_toolset_test() {
+  let tr =
+    transcript.new("alias-1", "sys")
+    |> transcript.append_user("first")
+
+  let opts = loop.frozen_options([echo_tool()])
+  let opts_again = loop.frozen_options([echo_tool()])
+  should.equal(
+    transcript.request_body(tr, opts),
+    transcript.request_body(tr, opts_again),
+  )
+
+  // A second turn of the same thread: the messages array grows at the
+  // tail only, and the envelope (stream + tools + tool_choice) is
+  // byte-identical.
+  let tr2 = transcript.append_user(tr, "second")
+  let #(prev_messages, prev_envelope) =
+    body_parts(transcript.request_body(tr, opts))
+  let #(next_messages, next_envelope) =
+    body_parts(transcript.request_body(tr2, opts))
+  should.be_true(string.starts_with(
+    next_messages,
+    string.drop_end(prev_messages, 1),
+  ))
+  should.equal(prev_envelope, next_envelope)
+
+  // The chat-only form is equally byte-stable, with its omission
+  // envelope (no tools/tool_choice keys at all).
+  let chat_only = loop.frozen_options([])
+  let #(prev_messages, prev_envelope) =
+    body_parts(transcript.request_body(tr, chat_only))
+  should.be_false(string.contains(prev_envelope, "tools"))
+  let #(next_messages, next_envelope) =
+    body_parts(transcript.request_body(tr2, chat_only))
+  should.be_true(string.starts_with(
+    next_messages,
+    string.drop_end(prev_messages, 1),
+  ))
+  should.equal(prev_envelope, next_envelope)
+}
+
+/// Different toolsets get different envelopes BY DESIGN (the plan's
+/// accepted trade: the tools array stops sharing across different bots;
+/// threads of the same bot still share their system+tools head).
+pub fn frozen_options_divergent_toolsets_diverge_test() {
+  let tr =
+    transcript.new("alias-1", "sys")
+    |> transcript.append_user("hello")
+  let with_tools =
+    transcript.request_body(tr, loop.frozen_options([echo_tool()]))
+  let chat_only = transcript.request_body(tr, loop.frozen_options([]))
+  should.be_false(with_tools == chat_only)
+}

@@ -59,6 +59,11 @@ pub type StoredSummary {
     /// verbatim with the registry's live `Record` (`thread.ThreadMeta`,
     /// issue #75) so a new metadata column is one field in one place.
     meta: thread.ThreadMeta,
+    /// The resolved tool names persisted at creation (bots plan P2) —
+    /// the snapshot a dormant thread rehydrates its runner bundle from.
+    /// Never NULL-for-default: plain threads carry the default set's
+    /// names, bot threads the bot-resolved list.
+    toolset: List(String),
     /// Epoch seconds; bumped on turn commit.
     last_active_at: Int,
     /// Includes the system prompt (Phase 1 semantics).

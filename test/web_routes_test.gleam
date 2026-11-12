@@ -143,7 +143,10 @@ fn start_server_with(
   extra(providers)
   // The REAL bot registry over the same mock store (bots plan P1):
   // plain start — no crypto, no fetcher to fake.
-  let assert Ok(_bots) = bot_registry.start(persistence, bots_name)
+  let assert Ok(_bots) =
+    bot_registry.start(persistence, bots_name, fn(names) {
+      tools.by_names(cfg, names) |> result.replace(names)
+    })
   let assert Ok(started) =
     thread_registry.start(
       cfg,
@@ -276,6 +279,7 @@ fn create(
         provider_id: store_mock.fixture_provider_id,
         model: model,
         system_prompt: None,
+        toolset: None,
         bot_id: None,
       ),
       toolset(happy_runner),
@@ -1036,4 +1040,98 @@ pub fn create_thread_from_bot_test() {
     )),
     #(400, "{\"error\":\"bot conflicts with provider/model — pick one shape\"}"),
   )
+}
+
+// ---------------------------------------------------------------------------
+// Bots plan P2: the tools field on the /bots surface.
+// ---------------------------------------------------------------------------
+
+/// The POST/PATCH body decoders keep the three toolset states distinct:
+/// create flattens absent/null to the default sentinel; patch preserves
+/// absent (keep) vs null (clear) vs array (replace).
+pub fn bot_tools_body_decoders_test() {
+  // Create: absent and null both mean "the default set"; an array is an
+  // explicit list; [] is chat-only.
+  let assert Ok(fields) =
+    web.parse_bot_create_json(
+      "{\"name\":\"b\",\"provider\":\"p\",\"model\":\"m\"}",
+    )
+  should.equal(fields.tools, None)
+  let assert Ok(fields) =
+    web.parse_bot_create_json(
+      "{\"name\":\"b\",\"provider\":\"p\",\"model\":\"m\",\"tools\":null}",
+    )
+  should.equal(fields.tools, None)
+  let assert Ok(fields) =
+    web.parse_bot_create_json(
+      "{\"name\":\"b\",\"provider\":\"p\",\"model\":\"m\",\"tools\":[]}",
+    )
+  should.equal(fields.tools, Some([]))
+  let assert Ok(fields) =
+    web.parse_bot_create_json(
+      "{\"name\":\"b\",\"provider\":\"p\",\"model\":\"m\",\"tools\":[\"http_fetch\"]}",
+    )
+  should.equal(fields.tools, Some(["http_fetch"]))
+
+  // Patch: absent keeps (None), null clears (Some(None)), array replaces
+  // (Some(Some)).
+  let assert Ok(patch) = web.parse_bot_patch_json("{\"description\":\"d\"}")
+  should.equal(patch.tools, None)
+  let assert Ok(patch) = web.parse_bot_patch_json("{\"tools\":null}")
+  should.equal(patch.tools, Some(None))
+  let assert Ok(patch) =
+    web.parse_bot_patch_json("{\"tools\":[\"http_fetch\",\"codemode\"]}")
+  should.equal(patch.tools, Some(Some(["http_fetch", "codemode"])))
+}
+
+/// The /bots routes validate toolsets against the REAL compiled catalog
+/// (the injected seam boot wires): unknown names are a 400, valid ones
+/// echo back on GET — and a bot carrying an explicit toolset creates
+/// threads fine (the registry snapshots the resolved names; the create's
+/// mechanics are pinned by thread_registry_test).
+pub fn bots_route_toolset_validation_test() {
+  let #(_registry, port) = start_server()
+
+  // Unknown name -> 400 with the catalog checker's text.
+  should.equal(
+    send_authorized(req(
+      port,
+      Post,
+      "/bots",
+      "{\"name\":\"Bad\",\"provider\":\"p-test\",\"model\":\"alias-a\",\"tools\":[\"ghost\"]}",
+    )),
+    #(400, "{\"error\":\"unknown tool name: ghost\"}"),
+  )
+
+  // A valid chat-only bot round-trips its toolset on the wire.
+  let assert #(201, created) =
+    send_authorized(req(
+      port,
+      Post,
+      "/bots",
+      "{\"name\":\"Quiet\",\"provider\":\"p-test\",\"model\":\"alias-a\",\"tools\":[]}",
+    ))
+  should.be_true(string.contains(created, "\"tools\":[]"))
+
+  // The rejected create consumed no id: the chat-only bot is b1.
+  // PATCH: null clears back to the default (tools becomes null on the
+  // wire); an array replaces; absent keeps.
+  let assert #(200, cleared) =
+    send_authorized(req(port, Patch, "/bots/b1", "{\"tools\":null}"))
+  should.be_true(string.contains(cleared, "\"tools\":null"))
+
+  let assert #(200, replaced) =
+    send_authorized(req(port, Patch, "/bots/b1", "{\"tools\":[\"http_fetch\"]}"))
+  should.be_true(string.contains(replaced, "\"tools\":[\"http_fetch\"]"))
+
+  let assert #(200, kept) =
+    send_authorized(req(port, Patch, "/bots/b1", "{\"description\":\"d\"}"))
+  should.be_true(string.contains(kept, "\"tools\":[\"http_fetch\"]"))
+
+  let assert #(200, listed) = send_authorized(req(port, Get, "/bots", ""))
+  should.be_true(string.contains(listed, "\"tools\":[\"http_fetch\"]"))
+
+  // The toolset-carrying bot creates a thread fine.
+  let assert #(201, _thread) =
+    send_authorized(req(port, Post, "/threads", "{\"bot\":\"b1\"}"))
 }

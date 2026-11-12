@@ -57,12 +57,27 @@ fn params(name: String) -> bot.BotParams {
     provider_id: store_mock.fixture_provider_id,
     model: "alias-1",
     system_prompt: None,
+    tools: None,
   )
 }
 
 fn start_registry(seam: store.Store) -> process.Subject(bot_registry.Msg) {
+  start_registry_with_validator(seam, fn(names) { Ok(names) })
+}
+
+/// `validate_tools` is the injected catalog seam; most tests pass the
+/// identity (tool NAMES are not their subject), the toolset tests pass a
+/// closed fake catalog.
+fn start_registry_with_validator(
+  seam: store.Store,
+  validate_tools: bot_registry.ValidateTools,
+) -> process.Subject(bot_registry.Msg) {
   let assert Ok(started) =
-    bot_registry.start(seam, process.new_name("nexus_bot_registry_test"))
+    bot_registry.start(
+      seam,
+      process.new_name("nexus_bot_registry_test"),
+      validate_tools,
+    )
   started.data
 }
 
@@ -80,6 +95,7 @@ pub fn boot_loads_and_mints_past_stored_ids_test() {
       provider_id: store_mock.fixture_provider_id,
       model: "alias-1",
       system_prompt: None,
+      tools: None,
       created_at: 1_700_000_000,
       updated_at: 1_700_000_000,
     ))
@@ -109,6 +125,7 @@ pub fn crud_round_trip_test() {
         provider_id: store_mock.fixture_provider_id,
         model: " alias-2 ",
         system_prompt: Some("  "),
+        tools: None,
       ),
     )
   should.equal(created.name, "Researcher")
@@ -136,6 +153,7 @@ pub fn crud_round_trip_test() {
         provider_id: None,
         model: Some("alias-3"),
         system_prompt: Some("be terse"),
+        tools: None,
       ),
     )
   should.equal(updated.name, "Researcher")
@@ -153,6 +171,7 @@ pub fn crud_round_trip_test() {
         provider_id: None,
         model: None,
         system_prompt: Some(""),
+        tools: None,
       ),
     )
   should.equal(cleared.system_prompt, None)
@@ -188,6 +207,7 @@ pub fn duplicate_name_pre_check_test() {
       provider_id: None,
       model: None,
       system_prompt: None,
+      tools: None,
     ),
   )
   |> should.equal(Error(bot_registry.DuplicateName))
@@ -207,6 +227,7 @@ pub fn unknown_id_update_delete_refused_test() {
       provider_id: None,
       model: None,
       system_prompt: None,
+      tools: None,
     ),
   )
   |> should.equal(Error(bot_registry.Unknown))
@@ -239,6 +260,7 @@ pub fn invalid_name_and_model_refused_test() {
         provider_id: None,
         model: None,
         system_prompt: None,
+        tools: None,
       ),
     )
   should.equal(kept.name, "ok")
@@ -308,4 +330,166 @@ pub fn provider_shape_test() {
       updated_at: fixture.updated_at,
     ),
   )
+}
+
+// ---------------------------------------------------------------------------
+// Per-bot toolsets (bots plan P2): save-time validation and normalization.
+// ---------------------------------------------------------------------------
+
+/// A fake catalog checker over a closed name list, reporting the first
+/// unknown name exactly like `tools.by_names` does.
+fn catalog_checker(known: List(String)) -> bot_registry.ValidateTools {
+  fn(names) {
+    case list.find(names, fn(name) { !list.contains(known, name) }) {
+      Ok(unknown) -> Error("unknown tool name: " <> unknown)
+      Error(_) -> Ok(names)
+    }
+  }
+}
+
+/// The catalog seam refuses unknown names; the registry surfaces the
+/// checker's reason verbatim (`InvalidTools`), on create and patch alike,
+/// and the store never sees the rejected rows.
+pub fn unknown_tool_name_refused_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  store_mock.ensure_fixture_provider(seam)
+  let registry =
+    start_registry_with_validator(
+      seam,
+      catalog_checker([
+        "http_fetch",
+        "web_search",
+      ]),
+    )
+
+  bot_registry.create_bot(
+    registry,
+    bot.BotParams(
+      ..params("tooled"),
+      tools: Some([
+        "http_fetch",
+        "nope",
+      ]),
+    ),
+  )
+  |> should.equal(Error(bot_registry.InvalidTools("unknown tool name: nope")))
+
+  let assert Ok(created) = bot_registry.create_bot(registry, params("plain"))
+  bot_registry.update_bot(
+    registry,
+    created.id,
+    bot.BotUpdate(
+      name: None,
+      description: None,
+      provider_id: None,
+      model: None,
+      system_prompt: None,
+      tools: Some(Some(["web_search", "ghost"])),
+    ),
+  )
+  |> should.equal(Error(bot_registry.InvalidTools("unknown tool name: ghost")))
+
+  // Only the one VALID create reached the store; both rejections were
+  // refused before any write.
+  let assert [plain_stored] = store_mock.bots(mock)
+  should.equal(plain_stored.id, created.id)
+}
+
+/// Save-time normalization (the structural half): entries are trimmed,
+/// blanks dropped, duplicates removed — first occurrence wins, because a
+/// toolset is a set and the name tuple is the cache key. An explicit
+/// empty list is the legitimate chat-only set; `[""]` is a refusal (the
+/// caller meant a list and wrote none).
+pub fn toolset_normalization_test() {
+  let seam = store_mock.seam(store_mock.start())
+  store_mock.ensure_fixture_provider(seam)
+  let registry =
+    start_registry_with_validator(
+      seam,
+      catalog_checker([
+        "http_fetch",
+        "web_search",
+      ]),
+    )
+
+  let assert Ok(created) =
+    bot_registry.create_bot(
+      registry,
+      bot.BotParams(
+        ..params("messy"),
+        tools: Some([
+          "  http_fetch ",
+          "",
+          "web_search",
+          "http_fetch",
+        ]),
+      ),
+    )
+  should.equal(created.tools, Some(["http_fetch", "web_search"]))
+
+  // Chat-only survives normalization verbatim.
+  let assert Ok(chat_only) =
+    bot_registry.create_bot(
+      registry,
+      bot.BotParams(..params("quiet"), tools: Some([])),
+    )
+  should.equal(chat_only.tools, Some([]))
+
+  // `[""]` refuses: an explicit list with no name in it.
+  bot_registry.create_bot(
+    registry,
+    bot.BotParams(..params("blank"), tools: Some(["   "])),
+  )
+  |> should.equal(
+    Error(bot_registry.InvalidTools(bot.describe(bot.InvalidTools))),
+  )
+
+  // PATCH three-state: a present list replaces (normalized), a present
+  // null clears back to the default, absent keeps.
+  let assert Ok(replaced) =
+    bot_registry.update_bot(
+      registry,
+      created.id,
+      bot.BotUpdate(
+        name: None,
+        description: None,
+        provider_id: None,
+        model: None,
+        system_prompt: None,
+        tools: Some(Some(["web_search"])),
+      ),
+    )
+  should.equal(replaced.tools, Some(["web_search"]))
+
+  let assert Ok(cleared) =
+    bot_registry.update_bot(
+      registry,
+      created.id,
+      bot.BotUpdate(
+        name: None,
+        description: None,
+        provider_id: None,
+        model: None,
+        system_prompt: None,
+        tools: Some(None),
+      ),
+    )
+  should.equal(cleared.tools, None)
+
+  let assert Ok(kept) =
+    bot_registry.update_bot(
+      registry,
+      created.id,
+      bot.BotUpdate(
+        name: None,
+        description: Some("a description"),
+        provider_id: None,
+        model: None,
+        system_prompt: None,
+        tools: None,
+      ),
+    )
+  should.equal(kept.tools, None)
+  should.equal(kept.description, "a description")
 }

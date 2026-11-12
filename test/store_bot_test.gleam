@@ -20,6 +20,7 @@ fn row(id: String, name: String) -> store.StoredBot {
     provider_id: store_mock.fixture_provider_id,
     model: "alias-1",
     system_prompt: None,
+    tools: None,
     created_at: 1_700_000_000,
     updated_at: 1_700_000_000,
   )
@@ -42,6 +43,7 @@ fn summary(id: String, bot_id: option.Option(String)) -> store.StoredSummary {
       created_at: 1_700_000_000,
     ),
     last_active_at: 1_700_000_000,
+    toolset: [],
     message_count: 1,
   )
 }
@@ -60,12 +62,22 @@ pub fn bot_crud_round_trips_test() {
   should.equal(got.name, "one")
   should.equal(got.system_prompt, None)
 
+  // The toolset rides the update and survives the read-back (the seam
+  // mapping's new P2 field — persist.gleam marshals it to the two SQL
+  // parameters, NULL sentinel included).
   let assert Ok(Nil) =
-    seam.update_bot(bot.Bot(..row("b1", "renamed"), system_prompt: Some("p")))
+    seam.update_bot(
+      bot.Bot(
+        ..row("b1", "renamed"),
+        system_prompt: Some("p"),
+        tools: Some(["http_fetch"]),
+      ),
+    )
 
   let assert Ok(updated) = seam.get_bot("b1")
   should.equal(updated.name, "renamed")
   should.equal(updated.system_prompt, Some("p"))
+  should.equal(updated.tools, Some(["http_fetch"]))
 
   let assert Ok(all) = seam.list_bots()
   should.equal(all |> list.map(fn(b) { b.id }), ["b1"])

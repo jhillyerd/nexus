@@ -110,6 +110,7 @@ fn pinned_thread(id: String, provider_id: String) -> store.StoredSummary {
     model: "alias-1",
     meta: fresh_meta(),
     last_active_at: 1_700_000_000,
+    toolset: [],
     message_count: 1,
   )
 }

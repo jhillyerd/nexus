@@ -13,6 +13,7 @@
 //// same way `thread.ThreadMeta` is (issue #75's one-type rule).
 //// Everything bot-sourced is hostile text under the UI contract.
 
+import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/string
 
@@ -41,6 +42,14 @@ pub type Bot {
     /// verbatim, never amended (the same default-versus-explicit rule
     /// as an explicit `NEXUS_SYSTEM_PROMPT`).
     system_prompt: Option(String),
+    /// The toolset new threads snapshot (bots plan P2, the live template
+    /// half): `None` = the CURRENT default set, resolved at thread
+    /// creation so the bot stays a live template; `Some([])` =
+    /// deliberately empty (a chat-only bot); `Some(names)` = an explicit
+    /// list, validated against the compiled-in catalog at save time and
+    /// re-validated at thread create. Order here is the wire order of
+    /// the resolved schemas.
+    tools: Option(List(String)),
     /// Epoch seconds.
     created_at: Int,
     /// Epoch seconds; bumped on update.
@@ -58,6 +67,9 @@ pub type BotParams {
     provider_id: String,
     model: String,
     system_prompt: Option(String),
+    /// Same three-state semantics as `Bot.tools`; normalized by
+    /// `validate_tools` (trimmed, blank entries dropped, deduplicated).
+    tools: Option(List(String)),
   )
 }
 
@@ -85,6 +97,11 @@ pub type BotUpdate {
     /// Present replaces (blank clears back to the default); absent
     /// keeps.
     system_prompt: Option(String),
+    /// Three-state (present-null vs present-list vs absent must stay
+    /// distinct, so the decoder nests): absent keeps the stored list;
+    /// `Some(None)` clears back to the default; `Some(Some(names))`
+    /// replaces with an explicit list (validated like a create).
+    tools: Option(Option(List(String))),
   )
 }
 
@@ -95,6 +112,11 @@ pub type BotError {
   /// A blank model alias (the create-time rule: a thread only ever
   /// exists with a non-empty pin).
   InvalidModel
+  /// A submitted toolset whose entries are all blank (the structural
+  /// half of tool validation — see `validate_tools`). Unknown NAMES are
+  /// refused by the registry's catalog check, not here: this module has
+  /// no catalog access (it stays pure domain).
+  InvalidTools
 }
 
 /// Fixed human-readable error text.
@@ -102,6 +124,8 @@ pub fn describe(error: BotError) -> String {
   case error {
     InvalidName -> "bot name must be non-empty after trimming"
     InvalidModel -> "bot model must be non-empty after trimming"
+    InvalidTools ->
+      "bot tools must contain at least one non-blank name when set"
   }
 }
 
@@ -136,8 +160,36 @@ pub fn normalize_prompt(prompt: Option(String)) -> Option(String) {
   }
 }
 
+/// Normalize a submitted toolset (bots plan P2): each entry trimmed,
+/// blanks dropped, duplicates removed (first occurrence wins — a
+/// toolset is a set, and duplicates would send one schema twice and
+/// make the name tuple → envelope mapping order-dependent). `None`
+/// passes through (the default). An input that held entries but
+/// normalizes to nothing (`[""]`) is a structural refusal — the caller
+/// meant an explicit list and wrote none; the DELIBERATE empty list is
+/// written as `[]`, not `[""]`.
+pub fn normalize_tools(
+  tools: Option(List(String)),
+) -> Result(Option(List(String)), BotError) {
+  case tools {
+    None -> Ok(None)
+    Some(names) -> {
+      let cleaned =
+        names
+        |> list.map(string.trim)
+        |> list.filter(fn(name) { name != "" })
+        |> list.unique
+      case cleaned, names {
+        [], [_, ..] -> Error(InvalidTools)
+        _, _ -> Ok(Some(cleaned))
+      }
+    }
+  }
+}
+
 /// Build a fresh row from validated params (id and stamps are the
-/// registry's — it mints the id and owns the clock).
+/// registry's — it mints the id and owns the clock; the toolset is
+/// normalized + catalog-checked before this runs).
 pub fn to_row(
   params: BotParams,
   id: String,
@@ -152,6 +204,7 @@ pub fn to_row(
     provider_id: params.provider_id,
     model: model,
     system_prompt: normalize_prompt(params.system_prompt),
+    tools: params.tools,
     created_at: now,
     updated_at: now,
   )
@@ -180,6 +233,10 @@ pub fn apply_update(row: Bot, update: BotUpdate, now: Int) -> Bot {
       Some(text) -> normalize_prompt(Some(text))
       None -> row.system_prompt
     },
+    tools: case update.tools {
+      Some(tools) -> tools
+      None -> row.tools
+    },
     updated_at: now,
   )
 }
@@ -205,4 +262,5 @@ pub fn empty_update(update: BotUpdate) -> Bool {
   && option.is_none(update.provider_id)
   && option.is_none(update.model)
   && option.is_none(update.system_prompt)
+  && option.is_none(update.tools)
 }

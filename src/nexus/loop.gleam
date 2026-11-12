@@ -8,8 +8,9 @@
 //// - the transcript is only ever appended to, through `nexus/transcript`;
 ////   every model call re-encodes the whole (immutable) message list, so
 ////   prefixes stay byte-identical (KV-cache contract rule 4);
-//// - the tool schema is whatever the caller passes — built once at boot
-////   from the global config, frozen for the VM's lifetime;
+//// - the tool schema is whatever the caller passes — built once per
+////   toolset (boot for the default set, first use for any other; bots
+////   plan P2), frozen for the registry's lifetime;
 //// - cancellation: the cancel subject is threaded through every stream
 ////   call; a stop between iterations aborts immediately, and a stop
 ////   observed mid-round (before a dispatch) skips every not-yet-started
@@ -108,19 +109,28 @@ pub fn endpoint_stream(endpoint: openai.Endpoint) -> StreamFn {
   }
 }
 
-/// The frozen request envelope: streaming on, the boot-built tool schemas,
-/// auto tool choice. This is the ONE construction site — both the agent
-/// loop and the utility runner consume it, so their envelopes are
-/// byte-identical by construction (KV-cache contract): the tool schema is
-/// built once at boot from the global config, never per thread, and
+/// The frozen request envelope: streaming on, the toolset's schemas, auto
+/// tool choice — the ONE construction site. Both the agent loop and the
+/// utility runner consume it, so their envelopes are byte-identical by
+/// construction (KV-cache contract): the tool schema is built once per
+/// toolset at registry boot or first use, never per request, and
 /// generation-side params (the utility's only delta,
 /// `max_completion_tokens`) do not tokenize into the prompt.
+///
+/// The no-tools envelope is OMISSION (bots plan P2): an empty toolset —
+/// a chat-only thread — sends neither `tools` nor `tool_choice`. The
+/// encoder already skips both for empty/None; this is where the
+/// per-toolset shape is decided, and the omitted-fields envelope is
+/// frozen at creation like any other.
 pub fn frozen_options(specs: List(ToolSpec)) -> Options {
   transcript.Options(
     ..transcript.default_options(),
     stream: True,
     tools: tools.schemas(specs),
-    tool_choice: Some(chat.ToolChoiceModeChoice(chat.ToolChoiceAuto)),
+    tool_choice: case specs {
+      [] -> None
+      _ -> Some(chat.ToolChoiceModeChoice(chat.ToolChoiceAuto))
+    },
   )
 }
 

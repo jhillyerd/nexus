@@ -3,5 +3,10 @@
 -- Postgres exposes no parameter nullability, so squirrel parameters cannot
 -- be nullable and the sentinel is its documented workaround (see
 -- insert_provider.sql).
-insert into bot (id, name, description, provider_id, model, system_prompt, created_at, updated_at)
-values ($1, $2, $3, $4, $5, nullif($6, ''), to_timestamp($7), to_timestamp($7))
+-- `tools` (bots plan P2) has TWO parameters for the same reason: $7 is the
+-- explicit name list ('{}' = chat-only — an EMPTY array is meaningful, so
+-- no nullif-style value sentinel can express NULL) and $8 is the
+-- is-default flag — true inserts NULL = resolve the current default set
+-- at thread creation.
+insert into bot (id, name, description, provider_id, model, system_prompt, tools, created_at, updated_at)
+values ($1, $2, $3, $4, $5, nullif($6, ''), case when $8::boolean then null else $7::text[] end, to_timestamp($9), to_timestamp($9))

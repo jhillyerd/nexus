@@ -631,9 +631,11 @@ type State {
   )
 }
 
-/// The real turn runner (M3): the bounded agent loop over the frozen tool
-/// registry. `specs` is built once at boot from the global config — never
-/// per thread — so the tool schema is identical in every request; the
+/// The real turn runner (M3): the bounded agent loop over the given
+/// toolset's specs. The specs come from the registry's per-toolset bundle
+/// — built once per toolset (boot for the default, first use for any
+/// other; bots plan P2), never per request — so the tool schema is
+/// identical in every request of every thread of that toolset; the
 /// endpoint arrives per call and is the thread's frozen one.
 pub fn agent_runner(
   max_iterations: Int,

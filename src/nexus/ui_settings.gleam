@@ -112,17 +112,23 @@ pub type Msg {
   BotAddToggled
   /// The add-bot form submitted. `system_prompt` blank = the global
   /// default (resolved when a thread is created from the bot).
+  /// `tools` is the raw comma-separated field; `chat_only` is the
+  /// checkbox state (bots plan P2 — parsing happens in the effect).
   BotSubmitted(
     name: String,
     description: String,
     provider_id: String,
     model: String,
     system_prompt: String,
+    tools: String,
+    chat_only: Bool,
   )
   BotEditToggled(id: String)
   /// The edit form submitted: blank name/model/provider keep the stored
   /// values; a blank system prompt CLEARS back to the default (a real
-  /// change — the two field classes in `bot.BotUpdate`).
+  /// change — the two field classes in `bot.BotUpdate`). The tools field
+  /// is always present (prefilled), so the patch replaces — untouched
+  /// resubmits the stored list verbatim (bots plan P2).
   BotEditSubmitted(
     id: String,
     name: String,
@@ -130,6 +136,8 @@ pub type Msg {
     provider_id: String,
     model: String,
     system_prompt: String,
+    tools: String,
+    chat_only: Bool,
   )
   BotDeleteRequested(id: String)
   BotDeleteCancelled
@@ -334,7 +342,15 @@ pub fn update(
       [],
     )
 
-    BotSubmitted(name, description, provider_id, model, system_prompt) -> #(
+    BotSubmitted(
+      name,
+      description,
+      provider_id,
+      model,
+      system_prompt,
+      tools,
+      chat_only,
+    ) -> #(
       State(..state, bots_open: False),
       create_bot_effect(
         bots,
@@ -343,6 +359,8 @@ pub fn update(
         provider_id,
         model,
         system_prompt,
+        tools,
+        chat_only,
       ),
       [],
     )
@@ -367,7 +385,16 @@ pub fn update(
       [],
     )
 
-    BotEditSubmitted(id, name, description, provider_id, model, system_prompt) -> #(
+    BotEditSubmitted(
+      id,
+      name,
+      description,
+      provider_id,
+      model,
+      system_prompt,
+      tools,
+      chat_only,
+    ) -> #(
       State(..state, bot_edit: None),
       update_bot_effect(
         bots,
@@ -377,6 +404,8 @@ pub fn update(
         provider_id,
         model,
         system_prompt,
+        tools,
+        chat_only,
       ),
       [],
     )
@@ -612,6 +641,16 @@ fn bot_row(
             html.text(truncate_preview(prompt, 120)),
           ])
       },
+      // The toolset display (bots plan P2): what NEW threads from this
+      // bot will snapshot — the live template, not any thread's frozen
+      // copy.
+      html.span([attr.class("provider-sub muted")], [
+        html.text(case b.tools {
+          None -> "default tools"
+          Some([]) -> "no tools (chat only)"
+          Some(names) -> "tools: " <> string.join(names, ", ")
+        }),
+      ]),
     ]),
     html.div([attr.class("row-controls")], [
       control("Edit", "Edit this bot", BotEditToggled(id)),
@@ -676,6 +715,25 @@ fn bot_row(
             None -> ""
           },
         ),
+        html.input([
+          attr.type_("text"),
+          attr.name("tools"),
+          attr.value(case b.tools {
+            Some(names) -> string.join(names, ", ")
+            None -> ""
+          }),
+          attr.placeholder("Tools, comma-separated (blank = default)"),
+          attr.aria("label", "Tools for " <> b.name),
+        ]),
+        html.label([attr.class("checkbox-field")], [
+          html.input([
+            attr.type_("checkbox"),
+            attr.name("chat_only"),
+            attr.value("on"),
+            attr.checked(b.tools == Some([])),
+          ]),
+          html.text("Chat only (no tools)"),
+        ]),
         html.div([attr.class("provider-form-buttons")], [
           html.button([attr.type_("submit")], [html.text("Save")]),
           html.button(
@@ -774,6 +832,20 @@ fn add_bot_form(state: State, provider_list: List(Provider)) -> Element(Msg) {
         ],
         "",
       ),
+      html.input([
+        attr.type_("text"),
+        attr.name("tools"),
+        attr.placeholder("Tools, comma-separated (blank = default)"),
+        attr.aria("label", "New bot tools"),
+      ]),
+      html.label([attr.class("checkbox-field")], [
+        html.input([
+          attr.type_("checkbox"),
+          attr.name("chat_only"),
+          attr.value("on"),
+        ]),
+        html.text("Chat only (no tools)"),
+      ]),
       html.div([attr.class("provider-form-buttons")], [
         html.button([attr.type_("submit")], [html.text("Add bot")]),
         html.button([attr.type_("button"), event.on_click(BotAddToggled)], [
@@ -1134,6 +1206,8 @@ fn create_bot_effect(
   provider_id: String,
   model: String,
   system_prompt: String,
+  tools: String,
+  chat_only: Bool,
 ) -> Effect(Msg) {
   let params =
     bot.BotParams(
@@ -1145,6 +1219,7 @@ fn create_bot_effect(
         "" -> None
         prompt -> Some(prompt)
       },
+      tools: parse_tools_field(tools, chat_only),
     )
   effect.from(fn(dispatch) {
     case bot_registry.create_bot(bots, params) {
@@ -1167,6 +1242,8 @@ fn update_bot_effect(
   provider_id: String,
   model: String,
   system_prompt: String,
+  tools: String,
+  chat_only: Bool,
 ) -> Effect(Msg) {
   let patch =
     bot.BotUpdate(
@@ -1175,6 +1252,10 @@ fn update_bot_effect(
       provider_id: keep_blank(provider_id),
       model: keep_blank(model),
       system_prompt: Some(system_prompt),
+      // The tools field is always present (prefilled), so the patch
+      // always replaces — an untouched form resubmits the stored list
+      // verbatim; blank clears back to the default set (bots plan P2).
+      tools: Some(parse_tools_field(tools, chat_only)),
     )
   effect.from(fn(dispatch) {
     case bot_registry.update_bot(bots, id, patch) {
@@ -1182,6 +1263,28 @@ fn update_bot_effect(
       Error(error) -> dispatch(BotMutateFailed(bot_registry.describe(error)))
     }
   })
+}
+
+/// The form's tool fields → the bot's three-state toolset (bots plan
+/// P2): the chat-only checkbox wins (`Some([])`); otherwise the
+/// comma-separated names (trimmed, blanks dropped) — none left means
+/// the default set (`None`). An explicit empty list is unreachable from
+/// the form without the checkbox, which is the point: blank MEANS the
+/// default here.
+fn parse_tools_field(text: String, chat_only: Bool) -> Option(List(String)) {
+  case chat_only {
+    True -> Some([])
+    False ->
+      case
+        text
+        |> string.split(",")
+        |> list.map(string.trim)
+        |> list.filter(fn(name) { name != "" })
+      {
+        [] -> None
+        names -> Some(names)
+      }
+  }
 }
 
 /// Hard delete (two-step confirmed): no guard — a bot's threads keep
@@ -1290,17 +1393,20 @@ fn bot_submitted() -> attr.Attribute(Msg) {
       form_field(entries, "description"),
       form_field(entries, "provider"),
       form_field(entries, "model"),
-      form_field(entries, "system_prompt")
+      form_field(entries, "system_prompt"),
+      form_field(entries, "tools")
     {
-      Ok(name), description, Ok(provider_id), Ok(model), prompt ->
+      Ok(name), description, Ok(provider_id), Ok(model), prompt, tools ->
         BotSubmitted(
           name,
           result.unwrap(description, ""),
           provider_id,
           model,
           result.unwrap(prompt, ""),
+          result.unwrap(tools, ""),
+          result.is_ok(form_field(entries, "chat_only")),
         )
-      _, _, _, _, _ -> Ignored
+      _, _, _, _, _, _ -> Ignored
     }
   })
   |> server_component.include(["detail.formData"])
@@ -1315,9 +1421,10 @@ fn bot_edit_submitted(id: String) -> attr.Attribute(Msg) {
       form_field(entries, "description"),
       form_field(entries, "provider"),
       form_field(entries, "model"),
-      form_field(entries, "system_prompt")
+      form_field(entries, "system_prompt"),
+      form_field(entries, "tools")
     {
-      Ok(name), description, provider_id, Ok(model), prompt ->
+      Ok(name), description, provider_id, Ok(model), prompt, tools ->
         BotEditSubmitted(
           id,
           name,
@@ -1325,8 +1432,10 @@ fn bot_edit_submitted(id: String) -> attr.Attribute(Msg) {
           result.unwrap(provider_id, ""),
           model,
           result.unwrap(prompt, ""),
+          result.unwrap(tools, ""),
+          result.is_ok(form_field(entries, "chat_only")),
         )
-      _, _, _, _, _ -> Ignored
+      _, _, _, _, _, _ -> Ignored
     }
   })
   |> server_component.include(["detail.formData"])

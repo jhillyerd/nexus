@@ -2,7 +2,7 @@
 title: Nexus — bots and profiles (named thread templates, per-bot toolsets, bot-to-bot messaging)
 status: active
 tags: [nexus, bots, threads, agents, kv-cache, gleam, beam]
-updated: 2026-11-11
+updated: 2026-11-12
 ---
 
 # Bots and profiles
@@ -67,11 +67,14 @@ plan builds, and the vocabulary the session→thread rename aligned with).
   explicit list. On `thread`: always the **resolved names persisted at
   creation** — never NULL-for-default — so neither a config change nor
   a bot edit can re-aim an existing thread's envelope (decision 2; the
-  same rationale as the persisted `system_prompt`). Pre-P2 rows with
-  `NULL` are **materialized once**: the first post-P2 boot stamps the
-  boot-resolved default names into the column, after which they are
-  ordinary snapshot rows — no code path ever resolves `NULL` against
-  live config.
+  same rationale as the persisted `system_prompt`). Landed form: the
+  column is NOT NULL in the base CREATE — under the pre-deployment
+  rule there are no pre-P2 rows anywhere, so no materialization path
+  exists. A future deployment that upgrades a database created before
+  this phase would need one (a first-boot stamp of the boot-resolved
+  default into each NULL row, after which they are ordinary snapshot
+  rows — never a read path resolving `NULL` against live config); that
+  is future work, deliberately not built now.
 
 ## Design summary
 
@@ -263,7 +266,29 @@ columns, NULL system-prompt resolution, stale-alias 400); UI rendering
 of bot-sourced fields with `<script>` payloads in names/descriptions;
 browser-suite coverage for the picker and settings section.
 
-## Phase 2 — per-bot toolsets (invariant amendment)
+## Phase 2 — per-bot toolsets (invariant amendment) — DONE
+
+Landed on `t3/bots-phase-2`: `bot.tools text[] NULL` (the write
+sentinel is an is-default bool — `'{}'` is meaningful, so no
+nullif-style value sentinel can express NULL) and `thread.toolset
+text[] NOT NULL`, always populated at insert with the resolved names.
+The registry resolves toolsets through the per-toolset bundle cache
+(#76 prep), `loop.frozen_options` omits `tools`/`tool_choice` for the
+empty toolset, bot save validates names through the injected catalog
+seam (boot wires `tools.by_names`; the registry stays config-free),
+hydration resolves snapshots with loud failure on absent names, and
+the AGENTS.md invariant carries the amended form. Pre-deployment rule
+held: the snapshot column is NOT NULL in the base CREATE and dev
+databases are recreated — see the vocabulary note above for what a
+future pre-P2 deployment would need.
+
+Verification outcomes: `m3_prefix_test` passed unchanged; 621 offline
+tests green; the e2e cache gate re-run on default-toolset threads —
+warm/cold TTFT median ratio **0.234 ≤ 0.3** (cold ~3.1s, warm ~0.7s
+medians). The smoke's secondary `cached_tokens` assertion could not
+run: the gateway's vLLM backends do not report `prompt_tokens_details`
+through Bifrost right now (the TTFT ratio is the PRD gate; the token
+check is conditional until usage flows again).
 
 **Scope:** `bot.tools text[] NULL` on the bot (NULL = current
 default), and `thread.toolset text[]` always populated at creation

@@ -28,6 +28,7 @@ import gleam/dict.{type Dict}
 import gleam/erlang/process.{type Subject}
 import gleam/int
 import gleam/list
+import gleam/option.{type Option, None, Some}
 
 import gleam/order
 import gleam/otp/actor
@@ -36,6 +37,15 @@ import gleam/string
 import nexus/bot
 import nexus/store.{type Store, type StoredBot}
 import nexus/timing
+
+/// The tool-catalog seam (bots plan P2): a submitted name list → the
+/// normalized list, or a reason string when some name is not in the
+/// compiled-in catalog. Boot wires `tools.by_names(cfg, _)` — validation
+/// against the SAME registry that builds the schemas — so this actor
+/// stays decoupled from the config and the tool modules (the same
+/// injected-fn pattern as the thread registry's `ResolveProvider`).
+pub type ValidateTools =
+  fn(List(String)) -> Result(List(String), String)
 
 /// Closed error vocabulary for callers (the HTTP layer maps it onto
 /// 400/404/409/502, exactly like `provider_registry.RegistryError`).
@@ -47,6 +57,11 @@ pub type RegistryError {
   InvalidModel
   /// Create/rename onto an existing bot's name (unique).
   DuplicateName
+  /// A submitted toolset was structurally malformed (all-blank) or
+  /// named a tool outside the compiled-in catalog (bots plan P2). The
+  /// reason is the structural text or the catalog checker's ("unknown
+  /// tool name: …").
+  InvalidTools(reason: String)
   /// The store refused or failed; carries the seam's sanitized text.
   StoreFailed(String)
 }
@@ -58,6 +73,7 @@ pub fn describe(error: RegistryError) -> String {
     InvalidName -> bot.describe(bot.InvalidName)
     InvalidModel -> bot.describe(bot.InvalidModel)
     DuplicateName -> "bot name already exists"
+    InvalidTools(reason) -> reason
     StoreFailed(reason) -> reason
   }
 }
@@ -95,15 +111,21 @@ type State {
     /// ID minting only (`b<N>`), seeded past every stored id at boot.
     counter: Int,
     store: Store,
+    /// The catalog check every submitted toolset passes through (see
+    /// `ValidateTools`).
+    validate_tools: ValidateTools,
   )
 }
 
 /// Start the registry actor (boot and tests). Boot semantics: the
 /// initialiser loads the whole table — an unreachable store fails start
-/// (and with the OneForAll root, the whole boot) loudly.
+/// (and with the OneForAll root, the whole boot) loudly. `validate_tools`
+/// is the catalog check (boot wires `tools.by_names(cfg, _)`; tests pass
+/// a pure list).
 pub fn start(
   persistence: Store,
   name: process.Name(Msg),
+  validate_tools: ValidateTools,
 ) -> actor.StartResult(Subject(Msg)) {
   let builder =
     actor.new_with_initialiser(5000, fn(self) {
@@ -114,6 +136,7 @@ pub fn start(
             rows: rows_by_id(rows),
             counter: max_bot_counter(rows),
             store: persistence,
+            validate_tools: validate_tools,
           ))
           |> actor.returning(self)
           |> actor.selecting(process.new_selector() |> process.select(self))
@@ -271,6 +294,8 @@ fn create_row(
   use model <- result.try(
     bot.validate_model(params.model) |> result.replace_error(InvalidModel),
   )
+  use tools <- result.try(validate_tools(state, params.tools))
+  let params = bot.BotParams(..params, tools: tools)
   // Uniqueness pre-check against loaded state (the schema's UNIQUE is
   // the cross-instance backstop, surfaced as StoreFailed).
   case name_taken(state.rows, id, name) {
@@ -286,6 +311,16 @@ fn update_row(
   row: StoredBot,
   patch: bot.BotUpdate,
 ) -> Result(StoredBot, RegistryError) {
+  // A present toolset is normalized + catalog-checked BEFORE the merge
+  // (apply_update's `Some` replaces verbatim, so the patch must already
+  // carry the effective list).
+  use patch <- result.try(case patch.tools {
+    Some(tools) -> {
+      use tools <- result.try(validate_tools(state, tools))
+      Ok(bot.BotUpdate(..patch, tools: Some(tools)))
+    }
+    None -> Ok(patch)
+  })
   // `apply_update` implements the identity fields' blank-keep rule, so
   // the merged row already carries the EFFECTIVE name/model — validation
   // sees exactly what would be stored.
@@ -311,6 +346,25 @@ fn name_taken(
   name: String,
 ) -> Bool {
   list.any(dict.values(rows), fn(row) { row.id != own_id && row.name == name })
+}
+
+/// One toolset rule for create and patch alike: structural
+/// normalization first (trim/blank-drop/dedupe — `Some([])` is the
+/// legitimate chat-only set), then the injected catalog check. `None`
+/// (the default-set sentinel) bypasses both: it carries no names.
+fn validate_tools(
+  state: State,
+  tools: Option(List(String)),
+) -> Result(Option(List(String)), RegistryError) {
+  case bot.normalize_tools(tools) {
+    Error(bot_error) -> Error(InvalidTools(bot.describe(bot_error)))
+    Ok(None) -> Ok(None)
+    Ok(Some(names)) ->
+      case state.validate_tools(names) {
+        Ok(names) -> Ok(Some(names))
+        Error(reason) -> Error(InvalidTools(reason))
+      }
+  }
 }
 
 // ---------------------------------------------------------------------------
