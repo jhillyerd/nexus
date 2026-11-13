@@ -51,16 +51,23 @@ set +a
 
 cd "$root"
 
+# Force the project name on the command line rather than trusting the
+# compose file's `name: nexus`: a COMPOSE_PROJECT_NAME in the
+# environment (or a stray .env) outranks the file, and `down -v` under a
+# different name would delete that project's volumes while leaving the
+# dev db untouched. The flag wins over the env, so both calls here always
+# address the singleton, and the volume name they resolve to
+# (`nexus_nexus-db-data`) is the one `up`/`migrate` read.
 if [ "$reset" = 1 ]; then
   # `down -v` removes this project's containers, network, and named
   # volumes — with the pinned project name that is exactly the one
-  # `nexus-db-data` volume, from any worktree. No `--remove-orphans`:
-  # this reset owns the db container and nothing else, and orphan
-  # cleanup would also tear down containers this file does not define.
+  # `nexus-db-data` volume, from any worktree. No `--remove-orphans`: this
+  # reset owns the db container and nothing else, and orphan cleanup would
+  # also tear down containers this file does not define.
   echo "dev-server.sh: --reset, destroying the dev database volume"
-  docker compose down -v
+  docker compose --project-name nexus down -v
 fi
 
-docker compose up -d --wait
+docker compose --project-name nexus up -d --wait
 gleam run -m nexus/store/migrate
 gleam run -m nexus/dev_seed && gleam run
