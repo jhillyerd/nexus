@@ -394,7 +394,9 @@ record; the implementation slices are #95 (P3a), #96 (P3b), #97
    target's turn. Sync would need the target actor to hold a reply
    subject across its whole turn state machine (`TurnStarted` →
    `WorkerDone`/`WorkerDown`) and would block the sender's worker past
-   every `actor.call` timeout convention (5s throughout); the
+   every bounded `actor.call` timeout in the repo — 5s on the registry
+   and thread ask paths, 20s at the largest (bot/provider CRUD) — none
+   of which is sized for a full LLM turn; the
    busy-guard semantics ("sender retries on its next turn") already
    assume async. The receipt names where the reply will land:
    `delivered to <bot> in thread <id>`. Refusals are failed tool
@@ -409,12 +411,22 @@ record; the implementation slices are #95 (P3a), #96 (P3b), #97
    (accepted MVP tradeoff; persisted DM columns would be schema debt
    until proven needed). The receipt and the `From` prefix both carry
    the thread id so replies can address it precisely. Self-addressed
-   delivery (A → A mid-turn) is refused by the busy guard for free.
+   delivery is refused BEFORE routing — any resolved target whose bot
+   is the sender's own bot. The busy guard alone is not enough there:
+   a NAME-addressed self-send with no `(A, A)` map entry would
+   find-or-create a different, idle A-thread and deliver into it; the
+   busy guard only covers thread-id addressing of the in-flight
+   thread.
 3. **`ToolCtx` grows `delivery: Option(Delivery)`** —
    `Delivery(registry, bots, thread_id, bot_id, depth)`. `Some` only on
-   threads created from a bot: the tool ships in bot toolsets only,
-   never the default set (a plain thread has no bot identity to send
-   from). Identity is per-THREAD, never per-toolset — bundles are
+   threads created from a bot: the HUMAN default toolset never
+   includes the tool (a plain thread has no bot identity to send
+   from), while create-from-bot with `bot.tools = NULL` resolves to
+   the human default PLUS `bot_message` — bots are the only senders,
+   so an ordinary bot gets the feature without listing it, and a bot
+   that wants it gone names an explicit list without it (a chat-only
+   `'{}'` bot already excludes it). Threads created before P3c keep
+   their frozen snapshots without it, like any snapshot change. Identity is per-THREAD, never per-toolset — bundles are
    cached by name tuple and shared across a bot's threads — so the
    registry injects it by wrapping the bundle's turn fn per thread at
    create/hydrate. Depth is computed per turn from the initiating
@@ -422,15 +434,22 @@ record; the implementation slices are #95 (P3a), #96 (P3b), #97
    survives restart. The sender's display name is resolved at SEND
    time by a worker-side ask to the bot registry (the caller P1
    anticipated): renames stay current, and a deleted sender bot is an
-   honest tool error.
+   honest tool error — at send time AND after restart: a hydrated
+   thread whose bot was deleted (`thread.bot_id` NULL via
+   `ON DELETE SET NULL`) builds no delivery context, so `bot_message`
+   fails with the same error. No second durable marker column for
+   that — schema debt for a dead-bot edge, inconsistent with P1's
+   deletion semantics.
 4. **Thread `Send` grows `author` and `depth`** —
    `Send(text, author: Option(String), depth: Int, reply)`, the ONE
    turn-machine path (no parallel `Deliver` message; human sends pass
    `None`/`0`). Model-visible identity rides **content** only:
    `From <bot> (thread <id>): …` — message bytes, append-only,
    contract-clean. UI attribution rides the display-only sidecar
-   class: one transcript dict `Dict(Int, Delivery)` (author + depth)
-   mirroring `timestamps`, set by `mark_delivery` immediately after
+   class: one transcript dict `Dict(Int, Origin)` — `Origin(author,
+   depth)`, distinct from the ToolCtx `Delivery` record, which carries
+   the per-thread identity — mirroring `timestamps`, set by
+   `mark_origin` immediately after
    `append_user` + `stamp` (same call-after-append rule). Persistence:
    `thread_message.author text NULL` (NULL = human; value = the bot's
    display name at send time — frozen like everything a bot sources,
