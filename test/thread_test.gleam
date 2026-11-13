@@ -1927,4 +1927,27 @@ pub fn authored_send_author_on_all_render_paths_test() {
     thread.AssistantFull("Final answer", Some(_)),
   ) = expect_event(sub4)
   expect_authored_echo(sub4, 1, "human again") |> should.equal(None)
+
+  // Release the "human again" turn's gate: the second gated runner would
+  // otherwise park its worker on the 5s gate receive past the test.
+  let assert Ok(gate2) = process.receive(gate_request, 2000)
+  process.send(gate2, Nil)
+}
+
+/// An empty author is no author: `mark_origin` drops it, and the echo
+/// reads the same sidecar a replay reads — so live and replay BOTH record
+/// a human send (never Some(""), which the store's nullif sentinel would
+/// file as NULL anyway). Pins the echo-reads-sidecar rule.
+pub fn authored_send_empty_author_is_no_author_test() {
+  let gate_request = process.new_subject()
+  let sess = start_with(gated_runner(gate_request))
+  let sub = join(sess)
+  let _ = expect_event(sub)
+
+  should.equal(send_as(sess, "q", Some(""), 1), thread.Sent)
+  expect_authored_echo(sub, 1, "q") |> should.equal(None)
+  transcript.origin_at(thread.snapshot(sess), 1) |> should.equal(None)
+
+  let assert Ok(gate) = process.receive(gate_request, 2000)
+  process.send(gate, Nil)
 }

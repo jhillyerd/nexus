@@ -522,6 +522,14 @@ pub fn event_translation_test() {
   |> should.equal(ui.Hello("smart"))
   ui.from_thread_event(thread.UserEcho("hi", Some(1_700_000_000), None))
   |> should.equal(ui.UserEcho("hi", Some(1_700_000_000), None))
+  // Bot-authored shape carries through too — a mapping that dropped the
+  // author would silently strip every badge.
+  ui.from_thread_event(thread.UserEcho(
+    "status",
+    Some(1_700_000_000),
+    Some("Hermes"),
+  ))
+  |> should.equal(ui.UserEcho("status", Some(1_700_000_000), Some("Hermes")))
   ui.from_thread_event(thread.AssistantFull("full", None))
   |> should.equal(ui.AssistantFull("full", None))
   ui.from_thread_event(thread.Token("t"))
@@ -1279,7 +1287,9 @@ fn should_not_contain(haystack: String, needle: String) {
 fn log_shapes(log: List(ui.Line)) -> List(ui.Line) {
   list.map(log, fn(line) {
     case line {
-      ui.UserLine(text, _, _) -> ui.UserLine(text, None, None)
+      // Only the stamp is stripped: the author is display provenance the
+      // commit-shape assertions must still see.
+      ui.UserLine(text, author, _) -> ui.UserLine(text, author, None)
       ui.AssistantLine(text, _) -> ui.AssistantLine(text, None)
       other -> other
     }

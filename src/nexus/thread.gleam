@@ -933,7 +933,20 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
             |> transcript.append_user(text)
             |> transcript.mark_origin(author, depth)
             |> transcript.stamp(stamped)
-          emit(state, UserEcho(text, Some(stamped), author))
+          // The echo's author is READ BACK from the sidecar the mark just
+          // populated — the same read side every replay uses — so live and
+          // persisted display metadata agree by construction: an author
+          // mark_origin dropped (e.g. Some("")) is absent here too, never
+          // Some("") live but None on replay. One source, one shape.
+          emit(
+            state,
+            UserEcho(
+              text,
+              Some(stamped),
+              transcript.origin_at(tr, transcript.length(tr) - 1)
+                |> option.map(fn(origin) { origin.author }),
+            ),
+          )
           let worker =
             process.spawn_unlinked(fn() {
               let cancel = process.new_subject()
