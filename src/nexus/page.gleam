@@ -847,7 +847,7 @@ button#send, button#create-thread { background: var(--pico-primary-background);
   /* Tab rail stacks above the section on mobile: the tabs become a
      horizontal row of equal-width buttons along the top of the page. */
   .settings-page { padding: .8rem .8rem 2rem; flex-direction: column; gap: .8rem; }
-  .settings-nav { flex-direction: row; width: auto; }
+  .settings-nav { flex-direction: row; width: auto; align-self: stretch; }
   #app .settings-tab { flex: 1; text-align: center; }
 }
 "

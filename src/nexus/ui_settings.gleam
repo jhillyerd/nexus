@@ -232,6 +232,11 @@ pub fn update(
   case msg {
     Ignored -> #(state, effect.none(), [])
 
+    // Re-clicking the active tab does nothing: a stray double click on
+    // a tab must not close a form the user is mid-way through. Only a
+    // real switch stands the transient state down.
+    TabSelected(tab) if tab == state.tab -> #(state, effect.none(), [])
+
     TabSelected(tab) -> #(
       State(
         ..state,

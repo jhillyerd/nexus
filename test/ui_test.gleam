@@ -2273,32 +2273,70 @@ pub fn settings_tab_switch_flips_visibility_test() {
 }
 
 pub fn settings_tab_switch_stands_forms_down_test() {
-  // Opening one section's form/editor/confirm used to stand the other
-  // section's down (one form per page); with tabs the same stand-down
-  // happens on every switch, so returning to a tab never resurrects a
-  // form you left open or a delete you armed there.
+  // Switching tabs stands every open form/editor/confirm down. The
+  // update rules only ever let ONE transient be active at a time (the
+  // one-form-per-page mutual exclusion), so a single setup cannot arm
+  // all six at once — the switch is exercised once from EACH state,
+  // with a precondition assert that the setup actually armed it, so a
+  // mutual-exclusion change that breaks reachability fails here
+  // instead of passing vacuously.
+  let base =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(ui.SettingsToggled)
+  let bots = ui.Settings(ui_settings.TabSelected(ui_settings.BotsTab))
+
+  let with_add = step(base, ui.Settings(ui_settings.AddToggled))
+  with_add.settings.open |> should.be_true
+  assert_settings_transients_down(step(with_add, bots))
+
+  let with_edit = step(base, ui.Settings(ui_settings.EditToggled("p1")))
+  with_edit.settings.edit |> should.equal(Some("p1"))
+  assert_settings_transients_down(step(with_edit, bots))
+
+  let with_confirm = step(base, ui.Settings(ui_settings.DeleteRequested("p1")))
+  with_confirm.settings.confirm |> should.equal(Some("p1"))
+  assert_settings_transients_down(step(with_confirm, bots))
+
+  let with_bot_add = step(base, ui.Settings(ui_settings.BotAddToggled))
+  with_bot_add.settings.bots_open |> should.be_true
+  assert_settings_transients_down(step(with_bot_add, bots))
+
+  let with_bot_edit = step(base, ui.Settings(ui_settings.BotEditToggled("b1")))
+  with_bot_edit.settings.bot_edit |> should.equal(Some("b1"))
+  assert_settings_transients_down(step(with_bot_edit, bots))
+
+  let with_bot_confirm =
+    step(base, ui.Settings(ui_settings.BotDeleteRequested("b1")))
+  with_bot_confirm.settings.bot_confirm |> should.equal(Some("b1"))
+  assert_settings_transients_down(step(with_bot_confirm, bots))
+}
+
+/// Every settings transient (both sections) is down after a tab
+/// switch, and the tab landed on Bots.
+fn assert_settings_transients_down(m: ui.Model) -> Nil {
+  m.settings.tab |> should.equal(ui_settings.BotsTab)
+  m.settings.open |> should.be_false
+  m.settings.edit |> should.be_none
+  m.settings.confirm |> should.be_none
+  m.settings.bots_open |> should.be_false
+  m.settings.bot_edit |> should.be_none
+  m.settings.bot_confirm |> should.be_none
+}
+
+pub fn settings_tab_reclick_is_noop_test() {
+  // Clicking the tab you are already on does nothing: a stray double
+  // click must not close a form you are mid-way through.
   let model =
     new_model()
     |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
     |> step(ui.SettingsToggled)
     |> step(ui.Settings(ui_settings.AddToggled))
-    |> step(ui.Settings(ui_settings.EditToggled("p1")))
-  let switched =
-    step(model, ui.Settings(ui_settings.TabSelected(ui_settings.BotsTab)))
-  switched.settings.tab |> should.equal(ui_settings.BotsTab)
-  switched.settings.open |> should.be_false
-  switched.settings.edit |> should.be_none
-  switched.settings.confirm |> should.be_none
-  switched.settings.bots_open |> should.be_false
-  // And back: the provider side's transient state stays down too.
-  let back =
-    step(
-      switched,
-      ui.Settings(ui_settings.TabSelected(ui_settings.ProvidersTab)),
-    )
-  back.settings.tab |> should.equal(ui_settings.ProvidersTab)
-  back.settings.open |> should.be_false
-  back.settings.edit |> should.be_none
+  let same =
+    step(model, ui.Settings(ui_settings.TabSelected(ui_settings.ProvidersTab)))
+  same.settings.tab |> should.equal(ui_settings.ProvidersTab)
+  same.settings.open |> should.be_true
+  same.settings.edit |> should.be_none
 }
 
 pub fn provider_test_button_state_machine_test() {
