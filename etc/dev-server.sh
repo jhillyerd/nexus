@@ -24,7 +24,10 @@ for arg in "$@"; do
   case "$arg" in
     --reset | -r) reset=1 ;;
     -h | --help)
-      sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+      # Print the header comment block (everything between the shebang and
+      # the first line of code), so the help text cannot drift out of sync
+      # with the file the way a hardcoded line range would.
+      awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } !/^#/ { exit }' "$0"
       exit 0
       ;;
     *)
@@ -49,11 +52,13 @@ set +a
 cd "$root"
 
 if [ "$reset" = 1 ]; then
-  # `down -v` removes the project's containers, network, and named
+  # `down -v` removes this project's containers, network, and named
   # volumes — with the pinned project name that is exactly the one
-  # `nexus-db-data` volume, from any worktree.
+  # `nexus-db-data` volume, from any worktree. No `--remove-orphans`:
+  # this reset owns the db container and nothing else, and orphan
+  # cleanup would also tear down containers this file does not define.
   echo "dev-server.sh: --reset, destroying the dev database volume"
-  docker compose down -v --remove-orphans
+  docker compose down -v
 fi
 
 docker compose up -d --wait
