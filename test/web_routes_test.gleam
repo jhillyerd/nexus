@@ -60,6 +60,8 @@ fn test_config() -> Config {
     codemode: False,
     codemode_timeout_ms: 30_000,
     codemode_max_output_chars: 32_768,
+    // Bots P3c: the delivery hop guard; 4 = the shipped default.
+    max_bot_hops: 4,
   )
 }
 
@@ -67,6 +69,7 @@ fn happy_runner(
   _endpoint,
   tr,
   _cancel,
+  _delivery,
   on_event: fn(loop.LoopEvent) -> Nil,
 ) -> thread.TurnOutcome {
   on_event(loop.StreamEvent(openai.TokenDelta("hi")))
@@ -158,6 +161,9 @@ fn start_server_with(
         |> result.map(fn(resolved) { resolved.endpoint })
         |> result.replace_error(thread_registry.ProviderUnknown)
       },
+      // The SAME name this harness started the bot registry under: the
+      // delivery wrapper's sender-name ask resolves it at ask time.
+      bots_name,
     )
   // Port 0: the kernel picks a free port and mist's after_start hands
   // it back; a bind failure now fails the test loudly at this line

@@ -51,6 +51,11 @@ pub type Config {
     system_prompt: String,
     /// M3 tool loop: maximum model round-trips per user turn (the guard).
     max_tool_iterations: Int,
+    /// Bots P3c (issue #97): the bot-to-bot hop guard. A delivery whose
+    /// depth exceeds this is refused by the thread registry's `Deliver`,
+    /// so a runaway A→B→C→… chain stops after N bot-to-bot hops — the
+    /// inter-bot analogue of `max_tool_iterations`.
+    max_bot_hops: Int,
     /// M3 http_fetch: maximum response body kept, in bytes.
     http_fetch_max_bytes: Int,
     /// M3 http_fetch: connect+receive timeout per hop, in ms.
@@ -126,6 +131,15 @@ pub fn from_env(
     get,
     "NEXUS_MAX_TOOL_ITERATIONS",
     32,
+  ))
+  // Non-negative like the other guards: a negative hop limit would
+  // refuse every bot delivery, so misconfiguration fails the load
+  // instead of surfacing as a broken feature at first use (the
+  // loud-boot philosophy).
+  use max_bot_hops <- result.try(optional_non_negative_int(
+    get,
+    "NEXUS_MAX_BOT_HOPS",
+    4,
   ))
   use http_fetch_max_bytes <- result.try(optional_int(
     get,
@@ -207,6 +221,7 @@ pub fn from_env(
     ui_token: optional_string(get, "NEXUS_UI_TOKEN"),
     system_prompt: system_prompt,
     max_tool_iterations: max_tool_iterations,
+    max_bot_hops: max_bot_hops,
     http_fetch_max_bytes: http_fetch_max_bytes,
     http_fetch_timeout_ms: http_fetch_timeout_ms,
     http_fetch_allow_private: http_fetch_allow_private,

@@ -40,6 +40,7 @@ import gleam/string
 import glopenai/chat
 import glopenai/shared.{type CompletionUsage}
 import nexus/config.{type Config}
+import nexus/delivery
 import nexus/loop
 import nexus/openai
 import nexus/timing
@@ -159,9 +160,19 @@ pub type TurnOutcome {
 /// tests for fakes). The endpoint is the thread's frozen provider
 /// endpoint — resolved once at create/hydration, never swapped mid-thread
 /// (multi-provider plan §8; a provider change is a fork, not an edit).
+/// `delivery` is the bot-to-bot identity for this turn (bots P3c, #97):
+/// `None` on plain threads; on bot threads the registry's per-thread
+/// runner wrapper builds it from the initiating user message's sidecar
+/// depth + 1 and hands it to the base runner here, so the agent loop can
+/// put it into every tool executor's `ToolCtx`.
 pub type TurnRunner =
-  fn(openai.Endpoint, Transcript, Subject(Nil), fn(loop.LoopEvent) -> Nil) ->
-    TurnOutcome
+  fn(
+    openai.Endpoint,
+    Transcript,
+    Subject(Nil),
+    Option(delivery.Delivery),
+    fn(loop.LoopEvent) -> Nil,
+  ) -> TurnOutcome
 
 /// The utility side-call seam (utility-titles plan §4.2): ONE blocking
 /// model round-trip over a committed transcript snapshot — the title
@@ -656,7 +667,7 @@ pub fn agent_runner(
   max_iterations: Int,
   specs: List(tools.ToolSpec),
 ) -> TurnRunner {
-  fn(endpoint, tr, cancel, on_event) {
+  fn(endpoint, tr, cancel, delivery, on_event) {
     case
       loop.run(
         specs,
@@ -667,6 +678,7 @@ pub fn agent_runner(
         loop.endpoint_stream(endpoint),
         tr,
         cancel,
+        delivery,
         on_event,
       )
     {
@@ -955,7 +967,12 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
               let on_event = fn(event) {
                 process.send(state.self, WorkerEvent(pid, event))
               }
-              let outcome = state.runner(state.endpoint, tr, cancel, on_event)
+              // The runner is the registry-built bundle's turn fn —
+              // wrapped per thread with the delivery identity on bot
+              // threads (bots P3c), which ignores this argument and
+              // builds its own context from the transcript's sidecar.
+              let outcome =
+                state.runner(state.endpoint, tr, cancel, None, on_event)
               process.send(state.self, WorkerDone(pid, outcome))
             })
           let monitor = process.monitor(worker)

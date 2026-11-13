@@ -175,6 +175,8 @@ flowchart TB
     sa -->|"spawn unlinked + monitor"| uw
     uw -->|"TagCorpus ask"| sa
     uw -->|"UpgradeAutoTitle ask<br/>(guarded apply)"| reg
+    tw -->|"bot_message: Deliver ask<br/>(routing + guards + send)"| reg
+    tw -->|"bot_message: sender name Get<br/>(ask-at-send)"| bots
     tw -->|"SSE stream<br/>(nexus/openai over net)"| llm
     tw -->|"tool exec"| eng
     tw -->|"tool exec"| web
@@ -207,20 +209,25 @@ flowchart TB
   message loop never calls back into the registry. The thread sees the
   outside world through closures injected at start: the turn runner, the
   `commit_hook` (store write-behind lane), and its frozen endpoint. The
-  ONE exception lives in the unlinked utility worker, never the thread
-  actor: it asks its thread actor for the tag corpus (`TagCorpus`) and
-  asks the registry to land the parsed title/tags (`UpgradeAutoTitle`).
-  Both asks are deadlock-safe because the worker is a separate process
-  (the thread actor never blocks on it) and the registry answers purely
-  from its state + the store, never calling into any thread (§8 rule 1).
+  exceptions all live in UNLINKED WORKERS, never a thread actor (§8 rule
+  1's exception class): the utility worker asks its thread actor for the
+  tag corpus (`TagCorpus`) and asks the registry to land the parsed
+  title/tags (`UpgradeAutoTitle`); the turn worker's `bot_message` tool
+  asks the bot registry for the sender's current display name (ask-at-send
+  — the `From` prefix stays current across renames; a deleted sender is an
+  honest tool error) and asks the thread registry to route + deliver
+  (`Deliver` — guards, DM find-or-create, the send into the target).
+  All are deadlock-safe because they originate in workers nothing waits
+  on synchronously and their answer paths never call into a waiting
+  worker (§8 rule 1).
 - **Scripting API → registries**: the same registry subjects the UI uses,
   over bearer-token-authenticated JSON routes (`/threads` CRUD + send/stop,
   `/providers` CRUD + model listing, `/bots` CRUD and the `{"bot": id}`
   half of `POST /threads`; `/healthz` is the one open route).
-- **No registry-to-registry edges.** The bot registry and the provider
-  registry are mutually ignorant; orchestration lives with the callers
-  (web and the UI runtime, through `nexus/thread_create` — the one
-  creation path both surfaces share):
+- **No registry-to-registry edges.** The bot registry, provider registry,
+  and thread registry are mutually ignorant; orchestration lives with the
+  callers (web and the UI runtime, through `nexus/thread_create` — the
+  one creation path both surfaces share):
   - `POST`/`PATCH /bots` validate `provider_id` against the
     provider-registry subject the web layer already holds (friendly
     400; the `ON DELETE RESTRICT` FK is the backstop);
@@ -233,6 +240,13 @@ flowchart TB
     model alias against the provider's LIVE list (a stale bot must
     400, never silently succeed); the thread registry never sees
     bots beyond the `bot_id` provenance column.
+  - bots P3c: the thread registry holds the bot registry's NAME (boot
+    wiring, like the provider resolver seam) only to build the
+    `bot_message` tool's sender-name closure, which resolves it at ask
+    time INSIDE the turn worker — no message ever flows
+    registry→registry. The delivery path's bot lookups (target by name,
+    `allow_inbound` gate) are STORE reads, the same
+    count/guard-through-the-store pattern as the provider delete guard.
 
 ---
 
@@ -282,6 +296,11 @@ sequenceDiagram
   The cancel subject is threaded through every stream call and tool run, so
   `Stop` kills an in-flight script and answers not-yet-started sibling
   calls with synthetic cancelled results.
+  Bots P3c: when the thread is a bot's, the loop's `ToolCtx` carries the
+  delivery identity (the registry wrapper's per-thread context), so a
+  `bot_message` tool call performs the two registry asks from this worker
+  (§4/§8 rule 1) — delivery is async (a receipt), and an ask timeout is a
+  retryable tool error, never a crash.
 - **Codemode engine** — for a codemode tool call, the turn worker spawns a
   **linked** engine child running the sandboxed Lua VM (wall-clock
   deadline kill, ~64 MiB heap ceiling). The engine in turn spawns
@@ -359,6 +378,38 @@ replacement rehydrates from the store, so the rebuilt transcript re-encodes
 byte-identically (§2's write-behind loss window applies here too: the last
 commits still queued at the crash are missing from the rehydrated set).
 
+Bots P3c adds three things (issue #97):
+
+- **The bot-default toolset transform**: a create from a bot with the
+  default sentinel (`toolset: NULL`) snapshots the human default set PLUS
+  `bot_message` — the delivery tool every ordinary bot carries without
+  listing it. The human default set never includes it; an explicit bot
+  toolset wins verbatim. Everything resolves through the same bundle
+  cache as any other snapshot.
+- **The per-thread delivery wrapper**: on bot threads (`bot_id` set) the
+  registry wraps the cached bundle's turn fn at create/hydrate, closing
+  over the thread id + bot id and the two worker-side ask closures. The
+  wrapper computes the turn's hop depth from the initiating user
+  message's sidecar depth + 1 (a human send resets to 0) — persisted
+  data, so the counter survives restarts. The bundle cache keeps the
+  unwrapped runner (identity is per-THREAD, never per-toolset).
+- **`Deliver` + the DM map**: the routing ask behind `bot_message`.
+  Guards, in order: unknown target; self-addressing (any resolved target
+  whose bot is the sender's own — refused BEFORE routing, because a
+  name-addressed self-send would otherwise find-or-create a second,
+  idle A-thread); archived target; the `allow_inbound` gate (a STORE
+  read, never a bot-registry call); hop depth (`NEXUS_MAX_BOT_HOPS`);
+  busy target (`Busy` — the target actor answers immediately in both
+  states). Name addressing routes through an in-memory per (sender bot,
+  target bot) DM-thread map, find-or-creating from the target bot
+  through the same internal start path as any create (no second
+  frozen-value path; the live model-alias revalidation `thread_create`
+  performs for user-facing creates is deliberately skipped here — it is
+  a network call, and no network call may run inside this actor). A
+  restart loses the map and opens a fresh DM thread on the next
+  name-addressed delivery — receipts and `From` prefixes carry thread
+  ids precisely so models can bypass the map by addressing the id.
+
 ### Thread actor
 
 Owns, per thread: the committed transcript (in-memory authority),
@@ -384,14 +435,32 @@ utility-attempt bookkeeping.
 
 ## 8. Dependency rules (structural, do not add edges)
 
-1. **registry → thread is the primary direction.** A thread actor's own
-   message loop never calls the registry. The one exception runs in the
-   unlinked utility worker (never the actor): it asks the registry to
-   apply the parsed title/tags (`UpgradeAutoTitle` guard, via the injected
-   `utility_apply_for` closure) and asks its thread actor for the tag
-   corpus (`TagCorpus`). Safe because the asks come from the worker
-   process — the thread actor never blocks on it — and the registry
-   answers purely from state + store, never calling into any thread.
+1. **registry → thread is the primary direction; unlinked workers may ask
+   the registries — the exception CLASS.** A thread actor's own message
+   loop never calls the registry. The thread sees the outside world
+   through closures injected at start. The asks that DO cross registry
+   boundaries all originate in UNLINKED WORKERS (never a thread actor):
+   the utility worker's `TagCorpus` + guarded `UpgradeAutoTitle` asks
+   (utility-titles plan), and — from bots P3c — the turn worker's
+   delivery asks: `bot_message`'s sender display-name `Get` against the
+   bot registry and the `Deliver` routing ask against the thread
+   registry (both built as closures by the registry's per-thread runner
+   wrapper; the bot registry is resolved BY NAME at ask time, so no
+   registry-to-registry edge exists). Deadlock-safe by construction: the
+   ask originates in a worker nothing waits on synchronously (the actor
+   monitors, never blocks on, its workers); each answer path is bounded —
+   registry state, a few synchronous store reads (`list_bots`/`get_bot`),
+   and at most one bounded ask into an idle-or-immediately-answering
+   actor (the target thread replies `Sent`/`Busy` without waiting on its
+   own worker; the bot registry answers from boot-loaded state) — and no
+   path leads from a registry back into a waiting worker, so no cycle
+   can close. Every ask on the path is a manual send plus bounded
+   receive on an asker-owned subject (`actor.call` would panic the
+   asker on a dead/stalled callee), so a timeout degrades to a refusal
+   or a retryable tool error, never a crash. Deliveries serialize
+   through the registry actor: under heavy cross-traffic a worker's
+   bounded ask times out as that unknown-outcome tool error, never a
+   deadlock.
 2. **thread → store only via the injected `commit_hook`** (fire-and-forget);
    all other store access goes through the registries.
 3. **threads never call the provider registry.** Boot injects a resolver

@@ -314,6 +314,28 @@ async function playScenario(res, request, state) {
       finish();
       return;
     }
+    case "relay": {
+      // Bots P3c bot-to-bot delivery smoke (issue #97): round 1 relays the
+      // named note via the bot_message tool (only bot-default toolsets
+      // carry it — a plain thread has no bot identity to send from),
+      // round 2 answers after the receipt. The user text after the marker
+      // is `<to bot name>|<note text>` — bot names may contain spaces, so
+      // the target is everything before the first `|` (cubic PR review).
+      const relay = /case:relay\s+([^|]+)\|([\s\S]+)/.exec(userText);
+      if (!hasToolResult) {
+        await streamText("Relaying.");
+        await streamToolCall(
+          "bot_message",
+          JSON.stringify({ to: relay?.[1] ?? "nobody", text: relay?.[2] ?? "" }),
+        );
+        finish();
+      } else {
+        await streamText("Relay complete: the receipt came back.");
+        sse(res, chunk({}, "stop"));
+        finish();
+      }
+      return;
+    }
     default: {
       await streamText("Unknown case marker; answering plainly.");
       sse(res, chunk({}, "stop"));

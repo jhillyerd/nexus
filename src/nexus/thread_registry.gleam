@@ -51,7 +51,10 @@ import gleam/otp/factory_supervisor
 import gleam/otp/supervision
 import gleam/result
 import gleam/string
+import glopenai/chat
+import nexus/bot_registry
 import nexus/config.{type Config}
+import nexus/delivery
 import nexus/openai
 import nexus/store.{type Store, type StoredSummary}
 import nexus/thread
@@ -81,10 +84,11 @@ pub type NewThread {
     system_prompt: Option(String),
     bot_id: Option(String),
     /// The toolset the new thread snapshots (bots plan P2): `None` = the
-    /// default set (the boot-built bundle — plain creates and
-    /// default-toolset bots); `Some(names)` = an explicit list, resolved
-    /// against the config-independent catalog (unknown name →
-    /// `UnknownToolset` — a stale bot is refused, never silently
+    /// default set for a plain thread — or, when `bot_id` is `Some` (bots
+    /// P3c), the default set PLUS `bot_message`, so an ordinary bot gets
+    /// the delivery tool without listing it; `Some(names)` = an explicit
+    /// list, resolved against the config-independent catalog (unknown
+    /// name → `UnknownToolset` — a stale bot is refused, never silently
     /// narrowed). The RESOLVED names — the bundle's — are what get
     /// persisted into `thread.toolset`.
     toolset: Option(List(String)),
@@ -204,6 +208,13 @@ pub type Msg {
   /// never call each other. No store write (the FK's SET NULL already
   /// fixed every row inside the delete itself).
   BotDeleted(id: String, reply: Subject(Nil))
+  /// Bot-to-bot delivery (bots P3c, #97): route + guard + send one
+  /// message from a bot's turn into another thread as a user turn.
+  /// Asked ONLY from the unlinked turn worker (the `bot_message` tool's
+  /// `Delivery.deliver` closure) — never from a thread actor, so the §8
+  /// rule-1 exception class holds. The reply vocabulary is the tool's
+  /// receipt: `Delivered(thread_id) | Busy | Refused(reason)`.
+  Deliver(request: delivery.Request, reply: Subject(delivery.Reply))
   /// Monitor plumbing (internal): a monitored thread actor exited.
   Down(pid: Pid, monitor: Monitor)
   /// Selector plumbing for non-process monitors; always ignored.
@@ -275,6 +286,20 @@ type State {
     counter: Int,
     /// The swappable persistence seam (mockable for offline tests).
     store: Store,
+    /// The bot registry's NAME (bots P3c): not an edge between the
+    /// registries — no message ever flows registry→registry. It exists so
+    /// the per-thread runner wrapper can build the `bot_message` tool's
+    /// `sender_name` closure, which resolves this name to a subject AT
+    /// ASK TIME inside the unlinked turn worker (the `tag_corpus_for`
+    /// pattern). The registry itself never calls it.
+    bots_name: process.Name(bot_registry.Msg),
+    /// The in-memory per (sender bot, target bot) DM-thread map (bots
+    /// P3c): bot-name-addressed deliveries find-or-create their DM
+    /// thread through it. Deliberately volatile — a restart loses the
+    /// map and the next name-addressed delivery opens a fresh DM thread
+    /// (accepted MVP tradeoff); receipts and `From` prefixes carry thread
+    /// ids precisely so models can bypass the map by addressing the id.
+    dm: Dict(#(String, String), String),
   )
 }
 
@@ -335,6 +360,7 @@ pub fn start(
   name: process.Name(Msg),
   persistence: Store,
   resolve_provider: ResolveProvider,
+  bots_name: process.Name(bot_registry.Msg),
 ) -> actor.StartResult(Subject(Msg)) {
   // The tool registry is built once, here, from the global config — before
   // any thread exists — so every request any thread of the default toolset
@@ -364,6 +390,7 @@ pub fn start(
     default_toolset,
     corpus,
     resolve_provider,
+    bots_name,
   )
 }
 
@@ -383,6 +410,7 @@ pub fn start_with_toolset(
   default_toolset: thread.Toolset,
   _corpus: fn() -> List(String),
   resolve_provider: ResolveProvider,
+  bots_name: process.Name(bot_registry.Msg),
 ) -> actor.StartResult(Subject(Msg)) {
   let builder =
     actor.new_with_initialiser(5000, fn(self) {
@@ -421,6 +449,8 @@ pub fn start_with_toolset(
               max_id_suffix(pruned),
             ),
             store: persistence,
+            bots_name: bots_name,
+            dm: dict.new(),
           ))
           |> actor.returning(self)
           |> actor.selecting(
@@ -500,12 +530,17 @@ fn boot_sweep(persistence: Store) -> List(String) {
 fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
   case msg {
     Create(requested, reply) ->
-      // Resolve the requested toolset through the bundle cache FIRST
-      // (bots plan P2): the default snapshot shares the boot-built
-      // bundle; an explicit list builds (and caches) on first use and
-      // refuses unknown names with `UnknownToolset` — a stale bot's
-      // create fails loudly, never silently narrowed.
-      case resolve_toolset(state, requested.toolset) {
+      // The bot-default toolset transform (bots P3c, #97): a thread
+      // created FROM a bot with the default sentinel (`toolset: None`)
+      // snapshots the human default set PLUS `bot_message` — bots are the
+      // only senders, so an ordinary bot gets the delivery tool without
+      // listing it, while the HUMAN default set never carries it (a plain
+      // thread has no bot identity to send from). A bot that wants it
+      // gone names an explicit list without it; a chat-only `'{}'` bot
+      // already excludes it. Everything resolves through the same bundle
+      // cache as any other snapshot (the default+bot_message tuple is
+      // its own cache entry, built once).
+      case resolve_toolset(state, effective_toolset(state, requested)) {
         Error(reason) -> {
           process.send(reply, Error(UnknownToolset(reason)))
           actor.continue(state)
@@ -516,7 +551,27 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
     CreateWithToolset(requested, toolset, reply) ->
       handle_create(state, requested, toolset, reply)
 
+    Deliver(request, reply) -> {
+      let #(state, outcome) = deliver_message(state, request)
+      process.send(reply, outcome)
+      actor.continue(state)
+    }
+
     _ -> handle_rest(state, msg)
+  }
+}
+
+/// The effective toolset NAMES a create request resolves through: the
+/// requested explicit list, or — for a bot-sourced create with the
+/// default sentinel — the default set plus `bot_message` (see `handle`).
+fn effective_toolset(
+  state: State,
+  requested: NewThread,
+) -> Option(List(String)) {
+  case requested.bot_id, requested.toolset {
+    Some(_), None ->
+      Some(list.append(tools.default_names(state.cfg), ["bot_message"]))
+    _, _ -> requested.toolset
   }
 }
 
@@ -595,24 +650,39 @@ fn handle_create(
   toolset: thread.Toolset,
   reply: Subject(Result(thread.ThreadSummary, CreateError)),
 ) -> actor.Next(State, Msg) {
+  let #(state, started) = start_new_thread(state, requested, toolset)
+  case started {
+    // The create reply IS the summary (#73): the same shape a following
+    // List would report (message_count 1 = the system prompt, activity =
+    // creation) — web and UI never hand-build one again.
+    Ok(record) -> process.send(reply, Ok(record_summary(record)))
+    Error(error) -> process.send(reply, Error(error))
+  }
+  actor.continue(state)
+}
+
+/// The ONE thread-start path — fresh creates AND bot-to-bot DM
+/// find-or-create (bots P3c) share it, so there is no second way to
+/// freeze values or persist a row. Returns the new `Record` on success so
+/// the DM path can route into the fresh actor immediately.
+fn start_new_thread(
+  state: State,
+  requested: NewThread,
+  toolset: thread.Toolset,
+) -> #(State, Result(Record, CreateError)) {
   case string.trim(requested.model) {
-    "" -> {
-      process.send(reply, Error(EmptyModel))
-      actor.continue(state)
-    }
+    "" -> #(state, Error(EmptyModel))
     alias ->
       // Resolve the endpoint FIRST: a thread is only ever created with
       // its frozen (provider, model) pin in place — there is no
       // create-then-attach path (multi-provider plan §8).
       case state.resolve_provider(requested.provider_id) {
-        Error(reason) -> {
-          process.send(reply, Error(ProviderFailed(reason)))
-          actor.continue(state)
-        }
+        Error(reason) -> #(state, Error(ProviderFailed(reason)))
         Ok(endpoint) -> {
           let counter = state.counter + 1
           let id = "s" <> int.to_string(counter)
           let name = process.new_name("nexus_thread_" <> id)
+          let created_at = timing.wall_now_s()
           // The registry resolves the system prompt at creation: an
           // explicit request prompt (a bot's, from the bots plan) or the
           // config default — the ONE NULL/default resolution point (#72).
@@ -622,6 +692,81 @@ fn handle_create(
           let prompt =
             option.unwrap(requested.system_prompt, state.cfg.system_prompt)
           let transcript = transcript.new(alias, prompt)
+          // The organizational block, built ONCE and shared by the stored
+          // row and the live record (issue #75) — the reply summary below
+          // only projects the same VALUES into the deliberately flat
+          // `ThreadSummary`. "" title, open auto paths, unlisted.
+          let meta =
+            thread.ThreadMeta(
+              title: "",
+              title_source: thread.AutoTitle,
+              pinned: False,
+              tags: [],
+              tags_manual: [],
+              tags_source: thread.AutoTags,
+              archived: False,
+              // Provenance only (bots plan P1): never read back — the
+              // frozen columns above are the thread's truth.
+              bot_id: requested.bot_id,
+              created_at: created_at,
+            )
+          // Write-through BEFORE the child starts: the thread row lands
+          // now, with the frozen alias and the frozen system prompt
+          // (contract rule 2), so hydration can rebuild the frozen prefix
+          // byte-identically — and so the delivery wrapper below is
+          // decided on the SAME fact the provenance pointer reflects.
+          let persisted = case
+            state.store.insert_thread(
+              store.StoredSummary(
+                id: id,
+                provider_id: requested.provider_id,
+                model: alias,
+                meta: meta,
+                // The creation-time snapshot (bots plan P2): the RESOLVED
+                // names this thread will run with, always persisted —
+                // never NULL-for-default — so no config change or bot
+                // edit can re-aim this envelope.
+                toolset: toolset.names,
+                last_active_at: created_at,
+                // 1 = the system prompt (Phase 1 message_count).
+                message_count: 1,
+              ),
+              // The RESOLVED prompt — the exact bytes frozen into the
+              // transcript above, never the config default an explicit
+              // request may have overridden.
+              prompt,
+            )
+          {
+            Ok(_) -> True
+            Error(error) -> {
+              log_store_error("insert_thread " <> id, error)
+              False
+            }
+          }
+          // The provenance pointer mirrors a STORED row's FK-maintained
+          // column, so an unpersisted create (the insert failed — store
+          // down, or the bot deleted between the orchestration's lookup
+          // and this insert) must not claim one: the bot-delete scrub
+          // cannot reach this record (it did not exist at delete time),
+          // making this the one place a dead id could otherwise ride a
+          // summary for the session's whole life. The insert ATTEMPT
+          // above still carries the pointer — the FK is what rejects a
+          // dead one.
+          let meta = case persisted {
+            True -> meta
+            False -> thread.ThreadMeta(..meta, bot_id: None)
+          }
+          // The delivery wrapper (bots P3c, #97): identity is per-THREAD,
+          // never per-toolset — bundles are cached by name tuple and
+          // shared across a bot's threads — so the registry wraps the
+          // bundle's turn fn HERE, per thread, closing over this thread's
+          // id + bot id. The cache keeps the unwrapped bundle. ONLY a
+          // persisted bot thread wraps: an unpersisted one presents as
+          // human (pointer scrubbed above), so it must BEHAVE human too —
+          // an unwrapped runner builds no delivery context and its
+          // `bot_message` errors honestly, instead of a bot-capable
+          // runner hiding behind a human summary and skipping the
+          // inbound gate (cubic PR review, P1).
           let spec =
             thread.ThreadSpec(
               id: id,
@@ -633,6 +778,14 @@ fn handle_create(
               hydrated: False,
               utility_apply: utility_apply_for(state.self, id),
             )
+          let spec = case requested.bot_id, persisted {
+            Some(bot_id), True ->
+              thread.ThreadSpec(
+                ..spec,
+                toolset: delivery_toolset(state, toolset, id, bot_id),
+              )
+            _, _ -> spec
+          }
           case
             factory_supervisor.start_child(
               state.factory,
@@ -640,70 +793,6 @@ fn handle_create(
             )
           {
             Ok(started) -> {
-              let created_at = timing.wall_now_s()
-              // The organizational block, built ONCE and shared by the
-              // stored row and the live record (issue #75) — the reply
-              // summary below only projects the same VALUES into the
-              // deliberately flat `ThreadSummary`. "" title, open auto
-              // paths, unlisted.
-              let meta =
-                thread.ThreadMeta(
-                  title: "",
-                  title_source: thread.AutoTitle,
-                  pinned: False,
-                  tags: [],
-                  tags_manual: [],
-                  tags_source: thread.AutoTags,
-                  archived: False,
-                  // Provenance only (bots plan P1): never read back — the
-                  // frozen columns above are the thread's truth.
-                  bot_id: requested.bot_id,
-                  created_at: created_at,
-                )
-              // Write-through: the thread row lands now, with the frozen
-              // alias and the frozen system prompt (contract rule 2), so
-              // hydration can rebuild the frozen prefix byte-identically.
-              let persisted = case
-                state.store.insert_thread(
-                  store.StoredSummary(
-                    id: id,
-                    provider_id: requested.provider_id,
-                    model: alias,
-                    meta: meta,
-                    // The creation-time snapshot (bots plan P2): the
-                    // RESOLVED names this thread will run with, always
-                    // persisted — never NULL-for-default — so no config
-                    // change or bot edit can re-aim this envelope.
-                    toolset: toolset.names,
-                    last_active_at: created_at,
-                    // 1 = the system prompt (Phase 1 message_count).
-                    message_count: 1,
-                  ),
-                  // The RESOLVED prompt — the exact bytes frozen into the
-                  // transcript above, never the config default an explicit
-                  // request may have overridden.
-                  prompt,
-                )
-              {
-                Ok(_) -> True
-                Error(error) -> {
-                  log_store_error("insert_thread " <> id, error)
-                  False
-                }
-              }
-              // The provenance pointer mirrors a STORED row's
-              // FK-maintained column, so an unpersisted create (the insert
-              // failed — store down, or the bot deleted between the
-              // orchestration's lookup and this insert) must not claim one:
-              // the bot-delete scrub cannot reach this record (it did not
-              // exist at delete time), making this the one place a dead id
-              // could otherwise ride a summary for the session's whole
-              // life. The insert ATTEMPT above still carries the pointer —
-              // the FK is what rejects a dead one.
-              let meta = case persisted {
-                True -> meta
-                False -> thread.ThreadMeta(..meta, bot_id: None)
-              }
               let record =
                 Record(
                   id: id,
@@ -718,47 +807,66 @@ fn handle_create(
                   meta: meta,
                   persisted: persisted,
                 )
-              // The create reply IS the summary (#73): the same shape a
-              // following List would report (message_count 1 = the system
-              // prompt, activity = creation) — web and UI never hand-build
-              // one again.
-              process.send(
-                reply,
-                Ok(thread.ThreadSummary(
-                  id: id,
-                  provider_id: requested.provider_id,
-                  model: alias,
-                  title: "",
-                  title_source: thread.AutoTitle,
-                  pinned: False,
-                  tags: [],
-                  archived: False,
-                  bot_id: meta.bot_id,
-                  message_count: 1,
-                  streaming: False,
-                  created_at: created_at,
-                  // Until the first commit, a thread's activity is its
-                  // creation.
-                  last_active_at: created_at,
-                  metrics: [],
-                )),
-              )
-              actor.continue(
+              #(
                 State(
                   ..state,
                   threads: dict.insert(state.threads, id, record),
                   counter: counter,
                 ),
+                Ok(record),
               )
             }
             Error(reason) -> {
-              process.send(reply, Error(StartFailed(string.inspect(reason))))
-              actor.continue(state)
+              // The child failed to start AFTER the row landed: delete the
+              // ghost row, or the next create would reuse this id against
+              // a durable half-thread and a restart would hydrate it
+              // (cubic PR review). The counter stays bumped either way —
+              // minted ids never recycle (the boot-sweep rule) — and the
+              // unpersisted lane (insert failed, no row, no child) just
+              // pays the counter bump for the same monotonic guarantee.
+              let state = case persisted {
+                True ->
+                  case state.store.delete_thread(id) {
+                    Ok(_) -> state
+                    Error(error) -> {
+                      log_store_error("delete ghost thread " <> id, error)
+                      state
+                    }
+                  }
+                False -> state
+              }
+              #(
+                State(..state, counter: counter),
+                Error(StartFailed(string.inspect(reason))),
+              )
             }
           }
         }
       }
   }
+}
+
+/// The create-reply projection of a fresh record: flat summary, empty
+/// display metadata (the record's meta carries the defaults #73 fixed),
+/// message_count 1 = the system prompt, activity = creation.
+fn record_summary(record: Record) -> thread.ThreadSummary {
+  thread.ThreadSummary(
+    id: record.id,
+    provider_id: record.provider_id,
+    model: record.model,
+    title: record.meta.title,
+    title_source: record.meta.title_source,
+    pinned: record.meta.pinned,
+    tags: record.meta.tags,
+    archived: record.meta.archived,
+    bot_id: record.meta.bot_id,
+    message_count: 1,
+    streaming: False,
+    created_at: record.meta.created_at,
+    // Until the first commit, a thread's activity is its creation.
+    last_active_at: record.meta.created_at,
+    metrics: [],
+  )
 }
 
 fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
@@ -1191,8 +1299,9 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
 
     MonitorNoise -> actor.continue(state)
 
-    // Create cases are handled in `handle` before delegating here.
-    Create(..) | CreateWithToolset(..) -> actor.continue(state)
+    // Create and Deliver cases are handled in `handle` before delegating
+    // here.
+    Create(..) | CreateWithToolset(..) | Deliver(..) -> actor.continue(state)
   }
 }
 
@@ -1290,7 +1399,17 @@ fn lazy_start(state: State, summary: StoredSummary) -> Resolved {
           )
           Missing
         }
-        Ok(#(state, toolset)) ->
+        Ok(#(state, resolved)) -> {
+          // The delivery wrapper rides hydration too (bots P3c, #97): a
+          // rehydrated bot thread must be able to send exactly like a
+          // freshly created one — depth comes from the persisted sidecar,
+          // so the counter survives the restart. The cache keeps the
+          // unwrapped bundle; the wrap is per thread.
+          let toolset = case summary.meta.bot_id {
+            Some(bot_id) ->
+              delivery_toolset(state, resolved, summary.id, bot_id)
+            None -> resolved
+          }
           case rebuild_transcript(state, summary.id) {
             Error(error) -> {
               log_store_error("lazy_start " <> summary.id, error)
@@ -1347,6 +1466,7 @@ fn lazy_start(state: State, summary: StoredSummary) -> Resolved {
               }
             }
           }
+        }
       }
   }
 }
@@ -1705,6 +1825,444 @@ fn restart(
 }
 
 // ---------------------------------------------------------------------------
+// Bot-to-bot delivery (bots plan P3c, issue #97)
+// ---------------------------------------------------------------------------
+
+/// The ask budget shared by every ask on the delivery path — the tool's
+/// worker-side asks (built below) and the send into the target thread —
+/// the same 5s every other registry/thread ask in the repo uses.
+const delivery_ask_timeout_ms = 5000
+
+/// Handle one `Deliver` ask (always from the unlinked turn worker — the
+/// `bot_message` tool's `Delivery.deliver` closure). Guards, in the
+/// settled order: unknown target; self-addressing — any RESOLVED target
+/// whose bot is the sender's own, refused BEFORE routing (a
+/// name-addressed self-send would otherwise find-or-create a different,
+/// idle A-thread; the busy guard alone only covers thread-id addressing
+/// of the in-flight thread); archived target (refuse — archived is
+/// quiescent); `allow_inbound` (#95 — a STORE read, never a
+/// bot-registry call); hop depth; busy target (the target actor answers
+/// immediately in both states — it never blocks on its own worker, so
+/// this ask is bounded).
+fn deliver_message(
+  state: State,
+  request: delivery.Request,
+) -> #(State, delivery.Reply) {
+  case classify_target(state, request.to) {
+    MissingTarget -> #(state, delivery.Refused("unknown target"))
+    // A store outage during the bot-name lookup is not an "unknown
+    // target" — the honest verdict names the failure so the sender can
+    // retry instead of giving up on a target that may well exist
+    // (cubic PR review).
+    LookupUnavailable -> #(
+      state,
+      delivery.Refused("target lookup failed; try again"),
+    )
+    FoundBot(bot) ->
+      case bot.id == request.from_bot_id {
+        True -> #(state, delivery.Refused("self-addressed delivery"))
+        False ->
+          // The name path pre-checks the gate and the hop count BEFORE
+          // find-or-create: a refused delivery must not leave a fresh,
+          // never-used DM thread behind. The resolved-thread path
+          // re-checks both below (idempotent — one store read extra at
+          // most), which is where the settled guard order lives.
+          case bot.allow_inbound {
+            False -> #(
+              state,
+              delivery.Refused("target does not accept inbound bot messages"),
+            )
+            True ->
+              case request.depth > state.cfg.max_bot_hops {
+                True -> #(state, delivery.Refused("max bot hops exceeded"))
+                False ->
+                  case find_or_create_dm(state, request, bot) {
+                    #(state, Ok(record)) ->
+                      deliver_to_thread(state, request, record)
+                    #(state, Error(reason)) -> #(
+                      state,
+                      delivery.Refused(reason),
+                    )
+                  }
+              }
+          }
+      }
+    FoundThread(state, record) ->
+      case record.meta.bot_id {
+        Some(bot_id) if bot_id == request.from_bot_id -> #(
+          state,
+          delivery.Refused("self-addressed delivery"),
+        )
+        _ -> deliver_to_thread(state, request, record)
+      }
+  }
+}
+
+/// What `to` resolved to. Thread ids win over bot names (the precise
+/// channel); a bot literally named like a thread id is reachable by name
+/// only while no thread owns that id — acceptable at personal scale.
+type Target {
+  MissingTarget
+  LookupUnavailable
+  FoundBot(bot: store.StoredBot)
+  FoundThread(state: State, record: Record)
+}
+
+fn classify_target(state: State, to: String) -> Target {
+  case resolve_thread(state, to) {
+    Ok(#(state, record)) -> FoundThread(state, record)
+    Error(_) ->
+      case find_bot_by_name(state, to) {
+        BotFound(bot) -> FoundBot(bot)
+        NoSuchBot -> MissingTarget
+        LookupFailed -> LookupUnavailable
+      }
+  }
+}
+
+/// Resolve a thread id to a live record, lazily starting a dormant one
+/// and retrying a failed restart — the same resolution the `Get` arm
+/// performs, returning the state transition beside the record so the
+/// delivery path can thread it through. `Error` = unknown or unstartable.
+fn resolve_thread(state: State, id: String) -> Result(#(State, Record), Nil) {
+  case dict.get(state.threads, id) {
+    Ok(record) ->
+      case record.start_error {
+        Some(_) ->
+          // Guard on `persisted` FIRST: case subjects evaluate eagerly,
+          // and an unpersisted record must never reach the store — or
+          // start a child the discarded state would orphan (the same
+          // guard shape as the `Get` arm; cubic PR review).
+          case record.persisted {
+            True ->
+              case retry_rehydrate(state, record) {
+                Started(next) ->
+                  case dict.get(next.threads, id) {
+                    Ok(record) -> Ok(#(next, record))
+                    Error(_) -> Error(Nil)
+                  }
+                _ -> Error(Nil)
+              }
+            False -> Error(Nil)
+          }
+        None -> Ok(#(state, record))
+      }
+    Error(_) ->
+      case dict.get(state.dormant, id) {
+        Ok(summary) ->
+          case lazy_start(state, summary) {
+            Started(next) ->
+              case dict.get(next.threads, id) {
+                Ok(record) -> Ok(#(next, record))
+                Error(_) -> Error(Nil)
+              }
+            _ -> Error(Nil)
+          }
+        Error(_) -> Error(Nil)
+      }
+  }
+}
+
+/// Bot-name lookup — a STORE read (the whole bot table; a personal-scale
+/// settings entity, the same shape the bot registry loads at boot), never
+/// a bot-registry call (§8 no-cross-registry-edges). A store failure is
+/// distinct from "no such bot": the caller must be able to tell a
+/// transient outage from a genuinely unknown target.
+type BotLookup {
+  BotFound(bot: store.StoredBot)
+  NoSuchBot
+  LookupFailed
+}
+
+fn find_bot_by_name(state: State, name: String) -> BotLookup {
+  case state.store.list_bots() {
+    Ok(bots) ->
+      case list.find(bots, fn(bot) { bot.name == name }) {
+        Ok(bot) -> BotFound(bot)
+        Error(Nil) -> NoSuchBot
+      }
+    Error(error) -> {
+      log_store_error("deliver target lookup", error)
+      LookupFailed
+    }
+  }
+}
+
+/// Name-addressed routing: the per (sender bot, target bot) DM-thread
+/// map. A hit resolves to a live record; a miss (or a map entry whose
+/// thread was deleted) find-or-creates from the TARGET bot through
+/// `start_new_thread` — the one creation path, no new frozen-value path.
+/// The registry-side create skips the live model-alias revalidation
+/// `nexus/thread_create` performs for user-facing creates: that check is
+/// a network call, and no network call may run inside this actor (§8 —
+/// the registry answers from state + bounded asks only). A bot whose
+/// alias went stale past an upgrade therefore starts its DM thread and
+/// its turns fail at stream time — the same "stale alias is legitimate
+/// at rest" semantics as the bot table itself.
+fn find_or_create_dm(
+  state: State,
+  request: delivery.Request,
+  bot: store.StoredBot,
+) -> #(State, Result(Record, String)) {
+  case dict.get(state.dm, #(request.from_bot_id, bot.id)) {
+    Ok(thread_id) -> {
+      // Guards cannot call functions: resolve the known-ness first (see
+      // the branches below).
+      let known = thread_known(state, thread_id)
+      case resolve_thread(state, thread_id) {
+        Ok(#(state, record)) -> #(state, Ok(record))
+        // Known to the registry (live or dormant) but unresolvable right
+        // now — a failed restart/start: refuse and KEEP the map entry, so
+        // the next delivery retries the SAME thread instead of opening a
+        // duplicate DM behind a transient failure (cubic PR review).
+        Error(_) if known -> #(state, Error("target thread unavailable"))
+        // Absent from both dicts: deleted behind the map — open a fresh
+        // one and repoint the entry.
+        Error(_) -> create_dm(state, request, bot)
+      }
+    }
+    Error(_) -> create_dm(state, request, bot)
+  }
+}
+
+/// True when the id still belongs to a record the registry knows — the
+/// map-miss fallback may only replace an entry the registry has truly
+/// forgotten (a delete), never one it merely failed to resolve.
+fn thread_known(state: State, id: String) -> Bool {
+  dict.has_key(state.threads, id) || dict.has_key(state.dormant, id)
+}
+
+fn create_dm(
+  state: State,
+  request: delivery.Request,
+  bot: store.StoredBot,
+) -> #(State, Result(Record, String)) {
+  let requested =
+    NewThread(
+      provider_id: bot.provider_id,
+      model: bot.model,
+      system_prompt: bot.system_prompt,
+      // The same bot-default transform a user-facing create-from-bot
+      // gets: `None` (the live-template sentinel) resolves to the
+      // default set plus `bot_message`.
+      toolset: bot.tools,
+      bot_id: Some(bot.id),
+    )
+  case resolve_toolset(state, effective_toolset(state, requested)) {
+    Error(reason) -> #(
+      state,
+      Error("target bot toolset unavailable: " <> reason),
+    )
+    Ok(#(state, toolset)) ->
+      case start_new_thread(state, requested, toolset) {
+        #(state, Ok(record)) -> {
+          let state =
+            State(
+              ..state,
+              dm: dict.insert(
+                state.dm,
+                #(request.from_bot_id, bot.id),
+                record.id,
+              ),
+            )
+          #(state, Ok(record))
+        }
+        #(state, Error(_)) -> #(
+          state,
+          Error("target bot's thread could not be started"),
+        )
+      }
+  }
+}
+
+/// The resolved-thread guards + the send. The model-visible identity
+/// rides CONTENT only — one append-only user turn whose bytes carry the
+/// `From <bot> (thread <id>):` prefix (the sender's CURRENT display name,
+/// resolved ask-at-send; the sender's thread id, so the target can reply
+/// by addressing it precisely). UI attribution rides the display-only
+/// origin sidecar (`Send`'s author/depth, marked by the target actor).
+fn deliver_to_thread(
+  state: State,
+  request: delivery.Request,
+  record: Record,
+) -> #(State, delivery.Reply) {
+  case record.meta.archived {
+    True -> #(state, delivery.Refused("target thread is archived"))
+    False ->
+      case inbound_gate(state, record.meta.bot_id) {
+        Error(reason) -> #(state, delivery.Refused(reason))
+        Ok(Nil) ->
+          // Hop guard: `depth` is this delivery's hop count (the
+          // initiating user message's sidecar depth + 1 — a human send
+          // reset it to 0, so the first bot turn delivers at depth 1).
+          // Refusing at depth > max_bot_hops caps the chain at N
+          // bot-to-bot hops, the inter-bot analogue of
+          // `max_tool_iterations`.
+          case request.depth > state.cfg.max_bot_hops {
+            True -> #(state, delivery.Refused("max bot hops exceeded"))
+            False -> {
+              let text =
+                "From "
+                <> request.from_bot_name
+                <> " (thread "
+                <> request.from_thread_id
+                <> "): "
+                <> request.text
+              // The ONE turn-machine path (`thread.Send`, bots P3b): no
+              // parallel Deliver variant. The target replies immediately
+              // in both states — idle: append + commit + spawn the
+              // worker, then `Sent`; busy: `Busy` — it never blocks on
+              // its own worker, so the ask is bounded. The ask itself is
+              // a manual send + bounded receive on a subject THIS actor
+              // owns (the same non-fatal pattern as the worker-side
+              // asks): this is the first synchronous registry→thread
+              // edge, and an `actor.call` would panic the registry on a
+              // target that dies or stalls mid-ask — a refusal is the
+              // honest verdict instead. (A timeout after the target
+              // already took the line leaves it delivered — at-most-once
+              // with a conservative receipt, the MVP's accepted
+              // ambiguity.)
+              let reply = process.new_subject()
+              process.send(
+                record.subject,
+                thread.Send(
+                  text,
+                  Some(request.from_bot_name),
+                  request.depth,
+                  reply,
+                ),
+              )
+              case process.receive(reply, delivery_ask_timeout_ms) {
+                Ok(thread.Sent) -> #(state, delivery.Delivered(record.id))
+                Ok(thread.Busy) -> #(state, delivery.Busy)
+                Error(Nil) -> #(
+                  state,
+                  delivery.Refused("target thread unavailable"),
+                )
+              }
+            }
+          }
+      }
+  }
+}
+
+/// The #95 inbound gate: a STORE read by the target thread's bot id —
+/// never a bot-registry call (the same store-count/guard pattern as the
+/// provider delete guard). A thread with no bot (a human thread
+/// addressed by id) has no gate to read.
+fn inbound_gate(state: State, bot_id: Option(String)) -> Result(Nil, String) {
+  case bot_id {
+    None -> Ok(Nil)
+    Some(id) ->
+      case state.store.get_bot(id) {
+        Ok(bot) ->
+          case bot.allow_inbound {
+            True -> Ok(Nil)
+            False -> Error("target does not accept inbound bot messages")
+          }
+        Error(_) -> Error("target bot is unavailable")
+      }
+  }
+}
+
+/// Wrap a toolset bundle's turn fn with THIS thread's delivery identity
+/// (bots P3c, #97). The bundle itself stays cached by name tuple and
+/// shared across the bot's threads — the wrap is per thread, applied at
+/// create/hydrate, closing over the thread id + bot id and the two ask
+/// closures. Depth is computed per turn from the initiating user
+/// message's sidecar depth + 1 (a human send resets to 0): persisted
+/// data, so the counter survives restarts. The ignored `delivery`
+/// parameter is always `None` here — the base bundle runner receives the
+/// wrapper-built context instead.
+fn delivery_toolset(
+  state: State,
+  toolset: thread.Toolset,
+  thread_id: String,
+  bot_id: String,
+) -> thread.Toolset {
+  let base = toolset.runner
+  thread.Toolset(
+    ..toolset,
+    runner: fn(endpoint, tr, cancel, _delivery, on_event) {
+      let ctx =
+        delivery.Delivery(
+          thread_id: thread_id,
+          bot_id: bot_id,
+          depth: initiating_depth(tr) + 1,
+          deliver: fn(request) { deliver_ask(state.self, request) },
+          sender_name: fn() { sender_name_ask(state.bots_name, bot_id) },
+        )
+      base(endpoint, tr, cancel, Some(ctx), on_event)
+    },
+  )
+}
+
+/// The initiating user message's sidecar depth: the LAST user message's
+/// `Origin.depth`, 0 when it has none (a human send — `mark_origin`
+/// records nothing for the human case) or when no user message exists.
+fn initiating_depth(tr: Transcript) -> Int {
+  let messages = transcript.messages(tr)
+  last_user_depth(tr, list.length(messages) - 1, list.reverse(messages))
+}
+
+/// Newest-first walk over the chronological message list (reversed above):
+/// the head is the transcript's LAST message at `index`, each step moves
+/// one chronological slot back.
+fn last_user_depth(
+  tr: Transcript,
+  index: Int,
+  newest_first: List(chat.ChatMessage),
+) -> Int {
+  case newest_first {
+    [] -> 0
+    [chat.UserMessage(..), ..] ->
+      case transcript.origin_at(tr, index) {
+        Some(transcript.Origin(_, depth)) -> depth
+        None -> 0
+      }
+    [_, ..rest] -> last_user_depth(tr, index - 1, rest)
+  }
+}
+
+/// The `Deliver` ask, built for the turn worker: a worker-OWNED reply
+/// subject with a manual send + bounded receive — `process.receive` is
+/// only legal on a subject the calling process created (the known Gleam
+/// pitfall), and this closure only ever runs inside the unlinked turn
+/// worker. The manual pattern keeps a slow or dead registry a retryable
+/// tool error (`Error`) instead of an `actor.call` panic killing the
+/// turn. Guard verdicts arrive as `Ok(Reply)`.
+fn deliver_ask(
+  registry: Subject(Msg),
+  request: delivery.Request,
+) -> Result(delivery.Reply, String) {
+  let reply = process.new_subject()
+  process.send(registry, Deliver(request, reply))
+  case process.receive(reply, delivery_ask_timeout_ms) {
+    Ok(outcome) -> Ok(outcome)
+    Error(Nil) -> Error("delivery ask timed out")
+  }
+}
+
+/// The sender's CURRENT display name, asked at send time from the bot
+/// registry (same manual ask pattern as `deliver_ask`; the registry
+/// answers from boot-loaded state). `Error` = the sender bot was deleted
+/// (`thread.bot_id` went NULL via `ON DELETE SET NULL`, so a hydrated
+/// thread of a deleted bot builds no working identity) or the ask timed
+/// out — an honest tool error either way.
+fn sender_name_ask(
+  bots_name: process.Name(bot_registry.Msg),
+  bot_id: String,
+) -> Result(String, Nil) {
+  let reply = process.new_subject()
+  let bots = process.named_subject(bots_name)
+  process.send(bots, bot_registry.Get(bot_id, reply))
+  case process.receive(reply, delivery_ask_timeout_ms) {
+    Ok(Ok(bot)) -> Ok(bot.name)
+    _ -> Error(Nil)
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Client helpers
 // ---------------------------------------------------------------------------
 
@@ -1811,4 +2369,15 @@ pub fn delete_thread(registry: Subject(Msg), id: String) -> Bool {
 /// ON DELETE SET NULL and bot_id rides no query but insert_thread.
 pub fn bot_deleted(registry: Subject(Msg), id: String) -> Nil {
   actor.call(registry, 5000, fn(reply) { BotDeleted(id:, reply:) })
+}
+
+/// Bot-to-bot delivery (bots P3c, #97): the client ask the `bot_message`
+/// tool's closure performs from inside the unlinked turn worker — also
+/// the direct seam the guard tests drive. The reply is the receipt
+/// vocabulary: `Delivered(thread_id) | Busy | Refused(reason)`.
+pub fn deliver(
+  registry: Subject(Msg),
+  request: delivery.Request,
+) -> delivery.Reply {
+  actor.call(registry, 5000, fn(reply) { Deliver(request, reply) })
 }

@@ -295,6 +295,7 @@ Bifrost/SearxNG, and the production cache check whose golden fixture is
 | `NEXUS_UI_TOKEN` | unset | single-user bearer token; unset disables auth |
 | `NEXUS_SYSTEM_PROMPT` | concise assistant (default gains an ASCII-only codemode note while `NEXUS_CODEMODE=true`; explicitly set values are never amended) | frozen for newly created threads |
 | `NEXUS_MAX_TOOL_ITERATIONS` | `32` | agent-loop guard: max model round-trips per user turn |
+| `NEXUS_MAX_BOT_HOPS` | `4` | bot-to-bot delivery guard: max hops in an inter-bot message chain (bots plan P3c) |
 | `NEXUS_HTTP_FETCH_MAX_BYTES` | `20000` | `http_fetch`: response body cap per call |
 | `NEXUS_HTTP_FETCH_TIMEOUT_MS` | `15000` | `http_fetch` HTTP connect+receive timeout per hop |
 | `NEXUS_HTTP_FETCH_ALLOW_PRIVATE` | `false` | dev/test escape hatch for private/loopback targets; never in production |

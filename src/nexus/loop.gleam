@@ -33,6 +33,7 @@ import gleam/option.{type Option, None, Some}
 import gleam/string
 import glopenai/chat
 import glopenai/shared
+import nexus/delivery
 import nexus/openai
 import nexus/timing
 import nexus/tool_calls.{type Accumulator}
@@ -136,12 +137,18 @@ pub fn frozen_options(specs: List(ToolSpec)) -> Options {
 
 /// Run the loop for one user turn. `tr` must already include the user
 /// message; the returned transcript (on non-failed outcomes) extends it.
+/// `delivery` is the bot-to-bot identity handed to every tool executor
+/// this turn (bots P3c, #97): `None` on plain threads, `Some` when the
+/// registry's per-thread runner wrapper built it — computed from the
+/// initiating user message's sidecar depth + 1, so it is derived from
+/// persisted data and survives restarts.
 pub fn run(
   specs: List(ToolSpec),
   max_iterations: Int,
   stream: StreamFn,
   tr: Transcript,
   cancel: Subject(Nil),
+  delivery: Option(delivery.Delivery),
   on_event: fn(LoopEvent) -> Nil,
 ) -> LoopOutcome {
   cell_init()
@@ -151,6 +158,7 @@ pub fn run(
     stream,
     tr,
     cancel,
+    delivery,
     on_event,
     1,
     StatsAcc(None, 0, 0, 0, 0, 0, 0, False, None),
@@ -177,6 +185,7 @@ fn iterate(
   stream,
   tr,
   cancel,
+  delivery,
   on_event,
   iteration,
   stats,
@@ -220,7 +229,15 @@ fn iterate(
               on_event(LoopStatus(iteration, max_iterations, "tools"))
               let #(tr2, flushed_at) = append_calls(tr, partial_text, assembled)
               case
-                execute_all(specs, cancel, assembled, flushed_at, on_event, tr2)
+                execute_all(
+                  specs,
+                  cancel,
+                  delivery,
+                  assembled,
+                  flushed_at,
+                  on_event,
+                  tr2,
+                )
               {
                 // A Stop observed mid-round ends the turn here: re-entering
                 // the stream would open one more model request before its
@@ -234,6 +251,7 @@ fn iterate(
                     stream,
                     tr3,
                     cancel,
+                    delivery,
                     on_event,
                     iteration + 1,
                     stats,
@@ -364,6 +382,7 @@ type ExecOutcome {
 fn execute_all(
   specs: List(ToolSpec),
   cancel: Subject(Nil),
+  delivery: Option(delivery.Delivery),
   assembled: List(tool_calls.ToolCall),
   flushed_at: Int,
   on_event: fn(LoopEvent) -> Nil,
@@ -373,7 +392,9 @@ fn execute_all(
   // execution (the streaming seam's input), which is what makes a
   // mid-script `Stop` interruptible — a Stop sent while a tool runs
   // lands in the subject's queue and wakes an interruptible executor.
-  let ctx = tools.ToolCtx(cancel:)
+  // `delivery` rides beside it (bots P3c): the bot_message executor's
+  // per-thread identity, built by the registry's runner wrapper.
+  let ctx = tools.ToolCtx(cancel:, delivery:)
   let stamped = Some(flushed_at)
   let state =
     list.fold(assembled, ExecRunning(tr), fn(state, call: tool_calls.ToolCall) {

@@ -2721,10 +2721,9 @@ pub fn meta_updated_refreshes_sidebar_test() {
       process.new_name("nexus_ui_providers"),
       fn(_endpoint) { Error(openai.Transport("offline test")) },
     )
+  let bots_name = process.new_name("nexus_ui_bots")
   let assert Ok(started_bots) =
-    bot_registry.start(seam, process.new_name("nexus_ui_bots"), fn(names) {
-      Ok(names)
-    })
+    bot_registry.start(seam, bots_name, fn(names) { Ok(names) })
   let bots = started_bots.data
   let providers = started_providers.data
   let factory_name = process.new_name("nexus_ui_factory")
@@ -2741,6 +2740,10 @@ pub fn meta_updated_refreshes_sidebar_test() {
       // so the boot stays offline.
       fn() { [] },
       fixture_resolver(),
+      // Bots P3c: the delivery wrapper's sender-name ask resolves this
+      // name at ask time — the SAME name this harness started the bot
+      // registry under.
+      bots_name,
     )
   let registry = started_registry.data
 
@@ -2852,10 +2855,9 @@ pub fn send_moves_previous_day_row_into_today_immediately_test() {
       process.new_name("nexus_ui_providers_row"),
       fn(_endpoint) { Error(openai.Transport("offline test")) },
     )
+  let bots_name = process.new_name("nexus_ui_bots")
   let assert Ok(started_bots) =
-    bot_registry.start(seam, process.new_name("nexus_ui_bots"), fn(names) {
-      Ok(names)
-    })
+    bot_registry.start(seam, bots_name, fn(names) { Ok(names) })
   let bots = started_bots.data
   let providers = started_providers.data
   let factory_name = process.new_name("nexus_ui_factory_row")
@@ -2872,6 +2874,10 @@ pub fn send_moves_previous_day_row_into_today_immediately_test() {
       // so the boot stays offline.
       fn() { [] },
       fixture_resolver(),
+      // Bots P3c: the delivery wrapper's sender-name ask resolves this
+      // name at ask time — the SAME name this harness started the bot
+      // registry under.
+      bots_name,
     )
   let registry = started_registry.data
 
@@ -2941,10 +2947,9 @@ pub fn connect_with_configured_provider_never_notes_no_provider_test() {
       process.new_name("nexus_ui_providers"),
       fn(_endpoint) { Error(openai.Transport("offline test")) },
     )
+  let bots_name = process.new_name("nexus_ui_bots")
   let assert Ok(started_bots) =
-    bot_registry.start(seam, process.new_name("nexus_ui_bots"), fn(names) {
-      Ok(names)
-    })
+    bot_registry.start(seam, bots_name, fn(names) { Ok(names) })
   let bots = started_bots.data
   let providers = started_providers.data
   let factory_name = process.new_name("nexus_ui_factory")
@@ -2961,6 +2966,10 @@ pub fn connect_with_configured_provider_never_notes_no_provider_test() {
       // so the boot stays offline.
       fn() { [] },
       fixture_resolver(),
+      // Bots P3c: the delivery wrapper's sender-name ask resolves this
+      // name at ask time — the SAME name this harness started the bot
+      // registry under.
+      bots_name,
     )
   let registry = started_registry.data
 
@@ -3000,6 +3009,7 @@ fn unused_turn_runner(
   _endpoint,
   _tr,
   _cancel,
+  _delivery,
   _on_event,
 ) -> thread.TurnOutcome {
   thread.StreamErrored("no turn expected in this test")
@@ -3009,7 +3019,13 @@ fn unused_turn_runner(
 /// the stand-in for a reply that is still streaming. Whatever a test
 /// observes while a turn runs this runner cannot have come from the
 /// turn's own commit.
-fn parked_runner(_endpoint, tr, cancel, _on_event) -> thread.TurnOutcome {
+fn parked_runner(
+  _endpoint,
+  tr,
+  cancel,
+  _delivery,
+  _on_event,
+) -> thread.TurnOutcome {
   let selector =
     process.new_selector()
     |> process.select_map(cancel, fn(_) { Nil })
@@ -3024,6 +3040,7 @@ fn leak_runner(
   _endpoint,
   tr,
   _cancel,
+  _delivery,
   on_event: fn(loop.LoopEvent) -> Nil,
 ) -> thread.TurnOutcome {
   on_event(loop.StreamEvent(openai.TokenDelta("LEAK-TOKEN")))
@@ -3080,10 +3097,9 @@ pub fn thread_switch_drops_left_thread_stream_test() {
       process.new_name("nexus_ui_providers_leak"),
       fn(_endpoint) { Error(openai.Transport("offline test")) },
     )
+  let bots_name = process.new_name("nexus_ui_bots")
   let assert Ok(started_bots) =
-    bot_registry.start(seam, process.new_name("nexus_ui_bots"), fn(names) {
-      Ok(names)
-    })
+    bot_registry.start(seam, bots_name, fn(names) { Ok(names) })
   let bots = started_bots.data
   let providers = started_providers.data
   let factory_name = process.new_name("nexus_ui_factory_leak")
@@ -3098,6 +3114,10 @@ pub fn thread_switch_drops_left_thread_stream_test() {
       toolset(leak_runner),
       fn() { [] },
       fixture_resolver(),
+      // Bots P3c: the delivery wrapper's sender-name ask resolves this
+      // name at ask time — the SAME name this harness started the bot
+      // registry under.
+      bots_name,
     )
   let registry = started_registry.data
 
@@ -3169,10 +3189,9 @@ pub fn meta_updated_from_other_thread_refreshes_sidebar_test() {
       process.new_name("nexus_ui_providers_meta"),
       fn(_endpoint) { Error(openai.Transport("offline test")) },
     )
+  let bots_name = process.new_name("nexus_ui_bots")
   let assert Ok(started_bots) =
-    bot_registry.start(seam, process.new_name("nexus_ui_bots"), fn(names) {
-      Ok(names)
-    })
+    bot_registry.start(seam, bots_name, fn(names) { Ok(names) })
   let bots = started_bots.data
   let providers = started_providers.data
   let factory_name = process.new_name("nexus_ui_factory_meta")
@@ -3187,6 +3206,10 @@ pub fn meta_updated_from_other_thread_refreshes_sidebar_test() {
       toolset(unused_turn_runner),
       fn() { [] },
       fixture_resolver(),
+      // Bots P3c: the delivery wrapper's sender-name ask resolves this
+      // name at ask time — the SAME name this harness started the bot
+      // registry under.
+      bots_name,
     )
   let registry = started_registry.data
 
@@ -3305,6 +3328,8 @@ fn test_config() -> config.Config {
     codemode: False,
     codemode_timeout_ms: 30_000,
     codemode_max_output_chars: 32_768,
+    // Bots P3c: the delivery hop guard; 4 = the shipped default.
+    max_bot_hops: 4,
   )
 }
 
@@ -3884,12 +3909,9 @@ fn start_offline_registries(
       process.new_name("nexus_ui_create_providers"),
       fetch,
     )
+  let bots_name = process.new_name("nexus_ui_create_bots")
   let assert Ok(started_bots) =
-    bot_registry.start(
-      seam,
-      process.new_name("nexus_ui_create_bots"),
-      fn(names) { Ok(names) },
-    )
+    bot_registry.start(seam, bots_name, fn(names) { Ok(names) })
   let factory_name = process.new_name("nexus_ui_create_factory")
   let assert Ok(_factory) =
     factory_supervisor.start(thread_registry.factory_builder(factory_name))
@@ -3902,6 +3924,10 @@ fn start_offline_registries(
       toolset(unused_turn_runner),
       fn() { [] },
       fixture_resolver(),
+      // Bots P3c: the delivery wrapper's sender-name ask resolves this
+      // name at ask time — the SAME name this harness started the bot
+      // registry under.
+      bots_name,
     )
   #(started_registry.data, started_providers.data, started_bots.data)
 }
