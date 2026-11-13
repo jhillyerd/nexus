@@ -1180,6 +1180,7 @@ fn seed_bot_with_tools(
     model: "alpha",
     system_prompt: prompt,
     tools: tools,
+    allow_inbound: True,
     created_at: 1_700_000_000,
     updated_at: 1_700_000_000,
   ))

@@ -50,6 +50,13 @@ pub type Bot {
     /// re-validated at thread create. Order here is the wire order of
     /// the resolved schemas.
     tools: Option(List(String)),
+    /// The inbound gate (bots plan P3a, issue #95): `False` blocks other
+    /// bots from delivering messages into this bot's threads. Nothing
+    /// ENFORCES it until P3c's delivery guard reads it — via a STORE
+    /// read, never a bot-registry call (the §8 no-cross-registry-edges
+    /// rule); the wire shape and Settings toggle already display and
+    /// patch it. Create always opens the gate; PATCH moves it.
+    allow_inbound: Bool,
     /// Epoch seconds.
     created_at: Int,
     /// Epoch seconds; bumped on update.
@@ -102,6 +109,8 @@ pub type BotUpdate {
     /// `Some(None)` clears back to the default; `Some(Some(names))`
     /// replaces with an explicit list (validated like a create).
     tools: Option(Option(List(String))),
+    /// Present flips the inbound gate (bots plan P3a); absent keeps.
+    allow_inbound: Option(Bool),
   )
 }
 
@@ -205,6 +214,9 @@ pub fn to_row(
     model: model,
     system_prompt: normalize_prompt(params.system_prompt),
     tools: params.tools,
+    // The gate starts open (the column's DEFAULT true; there is no
+    // create-time override — PATCH is the only way to close it).
+    allow_inbound: True,
     created_at: now,
     updated_at: now,
   )
@@ -237,6 +249,10 @@ pub fn apply_update(row: Bot, update: BotUpdate, now: Int) -> Bot {
       Some(tools) -> tools
       None -> row.tools
     },
+    allow_inbound: case update.allow_inbound {
+      Some(allow) -> allow
+      None -> row.allow_inbound
+    },
     updated_at: now,
   )
 }
@@ -263,4 +279,5 @@ pub fn empty_update(update: BotUpdate) -> Bool {
   && option.is_none(update.model)
   && option.is_none(update.system_prompt)
   && option.is_none(update.tools)
+  && option.is_none(update.allow_inbound)
 }

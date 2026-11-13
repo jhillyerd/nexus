@@ -3,8 +3,9 @@
 -- sentinel for NULL = global default (see insert_bot.sql). `tools` rides
 -- the same two-parameter scheme as the insert: $7 is the explicit list
 -- ('{}' = chat-only), $8 the is-default flag (true = NULL = the current
--- default set). `updated_at` is server-side now(), like the
--- provider/thread metadata writes.
+-- default set). `allow_inbound` (bots plan P3a) is the merged row's gate.
+-- `updated_at` is server-side now(), like the provider/thread metadata
+-- writes.
 update bot set
   name = $2,
   description = $3,
@@ -12,5 +13,6 @@ update bot set
   model = $5,
   system_prompt = nullif($6, ''),
   tools = case when $8::boolean then null else $7::text[] end,
+  allow_inbound = $9::boolean,
   updated_at = now()
 where id = $1

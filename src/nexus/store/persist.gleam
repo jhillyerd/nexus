@@ -584,6 +584,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
               row.model,
               row.system_prompt,
               row.tools,
+              row.allow_inbound,
               row.created_s,
               row.updated_s,
             )
@@ -611,6 +612,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
                 row.model,
                 row.system_prompt,
                 row.tools,
+                row.allow_inbound,
                 row.created_s,
                 row.updated_s,
               ))
@@ -639,6 +641,9 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           option.unwrap(bot.tools, []),
           option.is_none(bot.tools),
           int.to_float(bot.created_at),
+          // The inbound gate (bots plan P3a): the row's value verbatim
+          // (creates always carry true; the seam writes full rows).
+          bot.allow_inbound,
         )
         |> result.map(fn(_) { Nil })
         |> result.map_error(query_error)
@@ -661,6 +666,8 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           // Same two-parameter toolset scheme as the insert (P2).
           option.unwrap(bot.tools, []),
           option.is_none(bot.tools),
+          // The merged row's inbound gate (bots plan P3a).
+          bot.allow_inbound,
         )
         |> result.map(fn(_) { Nil })
         |> result.map_error(query_error)
@@ -899,6 +906,7 @@ fn bot_from_row(
   model: String,
   system_prompt: option.Option(String),
   tools: option.Option(List(String)),
+  allow_inbound: Bool,
   created_s: Int,
   updated_s: Int,
 ) -> store.StoredBot {
@@ -912,6 +920,8 @@ fn bot_from_row(
     // NULL = the current default at thread-create time (P2's live
     // template half); '{}' decodes as Some([]).
     tools: tools,
+    // The inbound gate (bots plan P3a).
+    allow_inbound: allow_inbound,
     created_at: created_s,
     updated_at: updated_s,
   )

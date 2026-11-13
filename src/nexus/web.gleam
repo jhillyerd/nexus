@@ -525,6 +525,8 @@ pub type BotPatchFields {
     model: Option(String),
     system_prompt: Option(String),
     tools: Option(Option(List(String))),
+    /// The inbound gate (bots plan P3a): present flips it, absent keeps.
+    allow_inbound: Option(Bool),
   )
 }
 
@@ -570,6 +572,13 @@ pub fn bot_patch_fields_decoder() -> decode.Decoder(BotPatchFields) {
         }
       }),
   )
+  use allow_inbound <- decode.optional_field(
+    "allow_inbound",
+    None,
+    // Two-state (bots plan P3a): absent keeps the stored gate,
+    // present true/false replaces it.
+    decode.optional(decode.bool),
+  )
   decode.success(BotPatchFields(
     name: blank_as_none(name),
     description: description,
@@ -577,6 +586,7 @@ pub fn bot_patch_fields_decoder() -> decode.Decoder(BotPatchFields) {
     model: blank_as_none(model),
     system_prompt: system_prompt,
     tools: tools,
+    allow_inbound: allow_inbound,
   ))
 }
 
@@ -890,6 +900,7 @@ fn patch_bot_response(
           model: fields.model,
           system_prompt: fields.system_prompt,
           tools: fields.tools,
+          allow_inbound: fields.allow_inbound,
         )
       case bot.empty_update(patch) {
         True -> json_response(400, err_json("empty patch"))
@@ -1290,6 +1301,9 @@ pub fn bot_json(b: bot.Bot) -> Json {
       Some(names) -> json.array(names, json.string)
       None -> json.null()
     }),
+    // The inbound gate (bots plan P3a): false blocks other bots from
+    // delivering into this bot's threads (the P3c guard will enforce it).
+    #("allow_inbound", json.bool(b.allow_inbound)),
     #("created_at", json.int(b.created_at)),
     #("created_at_rfc3339", json.string(timing.wall_to_rfc3339(b.created_at))),
     #("updated_at", json.int(b.updated_at)),

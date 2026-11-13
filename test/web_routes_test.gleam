@@ -1135,3 +1135,45 @@ pub fn bots_route_toolset_validation_test() {
   let assert #(201, _thread) =
     send_authorized(req(port, Post, "/threads", "{\"bot\":\"b1\"}"))
 }
+
+/// The inbound gate (bots plan P3a, issue #95) on the /bots surface:
+/// creates open it, PATCH flips it both ways, an absent field keeps it,
+/// and the wire shape carries it on every bot response.
+pub fn bots_allow_inbound_patch_round_trip_test() {
+  let #(_registry, port) = start_server()
+
+  // A plain create: the gate starts open and rides the response.
+  let assert #(201, created) =
+    send_authorized(req(
+      port,
+      Post,
+      "/bots",
+      "{\"name\":\"Gate\",\"provider\":\"p-test\",\"model\":\"alias-a\"}",
+    ))
+  should.be_true(string.contains(created, "\"allow_inbound\":true"))
+
+  // PATCH false: closed on the wire.
+  let assert #(200, closed) =
+    send_authorized(req(port, Patch, "/bots/b1", "{\"allow_inbound\":false}"))
+  should.be_true(string.contains(closed, "\"allow_inbound\":false"))
+
+  // An absent field keeps it (the full-row replace must not reopen the
+  // gate); the field rides GET too.
+  let assert #(200, kept) =
+    send_authorized(req(port, Patch, "/bots/b1", "{\"description\":\"d\"}"))
+  should.be_true(string.contains(kept, "\"allow_inbound\":false"))
+  let assert #(200, listed) = send_authorized(req(port, Get, "/bots", ""))
+  should.be_true(string.contains(listed, "\"allow_inbound\":false"))
+
+  // PATCH true: reopened.
+  let assert #(200, opened) =
+    send_authorized(req(port, Patch, "/bots/b1", "{\"allow_inbound\":true}"))
+  should.be_true(string.contains(opened, "\"allow_inbound\":true"))
+
+  // A gate-only patch is not an empty patch (no 400): it reaches the
+  // unknown-id path and comes back as the 404.
+  should.equal(
+    send_authorized(req(port, Patch, "/bots/b404", "{\"allow_inbound\":true}")),
+    #(404, "{\"error\":\"unknown bot\"}"),
+  )
+}

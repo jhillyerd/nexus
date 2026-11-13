@@ -3340,6 +3340,7 @@ fn bot_row(
     model: "smart",
     system_prompt: prompt,
     tools: None,
+    allow_inbound: True,
     created_at: 0,
     updated_at: 0,
   )
@@ -3354,6 +3355,20 @@ fn bot_row_with_tools(
   tools: option.Option(List(String)),
 ) -> bot.Bot {
   bot.Bot(..bot_row(id, name, description, prompt), tools: tools)
+}
+
+/// Same row shape with the inbound gate set (bots plan P3a's display).
+fn bot_row_inbound(
+  id: String,
+  name: String,
+  description: String,
+  prompt: option.Option(String),
+  allow_inbound: Bool,
+) -> bot.Bot {
+  bot.Bot(
+    ..bot_row(id, name, description, prompt),
+    allow_inbound: allow_inbound,
+  )
 }
 
 /// The Bots section renders beside Providers, mirroring the provider
@@ -3472,6 +3487,111 @@ pub fn view_settings_bots_tools_display_test() {
     |> step(ui.Settings(ui_settings.BotEditToggled("b2")))
     |> view_string
   should.be_true(string.contains(editing_chat_only, "checked"))
+}
+
+/// The inbound gate toggle (bots plan P3a, issue #95): the row's control
+/// names the INVERSE action (an open gate offers to block, a blocked one
+/// offers to reopen), the blocked gate shows a badge, and a
+/// payload-laden bot name renders the toggle row as inert text — the
+/// toggle sits beside hostile text, never around it.
+pub fn view_settings_bots_inbound_toggle_test() {
+  let html =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(
+      ui.BotsLoaded([
+        bot_row("b1", "<script>alert(3)</script>", "", None),
+        bot_row_inbound("b2", "quiet", "", None, False),
+      ]),
+    )
+    |> step(ui.SettingsToggled)
+    |> view_string
+  // Both toggle shapes are in the list, one per row.
+  should.be_true(string.contains(html, ">Block inbound<"))
+  should.be_true(string.contains(html, ">Allow inbound<"))
+  // The blocked gate's badge, mirroring the provider row's "off".
+  should.be_true(string.contains(html, "inbound off"))
+  // The hostile name is escaped text, never markup.
+  should.be_true(string.contains(html, "&lt;script&gt;alert(3)&lt;/script&gt;"))
+  should_not_contain(html, "<script>alert(3)</script>")
+}
+
+/// The toggle's CLICK, against the REAL runtime over a REAL bot
+/// registry: the patch lands write-through in the registry (and the
+/// store mock behind it), the reload re-renders the row with the badge,
+/// and the hostile name stays inert text through the whole cascade.
+pub fn settings_inbound_toggle_runtime_round_trip_test() {
+  let #(registry, providers, bots) =
+    start_offline_registries(
+      fn(seam) {
+        seam.insert_bot(bot.Bot(
+          id: "b1",
+          name: "<script>alert(3)</script>",
+          description: "",
+          provider_id: store_mock.fixture_provider_id,
+          model: "alias-1",
+          system_prompt: None,
+          tools: None,
+          allow_inbound: True,
+          created_at: 0,
+          updated_at: 0,
+        ))
+      },
+      fn(_endpoint) { Error(openai.Transport("offline test")) },
+    )
+  let #(runtime, client) = boot_create_runtime(registry, providers, bots)
+
+  // The connect cascade loads providers, bots, and threads.
+  let _connected = collect_until_quiet(client, 10, 10, "")
+
+  // Open the settings panel so the Bots section is in the rendered tree.
+  lustre.send(to: runtime, message: lustre.dispatch(ui.SettingsToggled))
+  let _panel = collect_until_quiet(client, 10, 10, "")
+
+  // The click: patch the gate closed through the registry.
+  lustre.send(
+    to: runtime,
+    message: lustre.dispatch(
+      ui.Settings(ui_settings.BotInboundToggled("b1", False)),
+    ),
+  )
+  wait_for_registry_gate(bots, "b1", False, 20)
+  let assert Ok(closed) = bot_registry.get_bot(bots, "b1")
+  should.be_false(closed.allow_inbound)
+
+  // The mutation reply reloads the bot list; the re-render shows the
+  // blocked badge with the name still escaped.
+  wait_for_patch(client, "inbound off", 20)
+  let assert [stored] = bot_registry_rows(bots)
+  should.equal(stored.name, "<script>alert(3)</script>")
+}
+
+/// Poll the registry until bot `id`'s gate reads `want` (the PATCH
+/// round-trips through the actor asynchronously). Panics on timeout —
+/// the caller asserts the gate off the registry read that follows.
+fn wait_for_registry_gate(
+  bots: process.Subject(bot_registry.Msg),
+  id: String,
+  want: Bool,
+  attempts: Int,
+) -> Nil {
+  case bot_registry.get_bot(bots, id) {
+    Ok(row) if row.allow_inbound == want -> Nil
+    _ ->
+      case attempts <= 0 {
+        True -> panic as "inbound gate patch never landed"
+        False -> {
+          process.sleep(100)
+          wait_for_registry_gate(bots, id, want, attempts - 1)
+        }
+      }
+  }
+}
+
+/// The registry's current rows (its in-state mirror post-write-through).
+fn bot_registry_rows(bots: process.Subject(bot_registry.Msg)) -> List(bot.Bot) {
+  let assert Ok(all) = bot_registry.list_bots(bots)
+  all
 }
 
 /// Without bots the section says so; without PROVIDERS it explains the
@@ -3919,6 +4039,7 @@ pub fn create_from_bot_worker_lands_provenance_test() {
           model: "alias-1",
           system_prompt: Some("be terse"),
           tools: None,
+          allow_inbound: True,
           created_at: 0,
           updated_at: 0,
         ))

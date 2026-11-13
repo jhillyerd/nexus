@@ -417,6 +417,7 @@ pub type GetBotRow {
     model: String,
     system_prompt: Option(String),
     tools: Option(List(String)),
+    allow_inbound: Bool,
     created_s: Int,
     updated_s: Int,
   )
@@ -425,7 +426,7 @@ pub type GetBotRow {
 /// One bot row by id. `Error` for unknown ids is decided by the caller
 /// from the empty result. `tools` (bots plan P2): NULL = the default set
 /// at thread-create time, '{}' = chat-only, else the explicit list (see
-/// insert_bot.sql).
+/// insert_bot.sql). `allow_inbound` (bots plan P3a) is the inbound gate.
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
@@ -442,8 +443,9 @@ pub fn get_bot(
     use model <- decode.field(4, decode.string)
     use system_prompt <- decode.field(5, decode.optional(decode.string))
     use tools <- decode.field(6, decode.optional(decode.list(decode.string)))
-    use created_s <- decode.field(7, decode.int)
-    use updated_s <- decode.field(8, decode.int)
+    use allow_inbound <- decode.field(7, decode.bool)
+    use created_s <- decode.field(8, decode.int)
+    use updated_s <- decode.field(9, decode.int)
     decode.success(GetBotRow(
       id:,
       name:,
@@ -452,6 +454,7 @@ pub fn get_bot(
       model:,
       system_prompt:,
       tools:,
+      allow_inbound:,
       created_s:,
       updated_s:,
     ))
@@ -460,7 +463,7 @@ pub fn get_bot(
   "-- One bot row by id. `Error` for unknown ids is decided by the caller
 -- from the empty result. `tools` (bots plan P2): NULL = the default set
 -- at thread-create time, '{}' = chat-only, else the explicit list (see
--- insert_bot.sql).
+-- insert_bot.sql). `allow_inbound` (bots plan P3a) is the inbound gate.
 select
   id,
   name,
@@ -469,6 +472,7 @@ select
   model,
   system_prompt,
   tools,
+  allow_inbound,
   extract(epoch from created_at)::int8 as created_s,
   extract(epoch from updated_at)::int8 as updated_s
 from bot
@@ -678,6 +682,9 @@ where id = $1
 /// no nullif-style value sentinel can express NULL) and $8 is the
 /// is-default flag — true inserts NULL = resolve the current default set
 /// at thread creation.
+/// `allow_inbound` (bots plan P3a) is the row's gate verbatim — creates
+/// always carry true (bot.to_row), but the seam writes full rows, so the
+/// column is a parameter like every other.
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
@@ -693,6 +700,7 @@ pub fn insert_bot(
   arg_7: List(String),
   arg_8: Bool,
   arg_9: Float,
+  arg_10: Bool,
 ) -> Result(pog.Returned(Nil), pog.QueryError) {
   let decoder = decode.map(decode.dynamic, fn(_) { Nil })
 
@@ -706,8 +714,11 @@ pub fn insert_bot(
 -- no nullif-style value sentinel can express NULL) and $8 is the
 -- is-default flag — true inserts NULL = resolve the current default set
 -- at thread creation.
-insert into bot (id, name, description, provider_id, model, system_prompt, tools, created_at, updated_at)
-values ($1, $2, $3, $4, $5, nullif($6, ''), case when $8::boolean then null else $7::text[] end, to_timestamp($9), to_timestamp($9))
+-- `allow_inbound` (bots plan P3a) is the row's gate verbatim — creates
+-- always carry true (bot.to_row), but the seam writes full rows, so the
+-- column is a parameter like every other.
+insert into bot (id, name, description, provider_id, model, system_prompt, tools, allow_inbound, created_at, updated_at)
+values ($1, $2, $3, $4, $5, nullif($6, ''), case when $8::boolean then null else $7::text[] end, $10::boolean, to_timestamp($9), to_timestamp($9))
 "
   |> pog.query
   |> pog.parameter(pog.text(arg_1))
@@ -719,6 +730,7 @@ values ($1, $2, $3, $4, $5, nullif($6, ''), case when $8::boolean then null else
   |> pog.parameter(pog.array(fn(value) { pog.text(value) }, arg_7))
   |> pog.parameter(pog.bool(arg_8))
   |> pog.parameter(pog.float(arg_9))
+  |> pog.parameter(pog.bool(arg_10))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }
@@ -844,6 +856,7 @@ pub type ListBotsRow {
     model: String,
     system_prompt: Option(String),
     tools: Option(List(String)),
+    allow_inbound: Bool,
     created_s: Int,
     updated_s: Int,
   )
@@ -853,6 +866,7 @@ pub type ListBotsRow {
 /// re-sorts). Bots carry no secrets — the row IS the public shape.
 /// `tools` (bots plan P2): NULL = the default set at thread-create time,
 /// '{}' = chat-only, else the explicit list (see insert_bot.sql).
+/// `allow_inbound` (bots plan P3a) is the inbound gate.
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
@@ -868,8 +882,9 @@ pub fn list_bots(
     use model <- decode.field(4, decode.string)
     use system_prompt <- decode.field(5, decode.optional(decode.string))
     use tools <- decode.field(6, decode.optional(decode.list(decode.string)))
-    use created_s <- decode.field(7, decode.int)
-    use updated_s <- decode.field(8, decode.int)
+    use allow_inbound <- decode.field(7, decode.bool)
+    use created_s <- decode.field(8, decode.int)
+    use updated_s <- decode.field(9, decode.int)
     decode.success(ListBotsRow(
       id:,
       name:,
@@ -878,6 +893,7 @@ pub fn list_bots(
       model:,
       system_prompt:,
       tools:,
+      allow_inbound:,
       created_s:,
       updated_s:,
     ))
@@ -887,6 +903,7 @@ pub fn list_bots(
 -- re-sorts). Bots carry no secrets — the row IS the public shape.
 -- `tools` (bots plan P2): NULL = the default set at thread-create time,
 -- '{}' = chat-only, else the explicit list (see insert_bot.sql).
+-- `allow_inbound` (bots plan P3a) is the inbound gate.
 select
   id,
   name,
@@ -895,6 +912,7 @@ select
   model,
   system_prompt,
   tools,
+  allow_inbound,
   extract(epoch from created_at)::int8 as created_s,
   extract(epoch from updated_at)::int8 as updated_s
 from bot
@@ -1334,8 +1352,9 @@ where id = $1
 /// sentinel for NULL = global default (see insert_bot.sql). `tools` rides
 /// the same two-parameter scheme as the insert: $7 is the explicit list
 /// ('{}' = chat-only), $8 the is-default flag (true = NULL = the current
-/// default set). `updated_at` is server-side now(), like the
-/// provider/thread metadata writes.
+/// default set). `allow_inbound` (bots plan P3a) is the merged row's gate.
+/// `updated_at` is server-side now(), like the provider/thread metadata
+/// writes.
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
@@ -1350,6 +1369,7 @@ pub fn update_bot(
   arg_6: String,
   arg_7: List(String),
   arg_8: Bool,
+  arg_9: Bool,
 ) -> Result(pog.Returned(Nil), pog.QueryError) {
   let decoder = decode.map(decode.dynamic, fn(_) { Nil })
 
@@ -1358,8 +1378,9 @@ pub fn update_bot(
 -- sentinel for NULL = global default (see insert_bot.sql). `tools` rides
 -- the same two-parameter scheme as the insert: $7 is the explicit list
 -- ('{}' = chat-only), $8 the is-default flag (true = NULL = the current
--- default set). `updated_at` is server-side now(), like the
--- provider/thread metadata writes.
+-- default set). `allow_inbound` (bots plan P3a) is the merged row's gate.
+-- `updated_at` is server-side now(), like the provider/thread metadata
+-- writes.
 update bot set
   name = $2,
   description = $3,
@@ -1367,6 +1388,7 @@ update bot set
   model = $5,
   system_prompt = nullif($6, ''),
   tools = case when $8::boolean then null else $7::text[] end,
+  allow_inbound = $9::boolean,
   updated_at = now()
 where id = $1
 "
@@ -1379,6 +1401,7 @@ where id = $1
   |> pog.parameter(pog.text(arg_6))
   |> pog.parameter(pog.array(fn(value) { pog.text(value) }, arg_7))
   |> pog.parameter(pog.bool(arg_8))
+  |> pog.parameter(pog.bool(arg_9))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }
