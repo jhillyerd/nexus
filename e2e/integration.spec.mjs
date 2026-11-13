@@ -286,6 +286,27 @@ async function connected() {
   await page.waitForSelector("#status.live", { timeout: 30_000 });
 }
 
+/// Open a committed tool chip's full-call popup, read its status,
+/// sections, and pre blocks, then dismiss it (outside click) so the fixed
+/// overlay cannot block later interactions — the chip/popup UI's read
+/// path (the chip itself carries no status/args/result since #66).
+async function popInfo(page_, selector) {
+  await page_.locator(selector).first().click();
+  const pop = page_.locator("dialog[open] article.tool-pop");
+  await pop.waitFor({ timeout: 15_000 });
+  const info = await pop.evaluate((el) => ({
+    status: el.querySelector(".tool-status")?.textContent ?? "",
+    sections: [...el.querySelectorAll("h3")].map((h) => h.textContent),
+    pres: [...el.querySelectorAll("pre")].map((p) => p.textContent),
+  }));
+  await page_.mouse.click(10, 10);
+  await poll(
+    () => page_.locator("dialog[open]").count().then((c) => c === 0),
+    { timeout: 10_000, message: "popup dismissed" },
+  );
+  return info;
+}
+
 async function createThread(alias) {
   const panelOpen = () => page.locator("#create-panel").evaluate((el) => !el.hidden);
   if (!(await panelOpen().catch(() => false))) await page.click("#new-thread");
@@ -321,10 +342,15 @@ async function turn(page_, text, { expectTool = null, retries = 3 } = {}) {
       { timeout: 240_000, message: "turn finished" },
     );
     if (!expectTool) return true;
+    // The chip is the tool name only (the #66 popup compaction); its
+    // aria-label carries the terminal state.
     const cards = await page_.$$eval(`.turn.tool[data-tool='${expectTool}']`, (els) =>
-      els.map((el) => el.querySelector(".tool-status").textContent),
+      els.map((el) => el.getAttribute("aria-label")),
     );
-    if (cards.length > 0 && cards.every((s) => s === "completed" || s === "failed")) {
+    if (
+      cards.length > 0 &&
+      cards.every((s) => s?.includes("completed") || s?.includes("failed"))
+    ) {
       return true;
     }
     console.log(`  (attempt ${attempt}: no ${expectTool} card, retrying)`);
@@ -397,16 +423,11 @@ async function main() {
         "then summarise the top result in one sentence.",
         { expectTool: "web_search", retries: 3 },
       );
-      const info = await page
-        .locator(".turn.tool[data-tool='web_search']")
-        .first()
-        .evaluate((el) => ({
-          status: el.querySelector(".tool-status").textContent,
-          result: el.querySelector(".tool-result")?.textContent ?? "",
-        }));
-      console.log(`  card: ${info.status} · result head: ${info.result.slice(0, 80)}`);
+      const info = await popInfo(page, ".turn.tool[data-tool='web_search']");
+      const result = info.pres[info.pres.length - 1] ?? "";
+      console.log(`  card: ${info.status} · result head: ${result.slice(0, 80)}`);
       assert(info.status === "completed", "search card completed");
-      assert(info.result.length > 10, "search result preview present");
+      assert(result.length > 10, "search result preview present");
       const answer = await page.$$eval(".turn.assistant", (els) => els.map((e) => e.textContent));
       assert(answer.length > 0, "final answer present");
     });
@@ -418,57 +439,59 @@ async function main() {
         `Use the http_fetch tool to fetch ${FETCH_URL} and tell me what project this README describes.`,
         { expectTool: "http_fetch", retries: 3 },
       );
-      const info = await page
-        .locator(".turn.tool[data-tool='http_fetch']")
-        .first()
-        .evaluate((el) => ({
-          status: el.querySelector(".tool-status").textContent,
-          args: el.querySelector(".tool-args").textContent,
-          result: el.querySelector(".tool-result")?.textContent ?? "",
-        }));
-      console.log(`  card: ${info.status} · args: ${info.args.slice(0, 60)}…`);
+      const info = await popInfo(page, ".turn.tool[data-tool='http_fetch']");
+      const args = info.pres[0] ?? "";
+      const result = info.pres[info.pres.length - 1] ?? "";
+      console.log(`  card: ${info.status} · args: ${args.slice(0, 60)}…`);
       assert(info.status === "completed", "fetch card completed");
-      assert(info.result.length > 10, "fetch result preview present");
+      assert(args.includes("http"), "fetch arguments present");
+      assert(result.length > 10, "fetch result preview present");
     });
 
     await test("reconnect: real tool history replays after reload", async () => {
       await page.reload();
       await connected();
-      // The current thread is the llama.cpp one: its fetch card must replay.
+      // Replayed history renders as chips (name + aria state); the full
+      // args/results live in the popup, resolved from the log. The
+      // current thread is the llama.cpp one: its fetch chip must replay
+      // completed, and its popup must carry the stored result.
       await poll(
-        () =>
-          page
+        async () =>
+          (await page.locator(".turn.tool[data-tool='http_fetch']").count()) > 0 &&
+          ((await page
             .locator(".turn.tool[data-tool='http_fetch']")
             .first()
-            .locator(".tool-result")
-            // Replayed cards collapse (details, no open) — the body has no
-            // box, so wait for attachment, not visibility.
-            .waitFor({ state: "attached", timeout: 500 })
-            .then(() => true)
-            .catch(() => false),
-        { timeout: 60_000, message: "http_fetch card replayed with result" },
+            .getAttribute("aria-label"))?.includes("completed") ?? false),
+        { timeout: 60_000, message: "http_fetch chip replayed completed" },
       );
-      // Switch to the vLLM thread: its search card must replay there too.
+      const fetchPop = await popInfo(page, ".turn.tool[data-tool='http_fetch']");
+      assert(
+        (fetchPop.pres[fetchPop.pres.length - 1] ?? "").length > 10,
+        "replayed fetch popup carries the stored result",
+      );
+      // Switch to the vLLM thread: its search chip must replay there too.
       await page
-        .locator("#thread-list .thread-item", { hasText: VLLM_ALIAS })
+        .locator("#thread-list .thread-row", { hasText: VLLM_ALIAS })
         .first()
         .click();
       await poll(
-        () =>
-          page
+        async () =>
+          (await page.locator(".turn.tool[data-tool='web_search']").count()) > 0 &&
+          ((await page
             .locator(".turn.tool[data-tool='web_search']")
             .first()
-            .locator(".tool-result")
-            .waitFor({ state: "attached", timeout: 500 })
-            .then(() => true)
-            .catch(() => false),
-        { timeout: 60_000, message: "web_search card replayed with result" },
+            .getAttribute("aria-label"))?.includes("completed") ?? false),
+        { timeout: 60_000, message: "web_search chip replayed completed" },
+      );
+      const searchPop = await popInfo(page, ".turn.tool[data-tool='web_search']");
+      assert(
+        (searchPop.pres[searchPop.pres.length - 1] ?? "").length > 10,
+        "replayed search popup carries the stored result",
       );
       const replayed = await page.$$eval(".turn.tool[data-call-id]", (els) =>
         els.map((el) => ({
           tool: el.getAttribute("data-tool"),
-          status: el.querySelector(".tool-status").textContent,
-          hasResult: Boolean(el.querySelector(".tool-result")),
+          label: el.getAttribute("aria-label"),
         })),
       );
       console.log(`  replayed (vLLM thread): ${JSON.stringify(replayed)}`);

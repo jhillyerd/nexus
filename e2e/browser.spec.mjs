@@ -1958,6 +1958,136 @@ async function main() {
       await connected(page);
     });
 
+    // -- 17c. bots P3c: bot-to-bot relay (bot_message) -------------------
+    // Alpha's thread — created FROM bot Alpha, so its toolset is the
+    // human default PLUS bot_message — relays a note to bot Beta: the
+    // fake gateway scripts the bot_message call, Alpha's turn receives
+    // the receipt, and Beta's DM thread gains the authored user turn
+    // (the From prefix rides the message bytes) and completes a plain
+    // turn. The gateway's recorded request bodies are the model-visible
+    // ground truth (issue #97's e2e smoke).
+    await test("bots: bot-to-bot relay delivers an authored user turn", async () => {
+      const headers = {
+        authorization: `Bearer ${TOKEN}`,
+        "content-type": "application/json",
+      };
+      const mkBot = async (name) => {
+        const res = await page.request.post(`${base}/bots`, {
+          data: {
+            name,
+            provider: "fake",
+            model: "smart",
+            description: `${name} relay smoke`,
+          },
+          headers,
+        });
+        eq(res.status(), 201, `bot ${name} created`);
+        return (await res.json()).id;
+      };
+      const alphaId = await mkBot("RelayAlpha");
+      const betaId = await mkBot("RelayBeta");
+
+      // A thread FROM Alpha (the shared orchestration re-validates the
+      // alias against the fake gateway's live list).
+      const created = await page.request.post(`${base}/threads`, {
+        data: { bot: alphaId },
+        headers,
+      });
+      eq(created.status(), 201, "thread from bot created");
+      const alphaThread = (await created.json()).id;
+
+      // Relay: the scripted scenario emits bot_message(to: "Relay Beta",
+      // text: the note), then answers after the receipt.
+      const note = "relay-note-123";
+      const sent = await page.request.post(`${base}/threads/${alphaThread}/send`, {
+        data: { text: `case:relay RelayBeta ${note}` },
+        headers,
+      });
+      eq(sent.status(), 202, "send accepted");
+
+      // Beta's DM thread appears (registry find-or-create from Beta),
+      // carries Beta's provenance, and completes a turn over the
+      // authored line — the fake gateway's marker-less default answers
+      // plain text, so the turn commits (message_count 3: system +
+      // authored line + assistant answer).
+      const betaThread = await poll(
+        async () => {
+          const { threads } = await (
+            await page.request.get(`${base}/threads`, { headers })
+          ).json();
+          const found = threads.find(
+            (s) => s.bot_id === betaId && s.id !== alphaThread,
+          );
+          return found && !found.streaming && found.message_count >= 3
+            ? found
+            : null;
+        },
+        { timeout: 30_000, interval: 500, message: "Beta DM turn completes" },
+      );
+
+      // Model-visible bytes: the gateway records raw request strings, so
+      // parse them. Beta's recorded request carries the authored user
+      // line — the From prefix names the sender and Alpha's thread, so
+      // Beta can reply by addressing it precisely.
+      const bodies = services.requests.map((r) => {
+        try {
+          return JSON.parse(r.body);
+        } catch {
+          return {};
+        }
+      });
+      const betaMessages = bodies
+        .map((body) => body?.messages ?? [])
+        .find((messages) =>
+          messages.some(
+            (m) =>
+              m.role === "user" &&
+              String(m.content).startsWith(
+                `From RelayAlpha (thread ${alphaThread}): `,
+              ),
+          ),
+        );
+      assert(betaMessages, "Beta's turn carried the authored line to the model");
+      const authored = betaMessages.find(
+        (m) => m.role === "user" && String(m.content).includes(note),
+      );
+      assert(
+        authored && authored.content.endsWith(note),
+        "authored line is the From prefix plus the tool's text",
+      );
+      // Beta's envelope carries its own (bot-default) toolset.
+      const betaBody = bodies.find(
+        (body) => (body?.messages ?? []) === betaMessages,
+      );
+      assert(
+        betaBody?.tools?.some((t) => t.function?.name === "bot_message"),
+        "bot thread envelope includes bot_message",
+      );
+
+      // Alpha's follow-up request carries the delivery receipt as the
+      // tool result — naming Beta's thread (where the reply conversation
+      // lives) — and round 2 answered after it.
+      const receipt = bodies
+        .flatMap((body) => body?.messages ?? [])
+        .find(
+          (m) =>
+            m.role === "tool" &&
+            String(m.content).includes("delivered to RelayBeta in thread"),
+        );
+      assert(receipt, "receipt landed as Alpha's tool result");
+      const receiptThread = /thread (s\d+)/.exec(receipt.content)?.[1];
+      eq(receiptThread, betaThread.id, "receipt names the DM thread");
+
+      // Cleanup so the sidebar-driven tests below keep a small world:
+      // drop the relay threads and bots.
+      for (const id of [alphaThread, betaThread.id]) {
+        await page.request.delete(`${base}/threads/${id}`, { headers });
+      }
+      for (const id of [alphaId, betaId]) {
+        await page.request.delete(`${base}/bots/${id}`, { headers });
+      }
+    });
+
     // -- 18. utility tags: model title + tags land as inert chips --------
     // The ui-made thread's first exchange (providers test, above) armed
     // its utility attempt, and nothing manual ever touched that row, so
