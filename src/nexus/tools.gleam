@@ -190,7 +190,7 @@ fn bot_message_run(
           text: parsed.text,
         )
       case d.deliver(request) {
-        Error(reason) ->
+        Error(_) ->
           // At-most-once, honestly stated: the timeout means the outcome
           // is UNKNOWN — the registry may have taken the line and be
           // delivering it right now, so a blind retry can duplicate it

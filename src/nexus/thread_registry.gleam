@@ -816,10 +816,30 @@ fn start_new_thread(
                 Ok(record),
               )
             }
-            Error(reason) -> #(
-              state,
-              Error(StartFailed(string.inspect(reason))),
-            )
+            Error(reason) -> {
+              // The child failed to start AFTER the row landed: delete the
+              // ghost row, or the next create would reuse this id against
+              // a durable half-thread and a restart would hydrate it
+              // (cubic PR review). The counter stays bumped either way —
+              // minted ids never recycle (the boot-sweep rule) — and the
+              // unpersisted lane (insert failed, no row, no child) just
+              // pays the counter bump for the same monotonic guarantee.
+              let state = case persisted {
+                True ->
+                  case state.store.delete_thread(id) {
+                    Ok(_) -> state
+                    Error(error) -> {
+                      log_store_error("delete ghost thread " <> id, error)
+                      state
+                    }
+                  }
+                False -> state
+              }
+              #(
+                State(..state, counter: counter),
+                Error(StartFailed(string.inspect(reason))),
+              )
+            }
           }
         }
       }

@@ -132,9 +132,10 @@ pub fn from_env(
     "NEXUS_MAX_TOOL_ITERATIONS",
     32,
   ))
-  // Non-negative like the other guards: a negative limit would refuse
-  // every delivery at runtime — misconfiguration fails the load instead
-  // (the loud-boot philosophy; cubic PR review).
+  // Non-negative like the other guards: a negative hop limit would
+  // refuse every bot delivery, so misconfiguration fails the load
+  // instead of surfacing as a broken feature at first use (the
+  // loud-boot philosophy).
   use max_bot_hops <- result.try(optional_non_negative_int(
     get,
     "NEXUS_MAX_BOT_HOPS",
