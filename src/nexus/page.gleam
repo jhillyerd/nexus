@@ -580,15 +580,22 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
 #create-panel { margin-bottom: 1rem; padding-bottom: .8rem; border-bottom: 1px solid
   color-mix(in srgb, currentColor 15%, transparent); display: flex; flex-direction: column; gap: .45rem; }
 #create-panel[hidden] { display: none; }
-/* ui-polish F7: the settings page reads as one structured column. The
-   46rem section is the column — centered like the chat lane (F6), so
-   the header row's title/Add ends stop pinning to opposite edges of a
-   wide pane ('Add' used to float mid-page on the left-pinned column).
-   Provider rows and the add/edit forms render as cards (the .turn.tool
-   hairline border recipe), with the heading language of the rest of
-   the shell. */
-.settings-page { overflow-y: auto; padding: 1.2rem 1.2rem 2.5rem; display: flex; flex-direction: column;
-  gap: 1rem; }
+/* ui-polish F7, extended with the tab rail: the page is a narrow left
+   rail (one button per settings category) beside a body column, and the
+   active section keeps the centered 46rem column shape inside that body
+   (so the section stays a centered F6-style lane, just offset by the
+   rail). The rail buttons are quiet — the `.on` highlight is the only
+   state signal, same language as the sidebar's `.toggle`. */
+.settings-page { overflow-y: auto; padding: 1.2rem 1.2rem 2.5rem; display: flex; flex-direction: row;
+  gap: 1.4rem; }
+.settings-nav { display: flex; flex-direction: column; gap: .3rem; width: 8.5rem; flex-shrink: 0;
+  align-self: flex-start; }
+.settings-body { display: flex; flex-direction: column; gap: 1rem; flex: 1; min-width: 0; }
+.settings-page section[hidden] { display: none; }
+#app .settings-tab { text-align: left; font-size: .85rem; padding: .32rem .6rem; border-color: transparent;
+  background: transparent; opacity: .75; }
+#app .settings-tab.on { opacity: 1; border-color: #3b82f6; color: #3b82f6; background:
+  color-mix(in srgb, #3b82f6 12%, transparent); }
 .settings-page section { display: flex; flex-direction: column; gap: .7rem; width: 100%;
   max-width: 46rem; margin-inline: auto; }
 #app .settings-page h2 { margin: 0; font-size: 1.15rem; }
@@ -837,7 +844,11 @@ button#send, button#create-thread { background: var(--pico-primary-background);
      `overflow-y: auto`). A real collapse toggle/drawer (options b/c) stays
      parked until this cap proves too tight against a 20+ thread list. */
   aside { max-height: 40dvh; }
-  .settings-page { padding: .8rem .8rem 2rem; }
+  /* Tab rail stacks above the section on mobile: the tabs become a
+     horizontal row of equal-width buttons along the top of the page. */
+  .settings-page { padding: .8rem .8rem 2rem; flex-direction: column; gap: .8rem; }
+  .settings-nav { flex-direction: row; width: auto; }
+  #app .settings-tab { flex: 1; text-align: center; }
 }
 "
 }

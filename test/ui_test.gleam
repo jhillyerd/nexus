@@ -2232,6 +2232,75 @@ pub fn settings_header_button_flips_label_test() {
   should.be_true(string.contains(open, "settings-mode"))
 }
 
+pub fn settings_tabs_render_providers_by_default_test() {
+  // The page is a left tab rail (Providers / Bots) beside the category
+  // sections. BOTH sections stay in the DOM — the inactive one carries
+  // `hidden`, mirroring the forms — so uncontrolled inputs keep typed
+  // values across tab switches. Providers is the default tab: the
+  // first-run auto-open lands there with an empty list.
+  let html =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(ui.SettingsToggled)
+    |> view_string
+  should.be_true(string.contains(html, "id=\"settings-nav\""))
+  should.be_true(string.contains(html, "id=\"tab-providers\""))
+  should.be_true(string.contains(html, "id=\"tab-bots\""))
+  // The pressed state and the `.on` class name the same tab, and the
+  // sections' visibility follows it.
+  should.be_true(string.contains(
+    html,
+    "class=\"settings-tab on\" id=\"tab-providers\"",
+  ))
+  should.be_false(string.contains(html, "hidden id=\"providers-panel\""))
+  should.be_true(string.contains(html, "hidden id=\"bots-panel\""))
+}
+
+pub fn settings_tab_switch_flips_visibility_test() {
+  let html =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(ui.SettingsToggled)
+    |> step(ui.Settings(ui_settings.TabSelected(ui_settings.BotsTab)))
+    |> view_string
+  // The sections swap visibility; both stay mounted.
+  should.be_true(string.contains(html, "hidden id=\"providers-panel\""))
+  should.be_false(string.contains(html, "hidden id=\"bots-panel\""))
+  should.be_true(string.contains(
+    html,
+    "class=\"settings-tab on\" id=\"tab-bots\"",
+  ))
+}
+
+pub fn settings_tab_switch_stands_forms_down_test() {
+  // Opening one section's form/editor/confirm used to stand the other
+  // section's down (one form per page); with tabs the same stand-down
+  // happens on every switch, so returning to a tab never resurrects a
+  // form you left open or a delete you armed there.
+  let model =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(ui.SettingsToggled)
+    |> step(ui.Settings(ui_settings.AddToggled))
+    |> step(ui.Settings(ui_settings.EditToggled("p1")))
+  let switched =
+    step(model, ui.Settings(ui_settings.TabSelected(ui_settings.BotsTab)))
+  switched.settings.tab |> should.equal(ui_settings.BotsTab)
+  switched.settings.open |> should.be_false
+  switched.settings.edit |> should.be_none
+  switched.settings.confirm |> should.be_none
+  switched.settings.bots_open |> should.be_false
+  // And back: the provider side's transient state stays down too.
+  let back =
+    step(
+      switched,
+      ui.Settings(ui_settings.TabSelected(ui_settings.ProvidersTab)),
+    )
+  back.settings.tab |> should.equal(ui_settings.ProvidersTab)
+  back.settings.open |> should.be_false
+  back.settings.edit |> should.be_none
+}
+
 pub fn provider_test_button_state_machine_test() {
   let base =
     new_model() |> step(ui.ProvidersLoaded([prov("p1", "a", True, True)]))
