@@ -319,8 +319,9 @@ async function playScenario(res, request, state) {
       // named note via the bot_message tool (only bot-default toolsets
       // carry it — a plain thread has no bot identity to send from),
       // round 2 answers after the receipt. The user text after the marker
-      // is `<to bot name> <note text>`.
-      const relay = /case:relay\s+(\S+)\s+([\s\S]+)/.exec(userText);
+      // is `<to bot name>|<note text>` — bot names may contain spaces, so
+      // the target is everything before the first `|` (cubic PR review).
+      const relay = /case:relay\s+([^|]+)\|([\s\S]+)/.exec(userText);
       if (!hasToolResult) {
         await streamText("Relaying.");
         await streamToolCall(

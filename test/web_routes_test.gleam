@@ -161,7 +161,9 @@ fn start_server_with(
         |> result.map(fn(resolved) { resolved.endpoint })
         |> result.replace_error(thread_registry.ProviderUnknown)
       },
-      process.new_name("nexus_bot_registry"),
+      // The SAME name this harness started the bot registry under: the
+      // delivery wrapper's sender-name ask resolves it at ask time.
+      bots_name,
     )
   // Port 0: the kernel picks a free port and mist's after_start hands
   // it back; a bind failure now fails the test loudly at this line

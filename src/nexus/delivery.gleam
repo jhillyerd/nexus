@@ -43,9 +43,10 @@ pub type Request {
 /// the thread the message landed in (and that the target's replies are
 /// keyed to), so the sender model can address it precisely by id even
 /// after a restart has lost the in-memory DM map. `Busy` is retryable (the
-/// target answers on its next turn); `Refused` carries a fixed reason
-/// string. Both non-Delivered variants render as failed tool results —
-/// tool errors are not loop errors.
+/// target answers on its next turn); `Refused` carries a reason string —
+/// fixed guard vocabulary, or the target-bot toolset checker's own text
+/// when a DM create refuses. Both non-Delivered variants render as failed
+/// tool results — tool errors are not loop errors.
 pub type Reply {
   Delivered(thread_id: String)
   Busy
@@ -59,12 +60,15 @@ pub type Reply {
 ///
 /// - `deliver` — the `Deliver` ask into the thread registry (routing,
 ///   guards, and the send into the target thread). `Error` is a
-///   transport-level failure of the ask itself (timeout); guard verdicts
-///   arrive as `Ok(Reply)`.
+///   failure of the ask itself (timeout); guard verdicts arrive as
+///   `Ok(Reply)`. A timeout carries NO verdict — the registry may still
+///   have taken the line, so the outcome is unknown (at-most-once; a
+///   blind retry can duplicate).
 /// - `sender_name` — the bot registry `Get(bot_id)` for the sender's
 ///   CURRENT display name, asked at send time. `Error` = the sender bot
-///   was deleted (an honest tool error — the thread keeps running, it
-///   just cannot send).
+///   was deleted OR the ask timed out — the caller cannot distinguish
+///   the two, and its error text must claim neither exclusively
+///   (cubic PR review).
 pub type Delivery {
   Delivery(
     /// The sending thread's id (rides the `From` prefix, so the target

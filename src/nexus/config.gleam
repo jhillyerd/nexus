@@ -132,7 +132,14 @@ pub fn from_env(
     "NEXUS_MAX_TOOL_ITERATIONS",
     32,
   ))
-  use max_bot_hops <- result.try(optional_int(get, "NEXUS_MAX_BOT_HOPS", 4))
+  // Non-negative like the other guards: a negative limit would refuse
+  // every delivery at runtime — misconfiguration fails the load instead
+  // (the loud-boot philosophy; cubic PR review).
+  use max_bot_hops <- result.try(optional_non_negative_int(
+    get,
+    "NEXUS_MAX_BOT_HOPS",
+    4,
+  ))
   use http_fetch_max_bytes <- result.try(optional_int(
     get,
     "NEXUS_HTTP_FETCH_MAX_BYTES",

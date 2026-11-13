@@ -448,14 +448,19 @@ utility-attempt bookkeeping.
    wrapper; the bot registry is resolved BY NAME at ask time, so no
    registry-to-registry edge exists). Deadlock-safe by construction: the
    ask originates in a worker nothing waits on synchronously (the actor
-   monitors, never blocks on, its workers); each answer path is actor
-   state plus at most one bounded `actor.call` into an idle-or-answering-
-   immediately actor (the target thread replies `Sent`/`Busy` without
-   waiting on its own worker; the bot registry answers from boot-loaded
-   state); and no path leads from a registry back into a waiting worker —
-   no cycle can close. Deliveries serialize through the registry actor:
-   under heavy cross-traffic a worker's bounded ask times out as a
-   retryable tool error, never a deadlock.
+   monitors, never blocks on, its workers); each answer path is bounded —
+   registry state, a few synchronous store reads (`list_bots`/`get_bot`),
+   and at most one bounded ask into an idle-or-immediately-answering
+   actor (the target thread replies `Sent`/`Busy` without waiting on its
+   own worker; the bot registry answers from boot-loaded state) — and no
+   path leads from a registry back into a waiting worker, so no cycle
+   can close. Every ask on the path is a manual send plus bounded
+   receive on an asker-owned subject (`actor.call` would panic the
+   asker on a dead/stalled callee), so a timeout degrades to a refusal
+   or a retryable tool error, never a crash. Deliveries serialize
+   through the registry actor: under heavy cross-traffic a worker's
+   bounded ask times out as that unknown-outcome tool error, never a
+   deadlock.
 2. **thread → store only via the injected `commit_hook`** (fire-and-forget);
    all other store access goes through the registries.
 3. **threads never call the provider registry.** Boot injects a resolver

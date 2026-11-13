@@ -718,14 +718,23 @@ async function main() {
   /// golden prefix test asserts encode-path invariants (determinism,
   /// suffix-only growth, frozen envelope), which hold for any content.
   /// Playwright's selector engine pierces the component's shadow root.
+  /// Scrape the replayed transcript into the fixture turn shape (the same
+  /// shape the pre-Lustre wire capture produced; test/m3_prefix_test.gleam decodes
+  /// it unchanged). Tool calls are CHIPS since #66 — the full arguments
+  /// and results live in each chip's popup, so the structural pass
+  /// collects the turn shape and the popups are read right after, in
+  /// DOM order. The golden prefix test asserts encode-path invariants
+  /// (determinism, suffix-only growth, frozen envelope), which hold for
+  /// any content. Playwright's selector engine pierces the component's
+  /// shadow root.
   async function scrapeTurns(page_) {
-    return page_.$$eval(".turn", (els) => {
-      const turns = [];
+    const turns = await page_.$$eval(".turn", (els) => {
+      const out = [];
       let current = null;
       for (const el of els) {
         if (el.classList.contains("user")) {
           current = { messages: [{ role: "user", content: el.textContent }] };
-          turns.push(current);
+          out.push(current);
         } else if (el.classList.contains("assistant")) {
           if (!current) continue;
           const text = el.textContent;
@@ -733,21 +742,48 @@ async function main() {
         } else if (el.classList.contains("tool")) {
           if (!current) continue;
           const callId = el.getAttribute("data-call-id");
+          if (!callId) continue; // a chip still streaming its arguments
           current.messages.push({
             role: "assistant_tool_call",
             id: callId,
             name: el.getAttribute("data-tool"),
-            arguments: el.querySelector(".tool-args")?.textContent ?? "",
+            arguments: "",
           });
-          const result = el.querySelector(".tool-result")?.textContent;
-          if (result !== undefined) {
-            current.messages.push({ role: "tool", tool_call_id: callId, content: result });
-          }
+          current.messages.push({ role: "tool", tool_call_id: callId, content: "" });
         }
       }
-      return turns;
+      return out;
     });
+    const chips = await page_.$$(".turn.tool[data-call-id]");
+    const calls = [];
+    for (const chip of chips) {
+      await chip.click();
+      const pop = page_.locator("dialog[open] article.tool-pop");
+      await pop.waitFor({ timeout: 15_000 });
+      const info = await pop.evaluate((el) => {
+        const pres = [...el.querySelectorAll("pre")].map((p) => p.textContent);
+        return { args: pres[0] ?? "", result: pres[pres.length - 1] ?? "" };
+      });
+      calls.push(info);
+      await page_.mouse.click(10, 10);
+      await page_
+        .locator("dialog[open]")
+        .first()
+        .waitFor({ state: "detached", timeout: 10_000 })
+        .catch(() => {});
+    }
+    let idx = 0;
+    for (const turn of turns) {
+      for (const message of turn.messages) {
+        if (message.role === "assistant_tool_call") {
+          message.arguments = calls[idx]?.args ?? "";
+        } else if (message.role === "tool") {
+          message.content = calls[idx]?.result ?? "";
+          idx += 1;
+        }
+      }
+    }
+    return turns;
   }
 }
-
 main();

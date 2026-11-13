@@ -225,13 +225,15 @@ pub fn bot_message_refused_and_busy_render_as_errors_test() {
   let assert Error(reason) = spec.run(ctx, "{\"to\":\"x\",\"text\":\"y\"}")
   should.be_true(string.contains(reason, "is mid-turn"))
 
-  // The delivery ASK itself failing (timeout) is retryable tool content.
+  // The delivery ASK itself failing (timeout) is honest unknown-outcome
+  // content: a blind retry could duplicate the message.
   use ctx <- with_fake_delivery(
     sender_name: Ok("alpha"),
     deliver: fn(_request: delivery.Request) { option.None |> fail_ask },
   )
   let assert Error(reason) = spec.run(ctx, "{\"to\":\"x\",\"text\":\"y\"}")
-  should.be_true(string.contains(reason, "retryable"))
+  should.be_true(string.contains(reason, "outcome unknown"))
+  should.be_true(string.contains(reason, "may still have been delivered"))
 }
 
 /// A deleted sender bot is an honest tool error from the ask-at-send
@@ -243,7 +245,11 @@ pub fn bot_message_sender_gone_and_bad_args_test() {
     deliver: fn(_request: delivery.Request) { panic as "must not be asked" },
   )
   let assert Error(reason) = spec.run(ctx, "{\"to\":\"x\",\"text\":\"y\"}")
-  should.equal(reason, "bot_message: the sender bot no longer exists")
+  should.equal(
+    reason,
+    "bot_message: the sender bot is unavailable (deleted, or the registry"
+      <> " ask timed out)",
+  )
 
   use ctx <- with_fake_delivery(
     sender_name: Ok("alpha"),

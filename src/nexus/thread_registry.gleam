@@ -682,6 +682,7 @@ fn start_new_thread(
           let counter = state.counter + 1
           let id = "s" <> int.to_string(counter)
           let name = process.new_name("nexus_thread_" <> id)
+          let created_at = timing.wall_now_s()
           // The registry resolves the system prompt at creation: an
           // explicit request prompt (a bot's, from the bots plan) or the
           // config default — the ONE NULL/default resolution point (#72).
@@ -691,6 +692,81 @@ fn start_new_thread(
           let prompt =
             option.unwrap(requested.system_prompt, state.cfg.system_prompt)
           let transcript = transcript.new(alias, prompt)
+          // The organizational block, built ONCE and shared by the stored
+          // row and the live record (issue #75) — the reply summary below
+          // only projects the same VALUES into the deliberately flat
+          // `ThreadSummary`. "" title, open auto paths, unlisted.
+          let meta =
+            thread.ThreadMeta(
+              title: "",
+              title_source: thread.AutoTitle,
+              pinned: False,
+              tags: [],
+              tags_manual: [],
+              tags_source: thread.AutoTags,
+              archived: False,
+              // Provenance only (bots plan P1): never read back — the
+              // frozen columns above are the thread's truth.
+              bot_id: requested.bot_id,
+              created_at: created_at,
+            )
+          // Write-through BEFORE the child starts: the thread row lands
+          // now, with the frozen alias and the frozen system prompt
+          // (contract rule 2), so hydration can rebuild the frozen prefix
+          // byte-identically — and so the delivery wrapper below is
+          // decided on the SAME fact the provenance pointer reflects.
+          let persisted = case
+            state.store.insert_thread(
+              store.StoredSummary(
+                id: id,
+                provider_id: requested.provider_id,
+                model: alias,
+                meta: meta,
+                // The creation-time snapshot (bots plan P2): the RESOLVED
+                // names this thread will run with, always persisted —
+                // never NULL-for-default — so no config change or bot
+                // edit can re-aim this envelope.
+                toolset: toolset.names,
+                last_active_at: created_at,
+                // 1 = the system prompt (Phase 1 message_count).
+                message_count: 1,
+              ),
+              // The RESOLVED prompt — the exact bytes frozen into the
+              // transcript above, never the config default an explicit
+              // request may have overridden.
+              prompt,
+            )
+          {
+            Ok(_) -> True
+            Error(error) -> {
+              log_store_error("insert_thread " <> id, error)
+              False
+            }
+          }
+          // The provenance pointer mirrors a STORED row's FK-maintained
+          // column, so an unpersisted create (the insert failed — store
+          // down, or the bot deleted between the orchestration's lookup
+          // and this insert) must not claim one: the bot-delete scrub
+          // cannot reach this record (it did not exist at delete time),
+          // making this the one place a dead id could otherwise ride a
+          // summary for the session's whole life. The insert ATTEMPT
+          // above still carries the pointer — the FK is what rejects a
+          // dead one.
+          let meta = case persisted {
+            True -> meta
+            False -> thread.ThreadMeta(..meta, bot_id: None)
+          }
+          // The delivery wrapper (bots P3c, #97): identity is per-THREAD,
+          // never per-toolset — bundles are cached by name tuple and
+          // shared across a bot's threads — so the registry wraps the
+          // bundle's turn fn HERE, per thread, closing over this thread's
+          // id + bot id. The cache keeps the unwrapped bundle. ONLY a
+          // persisted bot thread wraps: an unpersisted one presents as
+          // human (pointer scrubbed above), so it must BEHAVE human too —
+          // an unwrapped runner builds no delivery context and its
+          // `bot_message` errors honestly, instead of a bot-capable
+          // runner hiding behind a human summary and skipping the
+          // inbound gate (cubic PR review, P1).
           let spec =
             thread.ThreadSpec(
               id: id,
@@ -702,18 +778,13 @@ fn start_new_thread(
               hydrated: False,
               utility_apply: utility_apply_for(state.self, id),
             )
-          // The delivery wrapper (bots P3c, #97): identity is per-THREAD,
-          // never per-toolset — bundles are cached by name tuple and
-          // shared across a bot's threads — so the registry wraps the
-          // bundle's turn fn HERE, per thread, closing over this thread's
-          // id + bot id. The cache keeps the unwrapped bundle.
-          let spec = case requested.bot_id {
-            Some(bot_id) ->
+          let spec = case requested.bot_id, persisted {
+            Some(bot_id), True ->
               thread.ThreadSpec(
                 ..spec,
                 toolset: delivery_toolset(state, toolset, id, bot_id),
               )
-            None -> spec
+            _, _ -> spec
           }
           case
             factory_supervisor.start_child(
@@ -722,70 +793,6 @@ fn start_new_thread(
             )
           {
             Ok(started) -> {
-              let created_at = timing.wall_now_s()
-              // The organizational block, built ONCE and shared by the
-              // stored row and the live record (issue #75) — the reply
-              // summary below only projects the same VALUES into the
-              // deliberately flat `ThreadSummary`. "" title, open auto
-              // paths, unlisted.
-              let meta =
-                thread.ThreadMeta(
-                  title: "",
-                  title_source: thread.AutoTitle,
-                  pinned: False,
-                  tags: [],
-                  tags_manual: [],
-                  tags_source: thread.AutoTags,
-                  archived: False,
-                  // Provenance only (bots plan P1): never read back — the
-                  // frozen columns above are the thread's truth.
-                  bot_id: requested.bot_id,
-                  created_at: created_at,
-                )
-              // Write-through: the thread row lands now, with the frozen
-              // alias and the frozen system prompt (contract rule 2), so
-              // hydration can rebuild the frozen prefix byte-identically.
-              let persisted = case
-                state.store.insert_thread(
-                  store.StoredSummary(
-                    id: id,
-                    provider_id: requested.provider_id,
-                    model: alias,
-                    meta: meta,
-                    // The creation-time snapshot (bots plan P2): the
-                    // RESOLVED names this thread will run with, always
-                    // persisted — never NULL-for-default — so no config
-                    // change or bot edit can re-aim this envelope.
-                    toolset: toolset.names,
-                    last_active_at: created_at,
-                    // 1 = the system prompt (Phase 1 message_count).
-                    message_count: 1,
-                  ),
-                  // The RESOLVED prompt — the exact bytes frozen into the
-                  // transcript above, never the config default an explicit
-                  // request may have overridden.
-                  prompt,
-                )
-              {
-                Ok(_) -> True
-                Error(error) -> {
-                  log_store_error("insert_thread " <> id, error)
-                  False
-                }
-              }
-              // The provenance pointer mirrors a STORED row's
-              // FK-maintained column, so an unpersisted create (the insert
-              // failed — store down, or the bot deleted between the
-              // orchestration's lookup and this insert) must not claim one:
-              // the bot-delete scrub cannot reach this record (it did not
-              // exist at delete time), making this the one place a dead id
-              // could otherwise ride a summary for the session's whole
-              // life. The insert ATTEMPT above still carries the pointer —
-              // the FK is what rejects a dead one.
-              let meta = case persisted {
-                True -> meta
-                False -> thread.ThreadMeta(..meta, bot_id: None)
-              }
               let record =
                 Record(
                   id: id,
@@ -1823,6 +1830,14 @@ fn deliver_message(
 ) -> #(State, delivery.Reply) {
   case classify_target(state, request.to) {
     MissingTarget -> #(state, delivery.Refused("unknown target"))
+    // A store outage during the bot-name lookup is not an "unknown
+    // target" — the honest verdict names the failure so the sender can
+    // retry instead of giving up on a target that may well exist
+    // (cubic PR review).
+    LookupUnavailable -> #(
+      state,
+      delivery.Refused("target lookup failed; try again"),
+    )
     FoundBot(bot) ->
       case bot.id == request.from_bot_id {
         True -> #(state, delivery.Refused("self-addressed delivery"))
@@ -1868,6 +1883,7 @@ fn deliver_message(
 /// only while no thread owns that id — acceptable at personal scale.
 type Target {
   MissingTarget
+  LookupUnavailable
   FoundBot(bot: store.StoredBot)
   FoundThread(state: State, record: Record)
 }
@@ -1877,8 +1893,9 @@ fn classify_target(state: State, to: String) -> Target {
     Ok(#(state, record)) -> FoundThread(state, record)
     Error(_) ->
       case find_bot_by_name(state, to) {
-        Ok(bot) -> FoundBot(bot)
-        Error(_) -> MissingTarget
+        BotFound(bot) -> FoundBot(bot)
+        NoSuchBot -> MissingTarget
+        LookupFailed -> LookupUnavailable
       }
   }
 }
@@ -1892,13 +1909,21 @@ fn resolve_thread(state: State, id: String) -> Result(#(State, Record), Nil) {
     Ok(record) ->
       case record.start_error {
         Some(_) ->
-          case record.persisted, retry_rehydrate(state, record) {
-            True, Started(next) ->
-              case dict.get(next.threads, id) {
-                Ok(record) -> Ok(#(next, record))
-                Error(_) -> Error(Nil)
+          // Guard on `persisted` FIRST: case subjects evaluate eagerly,
+          // and an unpersisted record must never reach the store — or
+          // start a child the discarded state would orphan (the same
+          // guard shape as the `Get` arm; cubic PR review).
+          case record.persisted {
+            True ->
+              case retry_rehydrate(state, record) {
+                Started(next) ->
+                  case dict.get(next.threads, id) {
+                    Ok(record) -> Ok(#(next, record))
+                    Error(_) -> Error(Nil)
+                  }
+                _ -> Error(Nil)
               }
-            _, _ -> Error(Nil)
+            False -> Error(Nil)
           }
         None -> Ok(#(state, record))
       }
@@ -1920,16 +1945,25 @@ fn resolve_thread(state: State, id: String) -> Result(#(State, Record), Nil) {
 
 /// Bot-name lookup — a STORE read (the whole bot table; a personal-scale
 /// settings entity, the same shape the bot registry loads at boot), never
-/// a bot-registry call (§8 no-cross-registry-edges).
-fn find_bot_by_name(
-  state: State,
-  name: String,
-) -> Result(store.StoredBot, Nil) {
+/// a bot-registry call (§8 no-cross-registry-edges). A store failure is
+/// distinct from "no such bot": the caller must be able to tell a
+/// transient outage from a genuinely unknown target.
+type BotLookup {
+  BotFound(bot: store.StoredBot)
+  NoSuchBot
+  LookupFailed
+}
+
+fn find_bot_by_name(state: State, name: String) -> BotLookup {
   case state.store.list_bots() {
-    Ok(bots) -> list.find(bots, fn(bot) { bot.name == name })
+    Ok(bots) ->
+      case list.find(bots, fn(bot) { bot.name == name }) {
+        Ok(bot) -> BotFound(bot)
+        Error(Nil) -> NoSuchBot
+      }
     Error(error) -> {
       log_store_error("deliver target lookup", error)
-      Error(Nil)
+      LookupFailed
     }
   }
 }
@@ -1951,14 +1985,31 @@ fn find_or_create_dm(
   bot: store.StoredBot,
 ) -> #(State, Result(Record, String)) {
   case dict.get(state.dm, #(request.from_bot_id, bot.id)) {
-    Ok(thread_id) ->
+    Ok(thread_id) -> {
+      // Guards cannot call functions: resolve the known-ness first (see
+      // the branches below).
+      let known = thread_known(state, thread_id)
       case resolve_thread(state, thread_id) {
         Ok(#(state, record)) -> #(state, Ok(record))
-        // The DM thread was deleted behind the map: open a fresh one.
+        // Known to the registry (live or dormant) but unresolvable right
+        // now — a failed restart/start: refuse and KEEP the map entry, so
+        // the next delivery retries the SAME thread instead of opening a
+        // duplicate DM behind a transient failure (cubic PR review).
+        Error(_) if known -> #(state, Error("target thread unavailable"))
+        // Absent from both dicts: deleted behind the map — open a fresh
+        // one and repoint the entry.
         Error(_) -> create_dm(state, request, bot)
       }
+    }
     Error(_) -> create_dm(state, request, bot)
   }
+}
+
+/// True when the id still belongs to a record the registry knows — the
+/// map-miss fallback may only replace an entry the registry has truly
+/// forgotten (a delete), never one it merely failed to resolve.
+fn thread_known(state: State, id: String) -> Bool {
+  dict.has_key(state.threads, id) || dict.has_key(state.dormant, id)
 }
 
 fn create_dm(

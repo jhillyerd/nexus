@@ -2721,10 +2721,9 @@ pub fn meta_updated_refreshes_sidebar_test() {
       process.new_name("nexus_ui_providers"),
       fn(_endpoint) { Error(openai.Transport("offline test")) },
     )
+  let bots_name = process.new_name("nexus_ui_bots")
   let assert Ok(started_bots) =
-    bot_registry.start(seam, process.new_name("nexus_ui_bots"), fn(names) {
-      Ok(names)
-    })
+    bot_registry.start(seam, bots_name, fn(names) { Ok(names) })
   let bots = started_bots.data
   let providers = started_providers.data
   let factory_name = process.new_name("nexus_ui_factory")
@@ -2742,9 +2741,9 @@ pub fn meta_updated_refreshes_sidebar_test() {
       fn() { [] },
       fixture_resolver(),
       // Bots P3c: the delivery wrapper's sender-name ask resolves this
-      // name at ask time; no bot registry actor needs to exist for tests
-      // that never deliver.
-      process.new_name("nexus_bot_registry"),
+      // name at ask time — the SAME name this harness started the bot
+      // registry under.
+      bots_name,
     )
   let registry = started_registry.data
 
@@ -2856,10 +2855,9 @@ pub fn send_moves_previous_day_row_into_today_immediately_test() {
       process.new_name("nexus_ui_providers_row"),
       fn(_endpoint) { Error(openai.Transport("offline test")) },
     )
+  let bots_name = process.new_name("nexus_ui_bots")
   let assert Ok(started_bots) =
-    bot_registry.start(seam, process.new_name("nexus_ui_bots"), fn(names) {
-      Ok(names)
-    })
+    bot_registry.start(seam, bots_name, fn(names) { Ok(names) })
   let bots = started_bots.data
   let providers = started_providers.data
   let factory_name = process.new_name("nexus_ui_factory_row")
@@ -2877,9 +2875,9 @@ pub fn send_moves_previous_day_row_into_today_immediately_test() {
       fn() { [] },
       fixture_resolver(),
       // Bots P3c: the delivery wrapper's sender-name ask resolves this
-      // name at ask time; no bot registry actor needs to exist for tests
-      // that never deliver.
-      process.new_name("nexus_bot_registry"),
+      // name at ask time — the SAME name this harness started the bot
+      // registry under.
+      bots_name,
     )
   let registry = started_registry.data
 
@@ -2949,10 +2947,9 @@ pub fn connect_with_configured_provider_never_notes_no_provider_test() {
       process.new_name("nexus_ui_providers"),
       fn(_endpoint) { Error(openai.Transport("offline test")) },
     )
+  let bots_name = process.new_name("nexus_ui_bots")
   let assert Ok(started_bots) =
-    bot_registry.start(seam, process.new_name("nexus_ui_bots"), fn(names) {
-      Ok(names)
-    })
+    bot_registry.start(seam, bots_name, fn(names) { Ok(names) })
   let bots = started_bots.data
   let providers = started_providers.data
   let factory_name = process.new_name("nexus_ui_factory")
@@ -2970,9 +2967,9 @@ pub fn connect_with_configured_provider_never_notes_no_provider_test() {
       fn() { [] },
       fixture_resolver(),
       // Bots P3c: the delivery wrapper's sender-name ask resolves this
-      // name at ask time; no bot registry actor needs to exist for tests
-      // that never deliver.
-      process.new_name("nexus_bot_registry"),
+      // name at ask time — the SAME name this harness started the bot
+      // registry under.
+      bots_name,
     )
   let registry = started_registry.data
 
@@ -3100,10 +3097,9 @@ pub fn thread_switch_drops_left_thread_stream_test() {
       process.new_name("nexus_ui_providers_leak"),
       fn(_endpoint) { Error(openai.Transport("offline test")) },
     )
+  let bots_name = process.new_name("nexus_ui_bots")
   let assert Ok(started_bots) =
-    bot_registry.start(seam, process.new_name("nexus_ui_bots"), fn(names) {
-      Ok(names)
-    })
+    bot_registry.start(seam, bots_name, fn(names) { Ok(names) })
   let bots = started_bots.data
   let providers = started_providers.data
   let factory_name = process.new_name("nexus_ui_factory_leak")
@@ -3119,9 +3115,9 @@ pub fn thread_switch_drops_left_thread_stream_test() {
       fn() { [] },
       fixture_resolver(),
       // Bots P3c: the delivery wrapper's sender-name ask resolves this
-      // name at ask time; no bot registry actor needs to exist for tests
-      // that never deliver.
-      process.new_name("nexus_bot_registry"),
+      // name at ask time — the SAME name this harness started the bot
+      // registry under.
+      bots_name,
     )
   let registry = started_registry.data
 
@@ -3193,10 +3189,9 @@ pub fn meta_updated_from_other_thread_refreshes_sidebar_test() {
       process.new_name("nexus_ui_providers_meta"),
       fn(_endpoint) { Error(openai.Transport("offline test")) },
     )
+  let bots_name = process.new_name("nexus_ui_bots")
   let assert Ok(started_bots) =
-    bot_registry.start(seam, process.new_name("nexus_ui_bots"), fn(names) {
-      Ok(names)
-    })
+    bot_registry.start(seam, bots_name, fn(names) { Ok(names) })
   let bots = started_bots.data
   let providers = started_providers.data
   let factory_name = process.new_name("nexus_ui_factory_meta")
@@ -3212,9 +3207,9 @@ pub fn meta_updated_from_other_thread_refreshes_sidebar_test() {
       fn() { [] },
       fixture_resolver(),
       // Bots P3c: the delivery wrapper's sender-name ask resolves this
-      // name at ask time; no bot registry actor needs to exist for tests
-      // that never deliver.
-      process.new_name("nexus_bot_registry"),
+      // name at ask time — the SAME name this harness started the bot
+      // registry under.
+      bots_name,
     )
   let registry = started_registry.data
 
@@ -3914,12 +3909,9 @@ fn start_offline_registries(
       process.new_name("nexus_ui_create_providers"),
       fetch,
     )
+  let bots_name = process.new_name("nexus_ui_create_bots")
   let assert Ok(started_bots) =
-    bot_registry.start(
-      seam,
-      process.new_name("nexus_ui_create_bots"),
-      fn(names) { Ok(names) },
-    )
+    bot_registry.start(seam, bots_name, fn(names) { Ok(names) })
   let factory_name = process.new_name("nexus_ui_create_factory")
   let assert Ok(_factory) =
     factory_supervisor.start(thread_registry.factory_builder(factory_name))
@@ -3933,9 +3925,9 @@ fn start_offline_registries(
       fn() { [] },
       fixture_resolver(),
       // Bots P3c: the delivery wrapper's sender-name ask resolves this
-      // name at ask time; no bot registry actor needs to exist for tests
-      // that never deliver.
-      process.new_name("nexus_bot_registry"),
+      // name at ask time — the SAME name this harness started the bot
+      // registry under.
+      bots_name,
     )
   #(started_registry.data, started_providers.data, started_bots.data)
 }

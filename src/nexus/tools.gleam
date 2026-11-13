@@ -170,7 +170,15 @@ fn bot_message_run(
       use parsed <- result.try(parse_bot_message_args(arguments))
       use sender <- result.try(case d.sender_name() {
         Ok(name) -> Ok(name)
-        Error(Nil) -> Error("bot_message: the sender bot no longer exists")
+        Error(Nil) ->
+          // Both honest causes: a deleted sender (ON DELETE SET NULL left
+          // the thread without a working identity) or an ask that timed
+          // out — the model cannot tell them apart, so neither does the
+          // error text (cubic PR review).
+          Error(
+            "bot_message: the sender bot is unavailable (deleted, or the"
+            <> " registry ask timed out)",
+          )
       })
       let request =
         delivery.Request(
@@ -183,7 +191,14 @@ fn bot_message_run(
         )
       case d.deliver(request) {
         Error(reason) ->
-          Error("bot_message: delivery ask failed (retryable): " <> reason)
+          // At-most-once, honestly stated: the timeout means the outcome
+          // is UNKNOWN — the registry may have taken the line and be
+          // delivering it right now, so a blind retry can duplicate it
+          // (cubic PR review).
+          Error(
+            "bot_message: delivery timed out; outcome unknown — the message"
+            <> " may still have been delivered",
+          )
         Ok(delivery.Delivered(thread_id)) ->
           Ok(
             "delivered to "
