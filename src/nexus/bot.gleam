@@ -52,9 +52,10 @@ pub type Bot {
     tools: Option(List(String)),
     /// The inbound gate (bots plan P3a, issue #95): `False` blocks other
     /// bots from delivering messages into this bot's threads. Nothing
-    /// consumes it until P3c's delivery guard reads it — via a STORE
+    /// ENFORCES it until P3c's delivery guard reads it — via a STORE
     /// read, never a bot-registry call (the §8 no-cross-registry-edges
-    /// rule). Create always opens the gate; PATCH moves it.
+    /// rule); the wire shape and Settings toggle already display and
+    /// patch it. Create always opens the gate; PATCH moves it.
     allow_inbound: Bool,
     /// Epoch seconds.
     created_at: Int,

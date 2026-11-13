@@ -85,7 +85,7 @@ CREATE TABLE IF NOT EXISTS bot (
   model         text NOT NULL,                  -- alias, validated live at thread create (a bot can go stale)
   system_prompt text,                           -- NULL = global default, resolved AT CREATION into the thread's frozen prompt
   tools         text[],                         -- NULL = the current default set, resolved AT CREATION; '{}' = chat-only; else explicit names (validated against the compiled catalog at save)
-  allow_inbound boolean NOT NULL DEFAULT true,  -- bots plan P3a (#95): the inbound gate — false blocks other bots from delivering messages into this bot's threads (the P3c delivery guard reads it via a STORE read, never a bot-registry call). Nothing consumes it until P3c ships.
+  allow_inbound boolean NOT NULL DEFAULT true,  -- bots plan P3a (#95): the inbound gate — false blocks other bots from delivering messages into this bot's threads (the P3c delivery guard will read it via a STORE read, never a bot-registry call). Nothing ENFORCES it until P3c ships; the wire/UI surface it from P3a on.
   created_at    timestamptz NOT NULL,
   updated_at    timestamptz NOT NULL
 );

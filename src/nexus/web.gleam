@@ -1302,7 +1302,7 @@ pub fn bot_json(b: bot.Bot) -> Json {
       None -> json.null()
     }),
     // The inbound gate (bots plan P3a): false blocks other bots from
-    // delivering into this bot's threads (consumed by the P3c guard).
+    // delivering into this bot's threads (the P3c guard will enforce it).
     #("allow_inbound", json.bool(b.allow_inbound)),
     #("created_at", json.int(b.created_at)),
     #("created_at_rfc3339", json.string(timing.wall_to_rfc3339(b.created_at))),

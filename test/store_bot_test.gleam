@@ -88,9 +88,12 @@ pub fn bot_crud_round_trips_test() {
   should.equal(updated.tools, Some(["http_fetch"]))
   should.be_true(updated.allow_inbound)
 
-  // And the gate is in the list read too (the boot load's shape).
+  // And the gate is in the list read too (the boot load's shape), with
+  // the id — one row, correctly identified.
   let assert Ok(all) = seam.list_bots()
-  should.equal(all |> list.map(fn(b) { b.allow_inbound }), [True])
+  should.equal(all |> list.map(fn(b) { #(b.id, b.allow_inbound) }), [
+    #("b1", True),
+  ])
 
   let assert Ok(Nil) = seam.delete_bot("b1")
   seam.get_bot("b1") |> should.be_error
