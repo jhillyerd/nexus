@@ -2041,19 +2041,33 @@ fn deliver_to_thread(
               // parallel Deliver variant. The target replies immediately
               // in both states — idle: append + commit + spawn the
               // worker, then `Sent`; busy: `Busy` — it never blocks on
-              // its own worker, so this ask is bounded.
-              case
-                actor.call(record.subject, delivery_ask_timeout_ms, fn(reply) {
-                  thread.Send(
-                    text,
-                    Some(request.from_bot_name),
-                    request.depth,
-                    reply,
-                  )
-                })
-              {
-                thread.Sent -> #(state, delivery.Delivered(record.id))
-                thread.Busy -> #(state, delivery.Busy)
+              // its own worker, so the ask is bounded. The ask itself is
+              // a manual send + bounded receive on a subject THIS actor
+              // owns (the same non-fatal pattern as the worker-side
+              // asks): this is the first synchronous registry→thread
+              // edge, and an `actor.call` would panic the registry on a
+              // target that dies or stalls mid-ask — a refusal is the
+              // honest verdict instead. (A timeout after the target
+              // already took the line leaves it delivered — at-most-once
+              // with a conservative receipt, the MVP's accepted
+              // ambiguity.)
+              let reply = process.new_subject()
+              process.send(
+                record.subject,
+                thread.Send(
+                  text,
+                  Some(request.from_bot_name),
+                  request.depth,
+                  reply,
+                ),
+              )
+              case process.receive(reply, delivery_ask_timeout_ms) {
+                Ok(thread.Sent) -> #(state, delivery.Delivered(record.id))
+                Ok(thread.Busy) -> #(state, delivery.Busy)
+                Error(Nil) -> #(
+                  state,
+                  delivery.Refused("target thread unavailable"),
+                )
               }
             }
           }
