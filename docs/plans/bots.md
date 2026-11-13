@@ -2,7 +2,7 @@
 title: Nexus — bots and profiles (named thread templates, per-bot toolsets, bot-to-bot messaging)
 status: active
 tags: [nexus, bots, threads, agents, kv-cache, gleam, beam]
-updated: 2026-11-12
+updated: 2026-11-13
 ---
 
 # Bots and profiles
@@ -378,33 +378,137 @@ Verification:
 
 ## Phase 3 — bot-to-bot messaging (bot as thread user)
 
-**Scope:** a `bot_message`-style tool (exact name TBD) that delivers a
-message from one bot's turn into another bot's thread as a user-role
-turn. Hermes's "one bot is the user of another bot's session", mapped
-onto the existing single-owner model:
+**Scope:** a `bot_message` tool that delivers a message from one bot's
+turn into another bot's thread as a user-role turn. Hermes's "one bot
+is the user of another bot's session", mapped onto the existing
+single-owner model. Delivery goes through the thread registry
+(internal actor call, no HTTP loop): append a user-role message, run
+the target thread's loop.
 
-- Delivery goes through the thread registry (internal actor call, no
-  HTTP loop): append a user-role message, run the target thread's loop.
-- Model-visible identity rides the **content** (a `From <bot>: …`
-  prefix — message bytes, append-only, contract-clean). UI attribution
-  rides a **display-only sidecar**: `thread_message.author text NULL`
-  (NULL = human), the same never-in-request-bytes class as `reasoning`
-  and `created_at`.
-- **Guards** (the inter-bot analogue of `max_tool_iterations`):
-  1. *Busy target* — a thread mid-turn rejects delivery; the rejection
-     surfaces as the sender's tool error (no queueing in MVP — the
-     sender bot can retry on its next turn).
-  2. *Hop depth* — internal sends carry a depth counter; beyond
-     `max_bot_hops` (config, default 4) the registry refuses delivery.
-  3. *Inbound gate* — `bot.allow_inbound boolean NOT NULL DEFAULT true`
-     for MVP; per-pair allowlists later if needed.
-- UI: author badge on bot-sourced user lines; bot content renders under
-  the hostile-text rules verbatim (it is user content).
+**Design settled in the issue #77 session** — this section is the
+record; the implementation slices are #95 (P3a), #96 (P3b), #97
+(P3c):
+
+1. **Delivery is async — a receipt, not a reply.** The tool returns
+   once delivery is accepted or refused, never waiting for the
+   target's turn. Sync would need the target actor to hold a reply
+   subject across its whole turn state machine (`TurnStarted` →
+   `WorkerDone`/`WorkerDown`) and would block the sender's worker past
+   every bounded `actor.call` timeout in the repo — 5s on the registry
+   and thread ask paths, 20s at the largest (bot/provider CRUD) — none
+   of which is sized for a full LLM turn; the
+   busy-guard semantics ("sender retries on its next turn") already
+   assume async. The receipt names where the reply will land:
+   `delivered to <bot> in thread <id>`. Refusals are failed tool
+   results (tool errors are not loop errors) — the sender model sees
+   the error and adapts. A sync variant (`bot_message_wait`) is a
+   recorded non-goal pending P3 learnings.
+2. **Addressing takes a bot name or a thread id.** The sender model
+   addresses bots by name; the thread registry keeps an in-memory per
+   (sender bot, target bot) DM-thread map — find-or-create from the
+   target bot through `nexus/thread_create` (no new frozen-value
+   path). A restart loses the map and opens a fresh DM thread
+   (accepted MVP tradeoff; persisted DM columns would be schema debt
+   until proven needed). The receipt and the `From` prefix both carry
+   the thread id so replies can address it precisely. Self-addressed
+   delivery is refused BEFORE routing — any resolved target whose bot
+   is the sender's own bot. The busy guard alone is not enough there:
+   a NAME-addressed self-send with no `(A, A)` map entry would
+   find-or-create a different, idle A-thread and deliver into it; the
+   busy guard only covers thread-id addressing of the in-flight
+   thread.
+3. **`ToolCtx` grows `delivery: Option(Delivery)`** —
+   `Delivery(registry, bots, thread_id, bot_id, depth)`. `Some` only on
+   threads created from a bot: the HUMAN default toolset never
+   includes the tool (a plain thread has no bot identity to send
+   from), while create-from-bot with `bot.tools = NULL` resolves to
+   the human default PLUS `bot_message` — bots are the only senders,
+   so an ordinary bot gets the feature without listing it, and a bot
+   that wants it gone names an explicit list without it (a chat-only
+   `'{}'` bot already excludes it). Threads created before P3c keep
+   their frozen snapshots without it, like any snapshot change. Identity is per-THREAD, never per-toolset — bundles are
+   cached by name tuple and shared across a bot's threads — so the
+   registry injects it by wrapping the bundle's turn fn per thread at
+   create/hydrate. Depth is computed per turn from the initiating
+   user message's sidecar depth + 1 (human sends reset to 0), so it
+   survives restart. The sender's display name is resolved at SEND
+   time by a worker-side ask to the bot registry (the caller P1
+   anticipated): renames stay current, and a deleted sender bot is an
+   honest tool error — at send time AND after restart: a hydrated
+   thread whose bot was deleted (`thread.bot_id` NULL via
+   `ON DELETE SET NULL`) builds no delivery context, so `bot_message`
+   fails with the same error. No second durable marker column for
+   that — schema debt for a dead-bot edge, inconsistent with P1's
+   deletion semantics.
+4. **Thread `Send` grows `author` and `depth`** —
+   `Send(text, author: Option(String), depth: Int, reply)`, the ONE
+   turn-machine path (no parallel `Deliver` message; human sends pass
+   `None`/`0`). Model-visible identity rides **content** only:
+   `From <bot> (thread <id>): …` — message bytes, append-only,
+   contract-clean. UI attribution rides the display-only sidecar
+   class: one transcript dict `Dict(Int, Origin)` — `Origin(author,
+   depth)`, distinct from the ToolCtx `Delivery` record, which carries
+   the per-thread identity — mirroring `timestamps`, set by
+   `mark_origin` immediately after
+   `append_user` + `stamp` (same call-after-append rule). Persistence:
+   `thread_message.author text NULL` (NULL = human; value = the bot's
+   display name at send time — frozen like everything a bot sources,
+   rename/delete-safe) and `thread_message.hop_depth int NOT NULL
+   DEFAULT 0` (base-CREATE edits, pre-deployment rule). All three
+   render paths carry the author — live echo, `turn_view` mid-turn
+   join, hydration replay (one shape per path; a reload must not drop
+   badges). UI: author badge on bot-sourced user lines; bot content
+   renders under the hostile-text rules verbatim (it is user
+   content).
+5. **Guards** (the inter-bot analogue of `max_tool_iterations`),
+   checked by the registry in order: unknown target; archived target
+   (refuse — archived is quiescent); inbound gate —
+   `bot.allow_inbound boolean NOT NULL DEFAULT true` for MVP
+   (per-pair allowlists later if needed), read from the store (the
+   count/guard pattern, never a bot-registry call); hop depth —
+   internal sends carry a depth counter, and the registry refuses
+   delivery beyond `max_bot_hops` (`NEXUS_MAX_BOT_HOPS`, config,
+   default 4); busy target — a thread mid-turn rejects delivery, and
+   the target actor answers immediately in both states (idle: append
+   + spawn + `Sent`; busy: `Busy`) since it never blocks on its own
+   worker. No queueing in MVP. Reply vocabulary:
+   `Delivered(thread_id) | Busy | Refused(reason)`.
+6. **§8 rule 1's exception generalizes to a class** (recorded here;
+   lands in ARCHITECTURE.md with the P3c PR, per the track-HEAD
+   rule): unlinked workers may ask the registries — the utility
+   worker today, the turn worker's delivery tool from this phase.
+   Deadlock-safe because the ask originates in a worker nothing
+   waits on synchronously (the actor monitors, never blocks), the
+   registry's answer path is state plus one bounded `actor.call` into
+   an idle-or-busy-answering actor, and no path leads from the
+   registry back into a waiting worker — no cycle can close.
+   Deliveries serialize through the registry actor; under heavy
+   cross-traffic a worker's 5s ask can time out as a retryable tool
+   error, never a deadlock.
+
+Implementation slices (each a PR-shaped unit with its own tests;
+#95/#96 are independent of each other, #97 depends on both):
+
+- **P3a (#95): inbound gate** — the `bot.allow_inbound` column, the
+  bot-registry patch field, `PATCH /bots`, the Settings toggle.
+- **P3b (#96): author + hop-depth plumbing** — the schema columns,
+  store queries, transcript delivery sidecar, `Send` fields,
+  `UserEcho` + both replay paths, the UI badge. Lands producer-free
+  (a test seam sets authors; the writer is P3c) — the
+  sidecar/replay/persistence parity is where the subtle bugs live,
+  and the split keeps the delivery PR reviewable.
+- **P3c (#97): the delivery mechanism** — the tool,
+  `ToolCtx.delivery` + the per-thread runner wrapper, both worker-side
+  asks, registry `Deliver` with routing and guards, the `From`
+  prefix, the ARCHITECTURE.md §8 ride-along, `NEXUS_MAX_BOT_HOPS`,
+  and the e2e bot-to-bot smoke + cache gate re-run.
 
 Tests: depth and busy guards through the registry seam; author sidecar
-round-trip (store mock); UI rendering of bot-authored lines with
-payload-laden text; loop interaction — a bot message arriving mid-turn
-is rejected, not queued, and the UI's rollback rules are untouched.
+round-trip (store mock); replay parity (the live badge and the
+post-reload badge render the same author); UI rendering of
+bot-authored lines with payload-laden text; loop interaction — a bot
+message arriving mid-turn is rejected, not queued, and the UI's
+rollback rules are untouched.
 
 ## Non-goals (recorded, not planned)
 
