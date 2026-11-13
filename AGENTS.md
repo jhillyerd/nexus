@@ -122,7 +122,7 @@ Pinned by the e2e browser suite (`docs/plans/completed/m3-verification.md`);
   (`AssistantFull` / `commit_bubble` in `src/nexus/ui.gleam`) — one
   skipped shape per path, or a reload resurrects the empty pill.
 - **One frozen toolset per thread** (amended by bots plan P2;
-  `docs/plans/bots.md`). The toolset is persisted at creation as
+  `docs/plans/completed/bots.md`). The toolset is persisted at creation as
   resolved tool names (`thread.toolset` — the default set's, or the
   creating bot's; never NULL-for-default) and resolved against the
   config-independent catalog (`tools.by_names`) into runner bundles

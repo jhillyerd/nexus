@@ -1,11 +1,19 @@
 ---
 title: Nexus — bots and profiles (named thread templates, per-bot toolsets, bot-to-bot messaging)
-status: active
+status: completed
 tags: [nexus, bots, threads, agents, kv-cache, gleam, beam]
 updated: 2026-11-13
 ---
 
 # Bots and profiles
+
+> **Landed 2026-11-10/13** (P0 rename #70; P1 #87; P2 prep #92 + toolsets
+> #94; P3 design gaps #98, slices #99/#100/#101). All phases shipped as
+> designed, with the cache gate re-verified at each contract-touching
+> landing (P2: 0.234; P3c: 0.236, prior runs 0.228–0.243). What remains
+> open is only the recorded non-goals below, plus the future-work notes
+> flagged inline (the pre-P2 deployment materialization path, the sync
+> `bot_message_wait` variant).
 
 **Thesis.** A bot is a named, user-editable profile — default provider +
 model, system prompt, and (from P2) a tool list — that a new thread is
@@ -116,7 +124,7 @@ base-CREATE edits, no migration. Deliberate leftovers: browser-API
 word, and the word is now free for connection/auth scopes), and
 completed plan docs kept as historical records under their old names.
 
-## Phase 1 — bot entity + create-thread-from-bot
+## Phase 1 — bot entity + create-thread-from-bot — DONE
 
 **Scope:** bots exist, threads can name their bot, UI can create both.
 No contract changes — every thread still runs `tools.default(cfg)`.
@@ -376,7 +384,7 @@ Verification:
 - `e2e/integration.spec.mjs` cache gate re-run: warm/cold TTFT median
   ratio ≤ 0.3 on default-toolset threads (numbers comparable to today).
 
-## Phase 3 — bot-to-bot messaging (bot as thread user)
+## Phase 3 — bot-to-bot messaging (bot as thread user) — DONE
 
 **Scope:** a `bot_message` tool that delivers a message from one bot's
 turn into another bot's thread as a user-role turn. Hermes's "one bot
@@ -385,9 +393,9 @@ single-owner model. Delivery goes through the thread registry
 (internal actor call, no HTTP loop): append a user-role message, run
 the target thread's loop.
 
-**Design settled in the issue #77 session** — this section is the
-record; the implementation slices are #95 (P3a), #96 (P3b), #97
-(P3c):
+**Design settled in the issue #77 session** (remaining gaps closed by
+#98) — this section is the record; the slices landed as #99 (P3a), #100
+(P3b), #101 (P3c):
 
 1. **Delivery is async — a receipt, not a reply.** The tool returns
    once delivery is accepted or refused, never waiting for the
@@ -486,18 +494,18 @@ record; the implementation slices are #95 (P3a), #96 (P3b), #97
    cross-traffic a worker's 5s ask can time out as a retryable tool
    error, never a deadlock.
 
-Implementation slices (each a PR-shaped unit with its own tests;
-#95/#96 are independent of each other, #97 depends on both):
+Implementation slices (each landed as its own PR with its own tests;
+#99/#100 are independent of each other, #101 depends on both):
 
-- **P3a (#95): inbound gate** — the `bot.allow_inbound` column, the
+- **P3a (#99): inbound gate** — the `bot.allow_inbound` column, the
   bot-registry patch field, `PATCH /bots`, the Settings toggle.
-- **P3b (#96): author + hop-depth plumbing** — the schema columns,
+- **P3b (#100): author + hop-depth plumbing** — the schema columns,
   store queries, transcript delivery sidecar, `Send` fields,
   `UserEcho` + both replay paths, the UI badge. Lands producer-free
   (a test seam sets authors; the writer is P3c) — the
   sidecar/replay/persistence parity is where the subtle bugs live,
   and the split keeps the delivery PR reviewable.
-- **P3c (#97): the delivery mechanism** — the tool,
+- **P3c (#101): the delivery mechanism** — the tool,
   `ToolCtx.delivery` + the per-thread runner wrapper, both worker-side
   asks, registry `Deliver` with routing and guards, the `From`
   prefix, the ARCHITECTURE.md §8 ride-along, `NEXUS_MAX_BOT_HOPS`,

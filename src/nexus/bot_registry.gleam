@@ -1,4 +1,4 @@
-//// The bot registry (docs/plans/bots.md, Phase 1 — issue #74): the
+//// The bot registry (docs/plans/completed/bots.md, Phase 1 — issue #74): the
 //// small actor that owns bot rows between the store and everything
 //// else. The provider-registry pattern MINUS its security machinery:
 //// bots carry no key material, so there is no envelope to

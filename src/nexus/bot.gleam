@@ -1,4 +1,4 @@
-//// Pure bot domain (docs/plans/bots.md, Phase 1): the profile shape
+//// Pure bot domain (docs/plans/completed/bots.md, Phase 1): the profile shape
 //// other modules see, input validation, and the PATCH merge semantics.
 //// A bot is a named, user-editable **creation-time template** — default
 //// provider + model + system prompt that a new thread is created FROM.

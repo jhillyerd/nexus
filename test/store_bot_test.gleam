@@ -1,4 +1,4 @@
-//// Offline bot-store tests — Phase 1 of docs/plans/bots.md.
+//// Offline bot-store tests — Phase 1 of docs/plans/completed/bots.md.
 ////
 //// The `bot` table's seam contract against the in-memory mock: CRUD
 //// round-trip with the unique-name constraint, the provider RESTRICT,

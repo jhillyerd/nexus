@@ -39,7 +39,7 @@
 -- - `ON DELETE RESTRICT` + the registry's `409` pre-check: deleting a
 --   referenced provider is refused; disabling is the reversible path.
 --
--- Bot design notes (docs/plans/bots.md, Phase 1):
+-- Bot design notes (docs/plans/completed/bots.md, Phase 1):
 -- - `bot` is a creation-time template, NOT a runtime dependency: creating
 --   a thread from a bot COPIES provider/model/system_prompt into the
 --   thread's frozen-at-creation columns; editing or deleting a bot never
