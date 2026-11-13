@@ -4,6 +4,7 @@
 import gleam/erlang/process
 import gleam/list
 import gleam/option.{None, Some}
+import gleam/otp/actor
 import gleam/string
 import gleeunit/should
 import nexus/config
@@ -235,11 +236,17 @@ fn expect_user_echo_at(
   visit: Int,
   text: String,
 ) -> Int {
-  let assert thread.ThreadEvent(sid, v, thread.UserEcho(actual, Some(stamp))) =
-    expect_event(sub)
+  let assert thread.ThreadEvent(
+    sid,
+    v,
+    thread.UserEcho(actual, Some(stamp), author),
+  ) = expect_event(sub)
   sid |> should.equal(test_thread_id)
   v |> should.equal(visit)
   actual |> should.equal(text)
+  // Human sends (the only shape this helper drives) carry no provenance;
+  // authored sends are pinned by the bots P3b tests.
+  author |> should.equal(None)
   stamp
 }
 
@@ -1817,4 +1824,107 @@ pub fn utility_disabled_never_runs_test() {
 
   expect_no_utility(events, 400)
   expect_no_event(sub, 400)
+}
+
+// ---------------------------------------------------------------------------
+// Bots P3b: authored sends (author + hop depth)
+// ---------------------------------------------------------------------------
+
+/// The bots P3b test seam — the shape the P3c delivery registry will
+/// drive: the ONE `Send` message with display provenance. `send_message`
+/// is the human path and keeps its `None`/`0` shape; no parallel
+/// `Deliver` variant exists.
+fn send_as(
+  sess: process.Subject(thread.Msg),
+  text: String,
+  author: option.Option(String),
+  depth: Int,
+) -> thread.SendResult {
+  actor.call(sess, 5000, fn(reply) { thread.Send(text, author, depth, reply) })
+}
+
+/// Drain a subscriber's queued events up to (and including) the turn's
+/// terminal event. Used after releasing the gated runner, where the
+/// in-flight mix of already-streamed events is timing-dependent but the
+/// terminal event is not.
+fn drain_until_turn_done(sub: process.Subject(thread.ThreadEvent)) -> Nil {
+  case expect_event(sub) {
+    thread.ThreadEvent(_, _, thread.TurnDone(_, _)) -> Nil
+    _ -> drain_until_turn_done(sub)
+  }
+}
+
+/// `UserEcho` with an unpredictable wall-clock stamp, returning the
+/// author so callers can pin the provenance per render path.
+fn expect_authored_echo(
+  sub: process.Subject(thread.ThreadEvent),
+  visit: Int,
+  text: String,
+) -> option.Option(String) {
+  let assert thread.ThreadEvent(
+    sid,
+    v,
+    thread.UserEcho(actual, Some(_), author),
+  ) = expect_event(sub)
+  sid |> should.equal(test_thread_id)
+  v |> should.equal(visit)
+  actual |> should.equal(text)
+  author
+}
+
+/// The author rides EVERY render path — live echo, mid-turn join (the
+/// `turn_view` display mirror), and post-turn replay — one shape per
+/// path, so a reload never drops a badge (the empty-pill lesson). Depth
+/// rides the display-only transcript sidecar only (never the wire);
+/// pinned here through Snapshot.
+pub fn authored_send_author_on_all_render_paths_test() {
+  let gate_request = process.new_subject()
+  let sess = start_with(gated_runner(gate_request))
+  let sub = join(sess)
+  let _ = expect_event(sub)
+
+  should.equal(send_as(sess, "ping", Some("Hermes"), 2), thread.Sent)
+
+  // Live echo carries the author.
+  expect_authored_echo(sub, 1, "ping") |> should.equal(Some("Hermes"))
+
+  // Depth landed in the sidecar (index 1 = the user message; index 0 =
+  // the system prompt is never marked).
+  transcript.origin_at(thread.snapshot(sess), 1)
+  |> should.equal(Some(transcript.Origin("Hermes", 2)))
+  transcript.origin_at(thread.snapshot(sess), 0) |> should.equal(None)
+
+  // Mid-turn join: the mirror replays the SAME author.
+  let sub2 = join(sess)
+  let assert thread.ThreadEvent(_, 1, thread.Hello(_, _, _)) =
+    expect_event(sub2)
+  expect_authored_echo(sub2, 1, "ping") |> should.equal(Some("Hermes"))
+
+  // Finish the turn.
+  let assert Ok(gate) = process.receive(gate_request, 2000)
+  process.send(gate, Nil)
+  drain_until_turn_done(sub)
+  drain_until_turn_done(sub2)
+
+  // Post-turn join: the committed transcript replays the SAME author.
+  let sub3 = join(sess)
+  let assert thread.ThreadEvent(_, 1, thread.Hello(_, _, _)) =
+    expect_event(sub3)
+  expect_authored_echo(sub3, 1, "ping") |> should.equal(Some("Hermes"))
+
+  // A human send marks nothing — absence is the human case, live AND on
+  // replay.
+  should.equal(thread.send_message(sess, "human again"), thread.Sent)
+  expect_authored_echo(sub, 1, "human again") |> should.equal(None)
+  let sub4 = join(sess)
+  let assert thread.ThreadEvent(_, 1, thread.Hello(_, _, _)) =
+    expect_event(sub4)
+  expect_authored_echo(sub4, 1, "ping") |> should.equal(Some("Hermes"))
+  // The committed reply replays between the two user lines.
+  let assert thread.ThreadEvent(
+    _,
+    1,
+    thread.AssistantFull("Final answer", Some(_)),
+  ) = expect_event(sub4)
+  expect_authored_echo(sub4, 1, "human again") |> should.equal(None)
 }

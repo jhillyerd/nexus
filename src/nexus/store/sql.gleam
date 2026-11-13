@@ -17,6 +17,9 @@ import pog
 /// sentinel inserts NULL the same way (to_timestamp(NULL) is NULL), so
 /// unstamped rows stay honestly unstamped instead of borrowing the write
 /// instant as a fake append time.
+/// author is display-only provenance (bots P3b: which bot sent this user
+/// message); the '' sentinel inserts NULL the same way — NULL = a human
+/// sent it, and an authored row never travels as ''.
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
@@ -29,6 +32,8 @@ pub fn append_plain_message(
   arg_4: String,
   arg_5: String,
   arg_6: Int,
+  arg_7: String,
+  arg_8: Int,
 ) -> Result(pog.Returned(Nil), pog.QueryError) {
   let decoder = decode.map(decode.dynamic, fn(_) { Nil })
 
@@ -41,8 +46,11 @@ pub fn append_plain_message(
 -- sentinel inserts NULL the same way (to_timestamp(NULL) is NULL), so
 -- unstamped rows stay honestly unstamped instead of borrowing the write
 -- instant as a fake append time.
-insert into thread_message (thread_id, seq, role, content, reasoning, created_at)
-values ($1, $2, $3, $4, nullif($5, ''::text), to_timestamp(nullif($6, 0::bigint)))
+-- author is display-only provenance (bots P3b: which bot sent this user
+-- message); the '' sentinel inserts NULL the same way — NULL = a human
+-- sent it, and an authored row never travels as ''.
+insert into thread_message (thread_id, seq, role, content, reasoning, created_at, author, hop_depth)
+values ($1, $2, $3, $4, nullif($5, ''::text), to_timestamp(nullif($6, 0::bigint)), nullif($7, ''::text), $8)
 on conflict (thread_id, seq) do nothing
 "
   |> pog.query
@@ -52,6 +60,8 @@ on conflict (thread_id, seq) do nothing
   |> pog.parameter(pog.text(arg_4))
   |> pog.parameter(pog.text(arg_5))
   |> pog.parameter(pog.int(arg_6))
+  |> pog.parameter(pog.text(arg_7))
+  |> pog.parameter(pog.int(arg_8))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }
@@ -1116,6 +1126,8 @@ pub type LoadMessagesRow {
     tool_ok: Option(Bool),
     reasoning: Option(String),
     created_s: Int,
+    author: Option(String),
+    hop_depth: Int,
     message_count: Int,
   )
 }
@@ -1127,6 +1139,10 @@ pub type LoadMessagesRow {
 /// created_at is the display-only wall-clock stamp (NULL for unstamped
 /// rows: a multi-call assistant message's continuation rows carry no
 /// stamp of their own — the stamp rides the message's first row).
+/// author/hop_depth are the display-only provenance columns (bots P3b):
+/// author is a plain nullable column (wire nullability is visible for
+/// plain references, unlike expressions), hop_depth is NOT NULL DEFAULT
+/// 0 so human rows read as 0 without a sentinel.
 /// It reads through the 0 sentinel (0 = unstamped) rather than relying on
 /// NULL: Postgres reports expression results as NOT NULL in the wire
 /// protocol's row description, so squirrel would generate a non-optional
@@ -1150,7 +1166,9 @@ pub fn load_messages(
     use tool_ok <- decode.field(6, decode.optional(decode.bool))
     use reasoning <- decode.field(7, decode.optional(decode.string))
     use created_s <- decode.field(8, decode.int)
-    use message_count <- decode.field(9, decode.int)
+    use author <- decode.field(9, decode.optional(decode.string))
+    use hop_depth <- decode.field(10, decode.int)
+    use message_count <- decode.field(11, decode.int)
     decode.success(LoadMessagesRow(
       seq:,
       role:,
@@ -1161,6 +1179,8 @@ pub fn load_messages(
       tool_ok:,
       reasoning:,
       created_s:,
+      author:,
+      hop_depth:,
       message_count:,
     ))
   }
@@ -1172,12 +1192,16 @@ pub fn load_messages(
 -- created_at is the display-only wall-clock stamp (NULL for unstamped
 -- rows: a multi-call assistant message's continuation rows carry no
 -- stamp of their own — the stamp rides the message's first row).
+-- author/hop_depth are the display-only provenance columns (bots P3b):
+-- author is a plain nullable column (wire nullability is visible for
+-- plain references, unlike expressions), hop_depth is NOT NULL DEFAULT
+-- 0 so human rows read as 0 without a sentinel.
 -- It reads through the 0 sentinel (0 = unstamped) rather than relying on
 -- NULL: Postgres reports expression results as NOT NULL in the wire
 -- protocol's row description, so squirrel would generate a non-optional
 -- decoder for a bare extract(...) and crash on NULL rows — the same
 -- sentinel workaround as the '' text sentinel (insert_provider.sql).
-select m.seq, m.role, m.content, m.tool_call_id, m.tool_name, m.tool_args, m.tool_ok, m.reasoning, coalesce(extract(epoch from m.created_at)::int8, 0) as created_s, s.message_count
+select m.seq, m.role, m.content, m.tool_call_id, m.tool_name, m.tool_args, m.tool_ok, m.reasoning, coalesce(extract(epoch from m.created_at)::int8, 0) as created_s, m.author, m.hop_depth, s.message_count
 from thread_message m
 join thread s on s.id = m.thread_id
 where m.thread_id = $1

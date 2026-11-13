@@ -72,8 +72,12 @@ pub type EventKind {
   /// A user turn, echoed so every tab sees it. Also used for history replay.
   /// `at` is the message's display stamp — wall-clock epoch seconds from
   /// the transcript's timestamp sidecar (None for unstamped history) —
-  /// so every tab and a post-reload replay render the same age.
-  UserEcho(text: String, at: Option(Int))
+  /// so every tab and a post-reload replay render the same age. `author`
+  /// is the message's display provenance from the origin sidecar (bots
+  /// P3b): the bot that delivered it, `None` for a human send — so every
+  /// path that renders a user line (live echo, mid-turn join, hydration
+  /// replay) carries the same author and a reload never drops a badge.
+  UserEcho(text: String, at: Option(Int), author: Option(String))
   /// A complete assistant turn, used for history replay on (re)connect.
   /// `at` mirrors UserEcho's display stamp.
   AssistantFull(text: String, at: Option(Int))
@@ -474,8 +478,19 @@ pub type Msg {
   Join(sub: Subject(ThreadEvent), visit: Int)
   /// Unsubscribe `sub` from thread events (unknown subs are ignored).
   Leave(sub: Subject(ThreadEvent))
-  /// Append a user turn and start streaming a reply.
-  Send(text: String, reply: Subject(SendResult))
+  /// Append a user turn and start streaming a reply. `author`/`depth`
+  /// are the display provenance of a bot-delivered message (bots P3b):
+  /// the sender's frozen display name and its hop count; the human UI
+  /// path passes `None`/`0` through `send_message` — this ONE message is
+  /// the turn-machine path (no parallel Deliver variant), and P3c's
+  /// registry delivery reuses it. Never request bytes: the author/depth
+  /// land in the transcript's display-only origin sidecar.
+  Send(
+    text: String,
+    author: Option(String),
+    depth: Int,
+    reply: Subject(SendResult),
+  )
   /// Cancel the in-flight turn, if any.
   Stop
   /// Current transcript (for M2 thread resume / tests).
@@ -790,7 +805,16 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       |> list.index_fold(Nil, fn(_, message, index) {
         case message {
           chat.UserMessage(content: chat.UserTextContent(text), ..) ->
-            deliver(UserEcho(text, transcript.stamped_at(replay, index)))
+            deliver(UserEcho(
+              text,
+              transcript.stamped_at(replay, index),
+              // The origin sidecar is the one author source for BOTH
+              // the committed-transcript replay and the mid-turn turn_view
+              // mirror (the Send handler marks the mirror's base
+              // transcript), so live and replay badges agree.
+              transcript.origin_at(replay, index)
+                |> option.map(fn(origin) { origin.author }),
+            ))
           chat.AssistantMessage(content: text, tool_calls: calls, ..) -> {
             // Reasoning replay first: it was streamed before the message's
             // own output, so it replays before it too.
@@ -886,7 +910,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       actor.continue(state)
     }
 
-    Send(text, reply) -> {
+    Send(text, author, depth, reply) -> {
       // A utility side-call in flight never blocks a send: cancel it and
       // proceed normally — the thread must never report `Busy` because of
       // a side call (required fairness on serialized backends: the side
@@ -898,13 +922,18 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
         Idle -> {
           // One stamp for the append AND the echo broadcast, so the
           // sender's bubble and every other tab's (and a reload's replay)
-          // render the same wall-clock age for the same message.
+          // render the same wall-clock age for the same message. The
+          // origin mark rides immediately after (same call-after-append
+          // rule): display-only provenance, never a request byte. An
+          // authored send must mark BEFORE the mirror is built from `tr`,
+          // so a mid-turn join replays the author like the live echo.
           let stamped = timing.wall_now_s()
           let tr =
             state.transcript
             |> transcript.append_user(text)
+            |> transcript.mark_origin(author, depth)
             |> transcript.stamp(stamped)
-          emit(state, UserEcho(text, Some(stamped)))
+          emit(state, UserEcho(text, Some(stamped), author))
           let worker =
             process.spawn_unlinked(fn() {
               let cancel = process.new_subject()
@@ -1723,7 +1752,7 @@ fn usage_cached(usage: Option(CompletionUsage)) -> Option(Int) {
 
 /// Request/response helpers over the actor's subject.
 pub fn send_message(thread: Subject(Msg), text: String) -> SendResult {
-  actor.call(thread, 5000, fn(reply) { Send(text, reply) })
+  actor.call(thread, 5000, fn(reply) { Send(text, None, 0, reply) })
 }
 
 pub fn stop(thread: Subject(Msg)) -> Nil {

@@ -131,6 +131,8 @@ CREATE TABLE IF NOT EXISTS thread_message (
   tool_ok      boolean,
   reasoning    text,                           -- display-only chain-of-thought emitted before an assistant message; NULL for user/tool rows and reasoning-free messages. Plain text for the same byte-stability rationale as tool_args. Never sent back to the model.
   created_at   timestamptz,                    -- display-only wall-clock stamp of the message (drives the chat log's relative ages). Deliberately nullable: the store's 0 sentinel writes NULL for unstamped rows (to_timestamp(nullif($n, 0))) instead of borrowing the write instant as a fake append time; unstamped rows render without a timestamp. Never sent back to the model.
+  author       text,                           -- display-only provenance (bots P3b): NULL = a human sent it; otherwise the sending bot's display name frozen at send time (rename/delete-safe, like everything a bot sources). Rides the transcript sidecar, never the messages, so it is structurally unable to change a request byte; the '' sentinel inserts NULL (see append_plain_message.sql). Never sent back to the model.
+  hop_depth    int NOT NULL DEFAULT 0,         -- bot-to-bot hop counter (bots P3b): 0 = a human sent it; each bot-to-bot delivery adds 1, and the delivery path's recursion guard reads it (P3c, NEXUS_MAX_BOT_HOPS). Computed from the initiating user message's persisted depth, so it survives restart. Never sent back to the model.
   UNIQUE (thread_id, seq)
 );
 

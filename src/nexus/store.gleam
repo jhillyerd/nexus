@@ -115,7 +115,18 @@ pub type StoredProvider {
 /// like `content` and `reasoning` — it is set on the FIRST row of a run
 /// only: a call run is one assistant message, so it carries one stamp.
 pub type MessageRow {
-  UserRow(content: String, at: Option(Int))
+  UserRow(
+    content: String,
+    /// Display-only provenance (bots P3b): the sending bot's display name
+    /// frozen at send time; `None` = a human sent it. The transcript
+    /// origin sidecar round-tripped through `thread_message.author` —
+    /// never a request byte.
+    author: Option(String),
+    /// The bot-to-bot hop count at delivery (0 = human). `NOT NULL
+    /// DEFAULT 0` in the schema, so it always reads back.
+    hop_depth: Int,
+    at: Option(Int),
+  )
   AssistantRow(
     content: String,
     /// The model's chain-of-thought for this message, when it emitted
@@ -273,6 +284,7 @@ pub fn transcript_rows(
       fn(index) { transcript.reasoning_at(tr, index) },
       fn(index) { transcript.tool_result_at(tr, index) },
       fn(index) { transcript.stamped_at(tr, index) },
+      fn(index) { transcript.origin_at(tr, index) },
     )
   rows
 }
@@ -284,9 +296,14 @@ pub fn transcript_rows(
 /// `messages_to_rows_with` against the transcript's sidecars.
 pub fn messages_to_rows(messages: List(ChatMessage)) -> List(MessageRow) {
   let #(rows, _) =
-    messages_to_rows_with(messages, 0, fn(_) { None }, fn(_) { None }, fn(_) {
-      None
-    })
+    messages_to_rows_with(
+      messages,
+      0,
+      fn(_) { None },
+      fn(_) { None },
+      fn(_) { None },
+      fn(_) { None },
+    )
   rows
 }
 
@@ -295,13 +312,15 @@ pub fn messages_to_rows(messages: List(ChatMessage)) -> List(MessageRow) {
 /// rows carry it without it ever existing as a message; `tool_ok_at`
 /// resolves a tool message's outcome the same way (True when unknown);
 /// `stamped_at` resolves the wall-clock epoch the message was appended
-/// at (None = unstamped).
+/// at (None = unstamped); `origin_at` resolves the bot-delivery
+/// provenance (None = a human sent it — the metadata-free default).
 fn messages_to_rows_with(
   messages: List(ChatMessage),
   base: Int,
   reasoning_at: fn(Int) -> Option(String),
   tool_ok_at: fn(Int) -> Option(Bool),
   stamped_at: fn(Int) -> Option(Int),
+  origin_at: fn(Int) -> Option(transcript.Origin),
 ) -> #(List(MessageRow), dict.Dict(String, String)) {
   let #(rows, names, _) =
     list.index_fold(messages, #([], dict.new(), 0), fn(acc, message, index) {
@@ -309,11 +328,15 @@ fn messages_to_rows_with(
       let reasoning = reasoning_at(base + index)
       let at = stamped_at(base + index)
       case message {
-        chat.UserMessage(content: chat.UserTextContent(text), ..) -> #(
-          [UserRow(text, at), ..rows],
-          names,
-          index + 1,
-        )
+        chat.UserMessage(content: chat.UserTextContent(text), ..) -> {
+          // The origin sidecar flattens into the row's author/hop_depth
+          // pair; no entry = a human row (None / 0).
+          let #(author, hop_depth) = case origin_at(base + index) {
+            Some(transcript.Origin(author, depth)) -> #(Some(author), depth)
+            None -> #(None, 0)
+          }
+          #([UserRow(text, author, hop_depth, at), ..rows], names, index + 1)
+        }
         chat.AssistantMessage(content: text, tool_calls: calls, ..) ->
           case calls {
             Some(calls) -> {
@@ -406,12 +429,16 @@ pub fn transcript_from_rows(
 fn append_rows(tr: Transcript, rows: List(MessageRow)) -> Transcript {
   case rows {
     [] -> tr
-    // Stamps restore through the same construction path as the sidecars
-    // they mirror: append, then stamp the newest message. `stamp_opt` is
-    // the no-op for unstamped rows.
-    [UserRow(content, at), ..rest] ->
+    // Stamps and origins restore through the same construction path as
+    // the sidecars they mirror: append, then mark/stamp the newest
+    // message. `mark_origin` is the no-op for human rows (author None);
+    // `stamp_opt` is the no-op for unstamped rows.
+    [UserRow(content, author, hop_depth, at), ..rest] ->
       append_rows(
-        tr |> transcript.append_user(content) |> transcript.stamp_opt(at),
+        tr
+          |> transcript.append_user(content)
+          |> transcript.mark_origin(author, hop_depth)
+          |> transcript.stamp_opt(at),
         rest,
       )
     [AssistantRow(content, reasoning, at), ..rest] ->

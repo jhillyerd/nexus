@@ -66,7 +66,31 @@ pub opaque type Transcript {
     /// the commit / write-behind / replay lane that persists and restores
     /// it, so the chat log's per-message ages survive a reload.
     timestamps: Dict(Int, Int),
+    /// Display-only provenance sidecar (bots P3b): WHICH bot delivered
+    /// each user message and at what hop depth, keyed by the
+    /// CHRONOLOGICAL message index. Entries exist only for bot-authored
+    /// user messages (a human send marks nothing — absence IS the human
+    /// case), and the author is the sender's display name frozen at send
+    /// time, so renames and deletes never rewrite history. Distinct from
+    /// the delivery tool's per-thread `Delivery` context: this is
+    /// per-message display metadata. `to_request` reads only `messages`,
+    /// so — exactly like the sidecars above — it is structurally
+    /// incapable of changing a request byte, yet rides the commit /
+    /// write-behind / replay lane that persists and restores it
+    /// (`thread_message.author` / `.hop_depth`), so the UI's author
+    /// badges survive a reload. Bot text renders as ordinary user
+    /// content — hostile text rules apply, never a request byte.
+    origins: Dict(Int, Origin),
   )
+}
+
+/// One bot-authored user message's display provenance (bots P3b): the
+/// sending bot's display name frozen at send time and the bot-to-bot hop
+/// count at delivery (first bot in a chain = 1; human sends are recorded
+/// by absence — no sidecar entry at all, never depth 0). Pure display
+/// metadata: never enters a request body.
+pub type Origin {
+  Origin(author: String, depth: Int)
 }
 
 /// New transcript: system prompt is frozen at creation (contract rule 2).
@@ -77,6 +101,7 @@ pub fn new(model: String, system: String) -> Transcript {
     reasoning: dict.new(),
     tool_results: dict.new(),
     timestamps: dict.new(),
+    origins: dict.new(),
   )
 }
 
@@ -246,6 +271,44 @@ pub fn stamp_opt(transcript: Transcript, at: Option(Int)) -> Transcript {
 /// stamp. The replay / persistence read side of the sidecar.
 pub fn stamped_at(transcript: Transcript, index: Int) -> Option(Int) {
   dict.get(transcript.timestamps, index) |> option.from_result
+}
+
+/// Record the display provenance of the NEWEST message (bots P3b): the
+/// bot that delivered it and the hop depth it arrived at. Call immediately
+/// after the append (+ stamp) that created the message — the chronological
+/// index is derived from the message count, so a mark applied before an
+/// append would silently land on the wrong message, exactly like `stamp`.
+/// `None` (a human send — the only shape the UI's own send path and the
+/// pre-bots history produce) marks nothing: absence IS the human case, so
+/// the sidecar stays as sparse as `timestamps`. Pure display metadata:
+/// never enters a request body. The read side is `origin_at`.
+pub fn mark_origin(
+  transcript: Transcript,
+  author: Option(String),
+  depth: Int,
+) -> Transcript {
+  case author {
+    // An empty author is dropped like an empty reasoning text: an
+    // authored row never travels as '' (the SQL nullif sentinel would
+    // turn it into a human row anyway).
+    Some(name) if name != "" ->
+      Transcript(
+        ..transcript,
+        origins: dict.insert(
+          transcript.origins,
+          list.length(transcript.messages) - 1,
+          Origin(name, depth),
+        ),
+      )
+    _ -> transcript
+  }
+}
+
+/// The provenance of the message at chronological `index` (0 = the system
+/// prompt); `None` when it was not bot-authored. The replay / persistence
+/// read side of the sidecar.
+pub fn origin_at(transcript: Transcript, index: Int) -> Option(Origin) {
+  dict.get(transcript.origins, index) |> option.from_result
 }
 
 /// The stamped epoch of the NEWEST assistant text message — the terminal

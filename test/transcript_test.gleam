@@ -269,6 +269,61 @@ pub fn stamp_opt_passthrough_test() {
   transcript.stamped_at(dropped, 1) |> should.equal(None)
 }
 
+// Origin sidecar (display-only, never in a request byte) — bots P3b.
+// ---------------------------------------------------------------------------
+
+pub fn origin_never_changes_request_bytes_test() {
+  let opts = transcript.default_options()
+  let plain =
+    transcript.new("m", "s")
+    |> transcript.append_user("q")
+    |> transcript.append_assistant("a")
+  let authored =
+    transcript.new("m", "s")
+    |> transcript.append_user("q")
+    |> transcript.mark_origin(Some("Hermes"), 2)
+    |> transcript.stamp(1000)
+    |> transcript.append_assistant("a")
+    |> transcript.stamp(2000)
+  // The sidecar mirrors reasoning's contract: present on the commit /
+  // write-behind / replay lane, structurally absent from every byte.
+  transcript.request_body(plain, opts)
+  |> should.equal(transcript.request_body(authored, opts))
+}
+
+pub fn origin_at_indexes_chronologically_test() {
+  let tr =
+    transcript.new("m", "s")
+    |> transcript.append_user("human")
+    |> transcript.append_assistant("a")
+    |> transcript.append_user("from a bot")
+    |> transcript.mark_origin(Some("Hermes"), 2)
+  // system=0 (never marked); the human user message=1 records absence —
+  // absence IS the human case, not a zero-depth entry; assistant=2;
+  // the authored user message=3 carries the frozen name + hop count.
+  transcript.origin_at(tr, 0) |> should.equal(None)
+  transcript.origin_at(tr, 1) |> should.equal(None)
+  transcript.origin_at(tr, 2) |> should.equal(None)
+  transcript.origin_at(tr, 3)
+  |> should.equal(Some(transcript.Origin("Hermes", 2)))
+}
+
+pub fn mark_origin_requires_a_real_author_test() {
+  // None (a human send) and '' (never a valid author — the store's
+  // nullif sentinel would file it as human anyway) both mark nothing:
+  // the dict stays as sparse as `timestamps`.
+  let human =
+    transcript.new("m", "s")
+    |> transcript.append_user("q")
+    |> transcript.mark_origin(None, 0)
+  transcript.origin_at(human, 1) |> should.equal(None)
+  let empty =
+    transcript.new("m", "s")
+    |> transcript.append_user("q")
+    |> transcript.mark_origin(Some(""), 3)
+  transcript.origin_at(empty, 1) |> should.equal(None)
+}
+
 pub fn last_text_stamp_picks_newest_assistant_text_test() {
   let tr =
     transcript.new("m", "s")

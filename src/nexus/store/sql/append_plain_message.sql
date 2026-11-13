@@ -7,6 +7,9 @@
 -- sentinel inserts NULL the same way (to_timestamp(NULL) is NULL), so
 -- unstamped rows stay honestly unstamped instead of borrowing the write
 -- instant as a fake append time.
-insert into thread_message (thread_id, seq, role, content, reasoning, created_at)
-values ($1, $2, $3, $4, nullif($5, ''::text), to_timestamp(nullif($6, 0::bigint)))
+-- author is display-only provenance (bots P3b: which bot sent this user
+-- message); the '' sentinel inserts NULL the same way — NULL = a human
+-- sent it, and an authored row never travels as ''.
+insert into thread_message (thread_id, seq, role, content, reasoning, created_at, author, hop_depth)
+values ($1, $2, $3, $4, nullif($5, ''::text), to_timestamp(nullif($6, 0::bigint)), nullif($7, ''::text), $8)
 on conflict (thread_id, seq) do nothing

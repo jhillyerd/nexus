@@ -660,6 +660,14 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
 .turn { max-width: 46rem; padding: .55rem .8rem; border-radius: 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .turn.user { align-self: flex-end; background: color-mix(in srgb, #3b82f6 18%, transparent); }
 .turn.assistant { align-self: flex-start; background: color-mix(in srgb, currentColor 8%, transparent); }
+/* Bot-delivered user line's author badge (bots P3b, nexus/ui user_turn):
+   the sender's frozen display name as a small muted line above the
+   bubble text — display metadata like the timestamp below it, not a
+   parallel design system. #app-prefixed per the cascade traps;
+   `white-space` resets off `.turn`'s pre-wrap so a long name wraps as a
+   normal short line instead of stretching the pill. */
+#app .turn.user span.origin { display: block; margin-bottom: .15rem; font-size: .72rem;
+  opacity: .75; white-space: normal; }
 /* Per-message timestamp (nexus/ui time_stamp): a small muted line under
    the bubble text. #app-prefix per the cascade traps above (bare `time`
    could meet framework element rules); `white-space` resets off `.turn`'s

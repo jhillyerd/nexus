@@ -789,10 +789,21 @@ fn append_row(
 ) -> Result(pog.Returned(Nil), pog.QueryError) {
   // The stamp travels as epoch seconds; the queries' `nullif($n, 0)`
   // sentinel turns the unstamped 0 back into NULL (see the append_*.sql
-  // files).
+  // files). The author travels as text the same way: '' (a human send's
+  // None) turns back into NULL via the query's nullif sentinel.
   case row {
-    store.UserRow(content, at) ->
-      sql.append_plain_message(db, id, seq, "user", content, "", at_param(at))
+    store.UserRow(content, author, hop_depth, at) ->
+      sql.append_plain_message(
+        db,
+        id,
+        seq,
+        "user",
+        content,
+        "",
+        at_param(at),
+        option.unwrap(author, ""),
+        hop_depth,
+      )
     store.AssistantRow(content, reasoning, at) ->
       sql.append_plain_message(
         db,
@@ -802,6 +813,8 @@ fn append_row(
         content,
         option.unwrap(reasoning, ""),
         at_param(at),
+        "",
+        0,
       )
     store.ToolCallRow(content, call_id, name, arguments, reasoning, at) ->
       sql.append_tool_call(
@@ -975,7 +988,7 @@ fn message_row_from_row(row: sql.LoadMessagesRow) -> store.MessageRow {
     seconds -> Some(seconds)
   }
   case row.role, row.tool_call_id {
-    "user", _ -> store.UserRow(row.content, at)
+    "user", _ -> store.UserRow(row.content, row.author, row.hop_depth, at)
     "assistant", Some(call_id) ->
       store.ToolCallRow(
         content: row.content,
