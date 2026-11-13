@@ -9,6 +9,7 @@
 import gleam/erlang/process.{type Pid, type Subject}
 import gleam/list
 import gleam/option.{None, Some}
+import gleam/otp/actor
 import gleam/otp/factory_supervisor
 import gleam/string
 import gleeunit/should
@@ -768,9 +769,9 @@ pub fn reasoning_rows_round_trip_test() {
   let rows = store.transcript_rows(tr, 1)
   rows
   |> should.equal([
-    store.UserRow("think hard", None),
+    store.UserRow("think hard", None, 0, None),
     store.AssistantRow("the answer", Some("step one, then step two"), None),
-    store.UserRow("again", None),
+    store.UserRow("again", None, 0, None),
     store.AssistantRow("done", None, None),
   ])
   let rebuilt =
@@ -793,7 +794,7 @@ pub fn tool_call_reasoning_rides_first_row_of_run_test() {
     |> transcript.append_tool_result("c2", "r2", ok: True)
   store.transcript_rows(tr, 1)
   |> should.equal([
-    store.UserRow("q", None),
+    store.UserRow("q", None, 0, None),
     store.ToolCallRow("", "c1", "echo", "{}", Some("two calls needed"), None),
     store.ToolCallRow("", "c2", "echo", "{}", None, None),
     store.ToolResultRow("c1", "echo", True, "r1", None),
@@ -819,9 +820,9 @@ pub fn timestamp_rows_round_trip_test() {
   let rows = store.transcript_rows(tr, 1)
   rows
   |> should.equal([
-    store.UserRow("q", Some(1000)),
+    store.UserRow("q", None, 0, Some(1000)),
     store.AssistantRow("a", None, Some(2000)),
-    store.UserRow("again", Some(3000)),
+    store.UserRow("again", None, 0, Some(3000)),
     store.AssistantRow("done", None, Some(4000)),
   ])
   // Hydration restores the stamps at the same chronological indexes, so
@@ -851,7 +852,7 @@ pub fn tool_call_stamp_rides_first_row_of_run_test() {
     |> transcript.stamp(3000)
   store.transcript_rows(tr, 1)
   |> should.equal([
-    store.UserRow("q", Some(1000)),
+    store.UserRow("q", None, 0, Some(1000)),
     // One assistant message = one stamp, on the run's FIRST row only —
     // same rule as content/reasoning.
     store.ToolCallRow("", "c1", "echo", "{}", None, Some(2000)),
@@ -862,6 +863,96 @@ pub fn tool_call_stamp_rides_first_row_of_run_test() {
     store.transcript_from_rows("alias-1", "sys", store.transcript_rows(tr, 1))
   transcript.stamped_at(rebuilt, 2) |> should.equal(Some(2000))
   transcript.stamped_at(rebuilt, 3) |> should.equal(Some(3000))
+}
+
+// ---------------------------------------------------------------------------
+// Bots P3b: author + hop-depth provenance round-trip (display-only,
+// like the stamps above — never a request byte)
+// ---------------------------------------------------------------------------
+
+pub fn origin_rows_round_trip_test() {
+  let tr =
+    transcript.new("alias-1", test_config().system_prompt)
+    |> transcript.append_user("from the bot")
+    |> transcript.mark_origin(Some("Hermes"), 2)
+    |> transcript.stamp(1000)
+    |> transcript.append_assistant("reply")
+    |> transcript.stamp(2000)
+    |> transcript.append_user("from the human")
+    |> transcript.stamp(3000)
+  let rows = store.transcript_rows(tr, 1)
+  rows
+  |> should.equal([
+    // The authored row carries the frozen display name and hop count.
+    store.UserRow("from the bot", Some("Hermes"), 2, Some(1000)),
+    store.AssistantRow("reply", None, Some(2000)),
+    // A human row records absence: author None, hop_depth 0 — the
+    // schema's `NOT NULL DEFAULT 0` shape, never a fake author.
+    store.UserRow("from the human", None, 0, Some(3000)),
+  ])
+  // Hydration restores the provenance at the same chronological indexes.
+  let rebuilt =
+    store.transcript_from_rows("alias-1", test_config().system_prompt, rows)
+  transcript.origin_at(rebuilt, 1)
+  |> should.equal(Some(transcript.Origin("Hermes", 2)))
+  transcript.origin_at(rebuilt, 2) |> should.equal(None)
+  transcript.origin_at(rebuilt, 3) |> should.equal(None)
+}
+
+pub fn authored_send_badge_survives_restart_test() {
+  // Replay parity across a reload: the author the live tab sees and the
+  // author a post-reload tab sees are the SAME for the same message —
+  // one shape per render path (live echo, hydration replay), so a
+  // reload never drops a badge (the empty-pill lesson).
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  let booted = boot(seam)
+  let record = create(booted.registry, "alias-1", happy_runner)
+
+  // Subscribe like a UI tab, then drive the authored send through the
+  // seam — what the P3c delivery registry will call. `send_message`
+  // (the human helper) keeps its None/0 shape; Send is the ONE path.
+  let events = process.new_subject()
+  process.send(record.subject, thread.Join(events, 1))
+  let assert Ok(thread.ThreadEvent(_, _, thread.Hello(_, _, _))) =
+    process.receive(events, 2000)
+  let assert thread.Sent =
+    actor.call(record.subject, 5000, fn(reply) {
+      thread.Send("status?", Some("Hermes"), 1, reply)
+    })
+  // The live echo carries the author — the badge every tab sees now.
+  let assert Ok(thread.ThreadEvent(
+    _,
+    _,
+    thread.UserEcho(live_text, Some(_), Some(live_author)),
+  )) = process.receive(events, 2000)
+  live_text |> should.equal("status?")
+  live_author |> should.equal("Hermes")
+
+  store_mock.await_commits(mock, 2)
+
+  // ---- the "VM" restarts; only the store survives ---------------------
+  restart_vm(booted)
+  let booted2 = boot(store_mock.seam(mock))
+  let assert Ok(subject2) = thread_registry.get(booted2.registry, record.id)
+
+  // The hydrated transcript carries the same provenance, depth included.
+  transcript.origin_at(thread.snapshot(subject2), 1)
+  |> should.equal(Some(transcript.Origin("Hermes", 1)))
+
+  // And the replay a reloading tab receives carries the SAME author:
+  // the post-reload badge equals the live one.
+  let replay = process.new_subject()
+  process.send(subject2, thread.Join(replay, 1))
+  let assert Ok(thread.ThreadEvent(_, _, thread.Hello(_, _, _))) =
+    process.receive(replay, 2000)
+  let assert Ok(thread.ThreadEvent(
+    _,
+    _,
+    thread.UserEcho(replay_text, _, Some(replay_author)),
+  )) = process.receive(replay, 2000)
+  replay_text |> should.equal(live_text)
+  replay_author |> should.equal(live_author)
 }
 
 // ---------------------------------------------------------------------------

@@ -91,9 +91,11 @@ pub type ToolStatus {
 /// kept separately (like M2) so tokens can be appended cheaply. `at` on
 /// the text lines is the message's display stamp (wall-clock epoch
 /// seconds; None = unstamped history) — display metadata like the
-/// reasoning sidecar it mirrors, never a request byte.
+/// reasoning sidecar it mirrors, never a request byte. `author` on the
+/// user line is the message's display provenance (bots P3b): the bot
+/// that delivered it, None = a human sent it; rendered as a badge.
 pub type Line {
-  UserLine(text: String, at: Option(Int))
+  UserLine(text: String, author: Option(String), at: Option(Int))
   AssistantLine(text: String, at: Option(Int))
   /// The reasoning (chain of thought) a committed assistant message was
   /// preceded by — replayed from history or committed from the live
@@ -417,8 +419,11 @@ pub type Msg {
   Hello(model: String)
   /// A committed user line. `at` is its display stamp — wall-clock epoch
   /// seconds from the thread's echo (live and replay carry the same
-  /// value); None = unstamped history, rendered without a time.
-  UserEcho(String, Option(Int))
+  /// value); None = unstamped history, rendered without a time. `author`
+  /// is its display provenance (bots P3b): the bot that delivered it,
+  /// None = a human send — live echoes and both replay paths carry the
+  /// same value, so a reload never drops the badge.
+  UserEcho(String, Option(Int), Option(String))
   /// A committed assistant line, replayed from history (or seen by a
   /// second tab). `at` mirrors UserEcho's display stamp.
   AssistantFull(String, Option(Int))
@@ -498,7 +503,7 @@ pub type Msg {
 pub fn from_thread_event(event: thread.EventKind) -> Msg {
   case event {
     thread.Hello(model, _messages, _metrics) -> Hello(model)
-    thread.UserEcho(text, at) -> UserEcho(text, at)
+    thread.UserEcho(text, at, author) -> UserEcho(text, at, author)
     thread.AssistantFull(text, at) -> AssistantFull(text, at)
     thread.ReasoningFull(text) -> ReasoningFull(text)
     thread.Token(text) -> Token(text)
@@ -1095,10 +1100,10 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       effect.none(),
     )
 
-    UserEcho(text, at) -> #(
+    UserEcho(text, at, author) -> #(
       Model(
         ..model,
-        log: [UserLine(text, at), ..model.log],
+        log: [UserLine(text, author, at), ..model.log],
         // The user message marks the start of a (possibly live) turn: lines
           // beyond this point belong to it and roll back on a failed turn.
           turn_base: list.length(model.log) + 1,
@@ -2964,6 +2969,30 @@ fn turn(kind: String, text: String, at: Option(Int)) -> Element(Msg) {
   ])
 }
 
+/// A committed user line. Bot-authored lines (bots P3b) grow an author
+/// badge ahead of the text: the sender's display name frozen at send
+/// time, rendered as an inert text node like everything else in the log —
+/// a bot-supplied name is user content under the hostile-text rules, not
+/// markup. The badge rides the UserEcho, so live, mid-turn join, and
+/// post-reload replay all render it identically (one shape per path).
+fn user_turn(
+  text: String,
+  author: Option(String),
+  at: Option(Int),
+) -> Element(Msg) {
+  html.div([attr.class("turn user")], [
+    case author {
+      Some(name) ->
+        html.span([attr.class("origin"), attr.title("delivered by " <> name)], [
+          html.text(name),
+        ])
+      None -> element.none()
+    },
+    html.span([], [html.text(text)]),
+    time_stamp(at),
+  ])
+}
+
 /// Committed assistant turns render markdown (see `nexus/ui/markdown`
 /// for the hostile-text contract: raw HTML stays inert text, hrefs are
 /// scheme-filtered, images become links). The `md` class switches the
@@ -3039,7 +3068,7 @@ fn render_line(
   line: Line,
 ) -> Element(Msg) {
   case line {
-    UserLine(text, at) -> turn("user", text, at)
+    UserLine(text, author, at) -> user_turn(text, author, at)
     AssistantLine(text, at) -> assistant_turn(md_cache, text, at)
     ReasoningLine(text) -> reasoning_block(text, False)
     ToolLine(..) -> tool_card(line)
@@ -3110,7 +3139,7 @@ fn take_chips(run: List(Line), rest: List(Line)) -> #(List(Line), List(Line)) {
 fn is_chip(line: Line) -> Bool {
   case line {
     ReasoningLine(_) | ToolLine(..) -> True
-    UserLine(_, _) | AssistantLine(_, _) | NoteLine(_, _) -> False
+    UserLine(_, _, _) | AssistantLine(_, _) | NoteLine(_, _) -> False
   }
 }
 
