@@ -139,6 +139,9 @@ pub type Msg {
     tools: String,
     chat_only: Bool,
   )
+  /// The row's inbound gate toggled (bots plan P3a): `allow` is the NEW
+  /// value. A one-field PATCH — nothing else on the row moves.
+  BotInboundToggled(id: String, allow: Bool)
   BotDeleteRequested(id: String)
   BotDeleteCancelled
   BotDeleteConfirmed(id: String)
@@ -410,6 +413,12 @@ pub fn update(
       [],
     )
 
+    BotInboundToggled(id, allow) -> #(
+      state,
+      set_bot_inbound_effect(bots, id, allow),
+      [],
+    )
+
     BotDeleteRequested(id) -> #(
       State(
         ..state,
@@ -619,6 +628,13 @@ fn bot_row(
     html.div([attr.class("provider-main")], [
       html.div([attr.class("provider-head")], [
         html.strong([attr.class("provider-name")], [html.text(b.name)]),
+        // The blocked-gate badge (bots plan P3a), mirroring the
+        // provider row's "off" badge: the open gate is the normal
+        // state and says nothing.
+        case b.allow_inbound {
+          True -> element.none()
+          False -> span_badge("off", "inbound off")
+        },
       ]),
       html.span([attr.class("provider-sub")], [
         html.text(
@@ -653,6 +669,19 @@ fn bot_row(
       ]),
     ]),
     html.div([attr.class("row-controls")], [
+      // The inbound gate toggle (bots plan P3a): the button names the
+      // action, Enable/Disable style — clicking an open gate closes it.
+      control(
+        case b.allow_inbound {
+          True -> "Block inbound"
+          False -> "Allow inbound"
+        },
+        case b.allow_inbound {
+          True -> "Block inbound bot-to-bot messages to this bot"
+          False -> "Allow inbound bot-to-bot messages to this bot"
+        },
+        BotInboundToggled(id, !b.allow_inbound),
+      ),
       control("Edit", "Edit this bot", BotEditToggled(id)),
       control("Delete", "Delete this bot forever", BotDeleteRequested(id)),
     ]),
@@ -1256,6 +1285,35 @@ fn update_bot_effect(
       // always replaces — an untouched form resubmits the stored list
       // verbatim; blank clears back to the default set (bots plan P2).
       tools: Some(parse_tools_field(tools, chat_only)),
+      // The gate has no form field (bots plan P3a): the row's toggle
+      // patches it on its own.
+      allow_inbound: None,
+    )
+  effect.from(fn(dispatch) {
+    case bot_registry.update_bot(bots, id, patch) {
+      Ok(_) -> dispatch(BotMutated)
+      Error(error) -> dispatch(BotMutateFailed(bot_registry.describe(error)))
+    }
+  })
+}
+
+/// Flip the inbound gate (bots plan P3a): a one-field PATCH — the
+/// registry merges it onto the stored row and writes through, and the
+/// reply reloads the list like every other bot mutation.
+fn set_bot_inbound_effect(
+  bots: Subject(bot_registry.Msg),
+  id: String,
+  allow: Bool,
+) -> Effect(Msg) {
+  let patch =
+    bot.BotUpdate(
+      name: None,
+      description: None,
+      provider_id: None,
+      model: None,
+      system_prompt: None,
+      tools: None,
+      allow_inbound: Some(allow),
     )
   effect.from(fn(dispatch) {
     case bot_registry.update_bot(bots, id, patch) {

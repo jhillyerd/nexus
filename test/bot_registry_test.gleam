@@ -96,6 +96,7 @@ pub fn boot_loads_and_mints_past_stored_ids_test() {
       model: "alias-1",
       system_prompt: None,
       tools: None,
+      allow_inbound: True,
       created_at: 1_700_000_000,
       updated_at: 1_700_000_000,
     ))
@@ -154,6 +155,7 @@ pub fn crud_round_trip_test() {
         model: Some("alias-3"),
         system_prompt: Some("be terse"),
         tools: None,
+        allow_inbound: None,
       ),
     )
   should.equal(updated.name, "Researcher")
@@ -172,6 +174,7 @@ pub fn crud_round_trip_test() {
         model: None,
         system_prompt: Some(""),
         tools: None,
+        allow_inbound: None,
       ),
     )
   should.equal(cleared.system_prompt, None)
@@ -183,6 +186,84 @@ pub fn crud_round_trip_test() {
   bot_registry.get_bot(registry, created.id)
   |> should.be_error
   should.equal(store_mock.bots(mock), [])
+}
+
+/// The inbound gate (bots plan P3a, issue #95): creates open it, a
+/// one-field PATCH flips it — write-through into the store mock AND the
+/// registry's in-state read path — an absent field keeps it, and the
+/// gate rides the full-row update like every other field.
+pub fn allow_inbound_patch_round_trip_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  store_mock.ensure_fixture_provider(seam)
+  let registry = start_registry(seam)
+
+  // Create: the gate starts open (the column's DEFAULT true; no
+  // create-time override exists).
+  let assert Ok(created) = bot_registry.create_bot(registry, params("gated"))
+  should.be_true(created.allow_inbound)
+
+  // Patch closed: the reply, the registry's state, and the stored row
+  // all read closed.
+  let assert Ok(closed) =
+    bot_registry.update_bot(
+      registry,
+      created.id,
+      bot.BotUpdate(
+        name: None,
+        description: None,
+        provider_id: None,
+        model: None,
+        system_prompt: None,
+        tools: None,
+        allow_inbound: Some(False),
+      ),
+    )
+  should.be_false(closed.allow_inbound)
+  let assert Ok(from_state) = bot_registry.get_bot(registry, created.id)
+  should.be_false(from_state.allow_inbound)
+  let assert [stored] = store_mock.bots(mock)
+  should.be_false(stored.allow_inbound)
+
+  // A patch WITHOUT the field keeps the stored gate (and the write is
+  // still a full-row replace — the closed value must survive it).
+  let assert Ok(untouched) =
+    bot_registry.update_bot(
+      registry,
+      created.id,
+      bot.BotUpdate(
+        name: None,
+        description: Some("described"),
+        provider_id: None,
+        model: None,
+        system_prompt: None,
+        tools: None,
+        allow_inbound: None,
+      ),
+    )
+  should.equal(untouched.description, "described")
+  should.be_false(untouched.allow_inbound)
+  let assert Ok(reread) = bot_registry.get_bot(registry, created.id)
+  should.be_false(reread.allow_inbound)
+
+  // Reopen.
+  let assert Ok(opened) =
+    bot_registry.update_bot(
+      registry,
+      created.id,
+      bot.BotUpdate(
+        name: None,
+        description: None,
+        provider_id: None,
+        model: None,
+        system_prompt: None,
+        tools: None,
+        allow_inbound: Some(True),
+      ),
+    )
+  should.be_true(opened.allow_inbound)
+  let assert [final] = store_mock.bots(mock)
+  should.be_true(final.allow_inbound)
 }
 
 pub fn duplicate_name_pre_check_test() {
@@ -208,6 +289,7 @@ pub fn duplicate_name_pre_check_test() {
       model: None,
       system_prompt: None,
       tools: None,
+      allow_inbound: None,
     ),
   )
   |> should.equal(Error(bot_registry.DuplicateName))
@@ -228,6 +310,7 @@ pub fn unknown_id_update_delete_refused_test() {
       model: None,
       system_prompt: None,
       tools: None,
+      allow_inbound: None,
     ),
   )
   |> should.equal(Error(bot_registry.Unknown))
@@ -261,6 +344,7 @@ pub fn invalid_name_and_model_refused_test() {
         model: None,
         system_prompt: None,
         tools: None,
+        allow_inbound: None,
       ),
     )
   should.equal(kept.name, "ok")
@@ -386,6 +470,7 @@ pub fn unknown_tool_name_refused_test() {
       model: None,
       system_prompt: None,
       tools: Some(Some(["web_search", "ghost"])),
+      allow_inbound: None,
     ),
   )
   |> should.equal(Error(bot_registry.InvalidTools("unknown tool name: ghost")))
@@ -458,6 +543,7 @@ pub fn toolset_normalization_test() {
         model: None,
         system_prompt: None,
         tools: Some(Some(["web_search"])),
+        allow_inbound: None,
       ),
     )
   should.equal(replaced.tools, Some(["web_search"]))
@@ -473,6 +559,7 @@ pub fn toolset_normalization_test() {
         model: None,
         system_prompt: None,
         tools: Some(None),
+        allow_inbound: None,
       ),
     )
   should.equal(cleared.tools, None)
@@ -488,6 +575,7 @@ pub fn toolset_normalization_test() {
         model: None,
         system_prompt: None,
         tools: None,
+        allow_inbound: None,
       ),
     )
   should.equal(kept.tools, None)

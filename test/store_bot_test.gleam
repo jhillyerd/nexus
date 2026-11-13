@@ -21,6 +21,7 @@ fn row(id: String, name: String) -> store.StoredBot {
     model: "alias-1",
     system_prompt: None,
     tools: None,
+    allow_inbound: True,
     created_at: 1_700_000_000,
     updated_at: 1_700_000_000,
   )
@@ -56,21 +57,28 @@ fn seam() -> store.Store {
 
 pub fn bot_crud_round_trips_test() {
   let seam = seam()
-  let assert Ok(Nil) = seam.insert_bot(row("b1", "one"))
+  // The inbound gate (bots plan P3a) rides the insert verbatim — the
+  // seam writes full rows, closed included, even though registry
+  // creates always open it.
+  let assert Ok(Nil) =
+    seam.insert_bot(bot.Bot(..row("b1", "one"), allow_inbound: False))
 
   let assert Ok(got) = seam.get_bot("b1")
   should.equal(got.name, "one")
   should.equal(got.system_prompt, None)
+  should.be_false(got.allow_inbound)
 
   // The toolset rides the update and survives the read-back (the seam
   // mapping's new P2 field — persist.gleam marshals it to the two SQL
-  // parameters, NULL sentinel included).
+  // parameters, NULL sentinel included); the gate reopens with it
+  // (P3a) — same full-row replace.
   let assert Ok(Nil) =
     seam.update_bot(
       bot.Bot(
         ..row("b1", "renamed"),
         system_prompt: Some("p"),
         tools: Some(["http_fetch"]),
+        allow_inbound: True,
       ),
     )
 
@@ -78,9 +86,11 @@ pub fn bot_crud_round_trips_test() {
   should.equal(updated.name, "renamed")
   should.equal(updated.system_prompt, Some("p"))
   should.equal(updated.tools, Some(["http_fetch"]))
+  should.be_true(updated.allow_inbound)
 
+  // And the gate is in the list read too (the boot load's shape).
   let assert Ok(all) = seam.list_bots()
-  should.equal(all |> list.map(fn(b) { b.id }), ["b1"])
+  should.equal(all |> list.map(fn(b) { b.allow_inbound }), [True])
 
   let assert Ok(Nil) = seam.delete_bot("b1")
   seam.get_bot("b1") |> should.be_error
