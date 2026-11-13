@@ -51,6 +51,8 @@ fn test_config() -> config.Config {
     codemode: False,
     codemode_timeout_ms: 30_000,
     codemode_max_output_chars: 32_768,
+    // Bots P3c: the delivery hop guard; 4 = the shipped default.
+    max_bot_hops: 4,
   )
 }
 
@@ -99,6 +101,7 @@ fn happy_runner(
   _endpoint,
   tr,
   _cancel,
+  _delivery,
   on_event: fn(loop.LoopEvent) -> Nil,
 ) -> thread.TurnOutcome {
   on_event(loop.StreamEvent(openai.TokenDelta("hi")))
@@ -111,6 +114,7 @@ fn tool_round_runner(
   _endpoint,
   tr,
   _cancel,
+  _delivery,
   on_event: fn(loop.LoopEvent) -> Nil,
 ) -> thread.TurnOutcome {
   on_event(loop.ToolCallAssembled("call_a", "http_fetch", args_a, None))
@@ -299,6 +303,10 @@ fn boot(seam: store.Store) -> Boot {
       // above refuses before any request), pure to stay offline.
       fn() { [] },
       fixture_resolver(),
+      // Bots P3c: the delivery wrapper's sender-name ask resolves this
+      // name at ask time; no bot registry actor needs to exist for tests
+      // that never deliver.
+      process.new_name("nexus_bot_registry"),
     )
   Boot(
     registry: started.data,
@@ -745,6 +753,10 @@ pub fn boot_fails_when_store_unreachable_test() {
       process.new_name("nexus_broken_registry"),
       broken,
       fixture_resolver(),
+      // Bots P3c: the delivery wrapper's sender-name ask resolves this
+      // name at ask time; no bot registry actor needs to exist for tests
+      // that never deliver.
+      process.new_name("nexus_bot_registry"),
     )
   case started {
     Ok(_) -> panic as "registry must not start with an unreachable store"

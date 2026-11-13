@@ -58,6 +58,8 @@ fn test_config() -> config.Config {
     codemode: False,
     codemode_timeout_ms: 30_000,
     codemode_max_output_chars: 32_768,
+    // Bots P3c: the delivery hop guard; 4 = the shipped default.
+    max_bot_hops: 4,
   )
 }
 
@@ -80,6 +82,7 @@ fn happy_runner(
   _endpoint,
   tr,
   _cancel,
+  _delivery,
   on_event: fn(loop.LoopEvent) -> Nil,
 ) -> thread.TurnOutcome {
   on_event(loop.StreamEvent(openai.TokenDelta("Hello")))
@@ -98,6 +101,7 @@ fn blocking_runner(
   _endpoint,
   tr,
   cancel: process.Subject(Nil),
+  _delivery,
   on_event: fn(loop.LoopEvent) -> Nil,
 ) -> thread.TurnOutcome {
   on_event(loop.StreamEvent(openai.TokenDelta("partial")))
@@ -117,6 +121,7 @@ fn delayed_runner(
   _endpoint,
   tr,
   _cancel,
+  _delivery,
   on_event: fn(loop.LoopEvent) -> Nil,
 ) -> thread.TurnOutcome {
   on_event(loop.StreamEvent(openai.TokenDelta("first")))
@@ -134,6 +139,7 @@ fn failing_runner(
   _endpoint,
   _tr,
   _cancel,
+  _delivery,
   on_event: fn(loop.LoopEvent) -> Nil,
 ) -> thread.TurnOutcome {
   on_event(loop.StreamEvent(openai.TokenDelta("never committed")))
@@ -142,7 +148,13 @@ fn failing_runner(
 
 /// Kills its own (worker) process: the monitor path must convert this into
 /// a TurnFailed without hurting the thread actor.
-fn crashing_runner(_endpoint, _tr, _cancel, _on_event) -> thread.TurnOutcome {
+fn crashing_runner(
+  _endpoint,
+  _tr,
+  _cancel,
+  _delivery,
+  _on_event,
+) -> thread.TurnOutcome {
   process.kill(process.self())
   thread.StreamErrored("unreachable")
 }
@@ -178,7 +190,7 @@ fn counter_loop(subj: process.Subject(CounterMsg), count: Int) -> Nil {
 /// First turn streams normally, later turns fail: thread A gets two metric
 /// samples while committing the same history as a single-turn thread.
 fn flaky_runner(counter: process.Subject(CounterMsg)) -> thread.TurnRunner {
-  fn(_endpoint, tr, _cancel, on_event: fn(loop.LoopEvent) -> Nil) {
+  fn(_endpoint, tr, _cancel, _delivery, on_event: fn(loop.LoopEvent) -> Nil) {
     let turn = process.call(counter, 1000, fn(reply) { Ping(reply) })
     on_event(loop.StreamEvent(openai.TokenDelta("Hello")))
     on_event(loop.StreamEvent(openai.TokenDelta(" world")))
@@ -604,7 +616,7 @@ pub fn selected_alias_is_frozen_test() {
 /// existing thread's runner.
 pub fn runner_receives_frozen_endpoint_test() {
   let seen = process.new_subject()
-  let capturing = fn(endpoint, tr, _cancel, _on_event) {
+  let capturing = fn(endpoint, tr, _cancel, _delivery, _on_event) {
     process.send(seen, endpoint)
     thread.StreamDone(
       stats(),
@@ -790,6 +802,7 @@ fn tool_round_runner(
   _endpoint,
   tr,
   _cancel,
+  _delivery,
   on_event: fn(loop.LoopEvent) -> Nil,
 ) -> thread.TurnOutcome {
   on_event(loop.LoopStatus(1, 8, "request"))
@@ -880,7 +893,7 @@ pub fn failed_tool_result_replays_as_failed_test() {
   // rides the transcript's display-only sidecar, so the replayed
   // ToolResult carries the same ok the live event did.
   let sess =
-    start_with(fn(_endpoint, tr, _cancel, on_event) {
+    start_with(fn(_endpoint, tr, _cancel, _delivery, on_event) {
       on_event(loop.LoopStatus(1, 8, "tools"))
       on_event(loop.ToolCallAssembled("call_9", "http_fetch", "{}", None))
       on_event(loop.ToolResultEvent(
@@ -992,6 +1005,7 @@ fn guard_runner(
   _endpoint,
   tr,
   _cancel,
+  _delivery,
   on_event: fn(loop.LoopEvent) -> Nil,
 ) -> thread.TurnOutcome {
   on_event(loop.LoopStatus(4, 4, "guard"))
@@ -1007,7 +1021,7 @@ fn guard_runner(
 fn gated_runner(
   gate_request: process.Subject(process.Subject(Nil)),
 ) -> thread.TurnRunner {
-  fn(_endpoint, tr, _cancel, on_event) {
+  fn(_endpoint, tr, _cancel, _delivery, on_event) {
     // A fixed flush stamp: the loop stamps the round at append time and
     // broadcasts the same value on every assembled event — the tests pin
     // it end to end (live echo, mirror replay, restamp).
@@ -1186,6 +1200,7 @@ fn reasoning_runner(
   _endpoint,
   tr,
   _cancel,
+  _delivery,
   on_event: fn(loop.LoopEvent) -> Nil,
 ) -> thread.TurnOutcome {
   on_event(loop.StreamEvent(openai.ReasoningDelta("pondering ")))

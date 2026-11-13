@@ -2741,6 +2741,10 @@ pub fn meta_updated_refreshes_sidebar_test() {
       // so the boot stays offline.
       fn() { [] },
       fixture_resolver(),
+      // Bots P3c: the delivery wrapper's sender-name ask resolves this
+      // name at ask time; no bot registry actor needs to exist for tests
+      // that never deliver.
+      process.new_name("nexus_bot_registry"),
     )
   let registry = started_registry.data
 
@@ -2872,6 +2876,10 @@ pub fn send_moves_previous_day_row_into_today_immediately_test() {
       // so the boot stays offline.
       fn() { [] },
       fixture_resolver(),
+      // Bots P3c: the delivery wrapper's sender-name ask resolves this
+      // name at ask time; no bot registry actor needs to exist for tests
+      // that never deliver.
+      process.new_name("nexus_bot_registry"),
     )
   let registry = started_registry.data
 
@@ -2961,6 +2969,10 @@ pub fn connect_with_configured_provider_never_notes_no_provider_test() {
       // so the boot stays offline.
       fn() { [] },
       fixture_resolver(),
+      // Bots P3c: the delivery wrapper's sender-name ask resolves this
+      // name at ask time; no bot registry actor needs to exist for tests
+      // that never deliver.
+      process.new_name("nexus_bot_registry"),
     )
   let registry = started_registry.data
 
@@ -3000,6 +3012,7 @@ fn unused_turn_runner(
   _endpoint,
   _tr,
   _cancel,
+  _delivery,
   _on_event,
 ) -> thread.TurnOutcome {
   thread.StreamErrored("no turn expected in this test")
@@ -3009,7 +3022,13 @@ fn unused_turn_runner(
 /// the stand-in for a reply that is still streaming. Whatever a test
 /// observes while a turn runs this runner cannot have come from the
 /// turn's own commit.
-fn parked_runner(_endpoint, tr, cancel, _on_event) -> thread.TurnOutcome {
+fn parked_runner(
+  _endpoint,
+  tr,
+  cancel,
+  _delivery,
+  _on_event,
+) -> thread.TurnOutcome {
   let selector =
     process.new_selector()
     |> process.select_map(cancel, fn(_) { Nil })
@@ -3024,6 +3043,7 @@ fn leak_runner(
   _endpoint,
   tr,
   _cancel,
+  _delivery,
   on_event: fn(loop.LoopEvent) -> Nil,
 ) -> thread.TurnOutcome {
   on_event(loop.StreamEvent(openai.TokenDelta("LEAK-TOKEN")))
@@ -3098,6 +3118,10 @@ pub fn thread_switch_drops_left_thread_stream_test() {
       toolset(leak_runner),
       fn() { [] },
       fixture_resolver(),
+      // Bots P3c: the delivery wrapper's sender-name ask resolves this
+      // name at ask time; no bot registry actor needs to exist for tests
+      // that never deliver.
+      process.new_name("nexus_bot_registry"),
     )
   let registry = started_registry.data
 
@@ -3187,6 +3211,10 @@ pub fn meta_updated_from_other_thread_refreshes_sidebar_test() {
       toolset(unused_turn_runner),
       fn() { [] },
       fixture_resolver(),
+      // Bots P3c: the delivery wrapper's sender-name ask resolves this
+      // name at ask time; no bot registry actor needs to exist for tests
+      // that never deliver.
+      process.new_name("nexus_bot_registry"),
     )
   let registry = started_registry.data
 
@@ -3305,6 +3333,8 @@ fn test_config() -> config.Config {
     codemode: False,
     codemode_timeout_ms: 30_000,
     codemode_max_output_chars: 32_768,
+    // Bots P3c: the delivery hop guard; 4 = the shipped default.
+    max_bot_hops: 4,
   )
 }
 
@@ -3902,6 +3932,10 @@ fn start_offline_registries(
       toolset(unused_turn_runner),
       fn() { [] },
       fixture_resolver(),
+      // Bots P3c: the delivery wrapper's sender-name ask resolves this
+      // name at ask time; no bot registry actor needs to exist for tests
+      // that never deliver.
+      process.new_name("nexus_bot_registry"),
     )
   #(started_registry.data, started_providers.data, started_bots.data)
 }

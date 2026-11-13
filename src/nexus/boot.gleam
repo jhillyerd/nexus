@@ -135,6 +135,11 @@ pub fn main() -> Nil {
               registry_name,
               persist.seam(process.named_subject(store_name)),
               resolve_provider,
+              // The bot registry's NAME (bots P3c): no registry-to-registry
+              // edge — the delivery wrapper hands it to the `bot_message`
+              // tool's sender-name closure, which resolves it at ask time
+              // inside the unlinked turn worker (the TagCorpus pattern).
+              bot_registry_name,
             )
           }),
         )

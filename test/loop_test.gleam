@@ -93,6 +93,7 @@ fn run_recording(
       stream,
       tr,
       process.new_subject(),
+      None,
       fn(event) { process.send(events, event) },
     )
   let received = drain(events, [])
@@ -472,6 +473,7 @@ pub fn stop_mid_round_skips_remaining_calls_test() {
       stream,
       tr_with_user(),
       cancel,
+      None,
       fn(event) { process.send(events, event) },
     )
   let received = drain(events, [])
@@ -552,6 +554,7 @@ pub fn stop_consumed_mid_script_by_codemode_skips_rest_test() {
       stream,
       tr_with_user(),
       cancel,
+      None,
       fn(event) { process.send(events, event) },
     )
   let received = drain(events, [])

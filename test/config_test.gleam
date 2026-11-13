@@ -78,12 +78,15 @@ pub fn load_defaults_test() {
   cfg.http_bind |> should.equal("127.0.0.1")
   cfg.http_port |> should.equal(8080)
   cfg.ui_token |> should.equal(None)
+  // Bots P3c: the hop guard ships at 4 (four bot-to-bot hops max).
+  cfg.max_bot_hops |> should.equal(4)
   should.be_true(cfg.system_prompt |> string.starts_with("You are nexus"))
 }
 
 pub fn load_overrides_test() {
   set_all([
     #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_MAX_BOT_HOPS", "2"),
     #("NEXUS_SSE_FIRST_RESPONSE_TIMEOUT_MS", "60000"),
     #("NEXUS_STREAM_IDLE_TIMEOUT_MS", "5000"),
     #("NEXUS_HTTP_BIND", "0.0.0.0"),
@@ -92,6 +95,7 @@ pub fn load_overrides_test() {
     #("NEXUS_SYSTEM_PROMPT", "custom prompt"),
   ])
   let assert Ok(cfg) = config.load()
+  cfg.max_bot_hops |> should.equal(2)
   cfg.sse_first_response_timeout_ms |> should.equal(60_000)
   cfg.stream_idle_timeout_ms |> should.equal(5000)
   cfg.http_bind |> should.equal("0.0.0.0")

@@ -55,6 +55,8 @@ fn test_config() -> config.Config {
     codemode: False,
     codemode_timeout_ms: 30_000,
     codemode_max_output_chars: 32_768,
+    // Bots P3c: the delivery hop guard; 4 = the shipped default.
+    max_bot_hops: 4,
   )
 }
 
@@ -76,6 +78,7 @@ fn happy_runner(
   _endpoint,
   tr,
   _cancel,
+  _delivery,
   on_event: fn(loop.LoopEvent) -> Nil,
 ) -> thread.TurnOutcome {
   on_event(loop.StreamEvent(openai.TokenDelta("hi")))
@@ -557,7 +560,13 @@ pub fn delete_while_streaming_drops_the_row_test() {
 
 /// A runner that parks on its cancel subject until Stop arrives — the
 /// stand-in for a live streaming turn.
-fn blocking_runner(_cfg, tr, cancel, _on_event) -> thread.TurnOutcome {
+fn blocking_runner(
+  _cfg,
+  tr,
+  cancel,
+  _delivery,
+  _on_event,
+) -> thread.TurnOutcome {
   let selector =
     process.new_selector()
     |> process.select_map(cancel, fn(_) { Nil })
@@ -1086,6 +1095,7 @@ pub fn create_rejects_disabled_provider_test() {
       process.new_name("nexus_test_registry"),
       persistence,
       disabled,
+      process.new_name("nexus_bot_registry"),
     )
   thread_registry.create_with_toolset(
     started.data,
@@ -1102,7 +1112,7 @@ pub fn create_rejects_disabled_provider_test() {
 /// "a thread streams via its frozen endpoint").
 pub fn created_thread_runner_gets_resolved_endpoint_test() {
   let seen = process.new_subject()
-  let capturing = fn(endpoint, tr, _cancel, _on_event) {
+  let capturing = fn(endpoint, tr, _cancel, _delivery, _on_event) {
     process.send(seen, endpoint)
     thread.StreamDone(stats(), transcript.append_assistant(tr, "ok"))
   }
@@ -1153,6 +1163,10 @@ fn start_registry_keeping_seam_with(
       process.new_name("nexus_test_registry"),
       persistence,
       fixture_resolver(),
+      // Bots P3c: the delivery wrapper's sender-name ask resolves this
+      // name at ask time; no bot registry actor needs to exist for tests
+      // that never deliver.
+      process.new_name("nexus_bot_registry"),
     )
   #(started.data, persistence)
 }
@@ -1253,6 +1267,10 @@ fn boot_with_config(
       process.new_name("nexus_hydration_registry"),
       seam,
       fixture_resolver(),
+      // Bots P3c: the delivery wrapper's sender-name ask resolves this
+      // name at ask time; no bot registry actor needs to exist for tests
+      // that never deliver.
+      process.new_name("nexus_bot_registry"),
     )
   Boot(registry: started.data)
 }
@@ -1444,7 +1462,10 @@ pub fn create_from_bot_toolset_snapshot_test() {
   should.equal(stored.summary.meta.bot_id, Some("b-tools"))
 
   // The NULL-tools bot is the LIVE template half: `None` resolves to
-  // the current default at each create (below, via a plain request).
+  // the current default at each create — and, since bots P3c (#97), the
+  // bot-default form carries `bot_message` on top: bots are the only
+  // senders, so an ordinary bot gets the delivery tool without listing
+  // it. A PLAIN thread (no bot) still snapshots the bare default set.
   let assert Ok(Nil) = seed_bot_with_tools(seam, "b-default", None, None)
   let assert Ok(from_default_bot) =
     thread_registry.create(
@@ -1458,7 +1479,27 @@ pub fn create_from_bot_toolset_snapshot_test() {
       ),
     )
   let assert Ok(stored) = seam.get_thread(from_default_bot.id)
+  should.equal(
+    stored.summary.toolset,
+    list.append(tools.default_names(test_config()), ["bot_message"]),
+  )
+
+  // And the human default stays bare: a plain create never gains the
+  // delivery tool (a plain thread has no bot identity to send from).
+  let assert Ok(plain) =
+    thread_registry.create(
+      registry,
+      thread_registry.NewThread(
+        provider_id: store_mock.fixture_provider_id,
+        model: "alpha",
+        system_prompt: None,
+        toolset: None,
+        bot_id: None,
+      ),
+    )
+  let assert Ok(stored) = seam.get_thread(plain.id)
   should.equal(stored.summary.toolset, tools.default_names(test_config()))
+  should.equal(list.contains(stored.summary.toolset, "bot_message"), False)
 }
 
 /// THE shared orchestration (the gap the registry-level snapshot tests
@@ -1496,6 +1537,10 @@ pub fn create_from_bot_orchestration_carries_bot_toolset_test() {
       process.new_name("nexus_orch_registry"),
       seam,
       fixture_resolver(),
+      // Bots P3c: the delivery wrapper's sender-name ask resolves this
+      // name at ask time; no bot registry actor needs to exist for tests
+      // that never deliver.
+      process.new_name("nexus_bot_registry"),
     )
   let registry = started_registry.data
 
@@ -1659,6 +1704,10 @@ pub fn create_with_toolset_carries_the_whole_bundle_test() {
       process.new_name("nexus_bundle_registry"),
       persistence,
       fixture_resolver(),
+      // Bots P3c: the delivery wrapper's sender-name ask resolves this
+      // name at ask time; no bot registry actor needs to exist for tests
+      // that never deliver.
+      process.new_name("nexus_bot_registry"),
     )
   let registry = started.data
   let ping = process.new_subject()
@@ -1734,6 +1783,10 @@ pub fn dormant_summary_carries_bot_provenance_test() {
       process.new_name("nexus_test_registry_boot"),
       seam,
       fixture_resolver(),
+      // Bots P3c: the delivery wrapper's sender-name ask resolves this
+      // name at ask time; no bot registry actor needs to exist for tests
+      // that never deliver.
+      process.new_name("nexus_bot_registry"),
     )
 
   let summaries = thread_registry.list_threads(booted.data)
@@ -1756,6 +1809,10 @@ pub fn dormant_summary_carries_bot_provenance_test() {
       process.new_name("nexus_test_registry_boot2"),
       seam,
       fixture_resolver(),
+      // Bots P3c: the delivery wrapper's sender-name ask resolves this
+      // name at ask time; no bot registry actor needs to exist for tests
+      // that never deliver.
+      process.new_name("nexus_bot_registry"),
     )
   let after = thread_registry.list_threads(rebooted.data)
   let assert Ok(after_found) = list.find(after, fn(s) { s.id == "s9" })

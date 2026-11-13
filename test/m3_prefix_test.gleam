@@ -388,6 +388,10 @@ fn start_registry() -> process.Subject(thread_registry.Msg) {
       process.new_name("nexus_m3_registry"),
       persistence,
       fixture_resolver(),
+      // Bots P3c: the delivery wrapper's sender-name ask resolves this
+      // name at ask time; no bot registry actor needs to exist for tests
+      // that never deliver.
+      process.new_name("nexus_bot_registry"),
     )
   started.data
 }
@@ -425,6 +429,7 @@ fn happy_runner(
   _endpoint,
   tr,
   _cancel,
+  _delivery,
   on_event: fn(loop.LoopEvent) -> Nil,
 ) -> thread.TurnOutcome {
   on_event(loop.StreamEvent(openai.TokenDelta("hi")))
