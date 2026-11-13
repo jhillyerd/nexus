@@ -1170,7 +1170,8 @@ pub fn bots_allow_inbound_patch_round_trip_test() {
     send_authorized(req(port, Patch, "/bots/b1", "{\"allow_inbound\":true}"))
   should.be_true(string.contains(opened, "\"allow_inbound\":true"))
 
-  // A one-field gate patch is not an empty patch (it lands, not 400s).
+  // A gate-only patch is not an empty patch (no 400): it reaches the
+  // unknown-id path and comes back as the 404.
   should.equal(
     send_authorized(req(port, Patch, "/bots/b404", "{\"allow_inbound\":true}")),
     #(404, "{\"error\":\"unknown bot\"}"),

@@ -3555,25 +3555,28 @@ pub fn settings_inbound_toggle_runtime_round_trip_test() {
       ui.Settings(ui_settings.BotInboundToggled("b1", False)),
     ),
   )
-  should.be_false(wait_for_registry_gate(bots, "b1", False, 20))
+  wait_for_registry_gate(bots, "b1", False, 20)
+  let assert Ok(closed) = bot_registry.get_bot(bots, "b1")
+  should.be_false(closed.allow_inbound)
 
   // The mutation reply reloads the bot list; the re-render shows the
   // blocked badge with the name still escaped.
   wait_for_patch(client, "inbound off", 20)
-  let assert [stored] = bot_registry_list_via_store(bots)
+  let assert [stored] = bot_registry_rows(bots)
   should.equal(stored.name, "<script>alert(3)</script>")
 }
 
 /// Poll the registry until bot `id`'s gate reads `want` (the PATCH
-/// round-trips through the actor asynchronously).
+/// round-trips through the actor asynchronously). Panics on timeout —
+/// the caller asserts the gate off the registry read that follows.
 fn wait_for_registry_gate(
   bots: process.Subject(bot_registry.Msg),
   id: String,
   want: Bool,
   attempts: Int,
-) -> Bool {
+) -> Nil {
   case bot_registry.get_bot(bots, id) {
-    Ok(row) if row.allow_inbound == want -> row.allow_inbound
+    Ok(row) if row.allow_inbound == want -> Nil
     _ ->
       case attempts <= 0 {
         True -> panic as "inbound gate patch never landed"
@@ -3585,11 +3588,8 @@ fn wait_for_registry_gate(
   }
 }
 
-/// The registry's rows (what the mock store now holds after the
-/// write-through).
-fn bot_registry_list_via_store(
-  bots: process.Subject(bot_registry.Msg),
-) -> List(bot.Bot) {
+/// The registry's current rows (its in-state mirror post-write-through).
+fn bot_registry_rows(bots: process.Subject(bot_registry.Msg)) -> List(bot.Bot) {
   let assert Ok(all) = bot_registry.list_bots(bots)
   all
 }
