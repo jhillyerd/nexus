@@ -87,7 +87,7 @@ pub type Msg {
   )
   CountThreadsForProvider(id: String, reply: Subject(Result(Int, String)))
   DeleteProvider(id: String, reply: Subject(Result(Nil, String)))
-  // ---- bot rows (docs/plans/bots.md, Phase 1) ----
+  // ---- bot rows (docs/plans/completed/bots.md, Phase 1) ----
   ListBots(reply: Subject(Result(List(store.StoredBot), String)))
   GetBot(id: String, reply: Subject(Result(store.StoredBot, String)))
   InsertBot(bot: store.StoredBot, reply: Subject(Result(Nil, String)))
@@ -569,7 +569,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       actor.continue(state)
     }
 
-    // ---- bot rows (docs/plans/bots.md, Phase 1) ----
+    // ---- bot rows (docs/plans/completed/bots.md, Phase 1) ----
     ListBots(reply) -> {
       let result =
         sql.list_bots(state.db)

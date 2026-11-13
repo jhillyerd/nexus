@@ -87,7 +87,7 @@ pub type MockMsg {
   )
   CountThreadsForProvider(id: String, reply: Subject(Result(Int, String)))
   DeleteProvider(id: String, reply: Subject(Result(Nil, String)))
-  // ---- bot rows (docs/plans/bots.md, Phase 1) ----
+  // ---- bot rows (docs/plans/completed/bots.md, Phase 1) ----
   ListBots(reply: Subject(Result(List(StoredBot), String)))
   GetBot(id: String, reply: Subject(Result(StoredBot, String)))
   InsertBot(bot: StoredBot, reply: Subject(Result(Nil, String)))
@@ -839,7 +839,7 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
       }
     }
 
-    // ---- bot rows (docs/plans/bots.md, Phase 1) ----
+    // ---- bot rows (docs/plans/completed/bots.md, Phase 1) ----
     ListBots(reply) -> {
       let bots =
         state.bots

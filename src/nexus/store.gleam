@@ -242,7 +242,7 @@ pub type Store {
     /// provider (the FKs are the enforcement). Disabling is the
     /// reversible path.
     delete_provider: fn(String) -> Result(Nil, StoreError),
-    // ---- bot rows (docs/plans/bots.md, Phase 1) ----
+    // ---- bot rows (docs/plans/completed/bots.md, Phase 1) ----
     /// Every stored bot, ordered by id (registry boot load). No
     /// secrets: the row is the public shape.
     list_bots: fn() -> Result(List(StoredBot), StoreError),

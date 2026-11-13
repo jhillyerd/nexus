@@ -1,4 +1,4 @@
-//// Offline bot-registry tests — Phase 1 of docs/plans/bots.md (#74).
+//// Offline bot-registry tests — Phase 1 of docs/plans/completed/bots.md (#74).
 ////
 //// The registry actor against the in-memory store mock: the CRUD
 //// round-trip, the in-state duplicate-name pre-check, unknown-id
