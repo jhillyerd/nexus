@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # Dev server launcher — run from the main checkout or any worktree.
 #
-#   etc/dev-server.sh
+#   etc/dev-server.sh [--reset | -r]
+#
+# --reset (or -r) tears down the dev database first (compose `down -v`, which
+# deletes the named volume), so everything after starts against an empty
+# db: migrate builds the schema, dev_seed re-seeds, and the server boots
+# with no history. Destructive — every thread in the shared singleton is
+# lost, from whichever checkout you run this.
 #
 # The dev database is a compose singleton: docker-compose.yml pins the
 # project name (`nexus`), so `up -d --wait` from any worktree reaches the
@@ -12,6 +18,21 @@
 # vary per checkout. Schema applies via the migrate runner below
 # (idempotent DDL — cheap no-op when the volume is already current).
 set -euo pipefail
+
+reset=0
+for arg in "$@"; do
+  case "$arg" in
+    --reset | -r) reset=1 ;;
+    -h | --help)
+      sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *)
+      echo "dev-server.sh: unknown argument '$arg' (try --help)" >&2
+      exit 2
+      ;;
+  esac
+done
 
 # Root of THIS checkout (the script lives in <root>/etc).
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -26,6 +47,14 @@ source "$main/.env"
 set +a
 
 cd "$root"
+
+if [ "$reset" = 1 ]; then
+  # `down -v` removes the project's containers, network, and named
+  # volumes — with the pinned project name that is exactly the one
+  # `nexus-db-data` volume, from any worktree.
+  echo "dev-server.sh: --reset, destroying the dev database volume"
+  docker compose down -v --remove-orphans
+fi
 
 docker compose up -d --wait
 gleam run -m nexus/store/migrate
