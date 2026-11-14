@@ -6,6 +6,7 @@
 //// thread whose request prefix is byte-identical and grows by suffix
 //// only. No database, no network — plain `gleam test`.
 
+import gleam/dict
 import gleam/erlang/process.{type Pid, type Subject}
 import gleam/list
 import gleam/option.{None, Some}
@@ -51,6 +52,9 @@ fn test_config() -> config.Config {
     codemode: False,
     codemode_timeout_ms: 30_000,
     codemode_max_output_chars: 32_768,
+    plugins: [],
+    plugin_timeout_ms: 30_000,
+    plugin_max_output_chars: 32_768,
     // Bots P3c: the delivery hop guard; 4 = the shipped default.
     max_bot_hops: 4,
   )
@@ -307,6 +311,7 @@ fn boot(seam: store.Store) -> Boot {
       // name at ask time; no bot registry actor needs to exist for tests
       // that never deliver.
       process.new_name("nexus_bot_registry"),
+      dict.new(),
     )
   Boot(
     registry: started.data,
@@ -757,6 +762,7 @@ pub fn boot_fails_when_store_unreachable_test() {
       // name at ask time; no bot registry actor needs to exist for tests
       // that never deliver.
       process.new_name("nexus_bot_registry"),
+      dict.new(),
     )
   case started {
     Ok(_) -> panic as "registry must not start with an unreachable store"

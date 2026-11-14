@@ -41,7 +41,8 @@ import nexus/timing
 
 /// The tool-catalog seam (bots plan P2): a submitted name list → the
 /// normalized list, or a reason string when some name is not in the
-/// compiled-in catalog. Boot wires `tools.by_names(cfg, _)` — validation
+/// catalog. Boot wires `tools.by_names_with(cfg, providers, _)` — the
+/// compiled catalog ∪ the boot-built provider table — validation
 /// against the SAME registry that builds the schemas — so this actor
 /// stays decoupled from the config and the tool modules (the same
 /// injected-fn pattern as the thread registry's `ResolveProvider`).
@@ -121,8 +122,8 @@ type State {
 /// Start the registry actor (boot and tests). Boot semantics: the
 /// initialiser loads the whole table — an unreachable store fails start
 /// (and with the OneForAll root, the whole boot) loudly. `validate_tools`
-/// is the catalog check (boot wires `tools.by_names(cfg, _)`; tests pass
-/// a pure list).
+/// is the catalog check (boot wires `tools.by_names_with(cfg,
+/// providers, _)`; tests pass a pure list).
 pub fn start(
   persistence: Store,
   name: process.Name(Msg),

@@ -3102,6 +3102,7 @@ pub fn meta_updated_refreshes_sidebar_test() {
       // name at ask time — the SAME name this harness started the bot
       // registry under.
       bots_name,
+      dict.new(),
     )
   let registry = started_registry.data
 
@@ -3236,6 +3237,7 @@ pub fn send_moves_previous_day_row_into_today_immediately_test() {
       // name at ask time — the SAME name this harness started the bot
       // registry under.
       bots_name,
+      dict.new(),
     )
   let registry = started_registry.data
 
@@ -3344,6 +3346,7 @@ pub fn connect_with_configured_provider_never_notes_no_provider_test() {
       // name at ask time — the SAME name this harness started the bot
       // registry under.
       bots_name,
+      dict.new(),
     )
   let registry = started_registry.data
 
@@ -3492,6 +3495,7 @@ pub fn thread_switch_drops_left_thread_stream_test() {
       // name at ask time — the SAME name this harness started the bot
       // registry under.
       bots_name,
+      dict.new(),
     )
   let registry = started_registry.data
 
@@ -3584,6 +3588,7 @@ pub fn meta_updated_from_other_thread_refreshes_sidebar_test() {
       // name at ask time — the SAME name this harness started the bot
       // registry under.
       bots_name,
+      dict.new(),
     )
   let registry = started_registry.data
 
@@ -3702,6 +3707,9 @@ fn test_config() -> config.Config {
     codemode: False,
     codemode_timeout_ms: 30_000,
     codemode_max_output_chars: 32_768,
+    plugins: [],
+    plugin_timeout_ms: 30_000,
+    plugin_max_output_chars: 32_768,
     // Bots P3c: the delivery hop guard; 4 = the shipped default.
     max_bot_hops: 4,
   )
@@ -4307,6 +4315,7 @@ fn start_offline_registries(
       // name at ask time — the SAME name this harness started the bot
       // registry under.
       bots_name,
+      dict.new(),
     )
   #(started_registry.data, started_providers.data, started_bots.data)
 }

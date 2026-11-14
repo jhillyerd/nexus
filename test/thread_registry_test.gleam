@@ -2,6 +2,7 @@
 //// injected runners, and the same-ID empty restart when a thread actor
 //// dies. No network, no Bifrost.
 
+import gleam/dict
 import gleam/erlang/process.{type Monitor}
 import gleam/int
 import gleam/list
@@ -16,6 +17,7 @@ import nexus/bot_registry
 import nexus/config
 import nexus/loop
 import nexus/openai
+import nexus/plugin
 import nexus/provider_registry
 import nexus/store
 import nexus/thread
@@ -55,6 +57,9 @@ fn test_config() -> config.Config {
     codemode: False,
     codemode_timeout_ms: 30_000,
     codemode_max_output_chars: 32_768,
+    plugins: [],
+    plugin_timeout_ms: 30_000,
+    plugin_max_output_chars: 32_768,
     // Bots P3c: the delivery hop guard; 4 = the shipped default.
     max_bot_hops: 4,
   )
@@ -1096,6 +1101,7 @@ pub fn create_rejects_disabled_provider_test() {
       persistence,
       disabled,
       process.new_name("nexus_bot_registry"),
+      dict.new(),
     )
   thread_registry.create_with_toolset(
     started.data,
@@ -1167,6 +1173,7 @@ fn start_registry_keeping_seam_with(
       // name at ask time; no bot registry actor needs to exist for tests
       // that never deliver.
       process.new_name("nexus_bot_registry"),
+      dict.new(),
     )
   #(started.data, persistence)
 }
@@ -1271,6 +1278,7 @@ fn boot_with_config(
       // name at ask time; no bot registry actor needs to exist for tests
       // that never deliver.
       process.new_name("nexus_bot_registry"),
+      dict.new(),
     )
   Boot(registry: started.data)
 }
@@ -1437,6 +1445,69 @@ pub fn unknown_toolset_create_refused_test() {
   thread_registry.list_threads(registry) |> should.equal([])
 }
 
+/// Plugin-api Phase 1, at the registry seam: an explicit create naming
+/// a plugin's qualified tool resolves through the boot-built provider
+/// table (a real `plugin.boot` actor — the full stack), persists the
+/// resolved names like any toolset, and a plugin-shaped name the table
+/// does not know refuses with the SAME `UnknownToolset` error as any
+/// other unknown name — one refusal vocabulary, no new semantics.
+pub fn plugin_toolset_create_resolves_through_provider_table_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  store_mock.ensure_fixture_provider(seam)
+  // The production boot path: config-listed plugin → supervised actor →
+  // bounded ListTools → validated table.
+  let assert Ok(providers) =
+    plugin.boot(config.Config(..test_config(), plugins: ["example"]))
+
+  let factory_name = process.new_name("nexus_plugin_factory")
+  let assert Ok(_factory) =
+    factory_supervisor.start(thread_registry.factory_builder_with_child(
+      factory_name,
+      thread_registry.thread_child,
+    ))
+  let assert Ok(started) =
+    thread_registry.start(
+      test_config(),
+      factory_supervisor.get_by_name(factory_name),
+      process.new_name("nexus_plugin_registry"),
+      seam,
+      fixture_resolver(),
+      process.new_name("nexus_bot_registry"),
+      providers,
+    )
+  let registry = started.data
+
+  let assert Ok(summary) =
+    thread_registry.create(
+      registry,
+      thread_registry.NewThread(
+        provider_id: store_mock.fixture_provider_id,
+        model: "alpha",
+        system_prompt: None,
+        toolset: Some(["http_fetch", "example__echo"]),
+        bot_id: None,
+      ),
+    )
+  let assert Ok(stored) = seam.get_thread(summary.id)
+  should.equal(stored.summary.toolset, ["http_fetch", "example__echo"])
+
+  // A plugin-shaped name outside the table: same loud refusal.
+  thread_registry.create(
+    registry,
+    thread_registry.NewThread(
+      provider_id: store_mock.fixture_provider_id,
+      model: "alpha",
+      system_prompt: None,
+      toolset: Some(["nosuch__thing"]),
+      bot_id: None,
+    ),
+  )
+  |> should.equal(
+    Error(thread_registry.UnknownToolset("unknown tool name: nosuch__thing")),
+  )
+}
+
 /// A bot's toolset snapshots into the threads created from it: the
 /// orchestration passes `bot.tools` as the request's toolset (the same
 /// shape `create_thread_from_bot` builds), and the registry persists the
@@ -1541,6 +1612,7 @@ pub fn create_from_bot_orchestration_carries_bot_toolset_test() {
       // name at ask time; no bot registry actor needs to exist for tests
       // that never deliver.
       process.new_name("nexus_bot_registry"),
+      dict.new(),
     )
   let registry = started_registry.data
 
@@ -1696,6 +1768,7 @@ pub fn create_with_toolset_carries_the_whole_bundle_test() {
       // name at ask time; no bot registry actor needs to exist for tests
       // that never deliver.
       process.new_name("nexus_bot_registry"),
+      dict.new(),
     )
   let registry = started.data
   let ping = process.new_subject()
@@ -1775,6 +1848,7 @@ pub fn dormant_summary_carries_bot_provenance_test() {
       // name at ask time; no bot registry actor needs to exist for tests
       // that never deliver.
       process.new_name("nexus_bot_registry"),
+      dict.new(),
     )
 
   let summaries = thread_registry.list_threads(booted.data)
@@ -1801,6 +1875,7 @@ pub fn dormant_summary_carries_bot_provenance_test() {
       // name at ask time; no bot registry actor needs to exist for tests
       // that never deliver.
       process.new_name("nexus_bot_registry"),
+      dict.new(),
     )
   let after = thread_registry.list_threads(rebooted.data)
   let assert Ok(after_found) = list.find(after, fn(s) { s.id == "s9" })

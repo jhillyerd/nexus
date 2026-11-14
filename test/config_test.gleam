@@ -28,6 +28,9 @@ fn set_all(pairs: List(#(String, String))) -> Nil {
   envoy.unset("NEXUS_CODEMODE")
   envoy.unset("NEXUS_CODEMODE_TIMEOUT_MS")
   envoy.unset("NEXUS_CODEMODE_MAX_OUTPUT_CHARS")
+  envoy.unset("NEXUS_PLUGINS")
+  envoy.unset("NEXUS_PLUGIN_TIMEOUT_MS")
+  envoy.unset("NEXUS_PLUGIN_MAX_OUTPUT_CHARS")
   list.each(pairs, fn(pair) { envoy.set(pair.0, pair.1) })
 }
 
@@ -172,6 +175,55 @@ pub fn load_codemode_defaults_test() {
   cfg.codemode |> should.equal(False)
   cfg.codemode_timeout_ms |> should.equal(30_000)
   cfg.codemode_max_output_chars |> should.equal(32_768)
+}
+
+/// Plugin-api Phase 1: no plugins by default (the boot is the
+/// pre-plugin boot, byte for byte), with the timeout/cap defaults.
+pub fn load_plugin_defaults_test() {
+  set_all([#("NEXUS_ENCRYPTION_KEY", key_b64)])
+  let assert Ok(cfg) = config.load()
+  cfg.plugins |> should.equal([])
+  cfg.plugin_timeout_ms |> should.equal(30_000)
+  cfg.plugin_max_output_chars |> should.equal(32_768)
+}
+
+/// Comma-separated with tolerant trimming and empty-segment dropping:
+/// `NEXUS_PLUGINS="a, b,,"` means ["a", "b"]. (Unknown names are NOT
+/// a load error — they fail boot loudly in `plugin.boot`, which owns
+/// the compiled-in registry.)
+pub fn load_plugin_list_parses_test() {
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_PLUGINS", " example , b ,, "),
+    #("NEXUS_PLUGIN_TIMEOUT_MS", "1234"),
+    #("NEXUS_PLUGIN_MAX_OUTPUT_CHARS", "512"),
+  ])
+  let assert Ok(cfg) = config.load()
+  cfg.plugins |> should.equal(["example", "b"])
+  cfg.plugin_timeout_ms |> should.equal(1234)
+  cfg.plugin_max_output_chars |> should.equal(512)
+}
+
+/// A sub-100ms adapter deadline could never serve a call — fail the
+/// load, like the codemode timeout floor.
+pub fn load_rejects_low_plugin_timeout_test() {
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_PLUGIN_TIMEOUT_MS", "99"),
+  ])
+  let assert Error(message) = config.load()
+  message
+  |> should.equal(
+    "environment variable NEXUS_PLUGIN_TIMEOUT_MS must be >= 100: 99",
+  )
+}
+
+pub fn load_rejects_negative_plugin_output_cap_test() {
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_PLUGIN_MAX_OUTPUT_CHARS", "-1"),
+  ])
+  let assert Error(_) = config.load()
 }
 
 pub fn load_codemode_overrides_test() {

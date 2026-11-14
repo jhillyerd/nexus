@@ -20,6 +20,7 @@
 //// counts) confirm the hits happen end-to-end.
 
 import gleam/bit_array
+import gleam/dict
 import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/http/request
@@ -392,6 +393,7 @@ fn start_registry() -> process.Subject(thread_registry.Msg) {
       // name at ask time; no bot registry actor needs to exist for tests
       // that never deliver.
       process.new_name("nexus_bot_registry"),
+      dict.new(),
     )
   started.data
 }

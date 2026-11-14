@@ -68,7 +68,9 @@ a live registry.
 
 ```mermaid
 flowchart TB
+    PSUP["plugin_sup (OneForOne, linked to boot)<br/>nexus/plugin — only when NEXUS_PLUGINS is set"]
     ROOT["root supervisor (OneForAll)<br/>nexus/boot"]
+    PSUP -.->|"bounded ListTools snapshot →<br/>the provider table both consumers share"| ROOT
     ROOT -->|"1 — persistence is mandatory;<br/>unreachable DB fails boot"| STORE["store actor<br/>nexus/store/persist"]
     ROOT -->|"2 — loads + decrypt-validates<br/>every provider row"| PROV["provider registry<br/>nexus/provider_registry"]
     ROOT -->|"3 — loads every bot row"| BOT["bot registry<br/>nexus/bot_registry"]
@@ -78,6 +80,17 @@ flowchart TB
     FACT -.->|"starts on demand"| SA["thread actors<br/>nexus/thread"]
     REG -.->|"monitors; restarts a dead<br/>actor via the factory,<br/>rehydrating from the store"| SA
 ```
+
+Beside the root sits one separate tree, started before it (plugin-api
+plan Phase 1): `plugin_sup`, a OneForOne supervisor over the configured
+tool-provider actors, linked to boot — a crash-looping plugin exhausts
+its tolerance and takes boot down (fail loudly), while a single crashing
+plugin restarts alone instead of restarting every thread actor. It is
+separate because the boot-built provider table (each provider's bounded
+`ListTools` snapshot) must be one VALUE shared by the bot registry's
+toolset validation and the thread registry's resolution — root-tree
+children cannot hand values to each other. With `NEXUS_PLUGINS` unset
+no tree is started and the boot is the pre-plugin boot, byte for byte.
 
 Crash policy: the tree is deliberately aggressive. A crash loop at the root
 halts the VM and the *outer* supervisor (Nomad job / run script) restarts it

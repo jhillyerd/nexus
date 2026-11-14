@@ -11,8 +11,17 @@
 //// `default_names` picks the config-gated default set, `by_names`
 //// resolves ANY set of compiled-in names — per-toolset, with no config
 //// gating — so a thread can carry a toolset snapshot other than the
-//// default one.
+//// default one. The plugin-api plan (Phase 1) widens the catalog to
+//// compiled ∪ providers: `by_names_with` also resolves the boot-built
+//// provider table (`ProviderTable`, built by `nexus/plugin` from each
+//// provider actor's `ListTools`), so a plugin's qualified tools
+//// (`<provider>__<tool>`) behave exactly like compiled names —
+//// resolvable offline, snapshot-pinnable, loudly refused when stale —
+//// while never entering the DEFAULT set (config gates a provider's
+//// availability, never default membership; the default envelope
+//// cannot change under config drift).
 
+import gleam/dict.{type Dict}
 import gleam/dynamic/decode
 import gleam/erlang/process.{type Subject}
 import gleam/json
@@ -52,6 +61,29 @@ pub type ToolSpec {
   )
 }
 
+/// The boot-built provider half of the catalog (plugin-api plan):
+/// qualified wire name (`<provider>__<tool>`) → spec, with the
+/// executor addressing its provider actor BY NAME. Built once at boot
+/// from each provider's `ListTools` and handed to the surfaces that
+/// resolve names (`thread_registry`, the bot registry's validation
+/// closure) — the same resolution path as compiled names, so plugin
+/// tools are snapshot-pinnable by bots and refuse loudly when stale.
+/// An empty table is exactly the pre-plugin catalog.
+pub type ProviderTable =
+  Dict(String, ToolSpec)
+
+/// The complete compiled-in tool name set. Plugin-api plan: `__` is
+/// the reserved provider separator, so a compiled name containing it
+/// would admit a colliding qualified name — `is_compiled_name` is the
+/// registration-time guard's lookup, and every future compiled tool
+/// must keep its name `__`-free.
+pub fn is_compiled_name(name: String) -> Bool {
+  case name {
+    "http_fetch" | "web_search" | "bot_message" | "codemode" -> True
+    _ -> False
+  }
+}
+
 /// The default M3 toolset's NAMES, derived from the global config — the
 /// selection half of the `default(cfg)` split (bots plan P2 prep, #76).
 /// `web_search` is selected only when a SearxNG base URL is configured;
@@ -81,6 +113,22 @@ pub fn by_names(
   cfg: Config,
   names: List(String),
 ) -> Result(List(ToolSpec), String) {
+  by_names_with(cfg, dict.new(), names)
+}
+
+/// The full catalog resolution (plugin-api plan Phase 1): compiled ∪
+/// providers. A name is looked up in the compiled set first, then in
+/// the boot-built provider table — disjoint by construction (qualified
+/// names contain `__`, compiled names never do), so the order is
+/// cosmetic. Everything else is `by_names`'s contract unchanged:
+/// unique names in list order, an unknown name fails loudly, codemode
+/// registers LAST over the full sibling list — provider tools included,
+/// so a script can call them like any sibling.
+pub fn by_names_with(
+  cfg: Config,
+  providers: ProviderTable,
+  names: List(String),
+) -> Result(List(ToolSpec), String) {
   // A toolset is a set: duplicates would send one schema twice and make
   // the name tuple → envelope mapping order-dependent.
   let names = list.unique(names)
@@ -92,7 +140,11 @@ pub fn by_names(
         "bot_message" -> Ok([bot_message_spec()])
         // Codemode is built last below, over the full sibling list.
         "codemode" -> Ok([])
-        other -> Error(other)
+        other ->
+          case dict.get(providers, other) {
+            Ok(spec) -> Ok([spec])
+            Error(Nil) -> Error(other)
+          }
       }
     })
   case built {

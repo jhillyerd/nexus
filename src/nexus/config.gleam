@@ -6,6 +6,7 @@
 
 import envoy
 import gleam/int
+import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
@@ -98,6 +99,19 @@ pub type Config {
     /// omission noted; item/console separators are budgeted with their
     /// segments — issue #53).
     codemode_max_output_chars: Int,
+    /// Plugins (plugin-api plan Phase 1): compiled-in plugin names to
+    /// start as tool providers (`NEXUS_PLUGINS`, comma-separated).
+    /// Empty — the default — starts no provider and keeps the boot
+    /// byte-identical to the pre-plugin world. Gates availability
+    /// only, never default membership.
+    plugins: List(String),
+    /// Plugins: per-call wall-clock deadline in ms (the adapter's
+    /// timeout), the config default a provider may override.
+    plugin_timeout_ms: Int,
+    /// Plugins: the adapter's central output cap in characters for
+    /// provider results and error messages (display hygiene enforced
+    /// at the boundary, never delegated to untrusted sources).
+    plugin_max_output_chars: Int,
   )
 }
 
@@ -198,6 +212,25 @@ pub fn from_env(
     32_768,
     min: 0,
   ))
+  // ---- Plugins (plugin-api plan Phase 1). `NEXUS_PLUGINS` gates a
+  // provider's AVAILABILITY, never default membership: plugin tools
+  // enter a thread only via a bot template or an explicit create
+  // toolset, so the default envelope cannot change under config drift.
+  // Unknown names here fail boot loudly in `plugin.boot` (the
+  // compiled-in registry), not silently at first use.
+  let plugins = optional_string_list(get, "NEXUS_PLUGINS")
+  use plugin_timeout_ms <- result.try(optional_min_int(
+    get,
+    "NEXUS_PLUGIN_TIMEOUT_MS",
+    30_000,
+    min: 100,
+  ))
+  use plugin_max_output_chars <- result.try(optional_min_int(
+    get,
+    "NEXUS_PLUGIN_MAX_OUTPUT_CHARS",
+    32_768,
+    min: 0,
+  ))
   // The ASCII note rides the DEFAULT prompt only, and only while
   // codemode is enabled: an explicitly set NEXUS_SYSTEM_PROMPT is the
   // operator's own text and is never amended (enable codemode with a
@@ -237,6 +270,9 @@ pub fn from_env(
     codemode: codemode,
     codemode_timeout_ms: codemode_timeout_ms,
     codemode_max_output_chars: codemode_max_output_chars,
+    plugins: plugins,
+    plugin_timeout_ms: plugin_timeout_ms,
+    plugin_max_output_chars: plugin_max_output_chars,
   ))
 }
 
@@ -269,6 +305,26 @@ fn optional_string(
         value -> Some(value)
       }
     Error(_) -> None
+  }
+}
+
+fn optional_string_list(
+  get: fn(String) -> Result(String, Nil),
+  name: String,
+) -> List(String) {
+  // Comma-separated with tolerant trimming and empty-segment
+  // dropping, so `NEXUS_PLUGINS="a, b,,"` means ["a", "b"].
+  case optional_string(get, name) {
+    None -> []
+    Some(raw) ->
+      raw
+      |> string.split(",")
+      |> list.filter_map(fn(piece) {
+        case string.trim(piece) {
+          "" -> Error(Nil)
+          name -> Ok(name)
+        }
+      })
   }
 }
 

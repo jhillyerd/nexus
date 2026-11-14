@@ -324,20 +324,55 @@ consume. The plans land independently either way.
 
 ## Phases
 
-### Phase 1 — provider protocol + in-process plugins (offline-provable)
+### Phase 1 — provider protocol + in-process plugins (offline-provable) — IMPLEMENTED
 
-1. `src/nexus/provider.gleam` (protocol types), `src/nexus/plugin.gleam`
+As built (see the deltas below the list):
+
+1. `src/nexus/tool_provider.gleam` (protocol types), `src/nexus/plugin.gleam`
    (tier-1 SDK), the adapter executor with its select loop, and the
-   boot catalog generalization (compiled ∪ providers; `plugin_sup`
-   ordering; loud registration-time collision/refusal).
-2. One in-repo example plugin (compiled, config-listed) as the
-   reference implementation and test vehicle.
-3. Tests through subject-based seams, network-free: a fake provider
-   (`gated_runner`-style where gating is needed) pinning —
-   cancel-delivery + re-signal, timeout, provider-DOWN, late-reply
-   no-op, truncation at the adapter, exactly-one-reply under a crashing
-   SDK worker, catalog loudness, and `m3_prefix_test` untouched (default
-   envelope unchanged).
+   boot catalog generalization (compiled ∪ providers; loud
+   registration-time collision/refusal).
+2. One in-repo example plugin (`src/nexus/plugins/example.gleam`,
+   compiled, config-listed) as the reference implementation and test
+   vehicle.
+3. Tests through subject-based seams, network-free (`test/tool_provider_test.gleam`,
+   `test/plugin_test.gleam`, registry/config additions): a fake provider
+   (`gated_runner`-style where gating is needed) pinning — cancel-delivery
+   + re-signal, timeout, provider-DOWN, late-reply no-op, truncation at
+   the adapter, exactly-one-reply under a crashing SDK worker, catalog
+   loudness, and `m3_prefix_test` untouched (default envelope unchanged).
+
+**As-built deltas** (Phase 1 met code the design predates, plus two
+mechanics discovered mid-build):
+
+- The protocol module is `tool_provider.gleam`, not `provider.gleam` —
+  that path has been the LLM-provider domain since the multi-provider
+  rollout (Oct 2026). The `Plugin` DECLARATION type lives in
+  `tool_provider` too, so `nexus/plugins/*` import only the leaf (the
+  codemode↔tools cycle rule); the SDK actor and boot live in `plugin.gleam`.
+- `plugin_sup` is a separate OneForOne tree linked to boot main, not a
+  child of the OneForAll root: the boot-built provider table must be one
+  value shared by `bot_registry`'s ValidateTools closure and
+  `thread_registry`'s resolution, and root-tree children cannot hand
+  values to each other. A crash-looping plugin still fails loud — the
+  linked tree dying takes boot down, the same mechanism the root relies on.
+- `process.new_name` suffixes a unique counter per call, so a provider's
+  `Name` is minted ONCE and the VALUE threaded (supervisor child, snapshot
+  ask, and the spec executor all close over the same value — never
+  re-derived). The SDK actor registers that name itself in its
+  initialiser (`process.register`), so a supervisor restart re-registers
+  the fresh pid; its own message type is a superset (`SdkMsg`) fed by a
+  custom selector over the named subject, a private subject, and monitor
+  downs.
+- Sending to an UNREGISTERED named subject panics at the send — both
+  `run` and the boot-time `list_tools` resolve liveness (`process.named`)
+  BEFORE building the subject (pinned by a test).
+- Config knobs: `NEXUS_PLUGINS` (default empty — the pre-plugin boot,
+  byte for byte), `NEXUS_PLUGIN_TIMEOUT_MS` (default 30 000, floor 100),
+  `NEXUS_PLUGIN_MAX_OUTPUT_CHARS` (default 32 768). The catalog merge is
+  `tools.by_names_with(cfg, table, names)`; `by_names` is the empty-table
+  case; the bot registry's validation closure resolves through the table
+  too, so bot templates can pin plugin tools.
 
 ### Phase 2 — MCP config adapter + frozen snapshots
 
