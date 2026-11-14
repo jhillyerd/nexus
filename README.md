@@ -17,6 +17,15 @@ titles and tags ride one prefix-cache "utility branch" — designed in
 `docs/plans/completed/utility-titles.md`, with the tags pass landed per
 `docs/plans/completed/utility-tags.md`.
 
+## Mission
+
+Some of my goals for this project:
+
+- Be a good personal assistant first, coding agent second
+- Strong support for small local LLMs, maximizing use of their prefix-cache
+- NixOS friendly, for both hosting and coding
+- Take advantage of the BEAM's actor model and OTP supervision trees
+
 ## Development
 
 ```sh
