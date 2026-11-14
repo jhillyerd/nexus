@@ -2079,13 +2079,17 @@ fn create_dm(
 /// rides CONTENT only — one append-only user turn whose bytes carry the
 /// `From <bot> (thread <id>):` prefix (the sender's CURRENT display name,
 /// resolved ask-at-send; the sender's thread id, so the target can reply
-/// by addressing it precisely). Bot targets get an explicit reply
-/// instruction appended: the prefix alone carries the address but not
-/// the PROTOCOL, and a target that answers in plain text strands the
-/// reply in its own thread — the sender is never notified (observed in
-/// the field as one-way bot-to-bot messaging). Human threads addressed
-/// by id keep the bare prefix. UI attribution rides the display-only
-/// origin sidecar (`Send`'s author/depth, marked by the target actor).
+/// by addressing it precisely). Bot targets whose frozen toolset
+/// actually carries `bot_message` get an explicit reply instruction
+/// appended: the prefix alone carries the address but not the PROTOCOL,
+/// and a target that answers in plain text strands the reply in its own
+/// thread — the sender is never notified (observed in the field as
+/// one-way bot-to-bot messaging). The tool check matters: an explicit
+/// bot toolset or a pre-P3c persisted snapshot can omit `bot_message`,
+/// and the hint must never name a tool the target cannot call. Human
+/// threads addressed by id keep the bare prefix. UI attribution rides
+/// the display-only origin sidecar (`Send`'s author/depth, marked by
+/// the target actor).
 fn deliver_to_thread(
   state: State,
   request: delivery.Request,
@@ -2113,14 +2117,17 @@ fn deliver_to_thread(
                 <> request.from_thread_id
                 <> "): "
                 <> request.text
-              let text = case record.meta.bot_id {
-                Some(_) ->
+              let text = case
+                record.meta.bot_id,
+                list.contains(record.spec.toolset.names, "bot_message")
+              {
+                Some(_), True ->
                   prefix
                   <> "\n\n(reply via the bot_message tool with to \""
                   <> request.from_thread_id
                   <> "\" — a plain reply stays in this thread and never"
                   <> " reaches the sender)"
-                None -> prefix
+                _, _ -> prefix
               }
               // The ONE turn-machine path (`thread.Send`, bots P3b): no
               // parallel Deliver variant. The target replies immediately
