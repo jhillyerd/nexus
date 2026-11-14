@@ -154,15 +154,29 @@ committed; nothing new rolls back.
 - Per-thread directory under a configurable root
   (`workspace_root: Option(String)`; `None` disables env toolset
   selection at creation — the SearxNG-gating pattern). Path derives from
-  the thread id; lazy creation on first env tool call; retention policy
+  the thread id, and the RESOLVED root is frozen per thread at creation
+  (persisted on the thread — the frozen-endpoint pattern), so a later
+  `workspace_root` change affects new threads only and can never hide
+  an existing thread's files or re-aim its commands at another
+  directory; lazy creation on first env tool call; retention policy
   deferred (thread deletion exists today — a hard `DELETE /threads/:id`
   cascading `thread_message`, with no workspace-cleanup hook — so without
   a retention/cleanup decision, deleted threads would leave orphaned
   workspace dirs).
-- **Sandbox floor** (cheap, v1): cwd confinement to the workspace dir,
-  per-call wall-clock timeout, kill-tree on cancel (the codemode
-  cancel-subject pattern is the template). Container-per-workspace is the
-  documented escalation — and the **external container workspace** (a
+- **v1 floor — hygiene, NOT a security boundary.** cwd default +
+  per-call wall-clock timeout + kill-tree on cancel (the codemode
+  cancel-subject pattern is the template) + hard byte caps enforced
+  WHILE READING (port output and file reads capped at accumulation —
+  `http_fetch`'s max-bytes pattern; post-hoc truncation does not bound
+  memory) + canonical-path confinement for the fs tools
+  (`read_file`/`write_file`/`list_dir` resolve against the workspace
+  root and refuse escapes). This contains accidents and bounded output,
+  not a hostile model: a `bash` command can still reach the host (`cd
+  /`, absolute paths, symlinks — cwd confines nothing by itself), so
+  until the escalation lands, prompt-injection → host access under the
+  nexus user is an accepted, recorded risk of the Pi model on the
+  operator's own server. The escalation is container-per-workspace —
+  and the **external container workspace** (a
   container that connects in at startup and speaks the node protocol as
   target `workspace`) is the *same protocol participant* as a remote
   node, so the escalation changes deployment, not protocol. Mechanism
@@ -215,6 +229,13 @@ not a Postgres keyword; FK/index naming per AGENTS.md):
 - `node.id` (pk), `node.name` (unique, `node_name` index), `node.token_hash`
   (node tokens are distinct from the single UI token — scoped, revocable),
   `node.created_at`, `node.last_seen_at` (`node_recency`).
+- **Token authority is instance-wide by design (v1)**: nexus is
+  single-user today (one UI token guards the whole web surface), so a
+  node token grants exactly what a UI connection grants — join any
+  thread as viewer, join env-toolset threads as environment, Send —
+  scoped to node operations and revocable per node. Per-thread grants
+  and owner binding become REQUIRED the day multi-user accounts exist;
+  the join-authorization check is the seam they will extend.
 - Pairing UX deferred to P2 detail work (settings surface entry and/or a
   printed `nexus-node pair` bootstrap); the table lands first so tokens
   are verifiable statelessly per connection.
@@ -239,14 +260,17 @@ external server being online.
    compiled catalog, each with `target`; `workspace_root` config;
    `default_names` unchanged (env tools opt-in via bot template or create
    flag — `thread_create` carries it, `UnknownToolset` semantics reused).
-2. Workspace environment actor (cwd-confined port exec, timeout,
-   kill-on-cancel); `ToolCtx` environment handle; roster state in the
-   thread actor (`workspace` always present on env threads).
+2. Workspace environment actor (port exec with cwd default, timeout,
+   kill-on-cancel, byte caps at read, canonical-path fs tools); the
+   per-thread frozen workspace root; `ToolCtx` environment handle;
+   roster state in the thread actor (`workspace` always present on env
+   threads).
 3. Roster messages: system-authored user rows (author sidecar extension),
    UI status-line rendering, replay path.
 4. Tests: offline executor tests through the mockable seam (fake
    environment subject — the `gated_runner` protocol where needed);
-   `tools_test` additions (catalog gating, unknown-name loudness);
+   `tools_test` additions (catalog gating, unknown-name loudness,
+   byte-cap and path-escape refusals pinned);
    `ui_test` pins for status lines + hostile-text payloads in node
    metadata/errors; `m3_prefix_test` golden untouched (default envelope
    unchanged); `thread_test` roster ordering (attach queued behind a
@@ -306,7 +330,10 @@ external server being online.
 - **Hostile text**: everything a node reports (metadata, command output,
   errors) renders as Lustre text nodes — truncated, inert previews only;
   node bytes are external provider content, so the plugin-api adapter's
-  transport-read byte caps apply, not just post-hoc truncation.
+  transport-read byte caps apply, not just post-hoc truncation — and
+  the in-process workspace gets the same treatment (port output and
+  file reads capped at accumulation, never truncated only after
+  receipt).
 - **UI display-state mirror**: tool errors commit as failed results; no
   new rollback shape; roster messages replay like any user row.
 - **Schema conventions**: singular `node`; unquoted-safe names;
