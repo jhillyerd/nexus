@@ -76,7 +76,9 @@ fn base_config() -> config.Config {
 
 pub fn completes_with_output_items_test() {
   let assert Ok(result) =
-    run_code("local r = tools.echo({code = 'hi'})\ntext(r)\nreturn 'done'")
+    run_code(
+      "local r = await(tools.echo({code = 'hi'}))\ntext(r)\nreturn 'done'",
+    )
   should.be_true(string.contains(result, "Script completed ("))
   should.be_true(string.contains(result, " ms)"))
   // The args table round-tripped to sorted JSON and back as content.
@@ -132,9 +134,11 @@ pub fn print_overridden_to_console_block_test() {
   ))
 }
 
+/// A tool error surfaces at the await site as a script error carrying
+/// the tool's text — the JS unhandled-rejection shape.
 pub fn tool_error_aborts_script_with_reason_test() {
   let assert Error(result) =
-    run_code("text('before')\ntools.boom({})\ntext('after')")
+    run_code("text('before')\nawait(tools.boom({}))\ntext('after')")
   should.be_true(string.contains(result, "Script failed ("))
   should.be_true(string.contains(result, "before"))
   should.be_false(string.contains(result, "after"))
@@ -200,7 +204,7 @@ pub fn mid_script_cancellation_test() {
       max_output_chars: default_cap,
       cancel: cancel,
       arguments: code_argument(
-        "text('partial')\ntools.cancel_now({})\nwhile true do end",
+        "text('partial')\nawait(tools.cancel_now({}))\nwhile true do end",
       ),
     )
   should.be_true(string.contains(result, "Script failed ("))
@@ -209,8 +213,9 @@ pub fn mid_script_cancellation_test() {
 }
 
 /// The seam's raison d'être: a Stop that lands while the engine is
-/// BLOCKED inside a slow host tool call (previously unreachable — the
-/// cancel subject only fed the streaming seam) must still kill the run.
+/// BLOCKED inside await on a slow task child (previously unreachable —
+/// the cancel subject only fed the streaming seam) must still kill the
+/// run.
 pub fn cancel_during_slow_host_call_test() {
   let cancel = process.new_subject()
   let hosts = [
@@ -227,11 +232,11 @@ pub fn cancel_during_slow_host_call_test() {
       max_output_chars: default_cap,
       cancel: cancel,
       arguments: code_argument(
-        "text('partial')\nlocal r = tools.slow({})\ntext(r)",
+        "text('partial')\nlocal r = await(tools.slow({}))\ntext(r)",
       ),
     )
-  // The engine died mid-call (never reached the second text), and the
-  // run reports cancellation — not the 5 s deadline nor success.
+  // The engine died blocked in await (never reached the second text),
+  // and the run reports cancellation — not the 5 s deadline nor success.
   should.be_true(string.contains(result, "Script failed ("))
   should.be_true(string.contains(result, "Script error: cancelled"))
   should.be_true(string.contains(result, "partial"))
@@ -239,9 +244,11 @@ pub fn cancel_during_slow_host_call_test() {
 }
 
 // ---------------------------------------------------------------------------
-// Tool-call budget
+// Tool-call budget — drawn at START (tools.<name>), awaited or not
 // ---------------------------------------------------------------------------
 
+/// Unawaited calls still cost: the 26th start trips the budget even
+/// though nothing was ever awaited.
 pub fn tool_call_budget_exceeded_test() {
   let assert Error(result) =
     run_code(
@@ -615,7 +622,7 @@ pub fn stop_during_script_stops_the_turn_test() {
           0,
           Some("c1"),
           Some("codemode"),
-          code_argument("tools.cancel_now({})"),
+          code_argument("await(tools.cancel_now({}))"),
         ))
         openai.Completed(stats)
       }
@@ -690,10 +697,12 @@ pub fn empty_segments_are_not_retained_test() {
   should.equal(list.drop(parts, 1), ["ok"])
 }
 
-/// A sibling host that CRASHES (rather than returning an error) takes
-/// the engine process down with it; the worker survives and reports a
-/// crash — not out of memory.
-pub fn engine_crash_reported_as_crash_test() {
+/// A sibling host that CRASHES (rather than returning an error) is a
+/// settled error value on every path now — the old sync path took the
+/// engine down with it; the task child's safe_call turns the crash into
+/// the tool's error text, and await re-raises it as an ordinary script
+/// error. No engine death, no out-of-memory misdiagnosis.
+pub fn host_crash_is_an_error_not_engine_death_test() {
   let hosts = [
     codemode.HostTool(name: "explode", call: fn(_) { panic as "host crash" }),
   ]
@@ -703,10 +712,11 @@ pub fn engine_crash_reported_as_crash_test() {
       timeout_ms: default_timeout_ms,
       max_output_chars: default_cap,
       cancel: process.new_subject(),
-      arguments: code_argument("tools.explode({})"),
+      arguments: code_argument("await(tools.explode({}))"),
     )
   should.be_true(string.contains(result, "Script failed ("))
-  should.be_true(string.contains(result, "engine crashed"))
+  should.be_true(string.contains(result, "host crashed"))
+  should.be_false(string.contains(result, "engine crashed"))
   should.be_false(string.contains(result, "out of memory"))
 }
 
@@ -838,12 +848,12 @@ pub fn event_spam_script_dies_at_deadline_test() {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 2: tools.call_all — parallel batch (allSettled)
+// Handles: await / all_settled (JS-style async)
 // ---------------------------------------------------------------------------
 
-/// Monitor a pid and assert it reports DOWN within 1 s — proves batch
-/// children never outlive the engine (killed as stragglers on the happy
-/// path, reaped through the link on every death path).
+/// Monitor a pid and assert it reports DOWN within 1 s — proves task
+/// children never outlive the engine (killed as stragglers at engine
+/// exit, reaped through the link on every death path).
 fn assert_down(pid: process.Pid) -> Nil {
   let monitor = process.monitor(pid)
   let selector =
@@ -854,14 +864,25 @@ fn assert_down(pid: process.Pid) -> Nil {
   Nil
 }
 
-/// One array, input order — not completion order.
-pub fn call_all_returns_results_in_input_order_test() {
+/// The pcall mechanics all_settled is built on, pinned directly: a tool
+/// error raised by await is an ordinary catchable Lua error (pcall
+/// returns false plus the tool's text), not a VM-level abort.
+pub fn tool_errors_are_catchable_with_pcall_test() {
   let assert Ok(result) =
     run_code(
-      "local rs = tools.call_all({"
-      <> "{name = 'echo', args = {i = 3}},"
-      <> "{name = 'echo', args = {i = 1}},"
-      <> "{name = 'echo', args = {i = 2}}})"
+      "local ok, e = pcall(await, tools.boom({}))"
+      <> "\nreturn tostring(ok) .. ':' .. e",
+    )
+  let parts = string.split(result, "\n\n")
+  should.equal(list.drop(parts, 1), ["false:boom tool failed"])
+}
+
+/// One array, input order — not completion order.
+pub fn all_settled_returns_results_in_input_order_test() {
+  let assert Ok(result) =
+    run_code(
+      "local rs = all_settled({tools.echo({i = 3}), tools.echo({i = 1}),"
+      <> " tools.echo({i = 2})})"
       <> "\nreturn rs[1].result .. '|' .. rs[2].result .. '|' .. rs[3].result",
     )
   let parts = string.split(result, "\n\n")
@@ -872,10 +893,10 @@ pub fn call_all_returns_results_in_input_order_test() {
 
 /// Each entry carries its own ok flag and payload; a failing entry's
 /// error text rides the value.
-pub fn call_all_entries_carry_ok_flags_test() {
+pub fn all_settled_entries_carry_ok_flags_test() {
   let assert Ok(result) =
     run_code(
-      "local rs = tools.call_all({{name = 'boom'}, {name = 'echo', args = {}}})"
+      "local rs = all_settled({tools.boom({}), tools.echo({})})"
       <> "\nreturn tostring(rs[1].ok) .. tostring(rs[2].ok) .. rs[2].result"
       <> " .. '|' .. rs[1].error",
     )
@@ -883,14 +904,14 @@ pub fn call_all_entries_carry_ok_flags_test() {
   should.equal(list.drop(parts, 1), ["falsetrueecho:{}|boom tool failed"])
 }
 
-/// A CRASHING entry is an error value, not an engine death (contrast
-/// engine_crash_reported_as_crash_test, the sync path) — one failure
-/// never aborts the batch.
-pub fn call_all_crashing_entry_is_an_error_value_test() {
+/// A CRASHING tool is an error value like any other failure — the task
+/// child's safe_call isolates every path now (contrast
+/// host_crash_is_an_error_not_engine_death_test for the awaited form).
+pub fn all_settled_crashing_entry_is_an_error_value_test() {
   let hosts = [
     echo_host(),
     codemode.HostTool(name: "explode", call: fn(_) {
-      panic as "batch child crash"
+      panic as "task child crash"
     }),
   ]
   let assert Ok(result) =
@@ -900,7 +921,7 @@ pub fn call_all_crashing_entry_is_an_error_value_test() {
       default_cap,
       process.new_subject(),
       code_argument(
-        "local rs = tools.call_all({{name = 'explode'}, {name = 'echo'}})"
+        "local rs = all_settled({tools.explode({}), tools.echo({})})"
         <> "\ntext(tostring(rs[1].ok))"
         <> "\nreturn rs[2].result .. ' / ' .. rs[1].error",
       ),
@@ -912,8 +933,10 @@ pub fn call_all_crashing_entry_is_an_error_value_test() {
 }
 
 /// Three 400 ms calls finish in ~1x the single-call wall time, not 3x:
-/// the entries genuinely overlap. Generous margin for CI scheduling.
-pub fn call_all_overlaps_wall_time_test() {
+/// the eager starts genuinely overlap, and all_settled's sequential
+/// awaits only fold already-running tasks. Generous margin for CI
+/// scheduling.
+pub fn all_settled_overlaps_wall_time_test() {
   let hosts = [
     codemode.HostTool(name: "slow", call: fn(_) {
       process.sleep(400)
@@ -928,8 +951,8 @@ pub fn call_all_overlaps_wall_time_test() {
       default_cap,
       process.new_subject(),
       code_argument(
-        "local rs = tools.call_all({"
-        <> "{name = 'slow'}, {name = 'slow'}, {name = 'slow'}})"
+        "local rs = all_settled({tools.slow({}), tools.slow({}),"
+        <> " tools.slow({})})"
         <> "\nreturn #rs",
       ),
     )
@@ -938,11 +961,39 @@ pub fn call_all_overlaps_wall_time_test() {
   should.be_true(wall_ms < 900)
 }
 
-/// The batch's internal deadline (script deadline less the wrap-up
-/// margin) expires while the slow entry is in flight: call_all returns
-/// the partial list, the script folds and finishes BEFORE the worker's
-/// wall-clock kill — the run completes carrying the fold.
-pub fn call_all_deadline_returns_partial_list_test() {
+/// The Promise.all shape in userland: plain awaits over eager starts
+/// overlap too — no combinator needed, the calls were already running.
+pub fn eager_starts_overlap_under_plain_awaits_test() {
+  let hosts = [
+    codemode.HostTool(name: "slow", call: fn(_) {
+      process.sleep(400)
+      Ok("s")
+    }),
+  ]
+  let started_us = timing.now_us()
+  let assert Ok(_result) =
+    codemode.run(
+      hosts,
+      default_timeout_ms,
+      default_cap,
+      process.new_subject(),
+      code_argument(
+        "local a = tools.slow({})"
+        <> "\nlocal b = tools.slow({})"
+        <> "\nlocal x = await(a)"
+        <> "\nlocal y = await(b)"
+        <> "\nreturn x .. y",
+      ),
+    )
+  let wall_ms = { timing.now_us() - started_us } / 1000
+  should.be_true(wall_ms < 900)
+}
+
+/// The task deadline (script deadline less the wrap-up margin) expires
+/// while the slow task is in flight: await settles it as an error
+/// value, the script folds and finishes BEFORE the worker's wall-clock
+/// kill — the run completes carrying the fold.
+pub fn all_settled_deadline_returns_partial_list_test() {
   let pids = process.new_subject()
   let hosts = [
     echo_host(),
@@ -960,7 +1011,7 @@ pub fn call_all_deadline_returns_partial_list_test() {
       process.new_subject(),
       code_argument(
         "text('partial')"
-        <> "\nlocal rs = tools.call_all({{name = 'echo'}, {name = 'slow'}})"
+        <> "\nlocal rs = all_settled({tools.echo({}), tools.slow({})})"
         <> "\nreturn rs[1].result .. ' / ' .. tostring(rs[2].error)",
       ),
     )
@@ -973,9 +1024,9 @@ pub fn call_all_deadline_returns_partial_list_test() {
   assert_down(child)
 }
 
-/// A Stop during an in-flight batch kills the engine; the link reaps
-/// the child. Partial output before the batch is preserved.
-pub fn cancel_during_call_all_test() {
+/// A Stop while the engine is blocked in await kills the engine; the
+/// link reaps the child. Partial output before the await is preserved.
+pub fn cancel_during_await_test() {
   let cancel = process.new_subject()
   let pids = process.new_subject()
   let hosts = [
@@ -992,7 +1043,7 @@ pub fn cancel_during_call_all_test() {
       default_timeout_ms,
       default_cap,
       cancel,
-      code_argument("text('partial')\ntools.call_all({{name = 'cancel_slow'}})"),
+      code_argument("text('partial')\nawait(tools.cancel_slow({}))"),
     )
   should.be_true(string.contains(result, "Script failed ("))
   should.be_true(string.contains(result, "cancelled"))
@@ -1001,75 +1052,127 @@ pub fn cancel_during_call_all_test() {
   assert_down(child)
 }
 
-/// Every entry counts against the per-script budget, checked before
-/// anything spawns.
-pub fn call_all_budget_counts_every_entry_test() {
-  let assert Error(result) =
-    run_code(
-      "local batch = {}\nfor i = 1, 26 do batch[i] = {name = 'echo'} end\n"
-      <> "tools.call_all(batch)\nreturn 'unreachable'",
+/// An unawaited call never outlives a COMPLETED script: engine exit
+/// reaps its child explicitly (links cover abnormal deaths only — a
+/// normal exit propagates nothing).
+pub fn unawaited_call_killed_at_script_end_test() {
+  let pids = process.new_subject()
+  let hosts = [
+    codemode.HostTool(name: "slow", call: fn(_) {
+      process.send(pids, process.self())
+      process.sleep(10_000)
+      Ok("late")
+    }),
+  ]
+  let assert Ok(result) =
+    codemode.run(
+      hosts,
+      default_timeout_ms,
+      default_cap,
+      process.new_subject(),
+      code_argument("local h = tools.slow({})\ntext('done without it')"),
     )
-  should.be_true(string.contains(result, "tool call budget exceeded (25 calls)"))
+  should.be_true(string.contains(result, "Script completed ("))
+  should.be_true(string.contains(result, "done without it"))
+  let assert Ok(child) = process.receive(pids, within: 1000)
+  assert_down(child)
 }
 
-/// The budget is one shared counter: sync calls and batch entries draw
-/// down the same 25.
-pub fn call_all_budget_is_shared_with_sync_calls_test() {
-  let assert Error(result) =
-    run_code(
-      "for i = 1, 20 do tools.echo({}) end\n"
-      <> "local batch = {}\nfor i = 1, 6 do batch[i] = {name = 'echo'} end\n"
-      <> "tools.call_all(batch)\nreturn 'unreachable'",
-    )
-  should.be_true(string.contains(result, "tool call budget exceeded (25 calls)"))
-}
-
-/// An unknown tool name is a per-entry value, not a script failure.
-pub fn call_all_unknown_tool_is_a_value_test() {
+/// Double-await is legal (as in JS): the settle is cached, and a cached
+/// failure re-raises — awaiting a rejected promise twice throws twice.
+pub fn double_await_returns_cached_settle_test() {
   let assert Ok(result) =
     run_code(
-      "local rs = tools.call_all({{name = 'nope'}, {name = 'echo'}})"
-      <> "\nreturn tostring(rs[2].ok) .. '|' .. rs[1].error",
+      "local h = tools.echo({a = 1})"
+      <> "\nlocal x = await(h)"
+      <> "\nlocal y = await(h)"
+      <> "\nlocal ok1 = pcall(await, h)"
+      <> "\nreturn x .. y .. '|' .. tostring(x == y)",
     )
   let parts = string.split(result, "\n\n")
-  should.equal(list.drop(parts, 1), ["true|unknown tool: nope"])
+  should.equal(list.drop(parts, 1), [
+    "echo:{\"a\":1}echo:{\"a\":1}|true",
+  ])
+
+  let assert Ok(cached_failure) =
+    run_code(
+      "local h = tools.boom({})"
+      <> "\nlocal ok1 = pcall(await, h)"
+      <> "\nlocal ok2 = pcall(await, h)"
+      <> "\nreturn tostring(ok1) .. tostring(ok2)",
+    )
+  let parts = string.split(cached_failure, "\n\n")
+  should.equal(list.drop(parts, 1), ["falsefalse"])
 }
 
-/// Malformed batches are script errors, like a malformed sync call.
-pub fn call_all_malformed_entries_fail_the_script_test() {
-  let assert Error(missing) =
-    run_code("tools.call_all({{args = {}}})\nreturn 'unreachable'")
-  should.be_true(string.contains(missing, "call_all entry missing name"))
-  let assert Error(scalar) = run_code("tools.call_all({'echo'})")
-  should.be_true(string.contains(scalar, "call_all entry must be a table"))
-  let assert Error(not_table) = run_code("tools.call_all('nope')")
-  should.be_true(string.contains(not_table, "call_all wants a table of entries"))
+/// The classic missing-await bug self-describes: an unawaited handle
+/// rendered as output says what it is instead of dumping useless JSON.
+pub fn unawaited_handle_renders_hint_test() {
+  let assert Ok(named) = run_code("return tools.echo({})")
+  should.be_true(string.contains(
+    named,
+    "unawaited echo result - wrap in await(...)",
+  ))
+  let assert Ok(anonymous) = run_code("local h = tools.echo({})\nreturn {h}")
+  // A handle nested in a table still encodes as data (only a TOP-LEVEL
+  // handle renders as the hint) — cheap best-effort, not a deep walk.
+  should.be_true(string.contains(anonymous, "\"name\":\"echo\""))
 }
 
-/// An empty batch is a no-op that never touches the budget.
-pub fn call_all_empty_batch_is_empty_test() {
-  let assert Ok(result) = run_code("return #tools.call_all({})")
+/// Budget is drawn at START, so calls and awaits share one 25-call
+/// counter — mixed usage trips at the same total.
+pub fn calls_and_awaits_share_the_budget_test() {
+  let assert Error(result) =
+    run_code(
+      "for i = 1, 20 do await(tools.echo({})) end"
+      <> "\nlocal batch = {}"
+      <> "\nfor i = 1, 6 do batch[i] = tools.echo({}) end"
+      <> "\nall_settled(batch)"
+      <> "\nreturn 'unreachable'",
+    )
+  should.be_true(string.contains(result, "tool call budget exceeded (25 calls)"))
+}
+
+/// A non-handle entry settles as an error VALUE (allSettled of a
+/// rejected-ish input), while a non-array argument is a script error —
+/// the malformed-call convention.
+pub fn all_settled_malformed_argument_fails_the_script_test() {
+  let assert Error(not_table) = run_code("all_settled('nope')")
+  should.be_true(string.contains(not_table, "all_settled wants a table"))
+
+  let assert Error(sparse) =
+    run_code("all_settled({tools.echo({}), [3] = tools.echo({})})")
+  should.be_true(string.contains(sparse, "dense 1-based array"))
+
+  // A non-handle ELEMENT is a value, not a script error.
+  let assert Ok(non_handle) =
+    run_code(
+      "local rs = all_settled({42})"
+      <> "\nreturn tostring(rs[1].ok) .. '|' .. rs[1].error",
+    )
+  should.be_true(string.contains(non_handle, "false|"))
+  should.be_true(string.contains(non_handle, "await expects"))
+}
+
+/// An empty all_settled is a no-op that never touches the budget.
+pub fn all_settled_empty_is_empty_test() {
+  let assert Ok(result) = run_code("return #all_settled({})")
   let parts = string.split(result, "\n\n")
   should.equal(list.drop(parts, 1), ["0"])
 }
 
-/// Over-budget batches fail EVEN on the deadline short-circuit path: the
-/// batch is charged before remaining-time is considered, so a
-/// near-deadline script cannot keep issuing uncounted batches (cubic
-/// review — deadline-exceeded entries still draw budget).
+/// Over-budget starts fail EVEN on the deadline short-circuit path: the
+/// budget is charged before remaining-time is considered, so a
+/// near-deadline script cannot keep minting uncounted handles (cubic
+/// review carried over from call_all).
 ///
-/// Race-free by arithmetic (cubic follow-up: an earlier cut slept 980 ms
-/// of a 1 s deadline, but `process.sleep` can overshoot arbitrarily —
-/// past the kill — on a loaded CI box). Instead: no sleep at all. With
-/// timeout 55 ms and nominal engine startup ~20 ms, call_all is entered
-/// with ~35 ms remaining — inside the 50 ms wrap-up margin, i.e. ON the
-/// deadline path — while the budget error's Done still lands ~35 ms
-/// ahead of the worker's kill. There is no wake-up to overshoot; the
-/// only way this can time out is engine startup alone exceeding 55 ms
-/// (>2.5x nominal, well past what the suite's other timing tests
-/// tolerate). And post-fix the assertion holds on EITHER path, since
-/// the budget check now runs before the remaining-time branch.
-pub fn call_all_budget_charged_on_deadline_path_test() {
+/// Race-free by arithmetic (cubic follow-up): no sleep at all. With
+/// timeout 55 ms and nominal engine startup ~20 ms, the 26th start is
+/// attempted with ~35 ms remaining — inside the 50 ms wrap-up margin,
+/// i.e. ON the deadline path — while the budget error's Done still
+/// lands ~35 ms ahead of the worker's kill. The only way this can time
+/// out is engine startup alone exceeding 55 ms.
+pub fn budget_charged_on_deadline_path_test() {
   let assert Error(result) =
     codemode.run(
       [echo_host()],
@@ -1077,36 +1180,31 @@ pub fn call_all_budget_charged_on_deadline_path_test() {
       default_cap,
       process.new_subject(),
       code_argument(
-        "local batch = {}\nfor i = 1, 26 do batch[i] = {name = 'echo'} end\n"
-        <> "tools.call_all(batch)\nreturn 'unreachable'",
+        "local batch = {}"
+        <> "\nfor i = 1, 26 do batch[i] = tools.echo({}) end"
+        <> "\nall_settled(batch)"
+        <> "\nreturn 'unreachable'",
       ),
     )
   should.be_true(string.contains(result, "tool call budget exceeded (25 calls)"))
 }
 
-/// Sparse batches (holes, or non-1..n keys) are rejected instead of
-/// silently dropping entries after the hole — dropped entries would
-/// dodge both the calls and the budget accounting (cubic review).
-pub fn call_all_rejects_sparse_batches_test() {
-  let assert Error(hole) =
-    run_code("tools.call_all({{name = 'echo'}, [3] = {name = 'echo'}})")
-  should.be_true(string.contains(hole, "dense 1-based array"))
-  let assert Error(named) =
-    run_code("tools.call_all({{name = 'echo'}, extra = 1})")
-  should.be_true(string.contains(named, "dense 1-based array"))
-  // A dense array is still fine.
-  let assert Ok(dense) =
+/// An unknown tool raises at the ACCESS site (the metatable __index),
+/// synchronously — catchable with pcall like any Lua error, consistent
+/// with JS where calling an undefined method throws immediately.
+pub fn unknown_tool_error_is_catchable_test() {
+  let assert Ok(result) =
     run_code(
-      "local rs = tools.call_all({{name = 'echo'}, {name = 'echo'}})"
-      <> "\nreturn #rs",
+      "local ok, e = pcall(function() return tools.nope({}) end)"
+      <> "\nreturn tostring(ok) .. ':' .. e",
     )
-  let parts = string.split(dense, "\n\n")
-  should.equal(list.drop(parts, 1), ["2"])
+  let parts = string.split(result, "\n\n")
+  should.equal(list.drop(parts, 1), ["false:unknown tool: nope"])
 }
 
 /// A host crashing with a pathological reason must not blow up the
-/// child: the crash term is bounded BEFORE formatting, so the error
-/// value stays small no matter how large the reason (cubic review).
+/// task child: the crash term is bounded BEFORE formatting, so the
+/// settled error value stays small no matter how large the reason.
 pub fn crash_reason_is_bounded_test() {
   let hosts = [
     codemode.HostTool(name: "wibble", call: fn(_) {
@@ -1119,30 +1217,34 @@ pub fn crash_reason_is_bounded_test() {
       default_timeout_ms,
       default_cap,
       process.new_subject(),
-      code_argument(
-        "local rs = tools.call_all({{name = 'wibble'}})\nreturn rs[1].error",
-      ),
+      code_argument("return all_settled({tools.wibble({})})[1].error"),
     )
   should.be_true(string.contains(result, "host crashed"))
   should.be_true(string.length(result) < 1000)
+}
+
+/// The wire description documents the async surface (the model's only
+/// manual).
+pub fn await_and_all_settled_are_documented_test() {
+  let chat.FunctionTool(function: f) = codemode.schema()
+  let assert Some(text) = f.description
+  should.be_true(string.contains(text, "await(handle)"))
+  should.be_true(string.contains(text, "all_settled"))
+  should.be_true(string.contains(text, "Promise.allSettled"))
+  should.be_true(string.contains(text, "parallel"))
 }
 
 /// A Lua runtime TYPE error (glua's formatter crashes on badarg/
 /// badarith — format_lua_value returns IO data that string.join
 /// rejects) must stay a script failure with a readable reason, not take
 /// the engine down as "engine crashed". Found by the phase-2 tests;
-/// reachable since phase 1 (`return 'a' .. true`).
+/// reachable since phase 1 (`return 'a' .. true`). Restored after the
+/// await/all_settled rewrite (round-1 review): it is the ONLY pin on
+/// safe_format_error's formatter-crash fallback — the pcall-based tests
+/// never exercise the engine-tail formatting path.
 pub fn script_type_error_reports_lua_error_not_crash_test() {
   let assert Error(result) = run_code("return 'a' .. true")
   should.be_true(string.contains(result, "Script failed ("))
   should.be_false(string.contains(result, "engine crashed"))
   should.be_true(string.contains(result, "bad argument"))
-}
-
-/// The wire description documents call_all (the model's only manual).
-pub fn call_all_is_documented_in_the_description_test() {
-  let chat.FunctionTool(function: f) = codemode.schema()
-  let assert Some(text) = f.description
-  should.be_true(string.contains(text, "call_all"))
-  should.be_true(string.contains(text, "parallel"))
 }

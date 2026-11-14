@@ -135,7 +135,7 @@ fn run_toolset_codemode(
 pub fn codemode_hosts_come_from_the_requested_toolset_test() {
   let assert Ok(specs) = tools.by_names(plain(), ["web_search", "codemode"])
   let assert Error(result) =
-    run_toolset_codemode(specs, "tools.web_search({query = 'x'})")
+    run_toolset_codemode(specs, "await(tools.web_search({query = 'x'}))")
   should.be_true(string.contains(result, "Script failed ("))
   // The configured executor RAN (its guard fired) — not `unknown tool`.
   should.be_true(string.contains(
