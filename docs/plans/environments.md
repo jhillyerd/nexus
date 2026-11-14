@@ -32,7 +32,7 @@ remote paired TUI nodes"): OpenAI's self-hosted Agents API environments —
 harness in the cloud, executor in the user's environment, **outbound**
 WebSocket with reconnect and `pending / connected / failed` lifecycle — is
 the connectivity model for remote nodes. MCP semantics (tools/call,
-notifications/cancelled, structured results) are adopted for the tool
+notifications/cancelled, plain-content results) are adopted for the tool
 sub-protocol; ACP was evaluated and rejected (editor↔local-agent protocol,
 stdio transport, wrong trust model — it may return later as a *front-end*
 adapter, never as this transport).
@@ -97,8 +97,13 @@ adapter, never as this transport).
   agent does not wake on attach (no runaway loops). The user's next Send
   — from web or TUI — carries the turn.
 - **Ordering**: the thread actor serializes. An attach during an
-  in-flight turn is queued behind it (the `Busy`/pending-guard regime);
-  the message lands after `WorkerDone`, before the next request is built.
+  in-flight turn is queued behind it — NEW pending machinery beside the
+  existing `Busy` refusal (a late `Send` today is rejected, not queued;
+  `utility_pending` is a debounce flag, not a queue), and it must queue
+  on the actor side because the worker owns the extended transcript
+  mid-turn — an actor-side append before `WorkerDone` would be clobbered
+  when the worker installs its transcript. The message lands after
+  `WorkerDone`, before the next request is built.
 
 ### Fail fast (verified against the loop)
 
@@ -150,7 +155,10 @@ committed; nothing new rolls back.
   (`workspace_root: Option(String)`; `None` disables env toolset
   selection at creation — the SearxNG-gating pattern). Path derives from
   the thread id; lazy creation on first env tool call; retention policy
-  deferred (threads have no deletion today).
+  deferred (thread deletion exists today — a hard `DELETE /threads/:id`
+  cascading `thread_message`, with no workspace-cleanup hook — so without
+  a retention/cleanup decision, deleted threads would leave orphaned
+  workspace dirs).
 - **Sandbox floor** (cheap, v1): cwd confinement to the workspace dir,
   per-call wall-clock timeout, kill-tree on cancel (the codemode
   cancel-subject pattern is the template). Container-per-workspace is the
