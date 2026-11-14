@@ -375,9 +375,20 @@ pub fn update(
       [],
     )
 
-    Mutated -> #(State(..state, last_error: None), effect.none(), [
-      ProvidersChanged,
-    ])
+    Mutated -> #(
+      // A provider mutation (edit, enable/disable, delete) landed through
+      // this same connection: drop the bot forms' alias cache so a
+      // re-selected provider refetches instead of showing the pre-edit
+      // list. The cache is connection-lifetime, not mutation-proof.
+      State(
+        ..state,
+        last_error: None,
+        bot_aliases: dict.new(),
+        bot_alias_provider: None,
+      ),
+      effect.none(),
+      [ProvidersChanged],
+    )
 
     MutateFailed(reason) -> #(
       State(..state, last_error: Some(reason)),

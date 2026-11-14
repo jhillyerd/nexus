@@ -2519,6 +2519,33 @@ pub fn bot_model_combobox_scopes_and_lists_test() {
   should_not_contain(html, "bot-model-options-b1")
 }
 
+pub fn bot_alias_cache_invalidated_on_provider_mutation_test() {
+  // A provider edit/disable lands through the same connection that
+  // cached its alias list: the cache must not outlive the mutation, or
+  // re-selecting the provider would show the pre-edit list forever.
+  let model =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(ui.SettingsToggled)
+    |> step(ui.Settings(ui_settings.TabSelected(ui_settings.BotsTab)))
+    |> step(ui.Settings(ui_settings.BotAddToggled(Some("p1"))))
+    |> step(ui.Settings(ui_settings.BotAliasesLoaded("p1", ["smart"])))
+  model.settings.bot_aliases
+  |> dict.get("p1")
+  |> should.equal(Ok(ui_settings.AliasOk(["smart"])))
+
+  let mutated = step(model, ui.Settings(ui_settings.Mutated))
+  mutated.settings.bot_aliases |> dict.size |> should.equal(0)
+  mutated.settings.bot_alias_provider |> should.be_none
+
+  // Re-selecting refetches instead of trusting the dropped entry.
+  let repicked =
+    step(mutated, ui.Settings(ui_settings.BotAddProviderPicked("p1")))
+  repicked.settings.bot_aliases
+  |> dict.get("p1")
+  |> should.equal(Ok(ui_settings.AliasLoading))
+}
+
 pub fn bot_model_combobox_provider_switch_rescopes_test() {
   // Switching the open form's provider re-scopes the combobox and
   // fetches the new provider; the old list must not survive into it.

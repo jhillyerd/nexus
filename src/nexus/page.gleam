@@ -664,19 +664,13 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
 #app .provider-form h3 { margin: 0; font-size: .7rem; font-weight: 600; text-transform: uppercase;
   letter-spacing: .07em; opacity: .55; }
 .provider-form input { min-width: 0; }
-/* The form cards are flex columns whose gap IS the spacing rhythm, but
-   Pico's per-element margins stack on top of it: 1rem under every
-   input/select/textarea/button, .375rem under labels, and the
-   input+small hint's -.75rem pull-up — fields sat ~1.45rem apart while
-   the card gap says .45rem, and the combobox hint clipped under the
-   input's border. Zero the field margins inside the cards so the gap
-   rules the rhythm (the hint keeps Pico's width:100% block).
-   Specificity note (see the cascade traps at the top): plain-element
-   margins need the #app prefix to beat Pico's matching selectors. */
-#app .provider-form input:not([type=checkbox]),
-#app .provider-form select,
-#app .provider-form textarea,
-#app .provider-form label,
+/* Field margins inside the cards are already zero: the app-wide
+   `#app select, #app textarea, #app input, #app label { margin: 0 }`
+   rule below outranks Pico's. What still leaked into the cards were
+   BUTTON margins (Pico gives every button a 1rem bottom margin) and
+   the input+small hint's -.75rem pull-up, which clipped it under the
+   input's border. Zero those so the flex gap rules the rhythm (the
+   hint keeps Pico's width:100% block). */
 #app .provider-form button { margin: 0; }
 #app .provider-form input + small { margin: 0; }
 .provider-form-buttons { display: flex; gap: .3rem; }
