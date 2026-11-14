@@ -542,6 +542,27 @@ pub fn models_route_removed_test() {
   ))
 }
 
+/// GET /threads/<id> serves the page shell — the RESTful app view the
+/// static script reads location.pathname from. Auth-gated like `/`, and
+/// thread-agnostic: the shell carries no thread data, so any id (existing
+/// or not) gets the identical HTML; a vanished id degrades client-side to
+/// the auto-selection.
+pub fn thread_page_route_test() {
+  let #(_registry, port) = start_server()
+
+  // The token gate covers the app view like every other route.
+  let assert Ok(denied) = hackney.send(req(port, Get, "/threads/s-1", ""))
+  should.equal(denied.status, 401)
+
+  let #(status, body) = send_authorized(req(port, Get, "/threads/s-1", ""))
+  should.equal(status, 200)
+  should.be_true(string.contains(body, "lustre-server-component"))
+  let #(status2, body2) =
+    send_authorized(req(port, Get, "/threads/not-a-thread", ""))
+  should.equal(status2, 200)
+  should.equal(body2, body)
+}
+
 // A provider may be NAMED after another provider's id — the id is the
 // unambiguous key and must win: a request for "p1" pins the provider
 // WITH ID p1, never the provider merely named "p1" (review finding on

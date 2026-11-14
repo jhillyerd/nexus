@@ -1,7 +1,8 @@
 //// The HTTP surface: a JSON scripting API (provider CRUD, provider-
 //// scoped model listing, thread CRUD, send, stop), the Lustre shell
-//// page with its WebSocket transport (`/ws`, `/lustre/runtime.mjs`),
-//// and a health check.
+//// page (at `/` and at the thread app view `GET /threads/<id>`, which
+//// gives a thread its shareable URL) with its WebSocket transport
+//// (`/ws`, `/lustre/runtime.mjs`), and a health check.
 ////
 //// Mist remains sufficient: the WebSocket upgrade bypasses wisp, and the
 //// scripting surface is still small and explicit. The thread actor is
@@ -54,6 +55,14 @@ pub fn handler(
   fn(req: Request(mist.Connection)) -> Response(mist.ResponseData) {
     case req.method, request.path_segments(req) {
       Get, [] -> protected(cfg, req, fn() { page_response(cfg.ui_token) })
+      // The thread app view: the same page shell as `/`, at a RESTful
+      // member path so a thread has a shareable URL (`/threads/<id>`).
+      // The shell is thread-agnostic — it carries no thread data — so
+      // the id is unread here; the page's static script reads it from
+      // location.pathname and re-supplies it on the /ws route. If a JSON
+      // member GET is ever added, negotiate on Accept there.
+      Get, ["threads", _id] ->
+        protected(cfg, req, fn() { page_response(cfg.ui_token) })
       Get, ["threads"] ->
         protected(cfg, req, fn() { threads_response(registry, req) })
       Post, ["threads"] ->
@@ -1383,6 +1392,7 @@ fn text_decoder() -> decode.Decoder(String) {
 pub fn requires_auth(method: Method, segments: List(String)) -> Bool {
   case method, segments {
     Get, []
+    | Get, ["threads", _]
     | Get, ["threads"]
     | Get, ["providers"]
     | Get, ["providers", _, "models"]

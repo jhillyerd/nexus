@@ -354,6 +354,9 @@ pub fn registry_error_fields_test() {
 pub fn protected_route_matrix_test() {
   [
     #(Get, []),
+    // The thread app view (shareable /threads/<id> URLs) sits behind the
+    // same gate as `/`.
+    #(Get, ["threads", "s-1"]),
     #(Get, ["threads"]),
     #(Post, ["threads"]),
     #(Post, ["threads", "s-1", "send"]),
@@ -435,9 +438,10 @@ pub fn m3_page_autoscroll_script_test() {
   // characterData, and thread switches ride #layout[data-selected].
   should.be_true(string.contains(html, "characterData: true"))
   // Both shell scripts watch data-selected (thread_js persists the
-  // selection, the autoscroll script force-jumps on a switch) — count it
-  // so this test fails if the autoscroll half silently loses its
-  // observer, which a plain contains would never catch.
+  // selection and mirrors it into the address bar, the autoscroll script
+  // force-jumps on a switch) — count it so this test fails if the
+  // autoscroll half silently loses its observer, which a plain contains
+  // would never catch. (string.split yields occurrences + 1.)
   string.split(html, "attributeFilter: ['data-selected']")
   |> list.length
   |> should.equal(3)
@@ -486,6 +490,83 @@ pub fn ws_route_token_encoding_test() {
   nexus_page.ws_route(None) |> should.equal("/ws")
   nexus_page.ws_route(Some("a b&c"))
   |> should.equal("/ws?token=a%20b%26c")
+}
+
+/// thread_js mirrors the selection into the address bar so a thread has
+/// a shareable RESTful URL (/threads/<id>), and drives back/forward from
+/// it. The contract, in the order it runs: the PAGE url names the thread
+/// (the /threads/<id> path; a legacy ?thread= query is still honored so
+/// old links work) and outranks the stored selection at boot; the load's
+/// history entry is stamped so the first url write rewrites it
+/// (replaceState) while every later switch pushes; a selection the url
+/// already names (a pasted link that opened) clears the stamp in place —
+/// upgrading a legacy link to path form — so the NEXT switch pushes;
+/// popstate selects the named thread by clicking its sidebar row (the
+/// runtime forwards synthetic clicks), un-hiding a row the tag filter or
+/// the archived toggle hides first; a deselection never rewrites the url.
+pub fn m3_page_thread_url_script_test() {
+  let html = nexus_page.html(None)
+  // Boot: the page url names the thread — the /threads/<id> path first,
+  // a legacy ?thread= query as fallback — and outranks (and lands in)
+  // storage.
+  should.be_true(string.contains(
+    html,
+    "seg.length >= 3 && seg[1] === 'threads' && seg[2] !== ''",
+  ))
+  should.be_true(string.contains(html, "decodeURIComponent(seg[2])"))
+  should.be_true(string.contains(html, "url.searchParams.get('thread') || ''"))
+  should.be_true(string.contains(html, "var urlId = threadFromLocation();"))
+  should.be_true(string.contains(html, "var wanted = urlId || read();"))
+  // Writes are path-form: pathname set, legacy param dropped, token and
+  // other params ride along.
+  should.be_true(string.contains(
+    html,
+    "url.pathname = '/threads/' + encodeURIComponent(id)",
+  ))
+  should.be_true(string.contains(html, "url.searchParams.delete('thread');"))
+  // The load entry is stamped so the first write replaces, later ones
+  // push — back/forward walks real thread switches, not boot noise.
+  should.be_true(string.contains(
+    html,
+    "history.replaceState({ nexusBoot: true }, '')",
+  ))
+  should.be_true(string.contains(html, "entry.nexusBoot"))
+  should.be_true(string.contains(
+    html,
+    "history.replaceState({ nexus: 'thread', thread: id }",
+  ))
+  should.be_true(string.contains(
+    html,
+    "history.pushState({ nexus: 'thread', thread: id }",
+  ))
+  // A selection the url already names (pasted-link boot) clears the
+  // stamp in place — without it the next switch would REPLACE this
+  // entry and the pasted thread would fall out of back/forward.
+  should.be_true(string.contains(html, "var markOwned = function () {"))
+  should.be_true(string.contains(
+    html,
+    "if (!(entry && entry.nexusBoot)) return;",
+  ))
+  // popstate drives the server's Select path through a synthetic click
+  // on the row, never by touching the rendered tree's content.
+  should.be_true(string.contains(html, "window.addEventListener('popstate'"))
+  should.be_true(string.contains(html, "var id = threadFromLocation();"))
+  should.be_true(string.contains(
+    html,
+    ".thread-row[data-thread-id=\"' + safe + '\"] .thread-main",
+  ))
+  should.be_true(string.contains(html, "row.click();"))
+  // A hidden row (tag filter, archived hidden) is un-hidden first.
+  should.be_true(string.contains(html, "getElementById('filter-clear')"))
+  should.be_true(string.contains(html, "getElementById('show-archived')"))
+  // The url is never rewritten on popstate or deselection: the script
+  // tracks what the url names and only writes on a real switch.
+  should.be_true(string.contains(
+    html,
+    "urlId = id; // the url is already the state",
+  ))
+  should.be_true(string.contains(html, "if (id !== '') markOwned();"))
+  should.be_false(string.contains(html, "innerHTML"))
 }
 
 pub fn pico_href_token_encoding_test() {
