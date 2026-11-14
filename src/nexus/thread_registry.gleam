@@ -1992,13 +1992,13 @@ fn find_bot_by_name(state: State, name: String) -> BotLookup {
 /// map. A hit resolves to a live record; a miss (or a map entry whose
 /// thread was deleted) find-or-creates from the TARGET bot through
 /// `start_new_thread` — the one creation path, no new frozen-value path.
-/// The registry-side create skips the live model-alias revalidation
-/// `nexus/thread_create` performs for user-facing creates: that check is
-/// a network call, and no network call may run inside this actor (§8 —
-/// the registry answers from state + bounded asks only). A bot whose
-/// alias went stale past an upgrade therefore starts its DM thread and
-/// its turns fail at stream time — the same "stale alias is legitimate
-/// at rest" semantics as the bot table itself.
+/// The registry-side create performs no live model-alias validation —
+/// and neither does any other create path (see `nexus/thread_create`'s
+/// module doc: proxies serve aliases their live list may not carry, so a
+/// bot whose alias went stale past an upgrade still starts its DM thread
+/// and its turns fail at stream time). Independently, no network call
+/// may run inside this actor (§8 — the registry answers from state +
+/// bounded asks only).
 fn find_or_create_dm(
   state: State,
   request: delivery.Request,
@@ -2266,10 +2266,11 @@ fn sender_name_ask(
 // Client helpers
 // ---------------------------------------------------------------------------
 
-/// Create a thread from the request record. The provider/model validation
-/// (a network call) belongs in `nexus/thread_create`, OUTSIDE this loop —
-/// this ask only resolves the endpoint and starts the child. Replies with
-/// the fresh summary.
+/// Create a thread from the request record. Provider resolution belongs
+/// in `nexus/thread_create`, OUTSIDE this loop — this ask only resolves
+/// the endpoint and starts the child. Model aliases are not validated on
+/// any create path (a dead alias fails its first turn at stream time).
+/// Replies with the fresh summary.
 pub fn create(
   registry: Subject(Msg),
   requested: NewThread,

@@ -33,8 +33,8 @@ pub type Bot {
     /// The provider new threads pin (canonical registry id). Validated
     /// by the CALLER against the provider registry (no
     /// registry-to-registry edge); the FK is the backstop. A stale
-    /// model alias is legitimate at rest — thread create re-validates
-    /// it live and refuses dead ones.
+    /// model alias is legitimate at rest — nothing re-validates it; a
+    /// dead alias fails its thread's first turn at stream time.
     provider_id: String,
     /// The model alias new threads freeze.
     model: String,
@@ -46,9 +46,9 @@ pub type Bot {
     /// half): `None` = the CURRENT default set, resolved at thread
     /// creation so the bot stays a live template; `Some([])` =
     /// deliberately empty (a chat-only bot); `Some(names)` = an explicit
-    /// list, validated against the compiled-in catalog at save time and
-    /// re-validated at thread create. Order here is the wire order of
-    /// the resolved schemas.
+    /// list, validated against the compiled-in catalog at save time
+    /// and re-resolved (catalog-only, offline) at thread create. Order
+    /// here is the wire order of the resolved schemas.
     tools: Option(List(String)),
     /// The inbound gate (bots plan P3a, issue #95): `False` blocks other
     /// bots from delivering messages into this bot's threads. Nothing

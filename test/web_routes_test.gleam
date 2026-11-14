@@ -491,7 +491,10 @@ pub fn create_thread_validation_test() {
     )),
     #(400, "{\"error\":\"unknown provider: nope\"}"),
   )
-  // Unknown model on a KNOWN provider -> 400.
+  // An alias OFF the provider's live list is NOT a refusal — proxies
+  // like Bifrost accept aliases their /v1/models may not carry, so the
+  // create pins it as-is and the turn fails at stream time if dead
+  // (thread_create's module doc).
   should.equal(
     send_authorized(req(
       port,
@@ -500,8 +503,9 @@ pub fn create_thread_validation_test() {
       "{\"provider\":\""
         <> store_mock.fixture_provider_id
         <> "\",\"model\":\"nope\"}",
-    )),
-    #(400, "{\"error\":\"unknown model: nope\"}"),
+    ))
+      |> fn(pair) { pair.0 },
+    201,
   )
   // Missing provider field -> 400 (no default provider exists anymore;
   // the decoder is total over the two body shapes, so the refusal is the
@@ -553,29 +557,21 @@ pub fn create_thread_provider_id_wins_over_name_test() {
       create_provider(providers, "beta", "https://beta.test/v1")
       create_provider(providers, "p1", "https://gamma.test/v1")
     })
-  // p1 (id) is beta, whose fetcher serves the default list; the provider
-  // NAMED p1 serves only "gamma-only". If name-matching won, this would
-  // be a 400 unknown model instead of a 201...
-  should.equal(
-    send_authorized(req(
-      port,
-      Post,
-      "/threads",
-      "{\"provider\":\"p1\",\"model\":\"alias-a\"}",
-    ))
-      |> fn(pair) { #(pair.0, "") },
-    #(201, ""),
-  )
-  // ...and this 400 proves it did not resolve to the provider named p1.
-  should.equal(
+  // p1 (id) is beta; the provider NAMED p1 mints id p2. Ids are the
+  // unambiguous key and must win when the two disagree (review finding
+  // on PR #12). The summary pins WHICH provider row the create landed
+  // on — validation no longer distinguishes the two fetch lists, since
+  // aliases are not checked at create.
+  let assert #(201, id_wins) =
     send_authorized(req(
       port,
       Post,
       "/threads",
       "{\"provider\":\"p1\",\"model\":\"gamma-only\"}",
-    )),
-    #(400, "{\"error\":\"unknown model: gamma-only\"}"),
-  )
+    ))
+  // Name-matching would have pinned p2 (the provider named p1).
+  should.be_true(string.contains(id_wins, "\"provider_id\":\"p1\""))
+  should.be_false(string.contains(id_wins, "\"provider_id\":\"p2\""))
 }
 
 // ---------------------------------------------------------------------------
@@ -981,9 +977,10 @@ pub fn bots_crud_routes_test() {
 
 /// `POST /threads {"bot": id}`: the bot sources the frozen pin (and its
 /// prompt), the summary carries the provenance, and the plan's refusal
-/// paths hold — an unknown bot is a 400, a stale alias is a 400 (the
-/// create must never silently succeed on a dead alias), and bot +
-/// provider/model in one body is a conflict.
+/// paths hold — an unknown bot is a 400, a stale alias is NOT a refusal
+/// (aliases are not validated at create; the thread lands and its first
+/// turn fails at stream time), and bot + provider/model in one body is a
+/// conflict.
 pub fn create_thread_from_bot_test() {
   let #(_registry, port) = start_server()
 
@@ -1010,8 +1007,9 @@ pub fn create_thread_from_bot_test() {
     #(400, "{\"error\":\"unknown bot: b-nope\"}"),
   )
 
-  // Stale alias -> 400 (never a silent success): a bot pinned to an
-  // alias the provider no longer lists.
+  // Stale alias -> lands anyway: a bot pinned to an alias the provider
+  // no longer lists creates fine (the pin freezes "dead-alias"; the
+  // first turn fails at stream time if the proxy can't serve it).
   let assert #(201, _stale) =
     send_authorized(req(
       port,
@@ -1019,10 +1017,9 @@ pub fn create_thread_from_bot_test() {
       "/bots",
       "{\"name\":\"Stale\",\"provider\":\"p-test\",\"model\":\"dead-alias\"}",
     ))
-  should.equal(
-    send_authorized(req(port, Post, "/threads", "{\"bot\":\"b2\"}")),
-    #(400, "{\"error\":\"unknown model: dead-alias\"}"),
-  )
+  let assert #(201, stale_thread) =
+    send_authorized(req(port, Post, "/threads", "{\"bot\":\"b2\"}"))
+  should.be_true(string.contains(stale_thread, "\"model\":\"dead-alias\""))
 
   // Conflict: bot plus provider/model in one body.
   should.equal(

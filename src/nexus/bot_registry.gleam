@@ -11,8 +11,9 @@
 //// answering before the `bot_name` unique index (the cross-instance
 //// backstop, surfaced as `StoreFailed`). Unlike providers there is
 //// nothing to validate at load: a bot row cannot be invalid at rest,
-//// and a stale model alias is legitimate (thread create re-validates
-//// it against the provider's LIVE list and refuses dead ones).
+//// and a stale model alias is legitimate (aliases are not validated
+//// at thread create either — a dead alias fails its first turn at
+//// stream time; see `nexus/thread_create`).
 ////
 //// **No registry-to-registry edges** (ARCHITECTURE.md §8): this actor
 //// never resolves providers — `bot.provider_id` existence is validated

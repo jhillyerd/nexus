@@ -59,8 +59,9 @@ import nexus/ui_settings
 ///
 /// `models_timeout_ms` is the shared live-model budget
 /// (`thread_create.models_timeout`): the ONE `list_models` timeout rule,
-/// used by both the picker reload and the create path — never a
-/// per-surface constant.
+/// used by the picker reload — never a per-surface constant. (The create
+/// path itself no longer fetches the list: aliases are not validated at
+/// create.)
 ///
 /// `thread` is the client-supplied last-selected thread (the `/ws`
 /// route's `thread` query parameter, persisted by the page shell): each
@@ -227,16 +228,15 @@ pub type Model {
     bot_list: List(Bot),
     /// The bot selected in the create panel (start-from-bot): when set,
     /// the provider/model pickers stand down — the bot sources both,
-    /// re-validated live at create.
+    /// pinned as-is (no create-time alias validation).
     create_bot: Option(String),
     /// The per-connection pending-creation guard (#88): True from the
     /// moment a create request (plain OR bot-sourced) is handed to its
     /// worker until that worker's reply lands. Both paths share ONE
     /// slot — a duplicate request while one is pending is rejected, so
-    /// a slow (or hung) live model-list preflight cannot accumulate a
-    /// queue of creates behind it. Cleared by `Created`/`CreateFailed`,
-    /// success and failure alike, so a refused create never locks the
-    /// panel.
+    /// a slow (or hung) create worker cannot accumulate a queue of
+    /// creates behind it. Cleared by `Created`/`CreateFailed`, success
+    /// and failure alike, so a refused create never locks the panel.
     create_pending: Bool,
     /// Which main view the shell renders (chat vs settings).
     view: UiView,
@@ -1004,19 +1004,19 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
 
     CreateRequested ->
       // The shared pending guard FIRST (#88): at most one create in
-      // flight per connection, across both paths — while a worker is
-      // waiting out a slow live model-list preflight, further clicks
-      // must not queue more creates. Rejection is a silent no-op, the
-      // same shape as the streaming guard on `SendRequested`; the
-      // worker's reply (Created / CreateFailed) clears the guard.
+      // flight per connection, across both paths — while a create worker
+      // is mid-flight, further clicks must not queue more creates.
+      // Rejection is a silent no-op, the same shape as the streaming
+      // guard on `SendRequested`; the worker's reply (Created /
+      // CreateFailed) clears the guard.
       case model.create_pending {
         True -> #(model, effect.none())
         False ->
           // Start-from-bot (bots plan P1): a selected bot sources the
-          // provider/model/system prompt, and `thread_create` re-validates
-          // the alias against the provider's live model list before the
-          // registry ever sees the request; otherwise today's picker flow.
-          // Both paths share the one `thread_create` orchestration.
+          // provider/model/system prompt; otherwise today's picker flow.
+          // Both paths share the one `thread_create` orchestration, and
+          // neither validates the alias against the provider's live
+          // model list — a dead alias lands and fails its first turn.
           case model.create_bot {
             Some(bot_id) -> #(
               Model(..model, create_pending: True),
@@ -2056,20 +2056,18 @@ fn create_effect(model: Model, alias: String) -> Effect(Msg) {
   let registry = model.registry
   let providers = model.providers
   let provider = model.provider
-  let timeout = model.models_timeout_ms
   effect.from(fn(dispatch) {
     // OFF the runtime loop (#88), per ui_settings' `models_effect`
-    // pattern: `create_thread`'s preflight is a blocking live model-list
-    // actor call that waits out its whole timeout when the endpoint
-    // hangs — run inline, it would freeze this connection's entire UI
-    // (navigation, thread events, everything) for the wait. Spawn
-    // unlinked; the reply dispatches back (`Created` / `CreateFailed`).
-    // The pending guard in `update` keeps the single-slot honest: no
-    // second create can start before this one's reply lands.
+    // pattern: the create's registry asks block the worker, and a
+    // wedged registry must not freeze this connection's entire UI
+    // (navigation, thread events, everything). Spawn unlinked; the
+    // reply dispatches back (`Created` / `CreateFailed`). The pending
+    // guard in `update` keeps the single-slot honest: no second create
+    // can start before this one's reply lands.
     process.spawn_unlinked(fn() {
       // EVERY exit path dispatches (Created / CreateFailed): the create
       // outcome routes through `rescue` so a worker crash — e.g. an
-      // `actor.call` panic when a registry dies mid-preflight — lands on
+      // `actor.call` panic when a registry dies mid-create — lands on
       // the failure path too, instead of leaving `create_pending` stuck
       // True and Create disabled for this connection (#90 review).
       //
@@ -2078,9 +2076,10 @@ fn create_effect(model: Model, alias: String) -> Effect(Msg) {
       // toolset, pinned to the create panel's selected provider + model
       // (multi-provider §8: the pin is explicit, never defaulted).
       //
-      // The SHARED orchestration (#73): provider resolution + live
-      // model-alias validation outside the registry's loop — the UI used to
-      // skip the check, silently accepting a stale alias. The reply IS the
+      // The SHARED orchestration (#73): provider resolution outside the
+      // registry's loop. The alias is pinned as-is — NOT validated
+      // against the live list (proxies serve aliases their /v1/models
+      // may not list; see thread_create's module doc). The reply IS the
       // summary; this component never hand-builds one.
       let outcome =
         rescue.rescue(fn() {
@@ -2098,14 +2097,7 @@ fn create_effect(model: Model, alias: String) -> Effect(Msg) {
                   toolset: None,
                   bot_id: None,
                 )
-              case
-                thread_create.create_thread(
-                  providers,
-                  registry,
-                  timeout,
-                  requested,
-                )
-              {
+              case thread_create.create_thread(providers, registry, requested) {
                 Ok(summary) -> Ok(summary)
                 Error(problem) -> Error(thread_create.describe(problem))
               }
@@ -2123,21 +2115,18 @@ fn create_effect(model: Model, alias: String) -> Effect(Msg) {
 }
 
 /// Start a thread FROM a bot (bots plan P1): the shared create-from-bot
-/// orchestration resolves the bot, copies its frozen values, and
-/// re-validates the alias against the provider's LIVE list — the same
-/// stale-alias refusal the plain flow got from #73. A deleted bot (the
-/// row vanished between the pick and the click) reads as a create
-/// failure note, same vocabulary as every other refusal.
+/// orchestration resolves the bot and copies its frozen values — the
+/// alias pinned as-is, like the plain flow. A deleted bot (the row
+/// vanished between the pick and the click) reads as a create failure
+/// note, same vocabulary as every other refusal.
 fn create_from_bot_effect(model: Model, bot_id: String) -> Effect(Msg) {
   let registry = model.registry
   let providers = model.providers
   let bots = model.bots
-  let timeout = model.models_timeout_ms
   effect.from(fn(dispatch) {
     // OFF the runtime loop (#88), same `models_effect` shape as
-    // `create_effect` above: the shared orchestration's live
-    // model-list re-validation blocks for up to the shared timeout,
-    // and the connection's UI must keep serving events meanwhile.
+    // `create_effect` above: the worker's registry asks must never
+    // block this connection's UI.
     process.spawn_unlinked(fn() {
       // Same rescue contract as `create_effect` above: every exit
       // dispatches, so a crashed worker releases the pending guard
@@ -2149,7 +2138,6 @@ fn create_from_bot_effect(model: Model, bot_id: String) -> Effect(Msg) {
               bots,
               providers,
               registry,
-              timeout,
               bot_id,
             )
           {
