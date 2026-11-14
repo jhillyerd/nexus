@@ -2136,11 +2136,17 @@ async function main() {
           );
         assert(betaMessages, "Beta's turn carried the authored line to the model");
         const authored = betaMessages.find(
-          (m) => m.role === "user" && String(m.content).includes(note),
+          (m) =>
+            m.role === "user" && String(m.content).includes(note),
         );
         assert(
-          authored && authored.content.endsWith(note),
-          "authored line is the From prefix plus the tool's text",
+          authored &&
+            authored.content.endsWith(
+              "(reply via the bot_message tool with to \"" +
+                alphaThread +
+                "\" — a plain reply stays in this thread and never reaches the sender)",
+            ),
+          "authored line is the From prefix, the tool's text, and the reply hint",
         );
         // Beta's envelope carries its own (bot-default) toolset.
         const betaBody = bodies.find(

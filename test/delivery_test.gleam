@@ -542,7 +542,12 @@ pub fn deliver_by_name_creates_dm_test() {
   // thread (so the target can reply precisely), and the origin sidecar
   // records author + hop depth for the UI badge.
   let #(text, origin) = last_user_line(booted.registry, dm_id)
-  should.equal(text, "From alpha (thread s-alpha): hello beta")
+  should.equal(
+    text,
+    "From alpha (thread s-alpha): hello beta"
+      <> "\n\n(reply via the bot_message tool with to \"s-alpha\" — a plain"
+      <> " reply stays in this thread and never reaches the sender)",
+  )
   should.equal(origin, Some(transcript.Origin("alpha", 1)))
 
   let assert Ok(dm_summary) =
@@ -559,7 +564,12 @@ pub fn deliver_by_name_creates_dm_test() {
     deliver(booted.registry, alpha.id, "alpha", "s-alpha", 1, "beta", "again")
   should.equal(dm_id2, dm_id)
   let #(text2, _) = last_user_line(booted.registry, dm_id)
-  should.equal(text2, "From alpha (thread s-alpha): again")
+  should.equal(
+    text2,
+    "From alpha (thread s-alpha): again"
+      <> "\n\n(reply via the bot_message tool with to \"s-alpha\" — a plain"
+      <> " reply stays in this thread and never reaches the sender)",
+  )
 }
 
 /// Thread-id addressing goes direct (no DM map), including into a HUMAN
@@ -647,7 +657,13 @@ pub fn bot_message_tool_delivers_end_to_end_test() {
   let #(text, origin) = last_user_line(booted.registry, dm_id)
   should.equal(
     text,
-    "From alpha (thread " <> alpha_thread.id <> "): hello from the loop",
+    "From alpha (thread "
+      <> alpha_thread.id
+      <> "): hello from the loop"
+      <> "\n\n(reply via the bot_message tool with to \""
+      <> alpha_thread.id
+      <> "\" — a plain reply stays in this thread and never reaches"
+      <> " the sender)",
   )
   should.equal(origin, Some(transcript.Origin("alpha", 1)))
 }
