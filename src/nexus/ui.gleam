@@ -59,9 +59,10 @@ import nexus/ui_settings
 ///
 /// `models_timeout_ms` is the shared live-model budget
 /// (`thread_create.models_timeout`): the ONE `list_models` timeout rule,
-/// used by the picker reload — never a per-surface constant. (The create
-/// path itself no longer fetches the list: aliases are not validated at
-/// create.)
+/// used by every live-list fetch this connection makes — the picker
+/// reload, the Settings Test control, and the bot-form comboboxes.
+/// (The create path no longer fetches the list: aliases are not
+/// validated at create.)
 ///
 /// `thread` is the client-supplied last-selected thread (the `/ws`
 /// route's `thread` query parameter, persisted by the page shell): each
@@ -206,8 +207,9 @@ pub type Model {
     /// The bot registry subject (Settings Bots CRUD, start-from-bot).
     bots: Subject(bot_registry.Msg),
     /// The shared live-model budget (`thread_create.models_timeout`):
-    /// every list_models call this connection makes — the picker reload
-    /// AND the create path's alias validation — uses it.
+    /// every list_models call this connection makes — the picker
+    /// reload, the Settings Test control, the bot-form comboboxes.
+    /// (The create path fetches nothing: aliases are not validated.)
     models_timeout_ms: Int,
     // Long-lived subscription to the selected thread's events, owned by
     // this connection's runtime (one runtime per /ws client since the

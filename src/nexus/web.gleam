@@ -277,8 +277,9 @@ fn create_problem_status(problem: thread_create.CreateProblem) -> Int {
     thread_create.ProviderDisabled(_) -> 400
     thread_create.BotsUnavailable -> 502
     thread_create.BotUnknown(_) -> 400
-    // Post-resolution registry refusals are races: the provider passed
-    // the resolve, then could not stream when the thread pinned it.
+    // Provider and start failures after resolution are races: the
+    // provider passed the resolve, then could not stream when the
+    // thread pinned it. (EmptyModel above is client data, not a race.)
     thread_create.CreateFailed(thread_registry.EmptyModel) -> 400
     // A stale bot's toolset named a tool outside the compiled catalog
     // (bots plan P2): a client-data problem, refused like a bad alias.

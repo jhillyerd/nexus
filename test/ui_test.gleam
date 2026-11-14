@@ -4358,12 +4358,13 @@ fn wait_for_thread_count(
 /// The create worker over the real runtime, pinning the no-preflight
 /// contract end to end: an alias OFF the provider's live list lands as a
 /// pinned thread (proxies like Bifrost accept aliases their /v1/models
-/// may not carry — see `nexus/thread_create`; the create fetches no
-/// model list at all), and the runtime keeps serving view messages
-/// around the worker (#88's liveness pin — the worker is spawned
-/// unlinked; the old test's deterministic preflight park is gone with
-/// the preflight itself, and duplicates-while-pending stay pinned at the
-/// unit level, `create_pending_guard_spans_both_paths_test`).
+/// may not carry — see `nexus/thread_create`), and the create path
+/// fetches no model list at all. The view-patch check below only
+/// EXERCISES runtime liveness — with the preflight gone, nothing on the
+/// create path can block, so this test no longer proves it (that
+/// guarantee is structural: the worker is spawned unlinked;
+/// duplicates-while-pending stay pinned at the unit level,
+/// `create_pending_guard_spans_both_paths_test`).
 pub fn create_worker_lands_off_list_alias_and_runtime_stays_live_test() {
   // The gate protocol doubles as the settle barrier: the boot alias load
   // is the ONLY fetch this test answers — receiving its signal proves
