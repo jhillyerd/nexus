@@ -236,9 +236,9 @@ flowchart TB
     alongside `count_threads_for_provider`) — never a call into the
     bot registry;
   - create-from-bot resolves the bot in `thread_create`, copies its
-    frozen values into the creation request, and re-validates the
-    model alias against the provider's LIVE list (a stale bot must
-    400, never silently succeed); the thread registry never sees
+    frozen values into the creation request, and pins the alias as-is
+    (aliases are not validated at create at all — a stale alias fails
+    its first turn at stream time); the thread registry never sees
     bots beyond the `bot_id` provenance column.
   - bots P3c: the thread registry holds the bot registry's NAME (boot
     wiring, like the provider resolver seam) only to build the
@@ -366,8 +366,9 @@ public shape). Loads the whole table at boot (an unreachable store fails
 boot); write-through CRUD with the in-state duplicate-name pre-check;
 deletes are unguarded because `thread.bot_id` is `ON DELETE SET NULL`
 provenance — a bot's threads keep their frozen columns. A stale model
-alias is legitimate at rest: thread create re-validates it against the
-provider's live list. Never resolves providers (§4's no-edges rule) and
+alias is legitimate at rest: nothing re-validates it — not even thread
+create (aliases are not validated at create; a dead alias fails its
+first turn at stream time). Never resolves providers (§4's no-edges rule) and
 never touches the network.
 
 ### Thread registry
@@ -405,9 +406,8 @@ Bots P3c adds three things (issue #97):
   states). Name addressing routes through an in-memory per (sender bot,
   target bot) DM-thread map, find-or-creating from the target bot
   through the same internal start path as any create (no second
-  frozen-value path; the live model-alias revalidation `thread_create`
-  performs for user-facing creates is deliberately skipped here — it is
-  a network call, and no network call may run inside this actor). A
+  frozen-value path). Like every create path, it does not validate the
+  model alias — and no network call may run inside this actor. A
   restart loses the map and opens a fresh DM thread on the next
   name-addressed delivery — receipts and `From` prefixes carry thread
   ids precisely so models can bypass the map by addressing the id.

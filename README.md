@@ -242,13 +242,14 @@ All routes except `GET /healthz` require the configured token when
   then most recently active (default: active only)
 - `GET /threads?archived=1` — archived summaries only
 - `POST /threads` `{"provider":"id-or-name","model":"alias"}` —
-  the provider is resolved by id or name (unknown/disabled → `400`),
-  the alias validated against that provider's live model list, and the
-  `(provider, model)` pair pinned for the thread's lifetime — or
-  `{"bot":"id"}` alone, which sources the provider, model, and system
-  prompt from the bot at creation (unknown bot → `400`, a stale alias
-  → `400`; mixing `bot` with `provider`/`model` → `400`, even when the
-  provider/model values are blank). Editing a bot never changes an
+  the provider is resolved by id or name (unknown/disabled → `400`)
+  and the alias pinned AS-IS for the thread's lifetime — NOT validated
+  against the provider's live model list (proxies like Bifrost accept
+  aliases their `/v1/models` may not carry; a dead alias fails the
+  thread's first turn) — or `{"bot":"id"}` alone, which sources the
+  provider, model, and system prompt from the bot at creation (unknown
+  bot → `400`; mixing `bot` with `provider`/`model` → `400`, even when
+  the provider/model values are blank). Editing a bot never changes an
   existing thread — its provider/model/prompt were copied at creation —
   and deleting one only clears the `bot_id` provenance.
   (There is no global `GET /models` — with N providers there is no
