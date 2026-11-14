@@ -207,8 +207,11 @@ the rules that bite silently:
   (`tool_provider.run`) arms its monitor BEFORE dispatch, re-signals the
   cancel subject on the Cancel path (the codemode rule — the loop's
   LAST-call path depends on it), and truncates every provider byte at
-  the boundary. Boot asks are bounded; a compiled plugin that will not
-  start or answer fails boot.
+  the boundary — a CHARACTER cap applied AFTER receipt, display
+  hygiene only: it does not bound allocation for in-process plugins
+  (trusted code, the same trust as compiled tools); external
+  transports (MCP, Phase 2) must cap while READING. Boot asks are
+  bounded; a compiled plugin that will not start or answer fails boot.
 - **`plugin_sup` is a separate OneForOne tree linked to boot** (see
   ARCHITECTURE.md §2) — the provider table must be one value shared by
   the bot registry's validation closure and the thread registry; root

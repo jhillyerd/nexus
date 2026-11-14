@@ -373,6 +373,17 @@ mechanics discovered mid-build):
   `tools.by_names_with(cfg, table, names)`; `by_names` is the empty-table
   case; the bot registry's validation closure resolves through the table
   too, so bot templates can pin plugin tools.
+- Review-hardened after the PR review (cubic): half-names also reject
+  leading/trailing `_` — `a_`+`b` and `a`+`_b` both qualified to
+  `a___b`, so the separator was not the only `__` in a qualified name
+  (split-ambiguity); a plugin's `timeout_ms` override is validated
+  against the same 100 ms floor as the config (a negative override
+  reaches Erlang's `after` and crashes the per-turn worker with
+  `timeout_value`); the failed-dispatch branch demonitors before
+  returning; and every send to a provider's named subject is
+  rescue-guarded (unregistered-name sends badarg in the pinned
+  gleam_erlang — a provider dying with its DOWN in flight must
+  degrade to a tool error, never kill the worker).
 
 ### Phase 2 — MCP config adapter + frozen snapshots
 

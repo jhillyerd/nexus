@@ -70,7 +70,7 @@ a live registry.
 flowchart TB
     PSUP["plugin_sup (OneForOne, linked to boot)<br/>nexus/plugin — only when NEXUS_PLUGINS is set"]
     ROOT["root supervisor (OneForAll)<br/>nexus/boot"]
-    PSUP -.->|"bounded ListTools snapshot →<br/>the provider table both consumers share"| ROOT
+    PSUP -.->|"boot runs plugin.boot: starts the tree, then<br/>the bounded ListTools snapshot whose table<br/>feeds the root's consumers"| ROOT
     ROOT -->|"1 — persistence is mandatory;<br/>unreachable DB fails boot"| STORE["store actor<br/>nexus/store/persist"]
     ROOT -->|"2 — loads + decrypt-validates<br/>every provider row"| PROV["provider registry<br/>nexus/provider_registry"]
     ROOT -->|"3 — loads every bot row"| BOT["bot registry<br/>nexus/bot_registry"]
@@ -85,10 +85,12 @@ Beside the root sits one separate tree, started before it (plugin-api
 plan Phase 1): `plugin_sup`, a OneForOne supervisor over the configured
 tool-provider actors, linked to boot — a crash-looping plugin exhausts
 its tolerance and takes boot down (fail loudly), while a single crashing
-plugin restarts alone instead of restarting every thread actor. It is
-separate because the boot-built provider table (each provider's bounded
-`ListTools` snapshot) must be one VALUE shared by the bot registry's
-toolset validation and the thread registry's resolution — root-tree
+plugin restarts alone instead of restarting every thread actor. The
+snapshot coordination is `nexus/boot`'s, not the tree's: boot calls
+`plugin.boot`, which starts the tree and then runs each provider's
+bounded `ListTools` ask itself, returning the provider table as one
+VALUE that boot hands to both consumers (the bot registry's toolset
+validation closure and the thread registry's resolution) — root-tree
 children cannot hand values to each other. With `NEXUS_PLUGINS` unset
 no tree is started and the boot is the pre-plugin boot, byte for byte.
 
@@ -112,6 +114,9 @@ what is tied to what**.
 | Process | Actor? | Count | Lifetime | Scope / tied to |
 |---|---|---|---|---|
 | store actor (`nexus/store/persist`) | y | 1 per VM | boot → shutdown | shared by everything; owns the Postgres pool |
+| plugin_sup (`nexus/plugin`) | y (supervisor) | 0..1 per VM — only when `NEXUS_PLUGINS` is set | boot → shutdown | separate OneForOne tree **linked to boot main** (not a root child): one crash-looping plugin exhausts it and takes boot down |
+| plugin provider actor (`nexus/plugin` SDK) | y | one per configured plugin | boot → shutdown (supervised) | one plugin's tools; registered under `nexus_plugin_<name>`, addressed by name; restart re-registers |
+| plugin tool worker (`nexus/plugin`) | n | 0..N per provider | one tool call | one tool call; **unlinked** + monitored by the provider actor (crash answers `plugin tool crashed`) |
 | provider registry (`nexus/provider_registry`) | y | 1 per VM | boot → shutdown | shared; owns provider rows + plaintext keys |
 | bot registry (`nexus/bot_registry`) | y | 1 per VM | boot → shutdown | shared; owns bot rows (no secrets — the stored row is the public shape) |
 | thread registry (`nexus/thread_registry`) | y | 1 per VM | boot → shutdown | shared; owns thread IDs → live subjects |

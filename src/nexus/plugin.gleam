@@ -50,7 +50,7 @@ import gleam/erlang/process.{type Name, type Subject}
 import gleam/erlang/reference.{type Reference}
 import gleam/int
 import gleam/list
-import gleam/option
+import gleam/option.{None, Some}
 import gleam/otp/actor
 import gleam/otp/static_supervisor as supervisor
 import gleam/otp/supervision
@@ -115,10 +115,10 @@ pub fn start_named(
   name name: Name(tool_provider.Msg),
 ) -> actor.StartResult(Subject(SdkMsg)) {
   actor.new_with_initialiser(5000, fn(self) {
-    // The provider half of the reserved-separator rule (the tool half
-    // is checked at registration): an invalid plugin name refuses to
-    // START — loudly, before it can mint ambiguous wire names.
-    case validate_provider_name(p.name) {
+    // The whole-declaration boundary rule (name + timeout override):
+    // an invalid plugin refuses to START — loudly, before it can mint
+    // ambiguous wire names or a crash-inducing deadline.
+    case validate_plugin(p) {
       Error(reason) -> Error(reason)
       Ok(Nil) ->
         // Register HERE, not via `actor.named`: the name's payload type is
@@ -294,10 +294,17 @@ pub fn boot(cfg: Config) -> Result(tools.ProviderTable, String) {
   }
 }
 
-/// The provider half of the boundary rule: `^[a-zA-Z0-9_-]+$`, no
-/// `__` (the reserved separator — enforced on BOTH halves so a
-/// qualified name parses unambiguously). Checked where a plugin is
-/// resolved at boot AND at the actor seam, so no caller can skip it.
+/// The floor a plugin's per-call timeout override must meet — the same
+/// floor the config applies to `NEXUS_PLUGIN_TIMEOUT_MS` (a sub-100ms
+/// deadline could never serve a call; and a NEGATIVE value reaches
+/// Erlang's `after` and crashes with `timeout_value`, killing the
+/// per-turn worker — a loop error, not a tool error).
+const min_call_timeout_ms = 100
+
+/// The provider half of the boundary rule: `^[a-zA-Z0-9_-]+$`, no `__`,
+/// no leading or trailing `_` (see `tool_provider.valid_name`). Checked
+/// where a plugin is resolved at boot AND at the actor seam, so no
+/// caller can skip it.
 pub fn validate_provider_name(name: String) -> Result(Nil, String) {
   case tool_provider.valid_name(name) {
     True -> Ok(Nil)
@@ -306,8 +313,28 @@ pub fn validate_provider_name(name: String) -> Result(Nil, String) {
         "plugin '"
         <> name
         <> "' refused registration: provider name must match"
-        <> " ^[a-zA-Z0-9_-]+$ with no '__'",
+        <> " ^[a-zA-Z0-9_-]+$ with no '__' and no leading or trailing '_'",
       )
+  }
+}
+
+/// The whole-declaration boundary check a plugin passes before it may
+/// start or enter the catalog: the name rule above, plus a timeout
+/// override that meets the config's floor (so an override can never
+/// smuggle a crash-inducing deadline past the config validation).
+pub fn validate_plugin(p: Plugin) -> Result(Nil, String) {
+  use Nil <- result.try(validate_provider_name(p.name))
+  case p.timeout_ms {
+    Some(ms) if ms >= min_call_timeout_ms -> Ok(Nil)
+    Some(_) ->
+      Error(
+        "plugin '"
+        <> p.name
+        <> "' refused registration: timeout_ms override must be >= "
+        <> int.to_string(min_call_timeout_ms)
+        <> " ms",
+      )
+    None -> Ok(Nil)
   }
 }
 
@@ -323,7 +350,7 @@ fn compile_plugins(names: List(String)) -> Result(List(Plugin), String) {
           case by_config_name(name) {
             Error(reason) -> Error(reason)
             Ok(plugin) -> {
-              use Nil <- result.try(validate_provider_name(plugin.name))
+              use Nil <- result.try(validate_plugin(plugin))
               Ok(#(dict.insert(seen, name, Nil), [plugin, ..plugins]))
             }
           }
@@ -381,7 +408,8 @@ fn catalog_entries(
         Error(invalid(
           p.name,
           def,
-          "tool name must match ^[a-zA-Z0-9_-]+$ with no '__'",
+          "tool name must match ^[a-zA-Z0-9_-]+$ with no '__' and no"
+            <> " leading or trailing '_'",
         ))
     })
     use Nil <- result.try(

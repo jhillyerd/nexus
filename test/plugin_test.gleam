@@ -10,7 +10,7 @@ import gleam/dict
 import gleam/erlang/process
 import gleam/erlang/reference
 import gleam/list
-import gleam/option.{None}
+import gleam/option.{None, Some}
 import gleam/otp/actor
 import gleam/string
 import gleeunit/should
@@ -155,14 +155,42 @@ pub fn sdk_refuses_invalid_provider_name_test() {
   let assert Ok(Nil) = plugin.validate_provider_name("example")
 }
 
+/// A timeout override that misses the config's floor is refused loudly
+/// at both seams — a negative value would otherwise reach Erlang's
+/// `after` and crash the per-turn worker with `timeout_value` (a loop
+/// error, not a tool error).
+pub fn sdk_refuses_timeout_override_below_floor_test() {
+  let bad =
+    tool_provider.Plugin(
+      name: "hasty",
+      tools: [def("go")],
+      call: fn(_tool, _args) { Ok("never reached") },
+      timeout_ms: Some(-1),
+    )
+  let assert Error(actor.InitFailed(reason)) =
+    plugin.start_named(bad, process.new_name("nexus_plugin_bad_timeout"))
+  should.be_true(string.contains(reason, "timeout_ms override must be >= 100"))
+  // The floor, not just negativity: 50 ms is refused too, 100 passes.
+  let assert Error(_) =
+    plugin.validate_plugin(tool_provider.Plugin(..bad, timeout_ms: Some(50)))
+  let assert Ok(Nil) =
+    plugin.validate_plugin(tool_provider.Plugin(..bad, timeout_ms: Some(100)))
+}
+
 /// Cancelled kills the in-flight worker (a blocking call must not keep
 /// a process alive) and the actor keeps serving afterwards. The test
 /// drives the protocol directly so it owns the ref.
 pub fn sdk_cancelled_kills_worker_and_stays_live_test() {
   let name = process.new_name("nexus_plugin_sdk_block")
+  // The worker announces its OWN pid before blocking, so the test can
+  // monitor it: the kill is pinned by the worker's DOWN, which only
+  // arrives if Cancelled actually reaped it (an unkilled worker lives
+  // out the sleep and never goes down).
+  let woke = process.new_subject()
   let assert Ok(_) =
     plugin.start_named(
       instant_plugin("sdkblock", fn(_tool, _args) {
+        process.send(woke, process.self())
         // Block "forever": only Cancelled's kill ends this worker.
         process.sleep(30_000)
         Ok("slept")
@@ -173,9 +201,15 @@ pub fn sdk_cancelled_kills_worker_and_stays_live_test() {
   let ref = reference.new()
   let reply = process.new_subject()
   process.send(subject, Call(ref, "go", "{}", reply))
-  // Give the worker a moment to enter the sleep, then cancel.
-  process.sleep(100)
+  let assert Ok(worker) = process.receive(woke, 2000)
+  let mon = process.monitor(worker)
+  let selector =
+    process.new_selector() |> process.select_specific_monitor(mon, fn(d) { d })
   process.send(subject, Cancelled(ref))
+  // The kill: the worker's DOWN lands (a test-owned monitor — only the
+  // test receives on it, and only the kill can produce it).
+  let assert Ok(process.ProcessDown(pid: _, ..)) =
+    process.selector_receive(selector, 2000)
   // No reply ever lands for a cancelled call (the adapter already
   // ended it; the transcript carries the cancelled result).
   should.equal(process.receive(reply, 300), Error(Nil))

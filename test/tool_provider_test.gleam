@@ -128,9 +128,15 @@ pub fn valid_name_accepts_charset_test() {
 
 pub fn valid_name_rejects_bad_and_reserved_test() {
   should.be_false(tool_provider.valid_name(""))
-  // The reserved separator is enforced on both halves.
+  // The reserved separator is enforced on both halves …
   should.be_false(tool_provider.valid_name("a__b"))
   should.be_false(tool_provider.valid_name("__"))
+  // … and split-unambiguity forbids edge underscores: `a_`+`b` and
+  // `a`+`_b` would both qualify to `a___b`.
+  should.be_false(tool_provider.valid_name("a_"))
+  should.be_false(tool_provider.valid_name("_b"))
+  should.be_false(tool_provider.valid_name("_"))
+  should.be_true(tool_provider.valid_name("a_b"))
   should.be_false(tool_provider.valid_name("a b"))
   should.be_false(tool_provider.valid_name("a.b"))
   should.be_false(tool_provider.valid_name("tül"))
@@ -240,13 +246,15 @@ pub fn run_ok_and_err_round_trip_test() {
 
 pub fn run_times_out_when_provider_parks_test() {
   let name = process.new_name("nexus_plugin_parked")
-  // on_call does nothing: the reply never comes.
+  let cancels = process.new_subject()
+  // on_call does nothing: the reply never comes; on_cancel records the
+  // ref so the deadline path's best-effort Cancelled is observable.
   let assert Ok(_) =
     start_fake(
       FakeCfg(
         tools: [def("fetch")],
         on_call: fn(_, _, _, _) { Nil },
-        on_cancel: noop,
+        on_cancel: fn(ref) { process.send(cancels, ref) },
       ),
       name,
     )
@@ -255,6 +263,10 @@ pub fn run_times_out_when_provider_parks_test() {
     tool_provider.run(name, "fetch", 150, 1000, cancel, "{}"),
     Error("timed out after 150 ms"),
   )
+  // The protocol's documented deadline behavior: the provider gets a
+  // best-effort Cancelled for the abandoned call.
+  let assert Ok(_ref) = process.receive(cancels, 2000)
+  Nil
 }
 
 pub fn run_truncates_ok_and_err_test() {

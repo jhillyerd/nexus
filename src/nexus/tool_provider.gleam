@@ -119,12 +119,15 @@ pub fn qualified(provider: String, tool: String) -> String {
 }
 
 /// A provider or tool half-name is admissible when it is non-empty,
-/// every character is in `[a-zA-Z0-9_-]`, and it contains no `__` (the
-/// reserved separator — enforced on both halves so `p__t` parses
-/// unambiguously and can never collide with a compiled name).
+/// every character is in `[a-zA-Z0-9_-]`, it contains no `__`, and it
+/// neither starts nor ends with `_` (so `a_`+`b` and `a`+`_b` cannot
+/// both qualify to `a___b`): the reserved separator is then the ONLY
+/// `__` in a qualified name and `p__t` splits back unambiguously.
 pub fn valid_name(name: String) -> Bool {
   name != ""
   && !string.contains(name, "__")
+  && !string.starts_with(name, "_")
+  && !string.ends_with(name, "_")
   && list.all(string.to_graphemes(name), is_name_char)
 }
 
@@ -259,9 +262,14 @@ pub fn run(
       let subject = process.named_subject(provider)
       case try_send(subject, Call(ref, tool, arguments, reply)) {
         // The provider died between the liveness check and the
-        // dispatch (name unregistered, DOWN never armed to help):
-        // same honest answer as the entry check.
-        False -> Error("tool provider is unavailable")
+        // dispatch (name unregistered): same honest answer as the
+        // entry check, and the monitor is demonitored first so a
+        // racing DOWN (noproc fires immediately on a dead pid) is
+        // flushed instead of queueing as garbage in the worker.
+        False -> {
+          process.demonitor_process(mon)
+          Error("tool provider is unavailable")
+        }
         True ->
           select(subject, ref, mon, reply, cancel, timeout_ms, max_output_chars)
       }

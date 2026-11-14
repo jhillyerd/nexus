@@ -223,7 +223,11 @@ pub fn load_rejects_negative_plugin_output_cap_test() {
     #("NEXUS_ENCRYPTION_KEY", key_b64),
     #("NEXUS_PLUGIN_MAX_OUTPUT_CHARS", "-1"),
   ])
-  let assert Error(_) = config.load()
+  let assert Error(message) = config.load()
+  message
+  |> should.equal(
+    "environment variable NEXUS_PLUGIN_MAX_OUTPUT_CHARS must be >= 0: -1",
+  )
 }
 
 pub fn load_codemode_overrides_test() {
