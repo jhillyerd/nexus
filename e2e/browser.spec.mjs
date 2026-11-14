@@ -538,34 +538,42 @@ async function main() {
         { timeout: 15_000, message: "second thread appears" },
       );
       const labels = await page.$$eval("#thread-list .thread-main", (els) => els.map((e) => e.textContent));
-      // #107 dropped provider/model from the row subtitle: the label is
-      // the alias (title fallback) + age, with no provider prefix.
-      assert(labels.some((l) => l.includes("fast") && !l.includes("fake/")), `new thread label: ${labels}`);
+      // #107: untitled rows read "Untitled thread" — the alias fallback
+      // left the chrome with the provider/model subtitle. The rows are
+      // indistinguishable by label now, so the switch-back below targets
+      // the thread id from the API.
+      assert(labels.some((l) => l.includes("Untitled thread")), `new thread label: ${labels}`);
       const currentLabels = await page.$$eval(
         "#thread-list .thread-main[aria-current='true']",
         (els) => els.map((e) => e.textContent),
       );
       eq(currentLabels.length, 1, "exactly one current thread");
-      assert(currentLabels[0].includes("fast") && !currentLabels[0].includes("fake/"), `current is the new thread: ${currentLabels}`);
+      assert(currentLabels[0].includes("Untitled thread"), `current is the new thread: ${currentLabels}`);
       // Switch back to the original smart thread (Created prepends, so
-      // match by label rather than DOM position).
-      await page
-        .locator("#thread-list .thread-main", { hasText: "smart" })
-        .first()
-        .click();
-      await poll(
-        () => page.locator("#model").evaluate((el) => el.textContent === "smart"),
-        { timeout: 15_000, message: "header label after switch" },
+      // match by thread id rather than DOM position).
+      const headers = { authorization: `Bearer ${TOKEN}` };
+      const smart = (await (
+        await page.request.get(`${base}/threads`, { headers })
+      ).json()).threads.find((s) => s.model === "smart");
+      const smartMain = page.locator(
+        `#thread-list .thread-row[data-thread-id="${smart.id}"] .thread-main`,
       );
-      // ui-polish F8: the header context is the thread's TITLE; "smart"
-      // here is the alias fallback (the fresh thread is untitled), the
-      // same rule the row title uses. The real title is asserted in the
-      // organize test after its manual rename.
-      const smartCurrent = await page
-        .locator("#thread-list .thread-main", { hasText: "smart" })
-        .first()
-        .getAttribute("aria-current");
-      eq(smartCurrent, "true", "smart thread current again");
+      await smartMain.click();
+      // `#model` reads "Untitled thread" for EITHER untitled row — it
+      // cannot prove the switch landed — so the row's own aria-current
+      // is the poll target.
+      await poll(
+        async () => (await smartMain.getAttribute("aria-current")) === "true",
+        { timeout: 15_000, message: "smart thread current again" },
+      );
+      // ui-polish F8 + #107: the header context is the thread's TITLE —
+      // "Untitled thread" until the first message auto-titles it. The
+      // real title is asserted in the organize test after its rename.
+      eq(
+        await page.locator("#model").textContent(),
+        "Untitled thread",
+        "header title placeholder",
+      );
     });
 
     // -- 3b. thread organization --------------------------------------------
@@ -1989,7 +1997,7 @@ async function main() {
             !!kept
             && kept.provider_id === madeThread.provider_id
             && kept.model === madeThread.model
-            && rowText.includes("smart")
+            && rowText.includes("Untitled thread")
             && !rowText.includes("Writer")
           );
         },

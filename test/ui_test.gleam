@@ -1333,9 +1333,10 @@ pub fn view_renders_shell_and_sidebar_test() {
   should.be_true(string.contains(html, "id=\"app\""))
   should.be_true(string.contains(html, "id=\"thread-list\""))
   // M3 organization: the row carries the thread id; the title falls back
-  // to the alias until auto-titled. The subtitle no longer names the
-  // model (#107) — provenance is bot-or-nothing, then the age.
+  // to "Untitled thread" until auto-titled (#107: the alias left the
+  // chrome with the subtitle; provenance is bot-or-nothing, then the age).
   should.be_true(string.contains(html, "data-thread-id=\"s-1\""))
+  should.be_true(string.contains(html, "Untitled thread"))
   should.be_false(string.contains(html, "smart · "))
   should.be_true(string.contains(html, "class=\"thread-sub\""))
   should.be_true(string.contains(html, "aria-current=\"true\""))
@@ -1400,13 +1401,15 @@ pub fn view_header_shows_thread_title_test() {
   should.be_true(string.contains(html, "id=\"model\""))
   should.be_true(string.contains(html, "Renamed thread"))
 
-  // Untitled thread: the alias is the fallback, matching the row title.
+  // Untitled thread: a plain placeholder, in the header and the row —
+  // the alias fallback left the chrome with the subtitle (#107).
   let html =
     new_model()
     |> step(ui.ThreadsLoaded([summary("s-1", False)]))
     |> step(ui.Select("s-1"))
     |> view_string
-  should.be_true(string.contains(html, ">smart<"))
+  should.be_true(string.contains(html, ">Untitled thread<"))
+  should.be_false(string.contains(html, ">smart<"))
 }
 
 pub fn view_header_fallback_labels_test() {

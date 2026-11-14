@@ -530,7 +530,7 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
   transform: translateY(-50%); padding: 0 .3rem; min-height: 0; width: auto;
   border: none; background: none; font-size: .9rem; line-height: 1.4; opacity: .55; }
 #app .filter-box #filter-clear:hover { opacity: 1; }
-.archive-toggle-row { margin-top: .6rem; }
+.archive-toggle-row { margin: .6rem 0; }
 #app .toggle { font-size: .78rem; padding: .28rem .6rem; opacity: .8; }
 #app .toggle.on { opacity: 1; border-color: #3b82f6; color: #3b82f6; }
 .thread-list { display: flex; flex-direction: column; gap: .55rem; }

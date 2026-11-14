@@ -2367,11 +2367,10 @@ fn sidebar(model: Model) -> Element(Msg) {
         [attr.id("thread-list"), attr.class("thread-list"), attr.role("list")],
         thread_rows(model),
       ),
-      // The archived toggle sits BELOW the list (#107): it reveals the
-      // archive group that renders at the list's bottom, so the control
-      // belongs next to what it reveals, not above a list the user is
-      // about to read. `#show-archived` keeps its id — the browser suite
-      // drives it — and the toggle class language is unchanged.
+      // The archived toggle sits BETWEEN the active rows and the archive
+      // group (#107 follow-up): clicking it grows the section underneath,
+      // so the control never moves. `#show-archived` keeps its id — the
+      // browser suite drives it.
       html.div([attr.class("archive-toggle-row")], [
         html.button(
           [
@@ -2391,6 +2390,7 @@ fn sidebar(model: Model) -> Element(Msg) {
           ],
         ),
       ]),
+      archived_rows(model),
     ]),
   ])
 }
@@ -2496,25 +2496,21 @@ fn tag_filter_row(model: Model) -> Element(Msg) {
   ])
 }
 
-/// The visible rows: the filter runs first (title + tags), then the list
-/// splits into the pinned section, the recency buckets, and (when the
-/// toggle is on) the archived section.
+/// The visible ACTIVE rows: the filter runs first (title + tags), then
+/// the list splits into the pinned section and the recency buckets.
+/// Archived rows render separately, below the toggle (see `archived_rows`).
 fn thread_rows(model: Model) -> List(Element(Msg)) {
   let visible =
     list.filter(model.threads, fn(summary) {
       matches_filter(summary, model.tag_filter)
     })
-  let has_active = list.any(visible, fn(summary) { !summary.archived })
-  let has_archived =
-    model.show_archived && list.any(visible, fn(summary) { summary.archived })
-  case has_active || has_archived {
+  case list.any(visible, fn(summary) { !summary.archived }) {
     False -> [
       html.p([attr.class("muted")], [html.text(empty_state_text(model))]),
     ]
     True -> {
       let pinned = list.filter(visible, fn(s) { s.pinned && !s.archived })
       let unpinned = list.filter(visible, fn(s) { !s.pinned && !s.archived })
-      let archived = list.filter(visible, fn(s) { s.archived })
       let pinned_group = case pinned {
         [] -> element.none()
         rows ->
@@ -2523,20 +2519,30 @@ fn thread_rows(model: Model) -> List(Element(Msg)) {
             ..list.map(rows, thread_row(model, _))
           ])
       }
-      let archived_group = case model.show_archived, archived {
-        True, [_first, ..] ->
+      [pinned_group, ..bucket_groups(model, unpinned)]
+    }
+  }
+}
+
+/// The archive group, rendered by `sidebar` BELOW the toggle so the
+/// control sits between the active rows and the archived ones: clicking
+/// the toggle grows this section underneath without moving the button.
+fn archived_rows(model: Model) -> Element(Msg) {
+  case model.show_archived {
+    False -> element.none()
+    True -> {
+      let archived =
+        list.filter(model.threads, fn(summary) {
+          summary.archived && matches_filter(summary, model.tag_filter)
+        })
+      case archived {
+        [] -> element.none()
+        rows ->
           html.div([attr.class("thread-group archive-group")], [
             html.h3([attr.class("group-label")], [html.text("Archived")]),
-            ..list.map(archived, thread_row(model, _))
+            ..list.map(rows, thread_row(model, _))
           ])
-        _, _ -> element.none()
       }
-      [
-        pinned_group,
-        ..list.append(bucket_groups(model, unpinned), [
-          archived_group,
-        ])
-      ]
     }
   }
 }
@@ -2545,7 +2551,9 @@ fn empty_state_text(model: Model) -> String {
   case string.trim(model.tag_filter) {
     "" ->
       case model.show_archived {
-        True -> "No threads."
+        // The muted line is the ACTIVE section's empty state; with the
+        // archive revealed, archived rows may still sit below the toggle.
+        True -> "No active threads."
         False -> "No threads yet."
       }
     _ -> "No threads match the filter."
@@ -2577,11 +2585,9 @@ fn bucket_groups(
 }
 
 /// The header's thread context (ui-polish F8): the selected thread's
-/// title — the bare model alias ("nexus  smart") was cryptic, and the
-/// alias already rides the row subtitle. An untitled thread falls back
-/// to its alias (the row-title rule); with nothing selected the
-/// `model_label` fallbacks ("connecting…", "thread ended") keep their
-/// feedback role.
+/// title. An untitled thread falls back to "Untitled thread" (the
+/// row-title rule); with nothing selected the `model_label` fallbacks
+/// ("connecting…", "thread ended") keep their feedback role.
 fn header_title(model: Model) -> String {
   case model.selected {
     Some(id) ->
@@ -2593,11 +2599,14 @@ fn header_title(model: Model) -> String {
   }
 }
 
-/// Display title for a thread: its title, or the model alias until the
-/// first message auto-titles it.
+/// Display title for a thread: its title, or "Untitled thread" until the
+/// first message auto-titles it (#107 follow-up: the alias fallback was a
+/// milestone-era identity cue — the same one that left the subtitle — so
+/// an untitled thread reads as a plain placeholder in the row and the
+/// header, not as a bare model name).
 fn display_title(summary: thread.ThreadSummary) -> String {
   case summary.title {
-    "" -> summary.model
+    "" -> "Untitled thread"
     titled -> titled
   }
 }
