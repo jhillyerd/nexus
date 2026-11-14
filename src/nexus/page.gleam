@@ -472,6 +472,33 @@ fn css() -> String {
   --pico-primary-hover-border: #2563eb;
   --pico-primary-focus: color-mix(in srgb, #3b82f6 35%, transparent);
 }
+
+/* The bot forms' model combobox (ui_settings, datalist-backed): the
+   select-style chevron marks the field as offering OUR list, so at rest
+   it doesn't read as a plain text input feeding the browser's own
+   autofill/history suggestions (autocomplete=off handles the popup
+   side). Reuses Pico's own icon variable, so light/dark follow the
+   theme for free — a data URI here could not. */
+#app input.combo {
+  padding-right: calc(var(--pico-form-element-spacing-horizontal) + 1.5rem);
+  background-image: var(--pico-icon-chevron);
+  background-position: center right 0.75rem;
+  background-size: 1rem auto;
+  background-repeat: no-repeat;
+}
+/* Chrome draws its own solid indicator (the same glyph it uses for
+   autofill/history entries) at the right edge on hover/focus — beside
+   ours it read as two competing arrows. It is UA-internal (the
+   calendar-picker-indicator pseudo only styles date inputs), so instead
+   stand OUR chevron down while Chrome's is painted: rest state is the
+   themed decoration, interaction is the native clickable affordance.
+   WebKit/Blink only — Firefox draws no indicator and keeps ours. */
+@supports selector(::-webkit-calendar-picker-indicator) {
+  #app input.combo:hover,
+  #app input.combo:focus {
+    background-image: none;
+  }
+}
 @media only screen and (prefers-color-scheme: dark) {
   :root:not([data-theme=light]), :host(:not([data-theme=light])) {
     --pico-primary: #60a5fa;
