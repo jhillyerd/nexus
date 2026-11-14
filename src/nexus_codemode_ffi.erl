@@ -4,7 +4,9 @@
 -module(nexus_codemode_ffi).
 
 -export([set_max_heap_size_words/1, set_trap_exit/1, counter_next/1,
-         counter_add/2, safe_call/1, safe_format_error/1]).
+         safe_call/1, safe_format_error/1,
+         task_put_pending/3, task_put_settled/2, task_get/1,
+         kill_pending_tasks/0]).
 
 %% Hard memory ceiling for the CALLING process (the engine child): a VM
 %% that outgrows it is killed with reason `killed`, which the worker
@@ -51,21 +53,49 @@ counter_next(Key) ->
     erlang:put(Key, N + 1),
     N + 1.
 
-%% Add N to the per-process counter in one step (call_all budgets a
-%% whole batch before spawning anything) and return the new count.
-counter_add(Key, N) ->
-    V = case erlang:get(Key) of
-            undefined -> 0;
-            V0 -> V0
-        end,
-    erlang:put(Key, V + N),
-    V + N.
+%% ------------------------------------------------------------------
+%% Task handle registry (await/all_settled redesign, ex-phase-2).
+%%
+%% The engine process owns every started task; the registry lives in
+%% its process dictionary beside the budget counter. Entries are the
+%% Gleam constructors {task_pending, Subject, Pid} / {task_settled,
+%% Outcome} — this module only stores and returns the terms, never
+%% inspects them (kill_pending_tasks/0 pattern-matches the pending
+%% shape only).
+
+task_put_pending(Id, Subject, Pid) ->
+    erlang:put({?MODULE, task, Id}, {task_pending, Subject, Pid}),
+    ok.
+
+task_put_settled(Id, Outcome) ->
+    erlang:put({?MODULE, task, Id}, {task_settled, Outcome}),
+    ok.
+
+task_get(Id) ->
+    case erlang:get({?MODULE, task, Id}) of
+        undefined -> {error, nil};
+        Entry -> {ok, Entry}
+    end.
+
+%% Kill every still-pending task child at engine exit. Links cover the
+%% abnormal engine deaths (worker kill, deadline, max-heap reaper) but a
+%% NORMAL exit propagates nothing — this explicit reap is the only thing
+%% guaranteeing no unawaited call outlives the script on the happy path.
+%% Unlink BEFORE killing: the engine does not trap exits, so an
+%% EXIT(killed) arriving through the link would take the engine down
+%% right before its final report. Both calls are no-ops on an
+%% already-dead child.
+kill_pending_tasks() ->
+    {dictionary, Dict} = erlang:process_info(self(), dictionary),
+    [begin erlang:unlink(P), erlang:exit(P, kill) end
+     || {{?MODULE, task, _}, {task_pending, _Subject, P}} <- Dict],
+    ok.
 
 %% Run a host-tool closure, turning a crash into an error value.
-%% call_all's children run sibling tools in their own processes with
-%% allSettled semantics: a crashing entry must report
-%% {error, "host crashed: ..."} like any other failure instead of taking
-%% the child down (and, through the link, the engine). The reason text
+%% Task children run sibling tools in their own processes: a crashing
+%% tool must settle {error, "host crashed: ..."} like any other failure
+%% instead of taking the child down (and, through the link, the
+%% engine). The reason text
 %% is capped so a pathological stacktrace cannot balloon retained
 %% output; the cut is codepoint-safe and falls back to a bare label if
 %% the truncation lands inside a multi-byte sequence.

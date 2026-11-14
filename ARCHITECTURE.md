@@ -107,7 +107,7 @@ what is tied to what**.
 | thread actor (`nexus/thread`) | y | 0..N | created on demand; replaced by the registry on crash | one thread (server-global, not per client) |
 | turn worker (runs `nexus/loop`) | n | ≤ 1 per thread at a time | one turn | one turn; unlinked + monitored by its thread actor |
 | codemode engine child (`nexus/codemode`) | n | 0..1 per turn worker | one codemode tool call | one tool call; **linked to the turn worker** |
-| `tools.call_all` batch workers | n | one per batch entry | ≤ script deadline | one tool call; **linked to the codemode engine** |
+| codemode task children (`nexus/codemode`) | n | one per started tool call | ≤ script deadline (killed at engine exit if unawaited) | one tool call; **linked to the codemode engine** |
 | utility worker (runs `nexus/utility`) | n | ≤ 1 per thread | one title/tags attempt | one thread, background; unlinked + monitored |
 | provider `ListModels` fetch | n | 1 per request | one HTTP call | one-off inside the provider registry; unlinked |
 
@@ -157,7 +157,7 @@ flowchart TB
     sa["thread actor(s)"]
     tw["turn worker"]
     uw["utility worker"]
-    eng["codemode engine<br/>+ call_all workers"]
+    eng["codemode engine<br/>+ task children"]
     store["store actor"]
     pg[("Postgres")]
     llm["OpenAI-compatible provider"]
@@ -304,7 +304,9 @@ sequenceDiagram
 - **Codemode engine** — for a codemode tool call, the turn worker spawns a
   **linked** engine child running the sandboxed Lua VM (wall-clock
   deadline kill, ~64 MiB heap ceiling). The engine in turn spawns
-  **linked** `tools.call_all` workers for parallel sibling-tool batches.
+  **linked** task children — one per started tool call (`tools.<name>`
+  spawns eagerly and hands the script a handle to `await`), reaped at
+  engine exit whether awaited or not.
   The links are deliberate: teardown should cascade inward, while the
   worker itself stays unlinked from the actor above it.
 - **Utility worker** — background title/tags branch (`nexus/utility`),

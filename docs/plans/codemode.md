@@ -2,7 +2,7 @@
 title: Nexus — codemode tool (Lua scripts in the agent loop)
 status: active
 tags: [computing, self-hosting, local-llm, agents, gleam, beam, codemode]
-updated: 2026-11-08
+updated: 2026-11-14
 ---
 
 # Codemode: model-authored Lua scripts as a tool
@@ -24,12 +24,22 @@ EYG and ports documented as future alternatives behind the same seam.
 - **Engine**: [glua](https://hex.pm/packages/glua) v2 (Gleam wrapper over
   Luerl, pure-Erlang Lua 5.3 — no `coroutine` library, which codemode does
   not need).
-- **Script surface**: plain Lua 5.3 plus a host table:
-  - `tools.<name>(args)` — call a sibling tool; `args` is a Lua table shaped
-    like the tool's JSON schema; returns the tool's content string, or raises
-    a Lua error carrying the tool error text.
-  - `tools.call_all({{name=…, args=…}, …})` — phase 2: run a list of calls in
-    parallel, one array of allSettled values back in input order.
+- **Script surface**: plain Lua 5.3 plus JS-style async tool calls
+  (redesigned 2026-11-14, below — replaces the phase-1/2 dual API):
+  - `tools.<name>(args)` — START a sibling tool call eagerly (one
+    linked child process under `safe_call`) and return an opaque
+    handle, a promise; `args` is a Lua table shaped like the tool's
+    JSON schema. Draws the tool-call budget whether awaited or not.
+  - `await(handle)` — block for the settle and return the tool's content
+    string, or raise the tool's error at the await site like an
+    unhandled promise rejection (catchable with `pcall`). Double-await
+    returns the cached settle.
+  - `all_settled({handle, …})` — preamble Lua over `pcall(await, h)`:
+    one array in input order, each entry `{ok=true, result=…}` or
+    `{ok=false, error=…}` — the `Promise.allSettled` pattern. Starting
+    calls before awaiting them overlaps them (`Promise.all` shape).
+  - An unawaited handle rendered as output says so (the missing-await
+    bug self-describes); unawaited children are killed at engine exit.
   - `text(value)` — append an output item (strings as-is, tables as JSON).
   - `print(...)` — overridden; appends to a `<console_output>` block.
   - **Every** value the script's `return` yields becomes a trailing output
@@ -136,11 +146,52 @@ EYG and ports documented as future alternatives behind the same seam.
    calls, digests both, returns one small result; all tests green offline; UI
    renders script and result as ordinary (inert, truncated) tool content.
 
-## Phase 2 — parallel batch (`tools.call_all`) — IMPLEMENTED
+## Phase 3 — JS-style async surface (`await`/`all_settled`) — IMPLEMENTED
+
+Implemented 2026-11-14. Replaces the dual API (phase-1 synchronous
+`tools.<name>(args)` abort-on-error + phase-2 `tools.call_all` batch)
+with the one idiom every model already knows from JavaScript:
+handle-returning calls, `await`, and `all_settled`. This is the plan's
+"Later" `bg`/`await` tier pulled forward, with the sugar that
+`tools.<name>(args)` itself is the `bg()` call — no closures anywhere
+(the rejected L3 shape).
+
+- **Eager start**: `tools.<name>(args)` spawns the task child
+  immediately (JS promises are eager), so plain awaits over
+  pre-started handles overlap without any combinator. `call_all` is
+  deleted — `all_settled` is the one host-needed combinator (Lua
+  cannot build one from in-engine calls).
+- **Budget at START, not await** — an unawaited call still costs
+  (carries the phase-2 rule: budget is charged before the deadline
+  short-circuit, so a near-deadline script cannot mint uncounted
+  handles).
+- **Crash isolation everywhere**: every call runs in a child under
+  `safe_call`, which FIXES the phase-1 asymmetry where a crashing
+  sibling took the engine down ("engine crashed") on the sync path.
+- **Host functions never raise into pcall**: a host-side `glua.error`
+  surfaces to Luerl wrapped in glua's action-error term, which
+  `pcall` hands back as an unformattable tuple dump. So the host
+  `__nexus_await_raw(handle)` returns `(ok, value)` as plain values,
+  and the preamble's `await` wrapper (and the `tools` table's
+  `__index` unknown-tool raise) raise Lua-side with `error()`, which
+  `pcall` extracts cleanly — `all_settled` is exactly that `pcall`.
+- **Settle caching**: first settle wins and is cached in the engine's
+  process dictionary (same cell pattern as the budget counter), so
+  double-await is instant and a cached failure re-raises — awaiting a
+  rejected promise twice throws twice, as in JS.
+- **Straggler reap**: unawaited children are unlinked-and-killed at
+  engine exit (a NORMAL exit propagates nothing through links) — the
+  old `call_all` straggler kill, now the engine-exit path for every
+  task. Await timeout settles `deadline exceeded` (unlinked-killed,
+  cached) with the same 50 ms wrap-up margin so a partial fold can
+  emit before the worker's kill.
+
+## Phase 2 — parallel batch (`tools.call_all`) — SUPERSEDED by phase 3
 
 Implemented 2026-11-08 alongside two hardening points the plan text
 under-specified (both found by tests, both pinned by regression tests),
-plus three cubic review fixes on the phase-2 PR (all pinned):
+plus three cubic review fixes on the phase-2 PR (all pinned, all
+carried into phase 3 where they still apply):
 
 - **The batch is budgeted BEFORE the deadline short-circuit** —
   deadline-exceeded values are still handed to the script, so those
@@ -158,8 +209,8 @@ plus three cubic review fixes on the phase-2 PR (all pinned):
   runs its host closure under a crash-catching FFI (`safe_call`) — a
   panicking entry returns `{ok=false, error="host crashed: …"}` instead
   of taking the engine down through the link (allSettled semantics,
-  applied to crashes too; the SYNC path still dies as "engine crashed",
-  its pinned phase-1 behavior).
+  applied to crashes too). Phase 3 extends this to EVERY call: the
+  sync-path "engine crashed" is gone.
 - **The straggler reap unlinks before killing.** Killing a child that
   already reported but is still winding down would otherwise deliver
   `EXIT(killed)` through its link and take the ENGINE down — every
@@ -195,9 +246,10 @@ before the wall-clock kill — see `batch_deadline_margin_us`):
 
 ## Later / non-goals (recorded, not planned)
 
-- `bg`/`await` futures (overlapping dependent work) — additive later; the
-  `go`/`wait` state-forking design is rejected for now (outside glua's
-  state-threading contract).
+- `bg`/`await` futures — DONE: phase 3 is this tier, pulled forward as
+  the whole surface (`tools.<name>(args)` IS `bg()`; `await` blocks).
+  Still open: cancellation of a SINGLE awaited task from Lua (today
+  only the turn-level Stop exists).
 - `luerl_sandbox` reduction-budget FFI (CPU-hog preemption nicer than kill).
 - `store`/`load` KV across calls — would ride the transcript sidecar pattern
   (`reasoning_at` precedent) so it can never perturb request bytes.
