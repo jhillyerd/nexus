@@ -265,6 +265,23 @@ All routes except `GET /healthz` require the configured token when
 - `POST /threads/<id>/send` `{"text":"…"}` — start a turn (202; 409 while busy);
   the first message also auto-titles the thread
 - `POST /threads/<id>/stop` — cancel and commit the partial reply
+- `GET /threads/<id>/state` — debug dump: the server's complete
+  point-in-time view of one thread as JSON — `summary`, `status`,
+  `messages`, and `live_turn` while a turn is in flight (`null` when
+  idle — the key is always present). Each message row carries
+  chronological `seq` (0 = system prompt), role, content,
+  `stamped_at`, `origin`; assistant rows add `reasoning` and
+  `tool_calls` (id/name/arguments verbatim); tool rows add
+  `tool_call_id` and `is_error` (failed call → `true`). `live_turn`'s
+  `rounds` is the display mirror transcript — committed history as of
+  the send plus the in-flight rounds finished so far — beside the
+  pending stream buffers. Read-only side channel for curl and tests —
+  the UI never consumes it (its data path stays `/ws`). Like every
+  per-thread route it resolves the live actor, so a dormant thread
+  lazy-starts; and `summary` is the registry's snapshot, so under
+  concurrent activity its `message_count`/`streaming` can lag
+  `status` by an instant. A future abridged print/PDF view
+  (`/threads/<id>/transcript`) is tracked in issue #117
 - `GET /healthz` — unauthenticated liveness probe
 
 The browser UI does not use the JSON routes — it talks to the server

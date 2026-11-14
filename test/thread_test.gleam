@@ -1966,3 +1966,60 @@ pub fn authored_send_empty_author_is_no_author_test() {
   let assert Ok(gate) = process.receive(gate_request, 2000)
   process.send(gate, Nil)
 }
+
+/// The `/threads/<id>/state` dump's actor half (`web.gleam` asks
+/// `thread.inspect`): idle — committed transcript only, not streaming,
+/// no live mirror. The runner never fires.
+pub fn inspect_reports_idle_state_test() {
+  let sess = start_with(gated_runner(process.new_subject()))
+  let inspect = thread.inspect(sess)
+
+  should.be_false(inspect.status.streaming)
+  should.equal(1, inspect.status.message_count)
+  should.equal(None, inspect.live_turn)
+  should.equal(1, transcript.length(inspect.transcript))
+}
+
+/// Mid-turn the dump must report the ACTOR's truth: the committed
+/// transcript still holds only what was committed at Send (the worker
+/// owns the extended one until WorkerDone), `streaming` is on, and the
+/// live mirror carries the finished rounds plus the pending iteration
+/// buffers. The mirror drops and the transcript settles at completion.
+pub fn inspect_midturn_sees_mirror_then_settles_test() {
+  let gate_request = process.new_subject()
+  let sess = start_with(gated_runner(gate_request))
+  let sub = join(sess)
+  let _ = expect_event(sub)
+
+  should.equal(thread.send_message(sess, "research it"), thread.Sent)
+  let assert Ok(gate) = process.receive(gate_request, 5000)
+
+  let inspect = thread.inspect(sess)
+  should.be_true(inspect.status.streaming)
+  // Committed: system + user only — the worker's rounds are not
+  // installed yet.
+  should.equal(2, transcript.length(inspect.transcript))
+  // Mirror renders the round the way the replay path consumes it —
+  // pending text flushes as its own row, then ONE ROW PER CALL, then
+  // each result (vs the loop's committed transcript, which is one
+  // assistant row carrying both calls): system + user + text row + 2
+  // call rows + 2 result rows.
+  let assert Some(live) = inspect.live_turn
+  should.equal(7, transcript.length(live.view))
+  // Pending iteration-2 buffers (reset at the loop's "request" phase;
+  // round 1's text/reasoning already flushed into the view).
+  should.equal("Final answer", live.text)
+  should.equal("final thinking", live.reasoning)
+
+  process.send(gate, Nil)
+  drain_until_turn_done(sub)
+
+  let after = thread.inspect(sess)
+  should.be_false(after.status.streaming)
+  should.equal(None, after.live_turn)
+  // The worker's RETURNED transcript installed wholesale: a TurnRunner
+  // owns its transcript's shape, and the gated fake (like the real loop
+  // contract) returns just what it appended — system + user + final
+  // assistant. The mirror was event-driven, independent of it.
+  should.equal(3, transcript.length(after.transcript))
+}
