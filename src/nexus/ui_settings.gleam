@@ -22,6 +22,8 @@
 //// node — provider names, base URLs, model aliases, and failure reasons
 //// are all hostile text; there is no `innerHTML` anywhere.
 
+import gleam/dict.{type Dict}
+import gleam/dynamic/decode
 import gleam/erlang/process.{type Subject}
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -60,6 +62,18 @@ pub type ModelsState {
   ModelsFailed(id: String, reason: String)
 }
 
+/// Live model aliases for one provider, fetched on demand for the bot
+/// forms' model combobox: loading, the settled list, or failed (the
+/// form's note is static — the reason stays diagnostics-only, on the
+/// provider row's Test control). Cached per provider id for the
+/// connection, so re-selecting a provider never re-fetches a settled
+/// list.
+pub type AliasState {
+  AliasLoading
+  AliasOk(aliases: List(String))
+  AliasFailed
+}
+
 pub type State {
   State(
     /// The add-provider form is open (at most one form section-wide).
@@ -85,6 +99,13 @@ pub type State {
     /// The latest bot-mutation failure, rendered beside the Bots section
     /// (same rule as `last_error`).
     bot_last_error: Option(String),
+    /// The provider whose live model list the OPEN bot form's model
+    /// combobox is scoped to (the add form and the single inline editor
+    /// are mutually exclusive, so one slot serves whichever is open).
+    bot_alias_provider: Option(String),
+    /// Per-provider cache of live model lists fetched for the bot
+    /// forms' combobox (see `AliasState`).
+    bot_aliases: Dict(String, AliasState),
     /// Which tab the page's left rail shows. Both sections stay in the
     /// DOM (the inactive one `hidden`, like the forms) so uncontrolled
     /// form state survives tab switches; this only picks the visible one.
@@ -126,8 +147,16 @@ pub type Msg {
   ModelsLoaded(id: String, aliases: List(String))
   TestFailed(id: String, reason: String)
   // ---- Bots (bots plan P1) ----
-  /// The add-bot form toggled.
-  BotAddToggled
+  /// The add-bot form toggled. Opening carries the provider select's
+  /// default (the first provider) so the model combobox can scope to
+  /// it; closing ignores it.
+  BotAddToggled(provider: Option(String))
+  /// The add-bot form's provider select changed: the model combobox
+  /// re-scopes to the new provider's live model list.
+  BotAddProviderPicked(provider_id: String)
+  /// The edit form's provider select changed (same rule; the bot id
+  /// rides so the pick is unambiguous per row).
+  BotEditProviderPicked(bot_id: String, provider_id: String)
   /// The add-bot form submitted. `system_prompt` blank = the global
   /// default (resolved when a thread is created from the bot).
   /// `tools` is the raw comma-separated field; `chat_only` is the
@@ -141,7 +170,10 @@ pub type Msg {
     tools: String,
     chat_only: Bool,
   )
-  BotEditToggled(id: String)
+  /// Toggling open carries the bot's provider (the select's
+  /// preselected value) for the same combobox scoping; closing ignores
+  /// it.
+  BotEditToggled(id: String, provider_id: String)
   /// The edit form submitted: blank name/model/provider keep the stored
   /// values; a blank system prompt CLEARS back to the default (a real
   /// change — the two field classes in `bot.BotUpdate`). The tools field
@@ -175,6 +207,12 @@ pub type Msg {
   /// Any bot mutation failed; `reason` is the registry's fixed text —
   /// surfaced here AND as a chat-log note via `OpFailed`.
   BotMutateFailed(reason: String)
+  /// A bot form's live model list landed (dispatched by the combobox
+  /// fetch effect).
+  BotAliasesLoaded(provider_id: String, aliases: List(String))
+  /// The fetch failed (the combobox's note is static, so no reason
+  /// rides).
+  BotAliasesFailed(provider_id: String)
 }
 
 /// What the sub-component asks the parent (chat) model to do. Signals
@@ -211,6 +249,8 @@ pub fn init() -> State {
     bot_edit: None,
     bot_confirm: None,
     bot_last_error: None,
+    bot_alias_provider: None,
+    bot_aliases: dict.new(),
     tab: ProvidersTab,
   )
 }
@@ -252,6 +292,9 @@ pub fn update(
         bots_open: False,
         bot_edit: None,
         bot_confirm: None,
+        // The combobox slot goes with the forms; the per-provider
+        // alias cache survives (still valid for the next open).
+        bot_alias_provider: None,
       ),
       effect.none(),
       [],
@@ -332,9 +375,20 @@ pub fn update(
       [],
     )
 
-    Mutated -> #(State(..state, last_error: None), effect.none(), [
-      ProvidersChanged,
-    ])
+    Mutated -> #(
+      // A provider mutation (edit, enable/disable, delete) landed through
+      // this same connection: drop the bot forms' alias cache so a
+      // re-selected provider refetches instead of showing the pre-edit
+      // list. The cache is connection-lifetime, not mutation-proof.
+      State(
+        ..state,
+        last_error: None,
+        bot_aliases: dict.new(),
+        bot_alias_provider: None,
+      ),
+      effect.none(),
+      [ProvidersChanged],
+    )
 
     MutateFailed(reason) -> #(
       State(..state, last_error: Some(reason)),
@@ -373,21 +427,50 @@ pub fn update(
       }
 
     // ---- Bots (bots plan P1) ----
-    BotAddToggled -> #(
-      State(
-        ..state,
-        bots_open: !state.bots_open,
-        bot_edit: None,
-        bot_confirm: None,
-        // One form section-wide, like the provider forms: opening one
-        // closes the other section's open form/editor/confirm.
-        open: False,
-        edit: None,
-        confirm: None,
-      ),
-      effect.none(),
-      [],
-    )
+    BotAddToggled(provider) -> {
+      // Opening scopes the model combobox to the select's default (the
+      // first provider) and fetches its live list unless a usable copy
+      // is already cached; closing clears the slot.
+      let opening = !state.bots_open
+      let #(state, fetch) =
+        scope_bot_form(
+          State(
+            ..state,
+            bots_open: opening,
+            bot_edit: None,
+            bot_confirm: None,
+            // One form section-wide, like the provider forms: opening
+            // one closes the other section's open form/editor/confirm.
+            open: False,
+            edit: None,
+            confirm: None,
+          ),
+          case opening {
+            True -> provider
+            False -> None
+          },
+          providers,
+          models_timeout_ms,
+        )
+      #(state, fetch, [])
+    }
+
+    // The open bot form's provider select changed (add or edit — the
+    // forms are mutually exclusive, so the pick lands in the same
+    // slot): re-scope the model combobox. A stale fetched list must
+    // not survive a provider switch (the create panel's ProviderPicked
+    // rule); a cached settled list is reused as-is.
+    BotAddProviderPicked(provider_id) -> {
+      let #(state, fetch) =
+        scope_bot_form(state, Some(provider_id), providers, models_timeout_ms)
+      #(state, fetch, [])
+    }
+
+    BotEditProviderPicked(_bot_id, provider_id) -> {
+      let #(state, fetch) =
+        scope_bot_form(state, Some(provider_id), providers, models_timeout_ms)
+      #(state, fetch, [])
+    }
 
     BotSubmitted(
       name,
@@ -416,21 +499,32 @@ pub fn update(
       BotsChanged,
     ])
 
-    BotEditToggled(id) -> #(
-      State(
-        ..state,
-        bot_edit: toggle_open(state.bot_edit, id),
-        bots_open: False,
-        bot_confirm: None,
-        // One form section-wide, like the provider forms: opening one
-        // closes the other section's open form/editor/confirm.
-        open: False,
-        edit: None,
-        confirm: None,
-      ),
-      effect.none(),
-      [],
-    )
+    BotEditToggled(id, provider_id) -> {
+      // Opening scopes the model combobox to the bot's own provider
+      // (the select's preselected value); closing clears the slot.
+      let opening = state.bot_edit != Some(id)
+      let #(state, fetch) =
+        scope_bot_form(
+          State(
+            ..state,
+            bot_edit: toggle_open(state.bot_edit, id),
+            bots_open: False,
+            bot_confirm: None,
+            // One form section-wide, like the provider forms: opening
+            // one closes the other section's open form/editor/confirm.
+            open: False,
+            edit: None,
+            confirm: None,
+          ),
+          case opening {
+            True -> Some(provider_id)
+            False -> None
+          },
+          providers,
+          models_timeout_ms,
+        )
+      #(state, fetch, [])
+    }
 
     BotEditSubmitted(
       id,
@@ -505,6 +599,35 @@ pub fn update(
       effect.none(),
       [OpFailed("bot operation failed: " <> reason)],
     )
+
+    BotAliasesLoaded(id, aliases) ->
+      // Only a live fetch settles into the cache: a late reply for a
+      // superseded selection finds no waiting Loading entry and is
+      // dropped (the Test control's stale-reply rule).
+      case dict.get(state.bot_aliases, id) {
+        Ok(AliasLoading) -> #(
+          State(
+            ..state,
+            bot_aliases: dict.insert(state.bot_aliases, id, AliasOk(aliases)),
+          ),
+          effect.none(),
+          [],
+        )
+        _ -> #(state, effect.none(), [])
+      }
+
+    BotAliasesFailed(id) ->
+      case dict.get(state.bot_aliases, id) {
+        Ok(AliasLoading) -> #(
+          State(
+            ..state,
+            bot_aliases: dict.insert(state.bot_aliases, id, AliasFailed),
+          ),
+          effect.none(),
+          [],
+        )
+        _ -> #(state, effect.none(), [])
+      }
   }
 }
 
@@ -640,7 +763,14 @@ fn bots_section(
         [
           attr.id("add-bot"),
           attr.type_("button"),
-          event.on_click(BotAddToggled),
+          // The select's default (the first provider) rides along so
+          // the model combobox can scope to it on open.
+          event.on_click(
+            BotAddToggled(case provider_list {
+              [] -> None
+              [first, ..] -> Some(first.id)
+            }),
+          ),
         ],
         [html.text("Add")],
       ),
@@ -775,7 +905,7 @@ fn bot_row(
         },
         BotInboundToggled(id, !b.allow_inbound),
       ),
-      control("Edit", "Edit this bot", BotEditToggled(id)),
+      control("Edit", "Edit this bot", BotEditToggled(id, b.provider_id)),
       control("Delete", "Delete this bot forever", BotDeleteRequested(id)),
     ]),
     // Inline editor: prefilled name/model/prompt; the provider select
@@ -810,6 +940,7 @@ fn bot_row(
             attr.id("bot-provider-" <> id),
             attr.name("provider"),
             attr.aria("label", "Provider for " <> b.name),
+            bot_edit_provider_change(id),
           ],
           list.map(provider_list, fn(p) {
             html.option(
@@ -822,9 +953,24 @@ fn bot_row(
           attr.type_("text"),
           attr.name("model"),
           attr.value(b.model),
+          // Combobox: the scoped provider's live aliases suggest, free
+          // entry stays possible (a datalist never restricts — a stale
+          // alias saves fine and re-validates at thread create). The
+          // combo class draws the select-style chevron and
+          // autocomplete=off keeps the browser's own history/autofill
+          // popup out of the field.
+          attr.class("combo"),
+          attr.attribute("list", "bot-model-options-" <> id),
+          attr.attribute("autocomplete", "off"),
           attr.placeholder("Model alias"),
           attr.aria("label", "Model alias for " <> b.name),
         ]),
+        bot_model_options(
+          state,
+          "bot-model-options-" <> id,
+          state.bot_edit == Some(id),
+          combobox_provider_name(provider_list, state.bot_alias_provider),
+        ),
         html.textarea(
           [
             attr.name("system_prompt"),
@@ -859,7 +1005,10 @@ fn bot_row(
         html.div([attr.class("provider-form-buttons")], [
           html.button([attr.type_("submit")], [html.text("Save")]),
           html.button(
-            [attr.type_("button"), event.on_click(BotEditToggled(id))],
+            [
+              attr.type_("button"),
+              event.on_click(BotEditToggled(id, b.provider_id)),
+            ],
             [html.text("Cancel")],
           ),
         ]),
@@ -927,6 +1076,7 @@ fn add_bot_form(state: State, provider_list: List(Provider)) -> Element(Msg) {
           attr.id("add-bot-provider"),
           attr.name("provider"),
           attr.aria("label", "Provider"),
+          bot_add_provider_change(),
         ],
         case provider_list {
           [] -> [html.option([attr.value("")], "no providers")]
@@ -942,9 +1092,21 @@ fn add_bot_form(state: State, provider_list: List(Provider)) -> Element(Msg) {
       html.input([
         attr.type_("text"),
         attr.name("model"),
+        // Combobox, same rule as the edit form: live suggestions over
+        // free entry, chevron + autocomplete=off marking the field as
+        // ours.
+        attr.class("combo"),
+        attr.attribute("list", "add-bot-model-options"),
+        attr.attribute("autocomplete", "off"),
         attr.placeholder("Model alias"),
         attr.aria("label", "New bot model alias"),
       ]),
+      bot_model_options(
+        state,
+        "add-bot-model-options",
+        state.bots_open,
+        combobox_provider_name(provider_list, state.bot_alias_provider),
+      ),
       html.textarea(
         [
           attr.name("system_prompt"),
@@ -970,9 +1132,12 @@ fn add_bot_form(state: State, provider_list: List(Provider)) -> Element(Msg) {
       ]),
       html.div([attr.class("provider-form-buttons")], [
         html.button([attr.type_("submit")], [html.text("Add bot")]),
-        html.button([attr.type_("button"), event.on_click(BotAddToggled)], [
-          html.text("Cancel"),
-        ]),
+        html.button(
+          [attr.type_("button"), event.on_click(BotAddToggled(None))],
+          [
+            html.text("Cancel"),
+          ],
+        ),
       ]),
     ],
   )
@@ -1312,6 +1477,59 @@ fn models_effect(
   })
 }
 
+/// Scope the OPEN bot form's model combobox to `provider`: remember
+/// the slot, and fetch the provider's live model list only when this
+/// connection has no usable copy cached — a settled list is reused
+/// without a second network call, an in-flight fetch is left alone,
+/// and a failed one retries on the next selection (the static failure
+/// note stands until then). The add form and the single inline editor
+/// are mutually exclusive, so one slot serves whichever form is open.
+fn scope_bot_form(
+  state: State,
+  provider: Option(String),
+  providers: Subject(provider_registry.Msg),
+  models_timeout_ms: Int,
+) -> #(State, Effect(Msg)) {
+  case provider {
+    None -> #(State(..state, bot_alias_provider: None), effect.none())
+    Some(id) ->
+      case dict.get(state.bot_aliases, id) {
+        Ok(AliasOk(_)) | Ok(AliasLoading) -> #(
+          State(..state, bot_alias_provider: Some(id)),
+          effect.none(),
+        )
+        _ -> #(
+          State(
+            ..state,
+            bot_alias_provider: Some(id),
+            bot_aliases: dict.insert(state.bot_aliases, id, AliasLoading),
+          ),
+          bot_aliases_effect(providers, id, models_timeout_ms),
+        )
+      }
+  }
+}
+
+/// Fetch a provider's live model list for the bot forms' combobox. Off
+/// the runtime loop (`models_effect` states the rule — a blocking
+/// actor call must never run on the component's message loop), same
+/// shared live-model budget.
+fn bot_aliases_effect(
+  providers: Subject(provider_registry.Msg),
+  id: String,
+  models_timeout_ms: Int,
+) -> Effect(Msg) {
+  effect.from(fn(dispatch) {
+    process.spawn_unlinked(fn() {
+      case provider_registry.list_models(providers, id, models_timeout_ms) {
+        Ok(aliases) -> dispatch(BotAliasesLoaded(id, aliases))
+        Error(_) -> dispatch(BotAliasesFailed(id))
+      }
+    })
+    Nil
+  })
+}
+
 // ---------------------------------------------------------------------------
 // Bot effects (bots plan P1; §bot semantics via the bot registry — no
 // key material anywhere, so nothing to mask)
@@ -1531,6 +1749,99 @@ fn form_field(
     Ok(#(_, value)) -> Ok(value)
     Error(_) -> Error(Nil)
   }
+}
+
+/// The open bot form's model combobox backing (bots section): the
+/// scoped provider's live aliases as a `<datalist>` once loaded — with
+/// a muted hint NAMING the source under the field, so the suggestions
+/// popup reads as our data rather than the browser's own history — or
+/// a static hint while loading / after a failure. Manual entry stays
+/// possible in every state — a datalist only suggests; the save rule
+/// stays non-empty-only and thread create re-validates live. The
+/// hint precedes the datalist so Pico's `input + small` form-hint
+/// rule still matches (the invisible datalist after it breaks the
+/// adjacency).
+fn bot_model_options(
+  state: State,
+  datalist_id: String,
+  open: Bool,
+  provider_name: Option(String),
+) -> Element(Msg) {
+  case open {
+    False -> element.none()
+    True ->
+      case state.bot_alias_provider {
+        None -> element.none()
+        Some(id) ->
+          case dict.get(state.bot_aliases, id) {
+            Ok(AliasOk(aliases)) ->
+              element.fragment([
+                html.small([attr.class("muted")], [
+                  html.text(
+                    "live suggestions: "
+                    <> option.unwrap(provider_name, "the provider")
+                    <> " model list — type to filter or enter any alias",
+                  ),
+                ]),
+                html.datalist(
+                  [attr.id(datalist_id)],
+                  list.map(aliases, fn(alias) {
+                    html.option([attr.value(alias)], alias)
+                  }),
+                ),
+              ])
+            Ok(AliasLoading) ->
+              html.small([attr.class("muted")], [
+                html.text("loading the model list…"),
+              ])
+            _ ->
+              html.small([attr.class("muted")], [
+                html.text(
+                  "could not load the model list — type the alias manually",
+                ),
+              ])
+          }
+      }
+  }
+}
+
+/// The display name of the provider an open bot form's combobox is
+/// scoped to, for the source hint under the field. `None` (no slot or
+/// no match in the masked list) falls back to the generic wording at
+/// the call site.
+fn combobox_provider_name(
+  provider_list: List(Provider),
+  slot: Option(String),
+) -> Option(String) {
+  case slot {
+    None -> None
+    Some(id) ->
+      case list.find(provider_list, fn(p) { p.id == id }) {
+        Ok(p) -> Some(p.name)
+        Error(_) -> None
+      }
+  }
+}
+
+/// The add-bot form's provider select: switching providers re-scopes
+/// the model combobox's datalist (the create panel's ProviderPicked
+/// rule, carried into the bot forms).
+fn bot_add_provider_change() -> attr.Attribute(Msg) {
+  let decoder =
+    decode.at(["target", "value"], decode.string)
+    |> decode.map(BotAddProviderPicked)
+  event.on("change", decoder)
+  |> server_component.include(["target.value"])
+}
+
+/// The edit form's provider select (same rule, carrying the bot id so
+/// the pick is unambiguous per row).
+fn bot_edit_provider_change(id: String) -> attr.Attribute(Msg) {
+  let decoder =
+    decode.at(["target", "value"], decode.string)
+    |> decode.map(BotEditProviderPicked(id, _))
+  event.on("change", decoder)
+  |> server_component.include(["target.value"])
 }
 
 /// The add-bot form submits with its fields riding the form data (the

@@ -472,6 +472,33 @@ fn css() -> String {
   --pico-primary-hover-border: #2563eb;
   --pico-primary-focus: color-mix(in srgb, #3b82f6 35%, transparent);
 }
+
+/* The bot forms' model combobox (ui_settings, datalist-backed): the
+   select-style chevron marks the field as offering OUR list, so at rest
+   it doesn't read as a plain text input feeding the browser's own
+   autofill/history suggestions (autocomplete=off handles the popup
+   side). Reuses Pico's own icon variable, so light/dark follow the
+   theme for free — a data URI here could not. */
+#app input.combo {
+  padding-right: calc(var(--pico-form-element-spacing-horizontal) + 1.5rem);
+  background-image: var(--pico-icon-chevron);
+  background-position: center right 0.75rem;
+  background-size: 1rem auto;
+  background-repeat: no-repeat;
+}
+/* Chrome draws its own solid indicator (the same glyph it uses for
+   autofill/history entries) at the right edge on hover/focus — beside
+   ours it read as two competing arrows. It is UA-internal (the
+   calendar-picker-indicator pseudo only styles date inputs), so instead
+   stand OUR chevron down while Chrome's is painted: rest state is the
+   themed decoration, interaction is the native clickable affordance.
+   WebKit/Blink only — Firefox draws no indicator and keeps ours. */
+@supports selector(::-webkit-calendar-picker-indicator) {
+  #app input.combo:hover,
+  #app input.combo:focus {
+    background-image: none;
+  }
+}
 @media only screen and (prefers-color-scheme: dark) {
   :root:not([data-theme=light]), :host(:not([data-theme=light])) {
     --pico-primary: #60a5fa;
@@ -614,6 +641,12 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
 .provider-head { display: flex; align-items: center; gap: .4rem; flex-wrap: wrap; }
 .provider-name { overflow-wrap: anywhere; }
 .provider-sub { font-size: .72rem; opacity: .6; overflow-wrap: anywhere; }
+/* Bot rows are cards too — same recipe as .provider-row above. They had
+   no rules at all and rendered as bare text plus a button row beside
+   the styled provider cards on the neighbouring tab. */
+.bot-row { display: flex; flex-direction: column; gap: .4rem; border: 1px solid
+  color-mix(in srgb, currentColor 15%, transparent); border-radius: 10px; padding: .55rem .8rem; }
+.bot-list { display: flex; flex-direction: column; gap: .5rem; }
 /* Badges ride the .provider-head row now (F7): align-self center keeps
    the pill vertically centered against the name instead of stretching
    (default) or pinning to the row's top edge (flex-start). */
@@ -631,6 +664,15 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
 #app .provider-form h3 { margin: 0; font-size: .7rem; font-weight: 600; text-transform: uppercase;
   letter-spacing: .07em; opacity: .55; }
 .provider-form input { min-width: 0; }
+/* Field margins inside the cards are already zero: the app-wide
+   `#app select, #app textarea, #app input, #app label { margin: 0 }`
+   rule below outranks Pico's. What still leaked into the cards were
+   BUTTON margins (Pico gives every button a 1rem bottom margin) and
+   the input+small hint's -.75rem pull-up, which clipped it under the
+   input's border. Zero those so the flex gap rules the rhythm (the
+   hint keeps Pico's width:100% block). */
+#app .provider-form button { margin: 0; }
+#app .provider-form input + small { margin: 0; }
 .provider-form-buttons { display: flex; gap: .3rem; }
 #app .provider-form-buttons button { font-size: .75rem; padding: .25rem .6rem; }
 /* Form visuals (borders, focus rings, filled backgrounds, dark mode) are
