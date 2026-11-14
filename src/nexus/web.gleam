@@ -1,5 +1,6 @@
 //// The HTTP surface: a JSON scripting API (provider CRUD, provider-
-//// scoped model listing, thread CRUD, send, stop), the Lustre shell
+//// scoped model listing, thread CRUD, send, stop, and the read-only
+//// `/threads/<id>/state` debug dump), the Lustre shell
 //// page (at `/` and at the thread app view `GET /threads/<id>`, which
 //// gives a thread its shareable URL) with its WebSocket transport
 //// (`/ws`, `/lustre/runtime.mjs`), and a health check.
@@ -23,6 +24,7 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
+import glopenai/chat
 import mist
 import nexus/bot
 import nexus/bot_registry
@@ -34,6 +36,7 @@ import nexus/thread
 import nexus/thread_create
 import nexus/thread_registry
 import nexus/timing
+import nexus/transcript
 import nexus/ui_runtime
 
 /// Registry-backed handler. Threads are resolved by ID at request time so
@@ -96,10 +99,24 @@ pub fn handler(
         protected(cfg, req, fn() { delete_bot_response(registry, bots, id) })
       Post, ["threads", id, "send"] ->
         protected(cfg, req, fn() {
-          with_thread(registry, id, send_response(req, registry, id, _))
+          with_thread(registry, id, fn(_summary, subject) {
+            send_response(req, registry, id, subject)
+          })
         })
       Post, ["threads", id, "stop"] ->
-        protected(cfg, req, fn() { with_thread(registry, id, stop_response) })
+        protected(cfg, req, fn() {
+          with_thread(registry, id, fn(_summary, subject) {
+            stop_response(subject)
+          })
+        })
+      // Debug dump: the server's complete point-in-time view of a thread
+      // (committed transcript, status, live-turn mirror) as JSON. A
+      // read-only side channel for humans, curl, and tests — never a UI
+      // data source; the browser's truth path stays the /ws event stream.
+      Get, ["threads", id, "state"] ->
+        protected(cfg, req, fn() {
+          with_thread(registry, id, thread_state_response)
+        })
       Get, ["healthz"] ->
         json_response(200, json.object([#("ok", json.bool(True))]))
       Get, ["lustre", "runtime.mjs"] ->
@@ -159,14 +176,15 @@ fn pico_asset_response() -> Response(mist.ResponseData) {
 fn with_thread(
   registry: process.Subject(thread_registry.Msg),
   id: String,
-  then: fn(process.Subject(thread.Msg)) -> Response(mist.ResponseData),
+  then: fn(thread.ThreadSummary, process.Subject(thread.Msg)) ->
+    Response(mist.ResponseData),
 ) -> Response(mist.ResponseData) {
   let summaries = thread_registry.list_threads(registry)
-  case list.any(summaries, fn(summary) { summary.id == id }) {
-    False -> json_response(404, err_json("thread not found"))
-    True ->
+  case list.find(summaries, fn(summary) { summary.id == id }) {
+    Error(_) -> json_response(404, err_json("thread not found"))
+    Ok(summary) ->
       case thread_registry.get(registry, id) {
-        Ok(subject) -> then(subject)
+        Ok(subject) -> then(summary, subject)
         Error(_) -> json_response(503, err_json("thread unavailable"))
       }
   }
@@ -1255,6 +1273,13 @@ fn optional_int_json(value: Option(Int)) -> Json {
   }
 }
 
+fn optional_string_json(value: Option(String)) -> Json {
+  case value {
+    Some(s) -> json.string(s)
+    None -> json.null()
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Small response / decode helpers
 // ---------------------------------------------------------------------------
@@ -1372,6 +1397,180 @@ pub fn thread_summary_json(summary: thread.ThreadSummary) -> Json {
   ])
 }
 
+// ---------------------------------------------------------------------------
+// Thread state debug dump (GET /threads/<id>/state)
+// ---------------------------------------------------------------------------
+
+/// Read-only side channel: one JSON document holding the server's
+/// complete point-in-time view of a thread — registry summary, actor
+/// status, the committed transcript, and the display-only live-turn
+/// mirror while a turn is in flight. For humans, curl, and tests; the
+/// browser UI never consumes it (its data path is the /ws event stream).
+fn thread_state_response(
+  summary: thread.ThreadSummary,
+  subject: process.Subject(thread.Msg),
+) -> Response(mist.ResponseData) {
+  json_response(200, thread_state_json(summary, thread.inspect(subject)))
+}
+
+/// Pure — offline-testable.
+pub fn thread_state_json(
+  summary: thread.ThreadSummary,
+  inspect: thread.ThreadInspect,
+) -> Json {
+  json.object([
+    #("summary", thread_summary_json(summary)),
+    #("status", thread_status_json(inspect.status)),
+    #("messages", transcript_messages_json(inspect.transcript)),
+    #("live_turn", case inspect.live_turn {
+      Some(live) -> live_turn_json(live)
+      None -> json.null()
+    }),
+  ])
+}
+
+fn thread_status_json(status: thread.ThreadStatus) -> Json {
+  json.object([
+    #("model", json.string(status.model)),
+    #("message_count", json.int(status.message_count)),
+    #("streaming", json.bool(status.streaming)),
+    #("metrics", metrics_json(status.metrics)),
+    #("last_commit_at", json.int(status.last_commit_at)),
+  ])
+}
+
+/// The full transcript as inert JSON strings — complete ground truth:
+/// tool calls, reasoning, stamps, and origins appear exactly as stored
+/// (the abridged human view is issue #117's `/transcript` page). `seq`
+/// is the chronological index (0 = the system prompt), the same space
+/// the reasoning/stamp/origin sidecars address.
+fn transcript_messages_json(t: transcript.Transcript) -> Json {
+  t
+  |> transcript.messages
+  |> list.index_map(fn(message, seq) { chat_message_json(t, seq, message) })
+  |> json.preprocessed_array
+}
+
+fn chat_message_json(
+  t: transcript.Transcript,
+  seq: Int,
+  message: chat.ChatMessage,
+) -> Json {
+  let sidecars = [
+    #("seq", json.int(seq)),
+    #("stamped_at", optional_int_json(transcript.stamped_at(t, seq))),
+    #("origin", origin_json(transcript.origin_at(t, seq))),
+  ]
+  case message {
+    chat.SystemMessage(content: chat.SystemTextContent(text), ..) ->
+      json.object([
+        #("role", json.string("system")),
+        #("content", json.string(text)),
+        ..sidecars
+      ])
+    chat.UserMessage(content: chat.UserTextContent(text), ..) ->
+      json.object([
+        #("role", json.string("user")),
+        #("content", json.string(text)),
+        ..sidecars
+      ])
+    chat.AssistantMessage(content: content, tool_calls: calls, ..) ->
+      json.object([
+        #("role", json.string("assistant")),
+        #("content", assistant_content_json(content)),
+        #("reasoning", optional_string_json(transcript.reasoning_at(t, seq))),
+        #("tool_calls", tool_calls_json(calls)),
+        ..sidecars
+      ])
+    chat.ToolMessage(content: chat.ToolTextContent(text), tool_call_id: id) ->
+      json.object([
+        #("role", json.string("tool")),
+        #("tool_call_id", json.string(id)),
+        #("content", json.string(text)),
+        #("is_error", tool_result_json(transcript.tool_result_at(t, seq))),
+        ..sidecars
+      ])
+    // Content-part shapes nexus never constructs (every append_* builds
+    // the text variant; developer messages don't exist here). Pinned
+    // exhaustively so a codec upgrade cannot silently change the dump's
+    // shape.
+    chat.DeveloperMessage(..) ->
+      json.object([#("role", json.string("developer")), ..sidecars])
+    chat.SystemMessage(content: chat.SystemPartsContent(_), ..) ->
+      json.object([#("role", json.string("system")), ..sidecars])
+    chat.UserMessage(content: chat.UserPartsContent(_), ..) ->
+      json.object([#("role", json.string("user")), ..sidecars])
+    chat.ToolMessage(content: chat.ToolPartsContent(_), tool_call_id: id) ->
+      json.object([
+        #("role", json.string("tool")),
+        #("tool_call_id", json.string(id)),
+        ..sidecars
+      ])
+  }
+}
+
+fn assistant_content_json(
+  content: Option(chat.AssistantMessageContent),
+) -> Json {
+  case content {
+    Some(chat.AssistantTextContent(text)) -> json.string(text)
+    _ -> json.null()
+  }
+}
+
+fn tool_calls_json(calls: Option(List(chat.ToolCall))) -> Json {
+  case calls {
+    None -> json.null()
+    Some(calls) ->
+      json.preprocessed_array(
+        list.map(calls, fn(call) {
+          let chat.FunctionToolCall(id: id, function: f) = call
+          json.object([
+            #("id", json.string(id)),
+            #("name", json.string(f.name)),
+            // The model's argument string, byte-for-byte: tool args are
+            // request-tail bytes (KV-cache contract), so the dump shows
+            // them unnormalized.
+            #("arguments", json.string(f.arguments)),
+          ])
+        }),
+      )
+  }
+}
+
+/// The display-only outcome sidecar (`append_tool_result`'s `ok`),
+/// inverted to the question callers ask — "did this call fail?" — so a
+/// failed call reads `is_error: true`. Absent when no outcome recorded.
+fn tool_result_json(ok: Option(Bool)) -> Json {
+  case ok {
+    Some(ok) -> json.bool(!ok)
+    None -> json.null()
+  }
+}
+
+fn origin_json(origin: Option(transcript.Origin)) -> Json {
+  case origin {
+    Some(transcript.Origin(author, depth)) ->
+      json.object([
+        #("author", json.string(author)),
+        #("depth", json.int(depth)),
+      ])
+    None -> json.null()
+  }
+}
+
+/// The mid-turn display mirror (`turn_view` in thread.gleam): rounds the
+/// worker already finished render as `rounds`; `pending_text` /
+/// `pending_reasoning` are the streamed-but-uncommitted buffers. Present
+/// only while a turn is in flight. Display-only — never request bytes.
+fn live_turn_json(live: thread.LiveTurn) -> Json {
+  json.object([
+    #("rounds", transcript_messages_json(live.view)),
+    #("pending_text", json.string(live.text)),
+    #("pending_reasoning", json.string(live.reasoning)),
+  ])
+}
+
 fn unauthorized() -> Response(mist.ResponseData) {
   json_response(401, err_json("unauthorized"))
 }
@@ -1386,6 +1585,7 @@ pub fn requires_auth(method: Method, segments: List(String)) -> Bool {
     Get, []
     | Get, ["threads", _]
     | Get, ["threads"]
+    | Get, ["threads", _, "state"]
     | Get, ["providers"]
     | Get, ["providers", _, "models"]
     | Get, ["bots"]

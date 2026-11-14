@@ -197,6 +197,28 @@ re-capture the fixture from a real thread via the integration smoke's
 hand-edit the JSON. The live half of the contract is that suite's cache
 gate: warm/cold TTFT median ratio ≤ 0.3.
 
+## HTTP API and the debug dump
+
+The JSON routes are the scripting/e2e API (full list in the README's
+HTTP section; the browser UI uses none of them — it talks to the
+server component over `/ws`). One standing rule when touching them:
+
+- **`GET /threads/<id>/state` is a read-only debug side channel — never
+  a UI data source.** It answers "what does the server believe this
+  thread looks like right now?" in one consistent ask
+  (`ThreadInspect` in `src/nexus/thread.gleam`: committed transcript +
+  status + the display-only `live_turn` mirror). Comparing it against
+  what the DOM renders is exactly how replay/mirror bugs get caught.
+  The UI's truth path stays the `/ws` event stream — a second client
+  data source would fight the replay invariants above. Dump details:
+  `seq` is the chronological index (0 = the system prompt), the same
+  space the reasoning/stamp/origin sidecars address; `is_error` is the
+  INVERTED tool-outcome sidecar (`append_tool_result`'s `ok`, so a
+  failed call reads `true`); `live_turn` is display-only by the
+  existing invariant and is absent once the turn settles. The abridged
+  human/print-PDF HTML view (`/threads/<id>/transcript`) is deferred:
+  jhillyerd/nexus#117.
+
 ## e2e browser suite (per-worktree setup)
 
 `e2e/` is validation-only and its `node_modules` is not committed, so a

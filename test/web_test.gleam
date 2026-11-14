@@ -15,6 +15,7 @@ import nexus/provider
 import nexus/provider_registry
 import nexus/thread
 import nexus/thread_registry
+import nexus/transcript
 import nexus/ui_runtime
 import nexus/web
 
@@ -120,6 +121,102 @@ pub fn threads_json_test() {
   let from_bot = thread.ThreadSummary(..summary, id: "s-3", bot_id: Some("b1"))
   let bot_data = json.to_string(web.threads_json([from_bot]))
   should.be_true(string.contains(bot_data, "\"bot_id\":\"b1\""))
+}
+
+pub fn thread_state_json_test() {
+  // A full turn cycle: human send (stamped), reasoned assistant text,
+  // a tool-call round, and a FAILED tool result (sidecar records it).
+  let t =
+    transcript.new("alias-x", "you are helpful")
+    |> transcript.append_user("what is up")
+    |> transcript.stamp(1000)
+    |> transcript.append_assistant_with_reasoning(
+      "let me check",
+      Some("thought hard"),
+    )
+    |> transcript.stamp(2000)
+    |> transcript.append_assistant_tool_calls(
+      None,
+      calls: [#("c1", "http_fetch", "{\"url\":\"https://x.test\"}")],
+      reasoning: None,
+    )
+    |> transcript.append_tool_result(
+      tool_call_id: "c1",
+      content: "connection refused",
+      ok: False,
+    )
+  let status =
+    thread.ThreadStatus(
+      model: "alias-x",
+      message_count: 5,
+      streaming: False,
+      metrics: [],
+      last_commit_at: 2000,
+    )
+  let inspect =
+    thread.ThreadInspect(status: status, transcript: t, live_turn: None)
+  let data =
+    json.to_string(web.thread_state_json(
+      summary_with_archived("s-2", False),
+      inspect,
+    ))
+
+  // Shape: summary passthrough + status + committed transcript + idle.
+  should.be_true(string.contains(data, "\"summary\":{\"id\":\"s-2\""))
+  should.be_true(string.contains(data, "\"status\":{\"model\":\"alias-x\""))
+  should.be_true(string.contains(data, "\"message_count\":5"))
+  should.be_true(string.contains(data, "\"last_commit_at\":2000"))
+  should.be_true(string.contains(data, "\"live_turn\":null"))
+
+  // Every message row: chronological seq (0 = system prompt) rides the
+  // sidecar block after role/content, exactly as encoded.
+  should.be_true(string.contains(
+    data,
+    "\"role\":\"system\",\"content\":\"you are helpful\",\"seq\":0",
+  ))
+  should.be_true(string.contains(
+    data,
+    "\"role\":\"user\",\"content\":\"what is up\",\"seq\":1",
+  ))
+  should.be_true(string.contains(data, "\"stamped_at\":1000"))
+  // Absence IS the human case for the origin sidecar.
+  should.be_true(string.contains(data, "\"origin\":null"))
+  should.be_true(string.contains(
+    data,
+    "\"role\":\"assistant\",\"content\":\"let me check\",\"reasoning\":\"thought hard\",\"tool_calls\":null,\"seq\":2",
+  ))
+  should.be_true(string.contains(
+    data,
+    "\"arguments\":\"{\\\"url\\\":\\\"https://x.test\\\"}\"",
+  ))
+  should.be_true(string.contains(
+    data,
+    "\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":\"connection refused\",\"is_error\":true,\"seq\":4",
+  ))
+
+  // Mid-turn: the live mirror rides as its own object with the pending
+  // (uncommitted) stream buffers beside the finished rounds.
+  let live =
+    thread.LiveTurn(
+      view: t,
+      text: "still streaming",
+      reasoning: "still thinking",
+    )
+  let live_data =
+    web.thread_state_json(
+      summary_with_archived("s-2", False),
+      thread.ThreadInspect(..inspect, live_turn: Some(live)),
+    )
+    |> json.to_string
+  should.be_true(string.contains(live_data, "\"live_turn\":{\"rounds\":["))
+  should.be_true(string.contains(
+    live_data,
+    "\"pending_text\":\"still streaming\"",
+  ))
+  should.be_true(string.contains(
+    live_data,
+    "\"pending_reasoning\":\"still thinking\"",
+  ))
 }
 
 pub fn auto_title_test() {
@@ -361,6 +458,8 @@ pub fn protected_route_matrix_test() {
     #(Post, ["threads"]),
     #(Post, ["threads", "s-1", "send"]),
     #(Post, ["threads", "s-1", "stop"]),
+    // The /threads/<id>/state debug dump sits behind the same gate.
+    #(Get, ["threads", "s-1", "state"]),
     // M3 organization: metadata + deletion sit behind the same gate.
     #(Patch, ["threads", "s-1"]),
     #(Delete, ["threads", "s-1"]),

@@ -446,6 +446,19 @@ pub type ThreadStatus {
   )
 }
 
+/// One point-in-time read of everything a thread holds — committed
+/// transcript, status, and the display-only live-turn mirror — served as
+/// a single ask so the `/threads/<id>/state` debug dump (and its tests)
+/// sees one consistent snapshot instead of three racing ones. Read-only:
+/// nothing here is ever encoded into a request.
+pub type ThreadInspect {
+  ThreadInspect(
+    status: ThreadStatus,
+    transcript: Transcript,
+    live_turn: Option(LiveTurn),
+  )
+}
+
 /// Sidebar row (M2 §4.2). `id` is assigned by the registry, never by the
 /// thread, and never enters the transcript. The M3 organization fields
 /// (title, title_source, pinned, tags, archived, created_at,
@@ -508,6 +521,9 @@ pub type Msg {
   Snapshot(reply: Subject(Transcript))
   /// Current status for the registry's thread list (M2 §4.2).
   Describe(reply: Subject(ThreadStatus))
+  /// Full state for the `/threads/<id>/state` debug dump: transcript +
+  /// status + live-turn mirror in one consistent reply. Read-only.
+  Inspect(reply: Subject(ThreadInspect))
   /// Worker plumbing (internal).
   TurnStarted(worker: Pid, cancel: Subject(Nil))
   WorkerEvent(worker: Pid, event: loop.LoopEvent)
@@ -562,7 +578,7 @@ type TurnState {
 /// the FINAL iteration's still-streaming text is not mirrored — no event
 /// fires between stream close and the terminal broadcast. Chips and
 /// reasoning — the parts that made refreshes lose history — are.
-type LiveTurn {
+pub type LiveTurn {
   LiveTurn(
     view: Transcript,
     /// Content tokens accumulated since the iteration began (reset at the
@@ -1022,17 +1038,17 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
     }
 
     Describe(reply) -> {
+      process.send(reply, current_status(state))
+      actor.continue(state)
+    }
+
+    Inspect(reply) -> {
       process.send(
         reply,
-        ThreadStatus(
-          model: transcript.model(state.transcript),
-          message_count: transcript.length(state.transcript),
-          streaming: case state.turn {
-            Idle -> False
-            Starting(..) | Streaming(..) -> True
-          },
-          metrics: state.metrics,
-          last_commit_at: state.last_commit_s,
+        ThreadInspect(
+          status: current_status(state),
+          transcript: state.transcript,
+          live_turn: state.turn_view,
         ),
       )
       actor.continue(state)
@@ -1796,4 +1812,23 @@ pub fn snapshot(thread: Subject(Msg)) -> Transcript {
 /// Ask a thread for its current status (model, counts, metrics).
 pub fn describe(thread: Subject(Msg)) -> ThreadStatus {
   actor.call(thread, 5000, Describe)
+}
+
+/// Ask a thread for its full point-in-time state (debug dump read side).
+pub fn inspect(thread: Subject(Msg)) -> ThreadInspect {
+  actor.call(thread, 5000, Inspect)
+}
+
+/// The Describe body, shared with Inspect so both report identically.
+fn current_status(state: State) -> ThreadStatus {
+  ThreadStatus(
+    model: transcript.model(state.transcript),
+    message_count: transcript.length(state.transcript),
+    streaming: case state.turn {
+      Idle -> False
+      Starting(..) | Streaming(..) -> True
+    },
+    metrics: state.metrics,
+    last_commit_at: state.last_commit_s,
+  )
 }
