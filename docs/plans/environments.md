@@ -17,6 +17,16 @@ deployments: the in-process workspace on the nexus host (v1), an external
 container workspace (later, same wire protocol), and remote nodes reached
 through TUI clients that dial out to nexus.
 
+The tool plane has a named internal counterpart: the **tool provider
+protocol** (`docs/plans/plugin-api.md`) — named OTP actors answering
+`ListTools` / `Call` / `Cancelled` with caller-owned reply subjects. That
+plan declares this plan's `/node/ws` tool plane the *third deployment* of
+the protocol (after compiled-in plugins and MCP client adapters): the
+node adapter answers internal `Call` / `Cancelled` by translating to and
+from the client protocol's MCP-shaped frames. The two plans land
+independently; this one owns the roster and `target` machinery, that one
+owns the seam both consume.
+
 Precedent researched 2026-11-14 (Hindsight: "Environments: bot workspaces +
 remote paired TUI nodes"): OpenAI's self-hosted Agents API environments —
 harness in the cloud, executor in the user's environment, **outbound**
@@ -44,6 +54,10 @@ adapter, never as this transport).
   spoken by TUI clients (`/node/ws`). Deliberately *not* Lustre's `/ws`
   server-component protocol, which is Lustre-internal and version-coupled
   to the generated `runtime.mjs` it ships with.
+- **Provider protocol** — the internal tool-provider seam defined by
+  `docs/plans/plugin-api.md` (`nexus/provider.gleam`: `ListTools`, `Call`,
+  `Cancelled`; ok/err replies; adapter-side truncation). Node adapters are
+  one deployment of it.
 
 ## Design summary
 
@@ -95,9 +109,11 @@ ordinary tool results:
 - **Unknown target** (detached, typo'd, hallucinated): immediate error
   result — `target "proxmox-2" is not attached. attached targets: workspace` —
   no timeout burn; the model self-corrects next round.
-- **Mid-run detach** (node dies mid-command): the connection monitor fires,
-  the in-flight call resolves as a failed tool result; a cancel
-  notification is best-effort.
+- **Mid-run detach** (node dies mid-command): the adapter's process
+  monitor fires — the plugin-api adapter executor arms the monitor before
+  dispatch, so a dying provider is answered immediately, no burned
+  deadline — and the in-flight call resolves as a failed tool result; a
+  cancel notification is best-effort.
 - **Call timeout**: per-call wall clock (configurable per tool), rendered
   like any error.
 
@@ -118,6 +134,15 @@ committed; nothing new rolls back.
 - Codemode synergy: env tools in a codemode toolset are ordinary siblings
   (toolset minus codemode), so Lua scripts can `bash` + digest in one
   round trip; `target` is just an argument.
+- Remote dispatch rides the provider seam: a node adapter is a named
+  provider actor (registered at attach, unregistered at detach) whose
+  internal side is `provider.Msg` and whose transport side is the client
+  protocol — the plugin-api adapter executor (monitor-before-dispatch,
+  demonitor on every non-`Down` exit, the mandatory cancel re-signal,
+  per-call deadline) IS the fail-fast machinery above, verbatim. If env
+  routing ever needs identity inside a provider call, the route is
+  plugin-api phase 3's additive `Call` context growth (thread id,
+  environment handle) — not a new protocol field here.
 
 ### The workspace (v1: in-process)
 
@@ -150,9 +175,13 @@ committed; nothing new rolls back.
     socket via the same `Send` path the web UI uses. The TUI is a full
     client: view, type, and execute.
   - **Tool plane** (bidirectional): MCP-shaped JSON-RPC — `tools/call`
-    requests down, tool results up, `notifications/cancelled` down. Familiar
-    shapes, zero novel semantics; a future standalone MCP listener on the
-    node could share the handler.
+    requests down, tool results up, `notifications/cancelled` down — the
+    third deployment of the provider protocol: the node adapter translates
+    these frames to and from internal `Call` / `Cancelled` (already
+    aligned: cancel-as-message, per-call caller-owned reply subject,
+    ok/err as a failed tool result). Familiar shapes, zero novel
+    semantics; a future standalone MCP listener on the node could share
+    the handler.
 - **Not Lustre**: Lustre never appears in the path; Lustre upgrades cannot
   break remote clients. Cost: nexus owns a second wire format — same
   discipline as the store seam: owned boundary, versioned deliberately,
@@ -182,14 +211,17 @@ not a Postgres keyword; FK/index naming per AGENTS.md):
   printed `nexus-node pair` bootstrap); the table lands first so tokens
   are verifiable statelessly per connection.
 
-### General MCP (future, out of this plan's build)
+### General MCP (future, owned by the plugin-api plan)
 
 Third-party MCP servers mount **at thread creation only**, never
-mid-thread. The one generalization it will need: toolset entries become
-*name → compiled schema | frozen foreign snapshot* (persisted at create),
-because `by_names` today resolves only compiled-in names. Recorded here so
-P1/P2 choices don't foreclose it: env tools stay curated and compiled-in
-precisely so hydration never depends on an external server being online.
+mid-thread — the generalization is specified in
+`docs/plans/plugin-api.md`: an MCP client adapter per configured server
+(a config option, not a plugin), `thread.toolset` growing into an ordered
+manifest of tagged entries, schema TEXT frozen at create, hydration that
+never contacts the server, and boundary validation of `tools/list`
+entries. This plan's half of the contract is simply that env tools stay
+curated and compiled-in — precisely so hydration never depends on an
+external server being online.
 
 ## Phases
 
@@ -216,7 +248,8 @@ precisely so hydration never depends on an external server being online.
 
 1. `node` table + migrate + squirrel queries; token auth for `/node/ws`.
 2. Client protocol v1 (event projection + tool plane + user input);
-   adapter actor with socket-linked lifecycle; attach/detach roster
+   adapter actor with socket-linked lifecycle, registered as a named
+   provider actor at attach (the plugin-api seam); attach/detach roster
    mechanics incl. replace-on-reconnect and refuse-duplicate-live.
 3. Fail-fast paths for unknown target / mid-run detach / timeout through
    the live tool plane (tool errors commit; UI unchanged).
@@ -231,7 +264,9 @@ precisely so hydration never depends on an external server being online.
 ### Phase 3 — deferred (recorded, not scheduled)
 
 - External container workspace speaking the node protocol as `workspace`.
-- General MCP mounts at creation (schema snapshots).
+- General MCP mounts at creation — owned by `docs/plans/plugin-api.md`
+  phase 2 (ordered manifests, frozen TEXT snapshots, boundary
+  validation); nothing left to build here.
 - Parallel tool fan-out across targets (today `execute_all` is a
    sequential fold; correct-first).
 - Fork/upgrade path for chat-only threads that later want env tools
@@ -261,7 +296,9 @@ precisely so hydration never depends on an external server being online.
   `workspace_root` is unset; hydration resolves them from the compiled
   catalog.
 - **Hostile text**: everything a node reports (metadata, command output,
-  errors) renders as Lustre text nodes — truncated, inert previews only.
+  errors) renders as Lustre text nodes — truncated, inert previews only;
+  node bytes are external provider content, so the plugin-api adapter's
+  transport-read byte caps apply, not just post-hoc truncation.
 - **UI display-state mirror**: tool errors commit as failed results; no
   new rollback shape; roster messages replay like any user row.
 - **Schema conventions**: singular `node`; unquoted-safe names;
