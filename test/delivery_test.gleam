@@ -10,6 +10,7 @@
 //// point at a refused loopback port so they fail instantly and commit
 //// nothing beyond the delivered user line.
 
+import gleam/dict
 import gleam/erlang/process.{type Subject}
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -62,6 +63,9 @@ fn test_config() -> Config {
     codemode: False,
     codemode_timeout_ms: 30_000,
     codemode_max_output_chars: 32_768,
+    plugins: [],
+    plugin_timeout_ms: 30_000,
+    plugin_max_output_chars: 32_768,
     max_bot_hops: 4,
   )
 }
@@ -109,6 +113,7 @@ fn boot() -> Booted {
       seam,
       fn(_id) { Ok(refused_endpoint()) },
       bots_name,
+      dict.new(),
     )
   Booted(registry: started_registry.data, bots: started_bots.data, seam:)
 }

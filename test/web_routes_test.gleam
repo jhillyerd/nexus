@@ -3,6 +3,7 @@
 //// the auto-title-at-send boundary — over a real mist server and a real
 //// registry (fake turn runner; no Bifrost, no network beyond loopback).
 
+import gleam/dict
 import gleam/erlang/process
 import gleam/http.{Delete, Get, Patch, Post}
 import gleam/http/request.{type Request}
@@ -60,6 +61,9 @@ fn test_config() -> Config {
     codemode: False,
     codemode_timeout_ms: 30_000,
     codemode_max_output_chars: 32_768,
+    plugins: [],
+    plugin_timeout_ms: 30_000,
+    plugin_max_output_chars: 32_768,
     // Bots P3c: the delivery hop guard; 4 = the shipped default.
     max_bot_hops: 4,
   )
@@ -164,6 +168,7 @@ fn start_server_with(
       // The SAME name this harness started the bot registry under: the
       // delivery wrapper's sender-name ask resolves it at ask time.
       bots_name,
+      dict.new(),
     )
   // Port 0: the kernel picks a free port and mist's after_start hands
   // it back; a bind failure now fails the test loudly at this line

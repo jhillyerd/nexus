@@ -253,6 +253,13 @@ type Record {
 type State {
   State(
     cfg: Config,
+    /// The boot-built provider table (plugin-api plan Phase 1):
+    /// qualified plugin tool names → specs, merged into every EXPLICIT
+    /// toolset resolution (`tools.by_names_with`) — the same resolution
+    /// path as compiled names, so bot templates can pin plugin tools and
+    /// stale names refuse loudly. The default set never consults it
+    /// (a provider's availability is not default membership).
+    providers: tools.ProviderTable,
     /// The default toolset's resolved names — the key under which the
     /// boot-built bundle is cached below, and what plain creates resolve
     /// through the cache (the default snapshot IS the boot bundle).
@@ -261,9 +268,10 @@ type State {
     /// P2 prep, #76). Seeded at boot with the default bundle — today the
     /// only entry, since plain creates all resolve through it. P2's
     /// create-from-bot path is the first WRITER: a new name tuple builds
-    /// its bundle once (specs via `tools.by_names`, turn + utility
-    /// runners over them) and every later thread of that toolset shares
-    /// it, so threads of one toolset keep byte-identical
+    /// its bundle once (specs via `tools.by_names_with` over the compiled
+    /// catalog ∪ the provider table, turn + utility runners over them)
+    /// and every later thread of that toolset shares it, so threads of
+    /// one toolset keep byte-identical
     /// `tools` / `tool_choice` envelopes and each bundle's utility
     /// side-call rides its own turn envelope by construction.
     toolsets: Dict(List(String), thread.Toolset),
@@ -361,6 +369,7 @@ pub fn start(
   persistence: Store,
   resolve_provider: ResolveProvider,
   bots_name: process.Name(bot_registry.Msg),
+  providers: tools.ProviderTable,
 ) -> actor.StartResult(Subject(Msg)) {
   // The tool registry is built once, here, from the global config — before
   // any thread exists — so every request any thread of the default toolset
@@ -391,6 +400,7 @@ pub fn start(
     corpus,
     resolve_provider,
     bots_name,
+    providers,
   )
 }
 
@@ -411,6 +421,7 @@ pub fn start_with_toolset(
   _corpus: fn() -> List(String),
   resolve_provider: ResolveProvider,
   bots_name: process.Name(bot_registry.Msg),
+  providers: tools.ProviderTable,
 ) -> actor.StartResult(Subject(Msg)) {
   let builder =
     actor.new_with_initialiser(5000, fn(self) {
@@ -430,6 +441,7 @@ pub fn start_with_toolset(
             })
           actor.initialised(State(
             cfg: cfg,
+            providers: providers,
             default_names: default_toolset.names,
             toolsets: dict.from_list([
               #(default_toolset.names, default_toolset),
@@ -587,8 +599,9 @@ fn default_toolset(state: State) -> thread.Toolset {
 /// and caching on first use (bots plan P2). The cache key is the name
 /// tuple — the default snapshot's names hit the boot-seeded entry, so
 /// default threads share the boot-built runner; every distinct explicit
-/// list builds its own bundle exactly once (specs via `tools.by_names`
-/// against the config-INDEPENDENT catalog, turn + utility runners over
+/// list builds its own bundle exactly once (specs via
+/// `tools.by_names_with` — the config-INDEPENDENT compiled catalog ∪
+/// the boot-built provider table — turn + utility runners over
 /// the SAME specs — the same-specs property per toolset, by
 /// construction). Unknown names fail loudly (`UnknownToolset` at
 /// create; hydration refuses to start the thread). Returns the possibly
@@ -607,7 +620,7 @@ fn resolve_toolset(
       case dict.get(state.toolsets, names) {
         Ok(toolset) -> Ok(#(state, toolset))
         Error(_) ->
-          case tools.by_names(state.cfg, names) {
+          case tools.by_names_with(state.cfg, state.providers, names) {
             Error(reason) -> Error(reason)
             Ok(specs) -> {
               // Same build recipe as `start`'s boot bundle: the turn

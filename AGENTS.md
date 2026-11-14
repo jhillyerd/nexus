@@ -182,6 +182,41 @@ stays open, one runtime per connection.
   file, and re-run the e2e browser suite — the offline suite cannot see
   visual regressions.
 
+## Plugin / tool-provider invariants (Phase 1 shipped)
+
+`docs/plans/plugin-api.md` carries the full design and as-built deltas;
+the rules that bite silently:
+
+- **`__` is the reserved tool-name separator.** Compiled-in tool names
+  NEVER contain it; a provider/tool half-name containing it is refused
+  at registration (charset `^[a-zA-Z0-9_-]+$`, no `__`, object-rooted
+  parseable schema under the byte bound) — loudly, before any name
+  enters the catalog. Keep `tools.is_compiled_name` complete when
+  adding compiled tools.
+- **A provider's `Name` is minted once and threaded as a VALUE.**
+  `process.new_name` suffixes a unique counter per call — re-deriving
+  `nexus_plugin_<name>` from a string mints a DIFFERENT atom. The
+  supervisor child, the boot `ListTools` ask, and the spec executor all
+  close over the same value.
+- **Providers never join the default toolset.** `NEXUS_PLUGINS` gates
+  availability; membership only via explicit create toolsets or bot
+  templates, resolved through `tools.by_names_with` (compiled ∪ the
+  boot-built provider table) — the default envelope cannot change under
+  config drift.
+- **Provider failure is a tool error, not a loop error.** The adapter
+  (`tool_provider.run`) arms its monitor BEFORE dispatch, re-signals the
+  cancel subject on the Cancel path (the codemode rule — the loop's
+  LAST-call path depends on it), and truncates every provider byte at
+  the boundary — a CHARACTER cap applied AFTER receipt, display
+  hygiene only: it does not bound allocation for in-process plugins
+  (trusted code, the same trust as compiled tools); external
+  transports (MCP, Phase 2) must cap while READING. Boot asks are
+  bounded; a compiled plugin that will not start or answer fails boot.
+- **`plugin_sup` is a separate OneForOne tree linked to boot** (see
+  ARCHITECTURE.md §2) — the provider table must be one value shared by
+  the bot registry's validation closure and the thread registry; root
+  children cannot hand values to each other.
+
 ## Changing the transcript / request-encoding path
 
 `test/m3_prefix_test.gleam` is the offline golden: it replays the archived

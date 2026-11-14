@@ -8,6 +8,19 @@
 //// hydrates the dormant set from the store before serving), and the
 //// mist server last, so HTTP traffic always finds a live registry.
 ////
+//// Beside the root sits ONE separate tree, started before it (plugin-api
+//// plan Phase 1): `plugin_sup`, a OneForOne supervisor over the
+//// configured tool-provider actors, linked to this process — a
+//// crash-looping plugin exhausts its tolerance and takes boot down
+//// with it (the root tree's own fail-loud mechanism, applied to
+//// plugins), while a single crashing plugin restarts alone instead of
+//// restarting every thread actor. It is separate because the boot-built
+//// provider table (each provider's bounded `ListTools` snapshot) must
+//// be ONE value shared by the bot registry's toolset validation and
+//// the thread registry's resolution — root-tree children cannot hand
+//// values to each other. `NEXUS_PLUGINS` unset (the default) starts no
+//// tree and changes nothing.
+////
 //// Thread actors are started dynamically as temporary children of the
 //// factory; the registry replaces them by restarting through the factory
 //// and rehydrating their transcript from the store.
@@ -30,6 +43,7 @@ import gleam/string
 import mist
 import nexus/bot_registry
 import nexus/config
+import nexus/plugin
 import nexus/provider_registry
 import nexus/store/persist
 import nexus/thread_registry
@@ -51,6 +65,19 @@ pub fn main() -> Nil {
       halt(2)
     }
     Ok(cfg) -> {
+      // Plugins FIRST (plugin-api plan Phase 1): the provider table must
+      // exist before the root tree's closures capture it. Loud on every
+      // failure — an unknown name, a provider that will not start or
+      // answer, an invalid ToolDef — because a compiled plugin is part
+      // of the release (the no-silent-fallback philosophy). With no
+      // configured plugins this is the empty table and no tree.
+      let providers = case plugin.boot(cfg) {
+        Ok(table) -> table
+        Error(reason) -> {
+          io.println("plugin boot error: " <> reason)
+          halt(2)
+        }
+      }
       // Names are stable across restarts of the supervisor itself.
       let store_name = process.new_name("nexus_store")
       let provider_registry_name = process.new_name("nexus_provider_registry")
@@ -114,7 +141,12 @@ pub fn main() -> Nil {
               // schemas — injected as a fn so this actor stays decoupled
               // from the config and the tool modules. The specs are
               // built and discarded; only the verdict crosses the seam.
-              fn(names) { tools.by_names(cfg, names) |> result.replace(names) },
+              // Plugin-api Phase 1: the check resolves through the
+              // provider table too, so a bot may pin plugin tools.
+              fn(names) {
+                tools.by_names_with(cfg, providers, names)
+                |> result.replace(names)
+              },
             )
           }),
         )
@@ -140,6 +172,7 @@ pub fn main() -> Nil {
               // tool's sender-name closure, which resolves it at ask time
               // inside the unlinked turn worker (the TagCorpus pattern).
               bot_registry_name,
+              providers,
             )
           }),
         )
