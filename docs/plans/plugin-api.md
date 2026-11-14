@@ -150,15 +150,19 @@ fn provider_run(provider, tool, timeout_ms, ctx, arguments) {
       process.send(subject, provider.Call(ref, tool, arguments, reply))
       case selector over {reply → GotReply, ctx.cancel → Cancel,
                           mon → Down, deadline = timeout_ms} {
-        GotReply(ToolOk(content)) -> Ok(truncate(content))
-        GotReply(ToolErr(message)) -> Error(truncate(message))
+        GotReply(ToolOk(content)) ->
+          { demonitor(mon); Ok(truncate(content)) }
+        GotReply(ToolErr(message)) ->
+          { demonitor(mon); Error(truncate(message)) }
         Cancel -> {
+          demonitor(mon)                        // every non-Down exit
           process.send(ctx.cancel, Nil)        // RE-SIGNAL (see below)
           process.send(subject, provider.Cancelled(ref))
           Error("cancelled")
         }
         Down -> Error("tool provider is unavailable")
         Timeout -> {
+          demonitor(mon)
           process.send(subject, provider.Cancelled(ref))
           Error("timed out after …ms")
         }
@@ -184,6 +188,15 @@ Pinned details:
   environments plan's mid-run-detach analog). Dispatching first would
   leave a window where the call lands in a dead or unmonitored mailbox
   and only the timeout answers.
+- **Demonitor on every non-`Down` exit.** The monitor is per-call and
+  must not outlive it: on `GotReply`, `Cancel`, and `Timeout` the
+  adapter calls `process.demonitor_process` before returning — an
+  armed-but-forgotten monitor would queue an unmatched `DOWN` in the
+  still-live worker for every past call of the turn. The pinned API
+  exposes no flush flag, so a `DOWN` that already fired in the gap can
+  remain queued — at most one inert message per call, the same
+  bounded-by-the-turn garbage class as a late reply, never matched by
+  any later select.
 - **Late replies are harmless — but not because the worker is gone.**
   On timeout the worker lives on (sibling calls, the next iterations)
   and a stale `ToolReply` does queue in its mailbox. It is inert: the
