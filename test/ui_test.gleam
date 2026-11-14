@@ -1332,10 +1332,13 @@ pub fn view_renders_shell_and_sidebar_test() {
   let html = view_string(model)
   should.be_true(string.contains(html, "id=\"app\""))
   should.be_true(string.contains(html, "id=\"thread-list\""))
-  // M3 organization: the row carries the thread id and the model alias as
-  // its subtitle (title falls back to the alias until auto-titled).
+  // M3 organization: the row carries the thread id; the title falls back
+  // to "Untitled thread" until auto-titled (#107: the alias left the
+  // chrome with the subtitle; provenance is bot-or-nothing, then the age).
   should.be_true(string.contains(html, "data-thread-id=\"s-1\""))
-  should.be_true(string.contains(html, "smart · "))
+  should.be_true(string.contains(html, "Untitled thread"))
+  should.be_false(string.contains(html, "smart · "))
+  should.be_true(string.contains(html, "class=\"thread-sub\""))
   should.be_true(string.contains(html, "aria-current=\"true\""))
   should.be_true(string.contains(html, "id=\"model-picker\""))
   should.be_true(string.contains(html, "value=\"fast\""))
@@ -1398,13 +1401,15 @@ pub fn view_header_shows_thread_title_test() {
   should.be_true(string.contains(html, "id=\"model\""))
   should.be_true(string.contains(html, "Renamed thread"))
 
-  // Untitled thread: the alias is the fallback, matching the row title.
+  // Untitled thread: a plain placeholder, in the header and the row —
+  // the alias fallback left the chrome with the subtitle (#107).
   let html =
     new_model()
     |> step(ui.ThreadsLoaded([summary("s-1", False)]))
     |> step(ui.Select("s-1"))
     |> view_string
-  should.be_true(string.contains(html, ">smart<"))
+  should.be_true(string.contains(html, ">Untitled thread<"))
+  should.be_false(string.contains(html, ">smart<"))
 }
 
 pub fn view_header_fallback_labels_test() {
@@ -1743,10 +1748,35 @@ pub fn view_renders_archived_only_when_shown_test() {
   should.be_true(string.contains(shown, "Archived"))
   should.be_true(string.contains(shown, "Shelved"))
   should.be_true(string.contains(shown, "Restore"))
+  // The group keeps list semantics next to #thread-list — it moved
+  // below the toggle, not out of the thread list.
+  should.be_true(string.contains(shown, "archive-group\" role=\"list\""))
   // Invariant: archived rows carry no pin control (archiving unpins;
   // the registry refuses pins on archived threads).
   should.be_false(string.contains(shown, ">Pin<"))
   should.be_false(string.contains(shown, ">Unpin<"))
+
+  // A filter that matches only archived rows must not print "no
+  // matches" above the matching rows: the active section's empty line
+  // steps aside while the group below carries the results.
+  let filtered =
+    new_model()
+    |> step(ui.ThreadsLoaded([archived]))
+    |> step(ui.ArchivedToggled)
+    |> step(ui.TagFilterChanged("shel"))
+    |> view_string
+  should.be_true(string.contains(filtered, "Shelved"))
+  should.be_false(string.contains(filtered, "No threads match the filter."))
+
+  // No archived match under the filter: the honest empty text returns.
+  let none_match =
+    new_model()
+    |> step(ui.ThreadsLoaded([archived]))
+    |> step(ui.ArchivedToggled)
+    |> step(ui.TagFilterChanged("zzz"))
+    |> view_string
+  should.be_false(string.contains(none_match, "Shelved"))
+  should.be_true(string.contains(none_match, "No threads match the filter."))
 }
 
 pub fn view_hides_rows_failing_the_filter_test() {
@@ -2140,21 +2170,40 @@ pub fn view_provider_picker_lists_enabled_only_test() {
   should.be_true(string.contains(none, "no providers — add one in Settings"))
 }
 
-pub fn view_thread_subtitle_pins_provider_test() {
+/// The rendered text of the first `.thread-sub` span in a view string —
+/// empty when no row subtitle rendered. Subtitle assertions compare it
+/// whole, so a subtitle that silently dropped its age (or grew a
+/// provider/model prefix back) fails loudly instead of merely not
+/// matching a negative contains.
+fn first_thread_sub(html: String) -> String {
+  case string.split_once(html, "class=\"thread-sub\">") {
+    Error(_) -> ""
+    Ok(#(_, rest)) ->
+      case string.split_once(rest, "</span>") {
+        Error(_) -> ""
+        Ok(#(text, _)) -> text
+      }
+  }
+}
+
+pub fn view_thread_subtitle_omits_provider_model_test() {
   let html =
     new_model()
     |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
     |> step(ui.ThreadsLoaded([summary("s-1", False)]))
     |> view_string
-  // Subtitle: provider/model · age (§11). The summary pins p1, whose
-  // display name resolves from the masked list.
-  should.be_true(string.contains(html, "bifrost/smart · "))
-  // While the list lags, the id stands in — never blank.
+  // #107: the bot-less subtitle IS the age alone — compared whole against
+  // rel_time at (nearly) the same instant. The gap from epoch 0 is
+  // year-granular, so a second boundary between the render and this
+  // check cannot change the label. A subtitle that dropped its age or
+  // grew a provider/model prefix fails either way; the id fallback the
+  // old test pinned (`p1/smart`) has no render to exist in.
+  should.equal(first_thread_sub(html), ui.rel_time(timing.wall_now_s(), 0))
   let lagging =
     new_model()
     |> step(ui.ThreadsLoaded([summary("s-1", False)]))
     |> view_string
-  should.be_true(string.contains(lagging, "p1/smart · "))
+  should.equal(first_thread_sub(lagging), ui.rel_time(timing.wall_now_s(), 0))
 }
 
 // ---------------------------------------------------------------------------
@@ -3014,10 +3063,19 @@ pub fn send_moves_previous_day_row_into_today_immediately_test() {
   |> lustre.send(to: runtime)
 
   // The connect cascade settles with the old row under Yesterday — its
-  // subtitle age reads "1d".
+  // subtitle age reads "1d". #107 made the bare age the whole bot-less
+  // subtitle, so the middot is gone, and the log's age stamp ("1d ago",
+  // inside a <time>) makes plain "1d" ambiguous — these payloads are
+  // Lustre element JSON, not HTML, so the anchor pins the age to its
+  // span by the encoder's shape: a text node reading exactly "1d" as the
+  // sole child of a span whose first attribute is class thread-sub. No
+  // other node pairs that text with that class.
   let before = collect_until_quiet(client, 10, 10, "")
   should.be_true(string.contains(before, "Yesterday"))
-  should.be_true(string.contains(before, "· 1d"))
+  should.be_true(string.contains(
+    before,
+    "\"1d\",\"kind\":2}],\"attributes\":[{\"value\":\"thread-sub\"",
+  ))
 
   lustre.send(
     to: runtime,
@@ -3027,9 +3085,16 @@ pub fn send_moves_previous_day_row_into_today_immediately_test() {
   // While the reply is still parked, the row re-buckets into Today: its
   // subtitle age flips to "just now" — written by nothing but the
   // send-time refresh (the user echo proves the cascade itself flowed).
+  // Same adjacency anchor as `before`: the log's stamp for the new
+  // message also reads "just now" (inside a <time>), so bare text can't
+  // carry the claim. The created today-thread's subtitle shares the
+  // text — so did the old middot anchor.
   let after = collect_until_quiet(client, 10, 10, "")
   should.be_true(string.contains(after, "hello again"))
-  should.be_true(string.contains(after, "· just now"))
+  should.be_true(string.contains(
+    after,
+    "\"just now\",\"kind\":2}],\"attributes\":[{\"value\":\"thread-sub\"",
+  ))
 }
 
 /// Regression (bogus "no provider configured" note): the connect-time
@@ -3838,8 +3903,9 @@ pub fn view_create_panel_bot_picker_test() {
 }
 
 /// A bot-sourced thread's subtitle leads with the bot's name
-/// (provenance). A hostile bot name is escaped; a bot deleted since
-/// (unresolvable id) shows nothing and keeps provider/model · age.
+/// (provenance — the one identity #107 keeps). A hostile bot name is
+/// escaped; a bot deleted since (unresolvable id) shows nothing, and the
+/// age-only subtitle never resurrects provider/model.
 pub fn view_thread_subtitle_shows_bot_provenance_test() {
   let html =
     new_model()
@@ -3851,14 +3917,17 @@ pub fn view_thread_subtitle_shows_bot_provenance_test() {
       ]),
     )
     |> view_string
-  should.be_true(string.contains(
-    html,
-    "&lt;b&gt;Writer&lt;/b&gt; · bifrost/smart · ",
-  ))
-  should_not_contain(html, "<b>Writer</b> · bifrost")
+  // Subtitle compared whole: bot name (escaped) + middot + age, nothing
+  // else — provider/model has no way back in.
+  should.equal(
+    first_thread_sub(html),
+    "&lt;b&gt;Writer&lt;/b&gt; · " <> ui.rel_time(timing.wall_now_s(), 0),
+  )
+  // The escaped name is what rendered: raw markup never reaches the DOM.
+  should_not_contain(html, "<b>Writer</b>")
 
-  // Deleted bot: the pointer resolves to nothing, the subtitle keeps
-  // its plain shape (self-heals on rehydrate, which NULLs the column).
+  // Deleted bot: the pointer resolves to nothing, the subtitle is
+  // age-only (self-heals on rehydrate, which NULLs the column).
   let gone =
     new_model()
     |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
@@ -3868,8 +3937,9 @@ pub fn view_thread_subtitle_shows_bot_provenance_test() {
       ]),
     )
     |> view_string
-  should.be_true(string.contains(gone, "bifrost/smart · "))
-  should.be_false(string.contains(gone, "b-gone · "))
+  // Deleted bot: the pointer resolves to nothing, the subtitle is
+  // age-only — no `b-gone · ` echo, no provider/model rescue.
+  should.equal(first_thread_sub(gone), ui.rel_time(timing.wall_now_s(), 0))
 }
 
 /// A deleted bot falls out of the create panel's selection: the model

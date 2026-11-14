@@ -2363,6 +2363,14 @@ fn sidebar(model: Model) -> Element(Msg) {
         ),
       ]),
       tag_filter_row(model),
+      html.div(
+        [attr.id("thread-list"), attr.class("thread-list"), attr.role("list")],
+        thread_rows(model),
+      ),
+      // The archived toggle sits BETWEEN the active rows and the archive
+      // group (#107 follow-up): clicking it grows the section underneath,
+      // so the control never moves. `#show-archived` keeps its id — the
+      // browser suite drives it.
       html.div([attr.class("archive-toggle-row")], [
         html.button(
           [
@@ -2382,10 +2390,7 @@ fn sidebar(model: Model) -> Element(Msg) {
           ],
         ),
       ]),
-      html.div(
-        [attr.id("thread-list"), attr.class("thread-list"), attr.role("list")],
-        thread_rows(model),
-      ),
+      archived_rows(model),
     ]),
   ])
 }
@@ -2454,55 +2459,69 @@ fn provider_options(model: Model) -> List(Element(Msg)) {
 /// The tag-filter input. Uncontrolled like the composer: its text rides the
 /// `input` event, and programmatic changes (chip click, clear) rotate the
 /// key so the client replaces the element with the new value baked in —
-/// no value patch can race the user's typing that way.
+/// no value patch can race the user's typing that way. The clear × floats
+/// INSIDE the input (#107): `.filter-box` is the positioning context, and
+/// the whole box rides the keyed rotation so a programmatic set rebuilds
+/// input and button together.
 fn tag_filter_row(model: Model) -> Element(Msg) {
   keyed.element("div", [attr.class("filter-row")], [
     #(
       "tag-filter-" <> int.to_string(model.filter_gen),
-      html.input([
-        attr.id("tag-filter"),
-        attr.type_("text"),
-        attr.value(model.tag_filter),
-        attr.placeholder("Filter by title or tag…"),
-        attr.aria("label", "Filter threads"),
-        filter_changed(),
+      html.div([attr.class("filter-box")], [
+        html.input([
+          attr.id("tag-filter"),
+          attr.type_("text"),
+          attr.value(model.tag_filter),
+          attr.placeholder("Filter by title or tag…"),
+          attr.aria("label", "Filter threads"),
+          filter_changed(),
+        ]),
+        case string.trim(model.tag_filter) {
+          "" -> element.none()
+          _ ->
+            html.button(
+              [
+                attr.id("filter-clear"),
+                attr.type_("button"),
+                attr.title("Clear filter"),
+                // The × glyph alone is a weak accessible name; say it.
+                attr.aria("label", "Clear filter"),
+                event.on_click(TagFilterSet("")),
+              ],
+              [html.text("×")],
+            )
+        },
       ]),
     ),
-    #("filter-clear", case string.trim(model.tag_filter) {
-      "" -> element.none()
-      _ ->
-        html.button(
-          [
-            attr.id("filter-clear"),
-            attr.type_("button"),
-            attr.title("Clear filter"),
-            event.on_click(TagFilterSet("")),
-          ],
-          [html.text("×")],
-        )
-    }),
   ])
 }
 
-/// The visible rows: the filter runs first (title + tags), then the list
-/// splits into the pinned section, the recency buckets, and (when the
-/// toggle is on) the archived section.
+/// The visible ACTIVE rows: the filter runs first (title + tags), then
+/// the list splits into the pinned section and the recency buckets.
+/// Archived rows render separately, below the toggle (see `archived_rows`).
 fn thread_rows(model: Model) -> List(Element(Msg)) {
   let visible =
     list.filter(model.threads, fn(summary) {
       matches_filter(summary, model.tag_filter)
     })
-  let has_active = list.any(visible, fn(summary) { !summary.archived })
-  let has_archived =
-    model.show_archived && list.any(visible, fn(summary) { summary.archived })
-  case has_active || has_archived {
-    False -> [
-      html.p([attr.class("muted")], [html.text(empty_state_text(model))]),
-    ]
+  case list.any(visible, fn(summary) { !summary.archived }) {
+    False ->
+      // The muted line is the active section's empty state. With the
+      // archive revealed and matching archived rows below the toggle,
+      // the view is NOT empty — printing "no matches" above them would
+      // lie, so the line steps aside and the group speaks for itself.
+      case
+        model.show_archived
+        && list.any(visible, fn(summary) { summary.archived })
+      {
+        True -> []
+        False -> [
+          html.p([attr.class("muted")], [html.text(empty_state_text(model))]),
+        ]
+      }
     True -> {
       let pinned = list.filter(visible, fn(s) { s.pinned && !s.archived })
       let unpinned = list.filter(visible, fn(s) { !s.pinned && !s.archived })
-      let archived = list.filter(visible, fn(s) { s.archived })
       let pinned_group = case pinned {
         [] -> element.none()
         rows ->
@@ -2511,20 +2530,38 @@ fn thread_rows(model: Model) -> List(Element(Msg)) {
             ..list.map(rows, thread_row(model, _))
           ])
       }
-      let archived_group = case model.show_archived, archived {
-        True, [_first, ..] ->
-          html.div([attr.class("thread-group archive-group")], [
-            html.h3([attr.class("group-label")], [html.text("Archived")]),
-            ..list.map(archived, thread_row(model, _))
-          ])
-        _, _ -> element.none()
+      [pinned_group, ..bucket_groups(model, unpinned)]
+    }
+  }
+}
+
+/// The archive group, rendered by `sidebar` BELOW the toggle so the
+/// control sits between the active rows and the archived ones: clicking
+/// the toggle grows this section underneath without moving the button.
+fn archived_rows(model: Model) -> Element(Msg) {
+  case model.show_archived {
+    False -> element.none()
+    True -> {
+      let archived =
+        list.filter(model.threads, fn(summary) {
+          summary.archived && matches_filter(summary, model.tag_filter)
+        })
+      case archived {
+        [] -> element.none()
+        rows ->
+          html.div(
+            [
+              attr.class("thread-group archive-group"),
+              // Same list semantics as #thread-list: the group moved
+              // below the toggle, not out of the thread list.
+              attr.role("list"),
+            ],
+            [
+              html.h3([attr.class("group-label")], [html.text("Archived")]),
+              ..list.map(rows, thread_row(model, _))
+            ],
+          )
       }
-      [
-        pinned_group,
-        ..list.append(bucket_groups(model, unpinned), [
-          archived_group,
-        ])
-      ]
     }
   }
 }
@@ -2533,7 +2570,9 @@ fn empty_state_text(model: Model) -> String {
   case string.trim(model.tag_filter) {
     "" ->
       case model.show_archived {
-        True -> "No threads."
+        // The muted line is the ACTIVE section's empty state; with the
+        // archive revealed, archived rows may still sit below the toggle.
+        True -> "No active threads."
         False -> "No threads yet."
       }
     _ -> "No threads match the filter."
@@ -2565,11 +2604,9 @@ fn bucket_groups(
 }
 
 /// The header's thread context (ui-polish F8): the selected thread's
-/// title — the bare model alias ("nexus  smart") was cryptic, and the
-/// alias already rides the row subtitle. An untitled thread falls back
-/// to its alias (the row-title rule); with nothing selected the
-/// `model_label` fallbacks ("connecting…", "thread ended") keep their
-/// feedback role.
+/// title. An untitled thread falls back to "Untitled thread" (the
+/// row-title rule); with nothing selected the `model_label` fallbacks
+/// ("connecting…", "thread ended") keep their feedback role.
 fn header_title(model: Model) -> String {
   case model.selected {
     Some(id) ->
@@ -2581,11 +2618,14 @@ fn header_title(model: Model) -> String {
   }
 }
 
-/// Display title for a thread: its title, or the model alias until the
-/// first message auto-titles it.
+/// Display title for a thread: its title, or "Untitled thread" until the
+/// first message auto-titles it (#107 follow-up: the alias fallback was a
+/// milestone-era identity cue — the same one that left the subtitle — so
+/// an untitled thread reads as a plain placeholder in the row and the
+/// header, not as a bare model name).
 fn display_title(summary: thread.ThreadSummary) -> String {
   case summary.title {
-    "" -> summary.model
+    "" -> "Untitled thread"
     titled -> titled
   }
 }
@@ -2597,20 +2637,17 @@ fn thread_row(model: Model, summary: thread.ThreadSummary) -> Element(Msg) {
   let id = summary.id
   let selected = model.selected == Some(id)
   let title = display_title(summary)
-  // The subtitle pins the thread's identity: provider/model (both
-  // frozen at creation, §8) plus its age. The provider name resolves
-  // from the masked list so renames show at once. A bot-sourced thread
-  // leads with the bot's name (provenance — bots plan P1); a deleted
-  // bot shows nothing and self-heals on rehydrate (SET NULL).
+  // The subtitle is provenance + age (#107): a bot-sourced thread leads
+  // with the bot's name (provenance — bots plan P1); a deleted bot shows
+  // nothing and self-heals on rehydrate (SET NULL). The provider/model
+  // pair left the row — it only mattered while threads were pinned during
+  // the multi-provider milestone, and the pair stays frozen on the thread
+  // itself (§8), so nothing is lost by dropping it from the chrome.
   let subtitle =
     case bot_display(model, summary.bot_id) {
       Some(bot_name) -> bot_name <> " · "
       None -> ""
     }
-    <> provider_display(model, summary.provider_id)
-    <> "/"
-    <> summary.model
-    <> " · "
     <> rel_time(timing.wall_now_s(), summary.last_active_at)
   html.div(
     [
@@ -3463,17 +3500,6 @@ fn bot_display(model: Model, bot_id: Option(String)) -> Option(String) {
         Ok(bot) -> Some(bot.name)
         Error(_) -> None
       }
-  }
-}
-
-/// The display name for a summary's pinned provider, resolved from the
-/// masked list (renames show at once); the id stands in while the list
-/// lags. Deletes are guarded while threads pin a provider, so the
-/// fallback is cosmetic, not semantic.
-fn provider_display(model: Model, provider_id: String) -> String {
-  case list.find(model.provider_list, fn(p) { p.id == provider_id }) {
-    Ok(p) -> p.name
-    Error(_) -> provider_id
   }
 }
 
