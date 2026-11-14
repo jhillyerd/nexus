@@ -2508,7 +2508,7 @@ pub fn bot_model_combobox_scopes_and_lists_test() {
   // the popup reads as our data, not the browser's suggestions.
   should.be_true(string.contains(html, "class=\"combo\""))
   should.be_true(string.contains(html, "autocomplete=\"off\""))
-  should.be_true(string.contains(html, "▾ live suggestions: bifrost model list"))
+  should.be_true(string.contains(html, "live suggestions: bifrost model list"))
   should.be_true(string.contains(html, "list=\"add-bot-model-options\""))
   should.be_true(string.contains(
     html,
@@ -2599,7 +2599,7 @@ pub fn bot_edit_model_combobox_scopes_to_bot_provider_test() {
     step(model, ui.Settings(ui_settings.BotAliasesLoaded("p1", ["smart"])))
     |> view_string
   should.be_true(string.contains(html, "list=\"bot-model-options-b1\""))
-  should.be_true(string.contains(html, "▾ live suggestions: bifrost"))
+  should.be_true(string.contains(html, "live suggestions: bifrost"))
   should.be_true(string.contains(html, "<datalist id=\"bot-model-options-b1\">"))
 }
 

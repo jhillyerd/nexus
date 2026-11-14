@@ -1767,7 +1767,7 @@ fn bot_model_options(
               element.fragment([
                 html.small([attr.class("muted")], [
                   html.text(
-                    "▾ live suggestions: "
+                    "live suggestions: "
                     <> option.unwrap(provider_name, "the provider")
                     <> " model list — type to filter or enter any alias",
                   ),
