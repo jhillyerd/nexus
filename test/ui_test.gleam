@@ -2,6 +2,7 @@
 //// behaviour (selection, token assembly, turn terminal states, reconnect)
 //// and view rendering (element/text APIs only, no innerHTML).
 
+import gleam/dict
 import gleam/erlang/process
 import gleam/int
 import gleam/json
@@ -2347,11 +2348,13 @@ pub fn settings_tab_switch_stands_forms_down_test() {
   with_confirm.settings.confirm |> should.equal(Some("p1"))
   assert_settings_transients_down(step(with_confirm, bots))
 
-  let with_bot_add = step(base, ui.Settings(ui_settings.BotAddToggled))
+  let with_bot_add =
+    step(base, ui.Settings(ui_settings.BotAddToggled(Some("p1"))))
   with_bot_add.settings.bots_open |> should.be_true
   assert_settings_transients_down(step(with_bot_add, bots))
 
-  let with_bot_edit = step(base, ui.Settings(ui_settings.BotEditToggled("b1")))
+  let with_bot_edit =
+    step(base, ui.Settings(ui_settings.BotEditToggled("b1", "p1")))
   with_bot_edit.settings.bot_edit |> should.equal(Some("b1"))
   assert_settings_transients_down(step(with_bot_edit, bots))
 
@@ -2371,6 +2374,8 @@ fn assert_settings_transients_down(m: ui.Model) -> Nil {
   m.settings.bots_open |> should.be_false
   m.settings.bot_edit |> should.be_none
   m.settings.bot_confirm |> should.be_none
+  // The combobox slot goes down with the forms.
+  m.settings.bot_alias_provider |> should.be_none
 }
 
 pub fn settings_tab_reclick_is_noop_test() {
@@ -2511,6 +2516,203 @@ pub fn settings_view_escapes_hostile_text_test() {
   should.be_false(string.contains(html, "<script>alert"))
   should.be_true(string.contains(html, "&lt;img"))
   should.be_false(string.contains(html, "<img src="))
+}
+
+// ---------------------------------------------------------------------------
+// Bot model combobox (Settings → Bots): live aliases suggest over free entry
+// ---------------------------------------------------------------------------
+
+pub fn bot_model_combobox_scopes_and_lists_test() {
+  // Opening the add form scopes the combobox to the first provider and
+  // fetches its live list; the reply settles the per-provider cache and
+  // renders as a suggestion list anchored inside the field's wrap.
+  let model =
+    new_model()
+    |> step(
+      ui.ProvidersLoaded([
+        prov("p1", "bifrost", True, True),
+        prov("p2", "other", True, True),
+      ]),
+    )
+    |> step(ui.SettingsToggled)
+    |> step(ui.Settings(ui_settings.TabSelected(ui_settings.BotsTab)))
+    |> step(ui.Settings(ui_settings.BotAddToggled(Some("p1"))))
+  model.settings.bot_alias_provider |> should.equal(option.Some("p1"))
+  model.settings.bot_aliases
+  |> dict.get("p1")
+  |> should.equal(Ok(ui_settings.AliasLoading))
+
+  let loaded =
+    step(
+      model,
+      ui.Settings(ui_settings.BotAliasesLoaded("p1", ["smart", "fast"])),
+    )
+  loaded.settings.bot_aliases
+  |> dict.get("p1")
+  |> should.equal(Ok(ui_settings.AliasOk(["smart", "fast"])))
+
+  let html = view_string(loaded)
+  // The decoration: a select-style chevron class, the browser's own
+  // history/autofill popup suppressed, and a hint naming the source —
+  // the popup reads as our data, not the browser's suggestions.
+  should.be_true(string.contains(html, "class=\"combo\""))
+  should.be_true(string.contains(html, "autocomplete=\"off\""))
+  should.be_true(string.contains(html, "live suggestions: bifrost model list"))
+  // The suggestions are OUR list (no native datalist): server-rendered
+  // options inside the field's wrap, carrying the alias in data-value
+  // for the combobox script to fill on pick.
+  should.be_true(string.contains(html, "class=\"combo-wrap\""))
+  should.be_true(string.contains(html, "class=\"combo-list\""))
+  should.be_true(string.contains(html, "data-value=\"smart\""))
+  should.be_true(string.contains(html, "data-value=\"fast\""))
+  // No editor is open, so the page renders exactly one list (the add
+  // form's): split on the class and count the pieces.
+  string.split(html, "class=\"combo-list\"")
+  |> list.length
+  |> should.equal(2)
+}
+
+pub fn bot_alias_cache_invalidated_on_provider_mutation_test() {
+  // A provider edit/disable lands through the same connection that
+  // cached its alias list: the cache must not outlive the mutation, or
+  // re-selecting the provider would show the pre-edit list forever.
+  let model =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(ui.SettingsToggled)
+    |> step(ui.Settings(ui_settings.TabSelected(ui_settings.BotsTab)))
+    |> step(ui.Settings(ui_settings.BotAddToggled(Some("p1"))))
+    |> step(ui.Settings(ui_settings.BotAliasesLoaded("p1", ["smart"])))
+  model.settings.bot_aliases
+  |> dict.get("p1")
+  |> should.equal(Ok(ui_settings.AliasOk(["smart"])))
+
+  let mutated = step(model, ui.Settings(ui_settings.Mutated))
+  mutated.settings.bot_aliases |> dict.size |> should.equal(0)
+  mutated.settings.bot_alias_provider |> should.be_none
+
+  // Re-selecting refetches instead of trusting the dropped entry.
+  let repicked =
+    step(mutated, ui.Settings(ui_settings.BotAddProviderPicked("p1")))
+  repicked.settings.bot_aliases
+  |> dict.get("p1")
+  |> should.equal(Ok(ui_settings.AliasLoading))
+}
+
+pub fn bot_model_combobox_provider_switch_rescopes_test() {
+  // Switching the open form's provider re-scopes the combobox and
+  // fetches the new provider; the old list must not survive into it.
+  let model =
+    new_model()
+    |> step(
+      ui.ProvidersLoaded([
+        prov("p1", "bifrost", True, True),
+        prov("p2", "other", True, True),
+      ]),
+    )
+    |> step(ui.SettingsToggled)
+    |> step(ui.Settings(ui_settings.TabSelected(ui_settings.BotsTab)))
+    |> step(ui.Settings(ui_settings.BotAddToggled(Some("p1"))))
+    |> step(ui.Settings(ui_settings.BotAliasesLoaded("p1", ["smart"])))
+
+  let switched =
+    step(model, ui.Settings(ui_settings.BotAddProviderPicked("p2")))
+  switched.settings.bot_alias_provider |> should.equal(option.Some("p2"))
+  switched.settings.bot_aliases
+  |> dict.get("p2")
+  |> should.equal(Ok(ui_settings.AliasLoading))
+
+  // A late reply for the superseded provider is dropped (its cache
+  // entry already settled) — the Test control's stale-reply rule.
+  let late =
+    step(switched, ui.Settings(ui_settings.BotAliasesLoaded("p1", ["late"])))
+  late.settings.bot_aliases
+  |> dict.get("p1")
+  |> should.equal(Ok(ui_settings.AliasOk(["smart"])))
+
+  // The new provider's reply lands and is the only thing suggested.
+  let settled =
+    step(late, ui.Settings(ui_settings.BotAliasesLoaded("p2", ["fast"])))
+  let html = view_string(settled)
+  should.be_true(string.contains(html, "data-value=\"fast\""))
+  should_not_contain(html, "data-value=\"smart\"")
+  should_not_contain(html, "data-value=\"late\"")
+}
+
+pub fn bot_model_combobox_failure_note_test() {
+  // A failed fetch degrades to today's free-text behaviour with a
+  // muted hint; a later re-selection retries (a fresh Loading entry).
+  let model =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(ui.SettingsToggled)
+    |> step(ui.Settings(ui_settings.TabSelected(ui_settings.BotsTab)))
+    |> step(ui.Settings(ui_settings.BotAddToggled(Some("p1"))))
+    |> step(ui.Settings(ui_settings.BotAliasesFailed("p1")))
+  let html = view_string(model)
+  should.be_true(string.contains(
+    html,
+    "could not load the model list — type the alias manually",
+  ))
+  model.settings.bot_aliases
+  |> dict.get("p1")
+  |> should.equal(Ok(ui_settings.AliasFailed))
+
+  let retried = step(model, ui.Settings(ui_settings.BotAddProviderPicked("p1")))
+  retried.settings.bot_aliases
+  |> dict.get("p1")
+  |> should.equal(Ok(ui_settings.AliasLoading))
+}
+
+pub fn bot_edit_model_combobox_scopes_to_bot_provider_test() {
+  // The inline editor scopes the combobox to the bot's own provider
+  // (the select's preselected value), rendering the list inside that
+  // row's wrap.
+  let model =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(ui.BotsLoaded([bot_row("b1", "Writer", "", None)]))
+    |> step(ui.SettingsToggled)
+    |> step(ui.Settings(ui_settings.BotEditToggled("b1", "p1")))
+  model.settings.bot_alias_provider |> should.equal(option.Some("p1"))
+
+  let html =
+    step(model, ui.Settings(ui_settings.BotAliasesLoaded("p1", ["smart"])))
+    |> view_string
+  should.be_true(string.contains(html, "data-value=\"smart\""))
+  should.be_true(string.contains(html, "live suggestions: bifrost"))
+}
+
+pub fn bot_model_combobox_hostile_aliases_escape_test() {
+  // Model aliases come from the provider (hostile by contract): the
+  // suggestion list's labels are inert Lustre text nodes AND the
+  // data-value attribute the combobox script reads on pick is an
+  // escaped attribute value — the script does getAttribute (no HTML
+  // parsing), so a quote-bearing alias must arrive escaped in both
+  // places or not at all.
+  let html =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(ui.SettingsToggled)
+    |> step(ui.Settings(ui_settings.TabSelected(ui_settings.BotsTab)))
+    |> step(ui.Settings(ui_settings.BotAddToggled(Some("p1"))))
+    |> step(
+      ui.Settings(
+        ui_settings.BotAliasesLoaded("p1", [
+          "<img src=x onerror=alert(2)>",
+          "x\" onmouseover=\"alert(1)",
+        ]),
+      ),
+    )
+    |> view_string
+  should.be_true(string.contains(html, "&lt;img src=x onerror=alert(2)&gt;"))
+  should.be_true(string.contains(html, "x&quot; onmouseover=&quot;alert(1)"))
+  should.be_true(string.contains(
+    html,
+    "data-value=\"x&quot; onmouseover=&quot;alert(1)\"",
+  ))
+  should_not_contain(html, "<img src=x")
+  should_not_contain(html, "onmouseover=\"alert(1)\"")
 }
 
 // ---------------------------------------------------------------------------
@@ -3643,7 +3845,7 @@ pub fn view_settings_bots_section_test() {
     |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
     |> step(ui.BotsLoaded([bot_row("b1", "Writer", "", Some("be terse"))]))
     |> step(ui.SettingsToggled)
-    |> step(ui.Settings(ui_settings.BotEditToggled("b1")))
+    |> step(ui.Settings(ui_settings.BotEditToggled("b1", "p1")))
     |> view_string
   should.be_true(string.contains(editing, ">Edit bot<"))
   should.be_true(string.contains(editing, "value=\"Writer\""))
@@ -3711,7 +3913,7 @@ pub fn view_settings_bots_tools_display_test() {
       ]),
     )
     |> step(ui.SettingsToggled)
-    |> step(ui.Settings(ui_settings.BotEditToggled("b3")))
+    |> step(ui.Settings(ui_settings.BotEditToggled("b3", "p1")))
     |> view_string
   should.be_true(string.contains(editing, "value=\"http_fetch\""))
 
@@ -3722,7 +3924,7 @@ pub fn view_settings_bots_tools_display_test() {
       ui.BotsLoaded([bot_row_with_tools("b2", "quiet", "", None, Some([]))]),
     )
     |> step(ui.SettingsToggled)
-    |> step(ui.Settings(ui_settings.BotEditToggled("b2")))
+    |> step(ui.Settings(ui_settings.BotEditToggled("b2", "p1")))
     |> view_string
   should.be_true(string.contains(editing_chat_only, "checked"))
 }

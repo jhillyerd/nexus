@@ -70,6 +70,8 @@ pub fn html(token: Option(String)) -> String {
     autoscroll_js(),
     "\n",
     timestamps_js(),
+    "\n",
+    combobox_js(),
     "\n</script>\n</body>\n</html>\n",
   ])
 }
@@ -443,6 +445,178 @@ fn timestamps_js() -> String {
   <> "})();"
 }
 
+/// The bot forms' model combobox (ui_settings): the server renders the
+/// suggestion list inside the field's `.combo-wrap`; this script gives it
+/// native-picker behaviour WITHOUT the browser's datalist popup — open on
+/// focus, filter as you type, pick with a click, keyboard-pick with
+/// ArrowDown/ArrowUp (Enter/Space activate the focused option), Escape or
+/// an outside click closes. Delegated on `document` with `composedPath()`:
+/// the app lives in the component's (open) shadow root, so real targets
+/// ride the path. Nothing is built from data — the list is
+/// server-rendered hostile text; the script only toggles classes and
+/// reads `data-value` into the field's value. Static and token-free.
+fn combobox_js() -> String {
+  "(function () {\n"
+  <> "  'use strict';\n"
+  <> "  var target = function (e) { return e.composedPath()[0]; };\n"
+  <> "  var closest = function (el, sel) {\n"
+  <> "    return el && el.closest ? el.closest(sel) : null;\n"
+  <> "  };\n"
+  <> "  var wrapOf = function (el) { return closest(el, '.combo-wrap'); };\n"
+  <> "  var listOf = function (wrap) { return wrap.querySelector('.combo-list'); };\n"
+  <> "  var fieldOf = function (wrap) { return wrap.querySelector('input.combo'); };\n"
+  <> "  // Wraps the user explicitly closed (pick, Escape, a closing click):\n"
+  <> "  // re-render observers must not re-open them until focus or typing\n"
+  <> "  // returns to the field.\n"
+  <> "  var suppressed = new WeakSet();\n"
+  <> "  var closeAll = function () {\n"
+  <> "    // The lists live inside the component's shadow root: a plain\n"
+  <> "    // document.querySelectorAll would close nothing.\n"
+  <> "    document.querySelectorAll('lustre-server-component').forEach(\n"
+  <> "      function (h) {\n"
+  <> "        var root = h.shadowRoot;\n"
+  <> "        if (!root) return;\n"
+  <> "        root.querySelectorAll('.combo-list.open').forEach(\n"
+  <> "          function (l) { l.classList.remove('open'); },\n"
+  <> "        );\n"
+  <> "      },\n"
+  <> "    );\n"
+  <> "  };\n"
+  <> "  var setOpen = function (wrap, on) {\n"
+  <> "    var l = listOf(wrap);\n"
+  <> "    if (!l) return;\n"
+  <> "    l.classList.toggle('open', on);\n"
+  <> "    l.setAttribute('aria-hidden', on ? 'false' : 'true');\n"
+  <> "  };\n"
+  <> "  var filter = function (wrap) {\n"
+  <> "    var l = listOf(wrap);\n"
+  <> "    if (!l) return;\n"
+  <> "    var q = fieldOf(wrap).value.trim().toLowerCase();\n"
+  <> "    var hits = 0;\n"
+  <> "    l.querySelectorAll('button[data-value]').forEach(function (b) {\n"
+  <> "      var hit = q === '' ||\n"
+  <> "        b.getAttribute('data-value').toLowerCase().indexOf(q) !== -1;\n"
+  <> "      b.classList.toggle('hide', !hit);\n"
+  <> "      if (hit) hits += 1;\n"
+  <> "    });\n"
+  <> "    l.classList.toggle('empty', hits === 0);\n"
+  <> "  };\n"
+  <> "  var openIfFocused = function (wrap) {\n"
+  <> "    var field = fieldOf(wrap);\n"
+  <> "    if (wrap.getRootNode().activeElement !== field) return;\n"
+  <> "    if (suppressed.has(wrap)) return;\n"
+  <> "    setOpen(wrap, true);\n"
+  <> "    filter(wrap);\n"
+  <> "  };\n"
+  <> "  document.addEventListener('focusin', function (e) {\n"
+  <> "    var t = target(e);\n"
+  <> "    var w = closest(t, '.combo-wrap');\n"
+  <> "    if (w && closest(t, 'input.combo')) {\n"
+  <> "      // Focus arriving from outside the wrap is a fresh visit —\n"
+  <> "      // forget an earlier Escape/pick close. Focus moving WITHIN the\n"
+  <> "      // wrap (Escape handing focus back to the field) keeps it.\n"
+  <> "      if (e.relatedTarget && !wrapOf(e.relatedTarget)) {\n"
+  <> "        suppressed.delete(w);\n"
+  <> "      }\n"
+  <> "      openIfFocused(w);\n"
+  <> "    } else if (!w) {\n"
+  <> "      closeAll();\n"
+  <> "    }\n"
+  <> "  });\n"
+  <> "  document.addEventListener('input', function (e) {\n"
+  <> "    var t = target(e);\n"
+  <> "    if (t.classList && t.classList.contains('combo')) {\n"
+  <> "      var w = wrapOf(t);\n"
+  <> "      suppressed.delete(w);\n"
+  <> "      openIfFocused(w);\n"
+  <> "    }\n"
+  <> "  });\n"
+  <> "  // Holding focus through the pick: mousedown would otherwise blur the\n"
+  <> "  // field and close the list before the click lands.\n"
+  <> "  document.addEventListener('mousedown', function (e) {\n"
+  <> "    var opt = closest(target(e), '.combo-list button[data-value]');\n"
+  <> "    if (opt) e.preventDefault();\n"
+  <> "  });\n"
+  <> "  document.addEventListener('click', function (e) {\n"
+  <> "    var t = target(e);\n"
+  <> "    var opt = closest(t, '.combo-list button[data-value]');\n"
+  <> "    if (opt) {\n"
+  <> "      var w = wrapOf(opt);\n"
+  <> "      var field = fieldOf(w);\n"
+  <> "      field.value = opt.getAttribute('data-value');\n"
+  <> "      // A pick is an explicit choice: keep the list closed even\n"
+  <> "      // though focus stays in the field (the re-render observer\n"
+  <> "      // respects this; focus or typing clears it).\n"
+  <> "      suppressed.add(w);\n"
+  <> "      setOpen(w, false);\n"
+  <> "      field.focus();\n"
+  <> "      return;\n"
+  <> "    }\n"
+  <> "    if (closest(t, 'input.combo')) {\n"
+  <> "      // Always OPEN, never a toggle: focusin has usually opened the\n"
+  <> "      // list already and a toggle here would flash it closed.\n"
+  <> "      var w = wrapOf(t);\n"
+  <> "      suppressed.delete(w);\n"
+  <> "      openIfFocused(w);\n"
+  <> "      return;\n"
+  <> "    }\n"
+  <> "    if (!closest(t, '.combo-wrap')) closeAll();\n"
+  <> "  });\n"
+  <> "  document.addEventListener('keydown', function (e) {\n"
+  <> "    var t = target(e);\n"
+  <> "    var w = wrapOf(t);\n"
+  <> "    if (!w) return;\n"
+  <> "    if (e.key === 'Escape') {\n"
+  <> "      suppressed.add(w);\n"
+  <> "      setOpen(w, false);\n"
+  <> "      if (t !== fieldOf(w)) fieldOf(w).focus();\n"
+  <> "      return;\n"
+  <> "    }\n"
+  <> "    if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;\n"
+  <> "    var l = listOf(w);\n"
+  <> "    if (!l) return;\n"
+  <> "    var visible = Array.prototype.filter.call(\n"
+  <> "      l.querySelectorAll('button[data-value]'),\n"
+  <> "      function (b) { return !b.classList.contains('hide'); },\n"
+  <> "    );\n"
+  <> "    if (!visible.length) return;\n"
+  <> "    var idx = visible.indexOf(t.getRootNode().activeElement);\n"
+  <> "    e.preventDefault();\n"
+  <> "    if (e.key === 'ArrowDown') {\n"
+  <> "      (idx === -1\n"
+  <> "        ? visible[0]\n"
+  <> "        : visible[Math.min(idx + 1, visible.length - 1)]).focus();\n"
+  <> "    } else if (idx === -1) {\n"
+  <> "      visible[visible.length - 1].focus();\n"
+  <> "    } else if (idx === 0) {\n"
+  <> "      fieldOf(w).focus();\n"
+  <> "    } else {\n"
+  <> "      visible[idx - 1].focus();\n"
+  <> "    }\n"
+  <> "  });\n"
+  <> "  // When a (re-)render inserts or updates the list while the field\n"
+  <> "  // already holds focus — the alias fetch landed after focusin, say —\n"
+  <> "  // re-open it. The observer only ever OPENS; explicit closes mark the\n"
+  <> "  // wrap suppressed until focus or typing returns. One observer per\n"
+  <> "  // component shadow root, attached when its view mounts.\n"
+  <> "  var observed = new WeakSet();\n"
+  <> "  document.addEventListener('lustre:mount', function (e) {\n"
+  <> "    var root = e.target.shadowRoot;\n"
+  <> "    if (!root || observed.has(root)) return;\n"
+  <> "    observed.add(root);\n"
+  <> "    new MutationObserver(function () {\n"
+  <> "      root.querySelectorAll('.combo-wrap').forEach(function (w) {\n"
+  <> "        var field = fieldOf(w);\n"
+  <> "        if (root.activeElement !== field) return;\n"
+  <> "        if (suppressed.has(w)) return;\n"
+  <> "        setOpen(w, true);\n"
+  <> "        filter(w);\n"
+  <> "      });\n"
+  <> "    }).observe(root, { childList: true, subtree: true });\n"
+  <> "  });\n"
+  <> "})();"
+}
+
 fn css() -> String {
   "
 :root { color-scheme: light dark; }
@@ -472,6 +646,41 @@ fn css() -> String {
   --pico-primary-hover-border: #2563eb;
   --pico-primary-focus: color-mix(in srgb, #3b82f6 35%, transparent);
 }
+
+/* The bot forms' model combobox (ui_settings): the select-style chevron
+   marks the field as offering OUR list — and it never moves or changes:
+   the native datalist is gone, so Chrome's autofill-style indicator
+   (which swapped style and position on focus) is gone with it.
+   autocomplete=off keeps browser history out of the field. */
+#app input.combo {
+  padding-right: calc(var(--pico-form-element-spacing-horizontal) + 1.5rem);
+  background-image: var(--pico-icon-chevron);
+  background-position: center right 0.75rem;
+  background-size: 1rem auto;
+  background-repeat: no-repeat;
+}
+/* The suggestion list renders INSIDE the wrap, anchored to the field:
+   an overlay (absolute) so it covers following fields only while open,
+   closable by Escape or an outside click (combobox_js). */
+.combo-wrap { position: relative; }
+.combo-list { display: none; position: absolute; top: calc(100% + .2rem);
+  left: 0; right: 0; z-index: 40; margin: 0; padding: .25rem;
+  border: 1px solid color-mix(in srgb, currentColor 20%, transparent);
+  border-radius: 10px; background: var(--pico-background-color);
+  box-shadow: 0 .35rem 1rem rgba(0, 0, 0, .25); max-height: 12rem;
+  overflow-y: auto; }
+.combo-list.open { display: block; }
+.combo-list.empty { display: none; }
+#app .combo-list button { display: block; width: 100%; margin: 0;
+  padding: .3rem .55rem; border: 0; border-radius: 7px; background: none;
+  color: inherit; font-size: .82rem; text-align: left; cursor: pointer;
+  overflow-wrap: anywhere; }
+#app .combo-list button:hover { background:
+  color-mix(in srgb, currentColor 10%, transparent); }
+/* The .hide prefix is load-bearing: without #app this (0,2,1) loses to
+   #app .combo-list button { display: block } ((1,1,1)) and typing would
+   never visually filter the list. */
+#app .combo-list button.hide { display: none; }
 @media only screen and (prefers-color-scheme: dark) {
   :root:not([data-theme=light]), :host(:not([data-theme=light])) {
     --pico-primary: #60a5fa;
@@ -647,6 +856,12 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
 .provider-head { display: flex; align-items: center; gap: .4rem; flex-wrap: wrap; }
 .provider-name { overflow-wrap: anywhere; }
 .provider-sub { font-size: .72rem; opacity: .6; overflow-wrap: anywhere; }
+/* Bot rows are cards too — same recipe as .provider-row above. They had
+   no rules at all and rendered as bare text plus a button row beside
+   the styled provider cards on the neighbouring tab. */
+.bot-row { display: flex; flex-direction: column; gap: .4rem; border: 1px solid
+  color-mix(in srgb, currentColor 15%, transparent); border-radius: 10px; padding: .55rem .8rem; }
+.bot-list { display: flex; flex-direction: column; gap: .5rem; }
 /* Badges ride the .provider-head row now (F7): align-self center keeps
    the pill vertically centered against the name instead of stretching
    (default) or pinning to the row's top edge (flex-start). */
@@ -664,6 +879,15 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
 #app .provider-form h3 { margin: 0; font-size: .7rem; font-weight: 600; text-transform: uppercase;
   letter-spacing: .07em; opacity: .55; }
 .provider-form input { min-width: 0; }
+/* Field margins inside the cards are already zero: the app-wide
+   `#app select, #app textarea, #app input, #app label { margin: 0 }`
+   rule below outranks Pico's. What still leaked into the cards were
+   BUTTON margins (Pico gives every button a 1rem bottom margin) and
+   the input+small hint's -.75rem pull-up, which clipped it under the
+   input's border. Zero those so the flex gap rules the rhythm (the
+   hint keeps Pico's width:100% block). */
+#app .provider-form button { margin: 0; }
+#app .provider-form .combo-wrap + small { display: block; margin: 0; }
 .provider-form-buttons { display: flex; gap: .3rem; }
 #app .provider-form-buttons button { font-size: .75rem; padding: .25rem .6rem; }
 /* Form visuals (borders, focus rings, filled backgrounds, dark mode) are
