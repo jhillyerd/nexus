@@ -2505,9 +2505,20 @@ fn thread_rows(model: Model) -> List(Element(Msg)) {
       matches_filter(summary, model.tag_filter)
     })
   case list.any(visible, fn(summary) { !summary.archived }) {
-    False -> [
-      html.p([attr.class("muted")], [html.text(empty_state_text(model))]),
-    ]
+    False ->
+      // The muted line is the active section's empty state. With the
+      // archive revealed and matching archived rows below the toggle,
+      // the view is NOT empty — printing "no matches" above them would
+      // lie, so the line steps aside and the group speaks for itself.
+      case
+        model.show_archived
+        && list.any(visible, fn(summary) { summary.archived })
+      {
+        True -> []
+        False -> [
+          html.p([attr.class("muted")], [html.text(empty_state_text(model))]),
+        ]
+      }
     True -> {
       let pinned = list.filter(visible, fn(s) { s.pinned && !s.archived })
       let unpinned = list.filter(visible, fn(s) { !s.pinned && !s.archived })
@@ -2538,10 +2549,18 @@ fn archived_rows(model: Model) -> Element(Msg) {
       case archived {
         [] -> element.none()
         rows ->
-          html.div([attr.class("thread-group archive-group")], [
-            html.h3([attr.class("group-label")], [html.text("Archived")]),
-            ..list.map(rows, thread_row(model, _))
-          ])
+          html.div(
+            [
+              attr.class("thread-group archive-group"),
+              // Same list semantics as #thread-list: the group moved
+              // below the toggle, not out of the thread list.
+              attr.role("list"),
+            ],
+            [
+              html.h3([attr.class("group-label")], [html.text("Archived")]),
+              ..list.map(rows, thread_row(model, _))
+            ],
+          )
       }
     }
   }

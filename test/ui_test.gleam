@@ -1748,10 +1748,35 @@ pub fn view_renders_archived_only_when_shown_test() {
   should.be_true(string.contains(shown, "Archived"))
   should.be_true(string.contains(shown, "Shelved"))
   should.be_true(string.contains(shown, "Restore"))
+  // The group keeps list semantics next to #thread-list — it moved
+  // below the toggle, not out of the thread list.
+  should.be_true(string.contains(shown, "archive-group\" role=\"list\""))
   // Invariant: archived rows carry no pin control (archiving unpins;
   // the registry refuses pins on archived threads).
   should.be_false(string.contains(shown, ">Pin<"))
   should.be_false(string.contains(shown, ">Unpin<"))
+
+  // A filter that matches only archived rows must not print "no
+  // matches" above the matching rows: the active section's empty line
+  // steps aside while the group below carries the results.
+  let filtered =
+    new_model()
+    |> step(ui.ThreadsLoaded([archived]))
+    |> step(ui.ArchivedToggled)
+    |> step(ui.TagFilterChanged("shel"))
+    |> view_string
+  should.be_true(string.contains(filtered, "Shelved"))
+  should.be_false(string.contains(filtered, "No threads match the filter."))
+
+  // No archived match under the filter: the honest empty text returns.
+  let none_match =
+    new_model()
+    |> step(ui.ThreadsLoaded([archived]))
+    |> step(ui.ArchivedToggled)
+    |> step(ui.TagFilterChanged("zzz"))
+    |> view_string
+  should.be_false(string.contains(none_match, "Shelved"))
+  should.be_true(string.contains(none_match, "No threads match the filter."))
 }
 
 pub fn view_hides_rows_failing_the_filter_test() {
