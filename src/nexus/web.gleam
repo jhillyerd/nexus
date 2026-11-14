@@ -113,6 +113,8 @@ pub fn handler(
       // (committed transcript, status, live-turn mirror) as JSON. A
       // read-only side channel for humans, curl, and tests — never a UI
       // data source; the browser's truth path stays the /ws event stream.
+      // Like every per-thread route it resolves the live actor, so a
+      // dormant thread lazy-starts here.
       Get, ["threads", id, "state"] ->
         protected(cfg, req, fn() {
           with_thread(registry, id, thread_state_response)
@@ -1406,6 +1408,13 @@ pub fn thread_summary_json(summary: thread.ThreadSummary) -> Json {
 /// status, the committed transcript, and the display-only live-turn
 /// mirror while a turn is in flight. For humans, curl, and tests; the
 /// browser UI never consumes it (its data path is the /ws event stream).
+///
+/// Consistency note: `summary` is the registry's snapshot taken just
+/// before the actor ask, so under concurrent turn activity its
+/// `message_count`/`streaming` can lag `status` by an instant. The
+/// actor-sourced fields (`status`, `messages`, `live_turn`) are the
+/// consistent truth; a debug dump doesn't buy cross-actor
+/// serialization.
 fn thread_state_response(
   summary: thread.ThreadSummary,
   subject: process.Subject(thread.Msg),
@@ -1451,7 +1460,9 @@ fn transcript_messages_json(t: transcript.Transcript) -> Json {
   |> json.preprocessed_array
 }
 
-fn chat_message_json(
+/// Pure — offline-testable, so the unreachable content-part shapes can
+/// be pinned without widening Transcript's append surface.
+pub fn chat_message_json(
   t: transcript.Transcript,
   seq: Int,
   message: chat.ChatMessage,
@@ -1559,10 +1570,12 @@ fn origin_json(origin: Option(transcript.Origin)) -> Json {
   }
 }
 
-/// The mid-turn display mirror (`turn_view` in thread.gleam): rounds the
-/// worker already finished render as `rounds`; `pending_text` /
-/// `pending_reasoning` are the streamed-but-uncommitted buffers. Present
-/// only while a turn is in flight. Display-only — never request bytes.
+/// The mid-turn display mirror (`turn_view` in thread.gleam): `rounds`
+/// is the FULL mirror transcript — the committed history as of the send
+/// plus the in-flight rounds the worker finished so far — not just the
+/// current turn; `pending_text` / `pending_reasoning` are the streamed-
+/// but-uncommitted buffers. Present only while a turn is in flight.
+/// Display-only — never request bytes.
 fn live_turn_json(live: thread.LiveTurn) -> Json {
   json.object([
     #("rounds", transcript_messages_json(live.view)),

@@ -215,7 +215,11 @@ server component over `/ws`). One standing rule when touching them:
   space the reasoning/stamp/origin sidecars address; `is_error` is the
   INVERTED tool-outcome sidecar (`append_tool_result`'s `ok`, so a
   failed call reads `true`); `live_turn` is display-only by the
-  existing invariant and is absent once the turn settles. The abridged
+  existing invariant and is `null` once the turn settles (the key is
+  always present — scripts must not test key absence). The `summary`
+  block is the registry's snapshot taken just before the actor ask, so
+  under concurrent activity it can lag `status` by an instant. The
+  abridged
   human/print-PDF HTML view (`/threads/<id>/transcript`) is deferred:
   jhillyerd/nexus#117.
 

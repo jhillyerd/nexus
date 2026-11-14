@@ -10,6 +10,7 @@ import gleam/list
 import gleam/option.{None, Some}
 import gleam/string
 import gleeunit/should
+import glopenai/chat
 import nexus/page as nexus_page
 import nexus/provider
 import nexus/provider_registry
@@ -185,6 +186,12 @@ pub fn thread_state_json_test() {
     data,
     "\"role\":\"assistant\",\"content\":\"let me check\",\"reasoning\":\"thought hard\",\"tool_calls\":null,\"seq\":2",
   ))
+  // The tool-call assistant row: content null (calls only), the call's
+  // id/name/arguments verbatim, sidecars stamped at the flush.
+  should.be_true(string.contains(
+    data,
+    "\"role\":\"assistant\",\"content\":null,\"reasoning\":null,\"tool_calls\":[{\"id\":\"c1\",\"name\":\"http_fetch\",\"arguments\":",
+  ))
   should.be_true(string.contains(
     data,
     "\"arguments\":\"{\\\"url\\\":\\\"https://x.test\\\"}\"",
@@ -217,6 +224,41 @@ pub fn thread_state_json_test() {
     live_data,
     "\"pending_reasoning\":\"still thinking\"",
   ))
+}
+
+pub fn state_dump_unreachable_message_shapes_test() {
+  // The codec shapes nexus never constructs (every append_* builds the
+  // text variant) are pinned here instead of in a transcript, because
+  // Transcript's append surface can't build them: `chat_message_json` is
+  // exported pure exactly for this. A glopenai upgrade that changes
+  // these rows' rendering fails here instead of silently reshaping the
+  // dump.
+  let t = transcript.new("alias-x", "system")
+  let developer =
+    web.chat_message_json(
+      t,
+      4,
+      chat.DeveloperMessage(
+        content: chat.DeveloperTextContent("nope"),
+        name: None,
+      ),
+    )
+    |> json.to_string
+  should.be_true(string.contains(developer, "\"role\":\"developer\""))
+  should.be_true(string.contains(developer, "\"seq\":4"))
+  // No content key: the shape never occurs, so nothing is claimed.
+  should.be_false(string.contains(developer, "content"))
+
+  let parts =
+    web.chat_message_json(
+      t,
+      5,
+      chat.UserMessage(content: chat.UserPartsContent([]), name: None),
+    )
+    |> json.to_string
+  should.be_true(string.contains(parts, "\"role\":\"user\""))
+  should.be_true(string.contains(parts, "\"seq\":5"))
+  should.be_false(string.contains(parts, "content"))
 }
 
 pub fn auto_title_test() {
