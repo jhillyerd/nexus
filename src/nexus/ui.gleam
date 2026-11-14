@@ -2484,6 +2484,8 @@ fn tag_filter_row(model: Model) -> Element(Msg) {
                 attr.id("filter-clear"),
                 attr.type_("button"),
                 attr.title("Clear filter"),
+                // The × glyph alone is a weak accessible name; say it.
+                attr.aria("label", "Clear filter"),
                 event.on_click(TagFilterSet("")),
               ],
               [html.text("×")],

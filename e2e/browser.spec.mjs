@@ -1925,6 +1925,9 @@ async function main() {
         { timeout: 10_000, message: "provider/model pickers stood down" },
       );
       const threadsBefore = await page.locator("#thread-list .thread-main").count();
+      const beforeIds = new Set(
+        (await (await page.request.get(`${base}/threads`, { headers })).json()).threads.map((s) => s.id),
+      );
       await page.click("#create-thread");
       await poll(
         async () =>
@@ -1932,22 +1935,28 @@ async function main() {
             === threadsBefore + 1,
         { timeout: 15_000, message: "bot-sourced thread appears" },
       );
+      // The API agrees: identify the created thread precisely (a diff
+      // against the pre-create snapshot), so every later assertion — row
+      // subtitle, provenance drop, frozen pin — is about THIS thread,
+      // not any other smart-model row.
+      const threadsApi = await (
+        await page.request.get(`${base}/threads`, { headers })
+      ).json();
+      const madeThread = threadsApi.threads.find((s) => !beforeIds.has(s.id));
+      assert(madeThread, "bot-sourced thread in API");
+      eq(madeThread.bot_id, botId, "thread summary carries bot_id");
       // The row subtitle leads with the bot name (provenance), then the
       // age — #107 dropped the frozen pin from the chrome.
-      const botThreadRow = page
-        .locator("#thread-list .thread-main", { hasText: "Writer · " })
-        .first();
+      const botThreadRow = page.locator(
+        `#thread-list .thread-row[data-thread-id="${madeThread.id}"]`,
+      );
       await poll(async () => await botThreadRow.isVisible(), {
         timeout: 10_000,
         message: "thread subtitle leads with bot provenance",
       });
-      // The API agrees: the new thread carries the provenance pointer.
-      const threadsApi = await (
-        await page.request.get(`${base}/threads`, { headers })
-      ).json();
       assert(
-        threadsApi.threads.some((s) => s.bot_id === botId),
-        "thread summary carries bot_id",
+        (await botThreadRow.innerText()).includes("Writer · "),
+        "row subtitle leads with the bot name",
       );
 
       // Delete the bot (two-step, unguarded): the thread keeps its
@@ -1965,11 +1974,24 @@ async function main() {
         message: "bot row gone after delete",
       });
       await backToChat(page);
+      // Provenance is display-side self-healing: the summary's pointer
+      // stays stale until a rehydrate (the store's FK SET NULL), so the
+      // assertions are the surviving thread's frozen pin (API) and its
+      // row showing the age-only subtitle (display).
       await poll(
         async () => {
-          const rows = await page.locator("#thread-list .thread-main").allInnerTexts();
-          return rows.some((t) => t.includes("smart"))
-            && !rows.some((t) => t.includes("Writer · "));
+          const api = await (
+            await page.request.get(`${base}/threads`, { headers })
+          ).json();
+          const kept = api.threads.find((s) => s.id === madeThread.id);
+          const rowText = await botThreadRow.innerText().catch(() => "");
+          return (
+            !!kept
+            && kept.provider_id === madeThread.provider_id
+            && kept.model === madeThread.model
+            && rowText.includes("smart")
+            && !rowText.includes("Writer")
+          );
         },
         { timeout: 15_000, message: "thread keeps pin, provenance name gone",
         },

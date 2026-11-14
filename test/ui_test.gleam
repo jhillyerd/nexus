@@ -2142,17 +2142,40 @@ pub fn view_provider_picker_lists_enabled_only_test() {
   should.be_true(string.contains(none, "no providers — add one in Settings"))
 }
 
+/// The rendered text of the first `.thread-sub` span in a view string —
+/// empty when no row subtitle rendered. Subtitle assertions compare it
+/// whole, so a subtitle that silently dropped its age (or grew a
+/// provider/model prefix back) fails loudly instead of merely not
+/// matching a negative contains.
+fn first_thread_sub(html: String) -> String {
+  case string.split_once(html, "class=\"thread-sub\">") {
+    Error(_) -> ""
+    Ok(#(_, rest)) ->
+      case string.split_once(rest, "</span>") {
+        Error(_) -> ""
+        Ok(#(text, _)) -> text
+      }
+  }
+}
+
 pub fn view_thread_subtitle_omits_provider_model_test() {
   let html =
     new_model()
     |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
     |> step(ui.ThreadsLoaded([summary("s-1", False)]))
     |> view_string
-  // #107: the subtitle dropped provider/model — a bot-less thread shows
-  // only its age. Neither the resolved name nor the lagging-id fallback
-  // (`p1/smart`) may reappear in the chrome.
-  should.be_false(string.contains(html, "bifrost/smart · "))
-  should.be_false(string.contains(html, "p1/smart · "))
+  // #107: the bot-less subtitle IS the age alone — compared whole against
+  // rel_time at (nearly) the same instant. The gap from epoch 0 is
+  // year-granular, so a second boundary between the render and this
+  // check cannot change the label. A subtitle that dropped its age or
+  // grew a provider/model prefix fails either way; the id fallback the
+  // old test pinned (`p1/smart`) has no render to exist in.
+  should.equal(first_thread_sub(html), ui.rel_time(timing.wall_now_s(), 0))
+  let lagging =
+    new_model()
+    |> step(ui.ThreadsLoaded([summary("s-1", False)]))
+    |> view_string
+  should.equal(first_thread_sub(lagging), ui.rel_time(timing.wall_now_s(), 0))
 }
 
 // ---------------------------------------------------------------------------
@@ -3866,8 +3889,14 @@ pub fn view_thread_subtitle_shows_bot_provenance_test() {
       ]),
     )
     |> view_string
-  should.be_true(string.contains(html, "&lt;b&gt;Writer&lt;/b&gt; · "))
-  should_not_contain(html, "<b>Writer</b> · bifrost")
+  // Subtitle compared whole: bot name (escaped) + middot + age, nothing
+  // else — provider/model has no way back in.
+  should.equal(
+    first_thread_sub(html),
+    "&lt;b&gt;Writer&lt;/b&gt; · " <> ui.rel_time(timing.wall_now_s(), 0),
+  )
+  // The escaped name is what rendered: raw markup never reaches the DOM.
+  should_not_contain(html, "<b>Writer</b>")
 
   // Deleted bot: the pointer resolves to nothing, the subtitle is
   // age-only (self-heals on rehydrate, which NULLs the column).
@@ -3880,8 +3909,9 @@ pub fn view_thread_subtitle_shows_bot_provenance_test() {
       ]),
     )
     |> view_string
-  should.be_false(string.contains(gone, "b-gone · "))
-  should.be_false(string.contains(gone, "bifrost/smart · "))
+  // Deleted bot: the pointer resolves to nothing, the subtitle is
+  // age-only — no `b-gone · ` echo, no provider/model rescue.
+  should.equal(first_thread_sub(gone), ui.rel_time(timing.wall_now_s(), 0))
 }
 
 /// A deleted bot falls out of the create panel's selection: the model

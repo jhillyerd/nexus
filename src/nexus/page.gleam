@@ -542,26 +542,28 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
   border-radius: 10px; padding: .3rem; }
 .thread-row.selected { border-color: #3b82f6; background: color-mix(in srgb, #3b82f6 12%, transparent); }
 /* Soft hover (#107): the selected tint WITHOUT the border — the blue
-   border stays exclusive to selection. Behind the hover-media guard like
-   .row-controls below, so a touch scroll never leaves a sticky tint. */
-@media (hover: hover) {
-  .thread-row:hover { background: color-mix(in srgb, #3b82f6 12%, transparent); }
-}
+   border stays exclusive to selection — plus the title unwrap's hover
+   arm, both in the media block below with .row-controls' guard, so a
+   touch scroll never leaves a sticky tint or an unwrapped title. */
 /* min-width: 0 is load-bearing: .thread-main is a flex item of the row
    and the title span is a flex item of .thread-main — without it neither
    can shrink below content width and the title ellipsis never engages. */
 .thread-main { display: flex; flex-direction: column; gap: .1rem; text-align: left; min-width: 0; }
 /* Titles truncate to one ellipsized line at rest (#107) and unwrap on the
-   same reveal signals as .row-controls below (hover / selected /
-   focus-within — the last keeps keyboard users equal to pointer users).
+   same reveal signals as .row-controls below (selected / focus-within
+   always; hover behind the guard — a touch device's sticky :hover would
+   otherwise leave a non-selected row's title unwrapped).
    overflow-wrap returns with the unwrap so a long unbroken token wraps
    instead of clipping. The title text stays whole in the DOM: this is a
    CSS clip only, so textContent (and the hostile-text contract) is
    untouched. */
 .thread-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.thread-row:hover .thread-title,
 .thread-row.selected .thread-title,
 .thread-row:focus-within .thread-title { white-space: normal; overflow-wrap: anywhere; }
+@media (hover: hover) {
+  .thread-row:hover { background: color-mix(in srgb, #3b82f6 12%, transparent); }
+  .thread-row:hover .thread-title { white-space: normal; overflow-wrap: anywhere; }
+}
 .thread-sub { font-size: .72rem; opacity: .6; overflow-wrap: anywhere; }
 .tag-chips { display: flex; flex-wrap: wrap; gap: .25rem; }
 /* Quiet chip (ui-polish F2): no border by default, so a tagged row reads
