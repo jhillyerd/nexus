@@ -641,6 +641,12 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
 .provider-head { display: flex; align-items: center; gap: .4rem; flex-wrap: wrap; }
 .provider-name { overflow-wrap: anywhere; }
 .provider-sub { font-size: .72rem; opacity: .6; overflow-wrap: anywhere; }
+/* Bot rows are cards too — same recipe as .provider-row above. They had
+   no rules at all and rendered as bare text plus a button row beside
+   the styled provider cards on the neighbouring tab. */
+.bot-row { display: flex; flex-direction: column; gap: .4rem; border: 1px solid
+  color-mix(in srgb, currentColor 15%, transparent); border-radius: 10px; padding: .55rem .8rem; }
+.bot-list { display: flex; flex-direction: column; gap: .5rem; }
 /* Badges ride the .provider-head row now (F7): align-self center keeps
    the pill vertically centered against the name instead of stretching
    (default) or pinning to the row's top edge (flex-start). */
@@ -658,6 +664,21 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
 #app .provider-form h3 { margin: 0; font-size: .7rem; font-weight: 600; text-transform: uppercase;
   letter-spacing: .07em; opacity: .55; }
 .provider-form input { min-width: 0; }
+/* The form cards are flex columns whose gap IS the spacing rhythm, but
+   Pico's per-element margins stack on top of it: 1rem under every
+   input/select/textarea/button, .375rem under labels, and the
+   input+small hint's -.75rem pull-up — fields sat ~1.45rem apart while
+   the card gap says .45rem, and the combobox hint clipped under the
+   input's border. Zero the field margins inside the cards so the gap
+   rules the rhythm (the hint keeps Pico's width:100% block).
+   Specificity note (see the cascade traps at the top): plain-element
+   margins need the #app prefix to beat Pico's matching selectors. */
+#app .provider-form input:not([type=checkbox]),
+#app .provider-form select,
+#app .provider-form textarea,
+#app .provider-form label,
+#app .provider-form button { margin: 0; }
+#app .provider-form input + small { margin: 0; }
 .provider-form-buttons { display: flex; gap: .3rem; }
 #app .provider-form-buttons button { font-size: .75rem; padding: .25rem .6rem; }
 /* Form visuals (borders, focus rings, filled backgrounds, dark mode) are
