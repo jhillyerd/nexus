@@ -949,25 +949,26 @@ fn bot_row(
             )
           }),
         ),
-        html.input([
-          attr.type_("text"),
-          attr.name("model"),
-          attr.value(b.model),
-          // Combobox: the scoped provider's live aliases suggest, free
-          // entry stays possible (a datalist never restricts — a stale
-          // alias saves fine and re-validates at thread create). The
-          // combo class draws the select-style chevron and
-          // autocomplete=off keeps the browser's own history/autofill
-          // popup out of the field.
-          attr.class("combo"),
-          attr.attribute("list", "bot-model-options-" <> id),
-          attr.attribute("autocomplete", "off"),
-          attr.placeholder("Model alias"),
-          attr.aria("label", "Model alias for " <> b.name),
+        html.div([attr.class("combo-wrap")], [
+          html.input([
+            attr.type_("text"),
+            attr.name("model"),
+            attr.value(b.model),
+            // Combobox: the scoped provider's live aliases suggest, free
+            // entry stays possible (a stale alias saves fine and
+            // re-validates at thread create). The combo class draws the
+            // select-style chevron and autocomplete=off keeps the
+            // browser's own history/autofill popup out of the field —
+            // no native datalist, so no popup over the form.
+            attr.class("combo"),
+            attr.attribute("autocomplete", "off"),
+            attr.placeholder("Model alias"),
+            attr.aria("label", "Model alias for " <> b.name),
+          ]),
+          bot_model_suggestions(state, state.bot_edit == Some(id)),
         ]),
         bot_model_options(
           state,
-          "bot-model-options-" <> id,
           state.bot_edit == Some(id),
           combobox_provider_name(provider_list, state.bot_alias_provider),
         ),
@@ -1089,21 +1090,22 @@ fn add_bot_form(state: State, provider_list: List(Provider)) -> Element(Msg) {
             })
         },
       ),
-      html.input([
-        attr.type_("text"),
-        attr.name("model"),
-        // Combobox, same rule as the edit form: live suggestions over
-        // free entry, chevron + autocomplete=off marking the field as
-        // ours.
-        attr.class("combo"),
-        attr.attribute("list", "add-bot-model-options"),
-        attr.attribute("autocomplete", "off"),
-        attr.placeholder("Model alias"),
-        attr.aria("label", "New bot model alias"),
+      html.div([attr.class("combo-wrap")], [
+        html.input([
+          attr.type_("text"),
+          attr.name("model"),
+          // Combobox, same rule as the edit form: live suggestions over
+          // free entry, chevron + autocomplete=off marking the field as
+          // ours — no native datalist, so no popup over the form.
+          attr.class("combo"),
+          attr.attribute("autocomplete", "off"),
+          attr.placeholder("Model alias"),
+          attr.aria("label", "New bot model alias"),
+        ]),
+        bot_model_suggestions(state, state.bots_open),
       ]),
       bot_model_options(
         state,
-        "add-bot-model-options",
         state.bots_open,
         combobox_provider_name(provider_list, state.bot_alias_provider),
       ),
@@ -1751,19 +1753,53 @@ fn form_field(
   }
 }
 
-/// The open bot form's model combobox backing (bots section): the
-/// scoped provider's live aliases as a `<datalist>` once loaded — with
-/// a muted hint NAMING the source under the field, so the suggestions
-/// popup reads as our data rather than the browser's own history — or
-/// a static hint while loading / after a failure. Manual entry stays
-/// possible in every state — a datalist only suggests; the save rule
-/// stays non-empty-only and thread create re-validates live. The
-/// hint precedes the datalist so Pico's `input + small` form-hint
-/// rule still matches (the invisible datalist after it breaks the
-/// adjacency).
+/// The open bot form's suggestion list (bots section): the scoped
+/// provider's live aliases as server-rendered options inside the
+/// field's `.combo-wrap`. Hidden by default — `combobox_js` opens it on
+/// focus, filters as you type, and fills the field on pick — so unlike
+/// the browser's datalist popup it stays anchored to the field and only
+/// covers following fields while open. Manual entry stays possible in
+/// every state; the save rule stays non-empty-only and thread create
+/// re-validates live.
+fn bot_model_suggestions(state: State, open: Bool) -> Element(Msg) {
+  case open {
+    False -> element.none()
+    True ->
+      case state.bot_alias_provider {
+        None -> element.none()
+        Some(id) ->
+          case dict.get(state.bot_aliases, id) {
+            Ok(AliasOk(aliases)) ->
+              html.div(
+                [
+                  attr.class("combo-list"),
+                  attr.attribute("aria-hidden", "true"),
+                  attr.aria("label", "Model alias suggestions"),
+                ],
+                list.map(aliases, fn(alias) {
+                  html.button(
+                    [
+                      attr.type_("button"),
+                      attr.class("combo-opt"),
+                      attr.attribute("tabindex", "-1"),
+                      attr.data("value", alias),
+                    ],
+                    [html.text(alias)],
+                  )
+                }),
+              )
+            _ -> element.none()
+          }
+      }
+  }
+}
+
+/// The open bot form's model-combobox hint: names the source of the
+/// suggestions once loaded, and offers manual entry while loading /
+/// after a failure. The list itself renders inside the field's wrap
+/// (see `bot_model_suggestions`).
 fn bot_model_options(
   state: State,
-  datalist_id: String,
   open: Bool,
   provider_name: Option(String),
 ) -> Element(Msg) {
@@ -1774,20 +1810,12 @@ fn bot_model_options(
         None -> element.none()
         Some(id) ->
           case dict.get(state.bot_aliases, id) {
-            Ok(AliasOk(aliases)) ->
-              element.fragment([
-                html.small([attr.class("muted")], [
-                  html.text(
-                    "live suggestions: "
-                    <> option.unwrap(provider_name, "the provider")
-                    <> " model list — type to filter or enter any alias",
-                  ),
-                ]),
-                html.datalist(
-                  [attr.id(datalist_id)],
-                  list.map(aliases, fn(alias) {
-                    html.option([attr.value(alias)], alias)
-                  }),
+            Ok(AliasOk(_)) ->
+              html.small([attr.class("muted")], [
+                html.text(
+                  "live suggestions: "
+                  <> option.unwrap(provider_name, "the provider")
+                  <> " model list — type to filter, pick one, or enter any alias",
                 ),
               ])
             Ok(AliasLoading) ->

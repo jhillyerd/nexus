@@ -2476,7 +2476,7 @@ pub fn settings_view_escapes_hostile_text_test() {
 pub fn bot_model_combobox_scopes_and_lists_test() {
   // Opening the add form scopes the combobox to the first provider and
   // fetches its live list; the reply settles the per-provider cache and
-  // renders as a datalist wired to the input's `list` attribute.
+  // renders as a suggestion list anchored inside the field's wrap.
   let model =
     new_model()
     |> step(
@@ -2509,14 +2509,18 @@ pub fn bot_model_combobox_scopes_and_lists_test() {
   should.be_true(string.contains(html, "class=\"combo\""))
   should.be_true(string.contains(html, "autocomplete=\"off\""))
   should.be_true(string.contains(html, "live suggestions: bifrost model list"))
-  should.be_true(string.contains(html, "list=\"add-bot-model-options\""))
-  should.be_true(string.contains(
-    html,
-    "<datalist id=\"add-bot-model-options\">",
-  ))
-  should.be_true(string.contains(html, "<option value=\"smart\""))
-  // No editor is open, so no per-row datalist renders.
-  should_not_contain(html, "bot-model-options-b1")
+  // The suggestions are OUR list (no native datalist): server-rendered
+  // options inside the field's wrap, carrying the alias in data-value
+  // for the combobox script to fill on pick.
+  should.be_true(string.contains(html, "class=\"combo-wrap\""))
+  should.be_true(string.contains(html, "class=\"combo-list\""))
+  should.be_true(string.contains(html, "data-value=\"smart\""))
+  should.be_true(string.contains(html, "data-value=\"fast\""))
+  // No editor is open, so the page renders exactly one list (the add
+  // form's): split on the class and count the pieces.
+  string.split(html, "class=\"combo-list\"")
+  |> list.length
+  |> should.equal(2)
 }
 
 pub fn bot_alias_cache_invalidated_on_provider_mutation_test() {
@@ -2581,9 +2585,9 @@ pub fn bot_model_combobox_provider_switch_rescopes_test() {
   let settled =
     step(late, ui.Settings(ui_settings.BotAliasesLoaded("p2", ["fast"])))
   let html = view_string(settled)
-  should.be_true(string.contains(html, "<option value=\"fast\""))
-  should_not_contain(html, "<option value=\"smart\"")
-  should_not_contain(html, "<option value=\"late\"")
+  should.be_true(string.contains(html, "data-value=\"fast\""))
+  should_not_contain(html, "data-value=\"smart\"")
+  should_not_contain(html, "data-value=\"late\"")
 }
 
 pub fn bot_model_combobox_failure_note_test() {
@@ -2613,7 +2617,8 @@ pub fn bot_model_combobox_failure_note_test() {
 
 pub fn bot_edit_model_combobox_scopes_to_bot_provider_test() {
   // The inline editor scopes the combobox to the bot's own provider
-  // (the select's preselected value) under its per-row datalist id.
+  // (the select's preselected value), rendering the list inside that
+  // row's wrap.
   let model =
     new_model()
     |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
@@ -2625,14 +2630,13 @@ pub fn bot_edit_model_combobox_scopes_to_bot_provider_test() {
   let html =
     step(model, ui.Settings(ui_settings.BotAliasesLoaded("p1", ["smart"])))
     |> view_string
-  should.be_true(string.contains(html, "list=\"bot-model-options-b1\""))
+  should.be_true(string.contains(html, "data-value=\"smart\""))
   should.be_true(string.contains(html, "live suggestions: bifrost"))
-  should.be_true(string.contains(html, "<datalist id=\"bot-model-options-b1\">"))
 }
 
 pub fn bot_model_combobox_hostile_aliases_escape_test() {
   // Model aliases come from the provider (hostile by contract): the
-  // datalist's option labels are inert Lustre text nodes.
+  // suggestion list's labels are inert Lustre text nodes.
   let html =
     new_model()
     |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))

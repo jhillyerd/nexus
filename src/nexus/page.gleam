@@ -70,6 +70,8 @@ pub fn html(token: Option(String)) -> String {
     autoscroll_js(),
     "\n",
     timestamps_js(),
+    "\n",
+    combobox_js(),
     "\n</script>\n</body>\n</html>\n",
   ])
 }
@@ -443,6 +445,111 @@ fn timestamps_js() -> String {
   <> "})();"
 }
 
+/// The bot forms' model combobox (ui_settings): the server renders the
+/// suggestion list inside the field's `.combo-wrap`; this script gives it
+/// native-picker behaviour WITHOUT the browser's datalist popup — open on
+/// focus, filter as you type, pick with a click, Escape or an outside
+/// click closes. Delegated on `document` with `composedPath()`: the app
+/// lives in the component's (open) shadow root, so real targets ride the
+/// path. Nothing is built from data — the list is server-rendered hostile
+/// text; the script only toggles classes and reads `data-value` into the
+/// field's value. Static and token-free.
+fn combobox_js() -> String {
+  "(function () {\n"
+  <> "  'use strict';\n"
+  <> "  var target = function (e) { return e.composedPath()[0]; };\n"
+  <> "  var closest = function (el, sel) {\n"
+  <> "    return el && el.closest ? el.closest(sel) : null;\n"
+  <> "  };\n"
+  <> "  var wrapOf = function (el) { return closest(el, '.combo-wrap'); };\n"
+  <> "  var listOf = function (wrap) { return wrap.querySelector('.combo-list'); };\n"
+  <> "  var fieldOf = function (wrap) { return wrap.querySelector('input.combo'); };\n"
+  <> "  var closeAll = function () {\n"
+  <> "    // The lists live inside the component's shadow root: a plain\n"
+  <> "    // document.querySelectorAll would close nothing.\n"
+  <> "    document.querySelectorAll('lustre-server-component').forEach(\n"
+  <> "      function (h) {\n"
+  <> "        var root = h.shadowRoot;\n"
+  <> "        if (!root) return;\n"
+  <> "        root.querySelectorAll('.combo-list.open').forEach(\n"
+  <> "          function (l) { l.classList.remove('open'); },\n"
+  <> "        );\n"
+  <> "      },\n"
+  <> "    );\n"
+  <> "  };\n"
+  <> "  var setOpen = function (wrap, on) {\n"
+  <> "    var l = listOf(wrap);\n"
+  <> "    if (l) l.classList.toggle('open', on);\n"
+  <> "  };\n"
+  <> "  var filter = function (wrap) {\n"
+  <> "    var l = listOf(wrap);\n"
+  <> "    if (!l) return;\n"
+  <> "    var q = fieldOf(wrap).value.trim().toLowerCase();\n"
+  <> "    var hits = 0;\n"
+  <> "    l.querySelectorAll('button[data-value]').forEach(function (b) {\n"
+  <> "      var hit = q === '' ||\n"
+  <> "        b.getAttribute('data-value').toLowerCase().indexOf(q) !== -1;\n"
+  <> "      b.classList.toggle('hide', !hit);\n"
+  <> "      if (hit) hits += 1;\n"
+  <> "    });\n"
+  <> "    l.classList.toggle('empty', hits === 0);\n"
+  <> "  };\n"
+  <> "  document.addEventListener('focusin', function (e) {\n"
+  <> "    var t = target(e);\n"
+  <> "    var w = closest(t, '.combo-wrap');\n"
+  <> "    if (w && closest(t, 'input.combo')) {\n"
+  <> "      setOpen(w, true);\n"
+  <> "      filter(w);\n"
+  <> "    } else if (!w) {\n"
+  <> "      closeAll();\n"
+  <> "    }\n"
+  <> "  });\n"
+  <> "  document.addEventListener('input', function (e) {\n"
+  <> "    var t = target(e);\n"
+  <> "    var w = t.classList && t.classList.contains('combo') ? wrapOf(t) : null;\n"
+  <> "    // Typing re-opens too: after a pick the list is closed but focus\n"
+  <> "    // never left the field, so focusin will not fire again.\n"
+  <> "    if (w) {\n"
+  <> "      setOpen(w, true);\n"
+  <> "      filter(w);\n"
+  <> "    }\n"
+  <> "  });\n"
+  <> "  // Holding focus through the pick: mousedown would otherwise blur the\n"
+  <> "  // field and close the list before the click lands.\n"
+  <> "  document.addEventListener('mousedown', function (e) {\n"
+  <> "    var opt = closest(target(e), '.combo-list button[data-value]');\n"
+  <> "    if (opt) e.preventDefault();\n"
+  <> "  });\n"
+  <> "  document.addEventListener('click', function (e) {\n"
+  <> "    var t = target(e);\n"
+  <> "    var opt = closest(t, '.combo-list button[data-value]');\n"
+  <> "    if (opt) {\n"
+  <> "      var w = wrapOf(opt);\n"
+  <> "      var field = fieldOf(w);\n"
+  <> "      field.value = opt.getAttribute('data-value');\n"
+  <> "      setOpen(w, false);\n"
+  <> "      field.focus();\n"
+  <> "      return;\n"
+  <> "    }\n"
+  <> "    if (closest(t, 'input.combo')) {\n"
+  <> "      var w = wrapOf(t);\n"
+  <> "      // A click re-opens even when the field is already focused (no\n"
+  <> "      // focusin fires then) — the native picker's toggle behaviour.\n"
+  <> "      setOpen(w, !listOf(w).classList.contains('open'));\n"
+  <> "      filter(w);\n"
+  <> "      return;\n"
+  <> "    }\n"
+  <> "    if (!closest(t, '.combo-wrap')) closeAll();\n"
+  <> "  });\n"
+  <> "  document.addEventListener('keydown', function (e) {\n"
+  <> "    var t = target(e);\n"
+  <> "    if (e.key !== 'Escape') return;\n"
+  <> "    var w = t.classList && t.classList.contains('combo') ? wrapOf(t) : null;\n"
+  <> "    if (w) setOpen(w, false);\n"
+  <> "  });\n"
+  <> "})();"
+}
+
 fn css() -> String {
   "
 :root { color-scheme: light dark; }
@@ -473,12 +580,11 @@ fn css() -> String {
   --pico-primary-focus: color-mix(in srgb, #3b82f6 35%, transparent);
 }
 
-/* The bot forms' model combobox (ui_settings, datalist-backed): the
-   select-style chevron marks the field as offering OUR list, so at rest
-   it doesn't read as a plain text input feeding the browser's own
-   autofill/history suggestions (autocomplete=off handles the popup
-   side). Reuses Pico's own icon variable, so light/dark follow the
-   theme for free — a data URI here could not. */
+/* The bot forms' model combobox (ui_settings): the select-style chevron
+   marks the field as offering OUR list — and it never moves or changes:
+   the native datalist is gone, so Chrome's autofill-style indicator
+   (which swapped style and position on focus) is gone with it.
+   autocomplete=off keeps browser history out of the field. */
 #app input.combo {
   padding-right: calc(var(--pico-form-element-spacing-horizontal) + 1.5rem);
   background-image: var(--pico-icon-chevron);
@@ -486,19 +592,25 @@ fn css() -> String {
   background-size: 1rem auto;
   background-repeat: no-repeat;
 }
-/* Chrome draws its own solid indicator (the same glyph it uses for
-   autofill/history entries) at the right edge on hover/focus — beside
-   ours it read as two competing arrows. It is UA-internal (the
-   calendar-picker-indicator pseudo only styles date inputs), so instead
-   stand OUR chevron down while Chrome's is painted: rest state is the
-   themed decoration, interaction is the native clickable affordance.
-   WebKit/Blink only — Firefox draws no indicator and keeps ours. */
-@supports selector(::-webkit-calendar-picker-indicator) {
-  #app input.combo:hover,
-  #app input.combo:focus {
-    background-image: none;
-  }
-}
+/* The suggestion list renders INSIDE the wrap, anchored to the field:
+   an overlay (absolute) so it covers following fields only while open,
+   closable by Escape or an outside click (combobox_js). */
+.combo-wrap { position: relative; }
+.combo-list { display: none; position: absolute; top: calc(100% + .2rem);
+  left: 0; right: 0; z-index: 40; margin: 0; padding: .25rem;
+  border: 1px solid color-mix(in srgb, currentColor 20%, transparent);
+  border-radius: 10px; background: var(--pico-background-color);
+  box-shadow: 0 .35rem 1rem rgba(0, 0, 0, .25); max-height: 12rem;
+  overflow-y: auto; }
+.combo-list.open { display: block; }
+.combo-list.empty { display: none; }
+#app .combo-list button { display: block; width: 100%; margin: 0;
+  padding: .3rem .55rem; border: 0; border-radius: 7px; background: none;
+  color: inherit; font-size: .82rem; text-align: left; cursor: pointer;
+  overflow-wrap: anywhere; }
+#app .combo-list button:hover { background:
+  color-mix(in srgb, currentColor 10%, transparent); }
+.combo-list button.hide { display: none; }
 @media only screen and (prefers-color-scheme: dark) {
   :root:not([data-theme=light]), :host(:not([data-theme=light])) {
     --pico-primary: #60a5fa;
@@ -672,7 +784,7 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
    input's border. Zero those so the flex gap rules the rhythm (the
    hint keeps Pico's width:100% block). */
 #app .provider-form button { margin: 0; }
-#app .provider-form input + small { margin: 0; }
+#app .provider-form .combo-wrap + small { display: block; margin: 0; }
 .provider-form-buttons { display: flex; gap: .3rem; }
 #app .provider-form-buttons button { font-size: .75rem; padding: .25rem .6rem; }
 /* Form visuals (borders, focus rings, filled backgrounds, dark mode) are
