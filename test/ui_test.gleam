@@ -3012,10 +3012,19 @@ pub fn send_moves_previous_day_row_into_today_immediately_test() {
   |> lustre.send(to: runtime)
 
   // The connect cascade settles with the old row under Yesterday — its
-  // subtitle age reads "1d".
+  // subtitle age reads "1d". #107 made the bare age the whole bot-less
+  // subtitle, so the middot is gone, and the log's age stamp ("1d ago",
+  // inside a <time>) makes plain "1d" ambiguous — these payloads are
+  // Lustre element JSON, not HTML, so the anchor pins the age to its
+  // span by the encoder's shape: a text node reading exactly "1d" as the
+  // sole child of a span whose first attribute is class thread-sub. No
+  // other node pairs that text with that class.
   let before = collect_until_quiet(client, 10, 10, "")
   should.be_true(string.contains(before, "Yesterday"))
-  should.be_true(string.contains(before, "· 1d"))
+  should.be_true(string.contains(
+    before,
+    "\"1d\",\"kind\":2}],\"attributes\":[{\"value\":\"thread-sub\"",
+  ))
 
   lustre.send(
     to: runtime,
@@ -3025,9 +3034,16 @@ pub fn send_moves_previous_day_row_into_today_immediately_test() {
   // While the reply is still parked, the row re-buckets into Today: its
   // subtitle age flips to "just now" — written by nothing but the
   // send-time refresh (the user echo proves the cascade itself flowed).
+  // Same adjacency anchor as `before`: the log's stamp for the new
+  // message also reads "just now" (inside a <time>), so bare text can't
+  // carry the claim. The created today-thread's subtitle shares the
+  // text — so did the old middot anchor.
   let after = collect_until_quiet(client, 10, 10, "")
   should.be_true(string.contains(after, "hello again"))
-  should.be_true(string.contains(after, "· just now"))
+  should.be_true(string.contains(
+    after,
+    "\"just now\",\"kind\":2}],\"attributes\":[{\"value\":\"thread-sub\"",
+  ))
 }
 
 /// Regression (bogus "no provider configured" note): the connect-time
