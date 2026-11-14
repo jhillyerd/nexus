@@ -516,6 +516,56 @@ pub fn deliver_busy_target_test() {
 // Routing: name → DM find-or-create, thread id → direct
 // ---------------------------------------------------------------------------
 
+/// A bot target whose frozen toolset OMITS `bot_message` (explicit bot
+/// toolsets and pre-P3c persisted snapshots can) gets the BARE prefix —
+/// the hint must never name a tool the target cannot call.
+pub fn deliver_hint_only_when_tool_present_test() {
+  let booted = boot()
+  let alpha = create_bot(booted, "alpha", allow_inbound: True)
+  let quiet = create_bot(booted, "quiet", allow_inbound: True)
+
+  // A bot thread frozen WITHOUT the delivery tool (the same shape an
+  // explicit bot toolset or a pre-P3c snapshot hydrates to).
+  let assert Ok(specs) = tools.by_names(test_config(), [])
+  let assert Ok(summary) =
+    thread_registry.create_with_toolset(
+      booted.registry,
+      thread_registry.NewThread(
+        provider_id: store_mock.fixture_provider_id,
+        model: "alpha",
+        system_prompt: None,
+        toolset: None,
+        bot_id: Some(quiet.id),
+      ),
+      thread.Toolset(
+        names: [],
+        specs: specs,
+        runner: fn(_endpoint, tr, _cancel, _delivery, _on_event) {
+          thread.StreamDone(completed_stats(), tr)
+        },
+        utility_runner: fn(_endpoint, _tr, _cancel, _allow_pass) {
+          Error("no utility call in this test")
+        },
+      ),
+    )
+
+  let assert delivery.Delivered(tid) =
+    deliver(
+      booted.registry,
+      alpha.id,
+      "alpha",
+      "s-alpha",
+      1,
+      summary.id,
+      "hello there",
+    )
+  should.equal(tid, summary.id)
+  wait_idle(booted.registry, summary.id)
+  let #(text, origin) = last_user_line(booted.registry, summary.id)
+  should.equal(text, "From alpha (thread s-alpha): hello there")
+  should.equal(origin, Some(transcript.Origin("alpha", 1)))
+}
+
 /// A name-addressed delivery find-or-creates the per-pair DM thread from
 /// the TARGET bot, delivers the prefixed line (model-visible identity
 /// rides content only), marks the display sidecar, and the receipt names
@@ -542,7 +592,12 @@ pub fn deliver_by_name_creates_dm_test() {
   // thread (so the target can reply precisely), and the origin sidecar
   // records author + hop depth for the UI badge.
   let #(text, origin) = last_user_line(booted.registry, dm_id)
-  should.equal(text, "From alpha (thread s-alpha): hello beta")
+  should.equal(
+    text,
+    "From alpha (thread s-alpha): hello beta"
+      <> "\n\n(reply via the bot_message tool with to \"s-alpha\" — a plain"
+      <> " reply stays in this thread and never reaches the sender)",
+  )
   should.equal(origin, Some(transcript.Origin("alpha", 1)))
 
   let assert Ok(dm_summary) =
@@ -559,7 +614,12 @@ pub fn deliver_by_name_creates_dm_test() {
     deliver(booted.registry, alpha.id, "alpha", "s-alpha", 1, "beta", "again")
   should.equal(dm_id2, dm_id)
   let #(text2, _) = last_user_line(booted.registry, dm_id)
-  should.equal(text2, "From alpha (thread s-alpha): again")
+  should.equal(
+    text2,
+    "From alpha (thread s-alpha): again"
+      <> "\n\n(reply via the bot_message tool with to \"s-alpha\" — a plain"
+      <> " reply stays in this thread and never reaches the sender)",
+  )
 }
 
 /// Thread-id addressing goes direct (no DM map), including into a HUMAN
@@ -647,7 +707,13 @@ pub fn bot_message_tool_delivers_end_to_end_test() {
   let #(text, origin) = last_user_line(booted.registry, dm_id)
   should.equal(
     text,
-    "From alpha (thread " <> alpha_thread.id <> "): hello from the loop",
+    "From alpha (thread "
+      <> alpha_thread.id
+      <> "): hello from the loop"
+      <> "\n\n(reply via the bot_message tool with to \""
+      <> alpha_thread.id
+      <> "\" — a plain reply stays in this thread and never reaches"
+      <> " the sender)",
   )
   should.equal(origin, Some(transcript.Origin("alpha", 1)))
 }
