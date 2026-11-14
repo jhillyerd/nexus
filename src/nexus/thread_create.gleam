@@ -1,18 +1,21 @@
 //// The ONE thread-creation orchestration shared by the HTTP API and the
 //// UI (bots prep, #73): resolve the provider (id first, then name),
-//// validate the model alias against the provider's LIVE model list, then
-//// ask the thread registry to create.
+//// then ask the thread registry to create.
 ////
-//// The provider lookups are network calls, so they happen HERE — outside
-//// the registry's loop — and both surfaces get the same stale-alias
-//// refusal for free. That matters for the bots plan's "create thread
-//// from bot": a bot's stored model alias can go stale (the provider
-//// renamed or dropped it), and the create must fail loudly, never
-//// silently succeed with a dead alias. Before this module the UI skipped
-//// the check entirely and web kept its own copy.
+//// The provider resolution is a registry ask, so it happens HERE —
+//// outside the registry's loop. The model alias is NOT validated
+//// against the provider's live list: proxies like Bifrost accept
+//// aliases ("smart", "fast") that remap to whatever is deployed at the
+//// time, and such aliases come and go from the proxy's /v1/models — a
+//// create-time check refuses legitimate pins and races the very list
+//// the picker just offered. A dead alias instead lands as a pinned
+//// thread whose first turn fails at stream time — the same semantics
+//// the registry's bot-to-bot DM create always had. (This supersedes
+//// the old multi-provider §11 "400 unknown model" preflight; the
+//// empty-model and unknown-toolset refusals stay.)
 ////
-//// Registry errors that can only be pre-validation races (the provider
-//// vanished between check and create) surface as `CreateFailed` and stay
+//// Registry errors that can only be races (the provider vanished
+//// between resolve and create) surface as `CreateFailed` and stay
 //// server-side problems (502/503), not client errors.
 
 import gleam/erlang/process.{type Subject}
@@ -28,9 +31,12 @@ import nexus/thread_registry
 
 /// The live model-list budget: the endpoint's first-response timeout plus
 /// round-trip headroom. ONE rule for every `list_models` call in the app
-/// — the create preflight below, web's models routes, the UI's create
-/// panel picker, and the settings page's connection Test (all of which
-/// previously hard-coded or re-derived the value per surface).
+/// — web's provider models route, the UI's create panel picker, and the
+/// settings page's connection Test and bot-form comboboxes (all of which
+/// previously hard-coded or re-derived the value per surface). Thread
+/// creation itself no longer fetches the list at all: aliases are not
+/// validated at create (see the module doc), so the fetch would be a
+/// pointless preflight round-trip.
 pub fn models_timeout(cfg: Config) -> Int {
   cfg.sse_first_response_timeout_ms + 5000
 }
@@ -46,11 +52,6 @@ pub type CreateProblem {
   ProviderNotFound(ident: String)
   /// A provider matched but is disabled — the reversible delete.
   ProviderDisabled(name: String)
-  /// The provider's live model list could not be fetched.
-  ModelsUnavailable
-  /// The alias is not on the provider's live list — a stale alias (the
-  /// bots plan's required 400 on create-from-bot).
-  ModelUnknown(alias: String)
   /// The bot registry itself could not be asked — server-side.
   /// Defensive exhaustiveness arm: `get_bot` in practice only refuses
   /// with `Unknown` (the registry serves reads from its boot-loaded
@@ -61,23 +62,20 @@ pub type CreateProblem {
   BotsUnavailable
   /// No bot with that id (bots plan P1: `POST {"bot": id}`).
   BotUnknown(id: String)
-  /// The registry refused. After the pre-validation above, these are
+  /// The registry refused. After the provider resolution, these are
   /// races (provider vanished mid-flight) or start failures — the caller
   /// still maps them (400 empty model, 502 provider, 503 start).
   CreateFailed(thread_registry.CreateError)
 }
 
-/// Resolve, validate, create — the whole orchestration. Returns the
-/// registry's fresh `ThreadSummary` on success; callers never build one.
+/// Resolve, create — the whole orchestration. Returns the registry's
+/// fresh `ThreadSummary` on success; callers never build one.
 pub fn create_thread(
   providers: Subject(provider_registry.Msg),
   registry: Subject(thread_registry.Msg),
-  models_timeout_ms: Int,
   requested: thread_registry.NewThread,
 ) -> Result(thread.ThreadSummary, CreateProblem) {
   use found <- result.try(resolve_provider(providers, requested.provider_id))
-  use models <- result.try(list_models(providers, found.id, models_timeout_ms))
-  use _ <- result.try(known_model(models, requested.model))
   // The registry pins the CANONICAL provider id — the identifier a caller
   // may supply by NAME must never land in the frozen pin or the stored
   // row (web's id-or-name rule, §11).
@@ -92,15 +90,14 @@ pub fn create_thread(
 /// and `bot_id` rides along as provenance), then run the SAME shared
 /// create. The bot registry is only asked HERE, in the orchestration both
 /// surfaces share — it never resolves providers, and the thread registry
-/// never sees bots beyond the `bot_id` column. A bot's model alias is
-/// re-validated against the provider's LIVE list inside `create_thread`:
-/// a bot can go stale, and the create must not silently succeed on a
-/// dead alias.
+/// never sees bots beyond the `bot_id` column. The bot's model alias is
+/// NOT re-validated: a bot can go stale, but a stale alias is legitimate
+/// at rest (the bots plan) and at create (see the module doc) — the
+/// thread still lands and its first turn fails at stream time.
 pub fn create_thread_from_bot(
   bots: Subject(bot_registry.Msg),
   providers: Subject(provider_registry.Msg),
   registry: Subject(thread_registry.Msg),
-  models_timeout_ms: Int,
   bot_id: String,
 ) -> Result(thread.ThreadSummary, CreateProblem) {
   case bot_registry.get_bot(bots, bot_id) {
@@ -110,7 +107,6 @@ pub fn create_thread_from_bot(
       create_thread(
         providers,
         registry,
-        models_timeout_ms,
         thread_registry.NewThread(
           // The bot's provider id is canonical (the registry-validated
           // `provider_id` the bot was saved with), so `resolve_provider`'s
@@ -163,29 +159,6 @@ fn resolve_provider(
   }
 }
 
-fn list_models(
-  providers: Subject(provider_registry.Msg),
-  provider_id: String,
-  models_timeout_ms: Int,
-) -> Result(List(String), CreateProblem) {
-  case
-    provider_registry.list_models(providers, provider_id, models_timeout_ms)
-  {
-    Ok(models) -> Ok(models)
-    Error(_) -> Error(ModelsUnavailable)
-  }
-}
-
-fn known_model(
-  models: List(String),
-  alias: String,
-) -> Result(Nil, CreateProblem) {
-  case list.contains(models, alias) {
-    True -> Ok(Nil)
-    False -> Error(ModelUnknown(alias))
-  }
-}
-
 /// Fixed human text for a refused create — the same string both surfaces
 /// show (the HTTP error body embeds it verbatim). Never echoes key
 /// material; only identifiers the caller already supplied.
@@ -194,8 +167,6 @@ pub fn describe(problem: CreateProblem) -> String {
     ProvidersUnavailable -> "provider registry unavailable"
     ProviderNotFound(ident) -> "unknown provider: " <> ident
     ProviderDisabled(name) -> "provider is disabled: " <> name
-    ModelsUnavailable -> "unable to list models from provider"
-    ModelUnknown(alias) -> "unknown model: " <> alias
     BotsUnavailable -> "bot registry unavailable"
     BotUnknown(id) -> "unknown bot: " <> id
     CreateFailed(thread_registry.EmptyModel) -> "empty model"

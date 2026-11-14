@@ -58,7 +58,7 @@ pub fn handler(
         protected(cfg, req, fn() { threads_response(registry, req) })
       Post, ["threads"] ->
         protected(cfg, req, fn() {
-          create_thread_response(cfg, req, registry, providers, bots)
+          create_thread_response(req, registry, providers, bots)
         })
       Patch, ["threads", id] ->
         protected(cfg, req, fn() { patch_thread_response(req, registry, id) })
@@ -194,7 +194,6 @@ fn wants_archived(req: Request(a)) -> Bool {
 }
 
 fn create_thread_response(
-  cfg: Config,
   req: Request(mist.Connection),
   registry: process.Subject(thread_registry.Msg),
   providers: process.Subject(provider_registry.Msg),
@@ -215,15 +214,14 @@ fn create_thread_response(
           )
         BotCreate(bot_id) ->
           // The SHARED create-from-bot orchestration (#73/#74): resolve
-          // the bot, copy its frozen values, re-validate the alias
-          // against the provider's LIVE list, create. A stale bot alias
-          // must 400, never silently succeed.
+          // the bot, copy its frozen values, create. The alias is NOT
+          // re-validated (a stale alias is legitimate — the thread lands
+          // and its first turn fails at stream time).
           case
             thread_create.create_thread_from_bot(
               bots,
               providers,
               registry,
-              thread_create.models_timeout(cfg),
               bot_id,
             )
           {
@@ -239,10 +237,11 @@ fn create_thread_response(
         PlainCreate(provider: _, model: "") ->
           json_response(400, err_json("empty model"))
         PlainCreate(provider: ident, model: trimmed_model) -> {
-          // The shared orchestration (#73): provider resolution + live
-          // model-alias validation outside the registry's loop, then the
-          // create. The reply IS the summary — this layer never
-          // hand-builds one.
+          // The shared orchestration (#73): provider resolution outside
+          // the registry's loop, then the create. The model alias is NOT
+          // validated — proxies serve aliases their /v1/models may not
+          // list (see thread_create's module doc). The reply IS the
+          // summary — this layer never hand-builds one.
           let requested =
             thread_registry.NewThread(
               provider_id: ident,
@@ -254,14 +253,7 @@ fn create_thread_response(
               toolset: None,
               bot_id: None,
             )
-          case
-            thread_create.create_thread(
-              providers,
-              registry,
-              thread_create.models_timeout(cfg),
-              requested,
-            )
-          {
+          case thread_create.create_thread(providers, registry, requested) {
             Ok(summary) -> json_response(201, thread_summary_json(summary))
             Error(problem) ->
               json_response(
@@ -276,18 +268,18 @@ fn create_thread_response(
 
 /// The shared create vocabulary onto the plan's status codes (§11):
 /// pre-validation refusals are client errors (400), provider-side
-/// failures are server errors (502/503).
+/// failures are server errors (502/503). Model aliases are not
+/// pre-validated at all — an off-list alias is not a refusal.
 fn create_problem_status(problem: thread_create.CreateProblem) -> Int {
   case problem {
     thread_create.ProvidersUnavailable -> 502
     thread_create.ProviderNotFound(_) -> 400
     thread_create.ProviderDisabled(_) -> 400
-    thread_create.ModelsUnavailable -> 502
-    thread_create.ModelUnknown(_) -> 400
     thread_create.BotsUnavailable -> 502
     thread_create.BotUnknown(_) -> 400
-    // Post-validation registry refusals are races: the provider passed
-    // the live check, then could not stream when the thread pinned it.
+    // Provider and start failures after resolution are races: the
+    // provider passed the resolve, then could not stream when the
+    // thread pinned it. (EmptyModel above is client data, not a race.)
     thread_create.CreateFailed(thread_registry.EmptyModel) -> 400
     // A stale bot's toolset named a tool outside the compiled catalog
     // (bots plan P2): a client-data problem, refused like a bad alias.

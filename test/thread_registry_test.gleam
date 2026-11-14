@@ -1517,8 +1517,8 @@ pub fn create_from_bot_orchestration_carries_bot_toolset_test() {
       tools.by_names(cfg, names) |> result.replace(names)
     })
   let bots = started_bots.data
-  // The provider registry's live model list, fixed: the orchestration
-  // re-validates the bot's alias against it before the registry runs.
+  // The provider registry's live model list, fixed — inert now (creates
+  // fetch nothing) but it keeps the rig strictly offline.
   let assert Ok(started_providers) =
     provider_registry.start_with_model_fetcher(
       cfg,
@@ -1558,13 +1558,7 @@ pub fn create_from_bot_orchestration_carries_bot_toolset_test() {
       ),
     )
   let assert Ok(summary) =
-    thread_create.create_thread_from_bot(
-      bots,
-      providers,
-      registry,
-      5000,
-      bot_row.id,
-    )
+    thread_create.create_thread_from_bot(bots, providers, registry, bot_row.id)
   let assert Ok(stored) = seam.get_thread(summary.id)
   should.equal(stored.summary.toolset, ["http_fetch"])
   should.equal(stored.summary.meta.bot_id, Some(bot_row.id))
@@ -1583,13 +1577,7 @@ pub fn create_from_bot_orchestration_carries_bot_toolset_test() {
       ),
     )
   let assert Ok(chat_summary) =
-    thread_create.create_thread_from_bot(
-      bots,
-      providers,
-      registry,
-      5000,
-      chat_bot.id,
-    )
+    thread_create.create_thread_from_bot(bots, providers, registry, chat_bot.id)
   let assert Ok(chat_stored) = seam.get_thread(chat_summary.id)
   should.equal(chat_stored.summary.toolset, [])
 }

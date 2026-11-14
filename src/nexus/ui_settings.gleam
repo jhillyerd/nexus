@@ -955,8 +955,9 @@ fn bot_row(
             attr.name("model"),
             attr.value(b.model),
             // Combobox: the scoped provider's live aliases suggest, free
-            // entry stays possible (a stale alias saves fine and
-            // re-validates at thread create). The combo class draws the
+            // entry stays possible (a stale alias saves fine — aliases
+            // are not validated at thread create either). The combo
+            // class draws the
             // select-style chevron and autocomplete=off keeps the
             // browser's own history/autofill popup out of the field —
             // no native datalist, so no popup over the form.
@@ -1759,8 +1760,9 @@ fn form_field(
 /// focus, filters as you type, and fills the field on pick — so unlike
 /// the browser's datalist popup it stays anchored to the field and only
 /// covers following fields while open. Manual entry stays possible in
-/// every state; the save rule stays non-empty-only and thread create
-/// re-validates live.
+/// every state; the save rule stays non-empty-only, and thread create
+/// does not validate aliases at all (a dead alias fails its first
+/// turn).
 fn bot_model_suggestions(state: State, open: Bool) -> Element(Msg) {
   case open {
     False -> element.none()
