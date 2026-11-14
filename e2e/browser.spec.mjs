@@ -2232,6 +2232,167 @@ async function main() {
       eq(shadowScripts, 0, "no script elements inside the component view");
     });
 
+    // -- 18b. url bar mirrors the selection ---------------------------------
+    // thread_js (page shell): the address bar names the selected thread
+    // (/threads/<id> — the RESTful app view), user-driven switches push
+    // history entries, popstate re-opens the named thread through the
+    // same Select path a real click uses, and a pasted link (fresh
+    // context, no storage) boots straight into the named thread.
+    await test("url: address bar follows the selection; links share; back/forward walks history", async () => {
+      const headers = { authorization: `Bearer ${TOKEN}` };
+      const post = (model) =>
+        page.request.post(`${base}/threads`, { headers, data: { provider: "fake", model } });
+      const t1 = await (await post("smart")).json();
+      const t2 = await (await post("fast")).json();
+      try {
+        // An API-side create is invisible to a running client (the list
+        // refreshes on own creates and joined broadcasts only), so reload
+        // to fetch a fresh list. The boot restores this tab's stored
+        // selection and rewrites the load entry — exactly the baseline
+        // the assertions below start from.
+        await page.goto(`${base}/?token=${TOKEN}`);
+        await connected(page);
+        const row1 = page.locator(
+          `#thread-list .thread-row[data-thread-id="${t1.id}"] .thread-main`,
+        );
+        const row2 = page.locator(
+          `#thread-list .thread-row[data-thread-id="${t2.id}"] .thread-main`,
+        );
+        await poll(async () => (await row1.count()) === 1 && (await row2.count()) === 1, {
+          timeout: 15_000,
+          message: "new rows in sidebar",
+        });
+
+        // The address bar already names the current selection: the
+        // utility test's plain reload restored it from storage and the
+        // boot write rewrote the load entry (replaceState, no push).
+        const at = (id) => new URL(page.url()).pathname === `/threads/${id}`;
+        const id0 = await selectedId(page);
+        assert(id0, "a thread is selected");
+        assert(at(id0), `url names the selection: ${page.url()}`);
+
+        // A user-driven switch pushes a fresh history entry.
+        await row1.click();
+        await poll(async () => (await selectedId(page)) === t1.id, {
+          timeout: 15_000,
+          message: "t1 selected",
+        });
+        await poll(async () => at(t1.id), {
+          timeout: 15_000,
+          message: "url follows t1",
+        });
+        await row2.click();
+        await poll(async () => (await selectedId(page)) === t2.id, {
+          timeout: 15_000,
+          message: "t2 selected",
+        });
+        await poll(async () => at(t2.id), {
+          timeout: 15_000,
+          message: "url follows t2",
+        });
+
+        // Back re-opens t1: popstate drives the server's Select path
+        // through a synthetic click on the row (subscribe + replay), and
+        // the url is never rewritten on the way.
+        await page.goBack();
+        await poll(async () => (await selectedId(page)) === t1.id, {
+          timeout: 15_000,
+          message: "back re-opened t1",
+        });
+        assert(at(t1.id), `back lands on t1's url: ${page.url()}`);
+        await page.goForward();
+        await poll(async () => (await selectedId(page)) === t2.id, {
+          timeout: 15_000,
+          message: "forward re-opened t2",
+        });
+
+        // Back to a row the sidebar currently HIDES: with a non-matching
+        // tag filter, t1's row is not in the DOM, so the popstate handler
+        // clears the filter first and clicks the row when it renders.
+        await page.fill("#tag-filter", "zzz-no-match");
+        await poll(async () => !(await row1.isVisible()), {
+          timeout: 10_000,
+          message: "t1 hidden by the filter",
+        });
+        await page.goBack();
+        await poll(async () => (await selectedId(page)) === t1.id, {
+          timeout: 15_000,
+          message: "back un-hid and re-opened t1",
+        });
+        eq(
+          await page.locator("#tag-filter").inputValue(),
+          "",
+          "fallback cleared the filter",
+        );
+
+        // A pasted link boots into exactly the named thread — the page
+        // url names it and must OUTRANK the tab's stored selection, so
+        // the peer context is seeded with a competing storage entry
+        // (t2) before the /threads/t1 navigation. The RESTful path form
+        // is the primary shape; a legacy ?thread= link must keep working
+        // AND upgrade to the path form once its thread is live.
+        const peer = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+        const ppage = await peer.newPage();
+        track(ppage);
+        const legacy = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+        const lpage = await legacy.newPage();
+        track(lpage);
+        try {
+          // Seed a competing stored selection: load the app plainly, wait
+          // for its auto-selection to settle into storage, then overwrite
+          // it with t2. The /threads/t1 navigation below may only open t1
+          // if the url beats storage.
+          await ppage.goto(`${base}/?token=${TOKEN}`);
+          await connected(ppage);
+          await poll(async () => {
+            const sel = await selectedId(ppage);
+            return sel !== "" && (await ppage.evaluate(() => sessionStorage.getItem("nexus.thread"))) === sel;
+          }, { timeout: 15_000, message: "peer context selection settled into storage" });
+          await ppage.evaluate((id) => sessionStorage.setItem("nexus.thread", id), t2.id);
+          await ppage.goto(`${base}/threads/${t1.id}?token=${TOKEN}`);
+          await connected(ppage);
+          await poll(async () => (await selectedId(ppage)) === t1.id, {
+            timeout: 15_000,
+            message: "pasted link opened t1 over the stored t2",
+          });
+          eq(new URL(ppage.url()).pathname, `/threads/${t1.id}`, "pasted path url kept");
+
+          // Legacy link: opens the same thread, and the first url write
+          // (the stamp-clearing in-place rewrite) upgrades the address.
+          await lpage.goto(`${base}/?token=${TOKEN}&thread=${t1.id}`);
+          await connected(lpage);
+          await poll(async () => (await selectedId(lpage)) === t1.id, {
+            timeout: 15_000,
+            message: "legacy link opened t1",
+          });
+          await poll(async () => new URL(lpage.url()).pathname === `/threads/${t1.id}`, {
+            timeout: 15_000,
+            message: "legacy link upgraded to path form",
+          });
+          assert(!new URL(lpage.url()).searchParams.has("thread"), "legacy param dropped");
+        } finally {
+          await peer.close();
+          await legacy.close();
+        }
+
+        // Restore the suite's working selection.
+        await page
+          .locator(`#thread-list .thread-row[data-thread-id="${id0}"] .thread-main`)
+          .click();
+        await poll(async () => (await selectedId(page)) === id0, {
+          timeout: 15_000,
+          message: "original selection restored",
+        });
+      } finally {
+        // Suite cleanup is load-bearing (a shared database): a silent
+        // failure here would leak threads into every later run.
+        const gone1 = await page.request.delete(`${base}/threads/${t1.id}`, { headers });
+        eq(gone1.status(), 204, "t1 deleted");
+        const gone2 = await page.request.delete(`${base}/threads/${t2.id}`, { headers });
+        eq(gone2.status(), 204, "t2 deleted");
+      }
+    });
+
     // -- 19. no uncaught page errors ----------------------------------------
     // Guards the shell scripts (and the runtime wiring) as a whole: any
     // uncaught exception on any page the suite opened fails the run — a

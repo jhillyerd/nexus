@@ -10,7 +10,11 @@
 //// never enters JavaScript. The same query string carries the
 //// client-supplied last-selected thread back to the server (per-client
 //// runtimes: `thread_js` persists it and re-supplies it on connect so a
-//// reload re-opens the same thread).
+//// reload re-opens the same thread). `thread_js` also mirrors the
+//// selection into the address bar (`/threads/<id>`, served by the same
+//// shell — see the router) via the history API, so a thread has a
+//// shareable RESTful URL, and walks back/forward through the thread
+//// history on `popstate` — see its doc comment.
 
 import gleam/option.{type Option, None, Some}
 import gleam/string
@@ -111,19 +115,42 @@ fn indicator_js() -> String {
 }
 
 /// Per-client runtime break: each /ws connection owns its model, so a
-/// reload must tell the fresh runtime which thread to re-open. This
-/// static script is the only client-side keeper of that choice. Storage is
-/// `sessionStorage` — per-tab and reload-surviving, so one tab's selection
-/// never leaks into another tab's restore (a brand-new tab falls back to
-/// the server's auto-selection). Before the runtime module loads (it is
-/// deferred; this classic script runs during parsing) it appends the
-/// stored thread to the `route` attribute's query string; once the
-/// component renders it mirrors the server-rendered
-/// `#layout[data-selected]` back into storage, and on `lustre:close` it
-/// re-syncs the route's `thread` parameter with the CURRENT selection so
-/// a reconnect without a reload re-opens what this tab is looking at, not
-/// what it opened at load. The script is static, token-free, and never
-/// touches the rendered DOM — auth still rides the query string.
+/// reload must tell the fresh runtime which thread to re-open — and a
+/// thread should have a shareable URL. This static script is the only
+/// client-side keeper of that state. Storage is `sessionStorage` —
+/// per-tab and reload-surviving, so one tab's selection never leaks into
+/// another tab's restore (a brand-new tab falls back to the server's
+/// auto-selection). Before the runtime module loads (it is deferred; this
+/// classic script runs during parsing) it appends the chosen thread to
+/// the `route` attribute's query string — the PAGE url names the thread
+/// (the RESTful `/threads/<id>` path the router serves the shell at, or
+/// a legacy `?thread=` query from links shared before the path form) and
+/// that wins over storage: a pasted or bookmarked link is an explicit
+/// instruction, and a reload of an address-bar url restores exactly it.
+/// With neither, the stored last-selected thread is used (a plain
+/// reload of `/`); the winner is stored too, so a later reload without
+/// the url naming it restores the same thread. Once the component renders, the script mirrors the
+/// server-rendered `#layout[data-selected]` into storage AND into the
+/// address bar: the boot auto-selection rewrites the load's history
+/// entry (`replaceState`; the entry is stamped at script start), every
+/// later switch pushes a fresh entry, a selection the url already names
+/// (a pasted link that opened) rewrites the stamped entry in place —
+/// upgrading a legacy query link to the path form — so the NEXT switch
+/// pushes instead of displacing it, and `popstate` walks back/forward
+/// by clicking the named thread's sidebar row — the client runtime
+/// forwards a synthetic click exactly like a real one, and a row the tag
+/// filter or the archived toggle currently hides is un-hidden first. A
+/// deselection (archive, New) writes storage only: the no-thread state
+/// owns no history entry, and the URL keeps naming the tab's last
+/// thread. On `lustre:close` it re-syncs the route's `thread` parameter
+/// with the CURRENT selection so a reconnect without a reload re-opens
+/// what this tab is looking at, not what it opened at load. The observer
+/// attaches on `lustre:mount` — not just `lustre:connect`: connect fires
+/// at socket-open, before the first server render mounts the shadow root
+/// (a connect-only attach bails and never retries, leaving the mirror
+/// dead), while mount already carries the flags-rendered selection.
+/// The script is static, token-free, and never touches the rendered
+/// DOM — auth still rides the query string.
 fn thread_js() -> String {
   "(function () {\n"
   <> "  'use strict';\n"
@@ -142,27 +169,174 @@ fn thread_js() -> String {
   <> "    var layout = host.shadowRoot && host.shadowRoot.getElementById('layout');\n"
   <> "    return layout ? (layout.getAttribute('data-selected') || '') : null;\n"
   <> "  };\n"
-  <> "  // Pre-connect: append this tab's last-selected thread to the ws\n"
-  <> "  // route. The attribute is final before the element upgrades, so\n"
-  <> "  // the runtime connects once, with the thread in hand.\n"
-  <> "  var stored = read();\n"
-  <> "  if (stored) {\n"
+  <> "  // The thread id the address bar reflects right now, read from the\n"
+  <> "  // page url: the RESTful /threads/<id> path is the primary form; a\n"
+  <> "  // legacy ?thread= query (links shared before the path form) is\n"
+  <> "  // still honored so old links keep working. Either way the url is\n"
+  <> "  // an explicit instruction and outranks the stored selection.\n"
+  <> "  var threadFromLocation = function () {\n"
+  <> "    var url = new URL(location.href);\n"
+  <> "    var seg = url.pathname.split('/');\n"
+  <> "    if (seg.length >= 3 && seg[1] === 'threads' && seg[2] !== '') {\n"
+  <> "      try { return decodeURIComponent(seg[2]); } catch (e) { return seg[2]; }\n"
+  <> "    }\n"
+  <> "    return url.searchParams.get('thread') || '';\n"
+  <> "  };\n"
+  <> "  var urlId = threadFromLocation();\n"
+  <> "  // Pre-connect: append this tab's chosen thread to the ws route —\n"
+  <> "  // the page url's param when present (shareable links, and a\n"
+  <> "  // reload of an address-bar url), else the stored last-selected\n"
+  <> "  // thread (a plain reload of `/`). The winner is stored too, so a\n"
+  <> "  // later reload without the param restores the same thread. The\n"
+  <> "  // attribute is final before the element upgrades, so the runtime\n"
+  <> "  // connects once, with the thread in hand.\n"
+  <> "  var wanted = urlId || read();\n"
+  <> "  if (wanted) {\n"
+  <> "    write(wanted);\n"
   <> "    var route = host.getAttribute('route');\n"
   <> "    if (route) {\n"
-  <> "      var url = new URL(route, location.href);\n"
-  <> "      url.searchParams.set('thread', stored);\n"
-  <> "      host.setAttribute('route', url.pathname + url.search);\n"
+  <> "      var bootUrl = new URL(route, location.href);\n"
+  <> "      bootUrl.searchParams.set('thread', wanted);\n"
+  <> "      host.setAttribute('route', bootUrl.pathname + bootUrl.search);\n"
   <> "    }\n"
   <> "  }\n"
+  <> "  // Stamp the load's history entry so the FIRST url write REWRITES\n"
+  <> "  // it (replaceState) instead of stacking a duplicate: the boot\n"
+  <> "  // auto-selection silently swaps the bare `/` for its own address,\n"
+  <> "  // and a pasted link's entry is re-marked as the thread it names\n"
+  <> "  // once it is live. Every later switch pushes a fresh entry —\n"
+  <> "  // that is what makes back/forward walk the thread history.\n"
+  <> "  try { history.replaceState({ nexusBoot: true }, ''); } catch (e) {}\n"
+  <> "  var writeUrl = function (id) {\n"
+  <> "    var url = new URL(location.href);\n"
+  <> "    url.pathname = '/threads/' + encodeURIComponent(id);\n"
+  <> "    // The path replaces the legacy query form; token and any other\n"
+  <> "    // params ride along untouched.\n"
+  <> "    url.searchParams.delete('thread');\n"
+  <> "    // Only the stamped load entry may be rewritten; everything\n"
+  <> "    // after it appends.\n"
+  <> "    var entry = null;\n"
+  <> "    try { entry = history.state; } catch (e) {}\n"
+  <> "    var rewrite = entry && entry.nexusBoot;\n"
+  <> "    try {\n"
+  <> "      if (rewrite) {\n"
+  <> "        history.replaceState({ nexus: 'thread', thread: id }, '', url.pathname + url.search);\n"
+  <> "      } else {\n"
+  <> "        history.pushState({ nexus: 'thread', thread: id }, '', url.pathname + url.search);\n"
+  <> "      }\n"
+  <> "      urlId = id;\n"
+  <> "    } catch (e) {}\n"
+  <> "  };\n"
+  <> "  // The url already names this selection — a pasted-link boot whose\n"
+  <> "  // thread opened, or a popstate-driven click landing. The load's\n"
+  <> "  // boot stamp must still come OFF (same url, rewritten in place:\n"
+  <> "  // upgrade a legacy ?thread= link to the path form here too), or the\n"
+  <> "  // NEXT real switch would replace this entry instead of pushing and\n"
+  <> "  // the pasted thread would fall out of back/forward.\n"
+  <> "  var markOwned = function () {\n"
+  <> "    var entry = null;\n"
+  <> "    try { entry = history.state; } catch (e) {}\n"
+  <> "    if (!(entry && entry.nexusBoot)) return;\n"
+  <> "    var url = new URL(location.href);\n"
+  <> "    url.pathname = '/threads/' + encodeURIComponent(urlId);\n"
+  <> "    url.searchParams.delete('thread');\n"
+  <> "    try {\n"
+  <> "      history.replaceState({ nexus: 'thread', thread: urlId }, '', url.pathname + url.search);\n"
+  <> "    } catch (e) {}\n"
+  <> "  };\n"
+  <> "  // Back/forward: the history entry names a thread, so select it by\n"
+  <> "  // clicking its sidebar row — the runtime forwards a synthetic\n"
+  <> "  // click exactly like a real one, and the server's Select path\n"
+  <> "  // (subscribe + replay) runs unchanged. A row the sidebar\n"
+  <> "  // currently hides (tag filter, archived hidden) is un-hidden\n"
+  <> "  // first: clear the filter, reveal the archive, then click the row\n"
+  <> "  // when it renders. Ids are server-generated; the selector escape\n"
+  <> "  // is defense in depth.\n"
+  <> "  var clickRow = function (id) {\n"
+  <> "    var root = host.shadowRoot;\n"
+  <> "    if (!root) return false;\n"
+  <> "    var safe = id.replace(/[\"\\\\]/g, '\\\\$&');\n"
+  <> "    var row = root.querySelector('.thread-row[data-thread-id=\"' + safe + '\"] .thread-main');\n"
+  <> "    if (!row) return false;\n"
+  <> "    row.click();\n"
+  <> "    return true;\n"
+  <> "  };\n"
+  <> "  var retry = null;\n"
+  <> "  var retryTimer = null;\n"
+  <> "  var stopRetry = function () {\n"
+  <> "    if (retry) { retry.disconnect(); retry = null; }\n"
+  <> "    if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }\n"
+  <> "  };\n"
+  <> "  var revealAndClick = function (id) {\n"
+  <> "    // Cancel any older retry FIRST — even when this navigation's\n"
+  <> "    // own click succeeds: a stale observer firing on this switch's\n"
+  <> "    // re-render would re-click its old id and hijack the newer\n"
+  <> "    // navigation (and push a stale url with it).\n"
+  <> "    stopRetry();\n"
+  <> "    if (clickRow(id)) return;\n"
+  <> "    var root = host.shadowRoot;\n"
+  <> "    if (!root) return;\n"
+  <> "    // Un-hide whatever may be hiding it (no-ops when nothing does).\n"
+  <> "    var clear = root.getElementById('filter-clear');\n"
+  <> "    if (clear) clear.click();\n"
+  <> "    var toggle = root.getElementById('show-archived');\n"
+  <> "    if (toggle && !toggle.classList.contains('on')) toggle.click();\n"
+  <> "    // A missing row is not always a hidden one: the thread list may\n"
+  <> "    // still be loading (back/forward right after a reload), or a\n"
+  <> "    // re-render may be in flight. Keep retrying until the deadline\n"
+  <> "    // whether or not an un-hide click fired — giving up here would\n"
+  <> "    // lose the navigation silently.\n"
+  <> "    var deadline = Date.now() + 2000;\n"
+  <> "    var armed = currentId();\n"
+  <> "    retry = new MutationObserver(function () {\n"
+  <> "      // Deadline BEFORE acting: an observer that only thinks on\n"
+  <> "      // mutations would otherwise keep clicking past its expiry. A\n"
+  <> "      // selection change since arming means a newer navigation won —\n"
+  <> "      // this retry is stale and must not fight it (the designed case\n"
+  <> "      // — un-hide, re-render, click — leaves the selection untouched\n"
+  <> "      // until this retry's own click lands).\n"
+  <> "      var current = currentId();\n"
+  <> "      if (Date.now() > deadline) { stopRetry(); return; }\n"
+  <> "      if (current !== null && current !== armed) { stopRetry(); return; }\n"
+  <> "      if (clickRow(id)) stopRetry();\n"
+  <> "    });\n"
+  <> "    retry.observe(root, { childList: true, subtree: true });\n"
+  <> "    // Mutations are not guaranteed after arming: the timer enforces\n"
+  <> "    // the deadline (with slack for a mutation landing right on it)\n"
+  <> "    // even if the shadow root goes quiet.\n"
+  <> "    retryTimer = setTimeout(stopRetry, 2050);\n"
+  <> "  };\n"
+  <> "  window.addEventListener('popstate', function () {\n"
+  <> "    var id = threadFromLocation();\n"
+  <> "    urlId = id; // the url is already the state — never rewrite it here\n"
+  <> "    var current = currentId();\n"
+  <> "    if (!id || id === current) return;\n"
+  <> "    revealAndClick(id);\n"
+  <> "  });\n"
+  <> "  // Selection mirror: every data-selected change persists into\n"
+  <> "  // storage (reconnect/reload restore) and, when it is a REAL\n"
+  <> "  // switch — not the popstate-driven click landing, whose id the\n"
+  <> "  // url already carries — into the address bar via writeUrl. A\n"
+  <> "  // deselection (archive, New) writes storage only: the no-thread\n"
+  <> "  // state owns no history entry, and the url keeps naming the\n"
+  <> "  // tab's last thread.\n"
   <> "  var persist = function () {\n"
   <> "    var id = currentId();\n"
   <> "    if (id === null) return;\n"
   <> "    write(id);\n"
+  <> "    if (id !== '' && id !== urlId) {\n"
+  <> "      writeUrl(id);\n"
+  <> "      return;\n"
+  <> "    }\n"
+  <> "    // The no-selection state writes storage only: it owns no history\n"
+  <> "    // entry and never touches the url.\n"
+  <> "    if (id !== '') markOwned();\n"
   <> "  };\n"
   <> "  // A reconnect (no reload) re-uses the route attribute, so sync it\n"
   <> "  // with the current selection whenever the transport drops: the\n"
-  <> "  // next connect then re-opens what this tab is looking at. The\n"
-  <> "  // attribute is only touched when the parameter actually changes.\n"
+  <> "  // next connect then re-opens what this tab is looking at, not\n"
+  <> "  // what it opened at load. The attribute is only touched when the\n"
+  <> "  // parameter actually changes.\n"
   <> "  var syncRoute = function () {\n"
   <> "    var id = currentId();\n"
   <> "    if (id === null) return;\n"
@@ -187,6 +361,13 @@ fn thread_js() -> String {
   <> "    persist();\n"
   <> "  };\n"
   <> "  host.addEventListener('lustre:close', syncRoute);\n"
+  <> "  // Mount, not just connect: connect fires at socket-open, BEFORE the\n"
+  <> "  // server's first render mounts the shadow root — a connect-only\n"
+  <> "  // attach would bail and never retry, and every later data-selected\n"
+  <> "  // change would go unwitnessed (the reload-restore and the url bar\n"
+  <> "  // would both go dead). Mount carries the flags-rendered selection\n"
+  <> "  // already; connect covers the reconnect-without-reload case.\n"
+  <> "  host.addEventListener('lustre:mount', watch);\n"
   <> "  host.addEventListener('lustre:connect', watch);\n"
   <> "})();"
 }
