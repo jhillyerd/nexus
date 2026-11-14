@@ -4,6 +4,7 @@
 //// and the engine is pure BEAM (glua/Luerl).
 
 import gleam/erlang/process
+import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{None, Some}
@@ -1140,6 +1141,11 @@ pub fn all_settled_malformed_argument_fails_the_script_test() {
   let assert Error(not_table) = run_code("all_settled('nope')")
   should.be_true(string.contains(not_table, "all_settled wants a table"))
 
+  // nil follows the same malformed path — no silent empty-array special
+  // case (Promise.allSettled(undefined) rejects; review on #105).
+  let assert Error(nil_arg) = run_code("all_settled(nil)")
+  should.be_true(string.contains(nil_arg, "all_settled wants a table"))
+
   let assert Error(sparse) =
     run_code("all_settled({tools.echo({}), [3] = tools.echo({})})")
   should.be_true(string.contains(sparse, "dense 1-based array"))
@@ -1221,6 +1227,52 @@ pub fn crash_reason_is_bounded_test() {
     )
   should.be_true(string.contains(result, "host crashed"))
   should.be_true(string.length(result) < 1000)
+}
+
+/// Rendering (or otherwise probing) the tools TABLE itself must not
+/// error: the handle checks use rawget, so indexing with
+/// '__nexus_task' bypasses the table's raising __index instead of
+/// failing with "unknown tool: __nexus_task" (review on #105).
+pub fn tools_table_renders_instead_of_erroring_test() {
+  let assert Ok(result) =
+    run_code("text(tools)\nreturn type(rawget(tools, '__nexus_task'))")
+  let parts = string.split(result, "\n\n")
+  // The rendered table JSON (functions as "<function>") and the nil
+  // probe both come through — no Script error.
+  should.equal(list.drop(parts, 1), [
+    "{\"boom\":\"<function>\",\"echo\":\"<function>\"}",
+    "nil",
+  ])
+}
+
+/// A sibling tool that balloons memory inside its task child is killed
+/// by the SAME ~64 MiB heap ceiling the engine sets for itself: the
+/// child dies, the link takes the engine, and the run reports out of
+/// memory — the child used to inherit no ceiling at all (review on
+/// #105).
+pub fn host_allocation_killed_by_child_heap_ceiling_test() {
+  let hosts = [
+    codemode.HostTool(name: "hog", call: fn(_) {
+      let kept =
+        list.repeat(4_000_000, 50)
+        |> list.map(fn(n) { string.repeat("x", n) })
+      Ok(
+        int.to_string(
+          list.fold(kept, 0, fn(n, chunk) { n + string.length(chunk) }),
+        ),
+      )
+    }),
+  ]
+  let assert Error(result) =
+    codemode.run(
+      hosts,
+      default_timeout_ms,
+      default_cap,
+      process.new_subject(),
+      code_argument("await(tools.hog({}))"),
+    )
+  should.be_true(string.contains(result, "Script failed ("))
+  should.be_true(string.contains(result, "out of memory"))
 }
 
 /// The wire description documents the async surface (the model's only

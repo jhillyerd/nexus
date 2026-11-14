@@ -945,6 +945,12 @@ fn task_child(
   arguments: String,
   results: Subject(TaskMsg),
 ) -> Nil {
+  // The same heap ceiling the engine sets for itself: a sibling tool
+  // that balloons an intermediate or result is killed HERE (the link
+  // then takes the engine, reported as out of memory) instead of
+  // allocating uncapped in a child the engine's own flag never covers
+  // (review on #105 -- children used to inherit no ceiling at all).
+  let _ = set_max_heap_size(max_heap_words)
   let outcome = case safe_call(fn() { execute_host(hosts, name, arguments) }) {
     Ok(Ok(content)) -> TaskOk(content)
     Ok(Error(reason)) -> TaskErr(reason)
@@ -1196,20 +1202,25 @@ const preamble_lua =
   <> "\nfunction __nexus_render(v)"
   <> "\n  if v == nil then return nil end"
   <> "\n  if type(v) == 'string' then return v end"
-  <> "\n  if type(v) == 'table' and v.__nexus_task ~= nil then"
+  <> "\n  -- rawget, not a plain lookup: indexing with '__nexus_task' must"
+  <> "\n  -- bypass metamethods, or rendering a table with a raising"
+  <> "\n  -- __index (the tools table itself) errors 'unknown tool:"
+  <> "\n  -- __nexus_task' instead of rendering (review on #105)."
+  <> "\n  if type(v) == 'table' and rawget(v, '__nexus_task') ~= nil then"
   <> "\n    -- An unawaited handle rendered as data would be useless JSON;"
   <> "\n    -- say what it is so the classic missing-await bug self-describes"
   <> "\n    -- (rendering is the ONLY thing a handle is good for besides await)."
-  <> "\n    if type(v.name) == 'string' then"
-  <> "\n      return 'unawaited ' .. v.name .. ' result - wrap in await(...)'"
+  <> "\n    local nm = rawget(v, 'name')"
+  <> "\n    if type(nm) == 'string' then"
+  <> "\n      return 'unawaited ' .. nm .. ' result - wrap in await(...)'"
   <> "\n    end"
   <> "\n    return 'unawaited tool result - wrap in await(...)'"
   <> "\n  end"
   <> "\n  return enc(v, 0)"
   <> "\nend"
   <> "\nfunction __nexus_task_id(h)"
-  <> "\n  if type(h) == 'table' and type(h.__nexus_task) == 'string' then"
-  <> "\n    return h.__nexus_task"
+  <> "\n  if type(h) == 'table' and type(rawget(h, '__nexus_task')) == 'string' then"
+  <> "\n    return rawget(h, '__nexus_task')"
   <> "\n  end"
   <> "\n  return nil"
   <> "\nend"
@@ -1239,7 +1250,6 @@ const preamble_lua =
   <> "\n-- settles {ok = false, error = ...} instead of failing the script —"
   <> "\n-- but a non-array argument is a script error, like a malformed call."
   <> "\nall_settled = function(handles)"
-  <> "\n  if handles == nil then return {} end"
   <> "\n  if type(handles) ~= 'table' then"
   <> "\n    error('all_settled wants a table of handles')"
   <> "\n  end"
