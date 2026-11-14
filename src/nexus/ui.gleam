@@ -2363,6 +2363,15 @@ fn sidebar(model: Model) -> Element(Msg) {
         ),
       ]),
       tag_filter_row(model),
+      html.div(
+        [attr.id("thread-list"), attr.class("thread-list"), attr.role("list")],
+        thread_rows(model),
+      ),
+      // The archived toggle sits BELOW the list (#107): it reveals the
+      // archive group that renders at the list's bottom, so the control
+      // belongs next to what it reveals, not above a list the user is
+      // about to read. `#show-archived` keeps its id — the browser suite
+      // drives it — and the toggle class language is unchanged.
       html.div([attr.class("archive-toggle-row")], [
         html.button(
           [
@@ -2382,10 +2391,6 @@ fn sidebar(model: Model) -> Element(Msg) {
           ],
         ),
       ]),
-      html.div(
-        [attr.id("thread-list"), attr.class("thread-list"), attr.role("list")],
-        thread_rows(model),
-      ),
     ]),
   ])
 }
@@ -2454,33 +2459,40 @@ fn provider_options(model: Model) -> List(Element(Msg)) {
 /// The tag-filter input. Uncontrolled like the composer: its text rides the
 /// `input` event, and programmatic changes (chip click, clear) rotate the
 /// key so the client replaces the element with the new value baked in —
-/// no value patch can race the user's typing that way.
+/// no value patch can race the user's typing that way. The clear × floats
+/// INSIDE the input (#107): `.filter-box` is the positioning context, and
+/// the whole box rides the keyed rotation so a programmatic set rebuilds
+/// input and button together.
 fn tag_filter_row(model: Model) -> Element(Msg) {
   keyed.element("div", [attr.class("filter-row")], [
     #(
       "tag-filter-" <> int.to_string(model.filter_gen),
-      html.input([
-        attr.id("tag-filter"),
-        attr.type_("text"),
-        attr.value(model.tag_filter),
-        attr.placeholder("Filter by title or tag…"),
-        attr.aria("label", "Filter threads"),
-        filter_changed(),
+      html.div([attr.class("filter-box")], [
+        html.input([
+          attr.id("tag-filter"),
+          attr.type_("text"),
+          attr.value(model.tag_filter),
+          attr.placeholder("Filter by title or tag…"),
+          attr.aria("label", "Filter threads"),
+          filter_changed(),
+        ]),
+        case string.trim(model.tag_filter) {
+          "" -> element.none()
+          _ ->
+            html.button(
+              [
+                attr.id("filter-clear"),
+                attr.type_("button"),
+                attr.title("Clear filter"),
+                // The × glyph alone is a weak accessible name; say it.
+                attr.aria("label", "Clear filter"),
+                event.on_click(TagFilterSet("")),
+              ],
+              [html.text("×")],
+            )
+        },
       ]),
     ),
-    #("filter-clear", case string.trim(model.tag_filter) {
-      "" -> element.none()
-      _ ->
-        html.button(
-          [
-            attr.id("filter-clear"),
-            attr.type_("button"),
-            attr.title("Clear filter"),
-            event.on_click(TagFilterSet("")),
-          ],
-          [html.text("×")],
-        )
-    }),
   ])
 }
 
@@ -2597,20 +2609,17 @@ fn thread_row(model: Model, summary: thread.ThreadSummary) -> Element(Msg) {
   let id = summary.id
   let selected = model.selected == Some(id)
   let title = display_title(summary)
-  // The subtitle pins the thread's identity: provider/model (both
-  // frozen at creation, §8) plus its age. The provider name resolves
-  // from the masked list so renames show at once. A bot-sourced thread
-  // leads with the bot's name (provenance — bots plan P1); a deleted
-  // bot shows nothing and self-heals on rehydrate (SET NULL).
+  // The subtitle is provenance + age (#107): a bot-sourced thread leads
+  // with the bot's name (provenance — bots plan P1); a deleted bot shows
+  // nothing and self-heals on rehydrate (SET NULL). The provider/model
+  // pair left the row — it only mattered while threads were pinned during
+  // the multi-provider milestone, and the pair stays frozen on the thread
+  // itself (§8), so nothing is lost by dropping it from the chrome.
   let subtitle =
     case bot_display(model, summary.bot_id) {
       Some(bot_name) -> bot_name <> " · "
       None -> ""
     }
-    <> provider_display(model, summary.provider_id)
-    <> "/"
-    <> summary.model
-    <> " · "
     <> rel_time(timing.wall_now_s(), summary.last_active_at)
   html.div(
     [
@@ -3463,17 +3472,6 @@ fn bot_display(model: Model, bot_id: Option(String)) -> Option(String) {
         Ok(bot) -> Some(bot.name)
         Error(_) -> None
       }
-  }
-}
-
-/// The display name for a summary's pinned provider, resolved from the
-/// masked list (renames show at once); the id stands in while the list
-/// lags. Deletes are guarded while threads pin a provider, so the
-/// fallback is cosmetic, not semantic.
-fn provider_display(model: Model, provider_id: String) -> String {
-  case list.find(model.provider_list, fn(p) { p.id == provider_id }) {
-    Ok(p) -> p.name
-    Error(_) -> provider_id
   }
 }
 
