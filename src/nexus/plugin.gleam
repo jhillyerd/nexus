@@ -294,12 +294,13 @@ pub fn boot(cfg: Config) -> Result(tools.ProviderTable, String) {
   }
 }
 
-/// The floor a plugin's per-call timeout override must meet — the same
-/// floor the config applies to `NEXUS_PLUGIN_TIMEOUT_MS` (a sub-100ms
-/// deadline could never serve a call; and a NEGATIVE value reaches
+/// The floor a plugin's per-call timeout override must meet — the SAME
+/// floor the config applies to `NEXUS_PLUGIN_TIMEOUT_MS`
+/// (`config.plugin_timeout_floor_ms`, the one definition; a sub-100ms
+/// deadline could never serve a call, and a NEGATIVE value reaches
 /// Erlang's `after` and crashes with `timeout_value`, killing the
 /// per-turn worker — a loop error, not a tool error).
-const min_call_timeout_ms = 100
+const min_call_timeout_ms = config.plugin_timeout_floor_ms
 
 /// The provider half of the boundary rule: `^[a-zA-Z0-9_-]+$`, no `__`,
 /// no leading or trailing `_` (see `tool_provider.valid_name`). Checked

@@ -115,6 +115,11 @@ pub type Config {
   )
 }
 
+/// Plugins: the per-call timeout floor shared by `NEXUS_PLUGIN_TIMEOUT_MS`
+/// and a plugin's `timeout_ms` override (validated in `nexus/plugin`) —
+/// ONE definition so the two rules cannot drift apart.
+pub const plugin_timeout_floor_ms = 100
+
 /// Load config from the process environment.
 pub fn load() -> Result(Config, String) {
   from_env(envoy.get)
@@ -223,7 +228,7 @@ pub fn from_env(
     get,
     "NEXUS_PLUGIN_TIMEOUT_MS",
     30_000,
-    min: 100,
+    min: plugin_timeout_floor_ms,
   ))
   use plugin_max_output_chars <- result.try(optional_min_int(
     get,
