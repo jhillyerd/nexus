@@ -547,6 +547,21 @@ pub fn m3_page_thread_url_script_test() {
     html,
     "if (!(entry && entry.nexusBoot)) return;",
   ))
+  // The popstate retry enforces its deadline even without mutations
+  // (timer, expiry checked BEFORE clicking), cancels itself when a
+  // newer navigation has won, and is cancelled before every new
+  // attempt — a stale observer must never re-click an old id over a
+  // fresher selection.
+  should.be_true(string.contains(html, "    stopRetry();"))
+  should.be_true(string.contains(html, "    var armed = currentId();"))
+  should.be_true(string.contains(
+    html,
+    "      if (Date.now() > deadline) { stopRetry(); return; }",
+  ))
+  should.be_true(string.contains(
+    html,
+    "    retryTimer = setTimeout(stopRetry, 2050);",
+  ))
   // popstate drives the server's Select path through a synthetic click
   // on the row, never by touching the rendered tree's content.
   should.be_true(string.contains(html, "window.addEventListener('popstate'"))
