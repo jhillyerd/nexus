@@ -1332,10 +1332,12 @@ pub fn view_renders_shell_and_sidebar_test() {
   let html = view_string(model)
   should.be_true(string.contains(html, "id=\"app\""))
   should.be_true(string.contains(html, "id=\"thread-list\""))
-  // M3 organization: the row carries the thread id and the model alias as
-  // its subtitle (title falls back to the alias until auto-titled).
+  // M3 organization: the row carries the thread id; the title falls back
+  // to the alias until auto-titled. The subtitle no longer names the
+  // model (#107) — provenance is bot-or-nothing, then the age.
   should.be_true(string.contains(html, "data-thread-id=\"s-1\""))
-  should.be_true(string.contains(html, "smart · "))
+  should.be_false(string.contains(html, "smart · "))
+  should.be_true(string.contains(html, "class=\"thread-sub\""))
   should.be_true(string.contains(html, "aria-current=\"true\""))
   should.be_true(string.contains(html, "id=\"model-picker\""))
   should.be_true(string.contains(html, "value=\"fast\""))
@@ -2140,21 +2142,17 @@ pub fn view_provider_picker_lists_enabled_only_test() {
   should.be_true(string.contains(none, "no providers — add one in Settings"))
 }
 
-pub fn view_thread_subtitle_pins_provider_test() {
+pub fn view_thread_subtitle_omits_provider_model_test() {
   let html =
     new_model()
     |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
     |> step(ui.ThreadsLoaded([summary("s-1", False)]))
     |> view_string
-  // Subtitle: provider/model · age (§11). The summary pins p1, whose
-  // display name resolves from the masked list.
-  should.be_true(string.contains(html, "bifrost/smart · "))
-  // While the list lags, the id stands in — never blank.
-  let lagging =
-    new_model()
-    |> step(ui.ThreadsLoaded([summary("s-1", False)]))
-    |> view_string
-  should.be_true(string.contains(lagging, "p1/smart · "))
+  // #107: the subtitle dropped provider/model — a bot-less thread shows
+  // only its age. Neither the resolved name nor the lagging-id fallback
+  // (`p1/smart`) may reappear in the chrome.
+  should.be_false(string.contains(html, "bifrost/smart · "))
+  should.be_false(string.contains(html, "p1/smart · "))
 }
 
 // ---------------------------------------------------------------------------
@@ -3838,8 +3836,9 @@ pub fn view_create_panel_bot_picker_test() {
 }
 
 /// A bot-sourced thread's subtitle leads with the bot's name
-/// (provenance). A hostile bot name is escaped; a bot deleted since
-/// (unresolvable id) shows nothing and keeps provider/model · age.
+/// (provenance — the one identity #107 keeps). A hostile bot name is
+/// escaped; a bot deleted since (unresolvable id) shows nothing, and the
+/// age-only subtitle never resurrects provider/model.
 pub fn view_thread_subtitle_shows_bot_provenance_test() {
   let html =
     new_model()
@@ -3851,14 +3850,11 @@ pub fn view_thread_subtitle_shows_bot_provenance_test() {
       ]),
     )
     |> view_string
-  should.be_true(string.contains(
-    html,
-    "&lt;b&gt;Writer&lt;/b&gt; · bifrost/smart · ",
-  ))
+  should.be_true(string.contains(html, "&lt;b&gt;Writer&lt;/b&gt; · "))
   should_not_contain(html, "<b>Writer</b> · bifrost")
 
-  // Deleted bot: the pointer resolves to nothing, the subtitle keeps
-  // its plain shape (self-heals on rehydrate, which NULLs the column).
+  // Deleted bot: the pointer resolves to nothing, the subtitle is
+  // age-only (self-heals on rehydrate, which NULLs the column).
   let gone =
     new_model()
     |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
@@ -3868,8 +3864,8 @@ pub fn view_thread_subtitle_shows_bot_provenance_test() {
       ]),
     )
     |> view_string
-  should.be_true(string.contains(gone, "bifrost/smart · "))
   should.be_false(string.contains(gone, "b-gone · "))
+  should.be_false(string.contains(gone, "bifrost/smart · "))
 }
 
 /// A deleted bot falls out of the create panel's selection: the model

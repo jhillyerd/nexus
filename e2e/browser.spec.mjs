@@ -330,7 +330,7 @@ async function revealRowControls(row) {
 /// `focus()` is deliberately avoided: it proves nothing about the order,
 /// so a control dropping out of the tab order would pass unnoticed.
 async function tab_to_row_main(page, row) {
-  await page.locator("#show-archived").focus();
+  await page.locator("#tag-filter").focus();
   const want = row.locator(".thread-main");
   for (let i = 0; i < 40; i++) {
     await page.keyboard.press("Tab");
@@ -538,19 +538,19 @@ async function main() {
         { timeout: 15_000, message: "second thread appears" },
       );
       const labels = await page.$$eval("#thread-list .thread-main", (els) => els.map((e) => e.textContent));
-      // Subtitles are `provider/model · age` (P5), so the label carries
-      // the seeded provider's name before the alias.
-      assert(labels.some((l) => l.includes("fake/fast")), `new thread label: ${labels}`);
+      // #107 dropped provider/model from the row subtitle: the label is
+      // the alias (title fallback) + age, with no provider prefix.
+      assert(labels.some((l) => l.includes("fast") && !l.includes("fake/")), `new thread label: ${labels}`);
       const currentLabels = await page.$$eval(
         "#thread-list .thread-main[aria-current='true']",
         (els) => els.map((e) => e.textContent),
       );
       eq(currentLabels.length, 1, "exactly one current thread");
-      assert(currentLabels[0].includes("fake/fast"), `current is the new thread: ${currentLabels}`);
+      assert(currentLabels[0].includes("fast") && !currentLabels[0].includes("fake/"), `current is the new thread: ${currentLabels}`);
       // Switch back to the original smart thread (Created prepends, so
       // match by label rather than DOM position).
       await page
-        .locator("#thread-list .thread-main", { hasText: "fake/smart ·" })
+        .locator("#thread-list .thread-main", { hasText: "smart" })
         .first()
         .click();
       await poll(
@@ -562,7 +562,7 @@ async function main() {
       // same rule the row title uses. The real title is asserted in the
       // organize test after its manual rename.
       const smartCurrent = await page
-        .locator("#thread-list .thread-main", { hasText: "fake/smart ·" })
+        .locator("#thread-list .thread-main", { hasText: "smart" })
         .first()
         .getAttribute("aria-current");
       eq(smartCurrent, "true", "smart thread current again");
@@ -588,6 +588,10 @@ async function main() {
       // honest subject.
       {
         const controls = fastRow.locator(".row-controls");
+        // Park the pointer off the list first: an earlier test's row click
+        // can leave the mouse sitting on a row, and hover-revealed controls
+        // must not leak into the at-rest assertion.
+        await page.mouse.move(0, 0);
         eq(await controls.isVisible(), false, "unselected row hides its controls");
         // Pointer path.
         await fastRow.hover();
@@ -598,11 +602,11 @@ async function main() {
         // Keyboard path: real sequential Tab navigation, not `focus()`.
         // `focus()` would pass even if the row's controls fell out of the
         // tab order entirely, which is the regression worth catching. The
-        // sidebar's own `#show-archived` button is the last focusable
-        // before the list, so starting there and pressing Tab walks the
-        // actual order: every hidden control is out of the order until its
-        // row has focus, so the row's `.thread-main` is the stop that
-        // opens it.
+        // sidebar's `#tag-filter` input is the last focusable before the
+        // list (the `#show-archived` toggle moved BELOW the list, #107),
+        // so starting there and pressing Tab walks the actual order: every
+        // hidden control is out of the order until its row has focus, so
+        // the row's `.thread-main` is the stop that opens it.
         await page.mouse.move(0, 0); // leave the list: no hover help
         const reached = await tab_to_row_main(page, fastRow);
         assert(
@@ -1792,14 +1796,16 @@ async function main() {
         async () => (await page.locator("#thread-list .thread-main").count()) === threadsBefore + 1,
         { timeout: 15_000, message: "pinned thread appears" },
       );
-      // The row subtitle names the pinned provider (provider/model · age).
-      const madeThreadRow = page
-        .locator("#thread-list .thread-main", { hasText: "ui-made/smart ·" })
-        .first();
-      await poll(async () => await madeThreadRow.isVisible(), {
-        timeout: 10_000,
-        message: "thread subtitle pins provider/model",
-      });
+      // #107: the row subtitle no longer names the pinned provider —
+      // the chrome shows bot-or-nothing + age. The pin itself is
+      // asserted through the API and the streamed turn below.
+      eq(
+        await page
+          .locator("#thread-list .thread-main", { hasText: "ui-made/" })
+          .count(),
+        0,
+        "row subtitle omits provider/model",
+      );
 
       // Stream a turn end-to-end through the new provider.
       await sendAndWaitIdle(page, "case:text provider ui round");
@@ -1927,9 +1933,9 @@ async function main() {
         { timeout: 15_000, message: "bot-sourced thread appears" },
       );
       // The row subtitle leads with the bot name (provenance), then the
-      // frozen pin.
+      // age — #107 dropped the frozen pin from the chrome.
       const botThreadRow = page
-        .locator("#thread-list .thread-main", { hasText: "Writer · fake/smart ·" })
+        .locator("#thread-list .thread-main", { hasText: "Writer · " })
         .first();
       await poll(async () => await botThreadRow.isVisible(), {
         timeout: 10_000,
@@ -1962,8 +1968,8 @@ async function main() {
       await poll(
         async () => {
           const rows = await page.locator("#thread-list .thread-main").allInnerTexts();
-          return rows.some((t) => t.includes("fake/smart ·"))
-            && !rows.some((t) => t.includes("Writer · fake/smart"));
+          return rows.some((t) => t.includes("smart"))
+            && !rows.some((t) => t.includes("Writer · "));
         },
         { timeout: 15_000, message: "thread keeps pin, provenance name gone",
         },

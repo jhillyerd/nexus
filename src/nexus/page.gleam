@@ -515,10 +515,22 @@ aside { overflow-y: auto; padding: .8rem; border-right: 1px solid
   color-mix(in srgb, currentColor 15%, transparent); }
 aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; margin: 0; }
 .section-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: .6rem; }
-.filter-row { display: flex; gap: .35rem; align-items: center; margin-bottom: .45rem; }
-.filter-row input { flex: 1; min-width: 0; }
-#app #filter-clear { padding: .3rem .55rem; font-size: .85rem; }
-.archive-toggle-row { margin-bottom: .6rem; }
+.filter-row { display: flex; margin-bottom: .45rem; }
+/* The clear × floats INSIDE the input (#107) instead of dangling beside
+   it: `.filter-box` is the positioning context, the input reserves the
+   glyph's width with padding-right so text never runs under it, and the
+   button pins to the input's right edge. #app prefix per the cascade
+   traps — it must beat both `#app button` and Pico's `[type=button]`;
+   stripping border/background is what makes it read as a glyph, not a
+   CTA. Reserving the padding always (not only when × is visible) keeps
+   the field from changing width when the glyph appears. */
+.filter-box { position: relative; flex: 1; min-width: 0; }
+.filter-box input { width: 100%; padding-right: 1.9rem; }
+#app .filter-box #filter-clear { position: absolute; top: 50%; right: .3rem;
+  transform: translateY(-50%); padding: 0 .3rem; min-height: 0; width: auto;
+  border: none; background: none; font-size: .9rem; line-height: 1.4; opacity: .55; }
+#app .filter-box #filter-clear:hover { opacity: 1; }
+.archive-toggle-row { margin-top: .6rem; }
 #app .toggle { font-size: .78rem; padding: .28rem .6rem; opacity: .8; }
 #app .toggle.on { opacity: 1; border-color: #3b82f6; color: #3b82f6; }
 .thread-list { display: flex; flex-direction: column; gap: .55rem; }
@@ -529,8 +541,27 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
 .thread-row { display: flex; flex-direction: column; gap: .25rem; border: 1px solid transparent;
   border-radius: 10px; padding: .3rem; }
 .thread-row.selected { border-color: #3b82f6; background: color-mix(in srgb, #3b82f6 12%, transparent); }
-.thread-main { display: flex; flex-direction: column; gap: .1rem; text-align: left; }
-.thread-title { overflow-wrap: anywhere; }
+/* Soft hover (#107): the selected tint WITHOUT the border — the blue
+   border stays exclusive to selection. Behind the hover-media guard like
+   .row-controls below, so a touch scroll never leaves a sticky tint. */
+@media (hover: hover) {
+  .thread-row:hover { background: color-mix(in srgb, #3b82f6 12%, transparent); }
+}
+/* min-width: 0 is load-bearing: .thread-main is a flex item of the row
+   and the title span is a flex item of .thread-main — without it neither
+   can shrink below content width and the title ellipsis never engages. */
+.thread-main { display: flex; flex-direction: column; gap: .1rem; text-align: left; min-width: 0; }
+/* Titles truncate to one ellipsized line at rest (#107) and unwrap on the
+   same reveal signals as .row-controls below (hover / selected /
+   focus-within — the last keeps keyboard users equal to pointer users).
+   overflow-wrap returns with the unwrap so a long unbroken token wraps
+   instead of clipping. The title text stays whole in the DOM: this is a
+   CSS clip only, so textContent (and the hostile-text contract) is
+   untouched. */
+.thread-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.thread-row:hover .thread-title,
+.thread-row.selected .thread-title,
+.thread-row:focus-within .thread-title { white-space: normal; overflow-wrap: anywhere; }
 .thread-sub { font-size: .72rem; opacity: .6; overflow-wrap: anywhere; }
 .tag-chips { display: flex; flex-wrap: wrap; gap: .25rem; }
 /* Quiet chip (ui-polish F2): no border by default, so a tagged row reads
