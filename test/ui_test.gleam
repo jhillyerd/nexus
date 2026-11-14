@@ -2636,7 +2636,11 @@ pub fn bot_edit_model_combobox_scopes_to_bot_provider_test() {
 
 pub fn bot_model_combobox_hostile_aliases_escape_test() {
   // Model aliases come from the provider (hostile by contract): the
-  // suggestion list's labels are inert Lustre text nodes.
+  // suggestion list's labels are inert Lustre text nodes AND the
+  // data-value attribute the combobox script reads on pick is an
+  // escaped attribute value — the script does getAttribute (no HTML
+  // parsing), so a quote-bearing alias must arrive escaped in both
+  // places or not at all.
   let html =
     new_model()
     |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
@@ -2647,12 +2651,19 @@ pub fn bot_model_combobox_hostile_aliases_escape_test() {
       ui.Settings(
         ui_settings.BotAliasesLoaded("p1", [
           "<img src=x onerror=alert(2)>",
+          "x\" onmouseover=\"alert(1)",
         ]),
       ),
     )
     |> view_string
   should.be_true(string.contains(html, "&lt;img src=x onerror=alert(2)&gt;"))
+  should.be_true(string.contains(html, "x&quot; onmouseover=&quot;alert(1)"))
+  should.be_true(string.contains(
+    html,
+    "data-value=\"x&quot; onmouseover=&quot;alert(1)\"",
+  ))
   should_not_contain(html, "<img src=x")
+  should_not_contain(html, "onmouseover=\"alert(1)\"")
 }
 
 // ---------------------------------------------------------------------------
