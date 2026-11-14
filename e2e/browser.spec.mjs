@@ -2325,12 +2325,12 @@ async function main() {
           "fallback cleared the filter",
         );
 
-        // A pasted link (fresh context, empty sessionStorage) boots into
-        // exactly the named thread — the page url names it, outranking
-        // the stored selection — and the url keeps naming it after the
-        // boot. The RESTful path form is the primary shape; a legacy
-        // ?thread= link must keep working AND upgrade to the path form
-        // once its thread is live.
+        // A pasted link boots into exactly the named thread — the page
+        // url names it and must OUTRANK the tab's stored selection, so
+        // the peer context is seeded with a competing storage entry
+        // (t2) before the /threads/t1 navigation. The RESTful path form
+        // is the primary shape; a legacy ?thread= link must keep working
+        // AND upgrade to the path form once its thread is live.
         const peer = await browser.newContext({ viewport: { width: 1280, height: 900 } });
         const ppage = await peer.newPage();
         track(ppage);
@@ -2338,11 +2338,22 @@ async function main() {
         const lpage = await legacy.newPage();
         track(lpage);
         try {
+          // Seed a competing stored selection: load the app plainly, wait
+          // for its auto-selection to settle into storage, then overwrite
+          // it with t2. The /threads/t1 navigation below may only open t1
+          // if the url beats storage.
+          await ppage.goto(`${base}/?token=${TOKEN}`);
+          await connected(ppage);
+          await poll(async () => {
+            const sel = await selectedId(ppage);
+            return sel !== "" && (await ppage.evaluate(() => sessionStorage.getItem("nexus.thread"))) === sel;
+          }, { timeout: 15_000, message: "peer context selection settled into storage" });
+          await ppage.evaluate((id) => sessionStorage.setItem("nexus.thread", id), t2.id);
           await ppage.goto(`${base}/threads/${t1.id}?token=${TOKEN}`);
           await connected(ppage);
           await poll(async () => (await selectedId(ppage)) === t1.id, {
             timeout: 15_000,
-            message: "pasted link opened t1",
+            message: "pasted link opened t1 over the stored t2",
           });
           eq(new URL(ppage.url()).pathname, `/threads/${t1.id}`, "pasted path url kept");
 
@@ -2373,8 +2384,12 @@ async function main() {
           message: "original selection restored",
         });
       } finally {
-        await page.request.delete(`${base}/threads/${t1.id}`, { headers });
-        await page.request.delete(`${base}/threads/${t2.id}`, { headers });
+        // Suite cleanup is load-bearing (a shared database): a silent
+        // failure here would leak threads into every later run.
+        const gone1 = await page.request.delete(`${base}/threads/${t1.id}`, { headers });
+        eq(gone1.status(), 204, "t1 deleted");
+        const gone2 = await page.request.delete(`${base}/threads/${t2.id}`, { headers });
+        eq(gone2.status(), 204, "t2 deleted");
       }
     });
 
