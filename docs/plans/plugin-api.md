@@ -25,8 +25,9 @@ touch, the connection is named explicitly.
 Designed 2026-11-14 in conversation; every `gleam_erlang` API named here
 was verified against the pinned 1.3.0 source (`named_subject`,
 `process.named`, `monitor`, `select_specific_monitor`,
-`selector_receive` all exist — check `build/packages/gleam_erlang/…`
-before trusting training data, per the AGENTS.md pitfall list). The MCP
+`selector_receive`, `reference.new` all exist — check
+`build/packages/gleam_erlang/…` before trusting training data, per the
+AGENTS.md pitfall list). The MCP
 semantics adopted (tools/call, notifications/cancelled, plain-content
 results) follow the precedent research recorded in the environments
 plan.
@@ -100,12 +101,12 @@ pub type Msg {
 }
 ```
 
-`Ref` is a per-call unique token minted by the adapter (a tiny
-`@external` to `erlang:make_ref/0` — nothing in pinned gleam_stdlib /
-gleam_erlang mints one today; `nexus_loop_ffi` is the precedent home for
-such an FFI). It correlates `Call` ↔ `Cancelled` purely between adapter
-and provider, which is why `ToolSpec.run` does NOT need the wire
-`call_id` threaded into its signature.
+`Ref` is `reference.Reference` from the pinned gleam_erlang — minted
+per call with `reference.new()` (a thin wrap of `erlang:make_ref/0`;
+an earlier draft of this plan wrongly claimed nothing in the pinned
+packages mints one). It correlates `Call` ↔ `Cancelled` purely between
+adapter and provider, which is why `ToolSpec.run` does NOT need the
+wire `call_id` threaded into its signature.
 
 Shape rationale:
 
@@ -117,6 +118,12 @@ Shape rationale:
   truncates/sanitises centrally. Today each executor truncates itself;
   plugins and MCP servers are untrusted content sources, so the
   hostile-text invariant is enforced at the boundary, not delegated.
+  Truncation is display hygiene, not the memory bound: an external
+  provider's result size is capped while READING its transport
+  (bounded accumulation — the `http_fetch` max-bytes pattern), since
+  truncating after receipt does not bound allocation. In-process
+  plugins are trusted code — the same trust as compiled tools — where
+  adapter-side truncation is the whole story.
 - **Provider failure is a tool error.** A dead or wedged provider
   renders as a failed tool result; the round commits; the model
   self-corrects — the environments plan's fail-fast rule, applied
@@ -128,34 +135,34 @@ Runs inside the per-turn worker (a plain function, like every other
 executor). Codemode's worker select loop is the template:
 
 ```gleam
-fn provider_run(
-  provider: Name(provider.Msg),
-  tool: String,
-  timeout_ms: Int,
-  ctx: tools.ToolCtx,
-  arguments: String,
-) -> Result(String, String) {
-  let reply = process.new_subject()                // worker-owned ✓
-  let ref = fresh_ref()
-  let subject = process.named_subject(provider)    // Name → Subject:
-  process.send(subject, provider.Call(ref, tool, arguments, reply))
-  let mon = case process.named(provider) {         // restart-safe liveness
-    Ok(pid) -> Some(process.monitor(pid))
-    Error(Nil) -> None                              // already down: fail now
-  }
-  case selector over {reply → GotReply, ctx.cancel → Cancel,
-                      mon (if Some) → Down, deadline = timeout_ms} {
-    GotReply(ToolOk(content)) -> Ok(truncate(content))
-    GotReply(ToolErr(message)) -> Error(truncate(message))
-    Cancel -> {
-      process.send(ctx.cancel, Nil)          // RE-SIGNAL (see below)
-      process.send(subject, provider.Cancelled(ref))
-      Error("cancelled")
-    }
-    Down -> Error("tool provider is unavailable")
-    Timeout -> {
-      process.send(subject, provider.Cancelled(ref))
-      Error("timed out after …ms")
+//// Pseudocode — illustrative, not compilable Gleam. The ordering is
+//// the contract: resolve liveness and arm the monitor BEFORE the
+//// dispatch, so a crash in between cannot drop the call into an
+//// unmonitored void.
+fn provider_run(provider, tool, timeout_ms, ctx, arguments) {
+  case process.named(provider) {                    // liveness FIRST
+    Error(Nil) -> Error("tool provider is unavailable")  // no send
+    Ok(pid) -> {
+      let reply = process.new_subject()             // worker-owned ✓
+      let ref = reference.new()
+      let mon = process.monitor(pid)
+      let subject = process.named_subject(provider) // Name → Subject:
+      process.send(subject, provider.Call(ref, tool, arguments, reply))
+      case selector over {reply → GotReply, ctx.cancel → Cancel,
+                          mon → Down, deadline = timeout_ms} {
+        GotReply(ToolOk(content)) -> Ok(truncate(content))
+        GotReply(ToolErr(message)) -> Error(truncate(message))
+        Cancel -> {
+          process.send(ctx.cancel, Nil)        // RE-SIGNAL (see below)
+          process.send(subject, provider.Cancelled(ref))
+          Error("cancelled")
+        }
+        Down -> Error("tool provider is unavailable")
+        Timeout -> {
+          process.send(subject, provider.Cancelled(ref))
+          Error("timed out after …ms")
+        }
+      }
     }
   }
 }
@@ -169,14 +176,22 @@ Pinned details:
   reaching the next `cancel_pending` check (the codemode rule; see the
   comment on `loop.cancel_pending`). Dropping it would let a turn open
   another model request after the user asked it to stop.
-- **Monitor the provider, don't wait out the timeout.** The catalog
-  holds the Name; `process.named` → `monitor` + `select_specific_monitor`
-  turns a crash into an immediate error result instead of a burned
-  deadline (the environments plan's mid-run-detach analog).
-- **Late replies are harmless.** If the provider answers after the
-  worker is gone (timeout then stop), the send targets a dead owner and
-  is a no-op on the BEAM. The `Cancelled` notification is the
-  best-effort cleanup.
+- **Monitor before dispatch, don't wait out the timeout.** The pid is
+  resolved and the monitor armed BEFORE the `Call` is sent: a provider
+  already down fails without a send (`process.named` → `Error`), and
+  one that dies mid-call is answered immediately by the monitor
+  (`select_specific_monitor`) instead of a burned deadline (the
+  environments plan's mid-run-detach analog). Dispatching first would
+  leave a window where the call lands in a dead or unmonitored mailbox
+  and only the timeout answers.
+- **Late replies are harmless — but not because the worker is gone.**
+  On timeout the worker lives on (sibling calls, the next iterations)
+  and a stale `ToolReply` does queue in its mailbox. It is inert: the
+  reply subject is minted fresh per call, so no later select can ever
+  match it (selectors bind to their own subject), and the per-turn
+  worker dies at turn end, dropping the queue. Abandoned calls cost at
+  most mailbox garbage; the `Cancelled` notification is the best-effort
+  cleanup.
 - **Timeouts are per-call wall clock** — config default, overridable
   per provider — and render like any tool error, never a loop failure.
 
@@ -207,8 +222,12 @@ exactly once from wherever the work finishes. The protocol is the whole
 contract; nothing else about the plugin's internals is nexus's business.
 
 Lifecycle: providers start under a `plugin_sup` BEFORE the thread
-registry builds its catalog (a compiled plugin that won't start fails
-boot loudly — the no-silent-fallback philosophy). The interface is
+registry builds its catalog. The boot-time `ListTools` ask is BOUNDED
+(a short fixed timeout): a compiled plugin that won't start or won't
+answer fails boot loudly (the no-silent-fallback philosophy), and an
+MCP adapter that won't answer degrades exactly like an unreachable
+server — its names unresolvable at create, with the honest 400 — so
+nothing external can hang boot. The interface is
 load-mechanism-agnostic on purpose: anything that can (1) register the
 name and (2) speak `Msg` is a provider. v1 plugins are compiled into the
 release and listed by config; a future load mechanism only has to
@@ -221,6 +240,15 @@ produce the same two things.
   same catalog `tools.by_names` resolves. Plugin names therefore behave
   exactly like compiled names — resolvable offline, snapshot-pinnable by
   bots, loud `unknown tool name` refusal when stale.
+- **The catalog validates before it admits.** A `ToolDef` is untrusted
+  at the boundary: the unqualified name must match `^[a-zA-Z0-9_-]+$`
+  (the `__` separator is reserved, enforced on both halves of the
+  qualified name), `parameters_json` must parse with an OBJECT root and
+  fit a byte bound — anything less refuses the provider's registration
+  loudly, before any name enters the catalog or a frozen manifest.
+  (`tools.function_tool` today silently drops unparseable schema text
+  to `parameters: None` — acceptable for compiled-in programmer error,
+  wrong for provider input.)
 - **Never in the default toolset.** Plugin/MCP tools enter a thread only
   via a bot template or an explicit create flag. Config gates
   AVAILABILITY (the provider exists), never default membership — the
@@ -243,7 +271,9 @@ The one asymmetry vs in-process plugins: **the schema must come from
 somewhere at creation.** So:
 
 - Create naming `github__create_issue` → the registry asks the adapter's
-  live `tools/list`, **freezes the schema** into the toolset manifest,
+  live `tools/list`, validates each entry at the boundary (charset,
+  `__`, parseable object-rooted JSON, byte bound — the catalog rule
+  above), **freezes the schema** into the toolset manifest,
   and builds the bundle (bundle cache keyed by name tuple + snapshot
   identity, so two threads of one snapshot share it).
 - Hydration replays the frozen snapshot and never contacts the server —
@@ -340,8 +370,11 @@ consume. The plans land independently either way.
   construction path; `m3_prefix_test` golden untouched (default
   envelope unchanged).
 - **Hostile text**: every provider/MCP byte that reaches the UI passes
-  the adapter's truncation/sanitisation; results render as inert Lustre
-  text nodes like every other tool.
+  the adapter's truncation/sanitisation; external providers' result
+  sizes are capped at transport read (truncation is display hygiene,
+  not the memory bound); schemas are validated at the boundary before
+  entering the catalog or a frozen manifest; results render as inert
+  Lustre text nodes like every other tool.
 - **Loud unknown names**: `by_names` keeps refusing unknown names
   loudly (hydration of a name whose provider vanished from the catalog
   fails loudly, never silently narrows).
