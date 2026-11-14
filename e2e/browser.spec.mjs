@@ -291,6 +291,18 @@ async function backToChat(page) {
   });
 }
 
+// Switch the settings page's left tab rail (Providers / Bots). Idempotent:
+// clicking the already-active tab is harmless (the sections swap
+// visibility; both stay mounted). Providers is the default after any
+// page load, so this only matters for the bots flows.
+async function settingsTab(page, name) {
+  await page.click(`#tab-${name}`);
+  await poll(
+    async () => await page.locator(`#${name}-panel`).isVisible(),
+    { timeout: 10_000, message: `${name} tab open` },
+  );
+}
+
 // The per-client selection mirror (`#layout[data-selected]`, persisted
 // client-side by the page shell and re-supplied on the /ws route).
 async function selectedId(p) {
@@ -1695,19 +1707,26 @@ async function main() {
       assert((await seededRow.locator(".badge").textContent()) === "keyless", "keyless badge");
 
       // F7 restyle geometry (which the offline suite cannot see): the
-      // settings section is a centered column (the F6 shape) and provider
-      // rows render as bordered cards.
+      // tab rail sits LEFT of the body column, the active section is a
+      // centered column inside that body, and provider rows render as
+      // bordered cards.
       {
         const pane = await page.locator("#settings-page").boundingBox();
+        const nav = await page.locator("#settings-nav").boundingBox();
+        const body = await page.locator(".settings-body").boundingBox();
         const section = await page.locator("#providers-panel").boundingBox();
+        assert(
+          nav.x + nav.width <= section.x,
+          `tab rail left of section: nav ends ${nav.x + nav.width}, section starts ${section.x}`,
+        );
         assert(
           section.width < pane.width - 100,
           `settings column narrower than pane: ${section.width} vs ${pane.width}`,
         );
         const delta = Math.abs(
-          section.x + section.width / 2 - (pane.x + pane.width / 2),
+          section.x + section.width / 2 - (body.x + body.width / 2),
         );
-        assert(delta < 2, `settings column centered: delta ${delta}px`);
+        assert(delta < 2, `settings column centered in body: delta ${delta}px`);
         const border = await seededRow.evaluate(
           (el) =>
             `${getComputedStyle(el).borderTopStyle} ${getComputedStyle(el).borderTopWidth}`,
@@ -1848,9 +1867,11 @@ async function main() {
       await page.goto(`${base}/?token=${TOKEN}`);
       await connected(page);
 
-      // The Bots section sits beside Providers; the add form carries the
-      // template fields (provider select, model, optional prompt).
+      // The Bots section is its own tab now; the rail switches to it.
+      // The add form carries the template fields (provider select,
+      // model, optional prompt).
       await openSettings(page);
+      await settingsTab(page, "bots");
       await page.click("#add-bot");
       await page.fill('#add-bot-form input[name="name"]', "Writer");
       await page.fill('#add-bot-form input[name="description"]', "prose drafts");
@@ -1925,7 +1946,10 @@ async function main() {
 
       // Delete the bot (two-step, unguarded): the thread keeps its
       // frozen pin, and the provenance name falls away from the row.
+      // The bots tab is still the active one in this connection's
+      // settings state, but switching again is idempotent.
       await openSettings(page);
+      await settingsTab(page, "bots");
       await botRow.getByRole("button", { name: "Delete", exact: true }).click();
       await botRow
         .getByRole("button", { name: "Delete forever", exact: true })

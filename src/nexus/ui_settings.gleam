@@ -1,8 +1,10 @@
-//// The Settings sub-component: provider management (and, over time,
-//// other settings categories) rendered as a full-page view inside the
-//// chat component's shell. `nexus/ui` swaps its main area for this view
-//// when the header's Settings button opens it, and lifts the
-//// sub-component into the parent app with `element.map`/`effect.map`.
+//// The Settings sub-component: provider and bot management (and, over
+//// time, further settings categories) rendered as a full-page view
+//// inside the chat component's shell, laid out as a left-hand tab rail
+//// beside the active category's section. `nexus/ui` swaps its main
+//// area for this view when the header's Settings button opens it, and
+//// lifts the sub-component into the parent app with
+//// `element.map`/`effect.map`.
 ////
 //// The split is deliberately one-way:
 ////
@@ -37,6 +39,15 @@ import nexus/bot_registry
 import nexus/provider.{type Provider}
 import nexus/provider_registry
 import nexus/utility
+
+/// Which settings category the page's tab rail shows. Providers is the
+/// default: it is the page's original category and the first-run flow's
+/// target (a fresh database auto-opens the page with an empty provider
+/// list, and the user must add one before bots are usable at all).
+pub type SettingsTab {
+  ProvidersTab
+  BotsTab
+}
 
 /// On-demand connection-test state for the row Test control: idle,
 /// fetching, or the settled result (model aliases / fixed failure text)
@@ -74,6 +85,10 @@ pub type State {
     /// The latest bot-mutation failure, rendered beside the Bots section
     /// (same rule as `last_error`).
     bot_last_error: Option(String),
+    /// Which tab the page's left rail shows. Both sections stay in the
+    /// DOM (the inactive one `hidden`, like the forms) so uncontrolled
+    /// form state survives tab switches; this only picks the visible one.
+    tab: SettingsTab,
   )
 }
 
@@ -81,6 +96,9 @@ pub type Msg {
   /// A decoded event that carries nothing actionable (the submit
   /// decoders' fallback arm).
   Ignored
+  /// A tab in the page's left rail was clicked: the section switches,
+  /// and every open form/editor/confirm stands down (see `update`).
+  TabSelected(SettingsTab)
   /// The add-provider form toggled.
   AddToggled
   /// The add-provider form submitted (blank key = keyless).
@@ -193,6 +211,7 @@ pub fn init() -> State {
     bot_edit: None,
     bot_confirm: None,
     bot_last_error: None,
+    tab: ProvidersTab,
   )
 }
 
@@ -212,6 +231,31 @@ pub fn update(
 ) -> #(State, Effect(Msg), List(Signal)) {
   case msg {
     Ignored -> #(state, effect.none(), [])
+
+    // Re-clicking the active tab does nothing: a stray double click on
+    // a tab must not close a form the user is mid-way through. Only a
+    // real switch stands the transient state down.
+    TabSelected(tab) if tab == state.tab -> #(state, effect.none(), [])
+
+    TabSelected(tab) -> #(
+      State(
+        ..state,
+        tab: tab,
+        // Switching tabs stands every open form/editor/confirm down —
+        // the generalisation of the old one-form-per-page rule, which
+        // made each section's form stand the other section's down. The
+        // forms stay mounted under their `hidden` attributes, so typed
+        // values survive the stand-down; only the open state closes.
+        open: False,
+        edit: None,
+        confirm: None,
+        bots_open: False,
+        bot_edit: None,
+        bot_confirm: None,
+      ),
+      effect.none(),
+      [],
+    )
 
     AddToggled -> #(
       State(
@@ -468,18 +512,64 @@ pub fn update(
 // View
 // ---------------------------------------------------------------------------
 
-/// The whole settings page. Sectioned so future settings categories
-/// (each a `<section>` with its own `section-head`) slot in under the
-/// Providers section without structural changes.
+/// The whole settings page: a left-hand tab rail (one entry per
+/// settings category) beside the category sections. Both sections stay
+/// in the DOM — the inactive one carries `hidden` and CSS-displayed
+/// none, mirroring the forms — so the uncontrolled inputs keep typed
+/// values across tab switches, and the keyed bot list never unmounts.
 pub fn view(
   state: State,
   provider_list: List(Provider),
   bot_list: List(Bot),
 ) -> Element(Msg) {
   html.div([attr.id("settings-page"), attr.class("settings-page")], [
-    providers_section(state, provider_list),
-    bots_section(state, provider_list, bot_list),
+    settings_nav(state.tab),
+    html.div([attr.class("settings-body")], [
+      providers_section(state, provider_list),
+      bots_section(state, provider_list, bot_list),
+    ]),
   ])
+}
+
+/// The tab rail. A plain button pair with `aria-pressed` — the same
+/// pragmatic a11y as the sidebar toggles; full tablist/arrow-key
+/// semantics can come later if a third category ever needs them.
+fn settings_nav(active: SettingsTab) -> Element(Msg) {
+  html.nav(
+    [
+      attr.id("settings-nav"),
+      attr.class("settings-nav"),
+      attr.aria("label", "Settings sections"),
+    ],
+    [
+      tab_button("providers", "Providers", ProvidersTab, active),
+      tab_button("bots", "Bots", BotsTab, active),
+    ],
+  )
+}
+
+fn tab_button(
+  slug: String,
+  label: String,
+  tab: SettingsTab,
+  active: SettingsTab,
+) -> Element(Msg) {
+  html.button(
+    [
+      attr.id("tab-" <> slug),
+      attr.type_("button"),
+      attr.class(case tab == active {
+        True -> "settings-tab on"
+        False -> "settings-tab"
+      }),
+      attr.aria("pressed", case tab == active {
+        True -> "true"
+        False -> "false"
+      }),
+      event.on_click(TabSelected(tab)),
+    ],
+    [html.text(label)],
+  )
 }
 
 /// The Providers section, verbatim from the pre-bots settings page.
@@ -487,48 +577,51 @@ fn providers_section(
   state: State,
   provider_list: List(Provider),
 ) -> Element(Msg) {
-  html.section([attr.id("providers-panel")], [
-    // One header row: title left, Add right (ui-polish F7). The page
-    // itself is the settings surface the header button toggles, so the
-    // section head names only its category — future categories slot in
-    // as sibling sections with their own heads.
-    html.div([attr.class("section-head")], [
-      html.h2([], [html.text("Providers")]),
-      html.button(
-        [
-          attr.id("add-provider"),
-          attr.type_("button"),
-          event.on_click(AddToggled),
-        ],
-        [html.text("Add")],
-      ),
-    ]),
-    html.p([attr.class("muted")], [
-      html.text(
-        "Providers are OpenAI-compatible endpoints. Keys are encrypted "
-        <> "at rest and never shown back.",
-      ),
-    ]),
-    // The latest mutation failure renders HERE (the user is on this
-    // page when it happens) — the chat-log note via `OpFailed` is the
-    // durable transcript copy.
-    case state.last_error {
-      Some(reason) ->
-        html.p([attr.class("settings-error")], [
-          html.text("provider operation failed: " <> reason),
-        ])
-      None -> element.none()
-    },
-    add_provider_form(state),
-    ..case provider_list {
-      [] -> [
-        html.p([attr.class("muted")], [
-          html.text("No providers yet. Add one to start chatting."),
-        ]),
-      ]
-      providers -> list.map(providers, provider_row(state, _))
-    }
-  ])
+  html.section(
+    [attr.id("providers-panel"), attr.hidden(state.tab != ProvidersTab)],
+    [
+      // One header row: title left, Add right (ui-polish F7). The page
+      // itself is the settings surface the header button toggles, so the
+      // section head names only its category — the rail carries the
+      // between-category navigation.
+      html.div([attr.class("section-head")], [
+        html.h2([], [html.text("Providers")]),
+        html.button(
+          [
+            attr.id("add-provider"),
+            attr.type_("button"),
+            event.on_click(AddToggled),
+          ],
+          [html.text("Add")],
+        ),
+      ]),
+      html.p([attr.class("muted")], [
+        html.text(
+          "Providers are OpenAI-compatible endpoints. Keys are encrypted "
+          <> "at rest and never shown back.",
+        ),
+      ]),
+      // The latest mutation failure renders HERE (the user is on this
+      // page when it happens) — the chat-log note via `OpFailed` is the
+      // durable transcript copy.
+      case state.last_error {
+        Some(reason) ->
+          html.p([attr.class("settings-error")], [
+            html.text("provider operation failed: " <> reason),
+          ])
+        None -> element.none()
+      },
+      add_provider_form(state),
+      ..case provider_list {
+        [] -> [
+          html.p([attr.class("muted")], [
+            html.text("No providers yet. Add one to start chatting."),
+          ]),
+        ]
+        providers -> list.map(providers, provider_row(state, _))
+      }
+    ],
+  )
 }
 
 /// The Bots section (bots plan P1): per-row inline editor, add form,
@@ -540,7 +633,7 @@ fn bots_section(
   provider_list: List(Provider),
   bot_list: List(Bot),
 ) -> Element(Msg) {
-  html.section([attr.id("bots-panel")], [
+  html.section([attr.id("bots-panel"), attr.hidden(state.tab != BotsTab)], [
     html.div([attr.class("section-head")], [
       html.h2([], [html.text("Bots")]),
       html.button(

@@ -2232,6 +2232,113 @@ pub fn settings_header_button_flips_label_test() {
   should.be_true(string.contains(open, "settings-mode"))
 }
 
+pub fn settings_tabs_render_providers_by_default_test() {
+  // The page is a left tab rail (Providers / Bots) beside the category
+  // sections. BOTH sections stay in the DOM — the inactive one carries
+  // `hidden`, mirroring the forms — so uncontrolled inputs keep typed
+  // values across tab switches. Providers is the default tab: the
+  // first-run auto-open lands there with an empty list.
+  let html =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(ui.SettingsToggled)
+    |> view_string
+  should.be_true(string.contains(html, "id=\"settings-nav\""))
+  should.be_true(string.contains(html, "id=\"tab-providers\""))
+  should.be_true(string.contains(html, "id=\"tab-bots\""))
+  // The pressed state and the `.on` class name the same tab, and the
+  // sections' visibility follows it.
+  should.be_true(string.contains(
+    html,
+    "class=\"settings-tab on\" id=\"tab-providers\"",
+  ))
+  should.be_false(string.contains(html, "hidden id=\"providers-panel\""))
+  should.be_true(string.contains(html, "hidden id=\"bots-panel\""))
+}
+
+pub fn settings_tab_switch_flips_visibility_test() {
+  let html =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(ui.SettingsToggled)
+    |> step(ui.Settings(ui_settings.TabSelected(ui_settings.BotsTab)))
+    |> view_string
+  // The sections swap visibility; both stay mounted.
+  should.be_true(string.contains(html, "hidden id=\"providers-panel\""))
+  should.be_false(string.contains(html, "hidden id=\"bots-panel\""))
+  should.be_true(string.contains(
+    html,
+    "class=\"settings-tab on\" id=\"tab-bots\"",
+  ))
+}
+
+pub fn settings_tab_switch_stands_forms_down_test() {
+  // Switching tabs stands every open form/editor/confirm down. The
+  // update rules only ever let ONE transient be active at a time (the
+  // one-form-per-page mutual exclusion), so a single setup cannot arm
+  // all six at once — the switch is exercised once from EACH state,
+  // with a precondition assert that the setup actually armed it, so a
+  // mutual-exclusion change that breaks reachability fails here
+  // instead of passing vacuously.
+  let base =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(ui.SettingsToggled)
+  let bots = ui.Settings(ui_settings.TabSelected(ui_settings.BotsTab))
+
+  let with_add = step(base, ui.Settings(ui_settings.AddToggled))
+  with_add.settings.open |> should.be_true
+  assert_settings_transients_down(step(with_add, bots))
+
+  let with_edit = step(base, ui.Settings(ui_settings.EditToggled("p1")))
+  with_edit.settings.edit |> should.equal(Some("p1"))
+  assert_settings_transients_down(step(with_edit, bots))
+
+  let with_confirm = step(base, ui.Settings(ui_settings.DeleteRequested("p1")))
+  with_confirm.settings.confirm |> should.equal(Some("p1"))
+  assert_settings_transients_down(step(with_confirm, bots))
+
+  let with_bot_add = step(base, ui.Settings(ui_settings.BotAddToggled))
+  with_bot_add.settings.bots_open |> should.be_true
+  assert_settings_transients_down(step(with_bot_add, bots))
+
+  let with_bot_edit = step(base, ui.Settings(ui_settings.BotEditToggled("b1")))
+  with_bot_edit.settings.bot_edit |> should.equal(Some("b1"))
+  assert_settings_transients_down(step(with_bot_edit, bots))
+
+  let with_bot_confirm =
+    step(base, ui.Settings(ui_settings.BotDeleteRequested("b1")))
+  with_bot_confirm.settings.bot_confirm |> should.equal(Some("b1"))
+  assert_settings_transients_down(step(with_bot_confirm, bots))
+}
+
+/// Every settings transient (both sections) is down after a tab
+/// switch, and the tab landed on Bots.
+fn assert_settings_transients_down(m: ui.Model) -> Nil {
+  m.settings.tab |> should.equal(ui_settings.BotsTab)
+  m.settings.open |> should.be_false
+  m.settings.edit |> should.be_none
+  m.settings.confirm |> should.be_none
+  m.settings.bots_open |> should.be_false
+  m.settings.bot_edit |> should.be_none
+  m.settings.bot_confirm |> should.be_none
+}
+
+pub fn settings_tab_reclick_is_noop_test() {
+  // Clicking the tab you are already on does nothing: a stray double
+  // click must not close a form you are mid-way through.
+  let model =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(ui.SettingsToggled)
+    |> step(ui.Settings(ui_settings.AddToggled))
+  let same =
+    step(model, ui.Settings(ui_settings.TabSelected(ui_settings.ProvidersTab)))
+  same.settings.tab |> should.equal(ui_settings.ProvidersTab)
+  same.settings.open |> should.be_true
+  same.settings.edit |> should.be_none
+}
+
 pub fn provider_test_button_state_machine_test() {
   let base =
     new_model() |> step(ui.ProvidersLoaded([prov("p1", "a", True, True)]))
