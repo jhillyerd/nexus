@@ -138,9 +138,22 @@ dangling DM thread in the sidebar.
   turns, so its channels could never be appended through the normal
   path; cascading keeps state honest and closes the odd edge where some
   other bot addresses a channel BY ID (the `FoundThread` path does not
-  care where the sender ran) — that now refuses as archived too. Live
-  children archive through a bounded ask; dormant ones take a store
-  write (hydration reads `archived_at`). **Restore is symmetric**:
+  care where the sender ran) — that now refuses as archived too.
+  **Persistence-first**: the authority is ONE idempotent recursive store
+  update (a CTE walking `parent_thread_id`; restore runs the same shape,
+  clearing the column). The registry must NOT inherit the memory-first
+  `SetArchived` habit — that path logs write errors and updates memory
+  anyway, so a failed write hydrates back ACTIVE after restart and the
+  child accepts deliveries again. On CTE failure the cascade aborts
+  loudly with memory untouched (both dicts still say active — a
+  consistent state; retry re-runs the idempotent update, and nothing
+  hydrates archived). On success the registry syncs memory from the
+  acknowledged outcome: dormant summaries flipped in `state.dormant`
+  (the `apply_meta` pattern, so the pane badge and `Channels` ask are
+  correct immediately), live record metas updated, and live child
+  actors notified by bounded ask so their own Send-refusal state
+  applies (a dead actor's missed notify self-corrects at hydrate — the
+  store row is what hydration reads). **Restore is symmetric**:
   unarchiving a parent unarchives its channel subtree — unambiguous
   today because channels have no individual archive affordance to
   conflict with; when individual channel archiving lands, restore
@@ -149,18 +162,22 @@ dangling DM thread in the sidebar.
 - **Channels are not individually archivable in this plan** — the
   archive affordance lives on sidebar rows, and channels are hidden
   from the sidebar. The archived-CHANNEL delivery semantics are
-  therefore the contract a future affordance builds on, and the guard
-  that holds in the cascade's propagation window: an archived channel
-  refuses deliveries from its parent to that bot DURABLY —
-  `find_channel` re-finds the archived row and `deliver_to_thread`
-  answers the existing honest receipt (`Refused("target thread is
-  archived")`, a failed tool result the sender model can report). No
-  bot-driven recovery exists BY DESIGN: unlike today's accidental
-  post-restart duplicate (the lost map silently routing around an
-  archive), a delivery must never resurrect or sidestep one. Deleting
-  a channel row frees the pair, so the next delivery creates a fresh
-  channel. The pane renders archived channels dimmed with an archive
-  badge — still navigable (reading is allowed), never hidden.
+  therefore the contract a future affordance builds on: from each
+  child's row write ONWARD, an archived channel refuses deliveries
+  from its parent to that bot DURABLY — `find_channel` re-finds the
+  archived row and `deliver_to_thread` answers the existing honest
+  receipt (`Refused("target thread is archived")`, a failed tool
+  result the sender model can report). The cascade's propagation
+  window is NOT covered by that refusal — a delivery landing before
+  the child's row is written still succeeds and commits (at-most-once,
+  the same accepted ambiguity class as the existing ask-timeout
+  receipt; the window is one CTE wide). No bot-driven recovery exists
+  BY DESIGN: unlike today's accidental post-restart duplicate (the
+  lost map silently routing around an archive), a delivery must never
+  resurrect or sidestep one. Deleting a channel row frees the pair, so
+  the next delivery creates a fresh channel. The pane renders archived
+  channels dimmed with an archive badge — still navigable (reading is
+  allowed), never hidden.
 
 ### Second-class channels: no title/tag economy
 
@@ -266,12 +283,14 @@ instruction. So:
    delivery mid-turn → `Busy`; post-restart re-derivation finds the
    existing channel (map cleared, no duplicate created); lookup error
    during re-derivation refuses (no creation); guard order unchanged
-   (refusal creates nothing); parent-archive cascades transitively down
-   the channel subtree and restore unarchives it; delivery into a
-   cascade-archived channel refuses durably (no re-derivation escape
-   hatch); parent-delete drops the whole descendant tree (direct
-   children AND grandchildren); `m3_prefix_test` golden untouched;
-   `gleam test` stays offline.
+   (refusal creates nothing); parent-archive cascades transitively
+   (store-first CTE; memory synced so the pane badge and `Channels`
+   ask are correct immediately) and restore unarchives it; a failed
+   cascade write aborts with memory untouched (nothing hydrates
+   archived after restart); delivery into a cascade-archived channel
+   refuses durably (no re-derivation escape hatch); parent-delete
+   drops the whole descendant tree (direct children AND grandchildren);
+   `m3_prefix_test` golden untouched; `gleam test` stays offline.
 
 ### Phase 2 — the thread info pane (UI + e2e)
 
