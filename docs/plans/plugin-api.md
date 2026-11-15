@@ -398,7 +398,11 @@ As built (see the deltas below the list):
 2. The ordered manifest: `thread_toolset`
    (`thread_id, seq, name, description, schema_json`; PK
    `(thread_id, seq)`, singular-table conventions, frozen columns
-   TEXT) replaced `thread.toolset text[]` (dropped idempotently).
+   TEXT) replaced `thread.toolset text[]`. The upgrade is LOSSLESS:
+   a database still carrying the old column has its name lists
+   backfilled as plain manifest entries inside one guarded `DO` block
+   before the drop (plain entry is exactly what those names were); a
+   database already migrated skips both.
    `insert_thread` writes row + manifest as ONE statement (CTE +
    `json_to_recordset`), so a half-thread cannot exist; reads aggregate
    the manifest as one json text (transport only — stored columns stay
@@ -441,10 +445,16 @@ mechanics discovered mid-build):
   so the FFI resolves slash-free commands against the inherited PATH
   (first hit wins) before spawning. Env pairs override/add to the
   inherited environment (verified live).
-- **Boot ask budget 10 s, handshakes concurrent.** A stdio server may
-  be a slow first-run `npx` download; each adapter initialiser opens
-  its handshake immediately, so serial bounded asks return fast and
-  boot waits ≈ the slowest server, not the sum. An actor's
+- **Boot asks run CONCURRENTLY and every configured server is
+  mounted.** The bounded probes run as spawned askers over one shared
+  reply subject (N unreachable servers cost one budget, not N). A
+  failed probe logs loudly but does NOT unmount: the actor is alive
+  and registered, the create-time freeze asks LIVE and refuses with
+  the honest reason, and — the point — hydration of that server's
+  frozen threads keeps working from the manifest, which is the plan's
+  own hydration-never-contacts-the-server property. A server absent
+  from CONFIG is absent from the map and refuses as unknown (the same
+  loud rule as a plugin removed from `NEXUS_PLUGINS`). An actor's
   initialiser NEVER fails the supervisor child — a spawn failure is a
   `Down` phase (a crash-looping supervisor would take boot down for
   what is an external process). Port death arrives as
@@ -454,9 +464,10 @@ mechanics discovered mid-build):
   as future work.
 - **The actor's outbound deadline IS the server's resolved per-call
   timeout** (config default or the entry's `timeout_ms` override), so
-  actor and executor give up at the same wall clock — the actor's
-  timeout answers first with the `notifications/cancelled` notice,
-  and the executor's equal-deadline timeout (or late reply) is inert.
+  actor and executor give up at the same DURATION. Their clocks start
+  at different instants, so EITHER side may time out first; both paths
+  answer honestly (the actor's carries the `notifications/cancelled`
+  notice) and the loser's reply or notice is inert.
 - **`ListTools` is ALWAYS a live round trip** — boot mount and
   create-time freeze both get the server's current catalog, and askers
   arriving mid-round-trip (or during the handshake) ride it. Pagination
@@ -485,9 +496,10 @@ mechanics discovered mid-build):
   byte-identical to the pre-MCP world; the `m3_prefix_test` golden is
   untouched.
 - **HTTP transport deferred** (the plan's "stdio first; HTTP after"):
-  the `Transport` seam is the only HTTP-shaped hole, and the config's
-  JSON array is ready to carry `url` entries. Live-server e2e
-  integration coverage ships with it.
+  the `Transport` seam is the only HTTP-shaped hole. URL entries are
+  FUTURE CONFIG-SCHEMA WORK — the current schema requires `command`
+  and validates nothing else — and live-server e2e integration
+  coverage ships with that transport when it lands.
 
 ### Phase 3 — deferred (recorded, not scheduled)
 

@@ -205,6 +205,11 @@ pub type Incoming {
 
 pub fn parse_incoming(line: String) -> Incoming {
   let classified = {
+    use version <- decode.optional_field(
+      "jsonrpc",
+      None,
+      decode.optional(decode.string),
+    )
     use id <- decode.optional_field("id", None, decode.optional(decode.dynamic))
     use method <- decode.optional_field(
       "method",
@@ -221,11 +226,16 @@ pub fn parse_incoming(line: String) -> Incoming {
       None,
       decode.optional(decode.dynamic),
     )
-    decode.success(#(id, method, res, err))
+    decode.success(#(version, id, method, res, err))
   }
   case json.parse(line, classified) {
+    // The spec requires `"jsonrpc":"2.0"` on EVERY frame; its absence
+    // means garbage stdout (a stray log line with an unlucky "id" must
+    // not complete a pending request).
     Error(_) -> Garbage
-    Ok(#(id, method, res, err)) ->
+    Ok(#(None, _, _, _, _)) -> Garbage
+    Ok(#(Some(v), _, _, _, _)) if v != "2.0" -> Garbage
+    Ok(#(_, id, method, res, err)) ->
       case method, id {
         Some(m), Some(id_dyn) -> ServerRequest(id_dyn, m)
         Some(m), None -> ServerNotification(m)
@@ -290,12 +300,22 @@ pub fn decode_tools_list(
   case decode.run(result, decoder) {
     Error(_) ->
       Error("tools/list result must be {tools: [...], nextCursor?: string}")
-    Ok(#(raw_tools, cursor)) ->
-      list.try_map(raw_tools, fn(raw) {
-        tool_def_decoder(raw)
-        |> result.map_error(fn(reason) { "tools/list entry: " <> reason })
-      })
-      |> result.map(fn(defs) { #(defs, cursor) })
+    Ok(#(raw_tools, cursor)) -> {
+      use defs <- result.try(
+        list.try_map(raw_tools, fn(raw) {
+          tool_def_decoder(raw)
+          |> result.map_error(fn(reason) { "tools/list entry: " <> reason })
+        }),
+      )
+      // A server advertising two schemas under one name is broken or
+      // hostile: the freeze would silently pick the first. Refuse the
+      // page loudly.
+      let names = list.map(defs, fn(def) { def.name })
+      case list.length(names) == list.length(list.unique(names)) {
+        True -> Ok(#(defs, cursor))
+        False -> Error("duplicate tool name in tools/list page")
+      }
+    }
   }
 }
 
@@ -336,6 +356,28 @@ fn tool_def_decoder(raw: Dynamic) -> Result(ToolDef, String) {
             <> " bytes",
           )
       })
+      use Nil <- result.try(
+        case
+          // Both byte forms matter: a RAW NUL cannot ride the
+          // envelope, and the canonical encoder emits the 6-character
+          // ESCAPE sequence `\u0000` — which Postgres's json→text
+          // conversion unescapes and then refuses ("\u0000 cannot be
+          // converted to text"), failing a create inside the store.
+          // Refuse both here, at the boundary.
+          string.contains(canonical, "\u{0000}")
+          || string.contains(canonical, "\\u0000")
+          || string.contains(description, "\u{0000}")
+        {
+          True ->
+            Error(
+              "tool '"
+              <> name
+              <> "' refused: description or schema contains a NUL byte"
+              <> " (cannot be frozen into a manifest)",
+            )
+          False -> Ok(Nil)
+        },
+      )
       Ok(ToolDef(
         name: name,
         description: truncate_description(description),
@@ -524,11 +566,15 @@ pub type Frame {
   NotUtf8
 }
 
-/// Accumulates stdin bytes and emits complete lines. The buffer
-/// carries only the incomplete tail; a tail exceeding
-/// `max_frame_bytes` is refused (`TooBig`) and DROPPED — a hostile
-/// stream of never-terminated garbage cannot grow memory without
-/// bound, and complete frames already split off were emitted first.
+/// Accumulates stdin bytes and emits complete lines. The cap is
+/// enforced WHILE READING, before any concatenation: the running
+/// buffer is split first (so complete frames already inside it are
+/// emitted), and a tail at or over `max_frame_bytes` is refused
+/// (`TooBig`) and DROPPED before the new chunk is ever appended — the
+/// live buffer therefore never exceeds the cap plus ONE inbound port
+/// chunk (whose size is the OS driver's read buffer, not ours to
+/// bound). A hostile stream of never-terminated garbage cannot grow
+/// memory without bound.
 pub opaque type Feed {
   Feed(buf: BitArray)
 }
@@ -539,26 +585,53 @@ pub fn new_feed() -> Feed {
 
 pub fn feed(f: Feed, chunk: BitArray) -> #(List(Frame), Feed) {
   let Feed(buf) = f
-  do_feed(bit_array.append(buf, chunk))
+  do_feed(buf, chunk, [])
 }
 
-fn do_feed(buf: BitArray) -> #(List(Frame), Feed) {
-  let #(lines, rest) = take_lines(buf)
-  let frames =
-    list.fold(lines, [], fn(acc, line) {
-      case bit_array.byte_size(line) > max_frame_bytes {
-        True -> [TooBig, ..acc]
-        False ->
-          case bit_array.to_string(line) {
-            Ok(s) -> [Line(s), ..acc]
-            Error(_) -> [NotUtf8, ..acc]
-          }
+fn do_feed(
+  buf: BitArray,
+  chunk: BitArray,
+  acc: List(Frame),
+) -> #(List(Frame), Feed) {
+  // Split the OLD buffer first: its complete frames were received
+  // before anything in `chunk` and must not be dropped with a refused
+  // tail.
+  let #(lines, tail) = take_lines(buf)
+  let acc = collect_lines(lines, acc)
+  case bit_array.byte_size(tail) >= max_frame_bytes {
+    True ->
+      // The running frame is over the cap: refuse it, then start the
+      // new chunk on a FRESH buffer (recursing bounds that pass the
+      // same way — the chunk's own complete lines survive, its tail is
+      // checked again).
+      case chunk {
+        <<>> -> #(list.append(list.reverse(acc), [TooBig]), Feed(<<>>))
+        _ -> do_feed(<<>>, chunk, [TooBig, ..acc])
       }
-    })
-  case bit_array.byte_size(rest) > max_frame_bytes {
-    True -> #(list.append(list.reverse(frames), [TooBig]), Feed(<<>>))
-    False -> #(list.reverse(frames), Feed(rest))
+    False -> {
+      // Safe to concatenate: tail < cap, so the sum is bounded by the
+      // cap plus one inbound chunk.
+      let #(more, rest) = take_lines(bit_array.append(tail, chunk))
+      let acc = collect_lines(more, acc)
+      case bit_array.byte_size(rest) > max_frame_bytes {
+        True -> #(list.append(list.reverse(acc), [TooBig]), Feed(<<>>))
+        False -> #(list.reverse(acc), Feed(rest))
+      }
+    }
   }
+}
+
+fn collect_lines(lines: List(BitArray), acc: List(Frame)) -> List(Frame) {
+  list.fold(lines, acc, fn(acc, line) {
+    case bit_array.byte_size(line) > max_frame_bytes {
+      True -> [TooBig, ..acc]
+      False ->
+        case bit_array.to_string(line) {
+          Ok(s) -> [Line(s), ..acc]
+          Error(_) -> [NotUtf8, ..acc]
+        }
+    }
+  })
 }
 
 @external(erlang, "nexus_mcp_ffi", "take_lines")

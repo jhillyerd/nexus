@@ -181,8 +181,15 @@ pub type StoreError =
 /// path): implementations enqueue and persist write-behind, in order.
 pub type Store {
   Store(
+    // All stored summaries plus the IDS of rows skipped as corrupt (a
+    // manifest that will not decode). The skipped ids let the registry
+    // seed its minting counter PAST them — a corrupt row's id must
+    // never be reminted (its insert would collide) — while the row
+    // itself stays skipped (loud log at the store; the thread is
+    // unreachable until the row is repaired).
     /// Every stored thread (boot hydration of the dormant set).
-    list_summaries: fn() -> Result(List(StoredSummary), StoreError),
+    list_summaries: fn() ->
+      Result(#(List(StoredSummary), List(String)), StoreError),
     /// One stored thread incl. system prompt. `Error` for unknown ids.
     get_thread: fn(String) -> Result(StoredThread, StoreError),
     /// All rows of one thread in seq order (lazy start / restart

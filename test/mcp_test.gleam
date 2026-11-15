@@ -16,7 +16,6 @@ import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{None, Some}
-import gleam/otp/actor
 import gleam/otp/factory_supervisor
 import gleam/result
 import gleam/string
@@ -332,10 +331,9 @@ pub fn decode_call_result_flattens_content_test() {
 pub fn feed_splits_frames_across_chunks_test() {
   let feed = mcp.new_feed()
   // One chunk mid-frame, the rest in the next.
-  let assert #(frames1, feed2) =
-    mcp.feed(feed, bit_array_from("{\"a\":1}\n{\"b\":"))
+  let #(frames1, feed2) = mcp.feed(feed, bit_array_from("{\"a\":1}\n{\"b\":"))
   frames1 |> should.equal([mcp.Line("{\"a\":1}")])
-  let assert #(frames2, _) = mcp.feed(feed2, bit_array_from("2}\n"))
+  let #(frames2, _) = mcp.feed(feed2, bit_array_from("2}\n"))
   frames2 |> should.equal([mcp.Line("{\"b\":2}")])
 }
 
@@ -346,11 +344,11 @@ fn bit_array_from(s: String) -> BitArray {
 pub fn feed_refuses_oversized_tail_test() {
   let feed = mcp.new_feed()
   let big = string.repeat("x", mcp.max_frame_bytes + 1)
-  let assert #(frames, feed2) = mcp.feed(feed, bit_array_from(big <> "\n"))
+  let #(frames, feed2) = mcp.feed(feed, bit_array_from(big <> "\n"))
   frames |> should.equal([mcp.TooBig])
   // The hostile tail was DROPPED, not accumulated: the next frame is
   // readable.
-  let assert #(frames2, _) = mcp.feed(feed2, bit_array_from("ok\n"))
+  let #(frames2, _) = mcp.feed(feed2, bit_array_from("ok\n"))
   frames2 |> should.equal([mcp.Line("ok")])
 }
 
@@ -676,33 +674,6 @@ fn test_config() -> Config {
   cfg
 }
 
-/// Boot the fake adapter AND a real registry that mounts it, over the
-/// mock store. Returns everything a freeze test needs.
-fn boot_registry_with_fake_server() -> #(Fake, store.Store) {
-  let fake = start_fake("registry", 30_000)
-  complete_handshake(fake)
-  let persistence = store_mock.seam(store_mock.start())
-  store_mock.ensure_fixture_provider(persistence)
-  let factory_name = process.new_name("nexus_mcp_factory")
-  let assert Ok(_factory) =
-    factory_supervisor.start(thread_registry.factory_builder(factory_name))
-  let assert Ok(_registry) =
-    thread_registry.start(
-      test_config(),
-      factory_supervisor.get_by_name(factory_name),
-      process.new_name("nexus_mcp_registry"),
-      persistence,
-      fixture_resolver,
-      process.new_name("nexus_mcp_bots"),
-      dict.new(),
-      // The mount: server name → the fake adapter's minted name.
-      dict.from_list([
-        #("fakesrv", tools.ForeignServer(name: fake.name, timeout_ms: 30_000)),
-      ]),
-    )
-  #(fake, persistence)
-}
-
 pub fn create_freezes_live_schema_into_manifest_test() {
   let fake = start_fake("freeze", 30_000)
   complete_handshake(fake)
@@ -895,4 +866,147 @@ pub fn corrupt_plain_manifest_entry_refuses_test() {
       tools.ToolsetEntry("http_fetch", "x", Some("{}")),
     ])
   should.be_true(string.contains(reason, "corrupt"))
+}
+
+// ---------------------------------------------------------------------------
+// Review-hardening pins (cubic round, PR #124)
+// ---------------------------------------------------------------------------
+
+pub fn feed_refuses_oversized_accumulation_before_concat_test() {
+  // A partial frame left in the buffer, then a chunk big enough to
+  // blow the cap: the accumulated frame is refused (TooBig) WITHOUT
+  // the oversized tail ever becoming the new buffer, and the chunk's
+  // own trailing line still parses.
+  let #(frames1, feed2) = mcp.feed(mcp.new_feed(), bit_array_from("partial-"))
+  frames1 |> should.equal([])
+  let big = string.repeat("x", mcp.max_frame_bytes + 1)
+  let assert #(frames2, _) = mcp.feed(feed2, bit_array_from(big <> "\nok\n"))
+  frames2 |> should.equal([mcp.TooBig, mcp.Line("ok")])
+}
+
+pub fn parse_incoming_requires_jsonrpc_version_test() {
+  // A stray log line with an unlucky "id" must not complete a pending
+  // request: the spec's "jsonrpc":"2.0" is REQUIRED on every frame.
+  let assert mcp.Garbage =
+    mcp.parse_incoming("{\"id\":2,\"result\":{\"tools\":[]}}")
+  let assert mcp.Garbage =
+    mcp.parse_incoming("{\"jsonrpc\":\"1.0\",\"id\":2,\"result\":{}}")
+}
+
+pub fn decode_tools_list_refuses_duplicate_names_test() {
+  let assert Ok(result) =
+    json.parse(
+      "{\"tools\":[{\"name\":\"t\",\"inputSchema\":{\"type\":\"object\"}},"
+        <> "{\"name\":\"t\",\"inputSchema\":{\"type\":\"object\"}}]}",
+      decode.dynamic,
+    )
+  let assert Error(reason) = mcp.decode_tools_list(result)
+  should.be_true(string.contains(reason, "duplicate"))
+}
+
+pub fn decode_tools_list_refuses_nul_bytes_test() {
+  // Postgres TEXT cannot carry NUL: a hostile description must refuse
+  // at the MCP boundary, not fail a create inside the store.
+  let assert Ok(result) =
+    json.parse(
+      "{\"tools\":[{\"name\":\"t\",\"description\":\"a\\u0000b\","
+        <> "\"inputSchema\":{\"type\":\"object\"}}]}",
+      decode.dynamic,
+    )
+  let assert Error(reason) = mcp.decode_tools_list(result)
+  should.be_true(string.contains(reason, "NUL"))
+
+  let assert Ok(result2) =
+    json.parse(
+      "{\"tools\":[{\"name\":\"t\",\"description\":\"ok\","
+        <> "\"inputSchema\":{\"type\":\"object\",\"x\":\"\\u0000\"}}]}",
+      decode.dynamic,
+    )
+  let assert Error(reason2) = mcp.decode_tools_list(result2)
+  should.be_true(string.contains(reason2, "NUL"))
+}
+
+pub fn split_refuses_malformed_qualified_names_test() {
+  // Never produced by `qualified` — both halves must be valid names.
+  tool_provider.split("foo__bar__baz") |> should.equal(Error(Nil))
+  tool_provider.split("foo__bar.") |> should.equal(Error(Nil))
+  let assert Ok(#("foo", "bar")) = tool_provider.split("foo__bar")
+}
+
+pub fn tools_list_pagination_cap_fails_loudly_test() {
+  let fake = start_fake("cap", 30_000)
+  complete_handshake(fake)
+  let reply = ask_list_tools(fake, 30_000)
+  serve_paginated_pages(fake, 9)
+  // A catalog still carrying a cursor at the page cap FAILS the ask —
+  // never a silent truncation.
+  let assert Ok(Error(reason)) = process.receive(reply, 5000)
+  should.be_true(string.contains(reason, "exceeds"))
+}
+
+fn serve_paginated_pages(fake: Fake, pages: Int) -> Nil {
+  case pages {
+    0 -> Nil
+    n -> {
+      let assert Ok(frame) = process.receive(fake.to_server, 5000)
+      let id = extract_int_field_unsafe(frame, "id")
+      let cursor = case n {
+        1 -> "final-cursor-at-cap"
+        _ -> "page-" <> int.to_string(n)
+      }
+      server_says(
+        fake,
+        "{\"jsonrpc\":\"2.0\",\"id\":"
+          <> int.to_string(id)
+          <> ",\"result\":{\"tools\":[{\"name\":\"p"
+          <> int.to_string(n)
+          <> "\",\"inputSchema\":{\"type\":\"object\"}}],"
+          <> "\"nextCursor\":\""
+          <> cursor
+          <> "\"}}",
+      )
+      serve_paginated_pages(fake, n - 1)
+    }
+  }
+}
+
+pub fn corrupt_row_ids_are_not_reminted_test() {
+  // A store row skipped for a corrupt manifest must still protect its
+  // id: the registry's minting counter seeds PAST the skip list, so a
+  // fresh create can never collide with the corrupt row on insert.
+  let persistence = store_mock.seam(store_mock.start())
+  store_mock.ensure_fixture_provider(persistence)
+  let factory_name = process.new_name("nexus_corrupt_factory")
+  let assert Ok(_factory) =
+    factory_supervisor.start(thread_registry.factory_builder(factory_name))
+  let seam =
+    store.Store(..persistence, list_summaries: fn() { Ok(#([], ["s5"])) })
+  let assert Ok(started) =
+    thread_registry.start(
+      test_config(),
+      factory_supervisor.get_by_name(factory_name),
+      process.new_name("nexus_corrupt_registry"),
+      seam,
+      fixture_resolver,
+      process.new_name("nexus_corrupt_bots"),
+      dict.new(),
+      dict.new(),
+    )
+  let reply = process.new_subject()
+  process.send(
+    started.data,
+    thread_registry.Create(
+      thread_registry.NewThread(
+        provider_id: store_mock.fixture_provider_id,
+        model: "alpha",
+        system_prompt: None,
+        toolset: None,
+        bot_id: None,
+      ),
+      reply,
+    ),
+  )
+  let assert Ok(Ok(summary)) = process.receive(reply, 5000)
+  // No s5 remint: the counter jumped past the skipped id.
+  should.be_true(summary.id != "s5")
 }

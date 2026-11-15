@@ -121,10 +121,19 @@ pub fn qualified(provider: String, tool: String) -> String {
 /// Split a qualified wire name back into its halves — the provider
 /// (MCP server / plugin) and the unqualified tool — at the FIRST `__`.
 /// Valid halves contain no `__`, so the reserved separator splits
-/// unambiguously; a name without one was never qualified (a compiled
-/// name) and refuses.
+/// unambiguously — and BOTH halves must pass `valid_name`: a name like
+/// `foo__bar__baz` was never produced by `qualified` and refuses, so a
+/// malformed name cannot ride the foreign path (bot validation would
+/// otherwise pin it and only fail later at create).
 pub fn split(qualified: String) -> Result(#(String, String), Nil) {
-  string.split_once(qualified, "__")
+  case string.split_once(qualified, "__") {
+    Ok(#(provider, tool)) ->
+      case valid_name(provider) && valid_name(tool) {
+        True -> Ok(#(provider, tool))
+        False -> Error(Nil)
+      }
+    Error(Nil) -> Error(Nil)
+  }
 }
 
 /// A provider or tool half-name is admissible when it is non-empty,

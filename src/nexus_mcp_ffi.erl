@@ -27,6 +27,8 @@
 
 -export([open_port/3, send_line/2, take_lines/1]).
 
+-include_lib("kernel/include/file.hrl").
+
 open_port(Command, Args, Env) ->
     try
         Port =
@@ -61,13 +63,25 @@ resolve_command(Cmd) ->
             Dirs = string:split(Path, ":", all),
             Hit =
                 lists:search(
-                    fun(D) -> filelib:is_file(filename:join(D, Cmd)) end,
+                    fun(D) -> executable(filename:join(D, Cmd)) end,
                     Dirs
                 ),
             case Hit of
                 {value, D} -> filename:join(D, Cmd);
                 false -> Cmd
             end
+    end.
+
+%% A PATH hit must be a REGULAR FILE with at least one execute bit set —
+%% filelib:is_file/1 also matches directories and non-executable files,
+%% and either would shadow a valid command later in the PATH.
+executable(F) ->
+    case file:read_file_info(F) of
+        {ok, Info} ->
+            Info#file_info.type =:= regular
+            andalso (Info#file_info.mode band 8#111) =/= 0;
+        _ ->
+            false
     end.
 
 send_line(Port, Line) ->

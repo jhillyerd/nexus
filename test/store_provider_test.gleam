@@ -230,7 +230,7 @@ pub fn thread_pin_and_delete_guard_test() {
   let assert Ok(Nil) = seam.insert_thread(summary("s1", "p1"), "sys")
   let assert Ok(count) = seam.count_threads_for_provider("p1")
   count |> should.equal(1)
-  let assert Ok([stored]) = seam.list_summaries()
+  let assert Ok(#([stored], [])) = seam.list_summaries()
   stored.provider_id |> should.equal("p1")
 
   // Referenced providers cannot be deleted (the FK's RESTRICT is the
@@ -248,5 +248,5 @@ pub fn insert_thread_with_unknown_provider_fails_test() {
   let seam = store_mock.seam(store_mock.start())
   // thread_provider_id_fkey: no provider row, no thread row.
   seam.insert_thread(summary("s1", "ghost"), "sys") |> should.be_error
-  seam.list_summaries() |> should.equal(Ok([]))
+  seam.list_summaries() |> should.equal(Ok(#([], [])))
 }

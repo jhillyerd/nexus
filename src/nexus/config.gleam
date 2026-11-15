@@ -405,15 +405,22 @@ fn validate_mcp_servers(
         )
       _ -> Ok(Nil)
     })
-    use Nil <- result.try(case list.any(server.env, fn(pair) { pair.0 == "" }) {
-      True ->
-        Error(
-          "NEXUS_MCP_SERVERS_JSON: server '"
-          <> server.name
-          <> "': env keys must be non-empty",
-        )
-      False -> Ok(Nil)
-    })
+    use Nil <- result.try(
+      case
+        list.any(server.env, fn(pair) {
+          pair.0 == "" || string.contains(pair.0, "=")
+        })
+      {
+        True ->
+          Error(
+            "NEXUS_MCP_SERVERS_JSON: server '"
+            <> server.name
+            <> "': env keys must be non-empty and contain no '='"
+            <> " (they are OS environment names)",
+          )
+        False -> Ok(Nil)
+      },
+    )
     use Nil <- result.try(case server.timeout_ms {
       Some(ms) if ms >= plugin_timeout_floor_ms -> Ok(Nil)
       Some(_) ->

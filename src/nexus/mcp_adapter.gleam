@@ -128,9 +128,10 @@ type State {
     by_ref: Dict(reference.Reference, Int),
     /// The server's per-call wall-clock deadline (config default or
     /// the server's override) — reused as the actor-side outbound
-    /// deadline, so both sides of a call give up at the same wall
-    /// clock and the actor's timeout answers first (with the cancelled
-    /// notice), never double-failing through the executor's clock.
+    /// deadline, so both sides of a call give up at the same DURATION.
+    /// The clocks start at different instants, so EITHER side may time
+    /// out first; both paths answer honestly (the actor's carries the
+    /// cancelled notice) and the loser's reply or notice is inert.
     deadline_ms: Int,
   )
 }
@@ -489,6 +490,15 @@ fn finish_list(
   let acc = list.append(acc, defs)
   let more_pages = pages + 1 < max_list_pages
   case cursor, more_pages {
+    // The cap is not a truncation point: a catalog still carrying a
+    // cursor at 10 pages FAILS the ask — boot and create must never
+    // silently omit tools.
+    Some(_cursor), False ->
+      fail_list(
+        state,
+        askers,
+        "catalog exceeds " <> int.to_string(max_list_pages) <> " pages",
+      )
     Some(cursor), True -> {
       let next_id = state.out
       let _ = send_frame(state, mcp.tools_list_request(next_id, Some(cursor)))
@@ -614,9 +624,11 @@ fn request_timeout(state: State, id: Int) -> State {
     _ ->
       case dict.get(state.calls, id) {
         Ok(pending) -> {
-          // The actor-side deadline: answer the caller honestly (its
-          // own deadline equals this one — first timeout wins, the
-          // loser's reply is inert), and tell the server to stop.
+          // The actor-side deadline: answer the caller honestly. The
+          // executor's deadline has the same duration but a different
+          // start instant, so either side may fire first — the loser's
+          // reply or cancelled notice is inert either way. Tell the
+          // server to stop.
           process.send(
             pending.reply,
             tool_provider.ToolErr(
@@ -708,12 +720,21 @@ fn send_frame(state: State, frame: String) -> Result(Nil, String) {
 /// 1. `NEXUS_MCP_SERVERS_JSON` empty (the default) → no tree, empty
 ///    map — the pre-MCP boot, byte for byte.
 /// 2. Otherwise start the OneForOne `mcp_sup` (linked to the caller),
-///    then ask every adapter `ListTools` under the bounded budget. An
-///    adapter that will not answer DEGRADES: loud log, absent from the
-///    foreign map, creates naming its tools refuse with the honest
-///    400. The map is ONE value shared by the bot registry's
-///    validation and the thread registry's freeze — the same
-///    threading rule as the plugin table.
+///    then ask every adapter `ListTools` CONCURRENTLY (spawned askers,
+///    one shared reply subject — N unreachable servers cost one
+///    budget, not N) under the bounded per-ask budget. Every
+///    CONFIGURED server is mounted into the foreign map: the actor is
+///    alive and registered even when its probe failed — the boot probe
+///    is operational readiness, not admission. A failed probe logs
+///    loudly; that server's create-time freeze asks LIVE and refuses
+///    with the honest reason, while hydration of frozen threads keeps
+///    working from the manifest (the plan's
+///    hydration-never-contacts-the-server property). A server absent
+///    from CONFIG is absent from the map — its names refuse as
+///    unknown, the same loud rule as a plugin removed from
+///    `NEXUS_PLUGINS`. The map is ONE value shared by the bot
+///    registry's validation and the thread registry's freeze — the
+///    same threading rule as the plugin table.
 pub fn boot(
   cfg: Config,
 ) -> Result(List(#(String, tools.ForeignServer)), String) {
@@ -751,29 +772,84 @@ pub fn boot(
         supervisor.start(sup)
         |> result.replace_error("mcp_sup failed to start"),
       )
-      let mounted =
-        list.fold(entries, [], fn(acc, e) {
-          let #(s, name) = e
-          case tool_provider.list_tools(name, boot_ask_ms) {
-            Error(reason) -> {
-              io.println(
-                "mcp server '" <> s.name <> "' degraded (unmounted): " <> reason,
-              )
-              acc
-            }
-            Ok(_defs) -> [
-              #(
-                s.name,
-                tools.ForeignServer(
-                  name: name,
-                  timeout_ms: option.unwrap(s.timeout_ms, cfg.plugin_timeout_ms),
-                ),
-              ),
-              ..acc
-            ]
-          }
+      // Concurrent bounded probes: one spawned asker per server, one
+      // shared reply subject OWNED by this process (sending to it is
+      // legal from anywhere; the receive is local). Each asker
+      // self-bounds at the budget, so all results land by ~budget +
+      // slack; the collection deadline below only guards a wedged
+      // asker.
+      let reply = process.new_subject()
+      list.each(entries, fn(e) {
+        let #(s, name) = e
+        process.spawn_unlinked(fn() {
+          let outcome = tool_provider.list_tools(name, boot_ask_ms)
+          process.send(reply, #(s.name, outcome))
         })
-      Ok(list.reverse(mounted))
+      })
+      use outcomes <- result.try(collect_outcomes(
+        reply,
+        list.length(entries),
+        boot_ask_ms + 2000,
+        dict.new(),
+      ))
+      Ok(
+        list.map(entries, fn(e) {
+          let #(s, name) = e
+          case dict.get(outcomes, s.name) {
+            Ok(Ok(_defs)) -> Nil
+            _ ->
+              // Probe failed: LOUD, but the server stays mounted —
+              // hydration of its frozen threads must not depend on it
+              // being reachable at boot; the freeze re-asks live.
+              io.println(
+                "mcp server '"
+                <> s.name
+                <> "' degraded (catalog probe failed; frozen threads"
+                <> " still hydrate, creates re-ask live): "
+                <> case dict.get(outcomes, s.name) {
+                  Ok(Error(reason)) -> reason
+                  _ -> "no probe reply within the boot budget"
+                },
+              )
+          }
+          #(
+            s.name,
+            tools.ForeignServer(
+              name: name,
+              timeout_ms: option.unwrap(s.timeout_ms, cfg.plugin_timeout_ms),
+            ),
+          )
+        }),
+      )
     }
+  }
+}
+
+/// Collect up to `remaining` probe results off the shared subject,
+/// within the overall deadline. A result that never arrives maps to
+/// `Error("no probe reply within the boot budget")` for that server —
+/// logged loudly by the caller, never a hang.
+fn collect_outcomes(
+  reply: Subject(#(String, Result(List(ToolDef), String))),
+  remaining: Int,
+  deadline_ms: Int,
+  acc: Dict(String, Result(List(ToolDef), String)),
+) -> Result(Dict(String, Result(List(ToolDef), String)), String) {
+  case remaining {
+    0 -> Ok(acc)
+    _ ->
+      case process.receive(reply, deadline_ms) {
+        Ok(#(server, outcome)) ->
+          collect_outcomes(
+            reply,
+            remaining - 1,
+            deadline_ms,
+            dict.insert(acc, server, outcome),
+          )
+        // Deadline spent: whatever is missing stays missing (its asker
+        // is wedged — bounded above by the per-ask budget, so this is
+        // belt-and-braces).
+        Error(Nil) -> Ok(acc)
+      }
   }
 }

@@ -134,6 +134,8 @@ what is tied to what**.
 | plugin_sup (`nexus/plugin`) | y (supervisor) | 0..1 per VM — only when `NEXUS_PLUGINS` is set | boot → shutdown | separate OneForOne tree **linked to boot main** (not a root child): one crash-looping plugin exhausts it and takes boot down |
 | plugin provider actor (`nexus/plugin` SDK) | y | one per configured plugin | boot → shutdown (supervised) | one plugin's tools; registered under `nexus_plugin_<name>`, addressed by name; restart re-registers |
 | plugin tool worker (`nexus/plugin`) | n | 0..N per provider | one tool call | one tool call; **unlinked** + monitored by the provider actor (crash answers `plugin tool crashed`) |
+| mcp_sup (`nexus/mcp_adapter`) | y (supervisor) | 0..1 per VM — only when `NEXUS_MCP_SERVERS_JSON` is set | boot → shutdown | separate OneForOne tree **linked to boot main**; adapters never crash — a server that will not spawn/answer DEGRADES (loud log; hydration of its frozen threads still works, creates re-ask live) |
+| MCP adapter actor (`nexus/mcp_adapter`) | y | one per configured server | boot → shutdown (supervised) | one stdio server's tools; registered under `nexus_plugin_<name>`, addressed by name; owns the server's BEAM port; `Down` phase on child exit, retry = nexus restart |
 | provider registry (`nexus/provider_registry`) | y | 1 per VM | boot → shutdown | shared; owns provider rows + plaintext keys |
 | bot registry (`nexus/bot_registry`) | y | 1 per VM | boot → shutdown | shared; owns bot rows (no secrets — the stored row is the public shape) |
 | thread registry (`nexus/thread_registry`) | y | 1 per VM | boot → shutdown | shared; owns thread IDs → live subjects |
@@ -162,9 +164,11 @@ Notes on the "ties":
   model call is a fresh HTTP + SSE exchange. What is frozen per *thread*
   is the resolved `openai.Endpoint` (provider base URL + key + timeouts,
   pinned at create/hydration) and the tool schema set (the
-  creation-time `thread.toolset` snapshot, resolved per toolset into
-  cached runner bundles — bots plan P2; the default snapshot shares the
-  boot-built bundle). Both freezes serve the KV-cache contract.
+  creation-time `thread_toolset` manifest — plain names or frozen
+  foreign schemas — resolved per toolset into cached runner bundles —
+  bots plan P2, manifest per plugin-api Phase 2; the default snapshot
+  shares the boot-built bundle). Both freezes serve the KV-cache
+  contract.
 - **Browser connection** ties: exactly one UI runtime per `/ws` socket.
   Nothing UI-side is shared between connections; threads themselves are
   server-global, so every tab sees the same sidebar.
@@ -193,11 +197,13 @@ flowchart TB
     tw["turn worker"]
     uw["utility worker"]
     eng["codemode engine<br/>+ task children"]
+    mcp["MCP adapter actor(s)<br/>(1 per configured server)"]
     store["store actor"]
     pg[("Postgres")]
     llm["OpenAI-compatible provider"]
     searx["SearxNG"]
     web["any web host (SSRF-guarded)"]
+    mcpio[("MCP stdio server<br/>(child process)")]
 
     js <-- "WebSocket /ws" --> ws
     ws --- rt
@@ -216,6 +222,8 @@ flowchart TB
     tw -->|"tool exec"| eng
     tw -->|"tool exec"| web
     tw -->|"tool exec"| searx
+    tw -->|"tool exec<br/>(provider protocol,<br/>by name)"| mcp
+    mcp -->|"JSON-RPC over stdio<br/>(newline-delimited)"| mcpio
     sa -.->|"commit_hook<br/>(write-behind Commit)"| store
     reg -->|"sync reads + metadata"| store
     prov -->|"boot load + CRUD"| store
@@ -462,7 +470,7 @@ utility-attempt bookkeeping.
 
 | Frozen thing | Scope | Why |
 |---|---|---|
-| Tool schemas + `tool_choice` envelope | per thread (the creation-time `thread.toolset` snapshot, resolved into bundles cached per toolset; the default snapshot shares the boot-built bundle) | the envelope never varies mid-thread, so prefixes stay cacheable; threads of one toolset still share their tools head |
+| Tool schemas + `tool_choice` envelope | per thread (the creation-time `thread_toolset` manifest, resolved into bundles cached per entry tuple; the default snapshot shares the boot-built bundle) | the envelope never varies mid-thread, so prefixes stay cacheable; threads of one toolset still share their tools head |
 | `openai.Endpoint` (base URL, key, timeouts) + model | per thread, pinned at create/hydration | a thread only ever exists with its (provider, model) pin in place |
 | System prompt | per thread (refrozen from `thread.system_prompt` on hydration) | part of the immutable prefix |
 | Request bytes | per prefix — immutable forever (`nexus/transcript.to_request` is the only encode path) | the KV-cache contract |

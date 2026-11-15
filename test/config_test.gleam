@@ -31,6 +31,7 @@ fn set_all(pairs: List(#(String, String))) -> Nil {
   envoy.unset("NEXUS_PLUGINS")
   envoy.unset("NEXUS_PLUGIN_TIMEOUT_MS")
   envoy.unset("NEXUS_PLUGIN_MAX_OUTPUT_CHARS")
+  envoy.unset("NEXUS_MCP_SERVERS_JSON")
   list.each(pairs, fn(pair) { envoy.set(pair.0, pair.1) })
 }
 
@@ -382,6 +383,18 @@ pub fn mcp_servers_rejects_empty_command_test() {
   ])
   let assert Error(message) = config.load()
   should.be_true(string.contains(message, "command"))
+}
+
+pub fn mcp_servers_rejects_env_key_with_equals_test() {
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #(
+      "NEXUS_MCP_SERVERS_JSON",
+      "[{\"name\":\"a\",\"command\":\"x\",\"env\":{\"A=B\":\"v\"}}]",
+    ),
+  ])
+  let assert Error(message) = config.load()
+  should.be_true(string.contains(message, "'='"))
 }
 
 pub fn mcp_servers_rejects_low_timeout_test() {

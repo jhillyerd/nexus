@@ -451,7 +451,7 @@ pub fn start_with_toolset(
       case persistence.list_summaries() {
         Error(error) ->
           Error("thread store unreachable, cannot hydrate: " <> error)
-        Ok(summaries) -> {
+        Ok(#(summaries, corrupt_ids)) -> {
           let dormant =
             list.fold(summaries, dict.new(), fn(dormant, summary) {
               dict.insert(dormant, summary.id, summary)
@@ -474,8 +474,15 @@ pub fn start_with_toolset(
             // collide — but minted ids stay monotonically increasing
             // across sweeps anyway (a deleted s5 must not come back as
             // a different thread).
+            // Seeded past the survivors AND the corrupt ids AND the
+            // pruned ids: a corrupt row is skipped from hydration but
+            // its id must never be reminted (the insert would
+            // collide).
             counter: int.max(
-              max_stored_counter(summaries),
+              max_stored_counter(list.append(
+                summaries,
+                list.map(corrupt_ids, fn(id) { stored_summary_with_id(id) }),
+              )),
               max_id_suffix(pruned),
             ),
             store: persistence,
@@ -504,6 +511,31 @@ pub fn start_with_toolset(
 
 /// The highest numeric suffix among stored `s<N>` ids, so freshly minted
 /// ids never collide with dormant (stored-but-not-live) threads.
+/// A minimal summary shell for a SKIPPED row's id — only `id` is read
+/// by `max_stored_counter`; the placeholder fields exist to satisfy the
+/// record.
+fn stored_summary_with_id(id: String) -> StoredSummary {
+  store.StoredSummary(
+    id: id,
+    provider_id: "",
+    model: "",
+    meta: thread.ThreadMeta(
+      title: "",
+      title_source: thread.AutoTitle,
+      pinned: False,
+      tags: [],
+      tags_manual: [],
+      tags_source: thread.AutoTags,
+      archived: False,
+      bot_id: None,
+      created_at: 0,
+    ),
+    toolset: [],
+    last_active_at: 0,
+    message_count: 0,
+  )
+}
+
 fn max_stored_counter(summaries: List(StoredSummary)) -> Int {
   max_id_suffix(list.map(summaries, fn(summary) { summary.id }))
 }
@@ -657,18 +689,53 @@ pub fn plain_entries(names: List(String)) -> List(tools.ToolsetEntry) {
 
 /// The CREATE-time freeze (plugin-api plan Phase 2): requested NAMES →
 /// manifest ENTRIES. Plain names (compiled ∪ provider table) pass
-/// through as bare entries; a FOREIGN name (`<server>__<tool>` whose
-/// server half is mounted) is asked LIVE — `ListTools` through the
-/// adapter under the bounded freeze budget — and its def validated and
-/// frozen (canonical schema text + description). This is the ONE place
-/// a server's current catalog is captured; hydration replays the
-/// result without ever contacting the server. Unknown names and
-/// unmounted servers fail loudly (the honest 400 at create).
+/// through as bare entries; FOREIGN names (`<server>__<tool>` whose
+/// server half is mounted) are grouped BY SERVER and answered with ONE
+/// live `ListTools` ask per distinct server — the registry actor
+/// blocks on these, so a ten-tool toolset on one server must cost one
+/// round trip, not ten — under the bounded freeze budget. Each def is
+/// validated and frozen (canonical schema text + description). This is
+/// the ONE place a server's current catalog is captured; hydration
+/// replays the result without ever contacting the server. Unknown
+/// names and unavailable servers fail loudly (the honest 400 at
+/// create).
 fn freeze_entries(
   state: State,
   names: List(String),
 ) -> Result(List(tools.ToolsetEntry), String) {
-  list.try_map(list.unique(names), fn(name) {
+  let names = list.unique(names)
+  // One bounded live ask per DISTINCT server (a wedged server stalls
+  // this create — bounded at `freeze_ask_ms` — but never N budgets for
+  // N tools).
+  use catalogs <- result.try(
+    names
+    |> list.filter_map(fn(name) {
+      case tools.is_compiled_name(name) || dict.has_key(state.providers, name) {
+        True -> Error(Nil)
+        False ->
+          // Only MOUNTED servers get an ask — an unmounted server's
+          // names refuse in the build pass below ("not available").
+          case tool_provider.split(name) {
+            Ok(#(server, _tool)) ->
+              case dict.has_key(state.foreign, server) {
+                True -> Ok(server)
+                False -> Error(Nil)
+              }
+            Error(Nil) -> Error(Nil)
+          }
+      }
+    })
+    |> list.unique
+    |> list.try_fold(dict.new(), fn(acc, server) {
+      let assert Ok(mount) = dict.get(state.foreign, server)
+      case tool_provider.list_tools(mount.name, tools.freeze_ask_ms) {
+        Error(reason) ->
+          Error("mcp server '" <> server <> "' is unavailable: " <> reason)
+        Ok(defs) -> Ok(dict.insert(acc, server, defs))
+      }
+    }),
+  )
+  list.try_map(names, fn(name) {
     case tools.is_compiled_name(name) || dict.has_key(state.providers, name) {
       True ->
         Ok(tools.ToolsetEntry(name: name, description: "", schema_json: None))
@@ -679,12 +746,13 @@ fn freeze_entries(
             case dict.get(state.foreign, server) {
               Error(Nil) ->
                 Error("mcp server '" <> server <> "' is not available")
-              Ok(mount) ->
-                case tool_provider.list_tools(mount.name, tools.freeze_ask_ms) {
-                  Error(reason) ->
-                    Error(
-                      "mcp server '" <> server <> "' is unavailable: " <> reason,
-                    )
+              Ok(_mount) ->
+                case dict.get(catalogs, server) {
+                  // The catalog above was fetched for every mounted
+                  // server (an ask failure already refused); this arm
+                  // keeps the lookup total.
+                  Error(Nil) ->
+                    Error("mcp server '" <> server <> "' is not available")
                   Ok(defs) ->
                     case list.find(defs, fn(def) { def.name == tool }) {
                       Error(Nil) ->

@@ -42,7 +42,9 @@ import nexus/transcript.{type Transcript}
 import pog
 
 pub type Msg {
-  ListSummaries(reply: Subject(Result(List(store.StoredSummary), String)))
+  ListSummaries(
+    reply: Subject(Result(#(List(store.StoredSummary), List(String)), String)),
+  )
   GetThread(id: String, reply: Subject(Result(store.StoredThread, String)))
   LoadMessages(
     id: String,
@@ -296,17 +298,25 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           // A corrupt manifest skips its row (loud log): one bad row
           // must neither brick boot (this list feeds hydration) nor
           // silently narrow that thread — the thread simply fails to
-          // rehydrate later, with the corruption already logged.
+          // rehydrate later, with the corruption already logged. Its
+          // ID rides back separately so the registry's minting counter
+          // still seeds PAST it (a reminted id would collide on
+          // insert).
           returned.rows
-          |> list.filter_map(fn(row) {
+          |> list.fold(#([], []), fn(acc, row) {
+            let #(summaries, skipped) = acc
             case stored_summary_from_row(row) {
-              Ok(summary) -> Ok(summary)
+              Ok(summary) -> #([summary, ..summaries], skipped)
               Error(e) -> {
                 io.println("store: skipping corrupt thread row: " <> e)
-                Error(Nil)
+                #(summaries, [row.id, ..skipped])
               }
             }
           })
+          |> fn(pair) {
+            let #(summaries, skipped) = pair
+            #(list.reverse(summaries), list.reverse(skipped))
+          }
         })
         |> result.map_error(query_error)
       process.send(reply, result)

@@ -135,8 +135,25 @@ CREATE TABLE IF NOT EXISTS thread_toolset (
 );
 
 -- The old plain-name column, superseded by thread_toolset above
--- (plugin-api plan Phase 2). IF EXISTS keeps the migration idempotent.
-ALTER TABLE thread DROP COLUMN IF EXISTS toolset;
+-- (plugin-api plan Phase 2). The upgrade is LOSSLESS for existing rows:
+-- a database carrying the old column first backfills its name lists as
+-- plain manifest entries (schemas lived in code for those names —
+-- exactly what a plain entry means), then drops the column; a database
+-- already on the new schema skips both. One statement so the gate stays
+-- atomic, and idempotent under `IF EXISTS`/`EXISTS` guards.
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'thread' AND column_name = 'toolset'
+  ) THEN
+    INSERT INTO thread_toolset (thread_id, seq, name, description, schema_json)
+    SELECT t.id, u.idx - 1, u.name, '', NULL
+    FROM thread t, unnest(t.toolset) WITH ORDINALITY AS u(name, idx)
+    ON CONFLICT (thread_id, seq) DO NOTHING;
+    ALTER TABLE thread DROP COLUMN toolset;
+  END IF;
+END $$;
 
 CREATE INDEX IF NOT EXISTS thread_recency ON thread (archived_at, last_active_at DESC);
 CREATE INDEX IF NOT EXISTS thread_tags ON thread USING gin (tags);
