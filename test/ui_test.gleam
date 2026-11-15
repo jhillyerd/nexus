@@ -1538,6 +1538,9 @@ pub fn view_bot_message_renders_markdown_safely_test() {
     new_model()
     |> step(ui.UserEcho("**bold**", None, None))
     |> view_string
+  // The verbatim bytes survive untouched (a dropped or altered human
+  // message must not pass this probe), and markdown never applied.
+  should.be_true(string.contains(plain, "<span>**bold**</span>"))
   should.be_false(string.contains(plain, "<strong>"))
 }
 
