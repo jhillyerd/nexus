@@ -64,14 +64,26 @@
   #mk-info:target ~ .popzone { display:block; }
   .popzone .scrim { position:absolute; inset:0; display:block; }
 
-  /* child (channel) view — shown only while #mk-child is the target */
-  #head-child, #view-child, #hint-child { display:none; }
-  #mk-child:target ~ #head-parent,
-  #mk-child:target ~ #view-parent,
-  #mk-child:target ~ .composer #hint-parent { display:none; }
-  #mk-child:target ~ #head-child { display:flex; }
-  #mk-child:target ~ #view-child { display:block; }
-  #mk-child:target ~ .composer #hint-child { display:block; }
+  /* child (channel) views — each shown only while its marker is the target */
+  .child-head, .child-view, #hint-child { display:none; }
+  #mk-ch-0:target ~ #head-ch-0 { display:flex; }
+  #mk-ch-0:target ~ #view-ch-0 { display:block; }
+  #mk-ch-1:target ~ #head-ch-1 { display:flex; }
+  #mk-ch-1:target ~ #view-ch-1 { display:block; }
+  #mk-ch-2:target ~ #head-ch-2 { display:flex; }
+  #mk-ch-2:target ~ #view-ch-2 { display:block; }
+  #mk-ch-0:target ~ .composer #hint-child,
+  #mk-ch-1:target ~ .composer #hint-child,
+  #mk-ch-2:target ~ .composer #hint-child { display:block; }
+  #mk-ch-0:target ~ #head-parent,
+  #mk-ch-0:target ~ #view-parent,
+  #mk-ch-0:target ~ .composer #hint-parent,
+  #mk-ch-1:target ~ #head-parent,
+  #mk-ch-1:target ~ #view-parent,
+  #mk-ch-1:target ~ .composer #hint-parent,
+  #mk-ch-2:target ~ #head-parent,
+  #mk-ch-2:target ~ #view-parent,
+  #mk-ch-2:target ~ .composer #hint-parent { display:none; }
 
   /* ---------- popover (thread info) ---------- */
   .popover { position:absolute; top:3.3rem; right:.9rem; width:19.5rem;
@@ -163,7 +175,9 @@
 
     <!-- :target state markers — must precede everything they toggle -->
     <div class="marker" id="mk-info"></div>
-    <div class="marker" id="mk-child"></div>
+    <div class="marker" id="mk-ch-0"></div>
+    <div class="marker" id="mk-ch-1"></div>
+    <div class="marker" id="mk-ch-2"></div>
 
     <!-- header: parent view -->
     <div class="chat-head" id="head-parent">
@@ -175,10 +189,18 @@
       </a>
     </div>
 
-    <!-- header: child view -->
-    <div class="chat-head" id="head-child">
+    <!-- headers: child views -->
+    <div class="chat-head child-head" id="head-ch-0">
       <a class="crumb" href="#mk-x">‹ Infrastructure planning</a>
       <span class="title">RelayBeta</span>
+    </div>
+    <div class="chat-head child-head" id="head-ch-1">
+      <a class="crumb" href="#mk-x">‹ Infrastructure planning</a>
+      <span class="title">Scout</span>
+    </div>
+    <div class="chat-head child-head" id="head-ch-2">
+      <a class="crumb" href="#mk-x">‹ Infrastructure planning</a>
+      <span class="title">Cartographer</span>
     </div>
 
     <!-- popover zone: scrim closes, panel shows sections -->
@@ -187,19 +209,19 @@
       <div class="popover">
         <div class="sec">
           <h4>Channels</h4>
-          <a class="ch" href="#mk-child">
+          <a class="ch" href="#mk-ch-0">
             <span class="dot run"></span>
             <span class="nm">↳ RelayBeta</span>
             <span class="age">6m</span>
             <span class="chev">›</span>
           </a>
-          <a class="ch" href="#mk-child">
+          <a class="ch" href="#mk-ch-1">
             <span class="dot idle"></span>
             <span class="nm">↳ Scout</span>
             <span class="age">2h</span>
             <span class="chev">›</span>
           </a>
-          <a class="ch" href="#mk-child">
+          <a class="ch" href="#mk-ch-2">
             <span class="dot idle"></span>
             <span class="nm">↳ Cartographer</span>
             <span class="age">3d</span>
@@ -235,13 +257,27 @@
       </div>
     </div>
 
-    <!-- child transcript (navigated to, not embedded) -->
-    <div class="convwrap" id="view-child">
+    <!-- child transcripts (navigated to, not embedded) -->
+    <div class="convwrap child-view" id="view-ch-0">
       <div class="conv">
         <div class="turn from"><span class="who">RelayAlpha · via bot_message</span>From RelayAlpha (thread a1b2c3): can you check the staging deploy for errors? Focus on the health probe failures.</div>
         <div class="turn ai">Checked. The deploy itself succeeded — 3/4 replicas rolled clean. Replica staging-2 failed its readiness probe twice (timeout at 30s) before recovering. Cause looks like a cold cache on first boot, not a config drift.</div>
         <div class="turn from"><span class="who">RelayAlpha · via bot_message</span>From RelayAlpha (thread a1b2c3): good. Was the probe window tightened in the last chart bump?</div>
         <div class="turn ai">Yes — chart 2.4.1 cut initialDelaySeconds from 45s to 20s. That's the regression. Recommend reverting that one value or bumping the timeout to 45s.</div>
+      </div>
+    </div>
+
+    <div class="convwrap child-view" id="view-ch-1">
+      <div class="conv">
+        <div class="turn from"><span class="who">RelayAlpha · via bot_message</span>From RelayAlpha (thread a1b2c3): run the deploy checklist against staging and flag anything off.</div>
+        <div class="turn ai">Checklist done — 11 of 12 green. One flag: the rollout notification never fired to the ops channel. Everything else (secrets rotation, migrations, probes) checked out.</div>
+      </div>
+    </div>
+
+    <div class="convwrap child-view" id="view-ch-2">
+      <div class="conv">
+        <div class="turn from"><span class="who">RelayAlpha · via bot_message</span>From RelayAlpha (thread a1b2c3): map which vendor API endpoints our integration calls are missing deprecation windows on.</div>
+        <div class="turn ai">Mapped. Two endpoints are inside their deprecation window: the v1 search API (sunsets in 60 days) and the legacy webhook formatter (90 days). Full table with migration notes is in my summary.</div>
       </div>
     </div>
 

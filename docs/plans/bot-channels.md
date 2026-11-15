@@ -75,8 +75,14 @@ dangling DM thread in the sidebar.
 
     ALTER TABLE thread ADD COLUMN IF NOT EXISTS parent_thread_id
       text REFERENCES thread(id) ON DELETE CASCADE;
-    CREATE INDEX IF NOT EXISTS thread_parent ON thread (parent_thread_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS thread_channel ON thread (parent_thread_id, bot_id)
+      WHERE parent_thread_id IS NOT NULL;
 
+- **One partial unique index, two jobs**: `(parent_thread_id, bot_id)` is
+  the channel identity, and enforcing it (WHERE the parent link is set)
+  means `find_channel` re-derivation can never match ambiguously. The
+  leading column also serves the `parent_thread_id = $1` child-list
+  scan, so no separate plain index is needed.
 - **CASCADE, decided**: a channel is meaningless outside its parent's
   context; `SET NULL` would resurrect orphaned channels into the sidebar
   after a parent delete. (Contrast `bot_id ... ON DELETE SET NULL`: a
@@ -99,16 +105,34 @@ dangling DM thread in the sidebar.
 - **Re-derivation replaces blind find-or-create on a map miss**: a new
   store query (`find_channel.sql` — `select … from thread where
   parent_thread_id = $1 and bot_id = $2`) answers a miss by looking up
-  the existing channel row. Hit → repoint the map, resolve, deliver;
-  miss → create as today. Post-restart, the FIRST delivery for a pair
-  now re-finds the channel instead of duplicating it. A hit whose thread
-  was actually deleted cannot occur (CASCADE) — the map's
-  deleted-behind-the-map repoint branch keeps its current semantics for
-  the live-map case only.
-- Delete of a parent thread: the registry drops its live/dormant records
-  for every child (scan its dicts on parent id — personal scale), the
-  store cascade removes the rows, and stale `dm` entries pointing at
-  dropped channels are tolerated (the known-ness check already repoints).
+  the existing channel row, with `classify_target`'s lookup-error
+  discipline: the query yields `Result(Option(id), StoreError)` — a
+  hit repoints the map and delivers; a NO-ROW result creates as today;
+  a store ERROR refuses with the retryable vocabulary ("target lookup
+  failed; try again") and NEVER falls through to creation — a
+  transient outage must not duplicate a channel that may well exist.
+  Post-restart, the FIRST delivery for a pair now re-finds the channel
+  instead of duplicating it. A hit whose thread was actually deleted
+  cannot occur (CASCADE) — the map's deleted-behind-the-map repoint
+  branch keeps its current semantics for the live-map case only.
+- **Upgrade path (legacy P3c pair threads)**: DM threads created before
+  this change carry `parent_thread_id = NULL` and stay listed as
+  ordinary threads. No backfill exists — a pair-keyed thread
+  interleaves messages from multiple parent conversations, so no
+  single correct parent could be assigned. Post-upgrade routing never
+  re-enters them (`find_channel` matches on `parent_thread_id`, which
+  they lack; a fresh map creates per-parent channels), and the schema
+  lifecycle is pre-deploy (dev instances only, per AGENTS.md), so
+  archiving or deleting them locally is the retirement path.
+- Delete of a parent thread: the store cascade removes the whole
+  channel SUBTREE (hop chains make channels of channels, and the FK
+  deletes all descendants), so the registry's cleanup must be equally
+  transitive — a fixpoint walk that stops and demonitor every live
+  descendant, then drops each one's live/dormant records and `dm`
+  entries (not just direct children — a scan on the deleted parent's
+  id alone would orphan grandchild actors whose rows are gone).
+  Stale `dm` entries pointing at dropped channels are tolerated (the
+  known-ness check already repoints).
 - Archive: no cascade. An archived parent cannot originate turns, and
   id-addressed delivery INTO it already refuses (`target thread is
   archived`); channels stay readable in its pane.
@@ -212,9 +236,11 @@ instruction. So:
 5. Tests: registry tests — two parents' bots message the same target
    concurrently, both `Delivered` (no `Busy`); same parent, second
    delivery mid-turn → `Busy`; post-restart re-derivation finds the
-   existing channel (map cleared, no duplicate created); guard order
-   unchanged (refusal creates nothing); parent-delete drops children;
-   `m3_prefix_test` golden untouched; `gleam test` stays offline.
+   existing channel (map cleared, no duplicate created); lookup error
+   during re-derivation refuses (no creation); guard order unchanged
+   (refusal creates nothing); parent-delete drops the whole descendant
+   tree (direct children AND grandchildren); `m3_prefix_test` golden
+   untouched; `gleam test` stays offline.
 
 ### Phase 2 — the thread info pane (UI + e2e)
 
