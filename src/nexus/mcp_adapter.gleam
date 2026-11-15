@@ -371,11 +371,16 @@ fn step_frame(state: State, frame: mcp.Frame) -> State {
           state
         }
         mcp.ServerNotification(_) -> state
-        mcp.ServerRequest(id_dyn, _method) -> {
-          // Nexus is a tool client: server-initiated requests
-          // (sampling, roots, ping handlers that need replies) are
-          // refused — a JSON-RPC request REQUIRES a response.
-          let _ = send_frame(state, mcp.method_not_found_response(id_dyn))
+        mcp.ServerRequest(id_dyn, method) -> {
+          // Nexus is a tool client: sampling, roots and friends are
+          // refused (-32601) — a JSON-RPC request REQUIRES a response.
+          // `ping` is the exception: a liveness probe the spec
+          // REQUIRES answering with an empty result, so a health check
+          // succeeds on a responsive connection.
+          let _ = case method {
+            "ping" -> send_frame(state, mcp.ping_response(id_dyn))
+            _ -> send_frame(state, mcp.method_not_found_response(id_dyn))
+          }
           state
         }
         mcp.Response(id, outcome) -> on_response(state, id, outcome)
@@ -488,11 +493,11 @@ fn finish_list(
   cursor: Option(String),
 ) -> State {
   let acc = list.append(acc, defs)
-  let more_pages = pages + 1 < max_list_pages
+  // `pages` counts the page just received (first page = 1), so the
+  // tenth page is ALLOWED and a cursor returned ON it fails — the cap
+  // is a truncation guard, never a truncation.
+  let more_pages = pages + 1 <= max_list_pages
   case cursor, more_pages {
-    // The cap is not a truncation point: a catalog still carrying a
-    // cursor at 10 pages FAILS the ask — boot and create must never
-    // silently omit tools.
     Some(_cursor), False ->
       fail_list(
         state,

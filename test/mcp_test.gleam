@@ -937,22 +937,36 @@ pub fn tools_list_pagination_cap_fails_loudly_test() {
   let fake = start_fake("cap", 30_000)
   complete_handshake(fake)
   let reply = ask_list_tools(fake, 30_000)
-  serve_paginated_pages(fake, 9)
-  // A catalog still carrying a cursor at the page cap FAILS the ask —
-  // never a silent truncation.
+  // Ten pages served, the tenth still carrying a cursor: the cap is a
+  // truncation GUARD — the ask fails, never silently omits tools.
+  serve_paginated_pages(fake, 10, True)
   let assert Ok(Error(reason)) = process.receive(reply, 5000)
   should.be_true(string.contains(reason, "exceeds"))
 }
 
-fn serve_paginated_pages(fake: Fake, pages: Int) -> Nil {
+pub fn tools_list_pagination_tenth_page_allowed_test() {
+  let fake = start_fake("capok", 30_000)
+  complete_handshake(fake)
+  let reply = ask_list_tools(fake, 30_000)
+  // A catalog that finishes exactly ON the tenth page is valid.
+  serve_paginated_pages(fake, 10, False)
+  let assert Ok(Ok(defs)) = process.receive(reply, 5000)
+  list.length(defs) |> should.equal(10)
+}
+
+fn serve_paginated_pages(fake: Fake, pages: Int, final_cursor: Bool) -> Nil {
   case pages {
     0 -> Nil
     n -> {
       let assert Ok(frame) = process.receive(fake.to_server, 5000)
       let id = extract_int_field_unsafe(frame, "id")
       let cursor = case n {
-        1 -> "final-cursor-at-cap"
+        1 if final_cursor -> "final-cursor-at-cap"
         _ -> "page-" <> int.to_string(n)
+      }
+      let cursor_json = case n == 1 && !final_cursor {
+        True -> ""
+        False -> ",\"nextCursor\":\"" <> cursor <> "\""
       }
       server_says(
         fake,
@@ -960,12 +974,11 @@ fn serve_paginated_pages(fake: Fake, pages: Int) -> Nil {
           <> int.to_string(id)
           <> ",\"result\":{\"tools\":[{\"name\":\"p"
           <> int.to_string(n)
-          <> "\",\"inputSchema\":{\"type\":\"object\"}}],"
-          <> "\"nextCursor\":\""
-          <> cursor
-          <> "\"}}",
+          <> "\",\"inputSchema\":{\"type\":\"object\"}}]"
+          <> cursor_json
+          <> "}}",
       )
-      serve_paginated_pages(fake, n - 1)
+      serve_paginated_pages(fake, n - 1, final_cursor)
     }
   }
 }
@@ -1053,16 +1066,37 @@ pub fn feed_exactly_cap_line_accepted_on_any_chunk_boundary_test() {
 
 pub fn feed_one_over_cap_line_refused_on_any_chunk_boundary_test() {
   // cap+1 bytes: refused as soon as they are seen — with or without
-  // the newline having arrived — and the buffer is dropped, so the
-  // follow-up chunk parses fresh.
+  // the newline having arrived — and the feed is POISONED: the refused
+  // frame's remainder is discarded through its terminating newline, so
+  // a hostile suffix cannot re-enter parsing at a fake frame boundary.
   let big = string.repeat("z", mcp.max_frame_bytes + 1)
-  // No newline yet: the over-cap tail is refused immediately.
+  // No newline yet: the over-cap tail is refused immediately and the
+  // feed poisoned.
   let #(first, feed_mid) = mcp.feed(mcp.new_feed(), bit_array_from(big))
   first |> should.equal([mcp.TooBig])
-  // Same verdict when the newline DID ride the same chunk...
+  // Same verdict when the newline DID ride the same chunk (the frame
+  // was split off complete and consumed — no poison there).
   let #(one_chunk, _) = mcp.feed(mcp.new_feed(), bit_array_from(big <> "\n"))
   one_chunk |> should.equal([mcp.TooBig])
-  // ...and the follow-up chunk parses fresh either way.
-  let #(next, _) = mcp.feed(feed_mid, bit_array_from("ok\n"))
-  next |> should.equal([mcp.Line("ok")])
+  // The poisoned feed discards the remainder through its newline —
+  // even when it looks like a valid frame.
+  let #(remainder, feed_mid2) = mcp.feed(feed_mid, bit_array_from("\"x\":1\n"))
+  remainder |> should.equal([])
+  // ...and a frame AFTER the refused frame's newline parses normally.
+  let #(after, _) = mcp.feed(feed_mid2, bit_array_from("\"real\":2\n"))
+  after |> should.equal([mcp.Line("\"real\":2")])
+}
+
+pub fn server_ping_answered_with_empty_result_test() {
+  let fake = start_fake("ping", 30_000)
+  complete_handshake(fake)
+  server_says(
+    fake,
+    "{\"jsonrpc\":\"2.0\",\"id\":\"health-1\",\"method\":\"ping\"}",
+  )
+  let assert Ok(reply_frame) = process.receive(fake.to_server, 5000)
+  // MCP 2025-06-18: ping MUST be answered with an empty-object result
+  // — a liveness check succeeds on a responsive connection.
+  should.be_true(string.contains(reply_frame, "\"id\":\"health-1\""))
+  should.be_true(string.contains(reply_frame, "\"result\":{}"))
 }

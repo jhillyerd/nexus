@@ -105,9 +105,13 @@ pub type ToolsetEntry {
 }
 
 /// The create-time freeze's `ListTools` ask budget (plugin-api plan
-/// Phase 2): bounded like the boot ask, so a wedged server cannot hang
-/// a create.
-pub const freeze_ask_ms = 10_000
+/// Phase 2). STRICTLY SMALLER than the registry create wrapper's
+/// 5-second `actor.call` budget (the HTTP/UI caller's clock): the
+/// registry actor blocks on this ask, and a freeze that outlived its
+/// caller would let a thread materialize after the caller had already
+/// seen a timeout — a zombie create. A healthy server answers in
+/// milliseconds; the boot ask (no caller, no budget) stays at 10 s.
+pub const freeze_ask_ms = 4000
 
 /// The complete compiled-in tool name set. Plugin-api plan: `__` is
 /// the reserved provider separator, so a compiled name containing it

@@ -166,6 +166,15 @@ pub fn cancelled_notification(request_id: Int, reason: String) -> String {
   |> json.to_string
 }
 
+/// The reply to a SERVER-initiated `ping` (MCP 2025-06-18: the
+/// receiver MUST respond promptly with an empty-object result — ping
+/// is a liveness probe, and a health check must not fail on a
+/// responsive connection).
+pub fn ping_response(id: Dynamic) -> String {
+  let id_text = canonical_json_any(id)
+  "{\"jsonrpc\":\"2.0\",\"id\":" <> id_text <> ",\"result\":{}}"
+}
+
 /// The JSON-RPC error reply to a SERVER-initiated request. Nexus is a
 /// tool client only — sampling, roots and friends are refused with
 /// `method not found` (a response is REQUIRED by JSON-RPC; the server
@@ -577,17 +586,46 @@ pub type Frame {
 /// bound. The boundary is INCLUSIVE and chunk-independent: a frame of
 /// exactly `max_frame_bytes` bytes is accepted whether its newline
 /// arrived in the same chunk or the next one.
+/// `poisoned` marks a feed whose running frame was refused BEFORE its
+/// terminating newline arrived: every byte up to that newline still
+/// belongs to the refused frame and must be discarded — without the
+/// flag, a hostile prefix's remainder (or a crafted valid-JSON suffix)
+/// would re-enter parsing at a fake frame boundary.
 pub opaque type Feed {
-  Feed(buf: BitArray)
+  Feed(buf: BitArray, poisoned: Bool)
 }
 
 pub fn new_feed() -> Feed {
-  Feed(<<>>)
+  Feed(<<>>, False)
 }
 
 pub fn feed(f: Feed, chunk: BitArray) -> #(List(Frame), Feed) {
-  let Feed(buf) = f
-  do_feed(buf, chunk, [])
+  let Feed(buf, poisoned) = f
+  case poisoned {
+    True -> discard_through_newline(chunk, [])
+    False -> do_feed(buf, chunk, [])
+  }
+}
+
+/// Poisoned: discard bytes through the refused frame's terminating
+/// newline, then resume parsing on whatever follows. A chunk with no
+/// newline at all is still wholly inside the refused frame — dropped
+/// wholesale (bounded: dropped, never accumulated), stay poisoned.
+fn discard_through_newline(
+  chunk: BitArray,
+  acc: List(Frame),
+) -> #(List(Frame), Feed) {
+  let #(lines, rest) = take_lines(chunk)
+  case lines {
+    [] -> #(list.reverse(acc), Feed(<<>>, True))
+    _ -> {
+      // The first line is the oversized frame's remainder — dropped
+      // through its newline; everything after is back in frame sync
+      // (do_feed re-checks the caps on the remainder).
+      let acc = collect_lines(list.drop(lines, 1), acc)
+      do_feed(<<>>, rest, acc)
+    }
+  }
 }
 
 fn do_feed(
@@ -607,13 +645,12 @@ fn do_feed(
   // single-chunk path would have accepted.
   case bit_array.byte_size(tail) > max_frame_bytes {
     True ->
-      // The running frame is over the cap: refuse it, then start the
-      // new chunk on a FRESH buffer (recursing bounds that pass the
-      // same way — the chunk's own complete lines survive, its tail is
-      // checked again).
+      // The running frame is over the cap: refuse it and POISON the
+      // feed — the frame has no newline yet, so the refused frame's
+      // remainder (and nothing of it) may re-enter parsing.
       case chunk {
-        <<>> -> #(list.append(list.reverse(acc), [TooBig]), Feed(<<>>))
-        _ -> do_feed(<<>>, chunk, [TooBig, ..acc])
+        <<>> -> #(list.append(list.reverse(acc), [TooBig]), Feed(<<>>, True))
+        _ -> discard_through_newline(chunk, [TooBig, ..acc])
       }
     False -> {
       // Safe to concatenate: tail < cap, so the sum is bounded by the
@@ -621,8 +658,8 @@ fn do_feed(
       let #(more, rest) = take_lines(bit_array.append(tail, chunk))
       let acc = collect_lines(more, acc)
       case bit_array.byte_size(rest) > max_frame_bytes {
-        True -> #(list.append(list.reverse(acc), [TooBig]), Feed(<<>>))
-        False -> #(list.reverse(acc), Feed(rest))
+        True -> #(list.append(list.reverse(acc), [TooBig]), Feed(<<>>, True))
+        False -> #(list.reverse(acc), Feed(rest, False))
       }
     }
   }

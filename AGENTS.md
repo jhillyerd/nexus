@@ -218,9 +218,10 @@ the rules that bite silently:
   children cannot hand values to each other. Phase 2 adds a SECOND
   provider tree, `mcp_sup` (also OneForOne, linked to boot), with the
   opposite failure posture: its adapter actors never crash-boot — an
-  unreachable MCP server DEGRADES (loud log, absent from the foreign
-  map, honest 400 at create) because it is an external dependency, not
-  part of the release.
+  unreachable MCP server DEGRADES (loud log; every configured server
+  still mounts, so frozen threads hydrate without it, and creates
+  re-ask live and refuse with the honest reason) because it is an
+  external dependency, not part of the release.
 
 ## Changing the transcript / request-encoding path
 

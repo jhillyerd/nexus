@@ -84,10 +84,17 @@ executable(F) ->
             false
     end.
 
+%% port_command/2 with no options SUSPENDS the caller while the port
+%% is busy — a server that stopped reading stdin would freeze the whole
+%% adapter actor (no ListTools answers, no sibling calls, forever).
+%% The nosuspend variant returns `false` instead of suspending, so a
+%% wedged child degrades this one send into an honest error.
 send_line(Port, Line) ->
     try
-        erlang:port_command(Port, [Line, $\n]),
-        {ok, nil}
+        case erlang:port_command(Port, [Line, $\n], [nosuspend]) of
+            true -> {ok, nil};
+            false -> {error, <<"server stdin is busy">>}
+        end
     catch
         _:_ -> {error, <<"port dead">>}
     end.
