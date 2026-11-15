@@ -303,14 +303,17 @@ pub fn bash_owner_death_kills_group_test() {
           max_output_bytes: 100_000,
           environment: e,
           cancel: cancel,
-          arguments: "{\"target\":\"workspace\",\"command\":\"exec -a nxown8x sleep 45 & sleep 45\"}",
+          arguments: "{\"target\":\"workspace\",\"command\":\"touch started; exec -a nxown8x sleep 45 & sleep 45\"}",
         )
       process.sleep(60_000)
     })
-  // Kill the owner almost immediately — the marker may not have been
-  // parsed BEAM-side yet; the sentinel is armed before the command
-  // runs, so this window is real and deterministic to enter.
-  process.sleep(150)
+  // SYNCHRONIZE before killing (CodeRabbit review): poll for the
+  // marker file the command itself creates, so the test provably
+  // enters the mid-command window — the wrapper is running, the
+  // sentinel is armed, and the owner dies with the command in flight
+  // (whether the pid marker was parsed BEAM-side is immaterial: the
+  // sentinel's kill does not depend on it).
+  wait_started(root <> "/t1/started", 50)
   process.kill(owner)
   process.send(done, Nil)
   let assert Ok(Nil) = process.receive(done, 1000)
@@ -357,38 +360,46 @@ fn poll_tag_gone(pattern: String, attempts: Int) -> Nil {
   }
 }
 
-/// A pre-queued cancel (a Stop that landed before the executor even
-/// started selecting) must answer `cancelled` AND leave the one-shot
-/// re-signal observable for the loop's LAST-call path — with the
-/// marker wait port-only, nothing consumes the signal in between
-/// (CodeRabbit review).
-pub fn bash_prequeued_cancel_preserves_signal_test() {
+/// A mid-command cancel (CodeRabbit review): the tagged child
+/// provably started (the command touches a marker file first), the
+/// cancel lands while it runs, the result is `cancelled`, the
+/// one-shot re-signal is observable afterward, and the whole tree —
+/// including the tagged background child — is gone. Whether the pid
+/// marker had been parsed BEAM-side at cancel time is immaterial: the
+/// sentinel reaps the group at the port's EOF either way.
+pub fn bash_cancel_midrun_reaps_group_and_signal_test() {
   let root = fresh_root()
   let reply = process.new_subject()
   let worker =
     process.spawn_unlinked(fn() {
       let cancel = process.new_subject()
-      process.send(cancel, Nil)
+      let timer =
+        process.spawn(fn() {
+          process.sleep(400)
+          process.send(cancel, Nil)
+        })
+      let _ = timer
       let result =
         env.bash(
           timeout_ms: 60_000,
           max_output_bytes: 100_000,
           environment: env_for(root),
           cancel: cancel,
-          arguments: "{\"target\":\"workspace\",\"command\":\"echo partial; sleep 45\"}",
+          arguments: "{\"target\":\"workspace\",\"command\":\"touch running; exec -a nxcancel9x sleep 45 & sleep 45\"}",
         )
       let again = process.receive(cancel, 2000)
       process.send(reply, #(result, again))
     })
   let _ = worker
+  // The tagged child is provably up before the cancel fires: the
+  // timer's 400ms starts at spawn, and the marker file lands within
+  // milliseconds of the command starting.
+  wait_started(root <> "/t1/running", 50)
   let assert Ok(#(result, again)) = process.receive(reply, 30_000)
   let assert Error(text) = result
   let assert True = string.contains(text, "cancelled")
   let assert Ok(Nil) = again
-  // The cancelled command's whole tree is gone (CodeRabbit review):
-  // whether the pid marker was parsed or the kill was targetless, the
-  // sentinel reaps the group at the port's EOF.
-  poll_tag_gone("nxcancel[9]x", 30)
+  poll_tag_gone("nxcancel[9]x", 50)
   let _ = simplifile.delete(root)
 }
 
