@@ -396,27 +396,49 @@ fn validate_mcp_servers(
           <> " with no '__' and no leading or trailing '_'",
         )
     })
-    use Nil <- result.try(case string.trim(server.command) {
-      "" ->
+    let cmd = string.trim(server.command)
+    use Nil <- result.try(case cmd == "", string.contains(cmd, "\u{0000}") {
+      True, _ ->
         Error(
           "NEXUS_MCP_SERVERS_JSON: server '"
           <> server.name
           <> "': command must be a non-empty executable path",
         )
-      _ -> Ok(Nil)
+      _, True ->
+        Error(
+          "NEXUS_MCP_SERVERS_JSON: server '"
+          <> server.name
+          <> "': command contains a NUL byte",
+        )
+      _, False -> Ok(Nil)
     })
+    use Nil <- result.try(
+      case list.any(server.args, fn(arg) { string.contains(arg, "\u{0000}") }) {
+        True ->
+          Error(
+            "NEXUS_MCP_SERVERS_JSON: server '"
+            <> server.name
+            <> "': args must contain no NUL bytes",
+          )
+        False -> Ok(Nil)
+      },
+    )
     use Nil <- result.try(
       case
         list.any(server.env, fn(pair) {
-          pair.0 == "" || string.contains(pair.0, "=")
+          pair.0 == ""
+          || string.contains(pair.0, "=")
+          || string.contains(pair.0, "\u{0000}")
+          || string.contains(pair.1, "\u{0000}")
         })
       {
         True ->
           Error(
             "NEXUS_MCP_SERVERS_JSON: server '"
             <> server.name
-            <> "': env keys must be non-empty and contain no '='"
-            <> " (they are OS environment names)",
+            <> "': env keys must be non-empty, contain no '='"
+            <> " and no NUL bytes; values likewise (they are OS"
+            <> " environment names and values)",
           )
         False -> Ok(Nil)
       },

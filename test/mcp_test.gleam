@@ -1036,3 +1036,33 @@ pub fn tools_list_duplicate_name_across_pages_fails_test() {
   let assert Ok(Error(reason)) = process.receive(reply, 5000)
   should.be_true(string.contains(reason, "duplicate"))
 }
+
+pub fn feed_exactly_cap_line_accepted_on_any_chunk_boundary_test() {
+  // A line of EXACTLY max_frame_bytes is valid: chunk-independent
+  // acceptance, matching the single-chunk path.
+  let exact = string.repeat("y", mcp.max_frame_bytes)
+  // One chunk, newline included.
+  let assert #(single, _) =
+    mcp.feed(mcp.new_feed(), bit_array_from(exact <> "\n"))
+  single |> should.equal([mcp.Line(exact)])
+  // Two chunks, newline in the second: same verdict.
+  let #(_, feed_mid) = mcp.feed(mcp.new_feed(), bit_array_from(exact))
+  let #(split, _) = mcp.feed(feed_mid, bit_array_from("\n"))
+  split |> should.equal([mcp.Line(exact)])
+}
+
+pub fn feed_one_over_cap_line_refused_on_any_chunk_boundary_test() {
+  // cap+1 bytes: refused as soon as they are seen — with or without
+  // the newline having arrived — and the buffer is dropped, so the
+  // follow-up chunk parses fresh.
+  let big = string.repeat("z", mcp.max_frame_bytes + 1)
+  // No newline yet: the over-cap tail is refused immediately.
+  let #(first, feed_mid) = mcp.feed(mcp.new_feed(), bit_array_from(big))
+  first |> should.equal([mcp.TooBig])
+  // Same verdict when the newline DID ride the same chunk...
+  let #(one_chunk, _) = mcp.feed(mcp.new_feed(), bit_array_from(big <> "\n"))
+  one_chunk |> should.equal([mcp.TooBig])
+  // ...and the follow-up chunk parses fresh either way.
+  let #(next, _) = mcp.feed(feed_mid, bit_array_from("ok\n"))
+  next |> should.equal([mcp.Line("ok")])
+}

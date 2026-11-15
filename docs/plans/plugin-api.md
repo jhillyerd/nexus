@@ -497,9 +497,11 @@ mechanics discovered mid-build):
   untouched.
 - **HTTP transport deferred** (the plan's "stdio first; HTTP after"):
   the `Transport` seam is the only HTTP-shaped hole. URL entries are
-  FUTURE CONFIG-SCHEMA WORK — the current schema requires `command`
-  and validates nothing else — and live-server e2e integration
-  coverage ships with that transport when it lands.
+  FUTURE CONFIG-SCHEMA WORK: the current schema validates the stdio
+  shape (duplicate names, provider-name syntax, non-empty command, env
+  key/value rules, timeout floor) and has no URL form; a `url` variant
+  adds its own fields and checks when that transport lands, with
+  live-server e2e integration coverage.
 
 ### Phase 3 — deferred (recorded, not scheduled)
 

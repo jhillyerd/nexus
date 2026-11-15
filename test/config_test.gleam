@@ -408,3 +408,24 @@ pub fn mcp_servers_rejects_low_timeout_test() {
   let assert Error(message) = config.load()
   should.be_true(string.contains(message, "timeout_ms"))
 }
+
+pub fn mcp_servers_rejects_nul_in_env_test() {
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #(
+      "NEXUS_MCP_SERVERS_JSON",
+      "[{\"name\":\"a\",\"command\":\"x\",\"env\":{\"K\":\"v\\u0000\"}}]",
+    ),
+  ])
+  let assert Error(message) = config.load()
+  should.be_true(string.contains(message, "NUL"))
+}
+
+pub fn mcp_servers_rejects_nul_in_command_test() {
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_MCP_SERVERS_JSON", "[{\"name\":\"a\",\"command\":\"x\\u0000y\"}]"),
+  ])
+  let assert Error(message) = config.load()
+  should.be_true(string.contains(message, "NUL"))
+}

@@ -569,12 +569,14 @@ pub type Frame {
 /// Accumulates stdin bytes and emits complete lines. The cap is
 /// enforced WHILE READING, before any concatenation: the running
 /// buffer is split first (so complete frames already inside it are
-/// emitted), and a tail at or over `max_frame_bytes` is refused
-/// (`TooBig`) and DROPPED before the new chunk is ever appended — the
-/// live buffer therefore never exceeds the cap plus ONE inbound port
-/// chunk (whose size is the OS driver's read buffer, not ours to
-/// bound). A hostile stream of never-terminated garbage cannot grow
-/// memory without bound.
+/// emitted), and a tail OVER `max_frame_bytes` is refused (`TooBig`)
+/// and DROPPED before the new chunk is ever appended — the live buffer
+/// therefore never exceeds the cap plus ONE inbound port chunk (whose
+/// size is the OS driver's read buffer, not ours to bound). A hostile
+/// stream of never-terminated garbage cannot grow memory without
+/// bound. The boundary is INCLUSIVE and chunk-independent: a frame of
+/// exactly `max_frame_bytes` bytes is accepted whether its newline
+/// arrived in the same chunk or the next one.
 pub opaque type Feed {
   Feed(buf: BitArray)
 }
@@ -598,7 +600,12 @@ fn do_feed(
   // tail.
   let #(lines, tail) = take_lines(buf)
   let acc = collect_lines(lines, acc)
-  case bit_array.byte_size(tail) >= max_frame_bytes {
+  // STRICT over-the-cap refusal, matching `collect_lines`: a line of
+  // EXACTLY max_frame_bytes is valid no matter where its newline
+  // arrives, so a tail at exactly the cap keeps waiting (bounded — the
+  // buffer never exceeds the cap here) instead of refusing a frame the
+  // single-chunk path would have accepted.
+  case bit_array.byte_size(tail) > max_frame_bytes {
     True ->
       // The running frame is over the cap: refuse it, then start the
       // new chunk on a FRESH buffer (recursing bounds that pass the
