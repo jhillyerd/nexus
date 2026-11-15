@@ -2170,6 +2170,47 @@ async function main() {
         assert(receipt, "receipt landed as Alpha's tool result");
         const receiptThread = /thread (s\d+)/.exec(receipt.content)?.[1];
         eq(receiptThread, betaThread.id, "receipt names the DM thread");
+
+        // Display proof (issue #122): in the UI the authored line folds up
+        // as a bot chip instead of reading as the user's own bubble. The
+        // browser joins Beta's DM thread after the turn settled, so this
+        // exercises the replay path — the live path renders the same
+        // UserEcho shape (nexus/ui bot_turn, pinned offline in ui_test).
+        // Collapsed by default, the summary names the sender, the body
+        // carries the note, and no plain user bubble renders for it.
+        await page.goto(`${base}/?token=${TOKEN}`);
+        await connected(page);
+        await page
+          .locator(
+            `#thread-list .thread-row[data-thread-id="${betaThread.id}"] .thread-main`,
+          )
+          .click();
+        const botChip = page.locator("details.turn.bot");
+        await botChip.waitFor({ timeout: 15_000 });
+        const chip = await botChip.evaluate((el) => ({
+          open: el.open,
+          summary: el.querySelector("summary")?.textContent ?? "",
+          age: el.querySelector("summary time.ts")?.textContent ?? "",
+          body: el.querySelector(".bot-body")?.textContent ?? "",
+        }));
+        eq(chip.open, false, "bot chip renders collapsed");
+        assert(
+          chip.summary.includes("RelayAlpha"),
+          `chip summary names the sender: ${chip.summary}`,
+        );
+        assert(
+          chip.age.trim().length > 0,
+          `chip summary carries the message age: "${chip.age}"`,
+        );
+        assert(
+          chip.body.includes(note),
+          `chip body carries the note: ${chip.body}`,
+        );
+        eq(
+          await page.locator(".turn.user").count(),
+          0,
+          "the authored line is not a plain user bubble",
+        );
       } finally {
         await cleanup();
       }

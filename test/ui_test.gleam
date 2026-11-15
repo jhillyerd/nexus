@@ -1473,32 +1473,75 @@ pub fn view_escapes_markup_test() {
   should.be_false(string.contains(html, "<script>alert"))
 }
 
-// Bots P3b: the author badge on bot-delivered user lines. Bot text is
-// user content — it renders verbatim as an inert text node; only the
-// provenance chip is added, and only when an author exists.
-pub fn view_renders_author_badge_test() {
+// Bots P3b / issue #122: bot-delivered user lines fold up as a chip —
+// the collapsed summary names the sender, and the line no longer reads
+// as the user's own bubble. A human line beside it stays a plain user
+// bubble. Bot text renders as inert content; only the chip wraps it, and
+// only when an author exists.
+pub fn view_renders_bot_message_chip_test() {
   let model =
     new_model()
     |> step(ui.UserEcho("hello", None, Some("Hermes")))
     |> step(ui.UserEcho("mine", None, None))
   let html = view_string(model)
-  should.be_true(string.contains(html, "class=\"origin\""))
+  should.be_true(string.contains(html, "<details class=\"turn bot\">"))
   should.be_true(string.contains(html, ">Hermes<"))
   should.be_true(string.contains(html, ">mine<"))
-  // The badge carries the delivery provenance on hover, like the
+  // The chip carries the delivery provenance on hover, like the
   // timestamp's absolute instant.
   should.be_true(string.contains(html, "delivered by Hermes"))
+  // The bot payload must NOT read as the user's own bubble: the human
+  // line beside it keeps the plain user-bubble shape, and the bot text
+  // appears nowhere in one (the same class="turn user" probe on its own
+  // would pass off the human line alone).
+  should.be_true(string.contains(
+    html,
+    "<div class=\"turn user\"><span>mine</span>",
+  ))
+  should.be_false(string.contains(
+    html,
+    "<div class=\"turn user\"><span>hello</span>",
+  ))
 }
 
 pub fn view_escapes_author_names_test() {
   // The author name is bot-sourced display text frozen at send time —
-  // hostile-text rules apply to it exactly like message content.
+  // hostile-text rules apply to it exactly like message content: it is a
+  // text node in the chip summary and an escaped attribute value on its
+  // hover title, never markup.
   let model =
     new_model()
     |> step(ui.UserEcho("hi", None, Some("<img src=x onerror=alert(1)>")))
   let html = view_string(model)
   should.be_true(string.contains(html, "&lt;img"))
   should.be_false(string.contains(html, "<img "))
+}
+
+pub fn view_bot_message_renders_markdown_safely_test() {
+  // The chip body renders the sender's text through the same
+  // security-safe markdown renderer as assistant turns (issue #122):
+  // markdown structures render, hostile raw HTML stays inert escaped
+  // text. A HUMAN send carrying the same bytes keeps verbatim plain
+  // text — markdown is never applied to the user's own lane.
+  let model =
+    new_model()
+    |> step(ui.UserEcho(
+      "**bold** forecast\n\n- 12°C\n\n<script>alert(1)</script>",
+      None,
+      Some("researcher"),
+    ))
+  let html = view_string(model)
+  should.be_true(string.contains(html, "<strong>bold</strong>"))
+  should.be_true(string.contains(html, "&lt;script&gt;"))
+  should.be_false(string.contains(html, "<script>alert"))
+  let plain =
+    new_model()
+    |> step(ui.UserEcho("**bold**", None, None))
+    |> view_string
+  // The verbatim bytes survive untouched (a dropped or altered human
+  // message must not pass this probe), and markdown never applied.
+  should.be_true(string.contains(plain, "<span>**bold**</span>"))
+  should.be_false(string.contains(plain, "<strong>"))
 }
 
 pub fn view_renders_streaming_bubble_test() {
