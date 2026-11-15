@@ -133,9 +133,22 @@ dangling DM thread in the sidebar.
   id alone would orphan grandchild actors whose rows are gone).
   Stale `dm` entries pointing at dropped channels are tolerated (the
   known-ness check already repoints).
-- Archive: no cascade. An archived parent cannot originate turns, and
-  id-addressed delivery INTO it already refuses (`target thread is
-  archived`); channels stay readable in its pane.
+- Archive: no cascade, and channels CAN be archived — they are ordinary
+  threads under the same UI affordance. An archived CHANNEL is a
+  deliberate human decision, so deliveries from its parent to that bot
+  refuse DURABLY: `find_channel` re-finds the archived row and
+  `deliver_to_thread` answers the existing honest receipt
+  (`Refused("target thread is archived")`, a failed tool result the
+  sender model can report) until a human unarchives it or deletes the
+  channel row — deletion frees the pair, so the next delivery creates a
+  fresh channel. No bot-driven recovery exists BY DESIGN: unlike
+  today's accidental post-restart duplicate (the lost map silently
+  routing around an archive), a delivery must never resurrect or
+  sidestep one. The pane renders archived channels dimmed with an
+  archive badge — still navigable (reading is allowed), never hidden.
+- An archived PARENT cannot originate turns, and id-addressed delivery
+  INTO it already refuses (`target thread is archived`); its channels
+  stay readable in its pane.
 
 ### Second-class channels: no title/tag economy
 
@@ -238,9 +251,10 @@ instruction. So:
    delivery mid-turn → `Busy`; post-restart re-derivation finds the
    existing channel (map cleared, no duplicate created); lookup error
    during re-derivation refuses (no creation); guard order unchanged
-   (refusal creates nothing); parent-delete drops the whole descendant
-   tree (direct children AND grandchildren); `m3_prefix_test` golden
-   untouched; `gleam test` stays offline.
+   (refusal creates nothing); delivery into an archived channel refuses
+   durably (no re-derivation escape hatch); parent-delete drops the
+   whole descendant tree (direct children AND grandchildren);
+   `m3_prefix_test` golden untouched; `gleam test` stays offline.
 
 ### Phase 2 — the thread info pane (UI + e2e)
 
