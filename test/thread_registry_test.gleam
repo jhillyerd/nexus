@@ -1004,6 +1004,27 @@ fn seed_at(
   Nil
 }
 
+/// Like `seed`, with a frozen workspace root (an environment thread —
+/// the sweep's never-used ceiling for those is 2, system + roster).
+fn seed_env(seam: store.Store, id: String, message_count: Int) -> Nil {
+  store_mock.ensure_fixture_provider(seam)
+  let assert Ok(Nil) =
+    seam.insert_thread(
+      store.StoredSummary(
+        id: id,
+        provider_id: store_mock.fixture_provider_id,
+        model: "alpha",
+        meta: fresh_meta(),
+        toolset: thread_registry.plain_entries(["bash"]),
+        workspace_root: Some("/srv/old-root"),
+        last_active_at: 1_700_000_000,
+        message_count: message_count,
+      ),
+      "test system prompt",
+    )
+  Nil
+}
+
 fn listed_ids(registry: process.Subject(thread_registry.Msg)) -> List(String) {
   thread_registry.list_threads(registry)
   |> list.map(fn(summary) { summary.id })
@@ -1021,8 +1042,14 @@ pub fn boot_sweep_deletes_never_used_threads_test() {
   // Swept: stale never-used rows from earlier runs.
   seed(seam, "s1", "", thread.AutoTitle, False, False, 1)
   seed(seam, "s2", "", thread.AutoTitle, False, True, 1)
+  // Swept too: a never-used ENV thread (system + roster row = 2 —
+  // cubic PR review: the ceiling is per-shape, or abandoned empty env
+  // threads would live forever).
+  seed_env(seam, "s7", 2)
   // Kept: used, manually renamed, pinned…
   seed(seam, "s3", "hello world", thread.AutoTitle, False, False, 3)
+  // Kept: a SENT env thread (first commit takes the count to >= 3).
+  seed_env(seam, "s8", 3)
   seed(seam, "s4", "keep me", thread.ManualTitle, False, False, 1)
   seed(seam, "s5", "", thread.AutoTitle, True, False, 1)
   // …and a never-used thread created moments ago (grace window).
@@ -1038,7 +1065,7 @@ pub fn boot_sweep_deletes_never_used_threads_test() {
   )
 
   let registry = start_registry_over(seam)
-  listed_ids(registry) |> should.equal(["s3", "s4", "s5", "s6"])
+  listed_ids(registry) |> should.equal(["s3", "s4", "s5", "s6", "s8"])
 
   let swept =
     store_mock.events(mock)
@@ -1049,7 +1076,7 @@ pub fn boot_sweep_deletes_never_used_threads_test() {
       }
     })
     |> list.flatten
-  swept |> should.equal(["s1", "s2"])
+  swept |> should.equal(["s1", "s2", "s7"])
 }
 
 /// A never-used row inside the grace window is swept by a LATER boot,

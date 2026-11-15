@@ -328,11 +328,15 @@ fn read_json(req: Request(mist.Connection)) -> Result(String, Nil) {
 /// P1): `PlainCreate(provider, model)` (both required — a thread always
 /// pins its provider explicitly) or `BotCreate(bot)` (provider/model/
 /// system prompt copied from the bot at creation). A present `bot` KEY
-/// alongside a present `provider`/`model`/`tools` KEY — blank or not —
-/// is a conflict: the bot's frozen values (toolset included) must not
-/// be quietly overridden, and a silently dropped explicit `tools` list
-/// would hand the caller a different envelope than the one requested
-/// (cubic PR review). Classification is presence-aware (a trimmed-blank
+/// alongside a present `provider`/`model` KEY — blank or not — or a
+/// present non-null `tools` value is a conflict: the bot's frozen
+/// values (toolset included) must not be quietly overridden, and a
+/// silently dropped explicit `tools` list would hand the caller a
+/// different envelope than the one requested (cubic PR review). An
+/// explicit `"tools": null` is NOT a conflict — null flattens to the
+/// default-set sentinel exactly like absence (the bots-plan `tools`
+/// vocabulary), so `{"bot": …}` stays a plain bot create. The
+/// provider/model halves stay raw-presence-aware (a trimmed-blank
 /// value is still a value the caller sent); trimming happens after, so
 /// the plain path's blank halves stay the empty-field 400s. Presence is
 /// read on the RAW JSON value: an explicit `null` fails the decode

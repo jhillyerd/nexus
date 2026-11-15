@@ -1049,7 +1049,13 @@ fn update_stored(state: State, id: String, f: fn(Stored) -> Stored) -> State {
 const prune_grace_s = 900
 
 fn never_used(summary: StoredSummary, cutoff_s: Int) -> Bool {
-  summary.message_count <= 1
+  // Mirrors prune_never_used.sql: an environment thread's creation-time
+  // roster row counts too (never-used env = system + roster = 2; the
+  // first send persists >= 3).
+  let empty =
+    summary.message_count <= 1
+    || { summary.workspace_root != None && summary.message_count <= 2 }
+  empty
   && summary.meta.title_source == thread.AutoTitle
   && !summary.meta.pinned
   && summary.last_active_at < cutoff_s
