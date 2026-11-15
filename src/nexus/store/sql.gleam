@@ -1281,7 +1281,7 @@ pub type PruneNeverUsedRow {
 /// creation-time roster row (workspace_root IS NOT NULL AND
 /// message_count <= 2 — the row exists from creation and the first send
 /// takes the count to >= 3; without the second arm an abandoned empty
-/// env thread would never be swept, cubic PR review), never titled
+/// env thread would never be swept), never titled
 /// (title_source 'auto'; a manual rename is intent and survives), never
 /// pinned (also intent). Archived or not: an archived empty is still
 /// litter.
@@ -1311,7 +1311,7 @@ pub fn prune_never_used(
 -- creation-time roster row (workspace_root IS NOT NULL AND
 -- message_count <= 2 — the row exists from creation and the first send
 -- takes the count to >= 3; without the second arm an abandoned empty
--- env thread would never be swept, cubic PR review), never titled
+-- env thread would never be swept), never titled
 -- (title_source 'auto'; a manual rename is intent and survives), never
 -- pinned (also intent). Archived or not: an archived empty is still
 -- litter.
