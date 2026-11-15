@@ -267,7 +267,8 @@ instruction. So:
 3. Tests: `ui_test` — sidebar omits channels; pane renders rows with
    dots/ages/labels; badge counts; selection-without-listing highlight;
    breadcrumb; hostile-text payloads in labels; deleted-bot label
-   fallback; `m3_prefix_test` still golden; e2e — the bots P3c smoke
+   fallback; archived channel renders dimmed with the archive badge and
+   stays navigable (read-only transcript, never hidden); `m3_prefix_test` still golden; e2e — the bots P3c smoke
    (RelayAlpha → RelayBeta) drives the pane instead of the sidebar;
    integration `case:relay` scenario unchanged at the protocol level;
    the full browser suite re-run (the offline suite cannot see visual

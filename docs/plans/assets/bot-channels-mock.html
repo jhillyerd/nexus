@@ -72,9 +72,12 @@
   #mk-ch-1:target ~ #view-ch-1 { display:block; }
   #mk-ch-2:target ~ #head-ch-2 { display:flex; }
   #mk-ch-2:target ~ #view-ch-2 { display:block; }
+  #mk-ch-3:target ~ #head-ch-3 { display:flex; }
+  #mk-ch-3:target ~ #view-ch-3 { display:block; }
   #mk-ch-0:target ~ .composer #hint-child,
   #mk-ch-1:target ~ .composer #hint-child,
-  #mk-ch-2:target ~ .composer #hint-child { display:block; }
+  #mk-ch-2:target ~ .composer #hint-child,
+  #mk-ch-3:target ~ .composer #hint-child { display:block; }
   #mk-ch-0:target ~ #head-parent,
   #mk-ch-0:target ~ #view-parent,
   #mk-ch-0:target ~ .composer #hint-parent,
@@ -83,7 +86,10 @@
   #mk-ch-1:target ~ .composer #hint-parent,
   #mk-ch-2:target ~ #head-parent,
   #mk-ch-2:target ~ #view-parent,
-  #mk-ch-2:target ~ .composer #hint-parent { display:none; }
+  #mk-ch-2:target ~ .composer #hint-parent,
+  #mk-ch-3:target ~ #head-parent,
+  #mk-ch-3:target ~ #view-parent,
+  #mk-ch-3:target ~ .composer #hint-parent { display:none; }
 
   /* ---------- popover (thread info) ---------- */
   .popover { position:absolute; top:3.3rem; right:.9rem; width:19.5rem;
@@ -101,6 +107,11 @@
   .ch .dot.idle { background:#57636f; }
   .ch .nm { flex:1; font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .ch .age { font-family:var(--mono); font-size:11px; color:var(--muted); }
+  .ch .badge { font-family:var(--mono); font-size:10px; color:var(--muted);
+    border:1px solid var(--border); background:var(--panel2);
+    border-radius:999px; padding:.04rem .4rem; }
+  .ch.archived { opacity:.55; }
+  .chiprow .ref { color:#f85149; font-weight:600; }
   .ch .chev { color:var(--muted); font-size:12px; }
   .kv { display:flex; justify-content:space-between; gap:1rem;
     font-size:12.5px; padding:.16rem 0; }
@@ -178,6 +189,7 @@
     <div class="marker" id="mk-ch-0"></div>
     <div class="marker" id="mk-ch-1"></div>
     <div class="marker" id="mk-ch-2"></div>
+    <div class="marker" id="mk-ch-3"></div>
 
     <!-- header: parent view -->
     <div class="chat-head" id="head-parent">
@@ -202,6 +214,11 @@
       <a class="crumb" href="#mk-x">‹ Infrastructure planning</a>
       <span class="title">Cartographer</span>
     </div>
+    <div class="chat-head child-head" id="head-ch-3">
+      <a class="crumb" href="#mk-x">‹ Infrastructure planning</a>
+      <span class="title">OldHat</span>
+      <span class="chip" style="margin-left:.25rem;">archived</span>
+    </div>
 
     <!-- popover zone: scrim closes, panel shows sections -->
     <div class="popzone">
@@ -225,6 +242,13 @@
             <span class="dot idle"></span>
             <span class="nm">↳ Cartographer</span>
             <span class="age">3d</span>
+            <span class="chev">›</span>
+          </a>
+          <a class="ch archived" href="#mk-ch-3">
+            <span class="dot idle"></span>
+            <span class="nm">↳ OldHat</span>
+            <span class="badge">archived</span>
+            <span class="age">1d</span>
             <span class="chev">›</span>
           </a>
         </div>
@@ -254,6 +278,9 @@
         <div class="turn ai">Asking RelayBeta now — it has the deploy checklist. I'll relay its findings when it replies.</div>
         <div class="chiprow">bot_message → to "RelayBeta" · <b>Delivered</b> · thread f4e5d2</div>
         <div class="turn ai">RelayBeta picked it up (running in its own channel — see info ▸). Its reply will land back here.</div>
+        <div class="turn user">Also ask OldHat to sanity-check the probe theory.</div>
+        <div class="chiprow">bot_message → to "OldHat" · <span class="ref">Refused</span> · target thread is archived</div>
+        <div class="turn ai">OldHat's channel is archived, so the delivery was refused — unarchive it if you want it back in the loop, and I'll fold the check into RelayBeta's follow-up meanwhile.</div>
       </div>
     </div>
 
@@ -278,6 +305,14 @@
       <div class="conv">
         <div class="turn from"><span class="who">RelayAlpha · via bot_message</span>From RelayAlpha (thread a1b2c3): map which vendor API endpoints our integration calls are missing deprecation windows on.</div>
         <div class="turn ai">Mapped. Two endpoints are inside their deprecation window: the v1 search API (sunsets in 60 days) and the legacy webhook formatter (90 days). Full table with migration notes is in my summary.</div>
+      </div>
+    </div>
+
+    <div class="convwrap child-view" id="view-ch-3">
+      <div class="conv">
+        <div class="day">archived — readable, receives no deliveries</div>
+        <div class="turn from"><span class="who">RelayAlpha · via bot_message</span>From RelayAlpha (thread a1b2c3): keep an eye on the staging error budget this week.</div>
+        <div class="turn ai">Watching. Budget is at 72% with two days left — mostly from the probe timeouts, which RelayBeta is now on.</div>
       </div>
     </div>
 
