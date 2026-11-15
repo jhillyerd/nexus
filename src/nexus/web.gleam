@@ -239,7 +239,7 @@ fn create_thread_response(
         ConflictingCreate ->
           json_response(
             400,
-            err_json("bot conflicts with provider/model — pick one shape"),
+            err_json("bot conflicts with provider/model/tools — pick one shape"),
           )
         BotCreate(bot_id) ->
           // The SHARED create-from-bot orchestration (#73/#74): resolve
@@ -328,15 +328,18 @@ fn read_json(req: Request(mist.Connection)) -> Result(String, Nil) {
 /// P1): `PlainCreate(provider, model)` (both required — a thread always
 /// pins its provider explicitly) or `BotCreate(bot)` (provider/model/
 /// system prompt copied from the bot at creation). A present `bot` KEY
-/// alongside a present `provider`/`model` KEY — blank or not — is a
-/// conflict: the bot's frozen values must not be quietly overridden.
-/// Classification is presence-aware (a trimmed-blank value is still a
-/// value the caller sent); trimming happens after, so the plain path's
-/// blank halves stay the empty-field 400s. Presence is read on the RAW
-/// JSON value: an explicit `null` fails the decode (400) instead of
-/// collapsing into the missing-key default — `decode.optional` would
-/// blur `{"bot": null}` into a plain create and `{"bot": "b1",
-/// "provider": null}` into a bot create (coderabbit review, PR #87).
+/// alongside a present `provider`/`model`/`tools` KEY — blank or not —
+/// is a conflict: the bot's frozen values (toolset included) must not
+/// be quietly overridden, and a silently dropped explicit `tools` list
+/// would hand the caller a different envelope than the one requested
+/// (cubic PR review). Classification is presence-aware (a trimmed-blank
+/// value is still a value the caller sent); trimming happens after, so
+/// the plain path's blank halves stay the empty-field 400s. Presence is
+/// read on the RAW JSON value: an explicit `null` fails the decode
+/// (400) instead of collapsing into the missing-key default —
+/// `decode.optional` would blur `{"bot": null}` into a plain create and
+/// `{"bot": "b1", "provider": null}` into a bot create (coderabbit
+/// review, PR #87).
 pub type CreateFields {
   /// `tools` (environments plan Phase 1 follows the bots plan's create
   /// vocabulary): absent/null is the default set, `[]` chat-only, a
@@ -369,15 +372,18 @@ pub fn create_fields_decoder() -> decode.Decoder(CreateFields) {
     None,
     decode.optional(decode.list(decode.string)),
   )
-  decode.success(case bot, provider, model {
-    Some(bot), None, None -> BotCreate(string.trim(bot))
-    None, provider, model ->
+  decode.success(case bot, provider, model, tools {
+    // `tools` alongside `bot` is the same quiet-override conflict as
+    // provider/model: the bot's toolset wins or the request refuses —
+    // never silently drops the caller's list.
+    Some(bot), None, None, None -> BotCreate(string.trim(bot))
+    None, provider, model, _ ->
       PlainCreate(
         provider: string.trim(option.unwrap(provider, "")),
         model: string.trim(option.unwrap(model, "")),
         tools: tools,
       )
-    Some(_), _, _ -> ConflictingCreate
+    Some(_), _, _, _ -> ConflictingCreate
   })
 }
 
@@ -1036,6 +1042,7 @@ pub fn bot_error_fields(error: bot_registry.RegistryError) -> #(Int, String) {
   let status = case error {
     bot_registry.Unknown -> 404
     bot_registry.InvalidName -> 400
+    bot_registry.ReservedName -> 400
     bot_registry.InvalidModel -> 400
     bot_registry.InvalidTools(_) -> 400
     bot_registry.DuplicateName -> 409

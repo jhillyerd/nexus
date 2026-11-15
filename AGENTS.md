@@ -220,8 +220,9 @@ deltas; the rules that bite silently:
   the FFI's chunked read) — post-hoc truncation does not bound
   memory. Non-UTF-8 command output decodes lossily (latin-1
   fallback), never crashes. A bash non-zero exit status is DATA
-  (`Ok("exit status N\n…")`); only spawn/timeout/cancel are errors,
-  each carrying partial output.
+  (`Ok("exit status N\n…")`); only spawn/timeout/cancel are errors —
+  timeout and cancel carry their partial output, a spawn failure is
+  an immediate error (nothing ran).
 - **fs confinement is LEXICAL**: `..` folds against the workspace
   dir, absolute paths must already be inside it; symlinks are not
   resolved — v1 is hygiene, not a security boundary (the recorded

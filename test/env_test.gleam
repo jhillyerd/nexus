@@ -148,6 +148,20 @@ pub fn bash_timeout_kills_and_reports_partial_test() {
 }
 
 pub fn bash_timeout_kills_background_children_test() {
+  // The group kill is the setsid path's guarantee; a host without
+  // setsid (macOS dev machines) kills only the direct child by
+  // design — skip, not fail (cubic PR review).
+  case bash(env_for("/tmp"), 5000, "command -v setsid") {
+    Error("bash: no bash executable found on PATH") -> Nil
+    Ok("exit status 1" <> _) -> Nil
+    _ -> {
+      bash_timeout_kills_background_children_with_group_kill()
+      Nil
+    }
+  }
+}
+
+fn bash_timeout_kills_background_children_with_group_kill() {
   let root = fresh_root()
   // A background child that outlives the foreground: the group kill
   // (setsid + pgid) must reap it with the timeout. The child is
@@ -257,8 +271,10 @@ pub fn bash_marker_parse_failure_keeps_output_test() {
   let assert True = string.contains(out, "unexpected EOF")
 }
 
-/// The marker-absent path keeps MULTI-line output in order.
-pub fn bash_non_integer_first_line_all_output_test() {
+/// Multi-line output after a successful marker stays in order (the
+/// marker-absent path is the syntax-error test above — the marker
+/// always precedes a command's own output when it prints at all).
+pub fn bash_multiline_output_after_marker_test() {
   let root = fresh_root()
   let assert Ok(out) = bash(env_for(root), 5000, "echo notanumber; echo hello")
   let _ = simplifile.delete(root)
@@ -347,6 +363,52 @@ pub fn read_file_cap_truncates_test() {
   let _ = simplifile.delete(root)
   let assert True = string.contains(text, "0123")
   let assert True = string.contains(text, "[... truncated at 4 bytes ...]")
+}
+
+/// Cubic PR review (P1): a workspace FIFO would block the turn
+/// worker's open/read indefinitely — `bash` can create one inside the
+/// workspace, so both fs tools refuse non-regular files instead of
+/// touching them.
+pub fn fifo_refused_by_fs_tools_test() {
+  let root = fresh_root()
+  let e = env_for(root)
+  let assert Ok(_) = bash(env_for(root), 5000, "mkfifo pipe; mkfifo pipe2")
+  // Reading a FIFO blocks until a writer appears — refused, not read.
+  let assert Error("read_file: not a regular file: pipe") =
+    env.read_file(
+      max_output_bytes: 100,
+      environment: e,
+      arguments: "{\"target\":\"workspace\",\"path\":\"pipe\"}",
+    )
+  // Writing one blocks until a reader appears — refused too.
+  let assert Error("write_file: not a regular file: pipe2") =
+    env.write_file(
+      environment: e,
+      arguments: "{\"target\":\"workspace\",\"path\":\"pipe2\",\"content\":\"x\"}",
+    )
+  // Regular files are unaffected.
+  let assert Ok(_) =
+    env.write_file(
+      environment: e,
+      arguments: "{\"target\":\"workspace\",\"path\":\"plain.txt\",\"content\":\"ok\"}",
+    )
+  let _ = simplifile.delete(root)
+}
+
+/// Directories keep their honest read error under the regular-file
+/// guard.
+pub fn read_file_directory_refused_test() {
+  let root = fresh_root()
+  let e = env_for(root)
+  // The workspace root itself is a directory (a subdirectory would
+  // need creating first — "." is always there).
+  let assert Error("read_file: not a regular file: .") =
+    env.read_file(
+      max_output_bytes: 100,
+      environment: e,
+      arguments: "{\"target\":\"workspace\",\"path\":\".\"}",
+    )
+  let _ = simplifile.delete(root)
 }
 
 pub fn list_dir_root_and_missing_test() {

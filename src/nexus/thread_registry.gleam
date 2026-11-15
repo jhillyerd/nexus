@@ -1000,8 +1000,12 @@ fn start_new_thread(
                 // no env tools).
                 workspace_root: workspace_root,
                 last_active_at: created_at,
-                // 1 = the system prompt (Phase 1 message_count).
-                message_count: 1,
+                // The STARTING transcript's length (system prompt, plus
+                // the roster row on env threads) — the count the live
+                // actor and every later summary will report, so the
+                // create reply, GET /threads, and the first persisted
+                // state agree (cubic PR review).
+                message_count: transcript.length(transcript),
               ),
               // The RESOLVED prompt — the exact bytes frozen into the
               // transcript above, never the config default an explicit
@@ -1134,7 +1138,8 @@ fn start_new_thread(
 
 /// The create-reply projection of a fresh record: flat summary, empty
 /// display metadata (the record's meta carries the defaults #73 fixed),
-/// message_count 1 = the system prompt, activity = creation.
+/// message_count from the starting transcript (system prompt, plus the
+/// roster row on env threads), activity = creation.
 fn record_summary(record: Record) -> thread.ThreadSummary {
   thread.ThreadSummary(
     id: record.id,
@@ -1146,7 +1151,7 @@ fn record_summary(record: Record) -> thread.ThreadSummary {
     tags: record.meta.tags,
     archived: record.meta.archived,
     bot_id: record.meta.bot_id,
-    message_count: 1,
+    message_count: transcript.length(record.spec.transcript),
     streaming: False,
     created_at: record.meta.created_at,
     // Until the first commit, a thread's activity is its creation.
@@ -1718,6 +1723,34 @@ fn lazy_start(state: State, summary: StoredSummary) -> Resolved {
               Missing
             }
             Ok(transcript) -> {
+              // The roster-row heal (cubic PR review): an env thread
+              // hydrated BEFORE its first send has no roster row — it
+              // rides the write-behind lane from the first commit, and
+              // nothing was ever committed. Re-appending it here
+              // rebuilds EXACTLY the starting transcript a fresh create
+              // had (system prompt + roster row), so the model keeps
+              // its only signal that a workspace exists — without it,
+              // the announcement would be lost forever on this path.
+              // Byte-determinism is untouched: a never-sent thread has
+              // never built a request, so no cached prefix exists to
+              // diverge from (the same argument that makes the
+              // create-time append safe); a SENT env thread hydrated
+              // with the row already in place (length > 1) skips the
+              // heal.
+              let transcript = case
+                summary.workspace_root,
+                transcript.length(transcript)
+              {
+                Some(_), 1 ->
+                  transcript
+                  |> transcript.append_user(env.roster_attach_text(
+                    "workspace",
+                    env.attached_targets(),
+                  ))
+                  |> transcript.mark_origin(Some("system"), 0)
+                  |> transcript.stamp(summary.meta.created_at)
+                _, _ -> transcript
+              }
               let spec =
                 thread.ThreadSpec(
                   id: summary.id,

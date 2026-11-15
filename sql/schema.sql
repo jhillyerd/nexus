@@ -164,11 +164,6 @@ CREATE INDEX IF NOT EXISTS thread_recency ON thread (archived_at, last_active_at
 CREATE INDEX IF NOT EXISTS thread_tags ON thread USING gin (tags);
 CREATE INDEX IF NOT EXISTS thread_bot ON thread (bot_id);
 
--- Environments plan Phase 1: the frozen workspace root. Idempotent
--- ALTER for databases created before the column existed (no backfill:
--- pre-environments threads legitimately have none).
-ALTER TABLE thread ADD COLUMN IF NOT EXISTS workspace_root text;
-
 CREATE TABLE IF NOT EXISTS thread_message (
   id           bigserial PRIMARY KEY,
   thread_id   text NOT NULL REFERENCES thread(id) ON DELETE CASCADE,

@@ -1061,7 +1061,10 @@ pub fn create_thread_from_bot_test() {
       "/threads",
       "{\"bot\":\"b1\",\"model\":\"alias-a\"}",
     )),
-    #(400, "{\"error\":\"bot conflicts with provider/model — pick one shape\"}"),
+    #(
+      400,
+      "{\"error\":\"bot conflicts with provider/model/tools — pick one shape\"}",
+    ),
   )
 
   // The conflict rule is about KEYS: a blank provider value still
@@ -1073,7 +1076,10 @@ pub fn create_thread_from_bot_test() {
       "/threads",
       "{\"bot\":\"b1\",\"provider\":\"\"}",
     )),
-    #(400, "{\"error\":\"bot conflicts with provider/model — pick one shape\"}"),
+    #(
+      400,
+      "{\"error\":\"bot conflicts with provider/model/tools — pick one shape\"}",
+    ),
   )
 }
 

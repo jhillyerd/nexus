@@ -556,10 +556,21 @@ fn absorb_out(
   bytes: BitArray,
   max_output_bytes: Int,
 ) -> BashState {
-  let out = bit_array.append(state.out, bytes)
-  case bit_array.byte_size(out) > max_output_bytes + cap_slack_bytes {
-    True -> BashState(..state, out: out, killed: True)
-    False -> BashState(..state, out: out)
+  case state.killed {
+    // Post-kill chunks are DISCARDED, not buffered: between the
+    // group-kill dispatch and the child's death a gushing pipe can
+    // still deliver chunks, and feeding them through the append would
+    // accumulate output past the cap bounded only by wall clock
+    // (cubic PR review). The rendered result keeps the capped prefix
+    // plus the omission note — the discarded bytes never render.
+    True -> state
+    False -> {
+      let out = bit_array.append(state.out, bytes)
+      case bit_array.byte_size(out) > max_output_bytes + cap_slack_bytes {
+        True -> BashState(..state, out: out, killed: True)
+        False -> BashState(..state, out: out)
+      }
+    }
   }
 }
 
@@ -629,8 +640,12 @@ pub fn read_file(
   use env <- result.try(route(environment, args.target))
   use _ <- result.try(ensure_workspace(env))
   use path <- result.try(confined(env, args.path))
-  case simplifile.is_directory(path) {
-    Ok(True) -> Error("read_file: is a directory: " <> args.path)
+  case regular_file(path) {
+    // REGULAR FILES ONLY (cubic PR review): a workspace FIFO or device
+    // node would block the turn worker's open/read indefinitely —
+    // `bash` can create either inside the workspace, so the guard is
+    // not hypothetical. Directories keep their honest error.
+    Ok(False) -> Error("read_file: not a regular file: " <> args.path)
     _ ->
       case ffi_read_capped(path, max_output_bytes) {
         Error(reason) -> Error("read_file: " <> reason)
@@ -661,6 +676,14 @@ pub fn write_file(
   use env <- result.try(route(environment, args.target))
   use _ <- result.try(ensure_workspace(env))
   use path <- result.try(confined(env, args.path))
+  // An EXISTING non-regular target (a FIFO `bash` made) would block
+  // the write until a reader arrives — refuse it; a not-yet-existing
+  // path is a regular file to be created (cubic PR review). The
+  // same guard read_file carries: special files are never touched.
+  use _ <- result.try(case regular_file(path) {
+    Ok(False) -> Error("write_file: not a regular file: " <> args.path)
+    _ -> Ok(Nil)
+  })
   use _ <- result.try(
     simplifile.create_directory_all(filepath.directory_name(path))
     |> result.map_error(fn(e) { "write_file: " <> simplifile.describe_error(e) }),
@@ -720,6 +743,17 @@ pub fn list_dir(
           }
         }
       }
+  }
+}
+
+/// True when the path is a regular file; `Error` when it does not
+/// exist (or is unreadable) — the caller decides which answers are
+/// acceptable. `file_info` FOLLOWS symlinks, so a link to a regular
+/// file passes and a link to a FIFO does not.
+fn regular_file(path: String) -> Result(Bool, Nil) {
+  case simplifile.file_info(path) {
+    Ok(info) -> Ok(simplifile.file_info_type(info) == simplifile.File)
+    Error(_) -> Error(Nil)
   }
 }
 

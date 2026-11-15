@@ -187,26 +187,22 @@ pub fn uescape_string_test() {
 pub fn schema_is_the_entire_schema_test() {
   let assert Ok(schema) = read_file("sql/schema.sql") |> bit_array.to_string
   let statements = migrate.statements(schema)
-  should.equal(list.length(statements), 12)
-  // The non-CREATE statements: the manifest swap (plugin-api Phase 2)
-  // — a DO block that backfills the old plain-name column into
-  // thread_toolset entries before dropping it, lossless for existing
-  // rows, skipped entirely on a database already migrated — and the
-  // environments Phase 1 idempotent column add for `workspace_root`.
-  let non_create =
+  should.equal(list.length(statements), 11)
+  // The one non-CREATE statement: the manifest swap (plugin-api
+  // Phase 2) — a DO block that backfills the old plain-name column
+  // into thread_toolset entries before dropping it, lossless for
+  // existing rows, skipped entirely on a database already migrated.
+  // (The environments Phase 1 column landed as a CREATE-only edit, per
+  // the squash-migrations-into-the-base-CREATEs policy, cecd906.)
+  let assert [swap] =
     list.filter(statements, fn(stmt) {
       !string.starts_with(string.trim(string.lowercase(stmt)), "create")
     })
-  let assert [swap, workspace_add] = non_create
   should.be_true(string.contains(string.lowercase(swap), "do $$"))
   should.be_true(string.contains(string.lowercase(swap), "drop column toolset"))
   should.be_true(string.contains(
     string.lowercase(swap),
     "information_schema.columns",
-  ))
-  should.be_true(string.contains(
-    string.lowercase(workspace_add),
-    "alter table thread add column if not exists workspace_root",
   ))
   let assert [thread_create] =
     list.filter(statements, fn(stmt) { string.contains(stmt, "tags_manual") })

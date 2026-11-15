@@ -2226,9 +2226,23 @@ pub fn env_toolset_hydrates_from_persisted_root_test() {
     )
   let #(registry, _seam2) = start_registry_with_workspace("/srv/new-root", seam)
   // The lazy start resolves the env names through the catalog (config-
-  // independent) and wraps with the ROW's root — success is the
-  // observable; the handle's contents share the wrapper proven above.
-  thread_registry.get(registry, "s77") |> should.be_ok
+  // independent) and wraps with the ROW's root (the handle-value
+  // injection is the same `env_toolset` wrapper the create-path test
+  // observes end to end). Strengthened per cubic review: the hydrated
+  // actor must also carry the roster row — the env path hydrated, not
+  // just any start.
+  let assert Ok(sess) = thread_registry.get(registry, "s77")
+  let snapshot = actor.call(sess, 5000, thread.Snapshot)
+  let messages = transcript.messages(snapshot)
+  let assert [
+    glopenai_chat.UserMessage(
+      content: glopenai_chat.UserTextContent(
+        "environment attached: \"workspace\". attached targets: workspace.",
+      ),
+      ..,
+    ),
+    _,
+  ] = list.reverse(messages)
 }
 
 fn fresh_meta() -> thread.ThreadMeta {

@@ -357,6 +357,13 @@ pub fn request_body_decoders_test() {
   |> should.equal(Ok(web.ConflictingCreate))
   web.parse_create_json("{\"bot\":\"b1\",\"provider\":\"\",\"model\":\"\"}")
   |> should.equal(Ok(web.ConflictingCreate))
+  // `tools` alongside `bot` is the same quiet-override conflict (cubic
+  // PR review): the bot's toolset wins or the request refuses — an
+  // explicit null is fine (it is the default sentinel).
+  web.parse_create_json("{\"bot\":\"b1\",\"tools\":[\"bash\"]}")
+  |> should.equal(Ok(web.ConflictingCreate))
+  web.parse_create_json("{\"bot\":\"b1\",\"tools\":null}")
+  |> should.equal(Ok(web.BotCreate("b1")))
   // An explicit JSON null is NOT absent (coderabbit review, PR #87):
   // the null fails the decode — the whole body 400s — instead of
   // blurring {"bot": null} into a plain create or {"bot": "b1",

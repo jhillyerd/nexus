@@ -118,6 +118,11 @@ pub type BotUpdate {
 /// echoed beyond what the HTTP layer chooses to include.
 pub type BotError {
   InvalidName
+  /// The name is the reserved roster-message author (`system`,
+  /// environments plan Phase 1) — distinct from InvalidName so the
+  /// operator sees the actual restriction, not "non-empty after
+  /// trimming" for a perfectly trimmed name (cubic PR review).
+  ReservedName
   /// A blank model alias (the create-time rule: a thread only ever
   /// exists with a non-empty pin).
   InvalidModel
@@ -132,6 +137,9 @@ pub type BotError {
 pub fn describe(error: BotError) -> String {
   case error {
     InvalidName -> "bot name must be non-empty after trimming"
+    ReservedName ->
+      "bot name 'system' is reserved (roster messages are authored by"
+      <> " \"system\")"
     InvalidModel -> "bot model must be non-empty after trimming"
     InvalidTools ->
       "bot tools must contain at least one non-blank name when set"
@@ -148,7 +156,7 @@ pub fn validate_name(name: String) -> Result(String, BotError) {
     // status line — a bot named `system` would have its messages
     // render as status lines on every path (live echo, mid-turn
     // join, replay).
-    "system" -> Error(InvalidName)
+    "system" -> Error(ReservedName)
     trimmed -> Ok(trimmed)
   }
 }

@@ -338,12 +338,18 @@ pub fn invalid_name_and_model_refused_test() {
   |> should.equal(Error(bot_registry.InvalidName))
   // Environments plan Phase 1: `system` is the reserved roster-message
   // author — a bot by that name would render its messages as status
-  // lines on every path.
+  // lines on every path. Distinct from InvalidName so the message
+  // names the actual restriction (cubic PR review).
   bot_registry.create_bot(
     registry,
     bot.BotParams(..params("system"), model: "x"),
   )
-  |> should.equal(Error(bot_registry.InvalidName))
+  |> should.equal(Error(bot_registry.ReservedName))
+  should.equal(
+    bot_registry.describe(bot_registry.ReservedName),
+    "bot name 'system' is reserved (roster messages are authored by"
+      <> " \"system\")",
+  )
   bot_registry.create_bot(registry, bot.BotParams(..params("x"), model: "  "))
   |> should.equal(Error(bot_registry.InvalidModel))
 

@@ -330,12 +330,17 @@ mechanics discovered mid-build):
   it rides the registry-built starting transcript, and the write-
   behind lane lands it with the first `Send` — before any request is
   built nothing was ever sent, so hydration byte-determinism cannot
-  observe the gap. A restart between create and first send loses the
-  status line from the empty replay (no cache divergence: no request
-  ever existed); the boot sweep eventually reaps such a never-used
-  row, but only after its 15-minute grace window — inside that window
-  the dormant row simply replays without the line until used or
-  swept (recorded, benign).
+  observe the gap. A restart between create and first send would
+  otherwise lose the announcement FOREVER on hydration (the roster
+  row is the model's only signal a workspace exists), so lazy start
+  HEALS it: an env thread hydrated with a one-message transcript
+  (never used — no request ever built, so no cached prefix can
+  diverge) re-appends the roster row, rebuilding exactly the starting
+  transcript a fresh create had (cubic PR review; pinned by the
+  hydration test). A sent env thread hydrates with the row already
+  persisted and skips the heal. Within the boot sweep's 15-minute
+  grace window the dormant row replays without the line until
+  hydrated; unused rows are swept as never-used thereafter.
 - **Boot's bot-tool validation closure is extracted** into
   `boot.bot_validate_tools(cfg, providers, foreign)` so the env gate
   is offline-testable without starting the tree.
