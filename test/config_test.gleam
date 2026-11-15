@@ -294,3 +294,104 @@ pub fn load_rejects_non_boolean_codemode_flag_test() {
   let assert Error(message) = config.load()
   should.be_true(string.contains(message, "NEXUS_CODEMODE"))
 }
+
+// ---- MCP servers (plugin-api plan Phase 2) --------------------------------
+
+pub fn mcp_servers_absent_by_default_test() {
+  set_all([#("NEXUS_ENCRYPTION_KEY", key_b64)])
+  let assert Ok(cfg) = config.load()
+  cfg.mcp_servers |> should.equal([])
+}
+
+pub fn mcp_servers_parse_full_entry_test() {
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #(
+      "NEXUS_MCP_SERVERS_JSON",
+      "[{\"name\":\"github\",\"command\":\"npx\","
+        <> "\"args\":[\"-y\",\"@modelcontextprotocol/server-github\"],"
+        <> "\"env\":{\"GITHUB_TOKEN\":\"tok\"},\"timeout_ms\":60000}]",
+    ),
+  ])
+  let assert Ok(cfg) = config.load()
+  let assert [server] = cfg.mcp_servers
+  server.name |> should.equal("github")
+  server.command |> should.equal("npx")
+  server.args |> should.equal(["-y", "@modelcontextprotocol/server-github"])
+  server.timeout_ms |> should.equal(Some(60_000))
+  let assert [#(k, v)] = server.env
+  k |> should.equal("GITHUB_TOKEN")
+  v |> should.equal("tok")
+}
+
+pub fn mcp_servers_defaults_are_empty_test() {
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_MCP_SERVERS_JSON", "[{\"name\":\"fs\",\"command\":\"./fs\"}]"),
+  ])
+  let assert Ok(cfg) = config.load()
+  let assert [server] = cfg.mcp_servers
+  server.args |> should.equal([])
+  server.env |> should.equal([])
+  server.timeout_ms |> should.equal(None)
+}
+
+pub fn mcp_servers_blank_string_is_empty_test() {
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_MCP_SERVERS_JSON", "   "),
+  ])
+  let assert Ok(cfg) = config.load()
+  cfg.mcp_servers |> should.equal([])
+}
+
+pub fn mcp_servers_rejects_invalid_json_test() {
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_MCP_SERVERS_JSON", "[{name: github}]"),
+  ])
+  let assert Error(message) = config.load()
+  should.be_true(string.contains(message, "NEXUS_MCP_SERVERS_JSON"))
+}
+
+pub fn mcp_servers_rejects_bad_name_test() {
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_MCP_SERVERS_JSON", "[{\"name\":\"bad__name\",\"command\":\"x\"}]"),
+  ])
+  let assert Error(message) = config.load()
+  should.be_true(string.contains(message, "bad__name"))
+}
+
+pub fn mcp_servers_rejects_duplicate_names_test() {
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #(
+      "NEXUS_MCP_SERVERS_JSON",
+      "[{\"name\":\"a\",\"command\":\"x\"},{\"name\":\"a\",\"command\":\"y\"}]",
+    ),
+  ])
+  let assert Error(message) = config.load()
+  should.be_true(string.contains(message, "duplicate"))
+}
+
+pub fn mcp_servers_rejects_empty_command_test() {
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_MCP_SERVERS_JSON", "[{\"name\":\"a\",\"command\":\"  \"}]"),
+  ])
+  let assert Error(message) = config.load()
+  should.be_true(string.contains(message, "command"))
+}
+
+pub fn mcp_servers_rejects_low_timeout_test() {
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #(
+      "NEXUS_MCP_SERVERS_JSON",
+      "[{\"name\":\"a\",\"command\":\"x\",\"timeout_ms\":10}]",
+    ),
+  ])
+  let assert Error(message) = config.load()
+  should.be_true(string.contains(message, "timeout_ms"))
+}

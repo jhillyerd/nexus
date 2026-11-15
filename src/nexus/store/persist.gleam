@@ -293,7 +293,20 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       let result =
         sql.list_summaries(state.db)
         |> result.map(fn(returned) {
-          returned.rows |> list.map(stored_summary_from_row)
+          // A corrupt manifest skips its row (loud log): one bad row
+          // must neither brick boot (this list feeds hydration) nor
+          // silently narrow that thread — the thread simply fails to
+          // rehydrate later, with the corruption already logged.
+          returned.rows
+          |> list.filter_map(fn(row) {
+            case stored_summary_from_row(row) {
+              Ok(summary) -> Ok(summary)
+              Error(e) -> {
+                io.println("store: skipping corrupt thread row: " <> e)
+                Error(Nil)
+              }
+            }
+          })
         })
         |> result.map_error(query_error)
       process.send(reply, result)
@@ -306,30 +319,38 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
         Ok(pog.Returned(_, rows)) ->
           case rows {
             [row] ->
-              Ok(store.StoredThread(
-                summary: store.StoredSummary(
-                  id: row.id,
-                  provider_id: row.provider_id,
-                  model: row.model,
-                  meta: thread.ThreadMeta(
-                    title: row.title,
-                    title_source: title_source(row.title_source),
-                    pinned: row.pinned,
-                    archived: row.archived,
-                    tags: row.tags,
-                    tags_manual: row.tags_manual,
-                    tags_source: tags_source(row.tags_source),
-                    bot_id: row.bot_id,
-                    created_at: row.created_s,
-                  ),
-                  toolset: row.toolset,
-                  last_active_at: row.last_active_s,
-                  // The column already counts the system prompt
-                  // (Phase 1 semantics).
-                  message_count: row.message_count,
-                ),
-                system_prompt: row.system_prompt,
-              ))
+              // The frozen toolset manifest (plugin-api plan Phase 2):
+              // parsed from the row's aggregate json BEFORE the summary
+              // is built — a corrupt manifest is an error the caller
+              // refuses loudly, never a silent narrowing.
+              case store.decode_toolset(row.toolset) {
+                Error(e) -> Error(e)
+                Ok(entries) ->
+                  Ok(store.StoredThread(
+                    summary: store.StoredSummary(
+                      id: row.id,
+                      provider_id: row.provider_id,
+                      model: row.model,
+                      meta: thread.ThreadMeta(
+                        title: row.title,
+                        title_source: title_source(row.title_source),
+                        pinned: row.pinned,
+                        archived: row.archived,
+                        tags: row.tags,
+                        tags_manual: row.tags_manual,
+                        tags_source: tags_source(row.tags_source),
+                        bot_id: row.bot_id,
+                        created_at: row.created_s,
+                      ),
+                      toolset: entries,
+                      last_active_at: row.last_active_s,
+                      // The column already counts the system prompt
+                      // (Phase 1 semantics).
+                      message_count: row.message_count,
+                    ),
+                    system_prompt: row.system_prompt,
+                  ))
+              }
             _ -> Error("no stored thread " <> id)
           }
       }
@@ -383,11 +404,13 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           summary.meta.tags,
           int.to_float(summary.meta.created_at),
           summary.message_count,
-          // The creation-time snapshot (bots plan P2): the resolved
-          // names, always persisted — never NULL-for-default.
-          summary.toolset,
           // The '' sentinel writes NULL (no bot) — see insert_bot.sql.
           option.unwrap(summary.meta.bot_id, ""),
+          // The frozen toolset manifest (plugin-api plan Phase 2),
+          // written in the SAME statement as the row (CTE) so a
+          // half-thread can never exist. Transport-encoded as json
+          // ($12); the stored columns stay TEXT.
+          store.encode_toolset(summary.toolset),
         )
         |> result.map(fn(_) { Nil })
         |> result.map_error(query_error)
@@ -883,30 +906,38 @@ fn query_error(error: pog.QueryError) -> String {
   }
 }
 
-fn stored_summary_from_row(row: sql.ListSummariesRow) -> store.StoredSummary {
-  store.StoredSummary(
-    id: row.id,
-    provider_id: row.provider_id,
-    model: row.model,
-    meta: thread.ThreadMeta(
-      title: row.title,
-      title_source: title_source(row.title_source),
-      pinned: row.pinned,
-      archived: row.archived,
-      tags: row.tags,
-      tags_manual: row.tags_manual,
-      tags_source: tags_source(row.tags_source),
-      // Provenance pointer (bots plan P1): NULL = created without a bot.
-      bot_id: row.bot_id,
-      created_at: row.created_s,
-    ),
-    // The creation-time snapshot (bots plan P2): a dormant thread
-    // rehydrates its runner bundle from these names.
-    toolset: row.toolset,
-    last_active_at: row.last_active_s,
-    // The column already counts the system prompt (Phase 1 semantics).
-    message_count: row.message_count,
-  )
+fn stored_summary_from_row(
+  row: sql.ListSummariesRow,
+) -> Result(store.StoredSummary, String) {
+  case store.decode_toolset(row.toolset) {
+    Error(e) -> Error(e)
+    Ok(entries) ->
+      Ok(store.StoredSummary(
+        id: row.id,
+        provider_id: row.provider_id,
+        model: row.model,
+        meta: thread.ThreadMeta(
+          title: row.title,
+          title_source: title_source(row.title_source),
+          pinned: row.pinned,
+          archived: row.archived,
+          tags: row.tags,
+          tags_manual: row.tags_manual,
+          tags_source: tags_source(row.tags_source),
+          // Provenance pointer (bots plan P1): NULL = created without a bot.
+          bot_id: row.bot_id,
+          created_at: row.created_s,
+        ),
+        // The frozen toolset manifest (plugin-api plan Phase 2): a
+        // dormant thread rehydrates its runner bundle from these
+        // entries.
+        toolset: entries,
+        last_active_at: row.last_active_s,
+        // The column already counts the system prompt (Phase 1
+        // semantics).
+        message_count: row.message_count,
+      ))
+  }
 }
 
 /// A stored bot row from either query shape (get/list select the same

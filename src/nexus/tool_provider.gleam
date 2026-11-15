@@ -118,6 +118,15 @@ pub fn qualified(provider: String, tool: String) -> String {
   provider <> "__" <> tool
 }
 
+/// Split a qualified wire name back into its halves — the provider
+/// (MCP server / plugin) and the unqualified tool — at the FIRST `__`.
+/// Valid halves contain no `__`, so the reserved separator splits
+/// unambiguously; a name without one was never qualified (a compiled
+/// name) and refuses.
+pub fn split(qualified: String) -> Result(#(String, String), Nil) {
+  string.split_once(qualified, "__")
+}
+
 /// A provider or tool half-name is admissible when it is non-empty,
 /// every character is in `[a-zA-Z0-9_-]`, it contains no `__`, and it
 /// neither starts nor ends with `_` (so `a_`+`b` and `a`+`_b` cannot

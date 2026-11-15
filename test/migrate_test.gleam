@@ -187,11 +187,17 @@ pub fn uescape_string_test() {
 pub fn schema_is_the_entire_schema_test() {
   let assert Ok(schema) = read_file("sql/schema.sql") |> bit_array.to_string
   let statements = migrate.statements(schema)
-  should.equal(list.length(statements), 9)
-  let assert [] =
+  should.equal(list.length(statements), 11)
+  // The DROP COLUMN IF EXISTS (plugin-api Phase 2's manifest swap) is
+  // the one non-CREATE statement — expected and idempotent.
+  let assert [drop_column] =
     list.filter(statements, fn(stmt) {
       !string.starts_with(string.trim(string.lowercase(stmt)), "create")
     })
+  should.be_true(string.contains(
+    string.lowercase(drop_column),
+    "drop column if exists toolset",
+  ))
   let assert [thread_create] =
     list.filter(statements, fn(stmt) { string.contains(stmt, "tags_manual") })
   should.be_true(string.contains(thread_create, "tags_source"))

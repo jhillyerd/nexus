@@ -108,12 +108,35 @@ CREATE TABLE IF NOT EXISTS thread (
   created_at     timestamptz NOT NULL,
   last_active_at timestamptz NOT NULL,         -- bumped on turn commit; drives recency + buckets
   message_count  int NOT NULL DEFAULT 0,       -- denormalized for list queries
-  toolset        text[] NOT NULL,              -- bots plan P2: the RESOLVED tool names persisted at creation (default set's, or the creating bot's) — a snapshot, never NULL-for-default, so no config change or bot edit can re-aim this thread's envelope
   bot_id         text REFERENCES bot(id) ON DELETE SET NULL
                                                 -- provenance/display only (bots plan P1): which bot the frozen columns
                                                 -- were sourced from. Never joined at request-encoding time; deleting
                                                 -- the bot NULLs it — the thread is self-contained.
 );
+
+-- One thread's frozen toolset manifest (plugin-api plan Phase 2) — the
+-- ordered snapshot that replaced the old `thread.toolset text[]`
+-- (dropped below): order IS the envelope order, so the manifest lives
+-- in ONE ordered structure. `seq` is the 0-based envelope position;
+-- `name` is the qualified wire name; `description`/`schema_json` are
+-- ''/NULL for plain in-process names (compiled or plugin — their
+-- schema lives in code) and the frozen canonical text for FOREIGN
+-- (MCP) entries. Both frozen columns are TEXT, never jsonb — the
+-- thread_message.tool_args philosophy: jsonb normalizes (key order,
+-- whitespace), and envelope bytes are the KV-cache contract. Hydration
+-- replays the manifest and NEVER contacts the server.
+CREATE TABLE IF NOT EXISTS thread_toolset (
+  thread_id   text NOT NULL REFERENCES thread(id) ON DELETE CASCADE,
+  seq         int NOT NULL,                -- 0-based envelope position
+  name        text NOT NULL,               -- qualified wire name
+  description text NOT NULL DEFAULT '',   -- frozen foreign description ('' for plain)
+  schema_json text,                        -- frozen canonical schema (NULL = plain)
+  PRIMARY KEY (thread_id, seq)
+);
+
+-- The old plain-name column, superseded by thread_toolset above
+-- (plugin-api plan Phase 2). IF EXISTS keeps the migration idempotent.
+ALTER TABLE thread DROP COLUMN IF EXISTS toolset;
 
 CREATE INDEX IF NOT EXISTS thread_recency ON thread (archived_at, last_active_at DESC);
 CREATE INDEX IF NOT EXISTS thread_tags ON thread USING gin (tags);

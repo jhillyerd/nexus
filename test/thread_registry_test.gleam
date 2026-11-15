@@ -60,6 +60,7 @@ fn test_config() -> config.Config {
     plugins: [],
     plugin_timeout_ms: 30_000,
     plugin_max_output_chars: 32_768,
+    mcp_servers: [],
     // Bots P3c: the delivery hop guard; 4 = the shipped default.
     max_bot_hops: 4,
   )
@@ -608,7 +609,9 @@ fn seed_with_tags(seam: store.Store, id: String, tags: List(String)) -> Nil {
           created_at: 1_700_000_000,
         ),
         last_active_at: 1_700_000_000,
-        toolset: tools.default_names(test_config()),
+        toolset: thread_registry.plain_entries(
+          tools.default_names(test_config()),
+        ),
         message_count: 3,
       ),
       "test system prompt",
@@ -955,7 +958,9 @@ fn seed_at(
           created_at: last_active_at,
         ),
         last_active_at: last_active_at,
-        toolset: tools.default_names(test_config()),
+        toolset: thread_registry.plain_entries(
+          tools.default_names(test_config()),
+        ),
         message_count: message_count,
       ),
       "test system prompt",
@@ -1102,6 +1107,7 @@ pub fn create_rejects_disabled_provider_test() {
       disabled,
       process.new_name("nexus_bot_registry"),
       dict.new(),
+      dict.new(),
     )
   thread_registry.create_with_toolset(
     started.data,
@@ -1174,6 +1180,7 @@ fn start_registry_keeping_seam_with(
       // that never deliver.
       process.new_name("nexus_bot_registry"),
       dict.new(),
+      dict.new(),
     )
   #(started.data, persistence)
 }
@@ -1209,10 +1216,7 @@ fn seed_bot_with_tools(
 
 /// A dormant stored thread with a MANUAL title (survives the boot sweep)
 /// carrying an explicit toolset snapshot — the hydration rigs' fixture.
-fn stored_with_toolset(
-  id: String,
-  toolset: List(String),
-) -> store.StoredSummary {
+fn stored_with_toolset(id: String, names: List(String)) -> store.StoredSummary {
   store.StoredSummary(
     id: id,
     provider_id: store_mock.fixture_provider_id,
@@ -1228,7 +1232,7 @@ fn stored_with_toolset(
       bot_id: None,
       created_at: timing.wall_now_s(),
     ),
-    toolset: toolset,
+    toolset: thread_registry.plain_entries(names),
     last_active_at: timing.wall_now_s(),
     message_count: 1,
   )
@@ -1278,6 +1282,7 @@ fn boot_with_config(
       // name at ask time; no bot registry actor needs to exist for tests
       // that never deliver.
       process.new_name("nexus_bot_registry"),
+      dict.new(),
       dict.new(),
     )
   Boot(registry: started.data)
@@ -1373,7 +1378,7 @@ pub fn toolset_snapshot_persisted_at_creation_test() {
       ),
     )
   let assert Ok(stored) = seam.get_thread(explicit.id)
-  should.equal(stored.summary.toolset, ["http_fetch"])
+  should.equal(entry_names(stored.summary.toolset), ["http_fetch"])
 
   // A plain create: the default set's names, persisted verbatim.
   let assert Ok(plain) =
@@ -1382,7 +1387,10 @@ pub fn toolset_snapshot_persisted_at_creation_test() {
       new_thread(store_mock.fixture_provider_id, "alpha"),
     )
   let assert Ok(plain_stored) = seam.get_thread(plain.id)
-  should.equal(plain_stored.summary.toolset, tools.default_names(test_config()))
+  should.equal(
+    entry_names(plain_stored.summary.toolset),
+    tools.default_names(test_config()),
+  )
 }
 
 /// A `'{}'` (chat-only) toolset builds its own bundle (cache miss on the
@@ -1402,7 +1410,7 @@ pub fn chat_only_toolset_create_test() {
       ),
     )
   let assert Ok(stored) = seam.get_thread(summary.id)
-  should.equal(stored.summary.toolset, [])
+  should.equal(entry_names(stored.summary.toolset), [])
 
   // The chat-only bundle is cached by its own tuple: a second thread of
   // the same toolset resolves through the shared bundle and starts fine.
@@ -1418,7 +1426,7 @@ pub fn chat_only_toolset_create_test() {
       ),
     )
   let assert Ok(second_stored) = seam.get_thread(second.id)
-  should.equal(second_stored.summary.toolset, [])
+  should.equal(entry_names(second_stored.summary.toolset), [])
 }
 
 /// A toolset naming a tool outside the compiled catalog refuses the
@@ -1475,6 +1483,7 @@ pub fn plugin_toolset_create_resolves_through_provider_table_test() {
       fixture_resolver(),
       process.new_name("nexus_bot_registry"),
       providers,
+      dict.new(),
     )
   let registry = started.data
 
@@ -1490,7 +1499,10 @@ pub fn plugin_toolset_create_resolves_through_provider_table_test() {
       ),
     )
   let assert Ok(stored) = seam.get_thread(summary.id)
-  should.equal(stored.summary.toolset, ["http_fetch", "example__echo"])
+  should.equal(entry_names(stored.summary.toolset), [
+    "http_fetch",
+    "example__echo",
+  ])
 
   // A plugin-shaped name outside the table: same loud refusal.
   thread_registry.create(
@@ -1503,8 +1515,12 @@ pub fn plugin_toolset_create_resolves_through_provider_table_test() {
       bot_id: None,
     ),
   )
+  // Plugin-api Phase 2: a QUALIFIED name whose server half is not a
+  // mounted MCP server degrades to the honest per-server refusal (the
+  // unmounted server IS the reason) — the old catalog-miss wording
+  // survives only for names that never carried the reserved separator.
   |> should.equal(
-    Error(thread_registry.UnknownToolset("unknown tool name: nosuch__thing")),
+    Error(thread_registry.UnknownToolset("mcp server 'nosuch' is not available")),
   )
 }
 
@@ -1529,7 +1545,7 @@ pub fn create_from_bot_toolset_snapshot_test() {
       ),
     )
   let assert Ok(stored) = seam.get_thread(summary.id)
-  should.equal(stored.summary.toolset, ["http_fetch"])
+  should.equal(entry_names(stored.summary.toolset), ["http_fetch"])
   should.equal(stored.summary.meta.bot_id, Some("b-tools"))
 
   // The NULL-tools bot is the LIVE template half: `None` resolves to
@@ -1551,7 +1567,7 @@ pub fn create_from_bot_toolset_snapshot_test() {
     )
   let assert Ok(stored) = seam.get_thread(from_default_bot.id)
   should.equal(
-    stored.summary.toolset,
+    entry_names(stored.summary.toolset),
     list.append(tools.default_names(test_config()), ["bot_message"]),
   )
 
@@ -1569,8 +1585,14 @@ pub fn create_from_bot_toolset_snapshot_test() {
       ),
     )
   let assert Ok(stored) = seam.get_thread(plain.id)
-  should.equal(stored.summary.toolset, tools.default_names(test_config()))
-  should.equal(list.contains(stored.summary.toolset, "bot_message"), False)
+  should.equal(
+    entry_names(stored.summary.toolset),
+    tools.default_names(test_config()),
+  )
+  should.equal(
+    list.contains(entry_names(stored.summary.toolset), "bot_message"),
+    False,
+  )
 }
 
 /// THE shared orchestration (the gap the registry-level snapshot tests
@@ -1613,6 +1635,7 @@ pub fn create_from_bot_orchestration_carries_bot_toolset_test() {
       // that never deliver.
       process.new_name("nexus_bot_registry"),
       dict.new(),
+      dict.new(),
     )
   let registry = started_registry.data
 
@@ -1632,7 +1655,7 @@ pub fn create_from_bot_orchestration_carries_bot_toolset_test() {
   let assert Ok(summary) =
     thread_create.create_thread_from_bot(bots, providers, registry, bot_row.id)
   let assert Ok(stored) = seam.get_thread(summary.id)
-  should.equal(stored.summary.toolset, ["http_fetch"])
+  should.equal(entry_names(stored.summary.toolset), ["http_fetch"])
   should.equal(stored.summary.meta.bot_id, Some(bot_row.id))
 
   // The chat-only bot's empty set survives the same path.
@@ -1651,7 +1674,7 @@ pub fn create_from_bot_orchestration_carries_bot_toolset_test() {
   let assert Ok(chat_summary) =
     thread_create.create_thread_from_bot(bots, providers, registry, chat_bot.id)
   let assert Ok(chat_stored) = seam.get_thread(chat_summary.id)
-  should.equal(chat_stored.summary.toolset, [])
+  should.equal(entry_names(chat_stored.summary.toolset), [])
 }
 
 /// A dormant thread's PERSISTED toolset rehydrates through the same
@@ -1737,7 +1760,7 @@ pub fn toolset_snapshot_survives_changed_default_config_test() {
   let assert Ok(spec) = process.receive(spec_captor, 5000)
   should.equal(spec.toolset.names, ["web_search"])
   let assert Ok(stored) = seam.get_thread("s-pin")
-  should.equal(stored.summary.toolset, ["web_search"])
+  should.equal(entry_names(stored.summary.toolset), ["web_search"])
 }
 
 /// The create seam carries the WHOLE toolset bundle (#76): the created
@@ -1768,6 +1791,7 @@ pub fn create_with_toolset_carries_the_whole_bundle_test() {
       // name at ask time; no bot registry actor needs to exist for tests
       // that never deliver.
       process.new_name("nexus_bot_registry"),
+      dict.new(),
       dict.new(),
     )
   let registry = started.data
@@ -1823,7 +1847,9 @@ pub fn dormant_summary_carries_bot_provenance_test() {
           created_at: 1_700_000_000,
         ),
         last_active_at: 1_700_000_000,
-        toolset: tools.default_names(test_config()),
+        toolset: thread_registry.plain_entries(
+          tools.default_names(test_config()),
+        ),
         message_count: 3,
       ),
       "frozen",
@@ -1848,6 +1874,7 @@ pub fn dormant_summary_carries_bot_provenance_test() {
       // name at ask time; no bot registry actor needs to exist for tests
       // that never deliver.
       process.new_name("nexus_bot_registry"),
+      dict.new(),
       dict.new(),
     )
 
@@ -1875,6 +1902,7 @@ pub fn dormant_summary_carries_bot_provenance_test() {
       // name at ask time; no bot registry actor needs to exist for tests
       // that never deliver.
       process.new_name("nexus_bot_registry"),
+      dict.new(),
       dict.new(),
     )
   let after = thread_registry.list_threads(rebooted.data)
@@ -1925,7 +1953,9 @@ pub fn bot_delete_scrubs_cached_provenance_test() {
             created_at: 1_700_000_000,
           ),
           last_active_at: 1_700_000_000,
-          toolset: tools.default_names(test_config()),
+          toolset: thread_registry.plain_entries(
+            tools.default_names(test_config()),
+          ),
           message_count: 3,
         ),
         "frozen",
@@ -2026,4 +2056,8 @@ pub fn unpersisted_create_carries_no_provenance_test() {
   // Nothing was stored, so nothing could resurrect the pointer later.
   let assert Error(_) = seam.get_thread(summary.id)
   Nil
+}
+
+fn entry_names(entries: List(tools.ToolsetEntry)) -> List(String) {
+  list.map(entries, fn(entry) { entry.name })
 }

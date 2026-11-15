@@ -56,6 +56,7 @@ fn test_config() -> config.Config {
     plugins: [],
     plugin_timeout_ms: 2000,
     plugin_max_output_chars: 32_768,
+    mcp_servers: [],
   )
 }
 

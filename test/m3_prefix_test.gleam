@@ -394,6 +394,7 @@ fn start_registry() -> process.Subject(thread_registry.Msg) {
       // that never deliver.
       process.new_name("nexus_bot_registry"),
       dict.new(),
+      dict.new(),
     )
   started.data
 }

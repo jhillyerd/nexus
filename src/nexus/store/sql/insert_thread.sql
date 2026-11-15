@@ -1,14 +1,31 @@
--- A new thread row: created/last_active from the registry's epoch
--- seconds; message_count is the transcript length (1 = system prompt).
+-- A new thread row + its frozen toolset manifest in ONE statement
+-- (plugin-api plan Phase 2): the manifest rows ride a CTE off the
+-- inserted thread's id, so a half-thread (row without manifest) can
+-- never exist. Created/last_active from the registry's epoch seconds;
+-- message_count is the transcript length (1 = system prompt).
 -- provider_id is frozen at creation with the model (contract rule 2).
--- toolset is the bots plan P2 snapshot: the RESOLVED tool names persisted
--- at creation (the default set's, or the creating bot's) — always
--- populated, never NULL-for-default, so neither a config change nor a
--- bot edit can re-aim this thread's envelope.
+-- The manifest arrives as ONE json array param ($12) — a transport
+-- encoding only; the stored columns stay TEXT (jsonb normalizes, which
+-- would break the byte-identical hydration contract). Entries:
+-- [{"seq":N,"name":"<qualified>","description":"...","schema_json":...|"null"}]
+-- in envelope order; schema_json null = a plain in-process name.
 -- bot_id is provenance only (bots plan P1): the '' sentinel inserts
--- NULL (see insert_bot.sql) — a thread created without a bot.
+-- NULL (see insert_bot.sql).
 -- tags_manual is '{}' literally and tags_source is left to its column
 -- default 'auto' (utility-tags plan §3.5): a new thread has no tags and
 -- an open auto path.
-insert into thread (id, provider_id, title, title_source, model, system_prompt, pinned, tags, tags_manual, created_at, last_active_at, message_count, toolset, bot_id)
-values ($1, $2, $3, $4, $5, $6, $7, $8, '{}', to_timestamp($9), to_timestamp($9), $10, $11::text[], nullif($12, ''))
+with new_thread as (
+  insert into thread (id, provider_id, title, title_source, model, system_prompt, pinned, tags, tags_manual, created_at, last_active_at, message_count, bot_id)
+  values ($1, $2, $3, $4, $5, $6, $7, $8, '{}', to_timestamp($9), to_timestamp($9), $10, nullif($11, ''))
+  returning id
+)
+insert into thread_toolset (thread_id, seq, name, description, schema_json)
+select
+  new_thread.id,
+  e.seq,
+  e.name,
+  e.description,
+  e.schema_json
+from new_thread,
+     json_to_recordset($12::json)
+       as e(seq int, name text, description text, schema_json text)

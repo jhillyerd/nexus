@@ -69,8 +69,10 @@ a live registry.
 ```mermaid
 flowchart TB
     PSUP["plugin_sup (OneForOne, linked to boot)<br/>nexus/plugin — only when NEXUS_PLUGINS is set"]
+    MSUP["mcp_sup (OneForOne, linked to boot)<br/>nexus/mcp_adapter — only when NEXUS_MCP_SERVERS_JSON is set"]
     ROOT["root supervisor (OneForAll)<br/>nexus/boot"]
     PSUP -.->|"boot runs plugin.boot: starts the tree, then<br/>the bounded ListTools snapshot whose table<br/>feeds the root's consumers"| ROOT
+    MSUP -.->|"boot runs mcp_adapter.boot: starts the tree, then<br/>the bounded ListTools ask per server — a server that<br/>will not answer DEGRADES (loud log, absent from the<br/>foreign map; the honest 400 at create), never fails boot"| ROOT
     ROOT -->|"1 — persistence is mandatory;<br/>unreachable DB fails boot"| STORE["store actor<br/>nexus/store/persist"]
     ROOT -->|"2 — loads + decrypt-validates<br/>every provider row"| PROV["provider registry<br/>nexus/provider_registry"]
     ROOT -->|"3 — loads every bot row"| BOT["bot registry<br/>nexus/bot_registry"]
@@ -93,6 +95,21 @@ VALUE that boot hands to both consumers (the bot registry's toolset
 validation closure and the thread registry's resolution) — root-tree
 children cannot hand values to each other. With `NEXUS_PLUGINS` unset
 no tree is started and the boot is the pre-plugin boot, byte for byte.
+
+Beside it sits a second provider tree (plugin-api plan Phase 2):
+`mcp_sup`, a OneForOne supervisor over the configured MCP stdio servers
+(`NEXUS_MCP_SERVERS_JSON`), also linked to boot — but with the OPPOSITE
+failure posture, because a server is an external dependency (like
+SearxNG absence), not part of the release. The adapter actors never
+crash: a server that will not spawn, answer, or produce a valid catalog
+degrades to a loud log and an absent entry in the FOREIGN map (the
+second value boot threads to the root's consumers), so creates naming
+its tools refuse with the honest 400; a server that dies mid-life puts
+its adapter into a `Down` phase and every call renders the honest tool
+error until the next nexus restart re-spawns it. MCP tools never enter
+the provider table: their schemas freeze into the per-thread manifest
+(`thread_toolset`) at create-time via a LIVE `tools/list` ask, and
+hydration replays the frozen text without ever contacting the server.
 
 Crash policy: the tree is deliberately aggressive. A crash loop at the root
 halts the VM and the *outer* supervisor (Nomad job / run script) restarts it

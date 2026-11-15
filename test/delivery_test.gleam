@@ -66,6 +66,7 @@ fn test_config() -> Config {
     plugins: [],
     plugin_timeout_ms: 30_000,
     plugin_max_output_chars: 32_768,
+    mcp_servers: [],
     max_bot_hops: 4,
   )
 }
@@ -113,6 +114,7 @@ fn boot() -> Booted {
       seam,
       fn(_id) { Ok(refused_endpoint()) },
       bots_name,
+      dict.new(),
       dict.new(),
     )
   Booted(registry: started_registry.data, bots: started_bots.data, seam:)
