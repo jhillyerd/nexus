@@ -1509,17 +1509,10 @@ pub fn view_renders_bot_message_chip_test() {
 pub fn view_renders_roster_status_line_test() {
   let model =
     new_model()
-    |> step(ui.UserEcho(
-      "environment attached: \"workspace\". attached targets: workspace.",
-      None,
-      Some("system"),
-    ))
+    |> step(ui.UserEcho("attached targets: workspace.", None, Some("system")))
   let html = view_string(model)
   should.be_true(string.contains(html, "turn status"))
-  should.be_true(string.contains(
-    html,
-    "environment attached: &quot;workspace&quot;",
-  ))
+  should.be_true(string.contains(html, "attached targets: workspace."))
   // Not a chat bubble: no user pill, no origin badge.
   should.be_false(string.contains(html, "turn user"))
   should.be_false(string.contains(html, "class=\"origin\""))

@@ -525,6 +525,16 @@ pub type Msg {
   )
   /// Cancel the in-flight turn, if any.
   Stop
+  /// Attach a target to the live roster (environments plan Phase 2a).
+  /// The name is validated (charset, `workspace` reserved, no duplicate
+  /// live) and the change applies immediately when the thread is idle, or
+  /// queues behind an in-flight turn (applied at `WorkerDone`) — a reply
+  /// carries `Ok(Nil)` on accept (now or queued) or `Error` on refusal.
+  /// Does NOT trigger a turn; appends the tail roster line as a
+  /// system-author status row (never a request-byte change).
+  AttachTarget(name: String, reply: Subject(Result(Nil, String)))
+  /// Detach a target from the live roster (symmetric to `AttachTarget`).
+  DetachTarget(name: String, reply: Subject(Result(Nil, String)))
   /// Current transcript (for M2 thread resume / tests).
   Snapshot(reply: Subject(Transcript))
   /// Current status for the registry's thread list (M2 §4.2).
@@ -567,6 +577,17 @@ type TurnState {
     started_us: Int,
     first_delta_us: Option(Int),
   )
+}
+
+/// One queued roster mutation (environments plan Phase 2a): an attach or
+/// detach that arrived while a turn was in flight, held in
+/// `State.pending_roster` and applied — in arrival order — after
+/// `WorkerDone`. `name` is already VALIDATED (reserved/duplicate/charset
+/// checked at enqueue so a bad request refuses fast rather than silently
+/// queueing).
+type RosterChange {
+  RosterAttach(name: String)
+  RosterDetach(name: String)
 }
 
 /// Display-only mirror of the turn in flight: the transcript as of `Send`
@@ -653,6 +674,26 @@ type State {
     /// Phase 2 write-behind observer — the store's commit lane. Runs at
     /// commit points only, is a plain send, and never blocks.
     commit_hook: fn(Transcript) -> Nil,
+    /// The LIVE attached-target roster (environments plan Phase 2a): the
+    /// list `route` resolves against, in stable order with `workspace`
+    /// first (seeded `["workspace"]` on env-toolset threads, `[]` on
+    /// plain threads) and grown/shrunk by `AttachTarget`/`DetachTarget`.
+    /// Actor-owned: it is the SAME list the runner's `Environment.roster`
+    /// must reflect for `route` to see attach/detach — but the runner's
+    /// handle is a FROZEN value baked in at create/hydrate (Phase 1), so
+    /// this actor field is the source of truth until 2a's step-5 live
+    /// source threads it through. Names-only for now: the
+    /// `target → execution subject` map arrives with 2b's node adapter.
+    roster: List(String),
+    /// Roster changes queued while a turn is in flight (environments
+    /// plan Phase 2a ordering): an attach/detach landing mid-turn must
+    /// NOT append to the transcript the worker still owns (an actor-side
+    /// append before `WorkerDone` would be clobbered on install), so it
+    /// lands here and applies — in arrival order — after `WorkerDone`
+    /// installs the worker's transcript and before the next request is
+    /// built. Validation happens at ENQUEUE (fast refusal), not at
+    /// apply.
+    pending_roster: List(RosterChange),
     /// Utility side-call state (utility-titles plan §4.2).
     utility: UtilityState,
     /// A debounce is OWED: `UtilityStart` fired while a turn was in flight
@@ -776,6 +817,18 @@ fn start_builder(spec: ThreadSpec) {
       metrics: [],
       last_commit_s: 0,
       commit_hook: commit_hook,
+      // Roster seed (environments plan Phase 2a): an env-toolset thread
+      // starts with `workspace` attached; a plain thread with none.
+      // Derived from the FROZEN toolset names — the same fact the
+      // registry used to freeze `workspace_root` — so the seed can never
+      // drift from whether env tools exist.
+      roster: case
+        toolset.names |> list.any(fn(name) { env.is_env_name(name) })
+      {
+        True -> env.attached_targets()
+        False -> []
+      },
+      pending_roster: [],
       utility_apply: utility_apply,
     ))
     |> actor.returning(self)
@@ -1042,6 +1095,14 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           actor.continue(state)
         }
       }
+
+    AttachTarget(name, reply) -> {
+      handle_roster_change(state, RosterAttach(name), reply)
+    }
+
+    DetachTarget(name, reply) -> {
+      handle_roster_change(state, RosterDetach(name), reply)
+    }
 
     Snapshot(reply) -> {
       process.send(reply, state.transcript)
@@ -1331,8 +1392,11 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
             )
           // The utility trigger (utility-titles plan §4.2): the turn
           // committed → maybe arm the title-branch debounce. A failed turn
-          // (nothing committed) never triggers it.
-          actor.continue(arm_utility(state, committed))
+          // (nothing committed) never triggers it. Queued roster changes
+          // (environments plan Phase 2a) drain FIRST — they must land
+          // after the worker's transcript installs and before the next
+          // request is built, and the utility arm reads commit state.
+          actor.continue(arm_utility(drain_pending_roster(state), committed))
         }
       }
     }
@@ -1513,7 +1577,13 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
                       failure_reason: Some("turn worker exited unexpectedly"),
                     ),
                   ),
-                ),
+                )
+                // Queued roster changes (environments plan Phase 2a) drain
+                // here too: a crashed worker installs NO transcript, so
+                // there is nothing to clobber — the queued attach/detach
+                // apply against the committed transcript exactly as they
+                // would after `WorkerDone` (which is unreachable now).
+                |> drain_pending_roster,
               )
             }
           }
@@ -1531,6 +1601,129 @@ fn emit(state: State, kind: EventKind) -> Nil {
   dict.each(state.subs, fn(sub, subscriber) {
     process.send(sub, ThreadEvent(state.id, subscriber.visit, kind))
   })
+}
+
+// ---------------------------------------------------------------------------
+// Roster attach/detach (environments plan Phase 2a)
+// ---------------------------------------------------------------------------
+
+/// Compute the roster a change produces, or the loud refusal. Pure:
+/// `workspace` is validated as reserved by `env.valid_target_name`; an
+/// attach is refused when the name is already live; a detach is refused
+/// when it is not (and `workspace` is never detachable — it is the
+/// thread's own environment and always attached). Names-only for now.
+fn compute_roster(
+  roster: List(String),
+  change: RosterChange,
+) -> Result(List(String), String) {
+  case change {
+    RosterAttach(name) -> {
+      use Nil <- result.try(env.valid_target_name(name))
+      case list.contains(roster, name) {
+        True -> Error("target \"" <> name <> "\" is already attached")
+        False -> Ok(list.append(roster, [name]))
+      }
+    }
+    RosterDetach(name) -> {
+      case name {
+        "workspace" -> Error("target 'workspace' cannot be detached")
+        _ ->
+          case list.contains(roster, name) {
+            True -> Ok(list.filter(roster, fn(x) { x != name }))
+            False -> Error("target \"" <> name <> "\" is not attached")
+          }
+      }
+    }
+  }
+}
+
+/// The tail roster line appended on every successful attach/detach: a
+/// terse system-author status row naming the CURRENT full list. It is a
+/// committed transcript row (replayed and persisted like any message),
+/// emitted live as a `UserEcho` so clients render it without reload, and
+/// never triggers a turn.
+fn apply_roster_change(
+  state: State,
+  change: RosterChange,
+  new_roster: List(String),
+) -> State {
+  let stamped = timing.wall_now_s()
+  let text = case change {
+    RosterAttach(_) -> env.roster_attach_text("", new_roster)
+    RosterDetach(_) -> env.roster_detach_text("", new_roster)
+  }
+  let tr =
+    state.transcript
+    |> transcript.append_user(text)
+    |> transcript.mark_origin(Some("system"), 0)
+    |> transcript.stamp(stamped)
+  emit(state, UserEcho(text, Some(stamped), Some("system")))
+  let _ = state.commit_hook(tr)
+  State(..state, roster: new_roster, transcript: tr, last_commit_s: stamped)
+}
+
+/// Handle one attach/detach: validate against the CURRENT roster (or,
+/// mid-turn, against the roster the already-queued changes will produce),
+/// then either apply immediately (idle) or enqueue for `WorkerDone`.
+/// A refused change replies `Error` and changes nothing; an accepted one
+/// replies `Ok(Nil)` (whether applied now or queued).
+fn handle_roster_change(
+  state: State,
+  change: RosterChange,
+  reply: Subject(Result(Nil, String)),
+) -> actor.Next(State, Msg) {
+  // The preview roster the change would act against: mid-turn, the
+  // already-queued changes apply first (the live roster is frozen for
+  // the turn's duration), so validation sees the SAME list the drain
+  // will — no duplicate attach or double detach can squeeze through.
+  let preview =
+    list.fold(state.pending_roster, state.roster, fn(acc, queued) {
+      case compute_roster(acc, queued) {
+        Ok(next) -> next
+        Error(_) -> acc
+      }
+    })
+  case compute_roster(preview, change) {
+    Error(reason) -> {
+      process.send(reply, Error(reason))
+      actor.continue(state)
+    }
+    Ok(new_roster) ->
+      case state.turn {
+        Idle -> {
+          process.send(reply, Ok(Nil))
+          actor.continue(apply_roster_change(state, change, new_roster))
+        }
+        Starting(..) | Streaming(..) -> {
+          process.send(reply, Ok(Nil))
+          actor.continue(
+            State(
+              ..state,
+              pending_roster: list.append(state.pending_roster, [change]),
+            ),
+          )
+        }
+      }
+  }
+}
+
+/// Drain the queued roster changes after `WorkerDone`: the worker's
+/// transcript is now installed, so each change applies to the REAL
+/// transcript in arrival order (the ordering the plan requires — the
+/// actor-side append must land after install, before the next request).
+/// Each already validated at enqueue against the same preview, so the
+/// fold succeeds; an impossible `Error` is dropped (defensive).
+fn drain_pending_roster(state: State) -> State {
+  list.fold(
+    state.pending_roster,
+    State(..state, pending_roster: []),
+    fn(s, change) {
+      case compute_roster(s.roster, change) {
+        Ok(new_roster) -> apply_roster_change(s, change, new_roster)
+        Error(_) -> s
+      }
+    },
+  )
 }
 
 // ---------------------------------------------------------------------------

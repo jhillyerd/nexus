@@ -171,6 +171,23 @@ fn crashing_runner(
   thread.StreamErrored("unreachable")
 }
 
+/// Streams one token (so the turn reaches `Streaming`), then parks on a
+/// gate, then — on gate release — KILLS its own worker process, driving
+/// the `WorkerDown` path (not `WorkerDone`). The gate lets a test queue a
+/// roster change while the worker is truly mid-turn before it dies.
+fn crash_after_gate_runner(
+  gate_request: process.Subject(process.Subject(Nil)),
+) -> thread.TurnRunner {
+  fn(_endpoint, _tr, _cancel, _delivery, _environment, on_event) {
+    on_event(loop.StreamEvent(openai.TokenDelta("partial")))
+    let gate = process.new_subject()
+    process.send(gate_request, gate)
+    let _ = process.receive(gate, 5000)
+    process.kill(process.self())
+    thread.StreamErrored("unreachable")
+  }
+}
+
 type CounterMsg {
   Ping(reply: process.Subject(Int))
 }
@@ -368,6 +385,27 @@ fn start_with(runner: thread.TurnRunner) -> process.Subject(thread.Msg) {
       commit_hook: fn(_) { Nil },
       // The registry normally builds this; tests build it directly
       // through the same one construction path.
+      transcript: transcript.new("test-alias", ""),
+      hydrated: False,
+      utility_apply: no_utility_apply,
+    ))
+  started.data
+}
+
+/// A thread whose FROZEN toolset names an env tool — so the actor seeds
+/// its roster `["workspace"]` (environments plan Phase 2a). The runner
+/// is intentionally fake: roster tests never run a turn, and the specs
+/// are irrelevant to the seeding (only `names` drives it).
+fn start_with_env(runner: thread.TurnRunner) -> process.Subject(thread.Msg) {
+  let base = toolset(runner, no_utility_runner)
+  let env_toolset = thread.Toolset(..base, names: ["bash"])
+  let assert Ok(started) =
+    thread.start_with_spec(thread.ThreadSpec(
+      id: test_thread_id,
+      cfg: test_config(),
+      endpoint: test_endpoint(),
+      toolset: env_toolset,
+      commit_hook: fn(_) { Nil },
       transcript: transcript.new("test-alias", ""),
       hydrated: False,
       utility_apply: no_utility_apply,
@@ -2044,4 +2082,212 @@ pub fn inspect_midturn_sees_mirror_then_settles_test() {
   // contract) returns just what it appended — system + user + final
   // assistant. The mirror was event-driven, independent of it.
   should.equal(3, transcript.length(after.transcript))
+}
+
+// ---------------------------------------------------------------------------
+// Roster attach/detach (environments plan Phase 2a)
+// ---------------------------------------------------------------------------
+
+/// Drive one roster change against an IDLE thread and return its reply
+/// and the live `UserEcho` the tail line emits (the system-author status
+/// row). `start_with_env` seeds the roster `["workspace"]`.
+fn attach(
+  sess: process.Subject(thread.Msg),
+  sub: process.Subject(thread.ThreadEvent),
+  name: String,
+) -> Result(Nil, String) {
+  let reply = process.new_subject()
+  process.send(sess, thread.AttachTarget(name, reply))
+  let result = process.receive(reply, 2000)
+  // The tail line fans out immediately (idle path): a system-author
+  // UserEcho naming the CURRENT full list.
+  let assert thread.ThreadEvent(
+    _sid,
+    _v,
+    thread.UserEcho(text, Some(_stamp), Some("system")),
+  ) = expect_event(sub)
+  let assert Ok(r) = result
+  should.be_true(string.starts_with(text, "attached targets: "))
+  r
+}
+
+pub fn attach_grows_roster_and_appends_tail_line_test() {
+  let sess = start_with_env(happy_runner)
+  let sub = join(sess)
+  expect_event(sub) |> should.equal(scoped(thread.Hello("test-alias", 1, [])))
+
+  let assert Ok(Nil) = attach(sess, sub, "proxmox-2")
+  // Detach is symmetric.
+  let reply = process.new_subject()
+  process.send(sess, thread.DetachTarget("proxmox-2", reply))
+  let assert Ok(Ok(Nil)) = process.receive(reply, 2000)
+  let assert thread.ThreadEvent(
+    _,
+    _,
+    thread.UserEcho("attached targets: workspace.", Some(_), Some("system")),
+  ) = expect_event(sub)
+}
+
+pub fn attach_refuses_reserved_and_duplicate_test() {
+  let sess = start_with_env(happy_runner)
+  let sub = join(sess)
+  expect_event(sub) |> should.equal(scoped(thread.Hello("test-alias", 1, [])))
+
+  // `workspace` is reserved and refused.
+  let reply = process.new_subject()
+  process.send(sess, thread.AttachTarget("workspace", reply))
+  let assert Ok(Error("target name 'workspace' is reserved")) =
+    process.receive(reply, 2000)
+  // A duplicate live attach is refused.
+  let assert Ok(Nil) = attach(sess, sub, "node-1")
+  let reply2 = process.new_subject()
+  process.send(sess, thread.AttachTarget("node-1", reply2))
+  let assert Ok(Error(reason)) = process.receive(reply2, 2000)
+  reason |> should.equal("target \"node-1\" is already attached")
+  // Detaching a non-attached name refuses.
+  let reply3 = process.new_subject()
+  process.send(sess, thread.DetachTarget("ghost", reply3))
+  let assert Ok(Error(reason2)) = process.receive(reply3, 2000)
+  reason2 |> should.equal("target \"ghost\" is not attached")
+}
+
+pub fn attach_refuses_bad_charset_test() {
+  let sess = start_with_env(happy_runner)
+  let sub = join(sess)
+  expect_event(sub) |> should.equal(scoped(thread.Hello("test-alias", 1, [])))
+  let reply = process.new_subject()
+  process.send(sess, thread.AttachTarget("bad name", reply))
+  let assert Ok(Error(reason)) = process.receive(reply, 2000)
+  should.be_true(string.contains(reason, "must match ^[a-zA-Z0-9_-]+$"))
+}
+
+pub fn attach_mid_turn_queues_until_worker_done_test() {
+  // The ordering rule (environments plan Phase 2a): an attach landing
+  // while the worker owns the extended transcript must NOT append to the
+  // transcript the worker will install (an actor-side append before
+  // WorkerDone would be clobbered). It queues, replies Ok, emits no tail
+  // line yet, and applies AFTER the worker installs its transcript —
+  // so the subscriber sees TurnDone first, THEN the roster UserEcho.
+  let gate_request = process.new_subject()
+  let sess = start_with_env(gated_runner(gate_request))
+  let sub = join(sess)
+  let _ = expect_event(sub)
+
+  should.equal(thread.send_message(sess, "research it"), thread.Sent)
+  // The turn is now in flight (Starting/Streaming): the worker owns the
+  // extended transcript.
+  expect_user_echo(sub, "research it")
+
+  // Attach while the turn is in flight: accepted (queued), NO UserEcho
+  // emitted yet.
+  let reply = process.new_subject()
+  process.send(sess, thread.AttachTarget("proxmox-2", reply))
+  let assert Ok(Ok(Nil)) = process.receive(reply, 2000)
+  let snapshot = thread.snapshot(sess)
+  // The committed transcript is STILL just system + user (the attach has
+  // NOT been appended — it is queued, not clobbered).
+  should.equal(2, transcript.length(snapshot))
+
+  // Release the worker; the turn commits, THEN the queued attach applies.
+  let assert Ok(gate) = process.receive(gate_request, 5000)
+  process.send(gate, Nil)
+  drain_until_turn_done(sub)
+  // After TurnDone: the tail line lands (system-author roster row).
+  let assert thread.ThreadEvent(
+    _,
+    _,
+    thread.UserEcho(text, Some(_), Some("system")),
+  ) = expect_event(sub)
+  should.equal(text, "attached targets: workspace, proxmox-2.")
+
+  // The transcript now carries the roster row appended AFTER the turn.
+  let after = thread.snapshot(sess)
+  should.equal(4, transcript.length(after))
+}
+
+pub fn queued_roster_preview_fold_test() {
+  // The queue's preview fold (environments plan Phase 2a): while a turn
+  // is in flight, a NEW change validates against the roster the
+  // already-queued changes will produce — so a duplicate attach against
+  // a still-queued name refuses, and a detach of a still-queued name
+  // applies in arrival order after WorkerDone.
+  let gate_request = process.new_subject()
+  let sess = start_with_env(gated_runner(gate_request))
+  let sub = join(sess)
+  let _ = expect_event(sub)
+  should.equal(thread.send_message(sess, "research it"), thread.Sent)
+  expect_user_echo(sub, "research it")
+
+  // Queue an attach of "proxmox-2".
+  let r1 = process.new_subject()
+  process.send(sess, thread.AttachTarget("proxmox-2", r1))
+  let assert Ok(Ok(Nil)) = process.receive(r1, 2000)
+  // A SECOND attach of the same name, still queued, refuses against the
+  // preview (the live roster has not changed mid-turn).
+  let r2 = process.new_subject()
+  process.send(sess, thread.AttachTarget("proxmox-2", r2))
+  let assert Ok(Error("target \"proxmox-2\" is already attached")) =
+    process.receive(r2, 2000)
+  // A detach of the still-queued name is accepted — the preview lists it
+  // (attached by the queued change ahead of it).
+  let r3 = process.new_subject()
+  process.send(sess, thread.DetachTarget("proxmox-2", r3))
+  let assert Ok(Ok(Nil)) = process.receive(r3, 2000)
+
+  // Release: the two queued changes apply in order — attach, then detach
+  // — netting back to just `workspace`, with a tail line per change.
+  let assert Ok(gate) = process.receive(gate_request, 5000)
+  process.send(gate, Nil)
+  drain_until_turn_done(sub)
+  let assert thread.ThreadEvent(
+    _,
+    _,
+    thread.UserEcho(
+      "attached targets: workspace, proxmox-2.",
+      Some(_),
+      Some("system"),
+    ),
+  ) = expect_event(sub)
+  let assert thread.ThreadEvent(
+    _,
+    _,
+    thread.UserEcho("attached targets: workspace.", Some(_), Some("system")),
+  ) = expect_event(sub)
+}
+
+pub fn queued_roster_drains_on_worker_down_test() {
+  // The crash-path drain (environments plan Phase 2a): a roster change
+  // queued while the worker is mid-turn must still apply when the worker
+  // DIES instead of completing — `WorkerDown` installs no transcript, so
+  // the queued attach applies after `TurnFailed` rather than being
+  // stranded forever (cubic review).
+  let gate_request = process.new_subject()
+  let sess = start_with_env(crash_after_gate_runner(gate_request))
+  let sub = join(sess)
+  let _ = expect_event(sub)
+
+  should.equal(thread.send_message(sess, "doomed"), thread.Sent)
+  expect_user_echo(sub, "doomed")
+  // The worker emits one token before parking: consume it so the next
+  // event is the crash (TurnFailed), not leftover streaming.
+  expect_event(sub) |> should.equal(scoped(thread.Token("partial")))
+
+  // Queue an attach while the worker parks mid-turn.
+  let reply = process.new_subject()
+  process.send(sess, thread.AttachTarget("proxmox-2", reply))
+  let assert Ok(Ok(Nil)) = process.receive(reply, 2000)
+
+  // Release the gate: the worker kills itself → WorkerDown → TurnFailed,
+  // THEN the queued attach drains and its roster row lands.
+  let assert Ok(gate) = process.receive(gate_request, 5000)
+  process.send(gate, Nil)
+  let assert thread.ThreadEvent(_, 1, thread.TurnFailed(reason, _)) =
+    expect_event(sub)
+  should.be_true(string.contains(reason, "worker"))
+  let assert thread.ThreadEvent(
+    _,
+    _,
+    thread.UserEcho(text, Some(_), Some("system")),
+  ) = expect_event(sub)
+  should.equal(text, "attached targets: workspace, proxmox-2.")
 }

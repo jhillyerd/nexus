@@ -91,19 +91,29 @@ adapter, never as this transport).
   determinism and replay fall out for free.
 - Shape (terse, stable, self-healing — the full attached list is repeated
   so a stale belief corrects on the next event):
-  `[system] environment attached: "proxmox-2" (linux/x86_64, hostname pve2). attached targets: workspace, proxmox-2.`
-  and symmetrically for detach: `[system] environment detached: "proxmox-2". attached targets: workspace.`
+  `[system] attached targets: workspace, proxmox-2.`
+  The tail-short form (settled in Phase 2a) drops the per-node metadata
+  and the direction from the line — the human pane's Environments
+  section carries hostname/arch/direction from the event stream, and the
+  transcript line keeps only what the model needs: the CURRENT list,
+  token-minimal for small context windows. Phase 1 emitted a richer
+  creation-time line (`environment attached: "<target>" …`) for the
+  workspace seed; Phase 2a normalizes the workspace seed row, attach,
+  AND detach to the tail form (the seed row flows through the same
+  `roster_attach_text` path, so it changes with the rest).
 - **They never trigger a turn.** Roster messages are passive context; the
   agent does not wake on attach (no runaway loops). The user's next Send
   — from web or TUI — carries the turn.
-- **Ordering**: the thread actor serializes. An attach during an
-  in-flight turn is queued behind it — NEW pending machinery beside the
-  existing `Busy` refusal (a late `Send` today is rejected, not queued;
-  `utility_pending` is a debounce flag, not a queue), and it must queue
-  on the actor side because the worker owns the extended transcript
-  mid-turn — an actor-side append before `WorkerDone` would be clobbered
-  when the worker installs its transcript. The message lands after
-  `WorkerDone`, before the next request is built.
+- **Ordering**: the thread actor serializes. A roster change (attach OR
+  detach) during an in-flight turn is queued behind it — NEW pending
+  machinery beside the existing `Busy` refusal (a late `Send` today is
+  rejected, not queued; `utility_pending` is a debounce flag, not a
+  queue), and it must queue on the actor side because the worker owns
+  the extended transcript mid-turn — an actor-side append before
+  `WorkerDone` would be clobbered when the worker installs its
+  transcript. The message lands after `WorkerDone` (or `WorkerDown`, for
+  a crashed worker, which installs nothing), before the next request is
+  built.
 
 ### Fail fast (verified against the loop)
 
@@ -285,7 +295,7 @@ mechanics discovered mid-build):
   subject in the executor itself), and the v1 roster is the constant
   `["workspace"]` carried by the handle and the creation-time roster
   message. The thread-actor roster map (target → execution subject)
-  and the queued-attach machinery arrive with Phase 2, the first
+  and the queued-attach machinery arrive with Phase 2a, the first
   feature that needs live roster state (nodes attach mid-thread).
 - **The environment rides `TurnRunner` beside `delivery`** (the bots
   P3c precedent): `tools.ToolCtx` gained `environment:
@@ -343,15 +353,114 @@ mechanics discovered mid-build):
   absolute paths must already live inside it; symlinks are not
   resolved (the accepted v1 hygiene posture, now pinned by tests).
 
-### Phase 2 — node registry + client protocol + TUI
+### Phase 2a — live roster state + attach/detach (this slice)
+
+Sliced from the original Phase 2 for review: this slice owns ONLY the
+live-roster machinery — the thing Phase 1's `["workspace"]` constant
+was explicitly deferring. The node table, `/node/ws` client protocol,
+adapter actor, fake-node e2e, and TUI all move to Phase 2b (unchanged
+in substance, re-labelled for the split). Phase 2b needs a roster that
+actually routes, so this slice lands first as its own reviewable unit.
+
+**The model-facing-roster decision (settled, token-minimal).** Roster
+changes ride MESSAGES, never the envelope — but the model can only act
+on what it has IN its window, and the plan's single creation-time
+attach line scrolled off long ago. The fix is to keep the roster
+**queryable at the committed transcript's tail**: each attach/detach
+re-appends one terse user-role, author-`system` status line naming the
+CURRENT full attached list, so the newest context the model sees always
+names every live target. Terse by rule (one line, `"attached targets:
+a, b"`), minimised for small-context local models. Prior roster lines
+remain ordinary committed transcript rows — nothing replays a roster
+history into the request, so a provider that truncates context to the
+tail keeps only the most recent line; a long-context provider simply
+carries whichever old rows are still in its window (the same economics
+as any other transcript growth). The bot-channels info pane's
+Environments section (still plan-only) becomes the HUMAN mirror of the
+same state, fed by the same events — it cannot reach the model, so the
+tail line is deliberately separate from the click-to-reveal pane.
+
+1. **Live roster state in the thread actor** — the `["workspace"]`
+   constant that `env.attached_targets()` reads becomes an actor-owned
+   `State` field `roster: List(String)` (stable order, `workspace`
+   always first), seeded `["workspace"]` on env-toolset threads and `[]`
+   on plain threads. `env.route` gains a `roster` field on the handle
+   (a SNAPSHOT — see step 5) so the fail-fast error names a list rather
+   than the hard-coded constant; the live wiring is 2b's seam.
+2. **Attach / detach actor messages** — `AttachTarget(name)` /
+   `DetachTarget(name)` mutate `roster`, fan out a roster event, and
+   append the tail roster line (below). `name` charset
+   `^[a-zA-Z0-9_-]+$`, `workspace` reserved (refused on attach), no
+   duplicate-live attach, no detach of an absent target, and `workspace`
+   is never detachable. (Reconnect-replace and the `target → execution
+   subject` map arrive with the node adapter in 2b; here the roster is
+   names-only — execution routing is still `workspace`-only until 2b
+   wires a source.)
+3. **The tail roster line** — `attach`/`detach` re-append a user-role,
+   `system`-author, stamped status line via the SAME `append_user
+   → mark_origin → stamp` path Phase 1 used at creation. Attach and
+   detach share one text shape (the terse `attached targets: …` form,
+   `roster_attach_text`/`roster_detach_text` slimmed to the tail-short
+   wording); the full current list always repeats so a stale belief is
+   self-healing. It never triggers a turn.
+4. **Queued roster changes behind an in-flight turn** — the NEW pending
+   machinery the plan already foretold: an attach OR detach landing
+   mid-turn is queued beside the existing `Busy` refusal (a late `Send`
+   is rejected, not queued; `utility_pending` is a debounce flag, not a
+   queue) and lands AFTER `WorkerDone` (or `WorkerDown`, a crashed
+   worker that installs nothing), before the next request is built —
+   because the worker owns the extended transcript mid-turn and an
+   actor-side append before install would be clobbered.
+5. **Dynamic `target` routing into the tool plane (DEFERRED to 2b)** —
+   this slice does NOT thread the live roster into `ToolCtx`: the
+   `Environment` handle remains a FROZEN per-thread value baked into the
+   registry's `env_toolset` runner wrapper (it still carries
+   `workspace_root` + `thread_id` + the SEED roster snapshot), so a
+   freshly-attached node is not yet routable at execution time. Making
+   `ToolCtx.environment` consult a LIVE source (an ask to the thread
+   actor, or a shared reference) is the open seam — the design fork is
+   recorded, not decided, and it is 2b work alongside the node adapter's
+   `target → execution subject` map. The envelope keeps the frozen
+   schemas; only EXECUTION routing would become dynamic.
+6. **Fail-fast is already correct** — `route`'s unknown-target error
+   names the roster the handle carries (the seed snapshot in this
+   slice), and an attached-but-unroutable target gets its own honest
+   "attached but not routable yet" error rather than a false
+   "not attached". Attach/detach are the only new failure shapes; both
+   are ordinary tool/actor outcomes, no loop-error or rollback change.
+
+**Tests.** `env_test` keeps the workspace/`route`/confinement/kill-tree
+pins and gains: `route` against a NON-constant roster (live-list
+passed in), duplicate-live and reserved-name refusal, the tail-line
+text shape, and the unknown-target error naming the live list.
+`thread_registry_test` covers create seeding `["workspace"]`, and (gated
+on step 4) the queued-attach-lands-after-`WorkerDone` ordering.
+`ui_test` keeps the status-line rendering pin (the tail line is the
+same row shape) and hostile-text for the attach name. `m3_prefix_test`
+golden is UNTOUCHED — roster lines are transcript rows through the
+single encode path, appended to the tail, committed like any message;
+the frozen envelope never changes. `gleam test` stays network-free
+(roster is actor state; no WS in this slice).
+
+### Phase 2b — node registry + client protocol + TUI (follow-up)
 
 1. `node` table + migrate + squirrel queries; token auth for `/node/ws`.
 2. Client protocol v1 (event projection + tool plane + user input);
    adapter actor with socket-linked lifecycle, registered as a named
    provider actor at attach (the plugin-api seam); attach/detach roster
-   mechanics incl. replace-on-reconnect and refuse-duplicate-live.
+   mechanics incl. replace-on-reconnect and refuse-duplicate-live —
+   consuming the live roster and the `target → execution subject` map
+   this slice's step 5 reserved. **Hydration re-derivation**: once
+   attach/detach are reachable AND persist roster rows, the actor's
+   `State.roster` must be REBUILT from the persisted roster rows at
+   lazy-start / Down-replacement / retry (the same replay-from-store
+   rule the Phase 1 roster row already follows) — today the seed
+   `["workspace"]` is never wrong because nothing can attach yet, but
+   2b makes reconstruction reachable and mandatory.
 3. Fail-fast paths for unknown target / mid-run detach / timeout through
-   the live tool plane (tool errors commit; UI unchanged).
+   the live tool plane (tool errors commit; UI unchanged) — `route`'s
+   live-roster error (2a step 1) plus the plugin-api adapter's
+   monitor-before-dispatch detach-mid-call answer.
 4. A headless **fake node** in `e2e/` (Node script speaking the client
    protocol) driven by the integration spec — the browser suite cannot
    exercise a TUI, but a raw WS client can: attach, receive events, serve
