@@ -282,6 +282,67 @@ pub fn bash_multiline_output_after_marker_test() {
   let assert True = string.contains(out, "hello")
 }
 
+/// The death-with-port sentinel (cubic PR review): the owner dying
+/// mid-command — even IMMEDIATELY, before the BEAM side ever parses
+/// the pid marker — must reap the whole process group. The sentinel
+/// lives inside the wrapper (a subshell watching the dup'd stdin
+/// pipe), so the kill does not depend on any BEAM-side pid handoff
+/// and the test has no timing window.
+pub fn bash_owner_death_kills_group_test() {
+  let root = fresh_root()
+  let e = env_for(root)
+  let done = process.new_subject()
+  // UNLINKED: process.spawn links, and killing a linked owner would
+  // propagate the `killed` exit reason into this test's own process.
+  let owner =
+    process.spawn_unlinked(fn() {
+      let cancel = process.new_subject()
+      let _ =
+        env.bash(
+          timeout_ms: 60_000,
+          max_output_bytes: 100_000,
+          environment: e,
+          cancel: cancel,
+          arguments: "{\"target\":\"workspace\",\"command\":\"exec -a nxown8x sleep 45 & sleep 45\"}",
+        )
+      process.sleep(60_000)
+    })
+  // Kill the owner almost immediately — the marker may not have been
+  // parsed BEAM-side yet; the sentinel is armed before the command
+  // runs, so this window is real and deterministic to enter.
+  process.sleep(150)
+  process.kill(owner)
+  process.send(done, Nil)
+  let assert Ok(Nil) = process.receive(done, 1000)
+  // The sentinel fires on the port's EOF; give it a moment, then the
+  // renamed child must be gone (its argv[0] carries the tag).
+  poll_tag_gone("nxown[8]x", 30)
+  let _ = simplifile.delete(root)
+}
+
+fn poll_tag_gone(pattern: String, attempts: Int) -> Nil {
+  case
+    bash(
+      env_for("/tmp"),
+      5000,
+      "ps -eo cmd | grep -c '" <> pattern <> "' || true",
+    )
+  {
+    // "0" means only the probe's own pipeline counted zero matches.
+    Ok("0") -> Nil
+    Ok("exit status 1" <> _) -> Nil
+    Error("bash: no bash executable found on PATH") -> Nil
+    _ ->
+      case attempts {
+        0 -> panic as "owner-death group kill did not reap the tagged child"
+        n -> {
+          process.sleep(200)
+          poll_tag_gone(pattern, n - 1)
+        }
+      }
+  }
+}
+
 pub fn bash_empty_output_marker_test() {
   let root = fresh_root()
   let assert Ok("(no output)") = bash(env_for(root), 5000, "true")

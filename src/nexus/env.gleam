@@ -370,17 +370,35 @@ pub fn bash(
   // THAT single process — port_close alone provably kills nothing
   // (CodeRabbit review: an owner-killed port left `/bin/sleep`
   // running). Descendants survive the fallback (documented posture).
+  //
+  // The death-with-port SENTINEL (cubic PR review) closes the window
+  // no BEAM-side kill can: the owner dying before the marker pid was
+  // parsed leaves every kill targetless, and port_close kills nothing.
+  // A subshell inside the wrapper dup's the stdin pipe (fd 3) and
+  // blocks reading it; EOF on that pipe means the PORT closed, and a
+  // `kill -0 $$` check distinguishes the two closes — parent bash
+  // still alive means the owner vanished mid-command (kill the tree
+  // from inside, no pid handoff needed); parent gone means normal
+  // completion, so deliberate background strays survive (the
+  // documented posture). The command itself runs with stdin on
+  // /dev/null — the port never writes stdin, and instant EOF beats
+  // blocking on a writeless pipe.
+  let sentinel_kill = case setsid {
+    Ok(_) -> "kill -9 -- -$$"
+    Error(_) -> "kill -9 $$"
+  }
+  let prelude =
+    "printf '%d\\n' $$; exec 3<&0 0</dev/null; "
+    <> "(while read -r _line <&3; do :; done; kill -0 $$ 2>/dev/null && "
+    <> sentinel_kill
+    <> ") >/dev/null 2>&1 & "
   let #(exe, argv, kill_group) = case setsid {
     Ok(setsid_path) -> #(
       setsid_path,
-      ["-w", bash_path, "-c", "printf '%d\\n' $$; " <> args.command],
+      ["-w", bash_path, "-c", prelude <> args.command],
       True,
     )
-    Error(_) -> #(
-      bash_path,
-      ["-c", "printf '%d\\n' $$; " <> args.command],
-      False,
-    )
+    Error(_) -> #(bash_path, ["-c", prelude <> args.command], False)
   }
   case ffi_open_port(exe, argv, workspace_dir(env)) {
     Error(reason) -> Error("bash: " <> reason)
