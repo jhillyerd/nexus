@@ -265,6 +265,15 @@ const cap_slack_bytes = 4096
 /// of queueing garbage in the worker.
 const reap_ms = 1000
 
+/// How long a kill path waits for the still-pending pid marker before
+/// giving up on a targeted kill (CodeRabbit review): the wrapper prints
+/// it before running anything, so it arrives within milliseconds —
+/// unless the child never started, in which case there is nothing to
+/// kill. Killing with NO target degrades to port_close, which kills
+/// nothing (verified), so the brief wait trades a sliver of latency for
+/// an armed kill.
+const marker_wait_ms = 250
+
 type PortEvent {
   Data(BitArray)
   Exited(Int)
@@ -548,6 +557,13 @@ fn bash_receive(loop: BashLoop, state: BashState) -> Result(String, String) {
 /// during a timeout/cap reap stays queued for the loop's next
 /// `cancel_pending` check, exactly as before.
 fn kill_and_reap(loop: BashLoop, state: BashState) -> BashState {
+  // Marker still pending (cancel/timeout raced the child's first
+  // output): give the pid line its brief chance so the kill is armed
+  // instead of a port_close that kills nothing.
+  let state = case state.marker {
+    MarkerPending -> await_marker(loop, state, timing.now_us())
+    MarkerLeader(_) | MarkerAbsent -> state
+  }
   ffi_kill_tree(loop.p, marker_kill(state.marker, loop.kill_group))
   let reap_selector =
     process.new_selector()
@@ -557,6 +573,36 @@ fn kill_and_reap(loop: BashLoop, state: BashState) -> BashState {
     // Unreachable by construction (the reap selector carries no
     // cancel map) — the arm keeps the match total.
     Ok(Port(Exited(_))) | Ok(Cancelled) | Error(Nil) -> state
+  }
+}
+
+/// Drain briefly for the still-pending pid marker (bounded at
+/// `marker_wait_ms`): each queued chunk goes through `absorb`, which
+/// resolves the marker as soon as the first line lands; the wait ends
+/// early once it does. Output keeps flowing through the normal
+/// cap-checked path.
+fn await_marker(
+  loop: BashLoop,
+  state: BashState,
+  started_us: Int,
+) -> BashState {
+  // Remaining budget from the single start instant, so chunks cannot
+  // extend the wait.
+  let left_ms = case marker_wait_ms * 1000 - { timing.now_us() - started_us } {
+    remainder if remainder <= 0 -> 0
+    remainder -> { remainder + 999 } / 1000
+  }
+  case state.marker == MarkerPending && left_ms > 0 {
+    False -> state
+    True ->
+      case process.selector_receive(loop.selector, left_ms) {
+        Ok(Port(Data(bytes))) -> {
+          let state = absorb(loop, state, bytes)
+          await_marker(loop, state, started_us)
+        }
+        // The child exited before printing a marker — nothing to arm.
+        Ok(Port(Exited(_))) | Ok(Cancelled) | Error(Nil) -> state
+      }
   }
 }
 
