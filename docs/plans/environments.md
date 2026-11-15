@@ -285,7 +285,7 @@ mechanics discovered mid-build):
   subject in the executor itself), and the v1 roster is the constant
   `["workspace"]` carried by the handle and the creation-time roster
   message. The thread-actor roster map (target → execution subject)
-  and the queued-attach machinery arrive with Phase 2, the first
+  and the queued-attach machinery arrive with Phase 2a, the first
   feature that needs live roster state (nodes attach mid-thread).
 - **The environment rides `TurnRunner` beside `delivery`** (the bots
   P3c precedent): `tools.ToolCtx` gained `environment:
@@ -343,15 +343,102 @@ mechanics discovered mid-build):
   absolute paths must already live inside it; symlinks are not
   resolved (the accepted v1 hygiene posture, now pinned by tests).
 
-### Phase 2 — node registry + client protocol + TUI
+### Phase 2a — live roster + dynamic target routing (this slice)
+
+Sliced from the original Phase 2 for review: this slice owns ONLY the
+live-roster machinery — the thing Phase 1's `["workspace"]` constant
+was explicitly deferring. The node table, `/node/ws` client protocol,
+adapter actor, fake-node e2e, and TUI all move to Phase 2b (unchanged
+in substance, re-labelled for the split). Phase 2b needs a roster that
+actually routes, so this slice lands first as its own reviewable unit.
+
+**The model-facing-roster decision (settled, token-minimal).** Roster
+changes ride MESSAGES, never the envelope — but the model can only act
+on what it has IN its window, and the plan's single creation-time
+attach line scrolled off long ago. The fix is to keep the roster
+**queryable at the committed transcript's tail**: each attach/detach
+re-appends one terse user-role, author-`system` status line naming the
+CURRENT full attached list, so the newest context the model sees always
+names every live target. Terse by rule (one line, `"attached targets:
+a, b"`), minimised for small-context local models; no history of prior
+rosters is replayed into the request (past roster lines are ordinary
+committed rows — context-window economics, not correctness, decides
+whether a model's provider keeps them). The bot-channels info pane's
+Environments section (still plan-only) becomes the HUMAN mirror of the
+same state, fed by the same events — it cannot reach the model, so the
+tail line is deliberately separate from the click-to-reveal pane.
+
+1. **Live roster state in the thread actor** — the `["workspace"]`
+   constant that `env.attached_targets()` and `env.route` read becomes
+   actor-owned `State` field `roster: List(String)` (stable order,
+   `workspace` always first), seeded `["workspace"]` on env-toolset
+   threads and `[]` on plain threads. `env.route` grows to consult the
+   LIVE roster passed in rather than the constant (the constant stays as
+   the seed, matching Phase 1's persistence).
+2. **Attach / detach actor messages** — `AttachTarget(name)` /
+   `DetachTarget(name)` mutate `roster`, fan out a roster event, and
+   append the tail roster line (below). `name` charset `^[a-zA-Z0-9_-]+$
+   `, `workspace` reserved (refused), duplicate-live attach refused.
+   (Reconnect-replace and the `target → execution subject` map arrive
+   with the node adapter in 2b; here the roster is names-only —
+   execution routing is still `workspace`-only until 2b wires a source.)
+3. **The tail roster line** — `attach`/`detach` re-append a user-role,
+   `system`-author, stamped status line via the SAME `append_user
+   → mark_origin → stamp` path Phase 1 used at creation. Attach and
+   detach share one text shape (the terse `attached targets: …` form,
+   `roster_attach_text`/`roster_detach_text` slimmed to the tail-short
+   wording); the full current list always repeats so a stale belief is
+   self-healing. It never triggers a turn.
+4. **Queued attach behind an in-flight turn** — the NEW pending
+   machinery the plan already foretold: an attach landing mid-turn is
+   queued beside the existing `Busy` refusal (a late `Send` is rejected,
+   not queued; `utility_pending` is a debounce flag, not a queue) and
+   lands AFTER `WorkerDone`, before the next request is built — because
+   the worker owns the extended transcript mid-turn and an actor-side
+   append before `WorkerDone` would be clobbered on install.
+5. **Dynamic `target` routing into the tool plane** — the
+   `Environment` handle today is a FROZEN per-thread value baked into
+   the registry's `env_toolset` runner wrapper; it carries `workspace
+   _root` + `thread_id` and nothing else. The `ToolCtx.environment`
+   must grow a LIVE roster source (an ask to the thread actor, or a
+   shared reference the actor updates) so `route` sees the current
+   attached list — without letting any request byte change (the
+   envelope keeps the frozen schemas; only EXECUTION routing is
+   dynamic). This is the seam Phase 2b's node adapter plugs its
+   `target → execution subject` map into; this slice establishes the
+   seam and routes `workspace` through it.
+6. **Fail-fast is already correct** — `route`'s unknown-target error
+   ("target \"…\" is not attached. attached targets: …") now names the
+   LIVE roster (step 1), so it reads true under attach/detach churn.
+   Attach/detach are the only new failure shapes; both are ordinary
+   tool/actor outcomes, no loop-error or rollback change.
+
+**Tests.** `env_test` keeps the workspace/`route`/confinement/kill-tree
+pins and gains: `route` against a NON-constant roster (live-list
+passed in), duplicate-live and reserved-name refusal, the tail-line
+text shape, and the unknown-target error naming the live list.
+`thread_registry_test` covers create seeding `["workspace"]`, and (gated
+on step 4) the queued-attach-lands-after-`WorkerDone` ordering.
+`ui_test` keeps the status-line rendering pin (the tail line is the
+same row shape) and hostile-text for the attach name. `m3_prefix_test`
+golden is UNTOUCHED — roster lines are transcript rows through the
+single encode path, appended to the tail, committed like any message;
+the frozen envelope never changes. `gleam test` stays network-free
+(roster is actor state; no WS in this slice).
+
+### Phase 2b — node registry + client protocol + TUI (follow-up)
 
 1. `node` table + migrate + squirrel queries; token auth for `/node/ws`.
 2. Client protocol v1 (event projection + tool plane + user input);
    adapter actor with socket-linked lifecycle, registered as a named
    provider actor at attach (the plugin-api seam); attach/detach roster
-   mechanics incl. replace-on-reconnect and refuse-duplicate-live.
+   mechanics incl. replace-on-reconnect and refuse-duplicate-live —
+   consuming the live roster and the `target → execution subject` map
+   this slice's step 5 reserved.
 3. Fail-fast paths for unknown target / mid-run detach / timeout through
-   the live tool plane (tool errors commit; UI unchanged).
+   the live tool plane (tool errors commit; UI unchanged) — `route`'s
+   live-roster error (2a step 1) plus the plugin-api adapter's
+   monitor-before-dispatch detach-mid-call answer.
 4. A headless **fake node** in `e2e/` (Node script speaking the client
    protocol) driven by the integration spec — the browser suite cannot
    exercise a TUI, but a raw WS client can: attach, receive events, serve
