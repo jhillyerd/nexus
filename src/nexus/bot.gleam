@@ -142,6 +142,13 @@ pub fn describe(error: BotError) -> String {
 pub fn validate_name(name: String) -> Result(String, BotError) {
   case string.trim(name) {
     "" -> Error(InvalidName)
+    // `system` is reserved (environments plan Phase 1): roster
+    // messages ride the display-only origin sidecar with author
+    // `system`, and the UI branches on that exact string to render a
+    // status line — a bot named `system` would have its messages
+    // render as status lines on every path (live echo, mid-turn
+    // join, replay).
+    "system" -> Error(InvalidName)
     trimmed -> Ok(trimmed)
   }
 }

@@ -70,6 +70,12 @@ pub type StoredSummary {
     /// NULL-for-default: plain threads carry the default set, bot
     /// threads the bot-resolved list.
     toolset: List(ToolsetEntry),
+    /// The RESOLVED workspace root frozen at creation (environments
+    /// plan Phase 1): `Some` only on env-carrying threads — hydration
+    /// rebuilds the environment handle from it, so a later
+    /// `NEXUS_WORKSPACE_ROOT` change can never re-aim an existing
+    /// thread's files.
+    workspace_root: Option(String),
     /// Epoch seconds; bumped on turn commit.
     last_active_at: Int,
     /// Includes the system prompt (Phase 1 semantics).

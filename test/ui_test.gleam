@@ -1490,6 +1490,38 @@ pub fn view_renders_author_badge_test() {
   should.be_true(string.contains(html, "delivered by Hermes"))
 }
 
+// Environments plan Phase 1: roster messages (author sidecar `system`)
+// render as muted status lines — never chat bubbles, never badges.
+pub fn view_renders_roster_status_line_test() {
+  let model =
+    new_model()
+    |> step(ui.UserEcho(
+      "environment attached: \"workspace\". attached targets: workspace.",
+      None,
+      Some("system"),
+    ))
+  let html = view_string(model)
+  should.be_true(string.contains(html, "turn status"))
+  should.be_true(string.contains(
+    html,
+    "environment attached: &quot;workspace&quot;",
+  ))
+  // Not a chat bubble: no user pill, no origin badge.
+  should.be_false(string.contains(html, "turn user"))
+  should.be_false(string.contains(html, "class=\"origin\""))
+}
+
+// A roster message's bytes are external content under the hostile-text
+// rules — a node could report anything in its metadata.
+pub fn roster_status_line_hostile_text_test() {
+  let model =
+    new_model()
+    |> step(ui.UserEcho("<script>x</script>", None, Some("system")))
+  let html = view_string(model)
+  should.be_true(string.contains(html, "&lt;script&gt;"))
+  should.be_false(string.contains(html, "<script>x"))
+}
+
 pub fn view_escapes_author_names_test() {
   // The author name is bot-sourced display text frozen at send time —
   // hostile-text rules apply to it exactly like message content.
@@ -3195,6 +3227,7 @@ pub fn send_moves_previous_day_row_into_today_immediately_test() {
         toolset: thread_registry.plain_entries(
           tools.default_names(test_config()),
         ),
+        workspace_root: None,
         last_active_at: yesterday,
         message_count: 1,
       ),
@@ -3392,6 +3425,7 @@ fn unused_turn_runner(
   _tr,
   _cancel,
   _delivery,
+  _environment,
   _on_event,
 ) -> thread.TurnOutcome {
   thread.StreamErrored("no turn expected in this test")
@@ -3406,6 +3440,7 @@ fn parked_runner(
   tr,
   cancel,
   _delivery,
+  _environment,
   _on_event,
 ) -> thread.TurnOutcome {
   let selector =
@@ -3423,6 +3458,7 @@ fn leak_runner(
   tr,
   _cancel,
   _delivery,
+  _environment,
   on_event: fn(loop.LoopEvent) -> Nil,
 ) -> thread.TurnOutcome {
   on_event(loop.StreamEvent(openai.TokenDelta("LEAK-TOKEN")))
@@ -3718,6 +3754,9 @@ fn test_config() -> config.Config {
     plugin_timeout_ms: 30_000,
     plugin_max_output_chars: 32_768,
     mcp_servers: [],
+    workspace_root: None,
+    env_timeout_ms: 60_000,
+    env_max_output_bytes: 100_000,
     // Bots P3c: the delivery hop guard; 4 = the shipped default.
     max_bot_hops: 4,
   )

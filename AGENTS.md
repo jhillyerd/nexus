@@ -182,6 +182,55 @@ stays open, one runtime per connection.
   file, and re-run the e2e browser suite — the offline suite cannot see
   visual regressions.
 
+## Environment / workspace invariants (Phase 1 shipped)
+
+`docs/plans/environments.md` carries the full design and as-built
+deltas; the rules that bite silently:
+
+- **Env tools are compiled names that never join the default set.**
+  `bash`, `read_file`, `write_file`, `list_dir` resolve through the
+  catalog config-INDEPENDENTLY (a snapshot pins past a removed
+  `NEXUS_WORKSPACE_ROOT`, like `web_search` past SearxNG) — but a
+  CREATE or BOT SAVE naming them refuses while no root can be frozen
+  ("workspace tools require NEXUS_WORKSPACE_ROOT to be set", a 400).
+  The RESOLVED root freezes per thread onto `thread.workspace_root`;
+  hydration rebuilds the handle from the ROW, never the config.
+- **Every env tool takes `target` as a free string** — the schema is
+  byte-identical however many environments are attached; only
+  execution routing is dynamic. The v1 roster is the constant
+  `["workspace"]`; unknown targets fail fast as tool errors repeating
+  the attached list (tool errors are not loop errors — the round
+  commits).
+- **Roster changes ride MESSAGES, never the envelope.** The
+  creation-time attach appends a user-role row with the display-only
+  origin sidecar author `system` (which is exactly why a bot cannot
+  be NAMED `system`); the UI renders it as a muted status line
+  (`.turn.status`), not a bubble. It never triggers a turn and
+  persists with the first commit.
+- **`bash` exec runs in the per-turn worker** (the codemode pattern):
+  the executor selects over {port data, cancel, deadline}; cancel
+  RE-SIGNALS the one-shot subject (the codemode rule) — and the
+  bounded kill-reap must NOT re-consume the re-signal (its selector
+  matches the port only). The kill-tree is `setsid` + the first-line
+  pgid marker + the PATH-resolved `kill` BINARY with argv
+  `["-9", "--", "-<pgid>"]` — the `--` is load-bearing (procps-ng
+  4.x silently no-ops without it), and the kill helper must wait for
+  the binary to act (see `nexus_env_ffi.kill_tree`).
+- **Caps are enforced WHILE READING** (bash output, `read_file` via
+  the FFI's chunked read) — post-hoc truncation does not bound
+  memory. Non-UTF-8 command output decodes lossily (latin-1
+  fallback), never crashes. A bash non-zero exit status is DATA
+  (`Ok("exit status N\n…")`); only spawn/timeout/cancel are errors,
+  each carrying partial output.
+- **fs confinement is LEXICAL**: `..` folds against the workspace
+  dir, absolute paths must already be inside it; symlinks are not
+  resolved — v1 is hygiene, not a security boundary (the recorded
+  accepted risk; the escalation is Phase 3's container workspace).
+- **Offline tests**: `gleam test` runs real `bash` in temp dirs — no
+  network. The env module is a LEAF (`nexus/env` imports no nexus
+  actor module; the `nexus/tools` bridge builds the ToolSpecs — the
+  codemode cycle rule).
+
 ## Plugin / tool-provider invariants (Phase 1 shipped)
 
 `docs/plans/plugin-api.md` carries the full design and as-built deltas;

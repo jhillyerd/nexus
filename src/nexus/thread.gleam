@@ -41,6 +41,7 @@ import glopenai/chat
 import glopenai/shared.{type CompletionUsage}
 import nexus/config.{type Config}
 import nexus/delivery
+import nexus/env.{type Environment}
 import nexus/loop
 import nexus/openai
 import nexus/timing
@@ -164,13 +165,18 @@ pub type TurnOutcome {
 /// `None` on plain threads; on bot threads the registry's per-thread
 /// runner wrapper builds it from the initiating user message's sidecar
 /// depth + 1 and hands it to the base runner here, so the agent loop can
-/// put it into every tool executor's `ToolCtx`.
+/// put it into every tool executor's `ToolCtx`. The `environment`
+/// parameter (environments plan Phase 1) follows the same injection
+/// pattern: the registry's per-thread wrapper wraps env-carrying
+/// toolsets with the thread's frozen workspace handle, and the base
+/// runner (or a plain thread's unwrap) passes it into the loop.
 pub type TurnRunner =
   fn(
     openai.Endpoint,
     Transcript,
     Subject(Nil),
     Option(delivery.Delivery),
+    Option(Environment),
     fn(loop.LoopEvent) -> Nil,
   ) -> TurnOutcome
 
@@ -685,7 +691,7 @@ pub fn agent_runner(
   max_iterations: Int,
   specs: List(tools.ToolSpec),
 ) -> TurnRunner {
-  fn(endpoint, tr, cancel, delivery, on_event) {
+  fn(endpoint, tr, cancel, delivery, environment, on_event) {
     case
       loop.run(
         specs,
@@ -697,6 +703,7 @@ pub fn agent_runner(
         tr,
         cancel,
         delivery,
+        environment,
         on_event,
       )
     {
@@ -987,10 +994,12 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
               }
               // The runner is the registry-built bundle's turn fn —
               // wrapped per thread with the delivery identity on bot
-              // threads (bots P3c), which ignores this argument and
-              // builds its own context from the transcript's sidecar.
+              // threads (bots P3c) and the environment handle on
+              // env-carrying threads (environments Phase 1), both of
+              // which ignore these arguments and build their own
+              // contexts from the thread's frozen values.
               let outcome =
-                state.runner(state.endpoint, tr, cancel, None, on_event)
+                state.runner(state.endpoint, tr, cancel, None, None, on_event)
               process.send(state.self, WorkerDone(pid, outcome))
             })
           let monitor = process.monitor(worker)

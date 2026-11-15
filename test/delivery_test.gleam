@@ -67,6 +67,9 @@ fn test_config() -> Config {
     plugin_timeout_ms: 30_000,
     plugin_max_output_chars: 32_768,
     mcp_servers: [],
+    workspace_root: None,
+    env_timeout_ms: 60_000,
+    env_max_output_bytes: 100_000,
     max_bot_hops: 4,
   )
 }
@@ -238,7 +241,7 @@ fn bot_message_runner(
 ) -> thread.TurnRunner {
   let stream = bot_message_stream(to, text)
   let assert Ok(specs) = tools.by_names(test_config(), ["bot_message"])
-  fn(_endpoint, tr, cancel, delivery, on_event) {
+  fn(_endpoint, tr, cancel, delivery, _environment, on_event) {
     // The registry's per-thread wrapper must have built the context —
     // a bot thread's runner never runs without one.
     let assert Some(_) = delivery
@@ -250,7 +253,7 @@ fn bot_message_runner(
       }
       on_event(event)
     }
-    case loop.run(specs, 8, stream, tr, cancel, delivery, recording) {
+    case loop.run(specs, 8, stream, tr, cancel, delivery, None, recording) {
       loop.LoopDone(stats, tr) -> thread.StreamDone(stats, tr)
       loop.LoopStopped(tr) -> thread.StreamStopped(tr)
       loop.LoopGuardHit(max, tr) -> thread.StreamGuard(max, tr)
@@ -262,7 +265,7 @@ fn bot_message_runner(
 /// A blocking runner: holds the turn open until cancelled — the busy-target
 /// rig and the mid-turn delivery rig.
 fn blocking_runner() -> thread.TurnRunner {
-  fn(_endpoint, tr, cancel, _delivery, _on_event) {
+  fn(_endpoint, tr, cancel, _delivery, _environment, _on_event) {
     let selector =
       process.new_selector()
       |> process.select_map(cancel, fn(_) { Nil })
@@ -547,7 +550,7 @@ pub fn deliver_hint_only_when_tool_present_test() {
       thread.Toolset(
         names: [],
         specs: specs,
-        runner: fn(_endpoint, tr, _cancel, _delivery, _on_event) {
+        runner: fn(_endpoint, tr, _cancel, _delivery, _environment, _on_event) {
           thread.StreamDone(completed_stats(), tr)
         },
         utility_runner: fn(_endpoint, _tr, _cancel, _allow_pass) {

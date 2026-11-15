@@ -1113,6 +1113,14 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
    normal short line instead of stretching the pill. */
 #app .turn.user span.origin { display: block; margin-bottom: .15rem; font-size: .72rem;
   opacity: .75; white-space: normal; }
+/* Roster messages (environments plan Phase 1): a user-role row whose
+   display-only author sidecar is `system` renders as a muted status
+   line, not a chat bubble — same inert text nodes, smaller type, no
+   pill. #app-prefix per the cascade traps above. */
+#app .turn.status { align-self: center; max-width: 92%; background: none;
+  border: none; padding: .1rem 0; font-size: .72rem; opacity: .7;
+  text-align: center; }
+#app .turn.status time { font-size: .72rem; }
 /* Per-message timestamp (nexus/ui time_stamp): a small muted line under
    the bubble text. #app-prefix per the cascade traps above (bare `time`
    could meet framework element rules); `white-space` resets off `.turn`'s

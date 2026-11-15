@@ -34,6 +34,7 @@ import glopenai/shared.{FunctionObject}
 import nexus/codemode
 import nexus/config.{type Config}
 import nexus/delivery.{type Delivery}
+import nexus/env.{type Environment}
 import nexus/http_fetch
 import nexus/tool_provider
 import nexus/web_search
@@ -41,14 +42,24 @@ import nexus/web_search
 /// Per-turn context handed to every executor alongside the raw arguments.
 /// `cancel` is the turn's cancel subject (owned by the per-turn worker):
 /// a `Stop` during tool execution delivers `Nil` to it. Interruptible
-/// executors (codemode) select on it so a script dies mid-run; every
-/// other tool simply ignores it, exactly as before the seam existed.
-/// `delivery` is the bot-to-bot delivery identity (bots plan P3c, #97):
-/// `Some` only on threads created from a bot, injected by the registry's
-/// per-thread runner wrapper — the `bot_message` executor's only source
-/// of identity (a plain thread has no bot to send from).
+/// executors (codemode, the environment's `bash`) select on it so a
+/// script or command dies mid-run; every other tool simply ignores it,
+/// exactly as before the seam existed. `delivery` is the bot-to-bot
+/// delivery identity (bots plan P3c, #97): `Some` only on threads
+/// created from a bot, injected by the registry's per-thread runner
+/// wrapper — the `bot_message` executor's only source of identity (a
+/// plain thread has no bot to send from). `environment` is the
+/// environment handle (environments plan Phase 1): `Some` only on
+/// threads whose frozen toolset carries env tools, injected by the
+/// SAME registry wrapper — every env tool's only source of routing
+/// (workspace root + thread id); `None` renders an honest tool error,
+/// never a crash (a hand-built test toolset may name env tools).
 pub type ToolCtx {
-  ToolCtx(cancel: Subject(Nil), delivery: Option(Delivery))
+  ToolCtx(
+    cancel: Subject(Nil),
+    delivery: Option(Delivery),
+    environment: Option(Environment),
+  )
 }
 
 /// One tool: its wire schema plus the executor. `run` receives the
@@ -117,11 +128,13 @@ pub const freeze_ask_ms = 4000
 /// the reserved provider separator, so a compiled name containing it
 /// would admit a colliding qualified name — `is_compiled_name` is the
 /// registration-time guard's lookup, and every future compiled tool
-/// must keep its name `__`-free.
+/// must keep its name `__`-free. The four environment tools
+/// (environments plan Phase 1) are compiled names like any other —
+/// never in the DEFAULT set.
 pub fn is_compiled_name(name: String) -> Bool {
   case name {
     "http_fetch" | "web_search" | "bot_message" | "codemode" -> True
-    _ -> False
+    other -> env.is_env_name(other)
   }
 }
 
@@ -181,6 +194,18 @@ pub fn by_names_with(
         "bot_message" -> Ok([bot_message_spec()])
         // Codemode is built last below, over the full sibling list.
         "codemode" -> Ok([])
+        // The environment tools (environments plan Phase 1): compiled
+        // names resolving config-INDEPENDENTLY like every other — a
+        // thread created while `workspace_root` was set keeps its env
+        // tools past the config being removed (the freeze overrides
+        // the gate, the web_search rule); CREATE refuses when no root
+        // can be frozen (the registry's gate), and hydration replays
+        // the persisted per-thread root.
+        "bash" -> Ok([env_spec(cfg, env.bash_schema(), env_bash_run)])
+        "read_file" -> Ok([env_spec(cfg, env.read_file_schema(), env_read_run)])
+        "write_file" ->
+          Ok([env_spec(cfg, env.write_file_schema(), env_write_run)])
+        "list_dir" -> Ok([env_spec(cfg, env.list_dir_schema(), env_list_run)])
         other ->
           case dict.get(providers, other) {
             Ok(spec) -> Ok([spec])
@@ -287,6 +312,20 @@ fn dispatch_entry(
     ToolsetEntry("bot_message", _, _) -> Ok([bot_message_spec()])
     // Codemode is built last below, over the full sibling list.
     ToolsetEntry("codemode", _, _) -> Ok([])
+    ToolsetEntry("bash", _, _) ->
+      Ok([env_spec(cfg, env.bash_schema(), env_bash_run)])
+    ToolsetEntry("read_file", _, _) ->
+      Ok([
+        env_spec(cfg, env.read_file_schema(), env_read_run),
+      ])
+    ToolsetEntry("write_file", _, _) ->
+      Ok([
+        env_spec(cfg, env.write_file_schema(), env_write_run),
+      ])
+    ToolsetEntry("list_dir", _, _) ->
+      Ok([
+        env_spec(cfg, env.list_dir_schema(), env_list_run),
+      ])
     ToolsetEntry(name, _, None) ->
       case dict.get(providers, name) {
         Ok(spec) -> Ok([spec])
@@ -499,6 +538,81 @@ fn parse_bot_message_args(arguments: String) -> Result(BotMessageArgs, String) {
       }
     Error(_) -> Error("invalid bot_message arguments: {\"to\", \"text\"}")
   }
+}
+
+/// The environment tools' spec assembly (environments plan Phase 1):
+/// the schema and executor live in the leaf `nexus/env`; this bridge
+/// closes over the CONFIG constants (timeout, output cap) exactly like
+/// `fetch_spec`, and the executor reads its routing from the ctx's
+/// `environment` handle — the registry's per-thread runner wrapper's
+/// injection. Env tools are ordinary catalog siblings: codemode
+/// scripts call them like any other (the plan's synergy rule), and a
+/// toolset naming them without a handle errors honestly at run time
+/// (mirroring `bot_message` on a plain thread).
+type EnvRun =
+  fn(Int, Int, Option(Environment), Subject(Nil), String) ->
+    Result(String, String)
+
+fn env_bash_run(
+  timeout_ms: Int,
+  max_bytes: Int,
+  environment: Option(Environment),
+  cancel: Subject(Nil),
+  arguments: String,
+) -> Result(String, String) {
+  env.bash(
+    timeout_ms: timeout_ms,
+    max_output_bytes: max_bytes,
+    environment: environment,
+    cancel: cancel,
+    arguments: arguments,
+  )
+}
+
+fn env_read_run(
+  _timeout_ms: Int,
+  max_bytes: Int,
+  environment: Option(Environment),
+  _cancel: Subject(Nil),
+  arguments: String,
+) -> Result(String, String) {
+  env.read_file(
+    max_output_bytes: max_bytes,
+    environment: environment,
+    arguments: arguments,
+  )
+}
+
+fn env_write_run(
+  _timeout_ms: Int,
+  _max_bytes: Int,
+  environment: Option(Environment),
+  _cancel: Subject(Nil),
+  arguments: String,
+) -> Result(String, String) {
+  env.write_file(environment: environment, arguments: arguments)
+}
+
+fn env_list_run(
+  _timeout_ms: Int,
+  _max_bytes: Int,
+  environment: Option(Environment),
+  _cancel: Subject(Nil),
+  arguments: String,
+) -> Result(String, String) {
+  env.list_dir(environment: environment, arguments: arguments)
+}
+
+fn env_spec(cfg: Config, schema: ChatCompletionTool, run: EnvRun) -> ToolSpec {
+  ToolSpec(tool: schema, run: fn(ctx, arguments) {
+    run(
+      cfg.env_timeout_ms,
+      cfg.env_max_output_bytes,
+      ctx.environment,
+      ctx.cancel,
+      arguments,
+    )
+  })
 }
 
 fn fetch_spec(cfg: Config) -> ToolSpec {

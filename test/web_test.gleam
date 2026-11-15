@@ -335,13 +335,17 @@ pub fn request_body_decoders_test() {
   // blanks are the ROUTE's 400s ("empty provider"/"empty model"), not
   // decode failures, so the bot body parses with the same decoder.
   web.parse_create_json("{\"provider\":\"p1\",\"model\":\"alias-a\"}")
-  |> should.equal(Ok(web.PlainCreate(provider: "p1", model: "alias-a")))
+  |> should.equal(
+    Ok(web.PlainCreate(provider: "p1", model: "alias-a", tools: None)),
+  )
   web.parse_text_json("{\"model\":\"alias-a\"}")
   |> should.equal(Error(Nil))
   web.parse_create_json("{\"model\":\"alias-a\"}")
-  |> should.equal(Ok(web.PlainCreate(provider: "", model: "alias-a")))
+  |> should.equal(
+    Ok(web.PlainCreate(provider: "", model: "alias-a", tools: None)),
+  )
   web.parse_create_json("{\"provider\":\"p1\"}")
-  |> should.equal(Ok(web.PlainCreate(provider: "p1", model: "")))
+  |> should.equal(Ok(web.PlainCreate(provider: "p1", model: "", tools: None)))
   // The create-from-bot shape, and its conflict with provider/model —
   // the conflict rule is about KEYS, so a blank provider/model value
   // still conflicts (presence-aware classification).

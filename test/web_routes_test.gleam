@@ -65,6 +65,9 @@ fn test_config() -> Config {
     plugin_timeout_ms: 30_000,
     plugin_max_output_chars: 32_768,
     mcp_servers: [],
+    workspace_root: None,
+    env_timeout_ms: 60_000,
+    env_max_output_bytes: 100_000,
     // Bots P3c: the delivery hop guard; 4 = the shipped default.
     max_bot_hops: 4,
   )
@@ -75,6 +78,7 @@ fn happy_runner(
   tr,
   _cancel,
   _delivery,
+  _environment,
   on_event: fn(loop.LoopEvent) -> Nil,
 ) -> thread.TurnOutcome {
   on_event(loop.StreamEvent(openai.TokenDelta("hi")))

@@ -261,25 +261,27 @@ fn create_thread_response(
                 err_json(thread_create.describe(problem)),
               )
           }
-        PlainCreate(provider: "", model: _) ->
+        PlainCreate(provider: "", model: _, tools: _) ->
           json_response(400, err_json("empty provider"))
-        PlainCreate(provider: _, model: "") ->
+        PlainCreate(provider: _, model: "", tools: _) ->
           json_response(400, err_json("empty model"))
-        PlainCreate(provider: ident, model: trimmed_model) -> {
+        PlainCreate(provider: ident, model: trimmed_model, tools: tools) -> {
           // The shared orchestration (#73): provider resolution outside
           // the registry's loop, then the create. The model alias is NOT
           // validated — proxies serve aliases their /v1/models may not
           // list (see thread_create's module doc). The reply IS the
-          // summary — this layer never hand-builds one.
+          // summary — this layer never hand-builds one. `tools` is the
+          // explicit toolset vocabulary (absent/null = the default
+          // snapshot; a bot-sourced create arrives through the
+          // BotCreate arm above instead, bots plan P2) — the registry
+          // freezes env names' workspace root at this boundary
+          // (environments plan Phase 1).
           let requested =
             thread_registry.NewThread(
               provider_id: ident,
               model: trimmed_model,
-              // POST /threads pins the config default toolset; a
-              // bot-sourced create arrives through the BotCreate arm
-              // above instead (bots plan P2).
               system_prompt: None,
-              toolset: None,
+              toolset: tools,
               bot_id: None,
             )
           case thread_create.create_thread(providers, registry, requested) {
@@ -336,7 +338,12 @@ fn read_json(req: Request(mist.Connection)) -> Result(String, Nil) {
 /// blur `{"bot": null}` into a plain create and `{"bot": "b1",
 /// "provider": null}` into a bot create (coderabbit review, PR #87).
 pub type CreateFields {
-  PlainCreate(provider: String, model: String)
+  /// `tools` (environments plan Phase 1 follows the bots plan's create
+  /// vocabulary): absent/null is the default set, `[]` chat-only, a
+  /// non-empty array an explicit list the registry validates (env
+  /// names among them — refused while no workspace root can be
+  /// frozen).
+  PlainCreate(provider: String, model: String, tools: Option(List(String)))
   BotCreate(bot: String)
   /// `bot` alongside `provider` and/or `model` — the shapes cannot both
   /// be honored, and quietly preferring one would freeze values the
@@ -357,12 +364,18 @@ pub fn create_fields_decoder() -> decode.Decoder(CreateFields) {
   use provider <- decode.optional_field("provider", None, present_string())
   use model <- decode.optional_field("model", None, present_string())
   use bot <- decode.optional_field("bot", None, present_string())
+  use tools <- decode.optional_field(
+    "tools",
+    None,
+    decode.optional(decode.list(decode.string)),
+  )
   decode.success(case bot, provider, model {
     Some(bot), None, None -> BotCreate(string.trim(bot))
     None, provider, model ->
       PlainCreate(
         provider: string.trim(option.unwrap(provider, "")),
         model: string.trim(option.unwrap(model, "")),
+        tools: tools,
       )
     Some(_), _, _ -> ConflictingCreate
   })

@@ -353,6 +353,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
                         created_at: row.created_s,
                       ),
                       toolset: entries,
+                      workspace_root: row.workspace_root,
                       last_active_at: row.last_active_s,
                       // The column already counts the system prompt
                       // (Phase 1 semantics).
@@ -421,6 +422,9 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           // half-thread can never exist. Transport-encoded as json
           // ($12); the stored columns stay TEXT.
           store.encode_toolset(summary.toolset),
+          // Environments plan Phase 1: the frozen workspace root ($13),
+          // same '' sentinel (NULL = no env tools).
+          option.unwrap(summary.workspace_root, ""),
         )
         |> result.map(fn(_) { Nil })
         |> result.map_error(query_error)
@@ -942,6 +946,7 @@ fn stored_summary_from_row(
         // dormant thread rehydrates its runner bundle from these
         // entries.
         toolset: entries,
+        workspace_root: row.workspace_root,
         last_active_at: row.last_active_s,
         // The column already counts the system prompt (Phase 1
         // semantics).

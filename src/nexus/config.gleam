@@ -124,6 +124,22 @@ pub type Config {
     /// via a bot template or an explicit create toolset, and its schema
     /// freezes into the thread's manifest at creation.
     mcp_servers: List(McpServer),
+    /// Environments plan Phase 1: the root directory under which each
+    /// env-carrying thread gets its own workspace (`<root>/<thread
+    /// id>`, created lazily on first use). `None` — the default —
+    /// disables env toolset selection at creation entirely (the
+    /// SearxNG-gating pattern): the four env tools are never in the
+    /// default toolset, and a create or bot save naming them refuses
+    /// with the honest reason. The RESOLVED root freezes per thread at
+    /// creation (`thread.workspace_root`), so changing it later affects
+    /// new threads only.
+    workspace_root: Option(String),
+    /// Environments: per-call wall-clock deadline for `bash`, in ms.
+    env_timeout_ms: Int,
+    /// Environments: the byte cap enforced WHILE READING bash output
+    /// and file reads (accumulation-bounded — post-hoc truncation does
+    /// not bound memory).
+    env_max_output_bytes: Int,
   )
 }
 
@@ -271,6 +287,24 @@ pub fn from_env(
   // validated HERE (loud config failure, the boot philosophy); the
   // adapter's per-server degrade lives in `nexus/mcp`'s boot mount.
   use mcp_servers <- result.try(mcp_servers(get))
+  // ---- Environments plan Phase 1. `NEXUS_WORKSPACE_ROOT` gates env
+  // toolset AVAILABILITY at create/bot-save (the SearxNG pattern),
+  // never default membership; the timeout floor keeps a sub-second
+  // bash deadline from configuring a broken tool (the loud-boot
+  // philosophy, the codemode/plugin precedent).
+  let workspace_root = optional_string(get, "NEXUS_WORKSPACE_ROOT")
+  use env_timeout_ms <- result.try(optional_min_int(
+    get,
+    "NEXUS_ENV_TIMEOUT_MS",
+    60_000,
+    min: 1000,
+  ))
+  use env_max_output_bytes <- result.try(optional_min_int(
+    get,
+    "NEXUS_ENV_MAX_OUTPUT_BYTES",
+    262_144,
+    min: 1024,
+  ))
   // The ASCII note rides the DEFAULT prompt only, and only while
   // codemode is enabled: an explicitly set NEXUS_SYSTEM_PROMPT is the
   // operator's own text and is never amended (enable codemode with a
@@ -314,6 +348,9 @@ pub fn from_env(
     plugin_timeout_ms: plugin_timeout_ms,
     plugin_max_output_chars: plugin_max_output_chars,
     mcp_servers: mcp_servers,
+    workspace_root: workspace_root,
+    env_timeout_ms: env_timeout_ms,
+    env_max_output_bytes: env_max_output_bytes,
   ))
 }
 

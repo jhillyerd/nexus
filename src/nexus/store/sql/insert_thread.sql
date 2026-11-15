@@ -10,13 +10,15 @@
 -- [{"seq":N,"name":"<qualified>","description":"...","schema_json":...|"null"}]
 -- in envelope order; schema_json null = a plain in-process name.
 -- bot_id is provenance only (bots plan P1): the '' sentinel inserts
--- NULL (see insert_bot.sql).
+-- NULL (see insert_bot.sql). workspace_root (environments plan Phase 1)
+-- is the RESOLVED root frozen at creation for env-carrying threads; the
+-- '' sentinel inserts NULL (the same nullif pattern as bot_id).
 -- tags_manual is '{}' literally and tags_source is left to its column
 -- default 'auto' (utility-tags plan §3.5): a new thread has no tags and
 -- an open auto path.
 with new_thread as (
-  insert into thread (id, provider_id, title, title_source, model, system_prompt, pinned, tags, tags_manual, created_at, last_active_at, message_count, bot_id)
-  values ($1, $2, $3, $4, $5, $6, $7, $8, '{}', to_timestamp($9), to_timestamp($9), $10, nullif($11, ''))
+  insert into thread (id, provider_id, title, title_source, model, system_prompt, pinned, tags, tags_manual, created_at, last_active_at, message_count, bot_id, workspace_root)
+  values ($1, $2, $3, $4, $5, $6, $7, $8, '{}', to_timestamp($9), to_timestamp($9), $10, nullif($11, ''), nullif($13, ''))
   returning id
 )
 insert into thread_toolset (thread_id, seq, name, description, schema_json)

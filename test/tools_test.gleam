@@ -122,7 +122,11 @@ fn run_toolset_codemode(
     list.find(specs, fn(spec) { tools.tool_name(spec) == "codemode" })
   let arguments = json.object([#("code", json.string(code))]) |> json.to_string
   spec.run(
-    tools.ToolCtx(cancel: process.new_subject(), delivery: option.None),
+    tools.ToolCtx(
+      cancel: process.new_subject(),
+      delivery: option.None,
+      environment: option.None,
+    ),
     arguments,
   )
 }
@@ -174,7 +178,11 @@ pub fn bot_message_without_delivery_ctx_errors_test() {
   let assert Ok([spec]) = tools.by_names(plain(), ["bot_message"])
   let assert Error(reason) =
     spec.run(
-      tools.ToolCtx(cancel: process.new_subject(), delivery: option.None),
+      tools.ToolCtx(
+        cancel: process.new_subject(),
+        delivery: option.None,
+        environment: option.None,
+      ),
       "{\"to\":\"x\",\"text\":\"y\"}",
     )
   should.equal(
@@ -274,6 +282,7 @@ fn with_fake_delivery(
   let ctx =
     tools.ToolCtx(
       cancel: process.new_subject(),
+      environment: option.None,
       delivery: option.Some(
         delivery.Delivery(
           thread_id: "s9",
@@ -295,4 +304,52 @@ fn fail_ask(
 
 fn fail_name(_: option.Option(String)) -> Result(String, Nil) {
   Error(Nil)
+}
+
+// ---------------------------------------------------------------------------
+// Environments plan Phase 1
+// ---------------------------------------------------------------------------
+
+// The four env tools are compiled names, but NEVER in the default set —
+// a config flip must not change the default envelope.
+pub fn env_names_never_in_default_test() {
+  let names = tools.default_names(cfg([#("NEXUS_CODEMODE", "true")]))
+  should.be_false(list.contains(names, "bash"))
+  should.be_false(list.contains(names, "read_file"))
+  should.be_false(list.contains(names, "write_file"))
+  should.be_false(list.contains(names, "list_dir"))
+  should.be_true(tools.is_compiled_name("bash"))
+  should.be_true(tools.is_compiled_name("read_file"))
+  should.be_true(tools.is_compiled_name("write_file"))
+  should.be_true(tools.is_compiled_name("list_dir"))
+}
+
+// Env names resolve through the catalog like any compiled name —
+// config-INDEPENDENT (a snapshot pins past the gate; the create-time
+// refusal is the registry's, not the catalog's).
+pub fn by_names_resolves_env_tools_test() {
+  let assert Ok(specs) =
+    tools.by_names(plain(), ["bash", "read_file", "write_file", "list_dir"])
+  should.equal(list.map(specs, tools.tool_name), [
+    "bash",
+    "read_file",
+    "write_file",
+    "list_dir",
+  ])
+}
+
+// Without a handle in the ctx, an env tool errors honestly (the
+// bot_message-on-a-plain-thread rule) — never a crash.
+pub fn env_tool_without_handle_errors_test() {
+  let assert Ok(specs) = tools.by_names(plain(), ["bash"])
+  let assert [spec] = specs
+  let assert Error("this thread has no environment attached") =
+    spec.run(
+      tools.ToolCtx(
+        cancel: process.new_subject(),
+        delivery: option.None,
+        environment: option.None,
+      ),
+      "{\"target\":\"workspace\",\"command\":\"echo hi\"}",
+    )
 }

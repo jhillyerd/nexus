@@ -3002,22 +3002,35 @@ fn turn(kind: String, text: String, at: Option(Int)) -> Element(Msg) {
 /// a bot-supplied name is user content under the hostile-text rules, not
 /// markup. The badge rides the UserEcho, so live, mid-turn join, and
 /// post-reload replay all render it identically (one shape per path).
+/// Author `system` (environments plan Phase 1) is NOT a chat bubble at
+/// all: it is a roster message — a muted status line, still inert text
+/// nodes. The reserved author string is exactly why a bot cannot be
+/// named `system`.
 fn user_turn(
   text: String,
   author: Option(String),
   at: Option(Int),
 ) -> Element(Msg) {
-  html.div([attr.class("turn user")], [
-    case author {
-      Some(name) ->
-        html.span([attr.class("origin"), attr.title("delivered by " <> name)], [
-          html.text(name),
-        ])
-      None -> element.none()
-    },
-    html.span([], [html.text(text)]),
-    time_stamp(at),
-  ])
+  case author {
+    Some("system") ->
+      html.div([attr.class("turn status")], [
+        html.span([], [html.text(text)]),
+        time_stamp(at),
+      ])
+    _ ->
+      html.div([attr.class("turn user")], [
+        case author {
+          Some(name) ->
+            html.span(
+              [attr.class("origin"), attr.title("delivered by " <> name)],
+              [html.text(name)],
+            )
+          None -> element.none()
+        },
+        html.span([], [html.text(text)]),
+        time_stamp(at),
+      ])
+  }
 }
 
 /// Committed assistant turns render markdown (see `nexus/ui/markdown`

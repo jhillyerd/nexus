@@ -108,10 +108,15 @@ CREATE TABLE IF NOT EXISTS thread (
   created_at     timestamptz NOT NULL,
   last_active_at timestamptz NOT NULL,         -- bumped on turn commit; drives recency + buckets
   message_count  int NOT NULL DEFAULT 0,       -- denormalized for list queries
-  bot_id         text REFERENCES bot(id) ON DELETE SET NULL
-                                                -- provenance/display only (bots plan P1): which bot the frozen columns
-                                                -- were sourced from. Never joined at request-encoding time; deleting
-                                                -- the bot NULLs it — the thread is self-contained.
+  bot_id         text REFERENCES bot(id) ON DELETE SET NULL,   -- provenance/display only (bots plan P1): which bot the frozen
+                                                -- columns were sourced from. Never joined at request-encoding time;
+                                                -- deleting the bot NULLs it — the thread is self-contained.
+  workspace_root text                          -- environments plan Phase 1: the RESOLVED workspace root frozen at
+                                                -- creation (NULL = no env tools; the '' sentinel inserts NULL).
+                                                -- The per-thread dir derives from it (<root>/<id>), so a later
+                                                -- NEXUS_WORKSPACE_ROOT change affects new threads only and can
+                                                -- never re-aim an existing thread's files. The frozen-endpoint
+                                                -- pattern, applied to a directory.
 );
 
 -- One thread's frozen toolset manifest (plugin-api plan Phase 2) — the
@@ -158,6 +163,11 @@ END $$;
 CREATE INDEX IF NOT EXISTS thread_recency ON thread (archived_at, last_active_at DESC);
 CREATE INDEX IF NOT EXISTS thread_tags ON thread USING gin (tags);
 CREATE INDEX IF NOT EXISTS thread_bot ON thread (bot_id);
+
+-- Environments plan Phase 1: the frozen workspace root. Idempotent
+-- ALTER for databases created before the column existed (no backfill:
+-- pre-environments threads legitimately have none).
+ALTER TABLE thread ADD COLUMN IF NOT EXISTS workspace_root text;
 
 CREATE TABLE IF NOT EXISTS thread_message (
   id           bigserial PRIMARY KEY,
