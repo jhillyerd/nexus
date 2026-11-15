@@ -73,11 +73,11 @@ import simplifile
 /// thread id (the per-thread directory derives from it), and the
 /// ROSTER — the list of attached targets `route` resolves against.
 ///
-/// Phase 2a: `roster` starts as the frozen seed (`["workspace"]`) and
-/// is the live attached list the actor mirrors; attach/detach re-aim
-/// `route` by replacing this value's contents on the thread actor's
-/// copy. Until the live source lands, `route` fails fast on anything
-/// but the seed — the Phase 1 behaviour, now parametrised.
+/// Phase 2a: `roster` is a SNAPSHOT, seeded `["workspace"]` at
+/// create/hydrate — NOT yet refreshed from the thread actor's live
+/// roster (that is 2b's open seam: threading a live source through
+/// `ToolCtx`). `route` therefore fails fast on every non-`workspace`
+/// target, naming the snapshot's list in the error.
 pub type Environment {
   Environment(workspace_root: String, thread_id: String, roster: List(String))
 }
@@ -271,9 +271,10 @@ pub fn list_dir_schema() -> chat.ChatCompletionTool {
 /// environment, or the fail-fast error (no timeout burn — the model
 /// self-corrects next round). `workspace` is the only target that
 /// routes to execution in this slice (2b wires remote nodes' execution
-/// subjects); every other name fails fast, and the error repeats the
-/// full CURRENT attached list (the live roster) so a typo'd or
-/// detached target self-heals on the next event.
+/// subjects). A name IN the roster but not `workspace` fails fast too
+/// — "attached but not routable yet" — so the error never claims a
+/// listed target is absent; a name NOT in the roster reports the full
+/// attached list so a typo'd or detached target self-heals next event.
 pub fn route(
   environment: Option(Environment),
   target: String,
@@ -284,12 +285,25 @@ pub fn route(
       case target {
         "workspace" -> Ok(env)
         _ ->
-          Error(
-            "target \""
-            <> target
-            <> "\" is not attached. attached targets: "
-            <> string.join(env.roster, ", "),
-          )
+          case list.contains(env.roster, target) {
+            // Attached by name, but the execution subject does not exist
+            // until 2b wires the node adapter — honest about WHY it
+            // cannot route, and not a "not attached" lie.
+            True ->
+              Error(
+                "target \""
+                <> target
+                <> "\" is attached but not routable yet (execution for"
+                <> " remote nodes arrives in Phase 2b)",
+              )
+            False ->
+              Error(
+                "target \""
+                <> target
+                <> "\" is not attached. attached targets: "
+                <> string.join(env.roster, ", "),
+              )
+          }
       }
   }
 }

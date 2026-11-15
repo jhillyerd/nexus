@@ -1577,7 +1577,13 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
                       failure_reason: Some("turn worker exited unexpectedly"),
                     ),
                   ),
-                ),
+                )
+                // Queued roster changes (environments plan Phase 2a) drain
+                // here too: a crashed worker installs NO transcript, so
+                // there is nothing to clobber — the queued attach/detach
+                // apply against the committed transcript exactly as they
+                // would after `WorkerDone` (which is unreachable now).
+                |> drain_pending_roster,
               )
             }
           }

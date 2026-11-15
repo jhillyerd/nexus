@@ -2187,3 +2187,53 @@ pub fn attach_mid_turn_queues_until_worker_done_test() {
   let after = thread.snapshot(sess)
   should.equal(4, transcript.length(after))
 }
+
+pub fn queued_roster_preview_fold_test() {
+  // The queue's preview fold (environments plan Phase 2a): while a turn
+  // is in flight, a NEW change validates against the roster the
+  // already-queued changes will produce — so a duplicate attach against
+  // a still-queued name refuses, and a detach of a still-queued name
+  // applies in arrival order after WorkerDone.
+  let gate_request = process.new_subject()
+  let sess = start_with_env(gated_runner(gate_request))
+  let sub = join(sess)
+  let _ = expect_event(sub)
+  should.equal(thread.send_message(sess, "research it"), thread.Sent)
+  expect_user_echo(sub, "research it")
+
+  // Queue an attach of "proxmox-2".
+  let r1 = process.new_subject()
+  process.send(sess, thread.AttachTarget("proxmox-2", r1))
+  let assert Ok(Ok(Nil)) = process.receive(r1, 2000)
+  // A SECOND attach of the same name, still queued, refuses against the
+  // preview (the live roster has not changed mid-turn).
+  let r2 = process.new_subject()
+  process.send(sess, thread.AttachTarget("proxmox-2", r2))
+  let assert Ok(Error("target \"proxmox-2\" is already attached")) =
+    process.receive(r2, 2000)
+  // A detach of the still-queued name is accepted — the preview lists it
+  // (attached by the queued change ahead of it).
+  let r3 = process.new_subject()
+  process.send(sess, thread.DetachTarget("proxmox-2", r3))
+  let assert Ok(Ok(Nil)) = process.receive(r3, 2000)
+
+  // Release: the two queued changes apply in order — attach, then detach
+  // — netting back to just `workspace`, with a tail line per change.
+  let assert Ok(gate) = process.receive(gate_request, 5000)
+  process.send(gate, Nil)
+  drain_until_turn_done(sub)
+  let assert thread.ThreadEvent(
+    _,
+    _,
+    thread.UserEcho(
+      "attached targets: workspace, proxmox-2.",
+      Some(_),
+      Some("system"),
+    ),
+  ) = expect_event(sub)
+  let assert thread.ThreadEvent(
+    _,
+    _,
+    thread.UserEcho("attached targets: workspace.", Some(_), Some("system")),
+  ) = expect_event(sub)
+}
