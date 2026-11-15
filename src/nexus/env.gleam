@@ -402,25 +402,41 @@ pub fn bash(
           let mon = process.monitor(owner)
           watch(gate, mon, p, kill_group, None)
         })
-      let assert Ok(gate) = process.receive(gate_back, 1000)
-      let outcome =
-        bash_loop(
-          BashLoop(
-            p: p,
-            selector: selector,
-            cancel: cancel,
-            timeout_ms: timeout_ms,
-            deadline_us: deadline_us,
-            max_output_bytes: max_output_bytes,
-            kill_group: kill_group,
-            watch: gate,
-          ),
-          BashState(head: <<>>, marker: MarkerPending, out: <<>>, killed: False),
-        )
-      // Whatever the outcome, the loop is done with the port: the
-      // watchdog stands down (it demonitors and exits).
-      process.send(gate, WatchDone)
-      outcome
+      // The watchdog's gate handshake, degraded honestly instead of
+      // asserted (cubic PR review): a scheduler delay past the budget
+      // must answer the call, not crash the per-turn worker. Nothing
+      // ran yet, so closing the port and refusing is clean.
+      case process.receive(gate_back, 1000) {
+        Error(Nil) -> {
+          ffi_kill_tree(p, Error(Nil))
+          Error("bash: the kill watchdog failed to start")
+        }
+        Ok(gate) -> {
+          let outcome =
+            bash_loop(
+              BashLoop(
+                p: p,
+                selector: selector,
+                cancel: cancel,
+                timeout_ms: timeout_ms,
+                deadline_us: deadline_us,
+                max_output_bytes: max_output_bytes,
+                kill_group: kill_group,
+                watch: gate,
+              ),
+              BashState(
+                head: <<>>,
+                marker: MarkerPending,
+                out: <<>>,
+                killed: False,
+              ),
+            )
+          // Whatever the outcome, the loop is done with the port: the
+          // watchdog stands down (it demonitors and exits).
+          process.send(gate, WatchDone)
+          outcome
+        }
+      }
     }
   }
 }

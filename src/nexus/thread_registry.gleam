@@ -1738,34 +1738,10 @@ fn lazy_start(state: State, summary: StoredSummary) -> Resolved {
               Missing
             }
             Ok(transcript) -> {
-              // The roster-row heal (cubic PR review): an env thread
-              // hydrated BEFORE its first send has no roster row — it
-              // rides the write-behind lane from the first commit, and
-              // nothing was ever committed. Re-appending it here
-              // rebuilds EXACTLY the starting transcript a fresh create
-              // had (system prompt + roster row), so the model keeps
-              // its only signal that a workspace exists — without it,
-              // the announcement would be lost forever on this path.
-              // Byte-determinism is untouched: a never-sent thread has
-              // never built a request, so no cached prefix exists to
-              // diverge from (the same argument that makes the
-              // create-time append safe); a SENT env thread hydrated
-              // with the row already in place (length > 1) skips the
-              // heal.
-              let transcript = case
-                summary.workspace_root,
-                transcript.length(transcript)
-              {
-                Some(_), 1 ->
-                  transcript
-                  |> transcript.append_user(env.roster_attach_text(
-                    "workspace",
-                    env.attached_targets(),
-                  ))
-                  |> transcript.mark_origin(Some("system"), 0)
-                  |> transcript.stamp(summary.meta.created_at)
-                _, _ -> transcript
-              }
+              // The roster row persists AT INSERT (insert_thread's
+              // roster CTE), so this rebuild — like the Down and retry
+              // paths — replays it from the rows for every env thread;
+              // no in-memory repair is needed or wanted here.
               let spec =
                 thread.ThreadSpec(
                   id: summary.id,

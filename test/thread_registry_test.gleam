@@ -2241,8 +2241,9 @@ pub fn env_toolset_runner_receives_environment_handle_test() {
 /// system-authored roster row.
 pub fn env_roster_row_persists_with_first_commit_test() {
   let root = "/tmp/nexus-env-roster-" <> int.to_string(timing.now_us())
-  let #(registry, seam) =
-    start_registry_with_workspace(root, store_mock.seam(store_mock.start()))
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  let #(registry, _seam) = start_registry_with_workspace(root, seam)
   let env_toolset =
     thread.Toolset(
       names: ["bash"],
@@ -2262,8 +2263,11 @@ pub fn env_roster_row_persists_with_first_commit_test() {
     )
   let assert Ok(sess) = thread_registry.get(registry, summary.id)
   let assert thread.Sent = thread.send_message(sess, "do something")
-  // Let the write-behind commit land.
-  process.sleep(100)
+  // Synchronize with the write-behind lane instead of sleeping (cubic
+  // PR review): the mock exposes its commit counter. TWO commits —
+  // the user append at Send, then the worker's turn completion —
+  // land the assistant row the third pattern asserts on.
+  store_mock.await_commits(mock, 2)
   let assert Ok(rows) = seam.load_messages(summary.id)
   let assert [
     store.UserRow(
