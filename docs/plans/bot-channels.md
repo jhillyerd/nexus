@@ -133,22 +133,34 @@ dangling DM thread in the sidebar.
   id alone would orphan grandchild actors whose rows are gone).
   Stale `dm` entries pointing at dropped channels are tolerated (the
   known-ness check already repoints).
-- Archive: no cascade, and channels CAN be archived — they are ordinary
-  threads under the same UI affordance. An archived CHANNEL is a
-  deliberate human decision, so deliveries from its parent to that bot
-  refuse DURABLY: `find_channel` re-finds the archived row and
-  `deliver_to_thread` answers the existing honest receipt
-  (`Refused("target thread is archived")`, a failed tool result the
-  sender model can report) until a human unarchives it or deletes the
-  channel row — deletion frees the pair, so the next delivery creates a
-  fresh channel. No bot-driven recovery exists BY DESIGN: unlike
-  today's accidental post-restart duplicate (the lost map silently
-  routing around an archive), a delivery must never resurrect or
-  sidestep one. The pane renders archived channels dimmed with an
-  archive badge — still navigable (reading is allowed), never hidden.
-- An archived PARENT cannot originate turns, and id-addressed delivery
-  INTO it already refuses (`target thread is archived`); its channels
-  stay readable in its pane.
+- **Archiving a parent cascades down its channel subtree** (transitive —
+  the same fixpoint walk as delete). An archived parent cannot originate
+  turns, so its channels could never be appended through the normal
+  path; cascading keeps state honest and closes the odd edge where some
+  other bot addresses a channel BY ID (the `FoundThread` path does not
+  care where the sender ran) — that now refuses as archived too. Live
+  children archive through a bounded ask; dormant ones take a store
+  write (hydration reads `archived_at`). **Restore is symmetric**:
+  unarchiving a parent unarchives its channel subtree — unambiguous
+  today because channels have no individual archive affordance to
+  conflict with; when individual channel archiving lands, restore
+  policy must distinguish cascade-archived from human-archived (e.g.
+  `archived_at` compared against the parent's cascade stamp).
+- **Channels are not individually archivable in this plan** — the
+  archive affordance lives on sidebar rows, and channels are hidden
+  from the sidebar. The archived-CHANNEL delivery semantics are
+  therefore the contract a future affordance builds on, and the guard
+  that holds in the cascade's propagation window: an archived channel
+  refuses deliveries from its parent to that bot DURABLY —
+  `find_channel` re-finds the archived row and `deliver_to_thread`
+  answers the existing honest receipt (`Refused("target thread is
+  archived")`, a failed tool result the sender model can report). No
+  bot-driven recovery exists BY DESIGN: unlike today's accidental
+  post-restart duplicate (the lost map silently routing around an
+  archive), a delivery must never resurrect or sidestep one. Deleting
+  a channel row frees the pair, so the next delivery creates a fresh
+  channel. The pane renders archived channels dimmed with an archive
+  badge — still navigable (reading is allowed), never hidden.
 
 ### Second-class channels: no title/tag economy
 
@@ -229,6 +241,9 @@ instruction. So:
 - No notifications beyond the header badge (no push/email/unread
   persistence).
 - No sync `bot_message_wait` (recorded non-goal of the bots plan).
+- No individual channel archive/unarchive affordance (e.g. a pane-header
+  control) — future work; the archived-channel delivery semantics in
+  this plan are its contract.
 - No changes to delivery receipts, guard order, or `NEXUS_MAX_BOT_HOPS`.
 
 ## Phases
@@ -251,10 +266,12 @@ instruction. So:
    delivery mid-turn → `Busy`; post-restart re-derivation finds the
    existing channel (map cleared, no duplicate created); lookup error
    during re-derivation refuses (no creation); guard order unchanged
-   (refusal creates nothing); delivery into an archived channel refuses
-   durably (no re-derivation escape hatch); parent-delete drops the
-   whole descendant tree (direct children AND grandchildren);
-   `m3_prefix_test` golden untouched; `gleam test` stays offline.
+   (refusal creates nothing); parent-archive cascades transitively down
+   the channel subtree and restore unarchives it; delivery into a
+   cascade-archived channel refuses durably (no re-derivation escape
+   hatch); parent-delete drops the whole descendant tree (direct
+   children AND grandchildren); `m3_prefix_test` golden untouched;
+   `gleam test` stays offline.
 
 ### Phase 2 — the thread info pane (UI + e2e)
 
