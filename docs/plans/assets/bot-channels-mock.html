@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>nexus — per-parent bot channels mock</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg:#14191f; --panel:#1b2129; --panel2:#232b35; --border:#2e3742;
+    --text:#e6e9ee; --muted:#8b95a1; --accent:#4c8dff; --green:#3fb950;
+    --mono:ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  html, body { margin:0; padding:0; background:transparent; }
+  body { font:14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; color:var(--text); }
+
+  .app {
+    display:grid; grid-template-columns:15rem 1fr;
+    height:640px; background:var(--bg);
+    border:1px solid var(--border); border-radius:12px; overflow:hidden;
+    box-shadow:0 20px 60px rgba(0,0,0,.45);
+  }
+
+  /* ---------- sidebar ---------- */
+  #sidebar { border-right:1px solid var(--border); background:var(--panel);
+    display:flex; flex-direction:column; min-height:0; }
+  .side-head { display:flex; align-items:center; justify-content:space-between;
+    padding:.8rem .9rem; }
+  .brand { font-weight:700; letter-spacing:.02em; }
+  .btn { border:1px solid var(--border); background:var(--panel2); color:var(--text);
+    border-radius:8px; padding:.28rem .7rem; font:inherit; font-size:12.5px; cursor:pointer; }
+  .btn.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  .tlist { overflow:auto; padding:0 .5rem .6rem; }
+  .trow { padding:.45rem .6rem; border-radius:8px; cursor:pointer; margin-bottom:2px;
+    border:1px solid transparent; }
+  .trow:hover { background:var(--panel2); }
+  .trow.sel { background:rgba(76,141,255,.12); border-color:rgba(76,141,255,.5); }
+  .trow .t { font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .trow .s { font-size:11px; color:var(--muted); margin-top:1px; }
+
+  /* ---------- chat ---------- */
+  #chat { display:flex; flex-direction:column; min-width:0; min-height:0; position:relative; }
+  .chat-head { display:flex; align-items:center; gap:.6rem; padding:.55rem .9rem;
+    border-bottom:1px solid var(--border); position:relative; }
+  .crumb { color:var(--accent); font-size:12.5px; cursor:pointer;
+    padding:.15rem .3rem; border-radius:6px; text-decoration:none; }
+  .crumb:hover { background:var(--panel2); }
+  .title { font-weight:600; }
+  .infobtn { margin-left:auto; display:flex; align-items:center; gap:.45rem;
+    border:1px solid var(--border); background:var(--panel2); color:var(--text);
+    border-radius:8px; padding:.3rem .6rem; font:inherit; font-size:12.5px;
+    cursor:pointer; text-decoration:none; }
+  .infobtn:hover { border-color:var(--accent); }
+  .infobtn .dot { width:8px; height:8px; border-radius:50%; background:var(--accent);
+    animation:pulse 1.6s ease-in-out infinite; }
+  .infobtn .n { background:var(--accent); color:#fff; border-radius:999px;
+    font-size:10.5px; padding:0 .38rem; font-weight:600; }
+  @keyframes pulse { 50% { opacity:.35; } }
+
+  /* ---------- :target state machine (no JS) ---------- */
+  .marker { position:absolute; width:0; height:0; }
+
+  /* thread info popover — open only while #mk-info is the target */
+  .popzone { display:none; position:absolute; inset:0; z-index:10; }
+  #mk-info:target ~ .popzone { display:block; }
+  .popzone .scrim { position:absolute; inset:0; display:block; }
+
+  /* child (channel) view — shown only while #mk-child is the target */
+  #head-child, #view-child, #hint-child { display:none; }
+  #mk-child:target ~ #head-parent,
+  #mk-child:target ~ #view-parent,
+  #mk-child:target ~ .composer #hint-parent { display:none; }
+  #mk-child:target ~ #head-child { display:flex; }
+  #mk-child:target ~ #view-child { display:block; }
+  #mk-child:target ~ .composer #hint-child { display:block; }
+
+  /* ---------- popover (thread info) ---------- */
+  .popover { position:absolute; top:3.3rem; right:.9rem; width:19.5rem;
+    background:var(--panel); border:1px solid var(--border); border-radius:12px;
+    box-shadow:0 14px 44px rgba(0,0,0,.5); }
+  .sec { padding:.6rem .85rem; }
+  .sec + .sec { border-top:1px solid var(--border); }
+  .sec h4 { margin:0 0 .45rem; font-size:10.5px; letter-spacing:.07em;
+    text-transform:uppercase; color:var(--muted); font-weight:600; }
+  a.ch { display:flex; align-items:center; gap:.5rem; padding:.42rem .5rem;
+    border-radius:8px; cursor:pointer; text-decoration:none; color:inherit; }
+  a.ch:hover { background:var(--panel2); }
+  .ch .dot { width:8px; height:8px; border-radius:50%; flex:none; }
+  .ch .dot.run { background:var(--accent); animation:pulse 1.6s ease-in-out infinite; }
+  .ch .dot.idle { background:#57636f; }
+  .ch .nm { flex:1; font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .ch .age { font-family:var(--mono); font-size:11px; color:var(--muted); }
+  .ch .chev { color:var(--muted); font-size:12px; }
+  .kv { display:flex; justify-content:space-between; gap:1rem;
+    font-size:12.5px; padding:.16rem 0; }
+  .kv .k { color:var(--muted); }
+  .chips { display:flex; gap:.35rem; flex-wrap:wrap; margin-top:.3rem; }
+  .chip { font-family:var(--mono); font-size:11px; border:1px solid var(--border);
+    background:var(--panel2); padding:.08rem .45rem; border-radius:6px; color:var(--text); }
+  .none { color:var(--muted); font-style:italic; font-size:12.5px; }
+
+  /* ---------- conversation ---------- */
+  .convwrap { flex:1; min-height:0; overflow:auto; }
+  .conv { max-width:44rem; margin:0 auto; padding:1rem .9rem;
+    display:flex; flex-direction:column; gap:.6rem; }
+  .turn { max-width:82%; padding:.5rem .8rem; border-radius:10px;
+    white-space:pre-wrap; overflow-wrap:anywhere; font-size:13.5px; }
+  .turn.user { align-self:flex-end; background:rgba(76,141,255,.17); }
+  .turn.ai { align-self:flex-start; background:var(--panel2); border:1px solid var(--border); }
+  .turn.from { align-self:flex-start; background:var(--panel2);
+    border:1px solid rgba(76,141,255,.4); }
+  .who { display:block; font-family:var(--mono); font-size:10.5px;
+    color:var(--accent); margin-bottom:.25rem; }
+  .chiprow { align-self:flex-start; max-width:82%; font-family:var(--mono);
+    font-size:11.5px; color:var(--muted); background:var(--panel2);
+    border:1px solid var(--border); border-radius:8px; padding:.32rem .6rem; }
+  .chiprow b { color:var(--green); font-weight:600; }
+  .day { align-self:center; font-size:11px; color:var(--muted); }
+
+  /* ---------- composer ---------- */
+  .composer { border-top:1px solid var(--border); padding:.7rem .9rem; }
+  .inputbox { max-width:44rem; margin:0 auto; display:flex; gap:.5rem; }
+  .input { flex:1; background:var(--panel2); border:1px solid var(--border);
+    border-radius:10px; padding:.55rem .8rem; color:var(--muted); font-size:13px; }
+  .hint { max-width:44rem; margin:.35rem auto 0; font-size:10.5px; color:var(--muted); }
+</style>
+</head>
+<body>
+
+<div class="app">
+
+  <!-- ======================= sidebar: no channels, ever ======================= -->
+  <aside id="sidebar">
+    <div class="side-head">
+      <span class="brand">nexus</span>
+      <button class="btn primary">New</button>
+    </div>
+    <div class="tlist">
+      <div class="trow sel">
+        <div class="t">Infrastructure planning</div>
+        <div class="s">RelayAlpha · 6m ago</div>
+      </div>
+      <div class="trow">
+        <div class="t">Staging deploy postmortem</div>
+        <div class="s">Scout · 2h ago</div>
+      </div>
+      <div class="trow">
+        <div class="t">Q4 budget notes</div>
+        <div class="s">3d ago</div>
+      </div>
+      <div class="trow">
+        <div class="t">Map the vendor API gaps</div>
+        <div class="s">Cartographer · 4d ago</div>
+      </div>
+      <div class="trow">
+        <div class="t">Reading list cleanup</div>
+        <div class="s">6d ago</div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ======================= chat ======================= -->
+  <main id="chat">
+
+    <!-- :target state markers — must precede everything they toggle -->
+    <div class="marker" id="mk-info"></div>
+    <div class="marker" id="mk-child"></div>
+
+    <!-- header: parent view -->
+    <div class="chat-head" id="head-parent">
+      <span class="title">Infrastructure planning</span>
+      <a class="infobtn" href="#mk-info">
+        <span class="dot"></span>
+        <span>info</span>
+        <span class="n">1</span>
+      </a>
+    </div>
+
+    <!-- header: child view -->
+    <div class="chat-head" id="head-child">
+      <a class="crumb" href="#mk-x">‹ Infrastructure planning</a>
+      <span class="title">RelayBeta</span>
+    </div>
+
+    <!-- popover zone: scrim closes, panel shows sections -->
+    <div class="popzone">
+      <a class="scrim" href="#mk-x" aria-label="Close"></a>
+      <div class="popover">
+        <div class="sec">
+          <h4>Channels</h4>
+          <a class="ch" href="#mk-child">
+            <span class="dot run"></span>
+            <span class="nm">↳ RelayBeta</span>
+            <span class="age">6m</span>
+            <span class="chev">›</span>
+          </a>
+          <a class="ch" href="#mk-child">
+            <span class="dot idle"></span>
+            <span class="nm">↳ Scout</span>
+            <span class="age">2h</span>
+            <span class="chev">›</span>
+          </a>
+          <a class="ch" href="#mk-child">
+            <span class="dot idle"></span>
+            <span class="nm">↳ Cartographer</span>
+            <span class="age">3d</span>
+            <span class="chev">›</span>
+          </a>
+        </div>
+        <div class="sec">
+          <h4>Details</h4>
+          <div class="kv"><span class="k">Bot</span><span>RelayAlpha</span></div>
+          <div class="kv"><span class="k">Provider / model</span><span>ollama · qwen3:32b</span></div>
+          <div class="kv"><span class="k">Created</span><span>5d ago</span></div>
+          <div class="chips">
+            <span class="chip">http_fetch</span>
+            <span class="chip">web_search</span>
+            <span class="chip">bot_message</span>
+          </div>
+        </div>
+        <div class="sec">
+          <h4>Environments</h4>
+          <span class="none">none attached</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- parent transcript -->
+    <div class="convwrap" id="view-parent">
+      <div class="conv">
+        <div class="day">Tuesday</div>
+        <div class="turn user">Can you have RelayBeta double-check the staging deploy before we call it done?</div>
+        <div class="turn ai">Asking RelayBeta now — it has the deploy checklist. I'll relay its findings when it replies.</div>
+        <div class="chiprow">bot_message → to "RelayBeta" · <b>Delivered</b> · thread f4e5d2</div>
+        <div class="turn ai">RelayBeta picked it up (running in its own channel — see info ▸). Its reply will land back here.</div>
+      </div>
+    </div>
+
+    <!-- child transcript (navigated to, not embedded) -->
+    <div class="convwrap" id="view-child">
+      <div class="conv">
+        <div class="turn from"><span class="who">RelayAlpha · via bot_message</span>From RelayAlpha (thread a1b2c3): can you check the staging deploy for errors? Focus on the health probe failures.</div>
+        <div class="turn ai">Checked. The deploy itself succeeded — 3/4 replicas rolled clean. Replica staging-2 failed its readiness probe twice (timeout at 30s) before recovering. Cause looks like a cold cache on first boot, not a config drift.</div>
+        <div class="turn from"><span class="who">RelayAlpha · via bot_message</span>From RelayAlpha (thread a1b2c3): good. Was the probe window tightened in the last chart bump?</div>
+        <div class="turn ai">Yes — chart 2.4.1 cut initialDelaySeconds from 45s to 20s. That's the regression. Recommend reverting that one value or bumping the timeout to 45s.</div>
+      </div>
+    </div>
+
+    <div class="composer">
+      <div class="inputbox">
+        <div class="input">Reply as the human…</div>
+        <button class="btn primary">Send</button>
+      </div>
+      <div class="hint" id="hint-parent">Channels are hidden from the sidebar — they live under info ▸</div>
+      <div class="hint" id="hint-child">You're viewing a bot channel of “Infrastructure planning”</div>
+    </div>
+
+  </main>
+</div>
+
+</body>
+</html>

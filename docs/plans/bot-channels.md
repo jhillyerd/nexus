@@ -1,0 +1,241 @@
+---
+title: Nexus — bot channels (per-parent DM threads + the thread info pane)
+status: active
+tags: [nexus, bots, threads, agents, kv-cache, gleam, beam]
+updated: 2026-11-15
+---
+
+# Bot channels: per-parent DM threads + the thread info pane
+
+**Thesis.** Bot-to-bot DM threads (bots plan P3c) are routed through an
+in-memory map keyed by the **bot pair** — `#(from_bot_id, target_bot_id)`.
+That makes the busy guard emergently global: bot A running in two parent
+threads shares ONE DM thread with bot B, so parent 2's unrelated request
+gets `Busy` while parent 1's is mid-turn (#123). Worse, one DM transcript
+accumulates interleaved conversations from unrelated parents (context
+bleed into the target model), and the in-memory map is lost at restart, so
+the first post-restart delivery silently opens a duplicate DM thread. The
+fix: key DM channels by **parent thread** — `thread.parent_thread_id` —
+and make channels **second-class**: never in the sidebar, never consuming
+utility title/tag completions, surfaced instead through a **thread info
+pane** reached from the parent's chat pane (the lineage pattern: running
+dots, `rel_time` ages, rows that navigate the main chat area). The pane is
+built as a general thread-info surface — its Environments section is a
+placeholder for `docs/plans/environments.md`'s roster.
+
+Precedent: t3code's thread context panel (attached environment, branch,
+changes, **Lineage · N running** with per-child running dots and ages) —
+thread facts and attached things live in a popover pane, not the thread
+list. The mock (`assets/bot-channels-mock.html`, script-free, works
+offline in a browser) pins the agreed shape: header `info ▸ N` button,
+Channels/Details/Environments sections, selection-without-listing.
+
+Related: fixes #123. Extends the bots plan (P3c delivery, `docs/plans/
+completed/bots.md`); consumes nothing from environments.md yet — only
+reserves the pane section.
+
+## Vocabulary
+
+- **Channel** — a DM thread created by `bot_message` delivery, tied to the
+  thread whose turn originated the request (**parent**). Stored as
+  `thread.parent_thread_id`; NULL on every ordinary thread. A channel's
+  frozen columns are the TARGET bot's creation-time template, exactly as
+  P3c builds them today — only the routing key and the parent link change.
+- **Parent** — the thread a channel hangs off: the sender bot's own
+  thread. A parent has one frozen bot, so `(parent_thread_id, target
+  bot_id)` uniquely identifies a channel; hop chains make channels of
+  channels (a bot inside a channel delivers onward — its `from_thread_id`
+  is the channel), bounded by `NEXUS_MAX_BOT_HOPS` as today.
+- **Thread info pane** — the header-toggle popover (the `tool_pop`
+  precedent: shell top level, native overlay, no script) with sections
+  **Channels**, **Details**, **Environments** (placeholder until the
+  environments plan lands).
+- **Selection-without-listing** — the display distinction between the
+  thread the chat area shows (`selected`) and the rows the sidebar
+  renders (`listed`). A selected channel highlights its parent's row;
+  a breadcrumb offers the way back. One transcript renderer, one scroll
+  territory — the pane never embeds a second log.
+
+## The parallelism problem, precisely
+
+`find_or_create_dm` keys `state.dm` by `#(request.from_bot_id, bot.id)`.
+Busy is not a global flag — the target thread answers `thread.Busy` when
+mid-turn — but pair-keyed routing funnels ALL of bot A's traffic to bot B
+through one thread, so contention scope is the pair instead of the
+conversation. Two visible failures follow: unrelated parent threads
+serialize (the #123 report), and one mongrel transcript mixes unrelated
+tasks (the target model's context, auto-title, and tag suggestions all
+see the blend). The restart loss is the third failure: `state.dm` starts
+empty at boot, so the next pair delivery find-or-CREATES — a second,
+dangling DM thread in the sidebar.
+
+## Design
+
+### Schema: `thread.parent_thread_id`
+
+    ALTER TABLE thread ADD COLUMN IF NOT EXISTS parent_thread_id
+      text REFERENCES thread(id) ON DELETE CASCADE;
+    CREATE INDEX IF NOT EXISTS thread_parent ON thread (parent_thread_id);
+
+- **CASCADE, decided**: a channel is meaningless outside its parent's
+  context; `SET NULL` would resurrect orphaned channels into the sidebar
+  after a parent delete. (Contrast `bot_id ... ON DELETE SET NULL`: a
+  thread IS self-contained without its bot; it is NOT self-contained
+  without its parent.)
+- Unquoted-safe name (not a Postgres keyword); singular-table, FK and
+  index naming per AGENTS.md. Self-referencing FK is fine.
+- **Never a request byte**: like `bot_id`, display/routing metadata only —
+  structurally outside `messages` and the envelope, so the KV-cache
+  contract and `m3_prefix_test` golden are untouched.
+
+### Routing: re-key + restart re-derivation
+
+- `delivery.Request` already carries `from_thread_id` — no wire change.
+  `find_or_create_dm` keys `state.dm` by `#(request.from_thread_id,
+  target_bot.id)`; `create_dm` sets `NewThread(parent_thread_id: Some(
+  request.from_thread_id), …)` and inserts the map entry under the new
+  key. Guards unchanged and still evaluated before find-or-create (a
+  refused delivery must not leave a fresh channel behind).
+- **Re-derivation replaces blind find-or-create on a map miss**: a new
+  store query (`find_channel.sql` — `select … from thread where
+  parent_thread_id = $1 and bot_id = $2`) answers a miss by looking up
+  the existing channel row. Hit → repoint the map, resolve, deliver;
+  miss → create as today. Post-restart, the FIRST delivery for a pair
+  now re-finds the channel instead of duplicating it. A hit whose thread
+  was actually deleted cannot occur (CASCADE) — the map's
+  deleted-behind-the-map repoint branch keeps its current semantics for
+  the live-map case only.
+- Delete of a parent thread: the registry drops its live/dormant records
+  for every child (scan its dicts on parent id — personal scale), the
+  store cascade removes the rows, and stale `dm` entries pointing at
+  dropped channels are tolerated (the known-ness check already repoints).
+- Archive: no cascade. An archived parent cannot originate turns, and
+  id-addressed delivery INTO it already refuses (`target thread is
+  archived`); channels stay readable in its pane.
+
+### Second-class channels: no title/tag economy
+
+Every channel's purpose is known at creation — a model call to title it
+spends tokens discovering what we already know, and model tags would
+pollute the shared tag corpus that feeds every later thread's utility
+instruction. So:
+
+- `title_from_first_message` does not run for channels; `create_dm` sets
+  the (NOT NULL) title column to the target bot's name directly.
+- The thread actor's utility arm (`arm_utility`, utility-titles §4.2)
+  no-ops when the thread is a channel — one guard, keyed off the
+  spec/meta parent id. No attempt is armed, so no completion fires, no
+  PASS machinery engages, `title_source`/`tags_source` stay `'auto'`
+  untouched. Manual tag editing remains possible (nothing generates, the
+  display set just stays empty).
+- Display labels derive from the bot name at render (the same bot-name
+  resolution the sidebar subtitles already do), shown as `↳ <bot name>`.
+
+### Listing and the thread info pane
+
+- `list_summaries.sql` gains `parent_thread_id` (the boot load must carry
+  it — the registry needs children for lazy hydration and channel
+  lookups). The sidebar filter is **registry-side, not SQL**: the `List`
+  projection excludes threads with a parent, so the store stays complete
+  and `GET /threads/<id>/state` keeps answering for channels (debug side
+  channel unchanged — never a UI data source).
+- New registry ask `Channels(parent_id, reply)` — answered from state
+  (live records: running + last-active known; dormant summaries: idle),
+  bot names resolved through the existing `bots_name` handle (the same
+  bounded boot-loaded ask `sender_name_ask` uses — no new cross-registry
+  edge, §8 holds). Reply: `{thread_id, bot name, running, last_active_s}`.
+- **Header**: `info ▸ N` button (the mock) — a pulsing dot + count of
+  running channels. This is the ambient signal that replaces
+  recency-jumping: activity is visible without opening anything, and the
+  sidebar stays human-shaped. No channels → the button renders nothing.
+- **Pane**: Channels rows (dot state, `↳ <bot name>`, `rel_time` age,
+  chevron) from the `Channels` ask, refreshed on the event stream the
+  way sidebar rows already update (`MetaUpdated`/turn events — the pane
+  re-asks or re-projects on the same messages, per-connection state
+  only). Details section: bot, provider/model, created age, toolset
+  chips — all already in the summary the header renders from.
+  Environments section: placeholder ("none attached").
+- **Navigation**: a Channels row selects the channel into the main chat
+  area (normal `Join`/replay machinery — channels are full thread
+  actors; nothing new in the event path). The sidebar highlights the
+  parent row; the header swaps to `‹ <parent title>` breadcrumb + the
+  channel's bot name; a composer hint names the parent context.
+  Sending into a viewed channel is an ordinary human `Send` — the
+  channel is the target bot's thread and behaves like one.
+- **Reload/route flag**: `Flags.thread` may name a channel (it was last
+  selected). Allowed: chat shows the channel, the sidebar highlights the
+  parent. No deep-link format changes.
+
+### UI invariants audit (what this plan must not disturb)
+
+- Display-only end to end: pane state is per-connection Lustre model; no
+  request bytes change; the commit/rollback display rules and the
+  `turn_view` replay mirror are untouched (channels use the existing
+  paths — nothing new mirrors commit rules, per the m3 lesson that a
+  second surface that does is where replay bugs breed).
+- Hostile text: channel labels, ages, and Details render as Lustre text
+  nodes; `From …` content in a viewed channel is the existing P3b
+  rendering byte-for-byte. `ui_test` hostile-payload pins extend to the
+  pane rows and breadcrumb.
+- The shadow root stays open; one runtime per `/ws` connection — the
+  pane is ordinary per-client model state.
+- The `List` projection filter and the `Channels` ask never consult the
+  store at ask time (§8: answers from state; the boot load already has
+  every summary).
+
+## Non-goals
+
+- No re-parenting, renaming, or moving channels; no channel merge.
+- No cross-parent channel index or global "all channels" view (the pane
+  is strictly per parent; grandchild channels appear in their own
+  parent-channel's pane, per the hop-chain rule).
+- No notifications beyond the header badge (no push/email/unread
+  persistence).
+- No sync `bot_message_wait` (recorded non-goal of the bots plan).
+- No changes to delivery receipts, guard order, or `NEXUS_MAX_BOT_HOPS`.
+
+## Phases
+
+### Phase 1 — schema, routing, re-derivation (offline-provable)
+
+1. `sql/schema.sql`: column + index (idempotent); migrate re-applied;
+   squirrel regen (`sql.gleam` committed; CI `squirrel check`).
+2. Store: `NewThread`/insert carries `parent_thread_id`; summaries
+   (`list_summaries.sql`) + `get_thread` carry it; store-mock seam
+   (`store_mock.gleam`) round-trips it; new `find_channel.sql` query +
+   mock wiring.
+3. Registry: `dm` map re-key; `create_dm` sets parent + deterministic
+   title; find-or-create consults `find_channel` on a miss; child
+   cleanup on parent delete; `List` projection excludes channels;
+   `Channels(parent_id)` ask.
+4. Thread actor: utility-arm guard for channels; heuristic-title skip.
+5. Tests: registry tests — two parents' bots message the same target
+   concurrently, both `Delivered` (no `Busy`); same parent, second
+   delivery mid-turn → `Busy`; post-restart re-derivation finds the
+   existing channel (map cleared, no duplicate created); guard order
+   unchanged (refusal creates nothing); parent-delete drops children;
+   `m3_prefix_test` golden untouched; `gleam test` stays offline.
+
+### Phase 2 — the thread info pane (UI + e2e)
+
+1. `ThreadSummary`/spec plumbing of `parent_thread_id` into the UI model
+   (selection-without-listing mapping, header badge state).
+2. Header `info ▸ N` button + popover per the mock (Channels/Details/
+   Environments sections; `rel_time` ages; running dots from turn
+   events); channel row → select channel; breadcrumb + hints; sidebar
+   parent-highlight while a channel is selected; reload flag handling.
+3. Tests: `ui_test` — sidebar omits channels; pane renders rows with
+   dots/ages/labels; badge counts; selection-without-listing highlight;
+   breadcrumb; hostile-text payloads in labels; deleted-bot label
+   fallback; `m3_prefix_test` still golden; e2e — the bots P3c smoke
+   (RelayAlpha → RelayBeta) drives the pane instead of the sidebar;
+   integration `case:relay` scenario unchanged at the protocol level;
+   the full browser suite re-run (the offline suite cannot see visual
+   regressions — the mock is the visual reference).
+
+## Cache gate
+
+No envelope, transcript, or sidecar change: the golden (`test/fixtures/
+m3_cache_thread.json`) must re-encode byte-identically with no re-capture,
+and no warm/cold TTFT re-run is required — this plan touches routing
+metadata and display state only. If it fails, the change is wrong.
