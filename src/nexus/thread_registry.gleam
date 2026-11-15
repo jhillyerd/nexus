@@ -57,6 +57,7 @@ import nexus/config.{type Config}
 import nexus/delivery
 import nexus/env
 import nexus/openai
+import nexus/rescue
 import nexus/store.{type Store, type StoredSummary}
 import nexus/thread
 import nexus/timing
@@ -2137,17 +2138,36 @@ fn restart(
   factory: Factory,
   argument: ChildArgument,
 ) -> Result(actor.Started(Subject(thread.Msg)), actor.StartError) {
-  case factory_supervisor.start_child(factory, argument) {
-    Error(already_started) -> {
+  // Rescue-wrapped (the ui_settings worker pattern): at teardown, a
+  // thread actor's DOWN can reach this handler after the FACTORY has
+  // begun shutting down — start_child then panics (an unregistered or
+  // dying named target), which would take the whole registry actor
+  // down long after the owning test ended. A crashed start ask is the
+  // honest "start failed" this function already reports; the record
+  // keeps its start_error and the registry lives.
+  case
+    rescue.rescue(fn() { factory_supervisor.start_child(factory, argument) })
+  {
+    Error(_crash) -> Error(actor_init_failed())
+    Ok(Error(already_started)) -> {
       process.sleep(50)
-      case factory_supervisor.start_child(factory, argument) {
-        Ok(started) -> Ok(started)
-        Error(_) -> Error(already_started)
+      case
+        rescue.rescue(fn() { factory_supervisor.start_child(factory, argument) })
+      {
+        Ok(Ok(started)) -> Ok(started)
+        _ -> Error(already_started)
       }
       |> result.replace_error(already_started)
     }
-    other -> other
+    Ok(other) -> other
   }
+}
+
+/// A stable error value for rescue-wrapped start asks — `actor.StartError`
+/// has no cheap constructor for "the ask itself crashed", and the
+/// record's `start_error` string is what surfaces.
+fn actor_init_failed() -> actor.StartError {
+  actor.InitFailed("")
 }
 
 // ---------------------------------------------------------------------------

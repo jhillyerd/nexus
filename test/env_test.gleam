@@ -370,37 +370,72 @@ fn poll_tag_gone(pattern: String, attempts: Int) -> Nil {
 pub fn bash_cancel_midrun_reaps_group_and_signal_test() {
   let root = fresh_root()
   let reply = process.new_subject()
+  // The worker hands its cancel subject to the test BEFORE starting
+  // the call (CodeRabbit review): the test then provably observes the
+  // tagged child running — not a marker file the command touches
+  // before forking it — and only then delivers the cancel. Sending on
+  // a subject is legal from any process; only receiving is
+  // owner-restricted, and the worker keeps that.
+  let handoff = process.new_subject()
   let worker =
     process.spawn_unlinked(fn() {
       let cancel = process.new_subject()
-      let timer =
-        process.spawn(fn() {
-          process.sleep(400)
-          process.send(cancel, Nil)
-        })
-      let _ = timer
+      process.send(handoff, cancel)
       let result =
         env.bash(
           timeout_ms: 60_000,
           max_output_bytes: 100_000,
           environment: env_for(root),
           cancel: cancel,
-          arguments: "{\"target\":\"workspace\",\"command\":\"touch running; exec -a nxcancel9x sleep 45 & sleep 45\"}",
+          arguments: "{\"target\":\"workspace\",\"command\":\"exec -a nxcancel9x sleep 45 & sleep 45\"}",
         )
       let again = process.receive(cancel, 2000)
       process.send(reply, #(result, again))
     })
   let _ = worker
-  // The tagged child is provably up before the cancel fires: the
-  // timer's 400ms starts at spawn, and the marker file lands within
-  // milliseconds of the command starting.
-  wait_started(root <> "/t1/running", 50)
+  let assert Ok(cancel) = process.receive(handoff, 5000)
+  // The tagged child itself is up (its ps line is "nxcancel9x 45" —
+  // exec -a replaces argv[0]; the bracketed probe cannot match its
+  // own command line).
+  poll_tag_present("nxcancel[9]x 4[5]", 50)
+  process.send(cancel, Nil)
   let assert Ok(#(result, again)) = process.receive(reply, 30_000)
   let assert Error(text) = result
   let assert True = string.contains(text, "cancelled")
   let assert Ok(Nil) = again
   poll_tag_gone("nxcancel[9]x", 50)
   let _ = simplifile.delete(root)
+}
+
+/// Poll until the tagged process's ps line exists — the positive half
+/// of `poll_tag_gone`, so a disappearance probe can never pass
+/// without the child having lived.
+fn poll_tag_present(pattern: String, attempts: Int) -> Nil {
+  case
+    bash(
+      env_for("/tmp"),
+      10_000,
+      "ps -eo cmd | grep -c '" <> pattern <> "' || true",
+    )
+  {
+    Ok(n) ->
+      case int.parse(string.trim(n)) {
+        Ok(count) if count > 0 -> Nil
+        _ -> retry_present(pattern, attempts)
+      }
+    Error("bash: no bash executable found on PATH") -> Nil
+    _ -> retry_present(pattern, attempts)
+  }
+}
+
+fn retry_present(pattern: String, attempts: Int) -> Nil {
+  case attempts {
+    0 -> panic as "tagged child never appeared"
+    n -> {
+      process.sleep(200)
+      poll_tag_present(pattern, n - 1)
+    }
+  }
 }
 
 pub fn bash_empty_output_marker_test() {
