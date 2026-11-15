@@ -187,7 +187,7 @@ pub fn uescape_string_test() {
 pub fn schema_is_the_entire_schema_test() {
   let assert Ok(schema) = read_file("sql/schema.sql") |> bit_array.to_string
   let statements = migrate.statements(schema)
-  should.equal(list.length(statements), 11)
+  should.equal(list.length(statements), 14)
   // The one non-CREATE statement: the manifest swap (plugin-api
   // Phase 2) — a DO block that backfills the old plain-name column
   // into thread_toolset entries before dropping it, lossless for

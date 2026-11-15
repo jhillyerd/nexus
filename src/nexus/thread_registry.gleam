@@ -1068,6 +1068,13 @@ fn start_new_thread(
               commit_hook: commit_hook_for(state.store, id),
               transcript: transcript,
               hydrated: False,
+              // Fresh threads seed the roster from the FROZEN fact
+              // still in scope: an env thread starts with `workspace`
+              // attached, a plain thread with none.
+              roster: case workspace_root {
+                Some(_) -> env.attached_targets()
+                None -> []
+              },
               utility_apply: utility_apply_for(state.self, id),
             )
           // The environment wrapper (environments plan Phase 1): the
@@ -1545,13 +1552,15 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
           let spec = case record.persisted {
             True ->
               case rebuild_transcript(state, record.id) {
-                Ok(transcript) ->
+                Ok(#(transcript, roster)) ->
                   thread.ThreadSpec(
                     ..record.spec,
                     transcript: transcript,
                     // The replacement is a hydrated restart: its first
                     // exchange predates the new actor, so it never
-                    // attempts the utility-titles upgrade.
+                    // attempts the utility-titles upgrade — and its
+                    // roster re-derives from the persisted rows.
+                    roster: roster,
                     hydrated: True,
                   )
                 Error(error) -> {
@@ -1646,15 +1655,60 @@ fn utility_apply_for(
 
 /// Rebuild a stored thread's transcript through the one construction
 /// path: `transcript.new(model, system_prompt)` + `append_*` over the rows
-/// in seq order.
-fn rebuild_transcript(state: State, id: String) -> Result(Transcript, String) {
+/// in seq order. Returns the transcript AND the re-derived roster
+/// (environments plan Phase 2b): the newest persisted roster row names
+/// the CURRENT attached list, so a restart rebuilds the actor's roster
+/// from the store instead of re-seeding `["workspace"]`. `[]` when the
+/// thread has no roster row AND no workspace root (a plain, env-free
+/// thread); an env thread with no prefix-matching row re-seeds the
+/// constant `["workspace"]` (the legacy-fallback, see the `None` branch).
+fn rebuild_transcript(
+  state: State,
+  id: String,
+) -> Result(#(Transcript, List(String)), String) {
   use stored <- result.try(state.store.get_thread(id))
   use rows <- result.try(state.store.load_messages(id))
-  Ok(store.transcript_from_rows(
-    stored.summary.model,
-    stored.system_prompt,
-    rows,
-  ))
+  let transcript =
+    store.transcript_from_rows(stored.summary.model, stored.system_prompt, rows)
+  let roster = case roster_from_rows(rows) {
+    option.Some(list_) -> list_
+    // No roster row matched. A plain env-free thread seeds `[]`; an env
+    // thread whose persisted rows predate the Phase 2a tail-short line
+    // (the Phase 1 `environment attached: "workspace"...` wording) has
+    // no prefix-matching row but lived with the constant `["workspace"]`
+    // roster — nothing could attach before 2a — so re-seed that
+    // constant. This is the one place the fallback is provably exact.
+    option.None ->
+      case stored.summary.workspace_root {
+        option.Some(_) -> env.attached_targets()
+        option.None -> []
+      }
+  }
+  Ok(#(transcript, roster))
+}
+
+/// Re-derive the live attached-target roster from persisted rows
+/// (environments plan Phase 2b's hydration re-derivation): the NEWEST
+/// roster row — a user-role row whose `author` sidecar is `system` and
+/// whose content carries the roster-line prefix — names the CURRENT
+/// full attached list, self-healing by design (every attach/detach
+/// re-appends the whole list). Scan in seq order and keep the last
+/// match, so the roster survives a restart even after nodes attached
+/// mid-life. `None` when no prefix-matching row exists (a plain
+/// env-free thread, or a pre-2a env thread whose creation row used the
+/// Phase 1 wording) — the caller's fallback is workspace-root-keyed.
+fn roster_from_rows(rows: List(store.MessageRow)) -> Option(List(String)) {
+  rows
+  |> list.fold(option.None, fn(acc, row) {
+    case row {
+      store.UserRow(content: content, author: Some("system"), ..) ->
+        case string.starts_with(content, env.roster_prefix) {
+          True -> env.roster_parse(content)
+          False -> acc
+        }
+      _ -> acc
+    }
+  })
 }
 
 /// Lazily start a dormant (stored-but-not-live) thread, hydrated from the
@@ -1738,11 +1792,12 @@ fn lazy_start(state: State, summary: StoredSummary) -> Resolved {
               log_store_error("lazy_start " <> summary.id, error)
               Missing
             }
-            Ok(transcript) -> {
+            Ok(#(transcript, roster)) -> {
               // The roster row persists AT INSERT (insert_thread's
-              // roster CTE), so this rebuild — like the Down and retry
-              // paths — replays it from the rows for every env thread;
-              // no in-memory repair is needed or wanted here.
+              // roster CTE) and every attach/detach appends a fresh
+              // one, so this rebuild — like the Down and retry paths —
+              // re-derives the CURRENT attached list from the newest
+              // row; no in-memory repair is needed or wanted here.
               let spec =
                 thread.ThreadSpec(
                   id: summary.id,
@@ -1752,6 +1807,7 @@ fn lazy_start(state: State, summary: StoredSummary) -> Resolved {
                   commit_hook: commit_hook_for(state.store, summary.id),
                   transcript: transcript,
                   hydrated: True,
+                  roster: roster,
                   utility_apply: utility_apply_for(state.self, summary.id),
                 )
               let argument =
@@ -1806,13 +1862,15 @@ fn retry_rehydrate(state: State, record: Record) -> Resolved {
       log_store_error("retry_rehydrate " <> record.id, error)
       Missing
     }
-    Ok(transcript) -> {
+    Ok(#(transcript, roster)) -> {
       let spec =
         thread.ThreadSpec(
           ..record.spec,
           transcript: transcript,
           // Same rule as the Down replacement: a rehydrating restart
-          // never attempts the utility-titles upgrade.
+          // never attempts the utility-titles upgrade, and its roster
+          // re-derives from the persisted rows.
+          roster: roster,
           hydrated: True,
         )
       let argument = ChildArgument(spec: spec, name: record.name)

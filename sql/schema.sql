@@ -164,6 +164,33 @@ CREATE INDEX IF NOT EXISTS thread_recency ON thread (archived_at, last_active_at
 CREATE INDEX IF NOT EXISTS thread_tags ON thread USING gin (tags);
 CREATE INDEX IF NOT EXISTS thread_bot ON thread (bot_id);
 
+-- Remote paired TUI nodes (environments plan Phase 2b): a machine running
+-- the nexus TUI client that dials OUT to nexus over WebSocket and serves
+-- its machine as an environment target under a stable user-assigned name.
+--
+-- Token authority is instance-wide by design (v1): nexus is single-user
+-- today (one NEXUS_UI_TOKEN guards the whole web surface), so a node token
+-- grants exactly what a UI connection grants — join any thread as viewer,
+-- join env-toolset threads as environment, Send — scoped to node
+-- operations and revocable per node (DELETE the row). Per-thread grants
+-- become REQUIRED the day multi-user accounts exist.
+--
+-- token_hash is the SHA-256 of the node's bearer token (nexus/node.gleam,
+-- gleam_crypto), NEVER the plaintext: verification re-hashes the presented
+-- token and compares in constant time, so a stolen DB dump cannot mint a
+-- node connection. Tokens are distinct from the UI token and revocable by
+-- deleting the row (a revoke + re-pair mints a fresh hash).
+CREATE TABLE IF NOT EXISTS node (
+  id            text PRIMARY KEY,
+  name          text NOT NULL,                  -- stable user-assigned target name (unique)
+  token_hash    text NOT NULL,                  -- hex digest of the bearer token, never plaintext
+  created_at    timestamptz NOT NULL,
+  last_seen_at  timestamptz                     -- bumped on each authenticated connect (NULL = never connected)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS node_name ON node (name);
+CREATE INDEX IF NOT EXISTS node_recency ON node (last_seen_at DESC);
+
 CREATE TABLE IF NOT EXISTS thread_message (
   id           bigserial PRIMARY KEY,
   thread_id   text NOT NULL REFERENCES thread(id) ON DELETE CASCADE,

@@ -13,6 +13,7 @@ import gleam/list
 import gleam/option.{None, Some}
 import gleam/otp/actor
 import gleam/string
+import nexus/node
 import nexus/store.{
   type Store, type StoredBot, type StoredProvider, type StoredSummary,
 }
@@ -41,6 +42,9 @@ pub type Event {
   EvInsertBot(id: String)
   EvUpdateBot(id: String)
   EvDeleteBot(id: String)
+  EvInsertNode(id: String)
+  EvTouchNode(id: String)
+  EvDeleteNode(id: String)
 }
 
 pub type MockMsg {
@@ -96,6 +100,12 @@ pub type MockMsg {
   UpdateBot(bot: StoredBot, reply: Subject(Result(Nil, String)))
   DeleteBot(id: String, reply: Subject(Result(Nil, String)))
   CountBotsForProvider(id: String, reply: Subject(Result(Int, String)))
+  // ---- node rows (docs/plans/environments.md, Phase 2b) ----
+  ListNodes(reply: Subject(Result(List(store.StoredNode), String)))
+  GetNodeByName(name: String, reply: Subject(Result(store.StoredNode, String)))
+  InsertNode(node: store.StoredNode, reply: Subject(Result(Nil, String)))
+  TouchNode(id: String, reply: Subject(Result(Nil, String)))
+  DeleteNode(id: String, reply: Subject(Result(Nil, String)))
   // ---- test-only introspection ----
   Events(reply: Subject(List(Event)))
   Rows(reply: Subject(List(#(String, List(store.MessageRow)))))
@@ -103,6 +113,8 @@ pub type MockMsg {
   Providers(reply: Subject(List(StoredProvider)))
   /// Every stored bot, id-sorted — for direct row assertions.
   Bots(reply: Subject(List(StoredBot)))
+  /// Every stored node, id-sorted — for direct row assertions.
+  Nodes(reply: Subject(List(store.StoredNode)))
   /// Test-only: truncate a thread's stored rows back to `keep_rows` and
   /// its persisted message count to `messages` to model a crash between
   /// commits — the next Commit re-emits the delta, which is exactly the
@@ -134,6 +146,7 @@ type State {
     threads: Dict(String, Stored),
     providers: Dict(String, store.StoredProvider),
     bots: Dict(String, StoredBot),
+    nodes: Dict(String, store.StoredNode),
     events: List(Event),
   )
 }
@@ -182,6 +195,7 @@ pub fn start() -> Subject(MockMsg) {
           threads: dict.new(),
           providers: dict.new(),
           bots: dict.new(),
+          nodes: dict.new(),
           events: [],
         ),
       )
@@ -242,6 +256,13 @@ pub fn seam(mock: Subject(MockMsg)) -> Store {
     count_bots_for_provider: fn(id) {
       call(mock, 5000, fn(r) { CountBotsForProvider(id, r) })
     },
+    list_nodes: fn() { call(mock, 5000, ListNodes) },
+    get_node_by_name: fn(name) {
+      call(mock, 5000, fn(r) { GetNodeByName(name, r) })
+    },
+    insert_node: fn(row) { call(mock, 5000, fn(r) { InsertNode(row, r) }) },
+    touch_node: fn(id) { call(mock, 5000, fn(r) { TouchNode(id, r) }) },
+    delete_node: fn(id) { call(mock, 5000, fn(r) { DeleteNode(id, r) }) },
   )
 }
 
@@ -268,6 +289,11 @@ pub fn providers(mock: Subject(MockMsg)) -> List(store.StoredProvider) {
 /// Every stored bot, id-sorted — for direct row assertions.
 pub fn bots(mock: Subject(MockMsg)) -> List(store.StoredBot) {
   call(mock, 5000, Bots)
+}
+
+/// Every stored node, id-sorted — for direct row assertions.
+pub fn nodes(mock: Subject(MockMsg)) -> List(store.StoredNode) {
+  call(mock, 5000, Nodes)
 }
 
 /// Truncate a thread's stored rows (models a crash between commits so
@@ -1000,6 +1026,110 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
         |> list.filter(fn(bot) { bot.provider_id == id })
         |> list.length
       process.send(reply, Ok(count))
+      actor.continue(state)
+    }
+
+    // ---- node rows (docs/plans/environments.md, Phase 2b) ----
+    ListNodes(reply) -> {
+      let nodes =
+        state.nodes
+        |> dict.values
+        |> list.sort(fn(a, b) { string.compare(a.id, b.id) })
+      process.send(reply, Ok(nodes))
+      actor.continue(state)
+    }
+
+    GetNodeByName(name, reply) -> {
+      let found =
+        state.nodes
+        |> dict.values
+        |> list.find(fn(node) { node.name == name })
+      case found {
+        Ok(node) -> {
+          process.send(reply, Ok(node))
+          actor.continue(state)
+        }
+        Error(_) -> {
+          process.send(reply, Error("no stored node named " <> name))
+          actor.continue(state)
+        }
+      }
+    }
+
+    InsertNode(node, reply) ->
+      // node_pkey + node_name, like the schema's constraints.
+      case
+        dict.has_key(state.nodes, node.id),
+        list.any(dict.values(state.nodes), fn(existing) {
+          existing.name == node.name
+        })
+      {
+        True, _ -> {
+          process.send(reply, Error("node " <> node.id <> " exists"))
+          actor.continue(state)
+        }
+        False, True -> {
+          process.send(reply, Error("node name " <> node.name <> " exists"))
+          actor.continue(state)
+        }
+        False, False -> {
+          process.send(reply, Ok(Nil))
+          actor.continue(
+            State(
+              ..state,
+              nodes: dict.insert(state.nodes, node.id, node),
+              events: [EvInsertNode(node.id), ..state.events],
+            ),
+          )
+        }
+      }
+
+    TouchNode(id, reply) ->
+      case dict.get(state.nodes, id) {
+        // Like the SQL `update ... where id = $1`: a missing row is a
+        // silent no-op, not an error.
+        Error(_) -> {
+          process.send(reply, Ok(Nil))
+          actor.continue(state)
+        }
+        Ok(node) -> {
+          let stamped =
+            node.Node(..node, last_seen_at: Some(timing.wall_now_s()))
+          process.send(reply, Ok(Nil))
+          actor.continue(
+            State(
+              ..state,
+              nodes: dict.insert(state.nodes, id, stamped),
+              events: [EvTouchNode(id), ..state.events],
+            ),
+          )
+        }
+      }
+
+    DeleteNode(id, reply) -> {
+      case dict.has_key(state.nodes, id) {
+        False -> {
+          process.send(reply, Ok(Nil))
+          actor.continue(state)
+        }
+        True -> {
+          process.send(reply, Ok(Nil))
+          actor.continue(
+            State(..state, nodes: dict.delete(state.nodes, id), events: [
+              EvDeleteNode(id),
+              ..state.events
+            ]),
+          )
+        }
+      }
+    }
+
+    Nodes(reply) -> {
+      let nodes =
+        state.nodes
+        |> dict.values
+        |> list.sort(fn(a, b) { string.compare(a.id, b.id) })
+      process.send(reply, nodes)
       actor.continue(state)
     }
 

@@ -72,6 +72,21 @@ pub fn roster_texts_test() {
   |> should_equal("attached targets: workspace.")
 }
 
+pub fn roster_parse_roundtrips_test() {
+  // The inverse of the tail line (Phase 2b hydration re-derivation): a
+  // roster line parses back to its list, and a non-roster line is `None`.
+  env.roster_parse("attached targets: workspace, proxmox-2.")
+  |> should_equal(Some(["workspace", "proxmox-2"]))
+  env.roster_parse("attached targets: workspace.")
+  |> should_equal(Some(["workspace"]))
+  // Not a roster line: a plain user message or bot-authored row is None.
+  env.roster_parse("what is the weather?")
+  |> should_equal(None)
+  // Tolerant of a missing trailing dot (defensive on hand-written rows).
+  env.roster_parse("attached targets: workspace")
+  |> should_equal(Some(["workspace"]))
+}
+
 pub fn valid_target_name_test() {
   let assert Ok(Nil) = env.valid_target_name("proxmox-2")
   let assert Ok(Nil) = env.valid_target_name("node_a_1")

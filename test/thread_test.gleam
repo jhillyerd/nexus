@@ -387,6 +387,7 @@ fn start_with(runner: thread.TurnRunner) -> process.Subject(thread.Msg) {
       // through the same one construction path.
       transcript: transcript.new("test-alias", ""),
       hydrated: False,
+      roster: [],
       utility_apply: no_utility_apply,
     ))
   started.data
@@ -408,6 +409,7 @@ fn start_with_env(runner: thread.TurnRunner) -> process.Subject(thread.Msg) {
       commit_hook: fn(_) { Nil },
       transcript: transcript.new("test-alias", ""),
       hydrated: False,
+      roster: ["workspace"],
       utility_apply: no_utility_apply,
     ))
   started.data
@@ -648,6 +650,7 @@ pub fn selected_alias_is_frozen_test() {
       commit_hook: fn(_) { Nil },
       transcript: transcript.new("chosen-alias", ""),
       hydrated: False,
+      roster: [],
       utility_apply: no_utility_apply,
     )
   let assert Ok(started) = thread.start_with_spec(spec)
@@ -690,6 +693,7 @@ pub fn runner_receives_frozen_endpoint_test() {
       commit_hook: fn(_) { Nil },
       transcript: transcript.new("test-alias", ""),
       hydrated: False,
+      roster: [],
       utility_apply: no_utility_apply,
     )
   let assert Ok(started) = thread.start_with_spec(spec)
@@ -1505,6 +1509,7 @@ fn start_with_utility(
       commit_hook: fn(_) { Nil },
       transcript: transcript.new("test-alias", ""),
       hydrated: False,
+      roster: [],
       utility_apply: u_apply,
     ))
   started.data
