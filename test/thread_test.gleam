@@ -171,6 +171,23 @@ fn crashing_runner(
   thread.StreamErrored("unreachable")
 }
 
+/// Streams one token (so the turn reaches `Streaming`), then parks on a
+/// gate, then — on gate release — KILLS its own worker process, driving
+/// the `WorkerDown` path (not `WorkerDone`). The gate lets a test queue a
+/// roster change while the worker is truly mid-turn before it dies.
+fn crash_after_gate_runner(
+  gate_request: process.Subject(process.Subject(Nil)),
+) -> thread.TurnRunner {
+  fn(_endpoint, _tr, _cancel, _delivery, _environment, on_event) {
+    on_event(loop.StreamEvent(openai.TokenDelta("partial")))
+    let gate = process.new_subject()
+    process.send(gate_request, gate)
+    let _ = process.receive(gate, 5000)
+    process.kill(process.self())
+    thread.StreamErrored("unreachable")
+  }
+}
+
 type CounterMsg {
   Ping(reply: process.Subject(Int))
 }
@@ -2236,4 +2253,41 @@ pub fn queued_roster_preview_fold_test() {
     _,
     thread.UserEcho("attached targets: workspace.", Some(_), Some("system")),
   ) = expect_event(sub)
+}
+
+pub fn queued_roster_drains_on_worker_down_test() {
+  // The crash-path drain (environments plan Phase 2a): a roster change
+  // queued while the worker is mid-turn must still apply when the worker
+  // DIES instead of completing — `WorkerDown` installs no transcript, so
+  // the queued attach applies after `TurnFailed` rather than being
+  // stranded forever (cubic review).
+  let gate_request = process.new_subject()
+  let sess = start_with_env(crash_after_gate_runner(gate_request))
+  let sub = join(sess)
+  let _ = expect_event(sub)
+
+  should.equal(thread.send_message(sess, "doomed"), thread.Sent)
+  expect_user_echo(sub, "doomed")
+  // The worker emits one token before parking: consume it so the next
+  // event is the crash (TurnFailed), not leftover streaming.
+  expect_event(sub) |> should.equal(scoped(thread.Token("partial")))
+
+  // Queue an attach while the worker parks mid-turn.
+  let reply = process.new_subject()
+  process.send(sess, thread.AttachTarget("proxmox-2", reply))
+  let assert Ok(Ok(Nil)) = process.receive(reply, 2000)
+
+  // Release the gate: the worker kills itself → WorkerDown → TurnFailed,
+  // THEN the queued attach drains and its roster row lands.
+  let assert Ok(gate) = process.receive(gate_request, 5000)
+  process.send(gate, Nil)
+  let assert thread.ThreadEvent(_, 1, thread.TurnFailed(reason, _)) =
+    expect_event(sub)
+  should.be_true(string.contains(reason, "worker"))
+  let assert thread.ThreadEvent(
+    _,
+    _,
+    thread.UserEcho(text, Some(_), Some("system")),
+  ) = expect_event(sub)
+  should.equal(text, "attached targets: workspace, proxmox-2.")
 }
