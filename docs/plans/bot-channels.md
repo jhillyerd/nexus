@@ -152,19 +152,24 @@ dangling DM thread in the sidebar.
   (the `apply_meta` pattern, so the pane badge and `Channels` ask are
   correct immediately), live record metas updated, and live child
   actors notified by bounded ask so their own Send-refusal state
-  applies. A notify that times out or fails is retried briefly, then
-  falls back to the delete walk's existing stop-and-demonitor: the
-  actor is dropped to dormant, closing the stale-Send window
-  immediately — an actor that missed the notify would otherwise keep
-  accepting HUMAN Sends into an archived channel until restart, and
-  the pane is navigable, so that path is live. The channel lazily
-  rehydrates from its archived row on next selection. **Restore is
-  symmetric**: unarchiving a parent unarchives its channel subtree —
-  unambiguous today because channels have no individual archive
-  affordance to conflict with; when individual channel archiving
-  lands, restore policy must distinguish cascade-archived from
-  human-archived (e.g. `archived_at` compared against the parent's
-  cascade stamp).
+  applies. A live actor processes that ask promptly even MID-TURN —
+  the actor loop never blocks on its worker (§8) — so the archived
+  flag applies while the in-flight worker turn continues untouched:
+  the turn is preserved and no archive mechanic cancels it. A notify
+  failure therefore means the actor is DOWN — the ordinary crash
+  case, not an archive decision: bounded retries land the notify on
+  the rehydrated actor (created FROM THE STORE, so its archived state
+  is correct from birth), and every Send arriving meanwhile — human
+  or delivery — resolves through the registry, rehydrating the
+  archived row first, so the stale-Send window is closed by
+  construction. No `thread.Stop` anywhere in the cascade: stopping
+  could kill an in-flight descendant turn, which the no-cancel rule
+  forbids. **Restore is symmetric**:
+  unarchiving a parent unarchives its channel subtree — unambiguous
+  today because channels have no individual archive affordance to
+  conflict with; when individual channel archiving lands, restore
+  policy must distinguish cascade-archived from human-archived (e.g.
+  `archived_at` compared against the parent's cascade stamp).
 - **The delivery path refuses archived senders.** Archive does not
   cancel turns — a turn already in flight when its parent is archived
   keeps running and can still call `bot_message`. Without a check, the
@@ -310,7 +315,8 @@ instruction. So:
    cascade write aborts with memory untouched (nothing hydrates
    archived after restart); a mid-turn delivery from an archived
    parent refuses (sender-archived guard, no fresh channel); child
-   notify failure stops the actor to dormant (no stale-Send window);
+   notify failure self-corrects via rehydrate (actor born archived —
+   no `Stop`, no stale-Send window, in-flight turns preserved);
    delivery into a cascade-archived channel
    refuses durably (no re-derivation escape hatch); parent-delete
    drops the whole descendant tree (direct children AND grandchildren);
