@@ -283,11 +283,16 @@ pub fn bash_multiline_output_after_marker_test() {
 }
 
 /// The death-with-port sentinel (cubic PR review): the owner dying
-/// mid-command — even IMMEDIATELY, before the BEAM side ever parses
-/// the pid marker — must reap the whole process group. The sentinel
-/// lives inside the wrapper (a subshell watching the dup'd stdin
-/// pipe), so the kill does not depend on any BEAM-side pid handoff
-/// and the test has no timing window.
+/// mid-command — even before the BEAM side ever parses the pid
+/// marker — must reap the whole process group. The sentinel lives
+/// inside the wrapper (a subshell watching the dup'd stdin pipe), so
+/// the kill does not depend on any BEAM-side pid handoff.
+/// Synchronization is ps-based (cubic PR review): the presence probe
+/// waits for the WRAPPER bash's own command line, which carries the
+/// per-run tag from spawn — before the marker is read BEAM-side and
+/// before the tagged child forks — so the owner's death lands in the
+/// pre-handoff window (watchdog unarmed, sentinel-only cleanup) and
+/// the disappearance probe cannot pass vacuously.
 pub fn bash_owner_death_kills_group_test() {
   let root = fresh_root()
   let e = env_for(root)

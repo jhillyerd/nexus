@@ -2148,7 +2148,7 @@ fn restart(
   case
     rescue.rescue(fn() { factory_supervisor.start_child(factory, argument) })
   {
-    Error(_crash) -> Error(actor_init_failed())
+    Error(crash) -> Error(actor.InitFailed("factory ask crashed: " <> crash))
     Ok(Error(already_started)) -> {
       process.sleep(50)
       case
@@ -2161,13 +2161,6 @@ fn restart(
     }
     Ok(other) -> other
   }
-}
-
-/// A stable error value for rescue-wrapped start asks — `actor.StartError`
-/// has no cheap constructor for "the ask itself crashed", and the
-/// record's `start_error` string is what surfaces.
-fn actor_init_failed() -> actor.StartError {
-  actor.InitFailed("")
 }
 
 // ---------------------------------------------------------------------------
