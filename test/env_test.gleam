@@ -343,6 +343,37 @@ fn poll_tag_gone(pattern: String, attempts: Int) -> Nil {
   }
 }
 
+/// A pre-queued cancel (a Stop that landed before the executor even
+/// started selecting) must answer `cancelled` AND leave the one-shot
+/// re-signal observable for the loop's LAST-call path — with the
+/// marker wait port-only, nothing consumes the signal in between
+/// (CodeRabbit review).
+pub fn bash_prequeued_cancel_preserves_signal_test() {
+  let root = fresh_root()
+  let reply = process.new_subject()
+  let worker =
+    process.spawn_unlinked(fn() {
+      let cancel = process.new_subject()
+      process.send(cancel, Nil)
+      let result =
+        env.bash(
+          timeout_ms: 60_000,
+          max_output_bytes: 100_000,
+          environment: env_for(root),
+          cancel: cancel,
+          arguments: "{\"target\":\"workspace\",\"command\":\"echo partial; sleep 45\"}",
+        )
+      let again = process.receive(cancel, 2000)
+      process.send(reply, #(result, again))
+    })
+  let _ = worker
+  let assert Ok(#(result, again)) = process.receive(reply, 30_000)
+  let _ = simplifile.delete(root)
+  let assert Error(text) = result
+  let assert True = string.contains(text, "cancelled")
+  let assert Ok(Nil) = again
+}
+
 pub fn bash_empty_output_marker_test() {
   let root = fresh_root()
   let assert Ok("(no output)") = bash(env_for(root), 5000, "true")

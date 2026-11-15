@@ -599,9 +599,7 @@ fn kill_and_reap(loop: BashLoop, state: BashState) -> BashState {
     MarkerLeader(_) | MarkerAbsent -> state
   }
   ffi_kill_tree(loop.p, marker_kill(state.marker, loop.kill_group))
-  let reap_selector =
-    process.new_selector()
-    |> process.select_record(tag: loop.p, fields: 1, mapping: decode_port_msg)
+  let reap_selector = port_selector(loop.p)
   case process.selector_receive(reap_selector, reap_ms) {
     Ok(Port(Data(bytes))) -> kill_and_reap(loop, absorb(loop, state, bytes))
     // Unreachable by construction (the reap selector carries no
@@ -629,23 +627,28 @@ fn await_marker(
   case state.marker == MarkerPending && left_ms > 0 {
     False -> state
     True ->
-      case process.selector_receive(loop.selector, left_ms) {
+      // PORT-ONLY selector (CodeRabbit review): the wait must never
+      // touch the turn's one-shot cancel subject — a cancel landing
+      // here stays queued untouched for the caller's main select and
+      // the loop's LAST-call path, with no consume/re-signal dance.
+      case process.selector_receive(port_selector(loop.p), left_ms) {
         Ok(Port(Data(bytes))) -> {
           let state = absorb(loop, state, bytes)
           await_marker(loop, state, started_us)
         }
         // The child exited before printing a marker — nothing to arm.
-        Ok(Port(Exited(_))) | Error(Nil) -> state
-        // RE-SIGNAL (the codemode rule, cubic PR review): the wait's
-        // selector consumed the turn's one-shot `Nil`, and the loop's
-        // LAST-call path still needs to observe the Stop — put it
-        // back and let the caller's main select take the cancel path.
-        Ok(Cancelled) -> {
-          process.send(loop.cancel, Nil)
-          state
-        }
+        // Cancelled is unreachable by construction (port-only
+        // selector); the arm keeps the match total.
+        Ok(Port(Exited(_))) | Ok(Cancelled) | Error(Nil) -> state
       }
   }
+}
+
+/// A selector over the port's records ONLY — never the cancel subject
+/// (the shared shape of the marker wait and the kill reap).
+fn port_selector(p: Port) -> process.Selector(SelectMsg) {
+  process.new_selector()
+  |> process.select_record(tag: p, fields: 1, mapping: decode_port_msg)
 }
 
 /// A completed run: marker consumed, output capped and lossily
