@@ -617,7 +617,15 @@ fn await_marker(
           await_marker(loop, state, started_us)
         }
         // The child exited before printing a marker — nothing to arm.
-        Ok(Port(Exited(_))) | Ok(Cancelled) | Error(Nil) -> state
+        Ok(Port(Exited(_))) | Error(Nil) -> state
+        // RE-SIGNAL (the codemode rule, cubic PR review): the wait's
+        // selector consumed the turn's one-shot `Nil`, and the loop's
+        // LAST-call path still needs to observe the Stop — put it
+        // back and let the caller's main select take the cancel path.
+        Ok(Cancelled) -> {
+          process.send(loop.cancel, Nil)
+          state
+        }
       }
   }
 }
