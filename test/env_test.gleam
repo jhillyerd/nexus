@@ -292,6 +292,13 @@ pub fn bash_owner_death_kills_group_test() {
   let root = fresh_root()
   let e = env_for(root)
   let done = process.new_subject()
+  // PER-RUN tag (CodeRabbit review): an orphan from a failed earlier
+  // run could satisfy a fixed tag's presence probe and let both
+  // checks pass vacuously. The trailing letter pairs with the
+  // bracketed probe patterns (which the probe's own command line
+  // cannot match).
+  let uniq = int.to_string(timing.now_us())
+  let tag = "nxown" <> uniq <> "q"
   // UNLINKED: process.spawn links, and killing a linked owner would
   // propagate the `killed` exit reason into this test's own process.
   let owner =
@@ -303,7 +310,9 @@ pub fn bash_owner_death_kills_group_test() {
           max_output_bytes: 100_000,
           environment: e,
           cancel: cancel,
-          arguments: "{\"target\":\"workspace\",\"command\":\"exec -a nxown8x sleep 45 & sleep 45\"}",
+          arguments: "{\"target\":\"workspace\",\"command\":\"exec -a "
+            <> tag
+            <> " sleep 45 & sleep 45\"}",
         )
       process.sleep(60_000)
     })
@@ -315,14 +324,14 @@ pub fn bash_owner_death_kills_group_test() {
   // no parsed pgid), where the die-with-port sentinel is the only
   // cleanup — and the presence probe makes the disappearance probe
   // non-vacuous: the group provably existed.
-  poll_tag_present("nxown[8]x", 50)
+  poll_tag_present("nxown" <> uniq <> "[q]", 50)
   process.kill(owner)
   process.send(done, Nil)
   let assert Ok(Nil) = process.receive(done, 1000)
   // The sentinel fires on the port's EOF; give it a moment, then the
   // whole group (wrapper and any forked child, both matching the tag
   // in ps) must be gone.
-  poll_tag_gone("nxown[8]x", 50)
+  poll_tag_gone("nxown" <> uniq <> "[q]", 50)
   let _ = simplifile.delete(root)
 }
 
@@ -366,6 +375,10 @@ pub fn bash_cancel_midrun_reaps_group_and_signal_test() {
   // a subject is legal from any process; only receiving is
   // owner-restricted, and the worker keeps that.
   let handoff = process.new_subject()
+  // PER-RUN tag (CodeRabbit review): same orphan-aliasing hazard as
+  // the owner-death test.
+  let uniq = int.to_string(timing.now_us())
+  let tag = "nxcancel" <> uniq <> "q"
   let worker =
     process.spawn_unlinked(fn() {
       let cancel = process.new_subject()
@@ -376,7 +389,9 @@ pub fn bash_cancel_midrun_reaps_group_and_signal_test() {
           max_output_bytes: 100_000,
           environment: env_for(root),
           cancel: cancel,
-          arguments: "{\"target\":\"workspace\",\"command\":\"exec -a nxcancel9x sleep 45 & sleep 45\"}",
+          arguments: "{\"target\":\"workspace\",\"command\":\"exec -a "
+            <> tag
+            <> " sleep 45 & sleep 45\"}",
         )
       let again = process.receive(cancel, 2000)
       process.send(reply, #(result, again))
@@ -386,13 +401,13 @@ pub fn bash_cancel_midrun_reaps_group_and_signal_test() {
   // The tagged child itself is up (its ps line is "nxcancel9x 45" —
   // exec -a replaces argv[0]; the bracketed probe cannot match its
   // own command line).
-  poll_tag_present("nxcancel[9]x 4[5]", 50)
+  poll_tag_present("nxcancel" <> uniq <> "[q] 4[5]", 50)
   process.send(cancel, Nil)
   let assert Ok(#(result, again)) = process.receive(reply, 30_000)
   let assert Error(text) = result
   let assert True = string.contains(text, "cancelled")
   let assert Ok(Nil) = again
-  poll_tag_gone("nxcancel[9]x", 50)
+  poll_tag_gone("nxcancel" <> uniq <> "[q]", 50)
   let _ = simplifile.delete(root)
 }
 
