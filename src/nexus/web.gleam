@@ -239,7 +239,7 @@ fn create_thread_response(
         ConflictingCreate ->
           json_response(
             400,
-            err_json("bot conflicts with provider/model — pick one shape"),
+            err_json("bot conflicts with provider/model/tools — pick one shape"),
           )
         BotCreate(bot_id) ->
           // The SHARED create-from-bot orchestration (#73/#74): resolve
@@ -261,25 +261,27 @@ fn create_thread_response(
                 err_json(thread_create.describe(problem)),
               )
           }
-        PlainCreate(provider: "", model: _) ->
+        PlainCreate(provider: "", model: _, tools: _) ->
           json_response(400, err_json("empty provider"))
-        PlainCreate(provider: _, model: "") ->
+        PlainCreate(provider: _, model: "", tools: _) ->
           json_response(400, err_json("empty model"))
-        PlainCreate(provider: ident, model: trimmed_model) -> {
+        PlainCreate(provider: ident, model: trimmed_model, tools: tools) -> {
           // The shared orchestration (#73): provider resolution outside
           // the registry's loop, then the create. The model alias is NOT
           // validated — proxies serve aliases their /v1/models may not
           // list (see thread_create's module doc). The reply IS the
-          // summary — this layer never hand-builds one.
+          // summary — this layer never hand-builds one. `tools` is the
+          // explicit toolset vocabulary (absent/null = the default
+          // snapshot; a bot-sourced create arrives through the
+          // BotCreate arm above instead, bots plan P2) — the registry
+          // freezes env names' workspace root at this boundary
+          // (environments plan Phase 1).
           let requested =
             thread_registry.NewThread(
               provider_id: ident,
               model: trimmed_model,
-              // POST /threads pins the config default toolset; a
-              // bot-sourced create arrives through the BotCreate arm
-              // above instead (bots plan P2).
               system_prompt: None,
-              toolset: None,
+              toolset: tools,
               bot_id: None,
             )
           case thread_create.create_thread(providers, registry, requested) {
@@ -326,17 +328,29 @@ fn read_json(req: Request(mist.Connection)) -> Result(String, Nil) {
 /// P1): `PlainCreate(provider, model)` (both required — a thread always
 /// pins its provider explicitly) or `BotCreate(bot)` (provider/model/
 /// system prompt copied from the bot at creation). A present `bot` KEY
-/// alongside a present `provider`/`model` KEY — blank or not — is a
-/// conflict: the bot's frozen values must not be quietly overridden.
-/// Classification is presence-aware (a trimmed-blank value is still a
-/// value the caller sent); trimming happens after, so the plain path's
-/// blank halves stay the empty-field 400s. Presence is read on the RAW
-/// JSON value: an explicit `null` fails the decode (400) instead of
-/// collapsing into the missing-key default — `decode.optional` would
-/// blur `{"bot": null}` into a plain create and `{"bot": "b1",
-/// "provider": null}` into a bot create (coderabbit review, PR #87).
+/// alongside a present `provider`/`model` KEY — blank or not — or a
+/// present non-null `tools` value is a conflict: the bot's frozen
+/// values (toolset included) must not be quietly overridden, and a
+/// silently dropped explicit `tools` list would hand the caller a
+/// different envelope than the one requested (cubic PR review). An
+/// explicit `"tools": null` is NOT a conflict — null flattens to the
+/// default-set sentinel exactly like absence (the bots-plan `tools`
+/// vocabulary), so `{"bot": …}` stays a plain bot create. The
+/// provider/model halves stay raw-presence-aware (a trimmed-blank
+/// value is still a value the caller sent); trimming happens after, so
+/// the plain path's blank halves stay the empty-field 400s. Presence is
+/// read on the RAW JSON value: an explicit `null` fails the decode
+/// (400) instead of collapsing into the missing-key default —
+/// `decode.optional` would blur `{"bot": null}` into a plain create and
+/// `{"bot": "b1", "provider": null}` into a bot create (coderabbit
+/// review, PR #87).
 pub type CreateFields {
-  PlainCreate(provider: String, model: String)
+  /// `tools` (environments plan Phase 1 follows the bots plan's create
+  /// vocabulary): absent/null is the default set, `[]` chat-only, a
+  /// non-empty array an explicit list the registry validates (env
+  /// names among them — refused while no workspace root can be
+  /// frozen).
+  PlainCreate(provider: String, model: String, tools: Option(List(String)))
   BotCreate(bot: String)
   /// `bot` alongside `provider` and/or `model` — the shapes cannot both
   /// be honored, and quietly preferring one would freeze values the
@@ -357,14 +371,23 @@ pub fn create_fields_decoder() -> decode.Decoder(CreateFields) {
   use provider <- decode.optional_field("provider", None, present_string())
   use model <- decode.optional_field("model", None, present_string())
   use bot <- decode.optional_field("bot", None, present_string())
-  decode.success(case bot, provider, model {
-    Some(bot), None, None -> BotCreate(string.trim(bot))
-    None, provider, model ->
+  use tools <- decode.optional_field(
+    "tools",
+    None,
+    decode.optional(decode.list(decode.string)),
+  )
+  decode.success(case bot, provider, model, tools {
+    // `tools` alongside `bot` is the same quiet-override conflict as
+    // provider/model: the bot's toolset wins or the request refuses —
+    // never silently drops the caller's list.
+    Some(bot), None, None, None -> BotCreate(string.trim(bot))
+    None, provider, model, _ ->
       PlainCreate(
         provider: string.trim(option.unwrap(provider, "")),
         model: string.trim(option.unwrap(model, "")),
+        tools: tools,
       )
-    Some(_), _, _ -> ConflictingCreate
+    Some(_), _, _, _ -> ConflictingCreate
   })
 }
 
@@ -696,7 +719,12 @@ fn send_response(
           // the first-ever message titles the thread, and the registry
           // additionally refuses to clobber a manual (or already
           // generated) title.
-          let is_first = thread.describe(thread).message_count <= 1
+          // <= 2, not <= 1: an environment thread starts at 2
+          // (system prompt + roster row) and its first human send must
+          // still auto-title (CodeRabbit review). A plain thread never
+          // sits at 2 on a send boundary (first send commits >= 3, a
+          // failed one leaves 1).
+          let is_first = thread.describe(thread).message_count <= 2
           case thread.send_message(thread, trimmed) {
             thread.Sent -> {
               case is_first {
@@ -1023,6 +1051,7 @@ pub fn bot_error_fields(error: bot_registry.RegistryError) -> #(Int, String) {
   let status = case error {
     bot_registry.Unknown -> 404
     bot_registry.InvalidName -> 400
+    bot_registry.ReservedName -> 400
     bot_registry.InvalidModel -> 400
     bot_registry.InvalidTools(_) -> 400
     bot_registry.DuplicateName -> 409

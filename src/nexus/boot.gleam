@@ -44,6 +44,7 @@ import gleam/string
 import mist
 import nexus/bot_registry
 import nexus/config
+import nexus/env
 import nexus/mcp_adapter
 import nexus/plugin
 import nexus/provider_registry
@@ -55,6 +56,53 @@ import nexus/web
 
 @external(erlang, "nexus_boot_ffi", "halt")
 fn halt(code: Int) -> a
+
+/// The bot registry's tool-validation closure (bots plan P2, wired at
+/// boot): the compiled ∪ plugin catalog check, plus the two plan gates —
+/// a foreign name passes only while its server is mounted (no live ask:
+/// a bot save must not depend on a server's mood), and an env name only
+/// while a workspace root exists to freeze (environments plan Phase 1 —
+/// the same refusal a create gets, at the surface where the operator
+/// still has the form open). Extracted so the gates are offline-
+/// testable without booting the tree.
+pub fn bot_validate_tools(
+  cfg: config.Config,
+  providers: tools.ProviderTable,
+  foreign: dict.Dict(String, tools.ForeignServer),
+) -> fn(List(String)) -> Result(List(String), String) {
+  fn(names) {
+    let #(foreign_names, plain_names) =
+      list.fold(names, #([], []), fn(acc, name) {
+        let #(foreign_names, plain_names) = acc
+        let is_foreign = case tool_provider.split(name) {
+          Ok(#(server, _)) -> dict.has_key(foreign, server)
+          Error(Nil) -> False
+        }
+        case is_foreign {
+          True -> #([name, ..foreign_names], plain_names)
+          False -> #(foreign_names, [name, ..plain_names])
+        }
+      })
+    // Environments plan Phase 1: a bot template may pin env tools only
+    // while a workspace root exists to freeze.
+    case list.any(names, env.is_env_name), cfg.workspace_root {
+      True, option.None ->
+        Error("workspace tools require NEXUS_WORKSPACE_ROOT to be set")
+      _, _ ->
+        // Plain names resolve through the compiled ∪ plugin catalog
+        // (the loud refusal unchanged); a foreign name passed
+        // classification above, which already proved its server is
+        // mounted.
+        case tools.by_names_with(cfg, providers, list.reverse(plain_names)) {
+          Error(reason) -> Error(reason)
+          Ok(_) -> {
+            let _ = foreign_names
+            Ok(names)
+          }
+        }
+    }
+  }
+}
 
 pub fn main() -> Nil {
   io.println("nexus — M3 server-component UI")
@@ -165,35 +213,7 @@ pub fn main() -> Nil {
               // mounted MCP server passes here (no LIVE ask at bot
               // validation — a bot save must not depend on a server's
               // mood); the freeze happens per THREAD at create.
-              fn(names) {
-                let #(foreign_names, plain_names) =
-                  list.fold(names, #([], []), fn(acc, name) {
-                    let #(foreign_names, plain_names) = acc
-                    let is_foreign = case tool_provider.split(name) {
-                      Ok(#(server, _)) -> dict.has_key(foreign, server)
-                      Error(Nil) -> False
-                    }
-                    case is_foreign {
-                      True -> #([name, ..foreign_names], plain_names)
-                      False -> #(foreign_names, [name, ..plain_names])
-                    }
-                  })
-                // Plain names resolve through the compiled ∪ plugin
-                // catalog (the loud refusal unchanged); a foreign name
-                // passed classification above, which already proved its
-                // server is mounted — validation accepts it without a
-                // live ask (a bot save must not depend on a server's
-                // mood); the freeze happens per THREAD at create.
-                case
-                  tools.by_names_with(cfg, providers, list.reverse(plain_names))
-                {
-                  Error(reason) -> Error(reason)
-                  Ok(_) -> {
-                    let _ = foreign_names
-                    Ok(names)
-                  }
-                }
-              },
+              bot_validate_tools(cfg, providers, foreign),
             )
           }),
         )

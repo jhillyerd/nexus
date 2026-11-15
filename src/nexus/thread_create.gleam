@@ -173,7 +173,7 @@ pub fn describe(problem: CreateProblem) -> String {
     CreateFailed(thread_registry.ProviderFailed(_)) ->
       "provider became unusable"
     CreateFailed(thread_registry.UnknownToolset(reason)) ->
-      "bot toolset unavailable: " <> reason
+      "toolset unavailable: " <> reason
     CreateFailed(thread_registry.StartFailed(reason)) ->
       "thread unavailable: " <> reason
   }

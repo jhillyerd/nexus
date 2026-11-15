@@ -34,6 +34,7 @@ import gleam/string
 import glopenai/chat
 import glopenai/shared
 import nexus/delivery
+import nexus/env.{type Environment}
 import nexus/openai
 import nexus/timing
 import nexus/tool_calls.{type Accumulator}
@@ -141,7 +142,11 @@ pub fn frozen_options(specs: List(ToolSpec)) -> Options {
 /// this turn (bots P3c, #97): `None` on plain threads, `Some` when the
 /// registry's per-thread runner wrapper built it — computed from the
 /// initiating user message's sidecar depth + 1, so it is derived from
-/// persisted data and survives restarts.
+/// persisted data and survives restarts. `environment` is the
+/// environment handle (environments plan Phase 1): `None` on threads
+/// whose frozen toolset carries no env tools, `Some` from the same
+/// registry wrapper — per-thread static (frozen workspace root), so it
+/// too survives restarts from persisted data.
 pub fn run(
   specs: List(ToolSpec),
   max_iterations: Int,
@@ -149,6 +154,7 @@ pub fn run(
   tr: Transcript,
   cancel: Subject(Nil),
   delivery: Option(delivery.Delivery),
+  environment: Option(Environment),
   on_event: fn(LoopEvent) -> Nil,
 ) -> LoopOutcome {
   cell_init()
@@ -159,6 +165,7 @@ pub fn run(
     tr,
     cancel,
     delivery,
+    environment,
     on_event,
     1,
     StatsAcc(None, 0, 0, 0, 0, 0, 0, False, None),
@@ -186,6 +193,7 @@ fn iterate(
   tr,
   cancel,
   delivery,
+  environment,
   on_event,
   iteration,
   stats,
@@ -233,6 +241,7 @@ fn iterate(
                   specs,
                   cancel,
                   delivery,
+                  environment,
                   assembled,
                   flushed_at,
                   on_event,
@@ -252,6 +261,7 @@ fn iterate(
                     tr3,
                     cancel,
                     delivery,
+                    environment,
                     on_event,
                     iteration + 1,
                     stats,
@@ -383,6 +393,7 @@ fn execute_all(
   specs: List(ToolSpec),
   cancel: Subject(Nil),
   delivery: Option(delivery.Delivery),
+  environment: Option(env.Environment),
   assembled: List(tool_calls.ToolCall),
   flushed_at: Int,
   on_event: fn(LoopEvent) -> Nil,
@@ -394,7 +405,9 @@ fn execute_all(
   // lands in the subject's queue and wakes an interruptible executor.
   // `delivery` rides beside it (bots P3c): the bot_message executor's
   // per-thread identity, built by the registry's runner wrapper.
-  let ctx = tools.ToolCtx(cancel:, delivery:)
+  // `environment` rides beside it too (environments plan Phase 1):
+  // every env tool executor's routing, built by the same wrapper.
+  let ctx = tools.ToolCtx(cancel:, delivery:, environment:)
   let stamped = Some(flushed_at)
   let state =
     list.fold(assembled, ExecRunning(tr), fn(state, call: tool_calls.ToolCall) {

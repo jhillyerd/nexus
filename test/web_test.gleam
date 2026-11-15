@@ -335,13 +335,17 @@ pub fn request_body_decoders_test() {
   // blanks are the ROUTE's 400s ("empty provider"/"empty model"), not
   // decode failures, so the bot body parses with the same decoder.
   web.parse_create_json("{\"provider\":\"p1\",\"model\":\"alias-a\"}")
-  |> should.equal(Ok(web.PlainCreate(provider: "p1", model: "alias-a")))
+  |> should.equal(
+    Ok(web.PlainCreate(provider: "p1", model: "alias-a", tools: None)),
+  )
   web.parse_text_json("{\"model\":\"alias-a\"}")
   |> should.equal(Error(Nil))
   web.parse_create_json("{\"model\":\"alias-a\"}")
-  |> should.equal(Ok(web.PlainCreate(provider: "", model: "alias-a")))
+  |> should.equal(
+    Ok(web.PlainCreate(provider: "", model: "alias-a", tools: None)),
+  )
   web.parse_create_json("{\"provider\":\"p1\"}")
-  |> should.equal(Ok(web.PlainCreate(provider: "p1", model: "")))
+  |> should.equal(Ok(web.PlainCreate(provider: "p1", model: "", tools: None)))
   // The create-from-bot shape, and its conflict with provider/model —
   // the conflict rule is about KEYS, so a blank provider/model value
   // still conflicts (presence-aware classification).
@@ -353,6 +357,13 @@ pub fn request_body_decoders_test() {
   |> should.equal(Ok(web.ConflictingCreate))
   web.parse_create_json("{\"bot\":\"b1\",\"provider\":\"\",\"model\":\"\"}")
   |> should.equal(Ok(web.ConflictingCreate))
+  // `tools` alongside `bot` is the same quiet-override conflict (cubic
+  // PR review): the bot's toolset wins or the request refuses — an
+  // explicit null is fine (it is the default sentinel).
+  web.parse_create_json("{\"bot\":\"b1\",\"tools\":[\"bash\"]}")
+  |> should.equal(Ok(web.ConflictingCreate))
+  web.parse_create_json("{\"bot\":\"b1\",\"tools\":null}")
+  |> should.equal(Ok(web.BotCreate("b1")))
   // An explicit JSON null is NOT absent (coderabbit review, PR #87):
   // the null fails the decode — the whole body 400s — instead of
   // blurring {"bot": null} into a plain create or {"bot": "b1",

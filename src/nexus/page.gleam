@@ -1105,6 +1105,14 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
 .turn { max-width: 46rem; padding: .55rem .8rem; border-radius: 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .turn.user { align-self: flex-end; background: color-mix(in srgb, #3b82f6 18%, transparent); }
 .turn.assistant { align-self: flex-start; background: color-mix(in srgb, currentColor 8%, transparent); }
+/* Roster messages (environments plan Phase 1): a user-role row whose
+   display-only author sidecar is `system` renders as a muted status
+   line, not a chat bubble — same inert text nodes, smaller type, no
+   pill. #app-prefix per the cascade traps above. */
+#app .turn.status { align-self: center; max-width: 92%; background: none;
+  border: none; padding: .1rem 0; font-size: .72rem; opacity: .7;
+  text-align: center; }
+#app .turn.status time { font-size: .72rem; }
 /* Inbound bot message chip (issue #122, nexus/ui bot_turn): a
    bot-delivered user line folds up like a thinking chip instead of
    reading as the user's own bubble — collapsed, the summary names the

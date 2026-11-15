@@ -12,9 +12,11 @@ import gleam/otp/factory_supervisor
 import gleam/result
 import gleam/string
 import gleeunit/should
+import glopenai/chat as glopenai_chat
 import nexus/bot
 import nexus/bot_registry
 import nexus/config
+import nexus/env
 import nexus/loop
 import nexus/openai
 import nexus/plugin
@@ -61,6 +63,9 @@ fn test_config() -> config.Config {
     plugin_timeout_ms: 30_000,
     plugin_max_output_chars: 32_768,
     mcp_servers: [],
+    workspace_root: None,
+    env_timeout_ms: 60_000,
+    env_max_output_bytes: 100_000,
     // Bots P3c: the delivery hop guard; 4 = the shipped default.
     max_bot_hops: 4,
   )
@@ -85,6 +90,7 @@ fn happy_runner(
   tr,
   _cancel,
   _delivery,
+  _environment,
   on_event: fn(loop.LoopEvent) -> Nil,
 ) -> thread.TurnOutcome {
   on_event(loop.StreamEvent(openai.TokenDelta("hi")))
@@ -93,6 +99,33 @@ fn happy_runner(
 
 fn start_registry() -> process.Subject(thread_registry.Msg) {
   start_registry_with(thread_registry.thread_child)
+}
+
+/// Environments plan Phase 1: a registry boot with NEXUS_WORKSPACE_ROOT
+/// resolved, over an injected store seam (returned beside the subject so
+/// tests can read rows back).
+fn start_registry_with_workspace(
+  root: String,
+  persistence: store.Store,
+) -> #(process.Subject(thread_registry.Msg), store.Store) {
+  let factory_name = process.new_name("nexus_test_factory")
+  let assert Ok(_factory) =
+    factory_supervisor.start(thread_registry.factory_builder(factory_name))
+  store_mock.ensure_fixture_provider(persistence)
+  let assert Ok(started) =
+    thread_registry.start_with_toolset(
+      config.Config(..test_config(), workspace_root: option.Some(root)),
+      factory_supervisor.get_by_name(factory_name),
+      process.new_name("nexus_test_registry"),
+      persistence,
+      toolset(happy_runner),
+      fn() { [] },
+      fixture_resolver(),
+      process.new_name("nexus_bot_registry"),
+      dict.new(),
+      dict.new(),
+    )
+  #(started.data, persistence)
 }
 
 /// Boot a factory + registry pair over an injectable child starter (the
@@ -571,6 +604,7 @@ fn blocking_runner(
   tr,
   cancel,
   _delivery,
+  _environment,
   _on_event,
 ) -> thread.TurnOutcome {
   let selector =
@@ -612,6 +646,8 @@ fn seed_with_tags(seam: store.Store, id: String, tags: List(String)) -> Nil {
         toolset: thread_registry.plain_entries(
           tools.default_names(test_config()),
         ),
+        workspace_root: None,
+        roster: None,
         message_count: 3,
       ),
       "test system prompt",
@@ -961,6 +997,30 @@ fn seed_at(
         toolset: thread_registry.plain_entries(
           tools.default_names(test_config()),
         ),
+        workspace_root: None,
+        roster: None,
+        message_count: message_count,
+      ),
+      "test system prompt",
+    )
+  Nil
+}
+
+/// Like `seed`, with a frozen workspace root (an environment thread —
+/// the sweep's never-used ceiling for those is 2, system + roster).
+fn seed_env(seam: store.Store, id: String, message_count: Int) -> Nil {
+  store_mock.ensure_fixture_provider(seam)
+  let assert Ok(Nil) =
+    seam.insert_thread(
+      store.StoredSummary(
+        id: id,
+        provider_id: store_mock.fixture_provider_id,
+        model: "alpha",
+        meta: fresh_meta(),
+        toolset: thread_registry.plain_entries(["bash"]),
+        workspace_root: Some("/srv/old-root"),
+        roster: None,
+        last_active_at: 1_700_000_000,
         message_count: message_count,
       ),
       "test system prompt",
@@ -985,8 +1045,14 @@ pub fn boot_sweep_deletes_never_used_threads_test() {
   // Swept: stale never-used rows from earlier runs.
   seed(seam, "s1", "", thread.AutoTitle, False, False, 1)
   seed(seam, "s2", "", thread.AutoTitle, False, True, 1)
+  // Swept too: a never-used ENV thread (system + roster row = 2 —
+  // cubic PR review: the ceiling is per-shape, or abandoned empty env
+  // threads would live forever).
+  seed_env(seam, "s7", 2)
   // Kept: used, manually renamed, pinned…
   seed(seam, "s3", "hello world", thread.AutoTitle, False, False, 3)
+  // Kept: a SENT env thread (first commit takes the count to >= 3).
+  seed_env(seam, "s8", 3)
   seed(seam, "s4", "keep me", thread.ManualTitle, False, False, 1)
   seed(seam, "s5", "", thread.AutoTitle, True, False, 1)
   // …and a never-used thread created moments ago (grace window).
@@ -1002,7 +1068,7 @@ pub fn boot_sweep_deletes_never_used_threads_test() {
   )
 
   let registry = start_registry_over(seam)
-  listed_ids(registry) |> should.equal(["s3", "s4", "s5", "s6"])
+  listed_ids(registry) |> should.equal(["s3", "s4", "s5", "s6", "s8"])
 
   let swept =
     store_mock.events(mock)
@@ -1013,7 +1079,7 @@ pub fn boot_sweep_deletes_never_used_threads_test() {
       }
     })
     |> list.flatten
-  swept |> should.equal(["s1", "s2"])
+  swept |> should.equal(["s1", "s2", "s7"])
 }
 
 /// A never-used row inside the grace window is swept by a LATER boot,
@@ -1124,7 +1190,7 @@ pub fn create_rejects_disabled_provider_test() {
 /// "a thread streams via its frozen endpoint").
 pub fn created_thread_runner_gets_resolved_endpoint_test() {
   let seen = process.new_subject()
-  let capturing = fn(endpoint, tr, _cancel, _delivery, _on_event) {
+  let capturing = fn(endpoint, tr, _cancel, _delivery, _environment, _on_event) {
     process.send(seen, endpoint)
     thread.StreamDone(stats(), transcript.append_assistant(tr, "ok"))
   }
@@ -1233,6 +1299,8 @@ fn stored_with_toolset(id: String, names: List(String)) -> store.StoredSummary {
       created_at: timing.wall_now_s(),
     ),
     toolset: thread_registry.plain_entries(names),
+    workspace_root: None,
+    roster: None,
     last_active_at: timing.wall_now_s(),
     message_count: 1,
   )
@@ -1850,6 +1918,8 @@ pub fn dormant_summary_carries_bot_provenance_test() {
         toolset: thread_registry.plain_entries(
           tools.default_names(test_config()),
         ),
+        workspace_root: None,
+        roster: None,
         message_count: 3,
       ),
       "frozen",
@@ -1956,6 +2026,8 @@ pub fn bot_delete_scrubs_cached_provenance_test() {
           toolset: thread_registry.plain_entries(
             tools.default_names(test_config()),
           ),
+          workspace_root: None,
+          roster: None,
           message_count: 3,
         ),
         "frozen",
@@ -2060,4 +2132,218 @@ pub fn unpersisted_create_carries_no_provenance_test() {
 
 fn entry_names(entries: List(tools.ToolsetEntry)) -> List(String) {
   list.map(entries, fn(entry) { entry.name })
+}
+
+// ---------------------------------------------------------------------------
+// Environments plan Phase 1
+// ---------------------------------------------------------------------------
+
+/// A create naming env tools without NEXUS_WORKSPACE_ROOT refuses with
+/// the honest reason (UnknownToolset, a 400-class client error) — there
+/// is no root to freeze.
+pub fn env_toolset_refused_without_workspace_root_test() {
+  let registry = start_registry()
+  thread_registry.create(
+    registry,
+    thread_registry.NewThread(
+      ..new_thread(store_mock.fixture_provider_id, "alpha"),
+      toolset: Some(["bash", "read_file"]),
+    ),
+  )
+  |> should.equal(
+    Error(thread_registry.UnknownToolset(
+      "bash: workspace tools require NEXUS_WORKSPACE_ROOT to be set",
+    )),
+  )
+}
+
+/// With a root resolved, the create freezes it onto the thread (the
+/// store row carries it) and appends the roster message to the starting
+/// transcript — a user-role row with the `system` author sidecar, never
+/// a turn trigger, replayed like any other row.
+pub fn env_toolset_create_freezes_root_and_appends_roster_test() {
+  let root = "/tmp/nexus-env-registry-" <> int.to_string(timing.now_us())
+  let #(registry, seam) =
+    start_registry_with_workspace(root, store_mock.seam(store_mock.start()))
+  let assert Ok(summary) =
+    thread_registry.create(
+      registry,
+      thread_registry.NewThread(
+        ..new_thread(store_mock.fixture_provider_id, "alpha"),
+        toolset: Some(["bash"]),
+      ),
+    )
+  // The persisted row carries the frozen root.
+  let assert Ok(stored) = seam.get_thread(summary.id)
+  should.equal(stored.summary.workspace_root, Some(root))
+  // The roster message rides the starting transcript as a system-
+  // authored user row.
+  let assert Ok(sess) = thread_registry.get(registry, summary.id)
+  let snapshot = actor.call(sess, 5000, thread.Snapshot)
+  let messages = transcript.messages(snapshot)
+  should.equal(list.length(messages), 2)
+  // The newest message is the roster row (the oldest is the system
+  // prompt): a user-role row whose author sidecar is `system`.
+  let assert [
+    glopenai_chat.UserMessage(content: glopenai_chat.UserTextContent(text), ..),
+    _,
+  ] = list.reverse(messages)
+  should.equal(
+    text,
+    "environment attached: \"workspace\". attached targets: workspace.",
+  )
+  let assert Some(transcript.Origin("system", 0)) =
+    transcript.origin_at(snapshot, 1)
+}
+
+/// The environment wrapper (the registry's per-thread injection, the
+/// bots-P3c delivery pattern): an env-carrying thread's runner receives
+/// Some(Environment) built from the FROZEN root + thread id — observed
+/// through the injected-bundle seam, whose names drive the manifest
+/// exactly like a freeze-path create.
+pub fn env_toolset_runner_receives_environment_handle_test() {
+  let root = "/tmp/nexus-env-handle-" <> int.to_string(timing.now_us())
+  let #(registry, _seam) =
+    start_registry_with_workspace(root, store_mock.seam(store_mock.start()))
+  let seen = process.new_subject()
+  let env_toolset =
+    thread.Toolset(
+      // NAMES drive the registry's env derivation; the runner is a fake
+      // observing the wrapper's injection (specs are unused by it).
+      names: ["bash"],
+      specs: tools.default(test_config()),
+      runner: fn(_endpoint, tr, _cancel, _delivery, environment, _on_event) {
+        process.send(seen, environment)
+        thread.StreamDone(stats(), transcript.append_assistant(tr, "ok"))
+      },
+      utility_runner: fn(_endpoint, _tr, _cancel, _allow_pass) {
+        Error("no utility call in this test")
+      },
+    )
+  let assert Ok(summary) =
+    thread_registry.create_with_toolset(
+      registry,
+      new_thread(store_mock.fixture_provider_id, "alpha"),
+      env_toolset,
+    )
+  let assert Ok(sess) = thread_registry.get(registry, summary.id)
+  let assert thread.Sent = thread.send_message(sess, "run something")
+  let assert Ok(Some(env.Environment(got_root, id))) =
+    process.receive(seen, 5000)
+  should.equal(got_root, root)
+  should.equal(id, summary.id)
+}
+
+/// The roster row persists ATOMICALLY with the thread row: without
+/// it, the insert's watermark (message_count = 2) would make the first
+/// commit start PAST the roster and it would never persist (CodeRabbit
+/// review). After one send, the stored rows must lead with the
+/// system-authored roster row.
+pub fn env_roster_row_persists_with_first_commit_test() {
+  let root = "/tmp/nexus-env-roster-" <> int.to_string(timing.now_us())
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  let #(registry, _seam) = start_registry_with_workspace(root, seam)
+  let env_toolset =
+    thread.Toolset(
+      names: ["bash"],
+      specs: tools.default(test_config()),
+      runner: fn(_endpoint, tr, _cancel, _delivery, _environment, _on_event) {
+        thread.StreamDone(stats(), transcript.append_assistant(tr, "ok"))
+      },
+      utility_runner: fn(_endpoint, _tr, _cancel, _allow_pass) {
+        Error("no utility call in this test")
+      },
+    )
+  let assert Ok(summary) =
+    thread_registry.create_with_toolset(
+      registry,
+      new_thread(store_mock.fixture_provider_id, "alpha"),
+      env_toolset,
+    )
+  let assert Ok(sess) = thread_registry.get(registry, summary.id)
+  let assert thread.Sent = thread.send_message(sess, "do something")
+  // Synchronize with the write-behind lane instead of sleeping (cubic
+  // PR review): the mock exposes its commit counter. TWO commits —
+  // the user append at Send, then the worker's turn completion —
+  // land the assistant row the third pattern asserts on.
+  store_mock.await_commits(mock, 2)
+  let assert Ok(rows) = seam.load_messages(summary.id)
+  let assert [
+    store.UserRow(
+      content: "environment attached: \"workspace\". attached targets: workspace.",
+      author: Some("system"),
+      hop_depth: 0,
+      ..,
+    ),
+    store.UserRow(content: "do something", ..),
+    _,
+  ] = rows
+}
+
+/// Hydration replays the frozen root from the ROW, not the config: a
+/// dormant env thread rehydrates and runs even after the config root
+/// changed (the frozen-endpoint property, applied to a directory).
+pub fn env_toolset_hydrates_from_persisted_root_test() {
+  let old_root = "/srv/old-root"
+  let seam = store_mock.seam(store_mock.start())
+  store_mock.ensure_fixture_provider(seam)
+  // Seed BEFORE the boot: dormant rows hydrate at registry start (and
+  // recent timestamps keep the row past the boot sweep's grace window).
+  let assert Ok(Nil) =
+    seam.insert_thread(
+      store.StoredSummary(
+        id: "s77",
+        provider_id: store_mock.fixture_provider_id,
+        model: "alpha",
+        meta: fresh_meta(),
+        toolset: thread_registry.plain_entries(["bash"]),
+        workspace_root: Some(old_root),
+        // The creation-time roster row, as insert_thread persists it.
+        roster: Some(#(
+          env.roster_attach_text("workspace", env.attached_targets()),
+          1_700_000_000,
+        )),
+        last_active_at: timing.wall_now_s(),
+        message_count: 1,
+      ),
+      "prompt",
+    )
+  let #(registry, _seam2) = start_registry_with_workspace("/srv/new-root", seam)
+  // The lazy start resolves the env names through the catalog (config-
+  // independent) and wraps with the ROW's root (the handle-value
+  // injection is the same `env_toolset` wrapper the create-path test
+  // observes end to end). Strengthened per cubic review: the hydrated
+  // actor must also carry the roster row — the env path hydrated, not
+  // just any start.
+  let assert Ok(sess) = thread_registry.get(registry, "s77")
+  let snapshot = actor.call(sess, 5000, thread.Snapshot)
+  let messages = transcript.messages(snapshot)
+  // The roster row replays FROM THE STORED ROWS (the insert persisted
+  // it; no in-memory repair).
+  let assert [
+    glopenai_chat.UserMessage(
+      content: glopenai_chat.UserTextContent(
+        "environment attached: \"workspace\". attached targets: workspace.",
+      ),
+      ..,
+    ),
+    _,
+  ] = list.reverse(messages)
+}
+
+fn fresh_meta() -> thread.ThreadMeta {
+  thread.ThreadMeta(
+    title: "",
+    title_source: thread.AutoTitle,
+    pinned: False,
+    tags: [],
+    tags_manual: [],
+    tags_source: thread.AutoTags,
+    archived: False,
+    bot_id: None,
+    // Recent: the boot sweep prunes never-used rows past its grace
+    // window, keyed on last_active_at.
+    created_at: timing.wall_now_s(),
+  )
 }

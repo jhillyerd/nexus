@@ -566,7 +566,11 @@ fn run_registered(
   let assert Ok(spec) =
     list.find(specs, fn(spec) { tools.tool_name(spec) == "codemode" })
   spec.run(
-    tools.ToolCtx(cancel: process.new_subject(), delivery: None),
+    tools.ToolCtx(
+      cancel: process.new_subject(),
+      delivery: None,
+      environment: None,
+    ),
     code_argument(code),
   )
 }
@@ -638,7 +642,8 @@ pub fn stop_during_script_stops_the_turn_test() {
     }
   }
   let _ = reset_index()
-  let outcome = loop.run([spec], 8, stream, tr, cancel, None, fn(_) { Nil })
+  let outcome =
+    loop.run([spec], 8, stream, tr, cancel, None, None, fn(_) { Nil })
   case outcome {
     loop.LoopStopped(_) -> Nil
     loop.LoopFailed(reason) ->

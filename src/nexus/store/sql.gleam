@@ -592,6 +592,7 @@ pub type GetThreadRow {
     tags_source: String,
     toolset: String,
     bot_id: Option(String),
+    workspace_root: Option(String),
     created_s: Int,
     last_active_s: Int,
     message_count: Int,
@@ -629,9 +630,10 @@ pub fn get_thread(
     use tags_source <- decode.field(10, decode.string)
     use toolset <- decode.field(11, decode.string)
     use bot_id <- decode.field(12, decode.optional(decode.string))
-    use created_s <- decode.field(13, decode.int)
-    use last_active_s <- decode.field(14, decode.int)
-    use message_count <- decode.field(15, decode.int)
+    use workspace_root <- decode.field(13, decode.optional(decode.string))
+    use created_s <- decode.field(14, decode.int)
+    use last_active_s <- decode.field(15, decode.int)
+    use message_count <- decode.field(16, decode.int)
     decode.success(GetThreadRow(
       id:,
       provider_id:,
@@ -646,6 +648,7 @@ pub fn get_thread(
       tags_source:,
       toolset:,
       bot_id:,
+      workspace_root:,
       created_s:,
       last_active_s:,
       message_count:,
@@ -677,6 +680,7 @@ select
      from thread_toolset e
     where e.thread_id = thread.id) as toolset,
   bot_id,
+  workspace_root,
   extract(epoch from created_at)::int8 as created_s,
   extract(epoch from last_active_at)::int8 as last_active_s,
   message_count
@@ -805,7 +809,9 @@ values ($1, $2, $3, nullif($4, ''::bytea), $5, $6, $7, to_timestamp($8), to_time
 /// [{"seq":N,"name":"<qualified>","description":"...","schema_json":...|"null"}]
 /// in envelope order; schema_json null = a plain in-process name.
 /// bot_id is provenance only (bots plan P1): the '' sentinel inserts
-/// NULL (see insert_bot.sql).
+/// NULL (see insert_bot.sql). workspace_root (environments plan Phase 1)
+/// is the RESOLVED root frozen at creation for env-carrying threads; the
+/// '' sentinel inserts NULL (the same nullif pattern as bot_id).
 /// tags_manual is '{}' literally and tags_source is left to its column
 /// default 'auto' (utility-tags plan §3.5): a new thread has no tags and
 /// an open auto path.
@@ -827,6 +833,9 @@ pub fn insert_thread(
   arg_10: Int,
   arg_11: String,
   arg_12: Json,
+  arg_13: String,
+  arg_14: String,
+  arg_15: Int,
 ) -> Result(pog.Returned(Nil), pog.QueryError) {
   let decoder = decode.map(decode.dynamic, fn(_) { Nil })
 
@@ -842,25 +851,40 @@ pub fn insert_thread(
 -- [{\"seq\":N,\"name\":\"<qualified>\",\"description\":\"...\",\"schema_json\":...|\"null\"}]
 -- in envelope order; schema_json null = a plain in-process name.
 -- bot_id is provenance only (bots plan P1): the '' sentinel inserts
--- NULL (see insert_bot.sql).
+-- NULL (see insert_bot.sql). workspace_root (environments plan Phase 1)
+-- is the RESOLVED root frozen at creation for env-carrying threads; the
+-- '' sentinel inserts NULL (the same nullif pattern as bot_id).
 -- tags_manual is '{}' literally and tags_source is left to its column
 -- default 'auto' (utility-tags plan §3.5): a new thread has no tags and
 -- an open auto path.
 with new_thread as (
-  insert into thread (id, provider_id, title, title_source, model, system_prompt, pinned, tags, tags_manual, created_at, last_active_at, message_count, bot_id)
-  values ($1, $2, $3, $4, $5, $6, $7, $8, '{}', to_timestamp($9), to_timestamp($9), $10, nullif($11, ''))
+  insert into thread (id, provider_id, title, title_source, model, system_prompt, pinned, tags, tags_manual, created_at, last_active_at, message_count, bot_id, workspace_root)
+  values ($1, $2, $3, $4, $5, $6, $7, $8, '{}', to_timestamp($9), to_timestamp($9), $10, nullif($11, ''), nullif($13, ''))
   returning id
+),
+manifest as (
+  insert into thread_toolset (thread_id, seq, name, description, schema_json)
+  select
+    new_thread.id,
+    e.seq,
+    e.name,
+    e.description,
+    e.schema_json
+  from new_thread,
+       json_to_recordset($12::json)
+         as e(seq int, name text, description text, schema_json text)
 )
-insert into thread_toolset (thread_id, seq, name, description, schema_json)
-select
-  new_thread.id,
-  e.seq,
-  e.name,
-  e.description,
-  e.schema_json
-from new_thread,
-     json_to_recordset($12::json)
-       as e(seq int, name text, description text, schema_json text)
+-- Environments plan Phase 1: the creation-time roster row, persisted
+-- in the SAME statement so the write-behind watermark (seeded from
+-- message_count, which counts it) matches the stored rows from the
+-- first insert — the row is seq 0 under the watermark's
+-- transcript-index-to-seq mapping (system prompt rides the column,
+-- never a row). ''-sentinel content = no roster row.
+insert into thread_message (thread_id, seq, role, content, reasoning, created_at, author, hop_depth)
+select new_thread.id, 0, 'user', $14, NULL, to_timestamp(nullif($15, 0::bigint)), 'system', 0
+from new_thread
+where $14 <> ''
+on conflict (thread_id, seq) do nothing
 "
   |> pog.query
   |> pog.parameter(pog.text(arg_1))
@@ -875,6 +899,9 @@ from new_thread,
   |> pog.parameter(pog.int(arg_10))
   |> pog.parameter(pog.text(arg_11))
   |> pog.parameter(pog.text(json.to_string(arg_12)))
+  |> pog.parameter(pog.text(arg_13))
+  |> pog.parameter(pog.text(arg_14))
+  |> pog.parameter(pog.int(arg_15))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }
@@ -1055,6 +1082,7 @@ pub type ListSummariesRow {
     tags_source: String,
     toolset: String,
     bot_id: Option(String),
+    workspace_root: Option(String),
     created_s: Int,
     last_active_s: Int,
     message_count: Int,
@@ -1088,9 +1116,10 @@ pub fn list_summaries(
     use tags_source <- decode.field(9, decode.string)
     use toolset <- decode.field(10, decode.string)
     use bot_id <- decode.field(11, decode.optional(decode.string))
-    use created_s <- decode.field(12, decode.int)
-    use last_active_s <- decode.field(13, decode.int)
-    use message_count <- decode.field(14, decode.int)
+    use workspace_root <- decode.field(12, decode.optional(decode.string))
+    use created_s <- decode.field(13, decode.int)
+    use last_active_s <- decode.field(14, decode.int)
+    use message_count <- decode.field(15, decode.int)
     decode.success(ListSummariesRow(
       id:,
       provider_id:,
@@ -1104,6 +1133,7 @@ pub fn list_summaries(
       tags_source:,
       toolset:,
       bot_id:,
+      workspace_root:,
       created_s:,
       last_active_s:,
       message_count:,
@@ -1132,6 +1162,7 @@ select
      from thread_toolset e
     where e.thread_id = thread.id) as toolset,
   bot_id,
+  workspace_root,
   extract(epoch from created_at)::int8 as created_s,
   extract(epoch from last_active_at)::int8 as last_active_s,
   message_count
@@ -1263,9 +1294,14 @@ pub type PruneNeverUsedRow {
 ///
 /// Never-used = holds nothing but the frozen system prompt
 /// (message_count <= 1 — the same "no user message yet" rule the send
-/// paths use for auto-titling), never titled (title_source 'auto'; a
-/// manual rename is intent and survives), never pinned (also intent).
-/// Archived or not: an archived empty is still litter.
+/// paths use for auto-titling) PLUS, for environment threads, the
+/// creation-time roster row (workspace_root IS NOT NULL AND
+/// message_count <= 2 — the row exists from creation and the first send
+/// takes the count to >= 3; without the second arm an abandoned empty
+/// env thread would never be swept), never titled
+/// (title_source 'auto'; a manual rename is intent and survives), never
+/// pinned (also intent). Archived or not: an archived empty is still
+/// litter.
 ///
 /// The grace window protects a thread another concurrently-running
 /// server created moments ago and still holds live — it stays empty
@@ -1288,15 +1324,20 @@ pub fn prune_never_used(
 --
 -- Never-used = holds nothing but the frozen system prompt
 -- (message_count <= 1 — the same \"no user message yet\" rule the send
--- paths use for auto-titling), never titled (title_source 'auto'; a
--- manual rename is intent and survives), never pinned (also intent).
--- Archived or not: an archived empty is still litter.
+-- paths use for auto-titling) PLUS, for environment threads, the
+-- creation-time roster row (workspace_root IS NOT NULL AND
+-- message_count <= 2 — the row exists from creation and the first send
+-- takes the count to >= 3; without the second arm an abandoned empty
+-- env thread would never be swept), never titled
+-- (title_source 'auto'; a manual rename is intent and survives), never
+-- pinned (also intent). Archived or not: an archived empty is still
+-- litter.
 --
 -- The grace window protects a thread another concurrently-running
 -- server created moments ago and still holds live — it stays empty
 -- until its first turn commits. 15 minutes is far past any first turn.
 delete from thread
-where message_count <= 1
+where (message_count <= 1 or (workspace_root is not null and message_count <= 2))
   and title_source = 'auto'
   and pinned = false
   and last_active_at < now() - interval '15 minutes'

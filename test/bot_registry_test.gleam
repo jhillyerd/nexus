@@ -7,10 +7,12 @@
 //// `delete_provider`'s 409 counts bots through the STORE, never a call
 //// into this registry.
 
+import gleam/dict
 import gleam/erlang/process
 import gleam/list
 import gleam/option.{None, Some}
 import gleeunit/should
+import nexus/boot
 import nexus/bot
 import nexus/bot_registry
 import nexus/config
@@ -51,6 +53,9 @@ fn test_config() {
     plugin_timeout_ms: 30_000,
     plugin_max_output_chars: 32_768,
     mcp_servers: [],
+    workspace_root: None,
+    env_timeout_ms: 60_000,
+    env_max_output_bytes: 100_000,
     // Bots P3c: the delivery hop guard; 4 = the shipped default.
     max_bot_hops: 4,
   )
@@ -331,6 +336,20 @@ pub fn invalid_name_and_model_refused_test() {
 
   bot_registry.create_bot(registry, bot.BotParams(..params("  "), model: "x"))
   |> should.equal(Error(bot_registry.InvalidName))
+  // Environments plan Phase 1: `system` is the reserved roster-message
+  // author — a bot by that name would render its messages as status
+  // lines on every path. Distinct from InvalidName so the message
+  // names the actual restriction (cubic PR review).
+  bot_registry.create_bot(
+    registry,
+    bot.BotParams(..params("system"), model: "x"),
+  )
+  |> should.equal(Error(bot_registry.ReservedName))
+  should.equal(
+    bot_registry.describe(bot_registry.ReservedName),
+    "bot name 'system' is reserved (roster messages are authored by"
+      <> " \"system\")",
+  )
   bot_registry.create_bot(registry, bot.BotParams(..params("x"), model: "  "))
   |> should.equal(Error(bot_registry.InvalidModel))
 
@@ -586,4 +605,40 @@ pub fn toolset_normalization_test() {
     )
   should.equal(kept.tools, None)
   should.equal(kept.description, "a description")
+}
+
+// ---------------------------------------------------------------------------
+// Environments plan Phase 1: the boot validation closure's env gate
+// ---------------------------------------------------------------------------
+
+/// The REAL boot closure (`boot.bot_validate_tools`): a bot template
+/// naming env tools is refused while no workspace root exists — the
+/// same refusal a thread create gets — and accepted once one does.
+/// Offline-provable because the closure was extracted from boot's
+/// wiring; no tree is started.
+pub fn boot_tool_validation_env_gate_test() {
+  let assert Ok(no_root) =
+    config.from_env(fn(name) {
+      case name {
+        "NEXUS_ENCRYPTION_KEY" ->
+          Ok("MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
+        _ -> Error(Nil)
+      }
+    })
+  let with_root = config.Config(..no_root, workspace_root: Some("/srv/nx"))
+  // Refused without a root, naming the honest reason.
+  boot.bot_validate_tools(no_root, dict.new(), dict.new())(["bash"])
+  |> should.equal(Error(
+    "workspace tools require NEXUS_WORKSPACE_ROOT to be set",
+  ))
+  // Accepted with one (the catalog resolves env names config-
+  // independently — the freeze overrides the gate past creation).
+  boot.bot_validate_tools(with_root, dict.new(), dict.new())([
+    "bash",
+    "read_file",
+  ])
+  |> should.equal(Ok(["bash", "read_file"]))
+  // Plain names keep the loud unknown refusal either way.
+  boot.bot_validate_tools(with_root, dict.new(), dict.new())(["nope"])
+  |> should.equal(Error("unknown tool name: nope"))
 }

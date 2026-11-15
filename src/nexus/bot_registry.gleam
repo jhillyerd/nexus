@@ -56,6 +56,10 @@ pub type RegistryError {
   /// No bot with that id.
   Unknown
   InvalidName
+  /// The reserved roster-message author name (environments plan
+  /// Phase 1) — surfaced separately from InvalidName so the message
+  /// names the actual restriction (cubic PR review).
+  ReservedName
   InvalidModel
   /// Create/rename onto an existing bot's name (unique).
   DuplicateName
@@ -73,6 +77,7 @@ pub fn describe(error: RegistryError) -> String {
   case error {
     Unknown -> "unknown bot"
     InvalidName -> bot.describe(bot.InvalidName)
+    ReservedName -> bot.describe(bot.ReservedName)
     InvalidModel -> bot.describe(bot.InvalidModel)
     DuplicateName -> "bot name already exists"
     InvalidTools(reason) -> reason
@@ -290,9 +295,14 @@ fn create_row(
   id: String,
   params: bot.BotParams,
 ) -> Result(StoredBot, RegistryError) {
-  use name <- result.try(
-    bot.validate_name(params.name) |> result.replace_error(InvalidName),
-  )
+  use name <- result.try(case bot.validate_name(params.name) {
+    Ok(name) -> Ok(name)
+    Error(bot.InvalidName) -> Error(InvalidName)
+    Error(bot.ReservedName) -> Error(ReservedName)
+    // bot.BotError's remaining arms cannot escape validate_name (a
+    // name-only check); the arm keeps the match total.
+    Error(other) -> Error(InvalidName)
+  })
   use model <- result.try(
     bot.validate_model(params.model) |> result.replace_error(InvalidModel),
   )
@@ -327,10 +337,14 @@ fn update_row(
   // the merged row already carries the EFFECTIVE name/model — validation
   // sees exactly what would be stored.
   let merged = bot.apply_update(row, patch, timing.wall_now_s())
-  use _name <- result.try(
-    bot.validate_name(merged.name)
-    |> result.replace_error(InvalidName),
-  )
+  use _name <- result.try(case bot.validate_name(merged.name) {
+    Ok(name) -> Ok(name)
+    Error(bot.InvalidName) -> Error(InvalidName)
+    Error(bot.ReservedName) -> Error(ReservedName)
+    // bot.BotError's remaining arms cannot escape validate_name (a
+    // name-only check); the arm keeps the match total.
+    Error(other) -> Error(InvalidName)
+  })
   use _model <- result.try(
     bot.validate_model(merged.model)
     |> result.replace_error(InvalidModel),

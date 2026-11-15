@@ -188,10 +188,12 @@ pub fn schema_is_the_entire_schema_test() {
   let assert Ok(schema) = read_file("sql/schema.sql") |> bit_array.to_string
   let statements = migrate.statements(schema)
   should.equal(list.length(statements), 11)
-  // The manifest swap (plugin-api Phase 2) is the one non-CREATE
-  // statement: a DO block that backfills the old plain-name column
-  // into thread_toolset entries before dropping it — lossless for
+  // The one non-CREATE statement: the manifest swap (plugin-api
+  // Phase 2) — a DO block that backfills the old plain-name column
+  // into thread_toolset entries before dropping it, lossless for
   // existing rows, skipped entirely on a database already migrated.
+  // (The environments Phase 1 column landed as a CREATE-only edit, per
+  // the squash-migrations-into-the-base-CREATEs policy, cecd906.)
   let assert [swap] =
     list.filter(statements, fn(stmt) {
       !string.starts_with(string.trim(string.lowercase(stmt)), "create")

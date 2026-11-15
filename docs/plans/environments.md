@@ -2,7 +2,7 @@
 title: Nexus — environments (bot workspaces + remote paired TUI nodes)
 status: active
 tags: [computing, self-hosting, local-llm, agents, gleam, beam, environments]
-updated: 2026-11-14
+updated: 2026-11-15
 ---
 
 # Environments: one execution seam for bot workspaces and paired remote nodes
@@ -254,27 +254,94 @@ external server being online.
 
 ## Phases
 
-### Phase 1 — environment seam + in-process workspace (offline-provable)
+### Phase 1 — environment seam + in-process workspace (offline-provable) — IMPLEMENTED
+
+As built (see the deltas below the list):
 
 1. Env tools (`bash`, `read_file`, `write_file`, `list_dir`) in the
-   compiled catalog, each with `target`; `workspace_root` config;
-   `default_names` unchanged (env tools opt-in via bot template or create
-   flag — `thread_create` carries it, `UnknownToolset` semantics reused).
-2. Workspace environment actor (port exec with cwd default, timeout,
+   compiled catalog, each with `target`; `workspace_root` config
+   (`NEXUS_WORKSPACE_ROOT`); `default_names` unchanged (env tools
+   opt-in via bot template or create flag — the HTTP create body's
+   `tools` field carries it, `UnknownToolset` semantics reused).
+2. Workspace execution (port exec with cwd default, timeout,
    kill-on-cancel, byte caps at read, canonical-path fs tools); the
    per-thread frozen workspace root; `ToolCtx` environment handle;
-   roster state in the thread actor (`workspace` always present on env
-   threads).
-3. Roster messages: system-authored user rows (author sidecar extension),
+   the roster constant `"workspace"`.
+3. Roster messages: system-authored user rows (author sidecar),
    UI status-line rendering, replay path.
-4. Tests: offline executor tests through the mockable seam (fake
-   environment subject — the `gated_runner` protocol where needed);
-   `tools_test` additions (catalog gating, unknown-name loudness,
-   byte-cap and path-escape refusals pinned);
-   `ui_test` pins for status lines + hostile-text payloads in node
-   metadata/errors; `m3_prefix_test` golden untouched (default envelope
-   unchanged); `thread_test` roster ordering (attach queued behind a
-   turn).
+4. Tests: `test/env_test.gleam` (executor paths, kill-tree, caps,
+   confinement, cancel re-signal); `tools_test` catalog pins;
+   `ui_test` status-line + hostile-text pins; `thread_registry_test`
+   env create/hydration; `m3_prefix_test` golden untouched.
+
+**As-built deltas** (Phase 1 met code the design predates, plus
+mechanics discovered mid-build):
+
+- **No workspace child actor in v1.** The plan's "workspace
+  environment actor" and "roster state in the thread actor"
+  collapse into nothing measurable for a roster of exactly one:
+  the env executors run the port/fs work DIRECTLY in the per-turn
+  worker (the codemode engine pattern — cancel selects on the turn
+  subject in the executor itself), and the v1 roster is the constant
+  `["workspace"]` carried by the handle and the creation-time roster
+  message. The thread-actor roster map (target → execution subject)
+  and the queued-attach machinery arrive with Phase 2, the first
+  feature that needs live roster state (nodes attach mid-thread).
+- **The environment rides `TurnRunner` beside `delivery`** (the bots
+  P3c precedent): `tools.ToolCtx` gained `environment:
+  Option(env.Environment)`; `loop.run` and the runner type grew one
+  parameter each; the registry wraps the cached bundle per thread
+  (`env_toolset`), composing with the delivery wrapper (the delivery
+  wrap now wraps the CURRENT spec's toolset, not the base bundle —
+  composing both was a bug the registry tests would have caught).
+- **The kill-tree is `setsid` + pgid-marker + the real `kill`
+  binary.** The bash wrapper prints `$$` as the first stdout line and
+  runs under `setsid` (so the child is its own group leader); cancel /
+  timeout / cap-kill signal the whole GROUP via the PATH-resolved
+  `/usr/bin/kill` binary with argv `["-9", "--", "-<pgid>"]` — two
+  silent-failure traps found the hard way: procps-ng 4.x parses a
+  bare `"-<pgid>"` as another signal spec and exits 0 having killed
+  NOTHING (the `--` guard is required), and the detached kill helper
+  must WAIT for the kill to act (a helper returning early closes its
+  own port and kills the killer mid-flight). `setsid -w` propagates
+  the child's exit status (without it a forked setsid exits 0 and
+  swallows every non-zero bash status). Without setsid (macOS dev)
+  there is no marker and the kill degrades to port_close — the
+  documented fallback.
+- **The over-cap kill answers Ok**, not an error: the output that
+  WAS captured returns as data with an omission note naming the kill
+  (the http_fetch truncation posture — the command itself may have
+  been nowhere near done). Timeout and cancel remain errors carrying
+  their partial output.
+- **A bash non-zero exit status is DATA** — `Ok("exit status N\n" <>
+  output)` (the http_fetch non-2xx rule: a failing grep or compiler
+  is signal for the model, not a transport failure; errors stay for
+  nexus-side failures: spawn, timeout, cancel).
+- **One timeout knob, not per-tool**: `NEXUS_ENV_TIMEOUT_MS` (floor
+  1000) covers `bash`; `NEXUS_ENV_MAX_OUTPUT_BYTES` (floor 1024)
+  covers bash output AND `read_file`. Per-tool overrides can grow
+  onto the config when a consumer exists.
+- **`bot` names reserve `system`**: roster messages ride the origin
+  sidecar with author exactly `system`, and the UI branches on that
+  string to render a status line — a bot named `system` would have
+  its messages render as status lines on every path, so
+  `bot.validate_name` refuses it at save.
+- **The roster row persists AT INSERT**, in the same statement as the
+  thread row (insert_thread's roster CTE): `message_count` seeds the
+  write-behind watermark and counts the row, so storing it later would
+  make the first commit start PAST it and it would never persist
+  (CodeRabbit review — caught live). Every rebuild path (lazy start,
+  Down replacement, retry) therefore replays the announcement from the
+  stored rows; no in-memory repair exists. Byte-determinism holds
+  before the first send because no request was ever built on the
+  shorter prefix. Never-used env rows (system + roster = 2) are swept
+  past the grace window by the boot prune's env-aware ceiling.
+- **Boot's bot-tool validation closure is extracted** into
+  `boot.bot_validate_tools(cfg, providers, foreign)` so the env gate
+  is offline-testable without starting the tree.
+- **Confinement is LEXICAL**: `..` folds against the workspace root,
+  absolute paths must already live inside it; symlinks are not
+  resolved (the accepted v1 hygiene posture, now pinned by tests).
 
 ### Phase 2 — node registry + client protocol + TUI
 

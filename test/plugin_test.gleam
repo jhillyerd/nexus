@@ -57,6 +57,9 @@ fn test_config() -> config.Config {
     plugin_timeout_ms: 2000,
     plugin_max_output_chars: 32_768,
     mcp_servers: [],
+    workspace_root: None,
+    env_timeout_ms: 60_000,
+    env_max_output_bytes: 100_000,
   )
 }
 
@@ -252,7 +255,7 @@ pub fn boot_example_plugin_full_stack_test() {
   let cancel = process.new_subject()
   should.equal(
     spec.run(
-      tools.ToolCtx(cancel:, delivery: None),
+      tools.ToolCtx(cancel:, delivery: None, environment: None),
       "{\"text\":\"round trip\"}",
     ),
     Ok("round trip"),
@@ -260,7 +263,7 @@ pub fn boot_example_plugin_full_stack_test() {
   // Hostile-ish content passes through as plain truncated text.
   should.equal(
     spec.run(
-      tools.ToolCtx(cancel:, delivery: None),
+      tools.ToolCtx(cancel:, delivery: None, environment: None),
       "{\"text\":\"<script>alert(1)</script>\"}",
     ),
     Ok("<script>alert(1)</script>"),

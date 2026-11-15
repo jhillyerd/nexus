@@ -55,7 +55,9 @@ import glopenai/chat
 import nexus/bot_registry
 import nexus/config.{type Config}
 import nexus/delivery
+import nexus/env
 import nexus/openai
+import nexus/rescue
 import nexus/store.{type Store, type StoredSummary}
 import nexus/thread
 import nexus/timing
@@ -531,6 +533,8 @@ fn stored_summary_with_id(id: String) -> StoredSummary {
       created_at: 0,
     ),
     toolset: [],
+    workspace_root: None,
+    roster: None,
     last_active_at: 0,
     message_count: 0,
   )
@@ -737,8 +741,29 @@ fn freeze_entries(
   )
   list.try_map(names, fn(name) {
     case tools.is_compiled_name(name) || dict.has_key(state.providers, name) {
-      True ->
-        Ok(tools.ToolsetEntry(name: name, description: "", schema_json: None))
+      True -> {
+        // Environments plan Phase 1: the create-time gate (the
+        // SearxNG pattern, but refusing outright — unlike web_search,
+        // an env thread cannot exist without a root to FREEZE; a
+        // snapshot pinning past a removed config would have nowhere
+        // to run). The frozen root rides the thread row, so HYDRATION
+        // is gate-free (the freeze overrides the gate there, exactly
+        // like every other compiled name).
+        case env.is_env_name(name), state.cfg.workspace_root {
+          True, None ->
+            Error(
+              name
+              <> ": workspace tools require NEXUS_WORKSPACE_ROOT to be"
+              <> " set",
+            )
+          _, _ ->
+            Ok(tools.ToolsetEntry(
+              name: name,
+              description: "",
+              schema_json: None,
+            ))
+        }
+      }
       False ->
         case tool_provider.split(name) {
           Error(Nil) -> Error("unknown tool name: " <> name)
@@ -903,7 +928,39 @@ fn start_new_thread(
           // below, so create and hydration always agree byte-identically.
           let prompt =
             option.unwrap(requested.system_prompt, state.cfg.system_prompt)
+          // Environments plan Phase 1: the frozen workspace root. Any
+          // env entry in the manifest freezes the config's RESOLVED
+          // root onto the thread (the gate above proved it is `Some`
+          // on the freeze path; the injected-bundle test seam can
+          // bypass the gate, and then the honest answer is `None` —
+          // the env tools error at run time, like bot_message on a
+          // plain thread).
+          let has_env_tools =
+            list.any(entries, fn(entry) { env.is_env_name(entry.name) })
+          let workspace_root = case has_env_tools {
+            True -> state.cfg.workspace_root
+            False -> None
+          }
           let transcript = transcript.new(alias, prompt)
+          // The creation-time roster message (environments plan):
+          // roster changes ride MESSAGES, never the envelope — a
+          // user-role row with the display-only author sidecar
+          // `system`, replayed and persisted like any other row. It
+          // never triggers a turn; the user's first Send carries it.
+          // It rides the STARTING transcript and persists with the
+          // first commit (nothing was requested before that, so
+          // hydration byte-determinism cannot be affected).
+          let transcript = case workspace_root {
+            Some(_) ->
+              transcript
+              |> transcript.append_user(env.roster_attach_text(
+                "workspace",
+                env.attached_targets(),
+              ))
+              |> transcript.mark_origin(Some("system"), 0)
+              |> transcript.stamp(created_at)
+            None -> transcript
+          }
           // The organizational block, built ONCE and shared by the stored
           // row and the live record (issue #75) — the reply summary below
           // only projects the same VALUES into the deliberately flat
@@ -941,9 +998,30 @@ fn start_new_thread(
                 // so no config change, bot edit, or server drift can
                 // re-aim this envelope.
                 toolset: entries,
+                // Environments plan Phase 1: the frozen root (None =
+                // no env tools).
+                workspace_root: workspace_root,
+                // The roster row rides the INSERT (persisted
+                // atomically — see StoredSummary.roster) so the
+                // write-behind watermark matches the stored rows.
+                roster: case workspace_root {
+                  Some(_) ->
+                    Some(#(
+                      env.roster_attach_text(
+                        "workspace",
+                        env.attached_targets(),
+                      ),
+                      created_at,
+                    ))
+                  None -> None
+                },
                 last_active_at: created_at,
-                // 1 = the system prompt (Phase 1 message_count).
-                message_count: 1,
+                // The STARTING transcript's length (system prompt, plus
+                // the roster row on env threads) — the count the live
+                // actor and every later summary will report, so the
+                // create reply, GET /threads, and the first persisted
+                // state agree (cubic PR review).
+                message_count: transcript.length(transcript),
               ),
               // The RESOLVED prompt — the exact bytes frozen into the
               // transcript above, never the config default an explicit
@@ -992,11 +1070,25 @@ fn start_new_thread(
               hydrated: False,
               utility_apply: utility_apply_for(state.self, id),
             )
+          // The environment wrapper (environments plan Phase 1): the
+          // SAME per-thread injection point as the delivery wrapper —
+          // the bundle stays cached unwrapped, and an env-carrying
+          // thread's runner closes over its FROZEN root + id. The two
+          // wrappers compose (each passes the other's parameter
+          // through untouched).
+          let spec = case workspace_root {
+            Some(root) ->
+              thread.ThreadSpec(..spec, toolset: env_toolset(toolset, id, root))
+            None -> spec
+          }
           let spec = case requested.bot_id, persisted {
             Some(bot_id), True ->
               thread.ThreadSpec(
                 ..spec,
-                toolset: delivery_toolset(state, toolset, id, bot_id),
+                // `spec.toolset`, not the base bundle: it may already
+                // carry the environment wrapper above, and a wrap of
+                // the base would silently drop it.
+                toolset: delivery_toolset(state, spec.toolset, id, bot_id),
               )
             _, _ -> spec
           }
@@ -1062,7 +1154,8 @@ fn start_new_thread(
 
 /// The create-reply projection of a fresh record: flat summary, empty
 /// display metadata (the record's meta carries the defaults #73 fixed),
-/// message_count 1 = the system prompt, activity = creation.
+/// message_count from the starting transcript (system prompt, plus the
+/// roster row on env threads), activity = creation.
 fn record_summary(record: Record) -> thread.ThreadSummary {
   thread.ThreadSummary(
     id: record.id,
@@ -1074,7 +1167,7 @@ fn record_summary(record: Record) -> thread.ThreadSummary {
     tags: record.meta.tags,
     archived: record.meta.archived,
     bot_id: record.meta.bot_id,
-    message_count: 1,
+    message_count: transcript.length(record.spec.transcript),
     streaming: False,
     created_at: record.meta.created_at,
     // Until the first commit, a thread's activity is its creation.
@@ -1621,6 +1714,15 @@ fn lazy_start(state: State, summary: StoredSummary) -> Resolved {
           Missing
         }
         Ok(#(state, resolved)) -> {
+          // The environment wrapper rides hydration (environments plan
+          // Phase 1): the root comes from the THREAD ROW, never the
+          // config — the frozen-endpoint property. A dormant env
+          // thread rehydrates its handle even after NEXUS_WORKSPACE_ROOT
+          // changed or was removed (its files stay where they were).
+          let resolved = case summary.workspace_root {
+            Some(root) -> env_toolset(resolved, summary.id, root)
+            None -> resolved
+          }
           // The delivery wrapper rides hydration too (bots P3c, #97): a
           // rehydrated bot thread must be able to send exactly like a
           // freshly created one — depth comes from the persisted sidecar,
@@ -1637,6 +1739,10 @@ fn lazy_start(state: State, summary: StoredSummary) -> Resolved {
               Missing
             }
             Ok(transcript) -> {
+              // The roster row persists AT INSERT (insert_thread's
+              // roster CTE), so this rebuild — like the Down and retry
+              // paths — replays it from the rows for every env thread;
+              // no in-memory repair is needed or wanted here.
               let spec =
                 thread.ThreadSpec(
                   id: summary.id,
@@ -2032,16 +2138,28 @@ fn restart(
   factory: Factory,
   argument: ChildArgument,
 ) -> Result(actor.Started(Subject(thread.Msg)), actor.StartError) {
-  case factory_supervisor.start_child(factory, argument) {
-    Error(already_started) -> {
+  // Rescue-wrapped (the ui_settings worker pattern): at teardown, a
+  // thread actor's DOWN can reach this handler after the FACTORY has
+  // begun shutting down — start_child then panics (an unregistered or
+  // dying named target), which would take the whole registry actor
+  // down long after the owning test ended. A crashed start ask is the
+  // honest "start failed" this function already reports; the record
+  // keeps its start_error and the registry lives.
+  case
+    rescue.rescue(fn() { factory_supervisor.start_child(factory, argument) })
+  {
+    Error(crash) -> Error(actor.InitFailed("factory ask crashed: " <> crash))
+    Ok(Error(already_started)) -> {
       process.sleep(50)
-      case factory_supervisor.start_child(factory, argument) {
-        Ok(started) -> Ok(started)
-        Error(_) -> Error(already_started)
+      case
+        rescue.rescue(fn() { factory_supervisor.start_child(factory, argument) })
+      {
+        Ok(Ok(started)) -> Ok(started)
+        _ -> Error(already_started)
       }
       |> result.replace_error(already_started)
     }
-    other -> other
+    Ok(other) -> other
   }
 }
 
@@ -2419,6 +2537,36 @@ fn inbound_gate(state: State, bot_id: Option(String)) -> Result(Nil, String) {
   }
 }
 
+/// Wrap a toolset bundle's turn fn with THIS thread's environment
+/// handle (environments plan Phase 1). The bundle stays cached
+/// unwrapped (shared across threads of one toolset); the wrap is per
+/// thread, closing over the FROZEN root and the thread id. Plain
+/// threads unwrap to `None` inside their base runner call, and env
+/// tools on a handle-less thread error honestly at run time.
+fn env_toolset(
+  toolset: thread.Toolset,
+  thread_id: String,
+  workspace_root: String,
+) -> thread.Toolset {
+  let base = toolset.runner
+  thread.Toolset(
+    ..toolset,
+    runner: fn(endpoint, tr, cancel, delivery, _environment, on_event) {
+      base(
+        endpoint,
+        tr,
+        cancel,
+        delivery,
+        Some(env.Environment(
+          workspace_root: workspace_root,
+          thread_id: thread_id,
+        )),
+        on_event,
+      )
+    },
+  )
+}
+
 /// Wrap a toolset bundle's turn fn with THIS thread's delivery identity
 /// (bots P3c, #97). The bundle itself stays cached by name tuple and
 /// shared across the bot's threads — the wrap is per thread, applied at
@@ -2437,7 +2585,7 @@ fn delivery_toolset(
   let base = toolset.runner
   thread.Toolset(
     ..toolset,
-    runner: fn(endpoint, tr, cancel, _delivery, on_event) {
+    runner: fn(endpoint, tr, cancel, _delivery, environment, on_event) {
       let ctx =
         delivery.Delivery(
           thread_id: thread_id,
@@ -2446,7 +2594,7 @@ fn delivery_toolset(
           deliver: fn(request) { deliver_ask(state.self, request) },
           sender_name: fn() { sender_name_ask(state.bots_name, bot_id) },
         )
-      base(endpoint, tr, cancel, Some(ctx), on_event)
+      base(endpoint, tr, cancel, Some(ctx), environment, on_event)
     },
   )
 }

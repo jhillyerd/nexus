@@ -433,6 +433,7 @@ fn happy_runner(
   tr,
   _cancel,
   _delivery,
+  _environment,
   on_event: fn(loop.LoopEvent) -> Nil,
 ) -> thread.TurnOutcome {
   on_event(loop.StreamEvent(openai.TokenDelta("hi")))

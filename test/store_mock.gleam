@@ -411,7 +411,21 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
                         ),
                       ),
                       system_prompt,
-                      [],
+                      // insert_thread's roster CTE: the creation-time
+                      // roster row is stored WITH the thread (seq 0,
+                      // system-authored) — the watermark (messages)
+                      // already counts it.
+                      case summary.roster {
+                        option.Some(#(text, stamp)) -> [
+                          store.UserRow(
+                            content: text,
+                            author: option.Some("system"),
+                            hop_depth: 0,
+                            at: option.Some(stamp),
+                          ),
+                        ]
+                        option.None -> []
+                      },
                       summary.message_count,
                     ),
                   ),
@@ -1049,7 +1063,13 @@ fn update_stored(state: State, id: String, f: fn(Stored) -> Stored) -> State {
 const prune_grace_s = 900
 
 fn never_used(summary: StoredSummary, cutoff_s: Int) -> Bool {
-  summary.message_count <= 1
+  // Mirrors prune_never_used.sql: an environment thread's creation-time
+  // roster row counts too (never-used env = system + roster = 2; the
+  // first send persists >= 3).
+  let empty =
+    summary.message_count <= 1
+    || { summary.workspace_root != None && summary.message_count <= 2 }
+  empty
   && summary.meta.title_source == thread.AutoTitle
   && !summary.meta.pinned
   && summary.last_active_at < cutoff_s

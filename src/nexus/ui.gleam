@@ -2015,7 +2015,12 @@ fn send_effect(model: Model, text: String) -> Effect(Msg) {
         // rule. The transcript always carries the system prompt, so "no
         // user message yet" is a count of 1; the registry refuses to
         // clobber a manual (or already generated) title regardless.
-        let is_first = thread.describe(subject).message_count <= 1
+        // <= 2, not <= 1: an environment thread starts at 2 (system
+        // prompt + roster row) and its first human send must still
+        // auto-title (CodeRabbit review). A plain thread can never sit
+        // at 2 on a send boundary — its first send commits user +
+        // assistant (>= 3) or fails with nothing (1).
+        let is_first = thread.describe(subject).message_count <= 2
         case thread.send_message(subject, text) {
           thread.Sent -> {
             case is_first, id {
@@ -3016,6 +3021,18 @@ fn user_turn(text: String, at: Option(Int)) -> Element(Msg) {
   ])
 }
 
+/// A roster message (environments plan Phase 1): a user-role row whose
+/// display-only author sidecar is exactly `system` renders as a muted
+/// status line, not a chat bubble — same inert text nodes, smaller type,
+/// no pill. The reserved author string is exactly why a bot cannot be
+/// named `system`.
+fn system_turn(text: String, at: Option(Int)) -> Element(Msg) {
+  html.div([attr.class("turn status")], [
+    html.span([], [html.text(text)]),
+    time_stamp(at),
+  ])
+}
+
 /// A bot-delivered user line (bots P3b author, issue #122 display): it
 /// used to render as the user's own bubble — confusing (a bot's words
 /// reading as yours) and it stranded the sender's markdown as raw text.
@@ -3124,6 +3141,9 @@ fn render_line(
 ) -> Element(Msg) {
   case line {
     UserLine(text, None, at) -> user_turn(text, at)
+    // The roster row's reserved author: a status line, not a bubble and
+    // not a bot chip (environments plan Phase 1).
+    UserLine(text, Some("system"), at) -> system_turn(text, at)
     UserLine(text, Some(author), at) -> bot_turn(md_cache, text, author, at)
     AssistantLine(text, at) -> assistant_turn(md_cache, text, at)
     ReasoningLine(text) -> reasoning_block(text, False)
