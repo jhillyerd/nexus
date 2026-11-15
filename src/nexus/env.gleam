@@ -448,9 +448,6 @@ fn bash_loop(loop: BashLoop, state: BashState) -> Result(String, String) {
 /// Kill the child's tree and keep selecting (bounded at `reap_ms`)
 /// for the exit_status: the killed child's remaining buffered output
 /// lands too, and the port is consumed instead of queueing garbage.
-/// Kill the child's tree and keep selecting (bounded at `reap_ms`)
-/// for the exit_status: the killed child's remaining buffered output
-/// lands too, and the port is consumed instead of queueing garbage.
 /// The reap selector matches the PORT ONLY — never the cancel subject:
 /// the cancel path has just RE-SIGNALLED its one-shot `Nil` (the
 /// codemode rule), and a reap armed with the cancel map would consume
@@ -576,10 +573,10 @@ fn render_output(state: BashState, max_output_bytes: Int) -> String {
   let all = bit_array.append(state.head, state.out)
   let #(bytes, truncated) = case bit_array.byte_size(all) > max_output_bytes {
     True -> #(
-      bit_array.slice(state.out, 0, max_output_bytes) |> result.unwrap(<<>>),
+      bit_array.slice(all, 0, max_output_bytes) |> result.unwrap(<<>>),
       True,
     )
-    False -> #(state.out, False)
+    False -> #(all, False)
   }
   let text = ffi_to_text_lossy(bytes)
   let text = case string.trim(text) {
