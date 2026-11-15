@@ -303,38 +303,27 @@ pub fn bash_owner_death_kills_group_test() {
           max_output_bytes: 100_000,
           environment: e,
           cancel: cancel,
-          arguments: "{\"target\":\"workspace\",\"command\":\"touch started; exec -a nxown8x sleep 45 & sleep 45\"}",
+          arguments: "{\"target\":\"workspace\",\"command\":\"exec -a nxown8x sleep 45 & sleep 45\"}",
         )
       process.sleep(60_000)
     })
-  // SYNCHRONIZE before killing (CodeRabbit review): poll for the
-  // marker file the command itself creates, so the test provably
-  // enters the mid-command window — the wrapper is running, the
-  // sentinel is armed, and the owner dies with the command in flight
-  // (whether the pid marker was parsed BEAM-side is immaterial: the
-  // sentinel's kill does not depend on it).
-  wait_started(root <> "/t1/started", 50)
+  // SYNCHRONIZE on the WRAPPER's ps line (CodeRabbit review): the
+  // tag appears in the wrapper bash's own command line (the -c script
+  // names it), which exists from spawn — BEFORE the marker pid has
+  // been read by the executor and BEFORE the tagged child forks. The
+  // owner therefore dies in the PRE-HANDOFF window (the watchdog has
+  // no parsed pgid), where the die-with-port sentinel is the only
+  // cleanup — and the presence probe makes the disappearance probe
+  // non-vacuous: the group provably existed.
+  poll_tag_present("nxown[8]x", 50)
   process.kill(owner)
   process.send(done, Nil)
   let assert Ok(Nil) = process.receive(done, 1000)
   // The sentinel fires on the port's EOF; give it a moment, then the
-  // renamed child must be gone (its argv[0] carries the tag).
-  poll_tag_gone("nxown[8]x", 30)
+  // whole group (wrapper and any forked child, both matching the tag
+  // in ps) must be gone.
+  poll_tag_gone("nxown[8]x", 50)
   let _ = simplifile.delete(root)
-}
-
-fn wait_started(path: String, attempts: Int) -> Nil {
-  case simplifile.exists(path, True) {
-    Ok(True) -> Nil
-    _ ->
-      case attempts {
-        0 -> panic as "command never started (started file missing)"
-        n -> {
-          process.sleep(100)
-          wait_started(path, n - 1)
-        }
-      }
-  }
 }
 
 fn poll_tag_gone(pattern: String, attempts: Int) -> Nil {
@@ -409,7 +398,6 @@ pub fn bash_cancel_midrun_reaps_group_and_signal_test() {
 
 /// Poll until the tagged process's ps line exists — the positive half
 /// of `poll_tag_gone`, so a disappearance probe can never pass
-/// without the child having lived.
 fn poll_tag_present(pattern: String, attempts: Int) -> Nil {
   case
     bash(
