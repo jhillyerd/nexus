@@ -95,7 +95,9 @@ pub type ToolStatus {
 /// seconds; None = unstamped history) — display metadata like the
 /// reasoning sidecar it mirrors, never a request byte. `author` on the
 /// user line is the message's display provenance (bots P3b): the bot
-/// that delivered it, None = a human sent it; rendered as a badge.
+/// that delivered it, None = a human sent it. An authored line folds up
+/// as a bot chip (issue #122) instead of reading as the user's own
+/// bubble; a human line renders as before.
 pub type Line {
   UserLine(text: String, author: Option(String), at: Option(Int))
   AssistantLine(text: String, at: Option(Int))
@@ -1106,6 +1108,14 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       Model(
         ..model,
         log: [UserLine(text, author, at), ..model.log],
+        // A bot-delivered line (issue #122) renders its body through the
+        // same security-safe markdown renderer as assistant turns; parse
+        // once here, at the echo every path (live, mid-turn join, reload
+        // replay) delivers, and the view reads the cached tree.
+        md_cache: case author {
+          Some(_) -> dict.insert(model.md_cache, text, markdown.render(text))
+          None -> model.md_cache
+        },
         // The user message marks the start of a (possibly live) turn: lines
           // beyond this point belong to it and roll back on a failed turn.
           turn_base: list.length(model.log) + 1,
@@ -2996,27 +3006,45 @@ fn turn(kind: String, text: String, at: Option(Int)) -> Element(Msg) {
   ])
 }
 
-/// A committed user line. Bot-authored lines (bots P3b) grow an author
-/// badge ahead of the text: the sender's display name frozen at send
-/// time, rendered as an inert text node like everything else in the log —
-/// a bot-supplied name is user content under the hostile-text rules, not
-/// markup. The badge rides the UserEcho, so live, mid-turn join, and
-/// post-reload replay all render it identically (one shape per path).
-fn user_turn(
-  text: String,
-  author: Option(String),
-  at: Option(Int),
-) -> Element(Msg) {
+/// A committed HUMAN user line — plain verbatim text in the user's own
+/// bubble, markdown never applied (user input is rendered as-is, exactly
+/// what the hostile-text rules have always pinned for this lane).
+fn user_turn(text: String, at: Option(Int)) -> Element(Msg) {
   html.div([attr.class("turn user")], [
-    case author {
-      Some(name) ->
-        html.span([attr.class("origin"), attr.title("delivered by " <> name)], [
-          html.text(name),
-        ])
-      None -> element.none()
-    },
     html.span([], [html.text(text)]),
     time_stamp(at),
+  ])
+}
+
+/// A bot-delivered user line (bots P3b author, issue #122 display): it
+/// used to render as the user's own bubble — confusing (a bot's words
+/// reading as yours) and it stranded the sender's markdown as raw text.
+/// It now folds up like a thinking chip: the collapsed summary names the
+/// sender (frozen display name, inert text node — a bot-supplied name is
+/// user content under the hostile-text rules, never markup) beside the
+/// message's age, and the expanded body renders the full text through
+/// the same security-safe markdown renderer as assistant turns
+/// (`nexus/ui/markdown`: raw HTML stays inert text, hrefs scheme-filtered,
+/// images become links). Rides the UserEcho, so live, mid-turn join, and
+/// post-reload replay all render it identically (one shape per path). It
+/// stands OUTSIDE the chip-row runs (`is_chip`) on purpose: it is a
+/// message in the conversation, not the surrounding turn's internals.
+fn bot_turn(
+  md_cache: dict.Dict(String, List(Element(Msg))),
+  text: String,
+  author: String,
+  at: Option(Int),
+) -> Element(Msg) {
+  let elements = case dict.get(md_cache, text) {
+    Ok(elements) -> elements
+    Error(_) -> markdown.render(text)
+  }
+  html.details([attr.class("turn bot")], [
+    html.summary(
+      [attr.class("bot-label"), attr.title("delivered by " <> author)],
+      [html.text(author), time_stamp(at)],
+    ),
+    html.div([attr.class("bot-body md")], elements),
   ])
 }
 
@@ -3095,7 +3123,8 @@ fn render_line(
   line: Line,
 ) -> Element(Msg) {
   case line {
-    UserLine(text, author, at) -> user_turn(text, author, at)
+    UserLine(text, None, at) -> user_turn(text, at)
+    UserLine(text, Some(author), at) -> bot_turn(md_cache, text, author, at)
     AssistantLine(text, at) -> assistant_turn(md_cache, text, at)
     ReasoningLine(text) -> reasoning_block(text, False)
     ToolLine(..) -> tool_card(line)
