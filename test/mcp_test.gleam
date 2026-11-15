@@ -1100,3 +1100,47 @@ pub fn server_ping_answered_with_empty_result_test() {
   should.be_true(string.contains(reply_frame, "\"id\":\"health-1\""))
   should.be_true(string.contains(reply_frame, "\"result\":{}"))
 }
+
+pub fn busy_stdin_is_not_diagnosed_as_dead_test() {
+  // A transient backpressure error from the transport keeps its
+  // reason: the tool error names BUSY, not a closed stdin.
+  let busy_transport =
+    mcp.Transport(
+      send_line: fn(_line) { Error("server stdin is busy") },
+      arm: fn(events, selector, wrap) {
+        process.select_map(selector, events, wrap)
+      },
+    )
+  let name = adapter_name("busy")
+  let probe = process.new_subject()
+  let assert Ok(started) =
+    mcp_adapter.start_probing(
+      server: config.McpServer(
+        name: "busy",
+        command: "./unused",
+        args: [],
+        env: [],
+        timeout_ms: None,
+      ),
+      name: name,
+      deadline_ms: 30_000,
+      transport: busy_transport,
+      probe: probe,
+    )
+  let assert Ok(events) = process.receive(probe, 5000)
+  // The initialize frame's send failed → Down with the BUSY reason,
+  // honest and diagnosable.
+  let reply = process.new_subject()
+  process.send(
+    process.named_subject(name),
+    tool_provider.Call(
+      ref: make_ref(),
+      tool: "t",
+      arguments: "{}",
+      reply: reply,
+    ),
+  )
+  let assert Ok(tool_provider.ToolErr(message)) = process.receive(reply, 5000)
+  should.be_true(string.contains(message, "busy"))
+  should.equal(string.contains(message, "closed"), False)
+}

@@ -734,7 +734,9 @@ pub fn stdio(
       let send = fn(line: String) {
         case ffi_send_line(p, line) {
           Ok(Nil) -> Ok(Nil)
-          Error(_) -> Error("server stdin is closed")
+          // Pass the FFI's reason through: "busy" (transient
+          // backpressure) and "port dead" are different diagnoses.
+          Error(reason) -> Error(reason)
         }
       }
       Ok(

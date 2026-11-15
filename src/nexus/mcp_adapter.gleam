@@ -720,7 +720,10 @@ fn send_frame(state: State, frame: String) -> Result(Nil, String) {
     Some(transport) ->
       case transport.send_line(frame) {
         Ok(Nil) -> Ok(Nil)
-        Error(_) -> Error(unavailable(state, "server stdin is closed"))
+        // The transport's reason rides through: "server stdin is
+        // busy" (transient backpressure — the server is ALIVE) must
+        // not be diagnosed as a dead server.
+        Error(reason) -> Error(unavailable(state, reason))
       }
   }
 }
