@@ -1490,8 +1490,18 @@ pub fn view_renders_bot_message_chip_test() {
   // The chip carries the delivery provenance on hover, like the
   // timestamp's absolute instant.
   should.be_true(string.contains(html, "delivered by Hermes"))
-  // The human line is NOT folded — it stays the user's own bubble.
-  should.be_true(string.contains(html, "class=\"turn user\""))
+  // The bot payload must NOT read as the user's own bubble: the human
+  // line beside it keeps the plain user-bubble shape, and the bot text
+  // appears nowhere in one (the same class="turn user" probe on its own
+  // would pass off the human line alone).
+  should.be_true(string.contains(
+    html,
+    "<div class=\"turn user\"><span>mine</span>",
+  ))
+  should.be_false(string.contains(
+    html,
+    "<div class=\"turn user\"><span>hello</span>",
+  ))
 }
 
 pub fn view_escapes_author_names_test() {

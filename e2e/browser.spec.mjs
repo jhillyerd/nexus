@@ -2190,12 +2190,17 @@ async function main() {
         const chip = await botChip.evaluate((el) => ({
           open: el.open,
           summary: el.querySelector("summary")?.textContent ?? "",
+          age: el.querySelector("summary time.ts")?.textContent ?? "",
           body: el.querySelector(".bot-body")?.textContent ?? "",
         }));
         eq(chip.open, false, "bot chip renders collapsed");
         assert(
           chip.summary.includes("RelayAlpha"),
           `chip summary names the sender: ${chip.summary}`,
+        );
+        assert(
+          chip.age.trim().length > 0,
+          `chip summary carries the message age: "${chip.age}"`,
         );
         assert(
           chip.body.includes(note),

@@ -1111,15 +1111,19 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
    sender beside the message's age; expanded, the body renders the
    sender's text through the same security-safe markdown renderer as
    assistant turns. Same dashed chip look as reasoning, same left lane:
-   it is inbound traffic, not the user's own line. The summary time
-   override is #app-prefixed per the cascade traps — the bare form loses
-   to `#app .turn time.ts` on the id count. */
-details.turn.bot { align-self: flex-start; max-width: 46rem; padding: .35rem .7rem; border-radius: 10px;
+   it is inbound traffic, not the user's own line. The margin resets
+   kill Pico's accordion spacing — bare `details` carries a 1rem bottom
+   margin and `details[open]>summary` another 1rem under the label —
+   which would double the conversation gap and pad the expanded body
+   (the summary override is #app-free: class count already beats
+   Pico's `details[open]>summary` at equal element count). */
+details.turn.bot { margin: 0; align-self: flex-start; max-width: 46rem; padding: .35rem .7rem; border-radius: 10px;
   font-size: .8rem; border: 1px dashed color-mix(in srgb, currentColor 22%, transparent);
   background: color-mix(in srgb, currentColor 4%, transparent); }
 details.turn.bot > summary { cursor: pointer; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: .72rem; opacity: .75; display: flex; align-items: baseline; gap: .5rem;
   white-space: normal; }
+details.turn.bot[open] > summary { margin-bottom: 0; }
 #app details.turn.bot > summary time.ts { margin-top: 0; }
 details.turn.bot .bot-body { padding: .3rem 0 .1rem; }
 /* Per-message timestamp (nexus/ui time_stamp): a small muted line under
