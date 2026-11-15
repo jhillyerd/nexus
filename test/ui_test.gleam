@@ -3271,6 +3271,7 @@ pub fn send_moves_previous_day_row_into_today_immediately_test() {
           tools.default_names(test_config()),
         ),
         workspace_root: None,
+        roster: None,
         last_active_at: yesterday,
         message_count: 1,
       ),

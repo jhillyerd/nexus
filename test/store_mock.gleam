@@ -411,7 +411,21 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
                         ),
                       ),
                       system_prompt,
-                      [],
+                      // insert_thread's roster CTE: the creation-time
+                      // roster row is stored WITH the thread (seq 0,
+                      // system-authored) — the watermark (messages)
+                      // already counts it.
+                      case summary.roster {
+                        option.Some(#(text, stamp)) -> [
+                          store.UserRow(
+                            content: text,
+                            author: option.Some("system"),
+                            hop_depth: 0,
+                            at: option.Some(stamp),
+                          ),
+                        ]
+                        option.None -> []
+                      },
                       summary.message_count,
                     ),
                   ),

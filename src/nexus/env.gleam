@@ -275,6 +275,20 @@ type SelectMsg {
   Cancelled
 }
 
+/// The bash watchdog's mail (CodeRabbit review): the parsed pgid once
+/// the marker arrives, and the all-done notice when the bash loop
+/// returns on any path.
+type WatchMsg {
+  WatchPgid(Int)
+  WatchDone
+}
+
+/// What the watchdog selects over: its gate or the owner's DOWN.
+type WatchEvent {
+  Gate(WatchMsg)
+  OwnerDown
+}
+
 /// The first-stdout-line state machine (the kill-tree marker):
 /// `Pending` — under the setsid wrapper, the pid line is still to
 /// come; `Leader(n)` — parsed, the child is its own group leader and
@@ -341,13 +355,23 @@ pub fn bash(
   // machines) there is no marker and no pgid: the kill degrades to
   // port_close (direct child only) — the documented fallback.
   let setsid = ffi_resolve("setsid")
-  let #(exe, argv, expect_marker) = case setsid {
+  // BOTH paths print the first-line pid marker: under setsid it is the
+  // process-group id (the child is its own session leader); without
+  // setsid it is still the direct child's pid, and the kill targets
+  // THAT single process — port_close alone provably kills nothing
+  // (CodeRabbit review: an owner-killed port left `/bin/sleep`
+  // running). Descendants survive the fallback (documented posture).
+  let #(exe, argv, kill_group) = case setsid {
     Ok(setsid_path) -> #(
       setsid_path,
       ["-w", bash_path, "-c", "printf '%d\\n' $$; " <> args.command],
       True,
     )
-    Error(_) -> #(bash_path, ["-c", args.command], False)
+    Error(_) -> #(
+      bash_path,
+      ["-c", "printf '%d\\n' $$; " <> args.command],
+      False,
+    )
   }
   case ffi_open_port(exe, argv, workspace_dir(env)) {
     Error(reason) -> Error("bash: " <> reason)
@@ -357,26 +381,73 @@ pub fn bash(
         process.new_selector()
         |> process.select_map(cancel, fn(_) { Cancelled })
         |> process.select_record(tag: p, fields: 1, mapping: decode_port_msg)
-      bash_loop(
-        BashLoop(
-          p: p,
-          selector: selector,
-          cancel: cancel,
-          timeout_ms: timeout_ms,
-          deadline_us: deadline_us,
-          max_output_bytes: max_output_bytes,
-          expect_marker: expect_marker,
-        ),
-        BashState(
-          head: <<>>,
-          marker: case expect_marker {
-            True -> MarkerPending
-            False -> MarkerAbsent
-          },
-          out: <<>>,
-          killed: False,
-        ),
-      )
+      // The owner-death watchdog (the subject-owner rule inverted: the
+      // watchdog creates its own gate and hands it back, so it — not
+      // the executor — receives on it).
+      let gate_back = process.new_subject()
+      let owner = process.self()
+      let _watchdog =
+        process.spawn_unlinked(fn() {
+          let gate = process.new_subject()
+          process.send(gate_back, gate)
+          let mon = process.monitor(owner)
+          watch(gate, mon, p, kill_group, None)
+        })
+      let assert Ok(gate) = process.receive(gate_back, 1000)
+      let outcome =
+        bash_loop(
+          BashLoop(
+            p: p,
+            selector: selector,
+            cancel: cancel,
+            timeout_ms: timeout_ms,
+            deadline_us: deadline_us,
+            max_output_bytes: max_output_bytes,
+            kill_group: kill_group,
+            watch: gate,
+          ),
+          BashState(head: <<>>, marker: MarkerPending, out: <<>>, killed: False),
+        )
+      // Whatever the outcome, the loop is done with the port: the
+      // watchdog stands down (it demonitors and exits).
+      process.send(gate, WatchDone)
+      outcome
+    }
+  }
+}
+
+/// The watchdog: if the OWNING process dies while the bash port is
+/// live (a codemode task child killed at the script deadline, a
+/// crashed per-turn worker), the port closes and the BEAM kills only
+/// the DIRECT child — the setsid'd process group would survive. The
+/// watchdog fires the group kill on the owner's DOWN. It learns the
+/// pgid when the executor parses the marker (WatchPgid); an owner
+/// death before that degrades to port_close, no worse than before.
+/// One tiny process per bash call, gone when the loop returns.
+fn watch(
+  gate: Subject(WatchMsg),
+  mon: process.Monitor,
+  p: Port,
+  kill_group: Bool,
+  pgid: Option(Int),
+) -> Nil {
+  let selector =
+    process.new_selector()
+    |> process.select_map(gate, Gate)
+    |> process.select_specific_monitor(mon, fn(_down) { OwnerDown })
+  case process.selector_receive_forever(selector) {
+    Gate(WatchPgid(n)) -> watch(gate, mon, p, kill_group, Some(n))
+    Gate(WatchDone) -> {
+      process.demonitor_process(mon)
+      Nil
+    }
+    OwnerDown -> {
+      ffi_kill_tree(p, case pgid, kill_group {
+        Some(n), True -> Ok(ffi_kill_group(n))
+        Some(n), False -> Ok(ffi_kill_pid(n))
+        None, _ -> Error(Nil)
+      })
+      Nil
     }
   }
 }
@@ -389,28 +460,50 @@ type BashLoop {
     timeout_ms: Int,
     deadline_us: Int,
     max_output_bytes: Int,
-    expect_marker: Bool,
+    /// True under the setsid wrapper: the marker pid is a process-group
+    /// id and kills target the whole group; false (wrapperless
+    /// fallback): the marker pid is the direct child, killed alone.
+    kill_group: Bool,
+    /// The owner-death watchdog's gate (see `watch`).
+    watch: Subject(WatchMsg),
   )
 }
 
 fn bash_loop(loop: BashLoop, state: BashState) -> Result(String, String) {
+  // Deadline BEFORE receive (CodeRabbit review): a saturated pipe can
+  // keep queued `Data` permanently available to a zero-timeout
+  // receive, starving the timeout branch — the wall-clock guarantee
+  // must not depend on the child's output rate. Expired goes straight
+  // to the timeout branch, whose bounded reap still drains buffered
+  // output into the result.
+  case loop.deadline_us - timing.now_us() <= 0 {
+    True -> bash_timed_out(loop, state)
+    False -> bash_receive(loop, state)
+  }
+}
+
+fn bash_timed_out(loop: BashLoop, state: BashState) -> Result(String, String) {
+  {
+    let state = kill_and_reap(loop, state)
+    Error(
+      "timed out after "
+      <> int.to_string(loop.timeout_ms)
+      <> " ms. partial output:\n"
+      <> render_output(state, loop.max_output_bytes),
+    )
+  }
+}
+
+fn bash_receive(loop: BashLoop, state: BashState) -> Result(String, String) {
   let remaining_us = loop.deadline_us - timing.now_us()
   let remaining_ms = case remaining_us < 0 {
     True -> 0
     False -> int.divide(remaining_us, 1000) |> result.unwrap(0)
   }
   case process.selector_receive(loop.selector, remaining_ms) {
-    // Wall-clock deadline: kill the tree, reap bounded, answer with
-    // the honest timeout text and the partial output.
-    Error(Nil) -> {
-      let state = kill_and_reap(loop, state)
-      Error(
-        "timed out after "
-        <> int.to_string(loop.timeout_ms)
-        <> " ms. partial output:\n"
-        <> render_output(state, loop.max_output_bytes),
-      )
-    }
+    // The selector timed out with data still possible: same honest
+    // answer as an expired deadline checked up front.
+    Error(Nil) -> bash_timed_out(loop, state)
     Ok(Cancelled) -> {
       // The RE-SIGNAL is mandatory (the codemode rule): this select
       // consumed the turn's one-shot `Nil`, and the loop's LAST-call
@@ -455,7 +548,7 @@ fn bash_loop(loop: BashLoop, state: BashState) -> Result(String, String) {
 /// during a timeout/cap reap stays queued for the loop's next
 /// `cancel_pending` check, exactly as before.
 fn kill_and_reap(loop: BashLoop, state: BashState) -> BashState {
-  ffi_kill_tree(loop.p, marker_pgid(state.marker))
+  ffi_kill_tree(loop.p, marker_kill(state.marker, loop.kill_group))
   let reap_selector =
     process.new_selector()
     |> process.select_record(tag: loop.p, fields: 1, mapping: decode_port_msg)
@@ -505,12 +598,15 @@ fn absorb(loop: BashLoop, state: BashState, bytes: BitArray) -> BashState {
             Error(_) -> MarkerAbsent
           }
           case marker {
-            MarkerLeader(_) ->
+            MarkerLeader(n) -> {
+              // Arm the watchdog's group kill with the parsed pgid.
+              process.send(loop.watch, WatchPgid(n))
               absorb_out(
                 BashState(..state, head: <<>>, marker: marker),
                 rest,
                 loop.max_output_bytes,
               )
+            }
             // The first line was NOT the marker: all of it (line and
             // everything after) is output, and no marker is coming.
             MarkerAbsent ->
@@ -541,15 +637,31 @@ fn absorb(loop: BashLoop, state: BashState, bytes: BitArray) -> BashState {
   }
 }
 
-/// The group-kill target: only a parsed `MarkerLeader` pgid may be
-/// signalled (any other child is not a group leader — port_close
+/// The kill-tree target: a parsed `MarkerLeader` pid — as a GROUP id
+/// under the setsid wrapper, as the single direct pid in the
+/// wrapperless fallback; `Error` when no marker was parsed (port_close
 /// only).
-fn marker_pgid(marker: Marker) -> Result(Int, Nil) {
+fn marker_kill(
+  marker: Marker,
+  kill_group: Bool,
+) -> Result(ErlangKillTarget, Nil) {
   case marker {
-    MarkerLeader(n) -> Ok(n)
+    MarkerLeader(n) ->
+      case kill_group {
+        True -> Ok(ffi_kill_group(n))
+        False -> Ok(ffi_kill_pid(n))
+      }
     MarkerPending | MarkerAbsent -> Error(Nil)
   }
 }
+
+pub type ErlangKillTarget
+
+@external(erlang, "nexus_env_ffi", "kill_group_marker")
+fn ffi_kill_group(n: Int) -> ErlangKillTarget
+
+@external(erlang, "nexus_env_ffi", "kill_pid_marker")
+fn ffi_kill_pid(n: Int) -> ErlangKillTarget
 
 fn absorb_out(
   state: BashState,
@@ -880,7 +992,7 @@ fn ffi_open_port(
 ) -> Result(Port, String)
 
 @external(erlang, "nexus_env_ffi", "kill_tree")
-fn ffi_kill_tree(port: Port, pgid: Result(Int, Nil)) -> Nil
+fn ffi_kill_tree(port: Port, target: Result(ErlangKillTarget, Nil)) -> Nil
 
 @external(erlang, "nexus_env_ffi", "to_text_lossy")
 fn ffi_to_text_lossy(bytes: BitArray) -> String

@@ -326,21 +326,16 @@ mechanics discovered mid-build):
   string to render a status line — a bot named `system` would have
   its messages render as status lines on every path, so
   `bot.validate_name` refuses it at save.
-- **The roster row persists with the first commit**, not at insert:
-  it rides the registry-built starting transcript, and the write-
-  behind lane lands it with the first `Send` — before any request is
-  built nothing was ever sent, so hydration byte-determinism cannot
-  observe the gap. A restart between create and first send would
-  otherwise lose the announcement FOREVER on hydration (the roster
-  row is the model's only signal a workspace exists), so lazy start
-  HEALS it: an env thread hydrated with a one-message transcript
-  (never used — no request ever built, so no cached prefix can
-  diverge) re-appends the roster row, rebuilding exactly the starting
-  transcript a fresh create had (cubic PR review; pinned by the
-  hydration test). A sent env thread hydrates with the row already
-  persisted and skips the heal. Within the boot sweep's 15-minute
-  grace window the dormant row replays without the line until
-  hydrated; unused rows are swept as never-used thereafter.
+- **The roster row persists AT INSERT**, in the same statement as the
+  thread row (insert_thread's roster CTE): `message_count` seeds the
+  write-behind watermark and counts the row, so storing it later would
+  make the first commit start PAST it and it would never persist
+  (CodeRabbit review — caught live). Every rebuild path (lazy start,
+  Down replacement, retry) therefore replays the announcement from the
+  stored rows; no in-memory repair exists. Byte-determinism holds
+  before the first send because no request was ever built on the
+  shorter prefix. Never-used env rows (system + roster = 2) are swept
+  past the grace window by the boot prune's env-aware ceiling.
 - **Boot's bot-tool validation closure is extracted** into
   `boot.bot_validate_tools(cfg, providers, foreign)` so the env gate
   is offline-testable without starting the tree.

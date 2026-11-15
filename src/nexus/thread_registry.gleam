@@ -533,6 +533,7 @@ fn stored_summary_with_id(id: String) -> StoredSummary {
     ),
     toolset: [],
     workspace_root: None,
+    roster: None,
     last_active_at: 0,
     message_count: 0,
   )
@@ -999,6 +1000,20 @@ fn start_new_thread(
                 // Environments plan Phase 1: the frozen root (None =
                 // no env tools).
                 workspace_root: workspace_root,
+                // The roster row rides the INSERT (persisted
+                // atomically — see StoredSummary.roster) so the
+                // write-behind watermark matches the stored rows.
+                roster: case workspace_root {
+                  Some(_) ->
+                    Some(#(
+                      env.roster_attach_text(
+                        "workspace",
+                        env.attached_targets(),
+                      ),
+                      created_at,
+                    ))
+                  None -> None
+                },
                 last_active_at: created_at,
                 // The STARTING transcript's length (system prompt, plus
                 // the roster row on env threads) — the count the live

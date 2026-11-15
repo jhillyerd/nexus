@@ -647,6 +647,7 @@ fn seed_with_tags(seam: store.Store, id: String, tags: List(String)) -> Nil {
           tools.default_names(test_config()),
         ),
         workspace_root: None,
+        roster: None,
         message_count: 3,
       ),
       "test system prompt",
@@ -997,6 +998,7 @@ fn seed_at(
           tools.default_names(test_config()),
         ),
         workspace_root: None,
+        roster: None,
         message_count: message_count,
       ),
       "test system prompt",
@@ -1017,6 +1019,7 @@ fn seed_env(seam: store.Store, id: String, message_count: Int) -> Nil {
         meta: fresh_meta(),
         toolset: thread_registry.plain_entries(["bash"]),
         workspace_root: Some("/srv/old-root"),
+        roster: None,
         last_active_at: 1_700_000_000,
         message_count: message_count,
       ),
@@ -1297,6 +1300,7 @@ fn stored_with_toolset(id: String, names: List(String)) -> store.StoredSummary {
     ),
     toolset: thread_registry.plain_entries(names),
     workspace_root: None,
+    roster: None,
     last_active_at: timing.wall_now_s(),
     message_count: 1,
   )
@@ -1915,6 +1919,7 @@ pub fn dormant_summary_carries_bot_provenance_test() {
           tools.default_names(test_config()),
         ),
         workspace_root: None,
+        roster: None,
         message_count: 3,
       ),
       "frozen",
@@ -2022,6 +2027,7 @@ pub fn bot_delete_scrubs_cached_provenance_test() {
             tools.default_names(test_config()),
           ),
           workspace_root: None,
+          roster: None,
           message_count: 3,
         ),
         "frozen",
@@ -2228,6 +2234,49 @@ pub fn env_toolset_runner_receives_environment_handle_test() {
   should.equal(id, summary.id)
 }
 
+/// The roster row persists ATOMICALLY with the thread row: without
+/// it, the insert's watermark (message_count = 2) would make the first
+/// commit start PAST the roster and it would never persist (CodeRabbit
+/// review). After one send, the stored rows must lead with the
+/// system-authored roster row.
+pub fn env_roster_row_persists_with_first_commit_test() {
+  let root = "/tmp/nexus-env-roster-" <> int.to_string(timing.now_us())
+  let #(registry, seam) =
+    start_registry_with_workspace(root, store_mock.seam(store_mock.start()))
+  let env_toolset =
+    thread.Toolset(
+      names: ["bash"],
+      specs: tools.default(test_config()),
+      runner: fn(_endpoint, tr, _cancel, _delivery, _environment, _on_event) {
+        thread.StreamDone(stats(), transcript.append_assistant(tr, "ok"))
+      },
+      utility_runner: fn(_endpoint, _tr, _cancel, _allow_pass) {
+        Error("no utility call in this test")
+      },
+    )
+  let assert Ok(summary) =
+    thread_registry.create_with_toolset(
+      registry,
+      new_thread(store_mock.fixture_provider_id, "alpha"),
+      env_toolset,
+    )
+  let assert Ok(sess) = thread_registry.get(registry, summary.id)
+  let assert thread.Sent = thread.send_message(sess, "do something")
+  // Let the write-behind commit land.
+  process.sleep(100)
+  let assert Ok(rows) = seam.load_messages(summary.id)
+  let assert [
+    store.UserRow(
+      content: "environment attached: \"workspace\". attached targets: workspace.",
+      author: Some("system"),
+      hop_depth: 0,
+      ..,
+    ),
+    store.UserRow(content: "do something", ..),
+    _,
+  ] = rows
+}
+
 /// Hydration replays the frozen root from the ROW, not the config: a
 /// dormant env thread rehydrates and runs even after the config root
 /// changed (the frozen-endpoint property, applied to a directory).
@@ -2246,6 +2295,11 @@ pub fn env_toolset_hydrates_from_persisted_root_test() {
         meta: fresh_meta(),
         toolset: thread_registry.plain_entries(["bash"]),
         workspace_root: Some(old_root),
+        // The creation-time roster row, as insert_thread persists it.
+        roster: Some(#(
+          env.roster_attach_text("workspace", env.attached_targets()),
+          1_700_000_000,
+        )),
         last_active_at: timing.wall_now_s(),
         message_count: 1,
       ),
@@ -2261,6 +2315,8 @@ pub fn env_toolset_hydrates_from_persisted_root_test() {
   let assert Ok(sess) = thread_registry.get(registry, "s77")
   let snapshot = actor.call(sess, 5000, thread.Snapshot)
   let messages = transcript.messages(snapshot)
+  // The roster row replays FROM THE STORED ROWS (the insert persisted
+  // it; no in-memory repair).
   let assert [
     glopenai_chat.UserMessage(
       content: glopenai_chat.UserTextContent(

@@ -640,6 +640,7 @@ fn stored(id: String) -> store.StoredSummary {
     last_active_at: timing.wall_now_s(),
     toolset: thread_registry.plain_entries(tools.default_names(test_config())),
     workspace_root: None,
+    roster: None,
     message_count: 1,
   )
 }

@@ -53,6 +53,7 @@ fn summary(id: String, provider_id: String) -> store.StoredSummary {
     last_active_at: 1_700_000_000,
     toolset: [],
     workspace_root: None,
+    roster: None,
     message_count: 1,
   )
 }

@@ -76,6 +76,14 @@ pub type StoredSummary {
     /// `NEXUS_WORKSPACE_ROOT` change can never re-aim an existing
     /// thread's files.
     workspace_root: Option(String),
+    /// The creation-time roster row (environments plan Phase 1):
+    /// `Some(#(text, stamp))` on env threads — persisted ATOMICALLY
+    /// with the thread row (insert_thread's roster CTE) so the
+    /// write-behind watermark (seeded from `message_count`, which
+    /// counts the roster row) matches the stored rows from the very
+    /// first insert. Without it, the first commit would start past
+    /// the roster and it would never persist (CodeRabbit review).
+    roster: Option(#(String, Int)),
     /// Epoch seconds; bumped on turn commit.
     last_active_at: Int,
     /// Includes the system prompt (Phase 1 semantics).

@@ -29,7 +29,7 @@
 -module(nexus_env_ffi).
 
 -export([resolve/1, open_port/3, kill_tree/2, to_text_lossy/1, read_capped/2,
-         split_line/1]).
+         split_line/1, kill_group_marker/1, kill_pid_marker/1]).
 
 -include_lib("kernel/include/file.hrl").
 
@@ -115,7 +115,7 @@ kill_tree(Port, Pgid) ->
                                     erlang:open_port(
                                       {spawn_executable,
                                        unicode:characters_to_list(Kill)},
-                                      [{args, ["-9", "--", "-" ++ integer_to_list(N)]},
+                                      [{args, kill_args(N)},
                                        hide, exit_status, use_stdio]),
                                 %% WAIT for the kill to act: the helper is
                                 %% this port's connected process, and a
@@ -137,6 +137,17 @@ kill_tree(Port, Pgid) ->
         end,
     try erlang:port_close(Port) catch _:_ -> nil end,
     nil.
+
+%% {pid, N} signals ONE process (the wrapperless fallback's direct
+%% child); {pgid, N} signals the whole group (the setsid path). Both
+%% carry the `--` guard (procps-ng 4.x parses a bare "-N" as another
+%% signal spec and silently kills nothing).
+kill_args({pid, N}) -> ["-9", "--", integer_to_list(N)];
+kill_args({pgid, N}) -> ["-9", "--", "-" ++ integer_to_list(N)].
+
+%% Gleam-side marker constructors for the two kill shapes.
+kill_pid_marker(N) -> {pid, N}.
+kill_group_marker(N) -> {pgid, N}.
 
 %% Arbitrary command bytes -> String. Strict UTF-8 first; anything
 %% invalid falls back to latin-1 decoding (no byte dropped, mojibake

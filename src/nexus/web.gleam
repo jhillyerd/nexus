@@ -719,7 +719,12 @@ fn send_response(
           // the first-ever message titles the thread, and the registry
           // additionally refuses to clobber a manual (or already
           // generated) title.
-          let is_first = thread.describe(thread).message_count <= 1
+          // <= 2, not <= 1: an environment thread starts at 2
+          // (system prompt + roster row) and its first human send must
+          // still auto-title (CodeRabbit review). A plain thread never
+          // sits at 2 on a send boundary (first send commits >= 3, a
+          // failed one leaves 1).
+          let is_first = thread.describe(thread).message_count <= 2
           case thread.send_message(thread, trimmed) {
             thread.Sent -> {
               case is_first {

@@ -354,6 +354,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
                       ),
                       toolset: entries,
                       workspace_root: row.workspace_root,
+                      roster: option.None,
                       last_active_at: row.last_active_s,
                       // The column already counts the system prompt
                       // (Phase 1 semantics).
@@ -425,6 +426,17 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           // Environments plan Phase 1: the frozen workspace root ($13),
           // same '' sentinel (NULL = no env tools).
           option.unwrap(summary.workspace_root, ""),
+          // The creation-time roster row ($14 text / $15 stamp): the ''
+          // text sentinel skips the row entirely (plain threads).
+          case summary.roster {
+            option.Some(#(text, stamp)) -> #(text, stamp)
+            option.None -> #("", 0)
+          }
+            |> fn(row) { row.0 },
+          case summary.roster {
+            option.Some(#(_text, stamp)) -> stamp
+            option.None -> 0
+          },
         )
         |> result.map(fn(_) { Nil })
         |> result.map_error(query_error)
@@ -947,6 +959,7 @@ fn stored_summary_from_row(
         // entries.
         toolset: entries,
         workspace_root: row.workspace_root,
+        roster: option.None,
         last_active_at: row.last_active_s,
         // The column already counts the system prompt (Phase 1
         // semantics).

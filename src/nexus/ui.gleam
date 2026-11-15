@@ -2015,7 +2015,12 @@ fn send_effect(model: Model, text: String) -> Effect(Msg) {
         // rule. The transcript always carries the system prompt, so "no
         // user message yet" is a count of 1; the registry refuses to
         // clobber a manual (or already generated) title regardless.
-        let is_first = thread.describe(subject).message_count <= 1
+        // <= 2, not <= 1: an environment thread starts at 2 (system
+        // prompt + roster row) and its first human send must still
+        // auto-title (CodeRabbit review). A plain thread can never sit
+        // at 2 on a send boundary — its first send commits user +
+        // assistant (>= 3) or fails with nothing (1).
+        let is_first = thread.describe(subject).message_count <= 2
         case thread.send_message(subject, text) {
           thread.Sent -> {
             case is_first, id {
