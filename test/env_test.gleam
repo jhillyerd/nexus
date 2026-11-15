@@ -320,6 +320,20 @@ pub fn bash_owner_death_kills_group_test() {
   let _ = simplifile.delete(root)
 }
 
+fn wait_started(path: String, attempts: Int) -> Nil {
+  case simplifile.exists(path, True) {
+    Ok(True) -> Nil
+    _ ->
+      case attempts {
+        0 -> panic as "command never started (started file missing)"
+        n -> {
+          process.sleep(100)
+          wait_started(path, n - 1)
+        }
+      }
+  }
+}
+
 fn poll_tag_gone(pattern: String, attempts: Int) -> Nil {
   case
     bash(
@@ -368,10 +382,14 @@ pub fn bash_prequeued_cancel_preserves_signal_test() {
     })
   let _ = worker
   let assert Ok(#(result, again)) = process.receive(reply, 30_000)
-  let _ = simplifile.delete(root)
   let assert Error(text) = result
   let assert True = string.contains(text, "cancelled")
   let assert Ok(Nil) = again
+  // The cancelled command's whole tree is gone (CodeRabbit review):
+  // whether the pid marker was parsed or the kill was targetless, the
+  // sentinel reaps the group at the port's EOF.
+  poll_tag_gone("nxcancel[9]x", 30)
+  let _ = simplifile.delete(root)
 }
 
 pub fn bash_empty_output_marker_test() {
