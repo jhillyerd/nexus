@@ -152,13 +152,30 @@ dangling DM thread in the sidebar.
   (the `apply_meta` pattern, so the pane badge and `Channels` ask are
   correct immediately), live record metas updated, and live child
   actors notified by bounded ask so their own Send-refusal state
-  applies (a dead actor's missed notify self-corrects at hydrate — the
-  store row is what hydration reads). **Restore is symmetric**:
-  unarchiving a parent unarchives its channel subtree — unambiguous
-  today because channels have no individual archive affordance to
-  conflict with; when individual channel archiving lands, restore
-  policy must distinguish cascade-archived from human-archived (e.g.
-  `archived_at` compared against the parent's cascade stamp).
+  applies. A notify that times out or fails is retried briefly, then
+  falls back to the delete walk's existing stop-and-demonitor: the
+  actor is dropped to dormant, closing the stale-Send window
+  immediately — an actor that missed the notify would otherwise keep
+  accepting HUMAN Sends into an archived channel until restart, and
+  the pane is navigable, so that path is live. The channel lazily
+  rehydrates from its archived row on next selection. **Restore is
+  symmetric**: unarchiving a parent unarchives its channel subtree —
+  unambiguous today because channels have no individual archive
+  affordance to conflict with; when individual channel archiving
+  lands, restore policy must distinguish cascade-archived from
+  human-archived (e.g. `archived_at` compared against the parent's
+  cascade stamp).
+- **The delivery path refuses archived senders.** Archive does not
+  cancel turns — a turn already in flight when its parent is archived
+  keeps running and can still call `bot_message`. Without a check, the
+  race is wider than the propagation window: existing channels refuse
+  (their rows are archived), but `create_dm` would happily open a
+  BRAND-NEW ACTIVE channel under an archived parent. The guard chain
+  therefore gains a sender-side check BEFORE find-or-create: the
+  registry resolves `request.from_thread_id` and refuses with
+  `Refused("sender thread is archived")` when the originating thread
+  is archived. In-memory (the registry owns the sender's record), so
+  it costs nothing and slots into the settled guard order.
 - **Channels are not individually archivable in this plan** — the
   archive affordance lives on sidebar rows, and channels are hidden
   from the sidebar. The archived-CHANNEL delivery semantics are
@@ -171,7 +188,11 @@ dangling DM thread in the sidebar.
   window is NOT covered by that refusal — a delivery landing before
   the child's row is written still succeeds and commits (at-most-once,
   the same accepted ambiguity class as the existing ask-timeout
-  receipt; the window is one CTE wide). No bot-driven recovery exists
+  receipt; the window is one CTE wide). That from-write-onward claim
+  covers DELIVERIES (registry-refused, memory synced in the same
+  cascade step); a channel's HUMAN Send path is the actor's own
+  refusal state, covered by the notify-then-stop fallback above rather
+  than by the row write alone. No bot-driven recovery exists
   BY DESIGN: unlike today's accidental post-restart duplicate (the
   lost map silently routing around an archive), a delivery must never
   resurrect or sidestep one. Deleting a channel row frees the pair, so
@@ -287,7 +308,10 @@ instruction. So:
    (store-first CTE; memory synced so the pane badge and `Channels`
    ask are correct immediately) and restore unarchives it; a failed
    cascade write aborts with memory untouched (nothing hydrates
-   archived after restart); delivery into a cascade-archived channel
+   archived after restart); a mid-turn delivery from an archived
+   parent refuses (sender-archived guard, no fresh channel); child
+   notify failure stops the actor to dormant (no stale-Send window);
+   delivery into a cascade-archived channel
    refuses durably (no re-derivation escape hatch); parent-delete
    drops the whole descendant tree (direct children AND grandchildren);
    `m3_prefix_test` golden untouched; `gleam test` stays offline.
