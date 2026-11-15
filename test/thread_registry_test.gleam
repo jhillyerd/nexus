@@ -2188,10 +2188,7 @@ pub fn env_toolset_create_freezes_root_and_appends_roster_test() {
     glopenai_chat.UserMessage(content: glopenai_chat.UserTextContent(text), ..),
     _,
   ] = list.reverse(messages)
-  should.equal(
-    text,
-    "environment attached: \"workspace\". attached targets: workspace.",
-  )
+  should.equal(text, "attached targets: workspace.")
   let assert Some(transcript.Origin("system", 0)) =
     transcript.origin_at(snapshot, 1)
 }
@@ -2228,10 +2225,11 @@ pub fn env_toolset_runner_receives_environment_handle_test() {
     )
   let assert Ok(sess) = thread_registry.get(registry, summary.id)
   let assert thread.Sent = thread.send_message(sess, "run something")
-  let assert Ok(Some(env.Environment(got_root, id))) =
+  let assert Ok(Some(env.Environment(got_root, id, roster))) =
     process.receive(seen, 5000)
   should.equal(got_root, root)
   should.equal(id, summary.id)
+  should.equal(roster, ["workspace"])
 }
 
 /// The roster row persists ATOMICALLY with the thread row: without
@@ -2271,7 +2269,7 @@ pub fn env_roster_row_persists_with_first_commit_test() {
   let assert Ok(rows) = seam.load_messages(summary.id)
   let assert [
     store.UserRow(
-      content: "environment attached: \"workspace\". attached targets: workspace.",
+      content: "attached targets: workspace.",
       author: Some("system"),
       hop_depth: 0,
       ..,
@@ -2323,9 +2321,7 @@ pub fn env_toolset_hydrates_from_persisted_root_test() {
   // it; no in-memory repair).
   let assert [
     glopenai_chat.UserMessage(
-      content: glopenai_chat.UserTextContent(
-        "environment attached: \"workspace\". attached targets: workspace.",
-      ),
+      content: glopenai_chat.UserTextContent("attached targets: workspace."),
       ..,
     ),
     _,

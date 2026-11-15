@@ -69,15 +69,24 @@ import simplifile
 /// (injected by the registry's per-thread runner wrapper — the same
 /// injection point as the bots-plan `Delivery` identity). Carries the
 /// FROZEN resolved workspace root (persisted at creation, so a later
-/// config change can never re-aim an existing thread's files) and the
-/// thread id (the per-thread directory derives from it).
+/// config change can never re-aim an existing thread's files), the
+/// thread id (the per-thread directory derives from it), and the
+/// ROSTER — the list of attached targets `route` resolves against.
+///
+/// Phase 2a: `roster` starts as the frozen seed (`["workspace"]`) and
+/// is the live attached list the actor mirrors; attach/detach re-aim
+/// `route` by replacing this value's contents on the thread actor's
+/// copy. Until the live source lands, `route` fails fast on anything
+/// but the seed — the Phase 1 behaviour, now parametrised.
 pub type Environment {
-  Environment(workspace_root: String, thread_id: String)
+  Environment(workspace_root: String, thread_id: String, roster: List(String))
 }
 
 /// The complete v1 attached-target list, in stable order. `workspace`
 /// is the reserved target for the thread's own workspace — the only
-/// environment selected at thread creation.
+/// environment selected at thread creation. This is the SEED for a
+/// fresh environment handle's `roster` (attach/detach grows the live
+/// list from here in Phase 2a).
 pub fn attached_targets() -> List(String) {
   ["workspace"]
 }
@@ -99,27 +108,68 @@ pub fn workspace_dir(env: Environment) -> String {
 }
 
 /// The roster message appended to the transcript when a target
-/// attaches (environments plan: roster changes ride MESSAGES, never
-/// the envelope, so the KV prefix survives every roster change). The
-/// full attached list repeats so a stale belief self-heals on the
-/// next event. Appended as a user-role row with the display-only
-/// author sidecar `system`; never triggers a turn.
+/// attaches or detaches (environments plan: roster changes ride
+/// MESSAGES, never the envelope, so the KV prefix survives every
+/// roster change). Terse by rule — the full CURRENT attached list
+/// repeats on every line so a stale belief self-heals on the next
+/// event, and the model's tail context always names every live
+/// target. Token-minimal for small-context local models. Appended as
+/// a user-role row with the display-only author sidecar `system`;
+/// never triggers a turn.
+///
+/// The two directions share ONE shape (the tail-short form, settled
+/// in Phase 2a): `[system] attached targets: workspace, proxmox-2.`
+/// Attach and detach both emit it AFTER mutating the roster, so the
+/// line always describes the post-change state; the direction is NOT
+/// in the text (the human pane learns it from the event stream). The
+/// `target` argument is reserved for the caller-side reason / for
+/// 2b's named-node audit and is deliberately unused in the line — the
+/// FULL post-list is what self-heals, not the delta.
 pub fn roster_attach_text(target: String, attached: List(String)) -> String {
-  "environment attached: \""
-  <> target
-  <> "\". attached targets: "
-  <> string.join(attached, ", ")
-  <> "."
+  let _ = target
+  roster_line(attached)
 }
 
-/// The symmetric detach text (used from Phase 2's detach events; here
-/// for the vocabulary to be complete and pinned by tests).
+/// The symmetric detach text — same tail-short shape (see
+/// `roster_attach_text`).
 pub fn roster_detach_text(target: String, attached: List(String)) -> String {
-  "environment detached: \""
-  <> target
-  <> "\". attached targets: "
-  <> string.join(attached, ", ")
-  <> "."
+  let _ = target
+  roster_line(attached)
+}
+
+/// The one roster-line shape emitted on every attach/detach: a terse
+/// repetition of the CURRENT attached-target list, self-healing and
+/// tail-addressable.
+fn roster_line(attached: List(String)) -> String {
+  "attached targets: " <> string.join(attached, ", ") <> "."
+}
+
+/// Validate a proposed node/roster target name before it enters the
+/// live roster (environments plan Phase 2a): the charset rule shared
+/// with plugin tool half-names, `workspace` reserved (it is the
+/// thread's own environment and never attaches/detaches), no empty
+/// name. Refusal is loud and honest — no name enters the roster that
+/// would be ambiguous in `route`'s error or a roster line.
+pub fn valid_target_name(name: String) -> Result(Nil, String) {
+  case name {
+    "" -> Error("target name must not be empty")
+    "workspace" -> Error("target name 'workspace' is reserved")
+    _ ->
+      case string.split(name, "") |> list.all(fn(c) { is_name_char(c) }) {
+        True -> Ok(Nil)
+        False ->
+          Error(
+            "target name must match ^[a-zA-Z0-9_-]+$ (got \"" <> name <> "\")",
+          )
+      }
+  }
+}
+
+fn is_name_char(c: String) -> Bool {
+  string.contains(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-",
+    c,
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -217,9 +267,13 @@ pub fn list_dir_schema() -> chat.ChatCompletionTool {
 // Execution: target routing shared by every tool
 // ---------------------------------------------------------------------------
 
-/// Resolve `target` against the roster and return the routed
+/// Resolve `target` against the handle's roster and return the routed
 /// environment, or the fail-fast error (no timeout burn — the model
-/// self-corrects next round).
+/// self-corrects next round). `workspace` is the only target that
+/// routes to execution in this slice (2b wires remote nodes' execution
+/// subjects); every other name fails fast, and the error repeats the
+/// full CURRENT attached list (the live roster) so a typo'd or
+/// detached target self-heals on the next event.
 pub fn route(
   environment: Option(Environment),
   target: String,
@@ -234,7 +288,7 @@ pub fn route(
             "target \""
             <> target
             <> "\" is not attached. attached targets: "
-            <> string.join(attached_targets(), ", "),
+            <> string.join(env.roster, ", "),
           )
       }
   }

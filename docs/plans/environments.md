@@ -91,8 +91,14 @@ adapter, never as this transport).
   determinism and replay fall out for free.
 - Shape (terse, stable, self-healing — the full attached list is repeated
   so a stale belief corrects on the next event):
-  `[system] environment attached: "proxmox-2" (linux/x86_64, hostname pve2). attached targets: workspace, proxmox-2.`
-  and symmetrically for detach: `[system] environment detached: "proxmox-2". attached targets: workspace.`
+  `[system] attached targets: workspace, proxmox-2.`
+  The tail-short form (settled in Phase 2a) drops the per-node metadata
+  and the direction from the line — the human pane's Environments
+  section carries hostname/arch/direction from the event stream, and the
+  transcript line keeps only what the model needs: the CURRENT list,
+  token-minimal for small context windows. Phase 1 emitted a richer
+  creation-time line (`environment attached: "<target>" …`) for the
+  workspace seed; Phase 2a normalizes attach AND detach to the tail form.
 - **They never trigger a turn.** Roster messages are passive context; the
   agent does not wake on attach (no runaway loops). The user's next Send
   — from web or TUI — carries the turn.

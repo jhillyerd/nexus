@@ -2560,6 +2560,7 @@ fn env_toolset(
         Some(env.Environment(
           workspace_root: workspace_root,
           thread_id: thread_id,
+          roster: env.attached_targets(),
         )),
         on_event,
       )

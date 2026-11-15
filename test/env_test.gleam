@@ -20,7 +20,11 @@ fn fresh_root() -> String {
 }
 
 fn env_for(root: String) -> Option(env.Environment) {
-  Some(env.Environment(workspace_root: root, thread_id: "t1"))
+  Some(env.Environment(
+    workspace_root: root,
+    thread_id: "t1",
+    roster: env.attached_targets(),
+  ))
 }
 
 fn bash(
@@ -59,14 +63,24 @@ pub fn attached_targets_test() {
 }
 
 pub fn roster_texts_test() {
+  // Both directions share the ONE tail-short shape: the full CURRENT
+  // list, self-healing, with no direction (the human pane reads it
+  // from the event stream).
   env.roster_attach_text("proxmox-2", ["workspace", "proxmox-2"])
-  |> should_equal(
-    "environment attached: \"proxmox-2\". attached targets: workspace, proxmox-2.",
-  )
+  |> should_equal("attached targets: workspace, proxmox-2.")
   env.roster_detach_text("proxmox-2", ["workspace"])
-  |> should_equal(
-    "environment detached: \"proxmox-2\". attached targets: workspace.",
-  )
+  |> should_equal("attached targets: workspace.")
+}
+
+pub fn valid_target_name_test() {
+  let assert Ok(Nil) = env.valid_target_name("proxmox-2")
+  let assert Ok(Nil) = env.valid_target_name("node_a_1")
+  // Reserved: the thread's own workspace never attaches/detaches.
+  let assert Error(_) = env.valid_target_name("workspace")
+  // Empty and charset violations refuse loudly.
+  let assert Error(_) = env.valid_target_name("")
+  let assert Error(_) = env.valid_target_name("bad name")
+  let assert Error(_) = env.valid_target_name("bad/name")
 }
 
 pub fn is_env_name_test() {
@@ -94,6 +108,22 @@ pub fn unknown_target_fails_fast_test() {
   ) = result
 }
 
+pub fn route_names_live_roster_test() {
+  // The 2a observable: `route` reads the handle's ROSTER (not the
+  // compiled constant), so an attached list is what the fail-fast error
+  // names. `workspace` still routes to execution; a non-workspace
+  // member is attached-by-name but not routable yet (2b wires it).
+  let env =
+    env.Environment(workspace_root: "/srv/nexus", thread_id: "s12", roster: [
+      "workspace",
+      "proxmox-2",
+    ])
+  let assert Ok(_) = env.route(Some(env), "workspace")
+  let assert Error(
+    "target \"typo\" is not attached. attached targets: workspace, proxmox-2",
+  ) = env.route(Some(env), "typo")
+}
+
 pub fn no_environment_handle_errors_honestly_test() {
   let cancel = process.new_subject()
   let assert Error("this thread has no environment attached") =
@@ -117,7 +147,11 @@ pub fn bash_runs_in_workspace_cwd_test() {
   let assert True =
     string.contains(
       out,
-      env.workspace_dir(env.Environment(workspace_root: root, thread_id: "t1")),
+      env.workspace_dir(env.Environment(
+        workspace_root: root,
+        thread_id: "t1",
+        roster: env.attached_targets(),
+      )),
     )
   let _ = simplifile.delete(root)
 }
@@ -620,7 +654,12 @@ pub fn path_escape_refused_test() {
 }
 
 pub fn confinement_normalization_test() {
-  let e = env.Environment(workspace_root: "/srv/nexus", thread_id: "s12")
+  let e =
+    env.Environment(
+      workspace_root: "/srv/nexus",
+      thread_id: "s12",
+      roster: env.attached_targets(),
+    )
   let assert Ok("/srv/nexus/s12") = env.confined(e, ".")
   // `a/../..` folds ABOVE the workspace root: refused (the pop is
   // lexical — it cannot take the path past the confinement check).
@@ -634,7 +673,11 @@ pub fn confinement_normalization_test() {
 // ---------------------------------------------------------------------------
 
 pub fn workspace_dir_derivation_test() {
-  env.workspace_dir(env.Environment(workspace_root: "/srv/nx", thread_id: "s3"))
+  env.workspace_dir(env.Environment(
+    workspace_root: "/srv/nx",
+    thread_id: "s3",
+    roster: env.attached_targets(),
+  ))
   |> should_equal("/srv/nx/s3")
 }
 
