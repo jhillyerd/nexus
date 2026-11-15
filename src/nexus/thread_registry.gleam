@@ -59,6 +59,7 @@ import nexus/openai
 import nexus/store.{type Store, type StoredSummary}
 import nexus/thread
 import nexus/timing
+import nexus/tool_provider
 import nexus/tools
 import nexus/transcript.{type Transcript}
 import nexus/utility
@@ -87,10 +88,13 @@ pub type NewThread {
     /// default set for a plain thread — or, when `bot_id` is `Some` (bots
     /// P3c), the default set PLUS `bot_message`, so an ordinary bot gets
     /// the delivery tool without listing it; `Some(names)` = an explicit
-    /// list, resolved against the config-independent catalog (unknown
-    /// name → `UnknownToolset` — a stale bot is refused, never silently
-    /// narrowed). The RESOLVED names — the bundle's — are what get
-    /// persisted into `thread.toolset`.
+    /// list, resolved against the config-independent catalog ∪ mounted
+    /// MCP servers (unknown name or unmounted server → `UnknownToolset`
+    /// — a stale bot is refused, never silently narrowed). The FREEZE
+    /// step (plugin-api plan Phase 2) turns these names into the
+    /// manifest entries — plain names pass through; foreign names ask
+    /// their server LIVE and persist the frozen (description, schema)
+    /// into `thread_toolset`.
     toolset: Option(List(String)),
   )
 }
@@ -255,26 +259,35 @@ type State {
     cfg: Config,
     /// The boot-built provider table (plugin-api plan Phase 1):
     /// qualified plugin tool names → specs, merged into every EXPLICIT
-    /// toolset resolution (`tools.by_names_with`) — the same resolution
-    /// path as compiled names, so bot templates can pin plugin tools and
-    /// stale names refuse loudly. The default set never consults it
-    /// (a provider's availability is not default membership).
+    /// toolset resolution — the same resolution path as compiled
+    /// names, so bot templates can pin plugin tools and stale names
+    /// refuse loudly. The default set never consults it (a provider's
+    /// availability is not default membership).
     providers: tools.ProviderTable,
+    /// The mounted MCP servers (plugin-api plan Phase 2): server name
+    /// → its adapter actor's minted name + resolved deadline. NOT the
+    /// provider table — MCP tools never resolve from a boot snapshot;
+    /// their specs build from the FROZEN manifest schema (`by_entries_with`
+    /// → `foreign_spec`), and a create-time freeze asks the server
+    /// LIVE through the mount here. A server that degraded at boot is
+    /// absent: creates naming its tools are the honest 400.
+    foreign: Dict(String, tools.ForeignServer),
     /// The default toolset's resolved names — the key under which the
-    /// boot-built bundle is cached below, and what plain creates resolve
-    /// through the cache (the default snapshot IS the boot bundle).
+    /// boot-built bundle is cached below (as plain entries), and what
+    /// plain creates resolve through the cache (the default snapshot
+    /// IS the boot bundle).
     default_names: List(String),
-    /// Per-toolset runner bundles, cached by the name tuple (bots plan
-    /// P2 prep, #76). Seeded at boot with the default bundle — today the
-    /// only entry, since plain creates all resolve through it. P2's
-    /// create-from-bot path is the first WRITER: a new name tuple builds
-    /// its bundle once (specs via `tools.by_names_with` over the compiled
-    /// catalog ∪ the provider table, turn + utility runners over them)
-    /// and every later thread of that toolset shares it, so threads of
-    /// one toolset keep byte-identical
-    /// `tools` / `tool_choice` envelopes and each bundle's utility
-    /// side-call rides its own turn envelope by construction.
-    toolsets: Dict(List(String), thread.Toolset),
+    /// Per-toolset runner bundles, cached by the ENTRY tuple (bots
+    /// plan P2 prep, #76; plugin-api Phase 2 widens the key from the
+    /// plain name tuple — two threads naming the same MCP tool at
+    /// different times froze different schemas, and only a
+    /// byte-identical entry list may share a bundle). Seeded at boot
+    /// with the default bundle; every distinct entry list builds its
+    /// bundle exactly once, so threads of one toolset keep
+    /// byte-identical `tools` / `tool_choice` envelopes and each
+    /// bundle's utility side-call rides its own turn envelope by
+    /// construction.
+    toolsets: Dict(List(tools.ToolsetEntry), thread.Toolset),
     /// This actor's own subject: the utility apply closures ask the
     /// UpgradeAutoTitle guard through it from the (unlinked) utility
     /// worker process.
@@ -370,6 +383,7 @@ pub fn start(
   resolve_provider: ResolveProvider,
   bots_name: process.Name(bot_registry.Msg),
   providers: tools.ProviderTable,
+  foreign: Dict(String, tools.ForeignServer),
 ) -> actor.StartResult(Subject(Msg)) {
   // The tool registry is built once, here, from the global config — before
   // any thread exists — so every request any thread of the default toolset
@@ -401,6 +415,7 @@ pub fn start(
     resolve_provider,
     bots_name,
     providers,
+    foreign,
   )
 }
 
@@ -411,7 +426,8 @@ pub fn start(
 /// accepted beside the bundle so the seam mirrors `start`'s plumbing (a
 /// test booting the real runner closes over its corpus the same way), and
 /// deliberately unused here — whether a corpus is asked at all is the
-/// injected runner's business, and fakes never ask.
+/// injected runner's business, and fakes never ask. `foreign` is the
+/// mounted MCP servers (empty in every test that has none).
 pub fn start_with_toolset(
   cfg: Config,
   factory: Factory,
@@ -422,6 +438,7 @@ pub fn start_with_toolset(
   resolve_provider: ResolveProvider,
   bots_name: process.Name(bot_registry.Msg),
   providers: tools.ProviderTable,
+  foreign: Dict(String, tools.ForeignServer),
 ) -> actor.StartResult(Subject(Msg)) {
   let builder =
     actor.new_with_initialiser(5000, fn(self) {
@@ -434,7 +451,7 @@ pub fn start_with_toolset(
       case persistence.list_summaries() {
         Error(error) ->
           Error("thread store unreachable, cannot hydrate: " <> error)
-        Ok(summaries) -> {
+        Ok(#(summaries, corrupt_ids)) -> {
           let dormant =
             list.fold(summaries, dict.new(), fn(dormant, summary) {
               dict.insert(dormant, summary.id, summary)
@@ -442,9 +459,10 @@ pub fn start_with_toolset(
           actor.initialised(State(
             cfg: cfg,
             providers: providers,
+            foreign: foreign,
             default_names: default_toolset.names,
             toolsets: dict.from_list([
-              #(default_toolset.names, default_toolset),
+              #(plain_entries(default_toolset.names), default_toolset),
             ]),
             self: self,
             resolve_provider: resolve_provider,
@@ -456,8 +474,15 @@ pub fn start_with_toolset(
             // collide — but minted ids stay monotonically increasing
             // across sweeps anyway (a deleted s5 must not come back as
             // a different thread).
+            // Seeded past the survivors AND the corrupt ids AND the
+            // pruned ids: a corrupt row is skipped from hydration but
+            // its id must never be reminted (the insert would
+            // collide).
             counter: int.max(
-              max_stored_counter(summaries),
+              max_stored_counter(list.append(
+                summaries,
+                list.map(corrupt_ids, fn(id) { stored_summary_with_id(id) }),
+              )),
               max_id_suffix(pruned),
             ),
             store: persistence,
@@ -486,6 +511,31 @@ pub fn start_with_toolset(
 
 /// The highest numeric suffix among stored `s<N>` ids, so freshly minted
 /// ids never collide with dormant (stored-but-not-live) threads.
+/// A minimal summary shell for a SKIPPED row's id — only `id` is read
+/// by `max_stored_counter`; the placeholder fields exist to satisfy the
+/// record.
+fn stored_summary_with_id(id: String) -> StoredSummary {
+  store.StoredSummary(
+    id: id,
+    provider_id: "",
+    model: "",
+    meta: thread.ThreadMeta(
+      title: "",
+      title_source: thread.AutoTitle,
+      pinned: False,
+      tags: [],
+      tags_manual: [],
+      tags_source: thread.AutoTags,
+      archived: False,
+      bot_id: None,
+      created_at: 0,
+    ),
+    toolset: [],
+    last_active_at: 0,
+    message_count: 0,
+  )
+}
+
 fn max_stored_counter(summaries: List(StoredSummary)) -> Int {
   max_id_suffix(list.map(summaries, fn(summary) { summary.id }))
 }
@@ -550,18 +600,51 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       // thread has no bot identity to send from). A bot that wants it
       // gone names an explicit list without it; a chat-only `'{}'` bot
       // already excludes it. Everything resolves through the same bundle
-      // cache as any other snapshot (the default+bot_message tuple is
-      // its own cache entry, built once).
-      case resolve_toolset(state, effective_toolset(state, requested)) {
-        Error(reason) -> {
-          process.send(reply, Error(UnknownToolset(reason)))
-          actor.continue(state)
+      // cache as any other snapshot (the default+bot_message entry list
+      // is its own cache entry, built once). `None` (the plain default)
+      // skips the freeze entirely: the boot-seeded bundle IS the answer.
+      case effective_toolset(state, requested) {
+        None -> {
+          let toolset = default_toolset(state)
+          handle_create(
+            state,
+            requested,
+            toolset,
+            plain_entries(state.default_names),
+            reply,
+          )
         }
-        Ok(#(state, toolset)) -> handle_create(state, requested, toolset, reply)
+        Some(names) ->
+          // The create-time freeze (plugin-api plan Phase 2): names →
+          // manifest entries, asking mounted MCP servers LIVE — then
+          // resolve the entries through the bundle cache.
+          case freeze_entries(state, names) {
+            Error(reason) -> {
+              process.send(reply, Error(UnknownToolset(reason)))
+              actor.continue(state)
+            }
+            Ok(entries) ->
+              case resolve_entries(state, entries) {
+                Error(reason) -> {
+                  process.send(reply, Error(UnknownToolset(reason)))
+                  actor.continue(state)
+                }
+                Ok(#(state, toolset)) ->
+                  handle_create(state, requested, toolset, entries, reply)
+              }
+          }
       }
 
     CreateWithToolset(requested, toolset, reply) ->
-      handle_create(state, requested, toolset, reply)
+      // Injected bundle, no cache consult — the entries persisted are
+      // its plain names (a test bundle carries no foreign schemas).
+      handle_create(
+        state,
+        requested,
+        toolset,
+        plain_entries(toolset.names),
+        reply,
+      )
 
     Deliver(request, reply) -> {
       let #(state, outcome) = deliver_message(state, request)
@@ -591,69 +674,183 @@ fn effective_toolset(
 /// cache, so the default snapshot IS the boot-built bundle (#76). A miss
 /// would mean the seed was dropped — a programmer error, crashed loudly.
 fn default_toolset(state: State) -> thread.Toolset {
-  let assert Ok(toolset) = dict.get(state.toolsets, state.default_names)
+  let assert Ok(toolset) =
+    dict.get(state.toolsets, plain_entries(state.default_names))
   toolset
 }
 
-/// Resolve a requested toolset's NAMES into the cached bundle, building
-/// and caching on first use (bots plan P2). The cache key is the name
-/// tuple — the default snapshot's names hit the boot-seeded entry, so
-/// default threads share the boot-built runner; every distinct explicit
-/// list builds its own bundle exactly once (specs via
-/// `tools.by_names_with` — the config-INDEPENDENT compiled catalog ∪
-/// the boot-built provider table — turn + utility runners over
-/// the SAME specs — the same-specs property per toolset, by
-/// construction). Unknown names fail loudly (`UnknownToolset` at
-/// create; hydration refuses to start the thread). Returns the possibly
-/// cache-extended state beside the bundle — the caller threads it
-/// through.
-fn resolve_toolset(
+/// Plain manifest entries for a name list — no frozen schema, no
+/// description (both live in code for compiled and plugin names).
+pub fn plain_entries(names: List(String)) -> List(tools.ToolsetEntry) {
+  list.map(names, fn(name) {
+    tools.ToolsetEntry(name: name, description: "", schema_json: None)
+  })
+}
+
+/// The CREATE-time freeze (plugin-api plan Phase 2): requested NAMES →
+/// manifest ENTRIES. Plain names (compiled ∪ provider table) pass
+/// through as bare entries; FOREIGN names (`<server>__<tool>` whose
+/// server half is mounted) are grouped BY SERVER and answered with ONE
+/// live `ListTools` ask per distinct server — the registry actor
+/// blocks on these, so a ten-tool toolset on one server must cost one
+/// round trip, not ten — under the bounded freeze budget. Each def is
+/// validated and frozen (canonical schema text + description). This is
+/// the ONE place a server's current catalog is captured; hydration
+/// replays the result without ever contacting the server. Unknown
+/// names and unavailable servers fail loudly (the honest 400 at
+/// create).
+fn freeze_entries(
   state: State,
-  requested: Option(List(String)),
-) -> Result(#(State, thread.Toolset), String) {
-  case requested {
-    None -> Ok(#(state, default_toolset(state)))
-    Some(names) -> {
-      // A toolset is a set: dedupe FIRST so the cache key is stable
-      // regardless of how the caller spelled the list.
-      let names = list.unique(names)
-      case dict.get(state.toolsets, names) {
-        Ok(toolset) -> Ok(#(state, toolset))
-        Error(_) ->
-          case tools.by_names_with(state.cfg, state.providers, names) {
-            Error(reason) -> Error(reason)
-            Ok(specs) -> {
-              // Same build recipe as `start`'s boot bundle: the turn
-              // runner AND the utility runner over the same specs, so
-              // each bundle's utility side call shares its turn
-              // envelope. The corpus closure asks THIS registry (its
-              // own subject) from inside the utility worker — the same
-              // §3.3 pattern as `tag_corpus_for`, which cannot run
-              // here: the actor already exists by the time a bundle is
-              // first needed.
-              let toolset =
-                thread.Toolset(
-                  names: names,
-                  specs: specs,
-                  runner: thread.agent_runner(
-                    state.cfg.max_tool_iterations,
-                    specs,
-                  ),
-                  utility_runner: thread.utility_runner(specs, fn() {
-                    tag_corpus(state.self)
-                  }),
-                )
-              Ok(#(
-                State(
-                  ..state,
-                  toolsets: dict.insert(state.toolsets, names, toolset),
-                ),
-                toolset,
-              ))
-            }
+  names: List(String),
+) -> Result(List(tools.ToolsetEntry), String) {
+  let names = list.unique(names)
+  // One bounded live ask per DISTINCT server (a wedged server stalls
+  // this create — bounded at `freeze_ask_ms` — but never N budgets for
+  // N tools).
+  use catalogs <- result.try(
+    names
+    |> list.filter_map(fn(name) {
+      case tools.is_compiled_name(name) || dict.has_key(state.providers, name) {
+        True -> Error(Nil)
+        False ->
+          // Only MOUNTED servers get an ask — an unmounted server's
+          // names refuse in the build pass below ("not available").
+          case tool_provider.split(name) {
+            Ok(#(server, _tool)) ->
+              case dict.has_key(state.foreign, server) {
+                True -> Ok(server)
+                False -> Error(Nil)
+              }
+            Error(Nil) -> Error(Nil)
           }
       }
+    })
+    |> list.unique
+    |> list.try_fold(dict.new(), fn(acc, server) {
+      let assert Ok(mount) = dict.get(state.foreign, server)
+      case tool_provider.list_tools(mount.name, tools.freeze_ask_ms) {
+        Error(reason) ->
+          Error("mcp server '" <> server <> "' is unavailable: " <> reason)
+        Ok(defs) -> Ok(dict.insert(acc, server, defs))
+      }
+    }),
+  )
+  list.try_map(names, fn(name) {
+    case tools.is_compiled_name(name) || dict.has_key(state.providers, name) {
+      True ->
+        Ok(tools.ToolsetEntry(name: name, description: "", schema_json: None))
+      False ->
+        case tool_provider.split(name) {
+          Error(Nil) -> Error("unknown tool name: " <> name)
+          Ok(#(server, tool)) ->
+            case dict.get(state.foreign, server) {
+              Error(Nil) ->
+                Error("mcp server '" <> server <> "' is not available")
+              Ok(_mount) ->
+                case dict.get(catalogs, server) {
+                  // The catalog above was fetched for every mounted
+                  // server (an ask failure already refused); this arm
+                  // keeps the lookup total.
+                  Error(Nil) ->
+                    Error("mcp server '" <> server <> "' is not available")
+                  Ok(defs) ->
+                    case list.find(defs, fn(def) { def.name == tool }) {
+                      Error(Nil) ->
+                        Error(
+                          "mcp server '"
+                          <> server
+                          <> "' does not expose tool '"
+                          <> tool
+                          <> "'",
+                        )
+                      Ok(def) ->
+                        case
+                          tool_provider.valid_name(def.name)
+                          && tool_provider.valid_parameters(def.parameters_json)
+                        {
+                          // Belt-and-braces at the boundary (the
+                          // adapter already validated; a racing
+                          // catalog change between the ask and the
+                          // freeze must not smuggle garbage in).
+                          True ->
+                            Ok(tools.ToolsetEntry(
+                              name: name,
+                              description: def.description,
+                              schema_json: Some(def.parameters_json),
+                            ))
+                          False ->
+                            Error(
+                              "mcp server '"
+                              <> server
+                              <> "' refused: tool '"
+                              <> tool
+                              <> "' failed boundary validation",
+                            )
+                        }
+                    }
+                }
+            }
+        }
     }
+  })
+}
+
+/// Resolve manifest ENTRIES into the cached bundle, building and
+/// caching on first use (bots plan P2; plugin-api Phase 2 widens the
+/// key from names to entries). The default snapshot's entries hit the
+/// boot-seeded entry, so default threads share the boot-built runner;
+/// every distinct entry list builds its own bundle exactly once (specs
+/// via `tools.by_entries_with` — compiled ∪ provider table ∪ FROZEN
+/// foreign schemas, config-independent — turn + utility runners over
+/// the SAME specs, the same-specs property per toolset, by
+/// construction). Unknown names and unavailable foreign servers fail
+/// loudly (`UnknownToolset` at create; hydration refuses to start the
+/// thread). Returns the possibly cache-extended state beside the
+/// bundle — the caller threads it through.
+fn resolve_entries(
+  state: State,
+  entries: List(tools.ToolsetEntry),
+) -> Result(#(State, thread.Toolset), String) {
+  case dict.get(state.toolsets, entries) {
+    Ok(toolset) -> Ok(#(state, toolset))
+    Error(_) ->
+      case
+        tools.by_entries_with(
+          state.cfg,
+          state.providers,
+          state.foreign,
+          entries,
+        )
+      {
+        Error(reason) -> Error(reason)
+        Ok(specs) -> {
+          // Same build recipe as `start`'s boot bundle: the turn
+          // runner AND the utility runner over the same specs, so
+          // each bundle's utility side call shares its turn
+          // envelope. The corpus closure asks THIS registry (its
+          // own subject) from inside the utility worker — the same
+          // §3.3 pattern as `tag_corpus_for`, which cannot run
+          // here: the actor already exists by the time a bundle is
+          // first needed.
+          let names = list.map(entries, fn(entry) { entry.name })
+          let toolset =
+            thread.Toolset(
+              names: names,
+              specs: specs,
+              runner: thread.agent_runner(state.cfg.max_tool_iterations, specs),
+              utility_runner: thread.utility_runner(specs, fn() {
+                tag_corpus(state.self)
+              }),
+            )
+          Ok(#(
+            State(
+              ..state,
+              toolsets: dict.insert(state.toolsets, entries, toolset),
+            ),
+            toolset,
+          ))
+        }
+      }
   }
 }
 
@@ -661,9 +858,10 @@ fn handle_create(
   state: State,
   requested: NewThread,
   toolset: thread.Toolset,
+  entries: List(tools.ToolsetEntry),
   reply: Subject(Result(thread.ThreadSummary, CreateError)),
 ) -> actor.Next(State, Msg) {
-  let #(state, started) = start_new_thread(state, requested, toolset)
+  let #(state, started) = start_new_thread(state, requested, toolset, entries)
   case started {
     // The create reply IS the summary (#73): the same shape a following
     // List would report (message_count 1 = the system prompt, activity =
@@ -682,6 +880,7 @@ fn start_new_thread(
   state: State,
   requested: NewThread,
   toolset: thread.Toolset,
+  entries: List(tools.ToolsetEntry),
 ) -> #(State, Result(Record, CreateError)) {
   case string.trim(requested.model) {
     "" -> #(state, Error(EmptyModel))
@@ -735,11 +934,13 @@ fn start_new_thread(
                 provider_id: requested.provider_id,
                 model: alias,
                 meta: meta,
-                // The creation-time snapshot (bots plan P2): the RESOLVED
-                // names this thread will run with, always persisted —
-                // never NULL-for-default — so no config change or bot
-                // edit can re-aim this envelope.
-                toolset: toolset.names,
+                // The creation-time manifest (plugin-api plan Phase
+                // 2): the FROZEN entries this thread will run with —
+                // plain names and foreign (schema, description)
+                // snapshots — always persisted, never NULL-for-default,
+                // so no config change, bot edit, or server drift can
+                // re-aim this envelope.
+                toolset: entries,
                 last_active_at: created_at,
                 // 1 = the system prompt (Phase 1 message_count).
                 message_count: 1,
@@ -1390,23 +1591,30 @@ fn lazy_start(state: State, summary: StoredSummary) -> Resolved {
       Missing
     }
     Ok(endpoint) ->
-      // Resolve the dormant thread's PERSISTED toolset snapshot (bots
-      // plan P2) into its bundle — through the same cache a create
+      // Resolve the dormant thread's PERSISTED toolset manifest
+      // (plugin-api plan Phase 2, carrying the bots plan P2 snapshot
+      // forward) into its bundle — through the same cache a create
       // uses, so a rehydrated thread's envelope is byte-identical to
-      // the one it was created with. The snapshot wins over today's
-      // config: a name absent from the compiled code entirely (removed
-      // by an upgrade) fails hydration LOUDLY — no silent skip, no
-      // envelope change; the remedy is recreating the thread or
-      // hand-editing its row. The thread stays dormant and a later Get
-      // retries, exactly like the provider-failure path above.
-      case resolve_toolset(state, Some(summary.toolset)) {
+      // the one it was created with. The manifest wins over today's
+      // config AND over any server's current catalog: a foreign entry
+      // hydrates from its FROZEN schema (no server contact — the
+      // environments plan's property), and a name absent from the
+      // compiled code or a server no longer mounted fails hydration
+      // LOUDLY — no silent skip, no envelope change; the remedy is
+      // recreating the thread or hand-editing its row. The thread
+      // stays dormant and a later Get retries, exactly like the
+      // provider-failure path above.
+      case resolve_entries(state, summary.toolset) {
         Error(reason) -> {
           io.println(
             "nexus registry: lazy_start "
             <> summary.id
             <> " failed: toolset ["
-            <> string.join(summary.toolset, ", ")
-            <> "] is not in the compiled tool catalog ("
+            <> string.join(
+              list.map(summary.toolset, fn(entry) { entry.name }),
+              ", ",
+            )
+            <> "] is not resolvable ("
             <> reason
             <> "); thread stays dormant",
           )
@@ -2061,29 +2269,41 @@ fn create_dm(
       toolset: bot.tools,
       bot_id: Some(bot.id),
     )
-  case resolve_toolset(state, effective_toolset(state, requested)) {
+  case
+    freeze_entries(
+      state,
+      effective_toolset(state, requested) |> option.unwrap([]),
+    )
+  {
     Error(reason) -> #(
       state,
       Error("target bot toolset unavailable: " <> reason),
     )
-    Ok(#(state, toolset)) ->
-      case start_new_thread(state, requested, toolset) {
-        #(state, Ok(record)) -> {
-          let state =
-            State(
-              ..state,
-              dm: dict.insert(
-                state.dm,
-                #(request.from_bot_id, bot.id),
-                record.id,
-              ),
-            )
-          #(state, Ok(record))
-        }
-        #(state, Error(_)) -> #(
+    Ok(entries) ->
+      case resolve_entries(state, entries) {
+        Error(reason) -> #(
           state,
-          Error("target bot's thread could not be started"),
+          Error("target bot toolset unavailable: " <> reason),
         )
+        Ok(#(state, toolset)) ->
+          case start_new_thread(state, requested, toolset, entries) {
+            #(state, Ok(record)) -> {
+              let state =
+                State(
+                  ..state,
+                  dm: dict.insert(
+                    state.dm,
+                    #(request.from_bot_id, bot.id),
+                    record.id,
+                  ),
+                )
+              #(state, Ok(record))
+            }
+            #(state, Error(_)) -> #(
+              state,
+              Error("target bot's thread could not be started"),
+            )
+          }
       }
   }
 }

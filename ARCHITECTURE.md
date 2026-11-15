@@ -69,8 +69,10 @@ a live registry.
 ```mermaid
 flowchart TB
     PSUP["plugin_sup (OneForOne, linked to boot)<br/>nexus/plugin — only when NEXUS_PLUGINS is set"]
+    MSUP["mcp_sup (OneForOne, linked to boot)<br/>nexus/mcp_adapter — only when NEXUS_MCP_SERVERS_JSON is set"]
     ROOT["root supervisor (OneForAll)<br/>nexus/boot"]
     PSUP -.->|"boot runs plugin.boot: starts the tree, then<br/>the bounded ListTools snapshot whose table<br/>feeds the root's consumers"| ROOT
+    MSUP -.->|"boot runs mcp_adapter.boot: starts the tree, then<br/>the bounded ListTools ask per server — a server that<br/>will not answer DEGRADES (loud log, absent from the<br/>foreign map; the honest 400 at create), never fails boot"| ROOT
     ROOT -->|"1 — persistence is mandatory;<br/>unreachable DB fails boot"| STORE["store actor<br/>nexus/store/persist"]
     ROOT -->|"2 — loads + decrypt-validates<br/>every provider row"| PROV["provider registry<br/>nexus/provider_registry"]
     ROOT -->|"3 — loads every bot row"| BOT["bot registry<br/>nexus/bot_registry"]
@@ -93,6 +95,21 @@ VALUE that boot hands to both consumers (the bot registry's toolset
 validation closure and the thread registry's resolution) — root-tree
 children cannot hand values to each other. With `NEXUS_PLUGINS` unset
 no tree is started and the boot is the pre-plugin boot, byte for byte.
+
+Beside it sits a second provider tree (plugin-api plan Phase 2):
+`mcp_sup`, a OneForOne supervisor over the configured MCP stdio servers
+(`NEXUS_MCP_SERVERS_JSON`), also linked to boot — but with the OPPOSITE
+failure posture, because a server is an external dependency (like
+SearxNG absence), not part of the release. The adapter actors never
+crash: a server that will not spawn, answer, or produce a valid catalog
+degrades to a loud log and an absent entry in the FOREIGN map (the
+second value boot threads to the root's consumers), so creates naming
+its tools refuse with the honest 400; a server that dies mid-life puts
+its adapter into a `Down` phase and every call renders the honest tool
+error until the next nexus restart re-spawns it. MCP tools never enter
+the provider table: their schemas freeze into the per-thread manifest
+(`thread_toolset`) at create-time via a LIVE `tools/list` ask, and
+hydration replays the frozen text without ever contacting the server.
 
 Crash policy: the tree is deliberately aggressive. A crash loop at the root
 halts the VM and the *outer* supervisor (Nomad job / run script) restarts it
@@ -117,6 +134,8 @@ what is tied to what**.
 | plugin_sup (`nexus/plugin`) | y (supervisor) | 0..1 per VM — only when `NEXUS_PLUGINS` is set | boot → shutdown | separate OneForOne tree **linked to boot main** (not a root child): one crash-looping plugin exhausts it and takes boot down |
 | plugin provider actor (`nexus/plugin` SDK) | y | one per configured plugin | boot → shutdown (supervised) | one plugin's tools; registered under `nexus_plugin_<name>`, addressed by name; restart re-registers |
 | plugin tool worker (`nexus/plugin`) | n | 0..N per provider | one tool call | one tool call; **unlinked** + monitored by the provider actor (crash answers `plugin tool crashed`) |
+| mcp_sup (`nexus/mcp_adapter`) | y (supervisor) | 0..1 per VM — only when `NEXUS_MCP_SERVERS_JSON` is set | boot → shutdown | separate OneForOne tree **linked to boot main**; adapters never crash — a server that will not spawn/answer DEGRADES (loud log; hydration of its frozen threads still works, creates re-ask live) |
+| MCP adapter actor (`nexus/mcp_adapter`) | y | one per configured server | boot → shutdown (supervised) | one stdio server's tools; registered under `nexus_plugin_<name>`, addressed by name; owns the server's BEAM port; `Down` phase on child exit, retry = nexus restart |
 | provider registry (`nexus/provider_registry`) | y | 1 per VM | boot → shutdown | shared; owns provider rows + plaintext keys |
 | bot registry (`nexus/bot_registry`) | y | 1 per VM | boot → shutdown | shared; owns bot rows (no secrets — the stored row is the public shape) |
 | thread registry (`nexus/thread_registry`) | y | 1 per VM | boot → shutdown | shared; owns thread IDs → live subjects |
@@ -145,9 +164,11 @@ Notes on the "ties":
   model call is a fresh HTTP + SSE exchange. What is frozen per *thread*
   is the resolved `openai.Endpoint` (provider base URL + key + timeouts,
   pinned at create/hydration) and the tool schema set (the
-  creation-time `thread.toolset` snapshot, resolved per toolset into
-  cached runner bundles — bots plan P2; the default snapshot shares the
-  boot-built bundle). Both freezes serve the KV-cache contract.
+  creation-time `thread_toolset` manifest — plain names or frozen
+  foreign schemas — resolved per toolset into cached runner bundles —
+  bots plan P2, manifest per plugin-api Phase 2; the default snapshot
+  shares the boot-built bundle). Both freezes serve the KV-cache
+  contract.
 - **Browser connection** ties: exactly one UI runtime per `/ws` socket.
   Nothing UI-side is shared between connections; threads themselves are
   server-global, so every tab sees the same sidebar.
@@ -176,11 +197,13 @@ flowchart TB
     tw["turn worker"]
     uw["utility worker"]
     eng["codemode engine<br/>+ task children"]
+    mcp["MCP adapter actor(s)<br/>(1 per configured server)"]
     store["store actor"]
     pg[("Postgres")]
     llm["OpenAI-compatible provider"]
     searx["SearxNG"]
     web["any web host (SSRF-guarded)"]
+    mcpio[("MCP stdio server<br/>(child process)")]
 
     js <-- "WebSocket /ws" --> ws
     ws --- rt
@@ -199,6 +222,8 @@ flowchart TB
     tw -->|"tool exec"| eng
     tw -->|"tool exec"| web
     tw -->|"tool exec"| searx
+    tw -->|"tool exec<br/>(provider protocol,<br/>by name)"| mcp
+    mcp -->|"JSON-RPC over stdio<br/>(newline-delimited)"| mcpio
     sa -.->|"commit_hook<br/>(write-behind Commit)"| store
     reg -->|"sync reads + metadata"| store
     prov -->|"boot load + CRUD"| store
@@ -445,7 +470,7 @@ utility-attempt bookkeeping.
 
 | Frozen thing | Scope | Why |
 |---|---|---|
-| Tool schemas + `tool_choice` envelope | per thread (the creation-time `thread.toolset` snapshot, resolved into bundles cached per toolset; the default snapshot shares the boot-built bundle) | the envelope never varies mid-thread, so prefixes stay cacheable; threads of one toolset still share their tools head |
+| Tool schemas + `tool_choice` envelope | per thread (the creation-time `thread_toolset` manifest, resolved into bundles cached per entry tuple; the default snapshot shares the boot-built bundle) | the envelope never varies mid-thread, so prefixes stay cacheable; threads of one toolset still share their tools head |
 | `openai.Endpoint` (base URL, key, timeouts) + model | per thread, pinned at create/hydration | a thread only ever exists with its (provider, model) pin in place |
 | System prompt | per thread (refrozen from `thread.system_prompt` on hydration) | part of the immutable prefix |
 | Request bytes | per prefix — immutable forever (`nexus/transcript.to_request` is the only encode path) | the KV-cache contract |

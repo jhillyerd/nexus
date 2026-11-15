@@ -194,7 +194,9 @@ pub type UtilityRunner =
 /// envelope by construction (KV-cache contract) — the property the boot
 /// path always had (`agent_runner` + `utility_runner` over the same
 /// `specs`), preserved per toolset. The registry caches bundles keyed by
-/// the name tuple and hands every thread of one toolset the SAME bundle;
+/// the ENTRY tuple (plugin-api plan Phase 2 — names plus frozen foreign
+/// schemas, so only byte-identical snapshots share) and hands every
+/// thread of one toolset the SAME bundle;
 /// the boot-built default is the default snapshot's entry. `names` is the
 /// identity — what a create persists and what a later hydration resolves
 /// through `tools.by_names` — and must agree with `specs`.

@@ -64,6 +64,7 @@ fn test_config() -> Config {
     plugins: [],
     plugin_timeout_ms: 30_000,
     plugin_max_output_chars: 32_768,
+    mcp_servers: [],
     // Bots P3c: the delivery hop guard; 4 = the shipped default.
     max_bot_hops: 4,
   )
@@ -168,6 +169,7 @@ fn start_server_with(
       // The SAME name this harness started the bot registry under: the
       // delivery wrapper's sender-name ask resolves it at ask time.
       bots_name,
+      dict.new(),
       dict.new(),
     )
   // Port 0: the kernel picks a free port and mist's after_start hands

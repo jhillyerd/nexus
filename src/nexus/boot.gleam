@@ -31,22 +31,25 @@
 //// rehydrates from the store, so only turn commits still queued in the
 //// write-behind lane are lost (the PRD accepts this window for the MVP).
 
+import gleam/dict
 import gleam/erlang/process
 import gleam/int
 import gleam/io
+import gleam/list
 import gleam/option.{None, Some}
 import gleam/otp/factory_supervisor
 import gleam/otp/static_supervisor as supervisor
 import gleam/otp/supervision
-import gleam/result
 import gleam/string
 import mist
 import nexus/bot_registry
 import nexus/config
+import nexus/mcp_adapter
 import nexus/plugin
 import nexus/provider_registry
 import nexus/store/persist
 import nexus/thread_registry
+import nexus/tool_provider
 import nexus/tools
 import nexus/web
 
@@ -75,6 +78,21 @@ pub fn main() -> Nil {
         Ok(table) -> table
         Error(reason) -> {
           io.println("plugin boot error: " <> reason)
+          halt(2)
+        }
+      }
+      // MCP servers SECOND (plugin-api plan Phase 2): their adapters
+      // live in their own linked tree, but a server that will not
+      // spawn or answer DEGRADES (external dependency — the loud log
+      // and the honest 400 at create are the contract), never fails
+      // boot. The foreign map — like the provider table — is ONE value
+      // shared by the bot registry's validation and the thread
+      // registry's freeze. With no configured servers this is the
+      // empty map and no tree.
+      let foreign = case mcp_adapter.boot(cfg) {
+        Ok(mounts) -> dict.from_list(mounts)
+        Error(reason) -> {
+          io.println("mcp boot error: " <> reason)
           halt(2)
         }
       }
@@ -143,9 +161,38 @@ pub fn main() -> Nil {
               // built and discarded; only the verdict crosses the seam.
               // Plugin-api Phase 1: the check resolves through the
               // provider table too, so a bot may pin plugin tools.
+              // Plugin-api Phase 2: a name whose server half is a
+              // mounted MCP server passes here (no LIVE ask at bot
+              // validation — a bot save must not depend on a server's
+              // mood); the freeze happens per THREAD at create.
               fn(names) {
-                tools.by_names_with(cfg, providers, names)
-                |> result.replace(names)
+                let #(foreign_names, plain_names) =
+                  list.fold(names, #([], []), fn(acc, name) {
+                    let #(foreign_names, plain_names) = acc
+                    let is_foreign = case tool_provider.split(name) {
+                      Ok(#(server, _)) -> dict.has_key(foreign, server)
+                      Error(Nil) -> False
+                    }
+                    case is_foreign {
+                      True -> #([name, ..foreign_names], plain_names)
+                      False -> #(foreign_names, [name, ..plain_names])
+                    }
+                  })
+                // Plain names resolve through the compiled ∪ plugin
+                // catalog (the loud refusal unchanged); a foreign name
+                // passed classification above, which already proved its
+                // server is mounted — validation accepts it without a
+                // live ask (a bot save must not depend on a server's
+                // mood); the freeze happens per THREAD at create.
+                case
+                  tools.by_names_with(cfg, providers, list.reverse(plain_names))
+                {
+                  Error(reason) -> Error(reason)
+                  Ok(_) -> {
+                    let _ = foreign_names
+                    Ok(names)
+                  }
+                }
               },
             )
           }),
@@ -173,6 +220,9 @@ pub fn main() -> Nil {
               // inside the unlinked turn worker (the TagCorpus pattern).
               bot_registry_name,
               providers,
+              // The mounted MCP servers (plugin-api plan Phase 2): the
+              // freeze seam for create-time schema snapshots.
+              foreign,
             )
           }),
         )

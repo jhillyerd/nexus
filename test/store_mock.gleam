@@ -45,7 +45,9 @@ pub type Event {
 
 pub type MockMsg {
   // ---- seam operations (synchronous, Result replies) ----
-  ListSummaries(reply: Subject(Result(List(StoredSummary), String)))
+  ListSummaries(
+    reply: Subject(Result(#(List(StoredSummary), List(String)), String)),
+  )
   GetThread(id: String, reply: Subject(Result(store.StoredThread, String)))
   LoadMessages(
     id: String,
@@ -331,7 +333,7 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
         |> dict.values
         |> list.map(fn(stored) { stored.summary })
         |> list.sort(fn(a, b) { string.compare(a.id, b.id) })
-      process.send(reply, Ok(summaries))
+      process.send(reply, Ok(#(summaries, [])))
       actor.continue(state)
     }
 

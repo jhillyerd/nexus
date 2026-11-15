@@ -5,12 +5,16 @@
 //// own loader (`audit/config`) and must not depend on this surface.
 
 import envoy
+import gleam/dict
+import gleam/dynamic/decode
 import gleam/int
+import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import nexus/crypto
+import nexus/tool_provider
 
 /// Default system prompt (NEXUS_SYSTEM_PROMPT unset).
 const default_system_prompt =
@@ -112,6 +116,31 @@ pub type Config {
     /// provider results and error messages (display hygiene enforced
     /// at the boundary, never delegated to untrusted sources).
     plugin_max_output_chars: Int,
+    /// MCP servers (plugin-api plan Phase 2): configured stdio servers
+    /// to start as tool providers (`NEXUS_MCP_SERVERS_JSON`, a JSON
+    /// array). Empty — the default — starts no adapter and keeps the
+    /// boot byte-identical to the pre-MCP world. Gates availability
+    /// only, never default membership: an MCP tool enters a thread only
+    /// via a bot template or an explicit create toolset, and its schema
+    /// freezes into the thread's manifest at creation.
+    mcp_servers: List(McpServer),
+  )
+}
+
+/// One configured MCP server (plugin-api plan Phase 2): a stdio child
+/// process speaking newline-delimited JSON-RPC on stdin/stdout, adapted
+/// into the provider protocol by `nexus/mcp`. `name` is the provider
+/// half of the qualified wire name (`<name>__<tool>`) — same rules as
+/// a plugin name. `env` entries OVERRIDE/ADD to nexus's inherited
+/// environment; `timeout_ms` overrides the per-call deadline the same
+/// way a plugin's does (same floor).
+pub type McpServer {
+  McpServer(
+    name: String,
+    command: String,
+    args: List(String),
+    env: List(#(String, String)),
+    timeout_ms: Option(Int),
   )
 }
 
@@ -236,6 +265,12 @@ pub fn from_env(
     32_768,
     min: 0,
   ))
+  // ---- MCP servers (plugin-api plan Phase 2). One JSON env var, not a
+  // comma list: a stdio command carries arguments with spaces, and a
+  // command list would need quoting rules JSON already has. Parsed and
+  // validated HERE (loud config failure, the boot philosophy); the
+  // adapter's per-server degrade lives in `nexus/mcp`'s boot mount.
+  use mcp_servers <- result.try(mcp_servers(get))
   // The ASCII note rides the DEFAULT prompt only, and only while
   // codemode is enabled: an explicitly set NEXUS_SYSTEM_PROMPT is the
   // operator's own text and is never amended (enable codemode with a
@@ -278,7 +313,150 @@ pub fn from_env(
     plugins: plugins,
     plugin_timeout_ms: plugin_timeout_ms,
     plugin_max_output_chars: plugin_max_output_chars,
+    mcp_servers: mcp_servers,
   ))
+}
+
+/// Parse `NEXUS_MCP_SERVERS_JSON` (plugin-api plan Phase 2): a JSON
+/// array of server entries. Absent or `[]` — the default — configures
+/// no server and keeps boot byte-identical to the pre-MCP world. Every
+/// field is validated at the boundary (the name rule is the provider
+/// rule — `tool_provider.valid_name` — because the server name becomes
+/// the half-name of every qualified wire name): a bad entry fails the
+/// LOAD loudly, naming the server and the rule.
+fn mcp_servers(
+  get: fn(String) -> Result(String, Nil),
+) -> Result(List(McpServer), String) {
+  case optional_string(get, "NEXUS_MCP_SERVERS_JSON") {
+    None -> Ok([])
+    Some(raw) ->
+      case string.trim(raw) {
+        "" -> Ok([])
+        trimmed ->
+          case json.parse(trimmed, decode.list(decode_mcp_server())) {
+            Error(_) ->
+              Error(
+                "NEXUS_MCP_SERVERS_JSON: expected a JSON array of"
+                <> " {name, command, args?, env?, timeout_ms?} objects",
+              )
+            Ok(servers) -> validate_mcp_servers(servers)
+          }
+      }
+  }
+}
+
+fn decode_mcp_server() -> decode.Decoder(McpServer) {
+  use name <- decode.field("name", decode.string)
+  use command <- decode.field("command", decode.string)
+  use args <- decode.optional_field("args", [], decode.list(decode.string))
+  use env <- decode.optional_field(
+    "env",
+    [],
+    decode.dict(decode.string, decode.string)
+      |> decode.map(dict.to_list),
+  )
+  use timeout_ms <- decode.optional_field(
+    "timeout_ms",
+    None,
+    decode.optional(decode.int),
+  )
+  decode.success(McpServer(
+    name: name,
+    command: command,
+    args: args,
+    env: env,
+    timeout_ms: timeout_ms,
+  ))
+}
+
+fn validate_mcp_servers(
+  servers: List(McpServer),
+) -> Result(List(McpServer), String) {
+  use _seen <- result.try(
+    list.try_fold(servers, [], fn(seen, server) {
+      case list.contains(seen, server.name) {
+        True ->
+          Error(
+            "NEXUS_MCP_SERVERS_JSON: duplicate server name '"
+            <> server.name
+            <> "'",
+          )
+        False -> Ok([server.name, ..seen])
+      }
+    }),
+  )
+  list.try_map(servers, fn(server) {
+    use Nil <- result.try(case tool_provider.valid_name(server.name) {
+      True -> Ok(Nil)
+      False ->
+        Error(
+          "NEXUS_MCP_SERVERS_JSON: server name '"
+          <> server.name
+          <> "' refused: provider name must match ^[a-zA-Z0-9_-]+$"
+          <> " with no '__' and no leading or trailing '_'",
+        )
+    })
+    let cmd = string.trim(server.command)
+    use Nil <- result.try(case cmd == "", string.contains(cmd, "\u{0000}") {
+      True, _ ->
+        Error(
+          "NEXUS_MCP_SERVERS_JSON: server '"
+          <> server.name
+          <> "': command must be a non-empty executable path",
+        )
+      _, True ->
+        Error(
+          "NEXUS_MCP_SERVERS_JSON: server '"
+          <> server.name
+          <> "': command contains a NUL byte",
+        )
+      _, False -> Ok(Nil)
+    })
+    use Nil <- result.try(
+      case list.any(server.args, fn(arg) { string.contains(arg, "\u{0000}") }) {
+        True ->
+          Error(
+            "NEXUS_MCP_SERVERS_JSON: server '"
+            <> server.name
+            <> "': args must contain no NUL bytes",
+          )
+        False -> Ok(Nil)
+      },
+    )
+    use Nil <- result.try(
+      case
+        list.any(server.env, fn(pair) {
+          pair.0 == ""
+          || string.contains(pair.0, "=")
+          || string.contains(pair.0, "\u{0000}")
+          || string.contains(pair.1, "\u{0000}")
+        })
+      {
+        True ->
+          Error(
+            "NEXUS_MCP_SERVERS_JSON: server '"
+            <> server.name
+            <> "': env keys must be non-empty, contain no '='"
+            <> " and no NUL bytes; values likewise (they are OS"
+            <> " environment names and values)",
+          )
+        False -> Ok(Nil)
+      },
+    )
+    use Nil <- result.try(case server.timeout_ms {
+      Some(ms) if ms >= plugin_timeout_floor_ms -> Ok(Nil)
+      Some(_) ->
+        Error(
+          "NEXUS_MCP_SERVERS_JSON: server '"
+          <> server.name
+          <> "': timeout_ms override must be >= "
+          <> int.to_string(plugin_timeout_floor_ms)
+          <> " ms",
+        )
+      None -> Ok(Nil)
+    })
+    Ok(server)
+  })
 }
 
 fn required(

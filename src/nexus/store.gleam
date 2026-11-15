@@ -38,12 +38,15 @@
 ////   system prompt, matching Phase 1's `ThreadSummary.message_count`.
 
 import gleam/dict
+import gleam/dynamic/decode
+import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import glopenai/chat.{type ChatMessage}
 import nexus/bot
 import nexus/thread
+import nexus/tools.{type ToolsetEntry, ToolsetEntry}
 import nexus/transcript.{type Transcript}
 
 /// A stored thread's organizational metadata — exactly the Phase 1
@@ -59,11 +62,14 @@ pub type StoredSummary {
     /// verbatim with the registry's live `Record` (`thread.ThreadMeta`,
     /// issue #75) so a new metadata column is one field in one place.
     meta: thread.ThreadMeta,
-    /// The resolved tool names persisted at creation (bots plan P2) —
-    /// the snapshot a dormant thread rehydrates its runner bundle from.
-    /// Never NULL-for-default: plain threads carry the default set's
-    /// names, bot threads the bot-resolved list.
-    toolset: List(String),
+    /// The frozen toolset manifest persisted at creation (plugin-api
+    /// plan Phase 2; it replaced the bots-plan-P2 plain name list) —
+    /// the ordered entries a dormant thread rehydrates its runner
+    /// bundle from. Foreign (MCP) entries carry their frozen canonical
+    /// schema + description; plain entries are bare names. Never
+    /// NULL-for-default: plain threads carry the default set, bot
+    /// threads the bot-resolved list.
+    toolset: List(ToolsetEntry),
     /// Epoch seconds; bumped on turn commit.
     last_active_at: Int,
     /// Includes the system prompt (Phase 1 semantics).
@@ -175,8 +181,15 @@ pub type StoreError =
 /// path): implementations enqueue and persist write-behind, in order.
 pub type Store {
   Store(
+    // All stored summaries plus the IDS of rows skipped as corrupt (a
+    // manifest that will not decode). The skipped ids let the registry
+    // seed its minting counter PAST them — a corrupt row's id must
+    // never be reminted (its insert would collide) — while the row
+    // itself stays skipped (loud log at the store; the thread is
+    // unreachable until the row is repaired).
     /// Every stored thread (boot hydration of the dormant set).
-    list_summaries: fn() -> Result(List(StoredSummary), StoreError),
+    list_summaries: fn() ->
+      Result(#(List(StoredSummary), List(String)), StoreError),
     /// One stored thread incl. system prompt. `Error` for unknown ids.
     get_thread: fn(String) -> Result(StoredThread, StoreError),
     /// All rows of one thread in seq order (lazy start / restart
@@ -511,6 +524,54 @@ fn split_call_run(
 /// system prompt) has nothing new for `transcript_rows`.
 pub fn has_delta(transcript: Transcript, already_persisted: Int) -> Bool {
   transcript.length(transcript) > already_persisted
+}
+
+// ---------------------------------------------------------------------------
+// The toolset manifest's transport codec (plugin-api plan Phase 2)
+// ---------------------------------------------------------------------------
+
+/// Encode a toolset manifest as the JSON array `insert_thread` expects
+/// ($12): [{seq, name, description, schema_json|null}] in envelope
+/// order. A TRANSPORT encoding only — the stored columns stay TEXT
+/// (jsonb normalizes; the manifest must round-trip byte-identically,
+/// and a JSON string value does exactly that).
+pub fn encode_toolset(entries: List(ToolsetEntry)) -> json.Json {
+  entries
+  |> list.index_map(fn(entry, i) {
+    json.object([
+      #("seq", json.int(i)),
+      #("name", json.string(entry.name)),
+      #("description", json.string(entry.description)),
+      #("schema_json", json.nullable(entry.schema_json, json.string)),
+    ])
+  })
+  |> json.preprocessed_array
+}
+
+/// Decode a stored manifest's aggregate json text (get_thread /
+/// list_summaries) into entries. `seq` is carried by the list order;
+/// a malformed manifest is an error the caller refuses loudly (a
+/// corrupt row must never silently narrow a thread's toolset).
+pub fn decode_toolset(text: String) -> Result(List(ToolsetEntry), String) {
+  let decoder =
+    decode.list({
+      use name <- decode.field("name", decode.string)
+      use description <- decode.optional_field("description", "", decode.string)
+      use schema_json <- decode.optional_field(
+        "schema_json",
+        None,
+        decode.optional(decode.string),
+      )
+      decode.success(ToolsetEntry(
+        name: name,
+        description: description,
+        schema_json: schema_json,
+      ))
+    })
+  case json.parse(text, decoder) {
+    Ok(entries) -> Ok(entries)
+    Error(_) -> Error("stored toolset manifest is not valid JSON")
+  }
 }
 
 fn int_max(a: Int, b: Int) -> Int {

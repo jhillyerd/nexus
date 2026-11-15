@@ -35,6 +35,7 @@ import nexus/codemode
 import nexus/config.{type Config}
 import nexus/delivery.{type Delivery}
 import nexus/http_fetch
+import nexus/tool_provider
 import nexus/web_search
 
 /// Per-turn context handed to every executor alongside the raw arguments.
@@ -71,6 +72,46 @@ pub type ToolSpec {
 /// An empty table is exactly the pre-plugin catalog.
 pub type ProviderTable =
   Dict(String, ToolSpec)
+
+/// One configured MCP server's mount (plugin-api plan Phase 2): the
+/// minted registered name of its adapter actor — threaded as a VALUE
+/// from boot, never re-derived — plus the server's resolved per-call
+/// deadline. MCP tools resolve through this map, never the provider
+/// table: their schemas freeze at create-time into the thread
+/// manifest, so a spec is built from FROZEN text, not from a boot
+/// snapshot (`foreign_spec`).
+pub type ForeignServer {
+  ForeignServer(name: process.Name(tool_provider.Msg), timeout_ms: Int)
+}
+
+/// One entry of a thread's persisted toolset manifest — the ordered
+/// snapshot replacing the plain name list (plugin-api plan Phase 2).
+/// `None` schema: a plain in-process name (compiled or plugin — its
+/// schema lives in code). `Some(schema_json)`: a FOREIGN entry — an
+/// MCP tool whose schema was validated and canonicalized at create,
+/// frozen byte-stable; hydration replays this text and never contacts
+/// the server. The list order IS the envelope order.
+/// One entry of a thread's persisted toolset manifest — the ordered
+/// snapshot replacing the plain name list (plugin-api plan Phase 2).
+/// `schema_json = None`: a plain in-process name (compiled or plugin —
+/// its schema and description live in code, and `description` is
+/// unused). `Some(schema_json)`: a FOREIGN entry — an MCP tool whose
+/// schema AND description were validated and canonicalized at create,
+/// frozen byte-stable (both ride the request envelope, so both must
+/// survive restarts identical); hydration replays this text and never
+/// contacts the server. The list order IS the envelope order.
+pub type ToolsetEntry {
+  ToolsetEntry(name: String, description: String, schema_json: Option(String))
+}
+
+/// The create-time freeze's `ListTools` ask budget (plugin-api plan
+/// Phase 2). STRICTLY SMALLER than the registry create wrapper's
+/// 5-second `actor.call` budget (the HTTP/UI caller's clock): the
+/// registry actor blocks on this ask, and a freeze that outlived its
+/// caller would let a thread materialize after the caller had already
+/// seen a timeout — a zombie create. A healthy server answers in
+/// milliseconds; the boot ask (no caller, no budget) stays at 10 s.
+pub const freeze_ask_ms = 4000
 
 /// The complete compiled-in tool name set. Plugin-api plan: `__` is
 /// the reserved provider separator, so a compiled name containing it
@@ -171,6 +212,171 @@ pub fn by_names_with(
 pub fn default(cfg: Config) -> List(ToolSpec) {
   let assert Ok(specs) = by_names(cfg, default_names(cfg))
   specs
+}
+
+/// The full ENTRY resolution (plugin-api plan Phase 2): compiled ∪
+/// providers ∪ foreign. `by_names_with`'s contract, extended one rung:
+/// a `ToolsetEntry` with no schema resolves like a plain name (compiled
+/// dispatch, then the provider table); a FOREIGN entry builds its spec
+/// from the FROZEN canonical schema text — hydration's path, which
+/// never contacts the server — with the executor addressing the
+/// server's adapter actor by name. Unknown names fail loudly exactly
+/// as before; a foreign entry naming an unmounted server fails loudly
+/// too (hydration must never silently narrow). Codemode registers LAST
+/// over the assembled spec list, foreign tools included, so a script
+/// can call them like any sibling.
+pub fn by_entries_with(
+  cfg cfg: Config,
+  providers providers: ProviderTable,
+  foreign foreign: Dict(String, ForeignServer),
+  entries entries: List(ToolsetEntry),
+) -> Result(List(ToolSpec), String) {
+  // A toolset is a set: duplicates would send one schema twice and
+  // make the entry tuple → envelope mapping order-dependent.
+  let names = list.map(entries, fn(entry) { entry.name })
+  case list.length(names) == list.length(list.unique(names)) {
+    False -> Error("duplicate tool name in toolset")
+    True -> {
+      let built =
+        list.try_map(entries, fn(entry) {
+          // A schema on a plain (compiled/plugin) name is a corrupt
+          // manifest row: refused loudly, never silently ignored (the
+          // check runs outside the dispatch, whose guards cannot call
+          // functions).
+          let plain_with_schema = case entry.schema_json {
+            None -> False
+            Some(_) ->
+              tools_is_compiled_name(entry.name)
+              || dict.has_key(providers, entry.name)
+          }
+          case plain_with_schema {
+            True ->
+              Error(Reason("corrupt manifest entry '" <> entry.name <> "'"))
+            False -> dispatch_entry(cfg, providers, foreign, entry)
+          }
+        })
+      case built {
+        Error(UnknownName(name)) -> Error("unknown tool name: " <> name)
+        Error(Reason(text)) -> Error(text)
+        Ok(groups) -> {
+          let specs = list.flatten(groups)
+          // Codemode registers LAST wherever its name sat in the
+          // entries — capturing the sibling list it may call, foreign
+          // tools included, itself structurally absent from them.
+          case list.contains(names, "codemode") {
+            True -> Ok(list.append(specs, [codemode_spec(specs, cfg)]))
+            False -> Ok(specs)
+          }
+        }
+      }
+    }
+  }
+}
+
+/// One entry's dispatch (the corruption pre-check in `by_entries_with`
+/// has already filtered schema-on-plain-name rows).
+fn dispatch_entry(
+  cfg: Config,
+  providers: ProviderTable,
+  foreign: Dict(String, ForeignServer),
+  entry: ToolsetEntry,
+) -> Result(List(ToolSpec), ResolutionError) {
+  case entry {
+    ToolsetEntry("http_fetch", _, _) -> Ok([fetch_spec(cfg)])
+    ToolsetEntry("web_search", _, _) -> Ok([web_search_spec(cfg)])
+    ToolsetEntry("bot_message", _, _) -> Ok([bot_message_spec()])
+    // Codemode is built last below, over the full sibling list.
+    ToolsetEntry("codemode", _, _) -> Ok([])
+    ToolsetEntry(name, _, None) ->
+      case dict.get(providers, name) {
+        Ok(spec) -> Ok([spec])
+        Error(Nil) -> Error(UnknownName(name))
+      }
+    ToolsetEntry(name, description, Some(schema_json)) ->
+      case tool_provider.split(name) {
+        Error(Nil) ->
+          // A foreign entry whose name carries no reserved
+          // separator is a corrupt manifest row, not a
+          // resolution miss: refused loudly, never narrowed.
+          Error(Reason(
+            "frozen entry '" <> name <> "' has no reserved separator",
+          ))
+        Ok(#(server, tool)) ->
+          case dict.get(foreign, server) {
+            Error(Nil) ->
+              Error(Reason("mcp server '" <> server <> "' is not available"))
+            Ok(server_mount) ->
+              // Belt-and-braces: the frozen text was validated
+              // at freeze; a corrupted row refuses hydration
+              // loudly rather than encoding garbage.
+              case tool_provider.valid_parameters(schema_json) {
+                True ->
+                  Ok([
+                    foreign_spec(
+                      cfg: cfg,
+                      qualified: name,
+                      description: description,
+                      tool: tool,
+                      server: server_mount,
+                      schema_json: schema_json,
+                    ),
+                  ])
+                False ->
+                  Error(Reason(
+                    "frozen schema for '"
+                    <> name
+                    <> "' failed boundary validation",
+                  ))
+              }
+          }
+      }
+  }
+}
+
+/// `by_entries_with`'s internal error vocabulary: a name the catalog
+/// does not know (the loud `by_names` wording) versus a foreign entry
+/// with its own reason text (already phrased for the operator).
+type ResolutionError {
+  UnknownName(String)
+  Reason(String)
+}
+
+fn tools_is_compiled_name(name: String) -> Bool {
+  is_compiled_name(name)
+}
+
+/// The FOREIGN spec executor (plugin-api plan Phase 2): identical to a
+/// plugin spec's — the executor addresses its adapter actor BY NAME
+/// (the pre-minted value from `ForeignServer`) through the SAME select
+/// loop (`tool_provider.run`), deadline, monitor, cancel re-signal and
+/// all — but the wire schema is the FROZEN canonical text, not live
+/// catalog state. A server that died after create renders the honest
+/// tool error; nothing about the frozen envelope changes.
+pub fn foreign_spec(
+  cfg cfg: Config,
+  qualified qualified: String,
+  description description: String,
+  tool tool: String,
+  server server: ForeignServer,
+  schema_json schema_json: String,
+) -> ToolSpec {
+  ToolSpec(
+    tool: function_tool(
+      name: qualified,
+      description: description,
+      parameters_json: schema_json,
+    ),
+    run: fn(ctx, arguments) {
+      tool_provider.run(
+        provider: server.name,
+        tool: tool,
+        timeout_ms: server.timeout_ms,
+        max_output_chars: cfg.plugin_max_output_chars,
+        cancel: ctx.cancel,
+        arguments: arguments,
+      )
+    },
+  )
 }
 
 /// The bot-to-bot delivery tool (bots plan P3c, #97). Never part of the

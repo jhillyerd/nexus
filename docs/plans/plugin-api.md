@@ -2,7 +2,7 @@
 title: Nexus — plugin API and the tool provider protocol
 status: active
 tags: [computing, self-hosting, local-llm, agents, gleam, beam, plugins, mcp]
-updated: 2026-11-14
+updated: 2026-11-15
 ---
 
 # Plugin API: one provider protocol for plugins, MCP servers, and nodes
@@ -385,18 +385,123 @@ mechanics discovered mid-build):
   gleam_erlang — a provider dying with its DOWN in flight must
   degrade to a tool error, never kill the worker).
 
-### Phase 2 — MCP config adapter + frozen snapshots
+### Phase 2 — MCP config adapter + frozen snapshots — IMPLEMENTED
 
-1. MCP client adapter actor per configured server (stdio first; HTTP
-   after), speaking the provider protocol; config schema for servers.
-2. The ordered manifest column + migrate/squirrel flow; create-time
-   live `tools/list` freeze; hydration from snapshot only; bundle cache
-   keyed by tuple + snapshot identity.
-3. Tests: offline adapter tests over a fake JSON-RPC process; create /
-   hydrate / down-at-call paths; hostile-schema payloads (giant or
-   malformed `tools/list` entries) refused or bounded at the boundary.
-   Live-server behavior belongs to the e2e integration suite, not
-   `gleam test`.
+As built (see the deltas below the list):
+
+1. `src/nexus/mcp.gleam` — the codec (request builders, frame
+   classification, the `tools/list` boundary, the bounded line reader,
+   canonical JSON) and the `Transport` seam; `src/nexus/mcp_adapter.gleam`
+   — the actor + boot mount (`mcp_sup`). Config: `NEXUS_MCP_SERVERS_JSON`,
+   a JSON array of `{name, command, args?, env?, timeout_ms?}` entries,
+   validated loudly at config load.
+2. The ordered manifest: `thread_toolset`
+   (`thread_id, seq, name, description, schema_json`; PK
+   `(thread_id, seq)`, singular-table conventions, frozen columns
+   TEXT) replaced `thread.toolset text[]`. The upgrade is LOSSLESS:
+   a database still carrying the old column has its name lists
+   backfilled as plain manifest entries inside one guarded `DO` block
+   before the drop (plain entry is exactly what those names were); a
+   database already migrated skips both.
+   `insert_thread` writes row + manifest as ONE statement (CTE +
+   `json_to_recordset`), so a half-thread cannot exist; reads aggregate
+   the manifest as one json text (transport only — stored columns stay
+   TEXT). Create-time live `tools/list` freeze in
+   `thread_registry.freeze_entries`; hydration replays the frozen
+   manifest (`tools.by_entries_with` → `foreign_spec`) with NO server
+   contact; the bundle cache keys on the ENTRY tuple (name + description
+   + schema), so byte-identical snapshots share a bundle and drifted
+   ones never do.
+3. Tests, offline: the codec suite (canonical-JSON determinism, hostile
+   schemas, the 8 MiB read cap, frame classification) and the actor
+   suite over a fake transport (`start_probing`, the `gated_runner`
+   inversion — the test plays the server on the actor-owned events
+   subject), plus registry freeze/hydration/down-at-call integration
+   through the mock store. Live stdio behavior verified manually against
+   a Python echo server (PATH-resolved spawn, handshake, tools/list,
+   tools/call); live-server e2e coverage belongs to the integration
+   suite and is NOT yet added.
+
+**As-built deltas** (Phase 2 met code the design predates, plus the
+mechanics discovered mid-build):
+
+- **Frozen schemas are CANONICAL text, not the server's raw bytes.**
+  OTP's JSON decoder loses object key order, so freezing the server's
+  bytes verbatim is impossible after a parse — and an unsorted
+  re-encode would drift across VM runs (map iteration order is
+  unspecified). The freeze therefore persists OUR canonical form
+  (whitespace-free, keys sorted at every level), which is deterministic
+  from the parsed value and byte-stable forever after; the 16 KiB
+  boundary applies to the canonical text. Semantically lossless (key
+  order is not schema semantics) and envelope-stable — the two
+  properties the contract needs.
+- **The manifest freezes the DESCRIPTION too.** Descriptions ride the
+  request envelope, so a foreign entry persists (name, description,
+  schema) — the design's `{server, tool, frozen schema}` triple, with
+  description added where the envelope demanded it. Descriptions are
+  capped at 2 000 chars (marker counts inside the cap) at the same
+  boundary.
+- **`spawn_executable` does NOT search PATH** — a bare `npx` fails —
+  so the FFI resolves slash-free commands against the inherited PATH
+  (first hit wins) before spawning. Env pairs override/add to the
+  inherited environment (verified live).
+- **Boot asks run CONCURRENTLY and every configured server is
+  mounted.** The bounded probes run as spawned askers over one shared
+  reply subject (N unreachable servers cost one budget, not N). A
+  failed probe logs loudly but does NOT unmount: the actor is alive
+  and registered, the create-time freeze asks LIVE and refuses with
+  the honest reason, and — the point — hydration of that server's
+  frozen threads keeps working from the manifest, which is the plan's
+  own hydration-never-contacts-the-server property. A server absent
+  from CONFIG is absent from the map and refuses as unknown (the same
+  loud rule as a plugin removed from `NEXUS_PLUGINS`). An actor's
+  initialiser NEVER fails the supervisor child — a spawn failure is a
+  `Down` phase (a crash-looping supervisor would take boot down for
+  what is an external process). Port death arrives as
+  `{exit_status, N}` (no exit signal): the actor degrades to `Down`,
+  fails every pending ask/call honestly, and stays up; the next nexus
+  restart re-spawns the server. Mid-life retry/reconnect is recorded
+  as future work.
+- **The actor's outbound deadline IS the server's resolved per-call
+  timeout** (config default or the entry's `timeout_ms` override), so
+  actor and executor give up at the same DURATION. Their clocks start
+  at different instants, so EITHER side may time out first; both paths
+  answer honestly (the actor's carries the `notifications/cancelled`
+  notice) and the loser's reply or notice is inert.
+- **`ListTools` is ALWAYS a live round trip** — boot mount and
+  create-time freeze both get the server's current catalog, and askers
+  arriving mid-round-trip (or during the handshake) ride it. Pagination
+  (`nextCursor`) is followed to 10 pages. One bad `tools/list` entry
+  fails the whole catalog (refusing half a hostile server would be a
+  silent narrowing).
+- **Bot validation never asks the server.** A name whose server half is
+  mounted passes the bot registry's closure without a live ask (a bot
+  SAVE must not depend on a server's mood); the freeze happens per
+  THREAD at create. Collisions between `NEXUS_PLUGINS` and server
+  names refuse boot loudly (deterministic user config).
+- **Server-initiated JSON-RPC requests are answered `-32601`** (a
+  request REQUIRES a response; nexus is a tool client only);
+  notifications are ignored. Call arguments are canonicalized to an
+  object before the wire (MCP requires an arguments OBJECT, and the
+  canonical form is newline-free so the framing survives
+  pretty-printed model output); non-objects refuse before the wire.
+- **`tool_provider.run` is untouched** — a foreign spec is the same
+  executor shape with the frozen schema, addressing the adapter by its
+  minted name (the foreign map), monitor-armed before dispatch,
+  cancel re-signalling per the codemode rule, truncation at the
+  adapter.
+- **Config is ONE JSON env var** (`NEXUS_MCP_SERVERS_JSON`), not
+  per-server vars: a stdio command carries arguments with spaces, and
+  JSON already has the quoting rules. Empty/unset keeps boot
+  byte-identical to the pre-MCP world; the `m3_prefix_test` golden is
+  untouched.
+- **HTTP transport deferred** (the plan's "stdio first; HTTP after"):
+  the `Transport` seam is the only HTTP-shaped hole. URL entries are
+  FUTURE CONFIG-SCHEMA WORK: the current schema validates the stdio
+  shape (duplicate names, provider-name syntax, non-empty command, env
+  key/value rules, timeout floor) and has no URL form; a `url` variant
+  adds its own fields and checks when that transport lands, with
+  live-server e2e integration coverage.
 
 ### Phase 3 — deferred (recorded, not scheduled)
 

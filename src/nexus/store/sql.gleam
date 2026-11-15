@@ -5,6 +5,7 @@
 ////
 
 import gleam/dynamic/decode
+import gleam/json.{type Json}
 import gleam/option.{type Option}
 import pog
 
@@ -589,7 +590,7 @@ pub type GetThreadRow {
     tags: List(String),
     tags_manual: List(String),
     tags_source: String,
-    toolset: List(String),
+    toolset: String,
     bot_id: Option(String),
     created_s: Int,
     last_active_s: Int,
@@ -601,9 +602,11 @@ pub type GetThreadRow {
 /// provenance columns ride along (utility-tags plan §3.5): rehydration
 /// must never lack them. bot_id is the bots plan's provenance pointer
 /// (NULL = created without a bot; display only, never request bytes).
-/// toolset is the bots plan P2 snapshot: the resolved names hydration
-/// resolves through the config-independent catalog (loud failure on a
-/// name absent from the compiled code).
+/// toolset is the frozen toolset manifest (plugin-api plan Phase 2),
+/// aggregated in seq order as ONE json text (a transport encoding; the
+/// stored columns are TEXT — see thread_toolset in schema.sql): the
+/// ordered entries hydration replays through the config-independent
+/// catalog ∪ foreign mounts, NEVER contacting the server.
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
@@ -624,7 +627,7 @@ pub fn get_thread(
     use tags <- decode.field(8, decode.list(decode.string))
     use tags_manual <- decode.field(9, decode.list(decode.string))
     use tags_source <- decode.field(10, decode.string)
-    use toolset <- decode.field(11, decode.list(decode.string))
+    use toolset <- decode.field(11, decode.string)
     use bot_id <- decode.field(12, decode.optional(decode.string))
     use created_s <- decode.field(13, decode.int)
     use last_active_s <- decode.field(14, decode.int)
@@ -653,9 +656,11 @@ pub fn get_thread(
 -- provenance columns ride along (utility-tags plan §3.5): rehydration
 -- must never lack them. bot_id is the bots plan's provenance pointer
 -- (NULL = created without a bot; display only, never request bytes).
--- toolset is the bots plan P2 snapshot: the resolved names hydration
--- resolves through the config-independent catalog (loud failure on a
--- name absent from the compiled code).
+-- toolset is the frozen toolset manifest (plugin-api plan Phase 2),
+-- aggregated in seq order as ONE json text (a transport encoding; the
+-- stored columns are TEXT — see thread_toolset in schema.sql): the
+-- ordered entries hydration replays through the config-independent
+-- catalog ∪ foreign mounts, NEVER contacting the server.
 select
   id,
   provider_id,
@@ -668,7 +673,9 @@ select
   tags,
   tags_manual,
   tags_source,
-  toolset,
+  (select coalesce(json_agg(row_to_json(e) order by e.seq), '[]'::json)::text
+     from thread_toolset e
+    where e.thread_id = thread.id) as toolset,
   bot_id,
   extract(epoch from created_at)::int8 as created_s,
   extract(epoch from last_active_at)::int8 as last_active_s,
@@ -786,15 +793,19 @@ values ($1, $2, $3, nullif($4, ''::bytea), $5, $6, $7, to_timestamp($8), to_time
   |> pog.execute(db)
 }
 
-/// A new thread row: created/last_active from the registry's epoch
-/// seconds; message_count is the transcript length (1 = system prompt).
+/// A new thread row + its frozen toolset manifest in ONE statement
+/// (plugin-api plan Phase 2): the manifest rows ride a CTE off the
+/// inserted thread's id, so a half-thread (row without manifest) can
+/// never exist. Created/last_active from the registry's epoch seconds;
+/// message_count is the transcript length (1 = system prompt).
 /// provider_id is frozen at creation with the model (contract rule 2).
-/// toolset is the bots plan P2 snapshot: the RESOLVED tool names persisted
-/// at creation (the default set's, or the creating bot's) — always
-/// populated, never NULL-for-default, so neither a config change nor a
-/// bot edit can re-aim this thread's envelope.
+/// The manifest arrives as ONE json array param ($12) — a transport
+/// encoding only; the stored columns stay TEXT (jsonb normalizes, which
+/// would break the byte-identical hydration contract). Entries:
+/// [{"seq":N,"name":"<qualified>","description":"...","schema_json":...|"null"}]
+/// in envelope order; schema_json null = a plain in-process name.
 /// bot_id is provenance only (bots plan P1): the '' sentinel inserts
-/// NULL (see insert_bot.sql) — a thread created without a bot.
+/// NULL (see insert_bot.sql).
 /// tags_manual is '{}' literally and tags_source is left to its column
 /// default 'auto' (utility-tags plan §3.5): a new thread has no tags and
 /// an open auto path.
@@ -814,25 +825,42 @@ pub fn insert_thread(
   arg_8: List(String),
   arg_9: Float,
   arg_10: Int,
-  arg_11: List(String),
-  arg_12: String,
+  arg_11: String,
+  arg_12: Json,
 ) -> Result(pog.Returned(Nil), pog.QueryError) {
   let decoder = decode.map(decode.dynamic, fn(_) { Nil })
 
-  "-- A new thread row: created/last_active from the registry's epoch
--- seconds; message_count is the transcript length (1 = system prompt).
+  "-- A new thread row + its frozen toolset manifest in ONE statement
+-- (plugin-api plan Phase 2): the manifest rows ride a CTE off the
+-- inserted thread's id, so a half-thread (row without manifest) can
+-- never exist. Created/last_active from the registry's epoch seconds;
+-- message_count is the transcript length (1 = system prompt).
 -- provider_id is frozen at creation with the model (contract rule 2).
--- toolset is the bots plan P2 snapshot: the RESOLVED tool names persisted
--- at creation (the default set's, or the creating bot's) — always
--- populated, never NULL-for-default, so neither a config change nor a
--- bot edit can re-aim this thread's envelope.
+-- The manifest arrives as ONE json array param ($12) — a transport
+-- encoding only; the stored columns stay TEXT (jsonb normalizes, which
+-- would break the byte-identical hydration contract). Entries:
+-- [{\"seq\":N,\"name\":\"<qualified>\",\"description\":\"...\",\"schema_json\":...|\"null\"}]
+-- in envelope order; schema_json null = a plain in-process name.
 -- bot_id is provenance only (bots plan P1): the '' sentinel inserts
--- NULL (see insert_bot.sql) — a thread created without a bot.
+-- NULL (see insert_bot.sql).
 -- tags_manual is '{}' literally and tags_source is left to its column
 -- default 'auto' (utility-tags plan §3.5): a new thread has no tags and
 -- an open auto path.
-insert into thread (id, provider_id, title, title_source, model, system_prompt, pinned, tags, tags_manual, created_at, last_active_at, message_count, toolset, bot_id)
-values ($1, $2, $3, $4, $5, $6, $7, $8, '{}', to_timestamp($9), to_timestamp($9), $10, $11::text[], nullif($12, ''))
+with new_thread as (
+  insert into thread (id, provider_id, title, title_source, model, system_prompt, pinned, tags, tags_manual, created_at, last_active_at, message_count, bot_id)
+  values ($1, $2, $3, $4, $5, $6, $7, $8, '{}', to_timestamp($9), to_timestamp($9), $10, nullif($11, ''))
+  returning id
+)
+insert into thread_toolset (thread_id, seq, name, description, schema_json)
+select
+  new_thread.id,
+  e.seq,
+  e.name,
+  e.description,
+  e.schema_json
+from new_thread,
+     json_to_recordset($12::json)
+       as e(seq int, name text, description text, schema_json text)
 "
   |> pog.query
   |> pog.parameter(pog.text(arg_1))
@@ -845,8 +873,8 @@ values ($1, $2, $3, $4, $5, $6, $7, $8, '{}', to_timestamp($9), to_timestamp($9)
   |> pog.parameter(pog.array(fn(value) { pog.text(value) }, arg_8))
   |> pog.parameter(pog.float(arg_9))
   |> pog.parameter(pog.int(arg_10))
-  |> pog.parameter(pog.array(fn(value) { pog.text(value) }, arg_11))
-  |> pog.parameter(pog.text(arg_12))
+  |> pog.parameter(pog.text(arg_11))
+  |> pog.parameter(pog.text(json.to_string(arg_12)))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }
@@ -1025,7 +1053,7 @@ pub type ListSummariesRow {
     tags: List(String),
     tags_manual: List(String),
     tags_source: String,
-    toolset: List(String),
+    toolset: String,
     bot_id: Option(String),
     created_s: Int,
     last_active_s: Int,
@@ -1036,8 +1064,10 @@ pub type ListSummariesRow {
 /// All stored thread summaries, ordered by id (the registry re-sorts).
 /// The provenance columns ride along (utility-tags plan §3.5): the boot
 /// load must never lack them. bot_id is the bots plan's provenance
-/// pointer (NULL = created without a bot); toolset is the bots plan P2
-/// snapshot a dormant thread rehydrates its runner bundle from.
+/// pointer (NULL = created without a bot); toolset is the frozen
+/// toolset manifest (plugin-api plan Phase 2), aggregated in seq order
+/// as ONE json text — the entries a dormant thread rehydrates its
+/// runner bundle from, without contacting any server.
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
@@ -1056,7 +1086,7 @@ pub fn list_summaries(
     use tags <- decode.field(7, decode.list(decode.string))
     use tags_manual <- decode.field(8, decode.list(decode.string))
     use tags_source <- decode.field(9, decode.string)
-    use toolset <- decode.field(10, decode.list(decode.string))
+    use toolset <- decode.field(10, decode.string)
     use bot_id <- decode.field(11, decode.optional(decode.string))
     use created_s <- decode.field(12, decode.int)
     use last_active_s <- decode.field(13, decode.int)
@@ -1083,8 +1113,10 @@ pub fn list_summaries(
   "-- All stored thread summaries, ordered by id (the registry re-sorts).
 -- The provenance columns ride along (utility-tags plan §3.5): the boot
 -- load must never lack them. bot_id is the bots plan's provenance
--- pointer (NULL = created without a bot); toolset is the bots plan P2
--- snapshot a dormant thread rehydrates its runner bundle from.
+-- pointer (NULL = created without a bot); toolset is the frozen
+-- toolset manifest (plugin-api plan Phase 2), aggregated in seq order
+-- as ONE json text — the entries a dormant thread rehydrates its
+-- runner bundle from, without contacting any server.
 select
   id,
   provider_id,
@@ -1096,7 +1128,9 @@ select
   tags,
   tags_manual,
   tags_source,
-  toolset,
+  (select coalesce(json_agg(row_to_json(e) order by e.seq), '[]'::json)::text
+     from thread_toolset e
+    where e.thread_id = thread.id) as toolset,
   bot_id,
   extract(epoch from created_at)::int8 as created_s,
   extract(epoch from last_active_at)::int8 as last_active_s,

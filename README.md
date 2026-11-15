@@ -341,7 +341,8 @@ Bifrost/SearxNG, and the production cache check whose golden fixture is
 | `NEXUS_CODEMODE_MAX_OUTPUT_CHARS` | `32768` | `codemode`: rendered-output cap in characters (>= 0; head and tail kept, omission noted) |
 | `NEXUS_PLUGINS` | _(unset)_ | comma-separated compiled-in plugins to start as tool providers (e.g. `example`); plugin tools enter a thread only via an explicit create toolset or a bot template, never the default (`docs/plans/plugin-api.md`) |
 | `NEXUS_PLUGIN_TIMEOUT_MS` | `30000` | plugins: per-call wall-clock deadline in ms (>= 100); a provider that misses it renders as a failed tool result |
-| `NEXUS_PLUGIN_MAX_OUTPUT_CHARS` | `32768` | plugins: the adapter's output cap in characters (>= 0) for provider results and error messages |
+| `NEXUS_PLUGIN_MAX_OUTPUT_CHARS` | `32768` | plugins: the adapter's output cap in characters (>= 0) for provider results and error messages (shared with MCP adapters) |
+| `NEXUS_MCP_SERVERS_JSON` | _(unset)_ | MCP stdio servers to mount as tool providers — a JSON array of `{"name","command","args"?,"env"?,"timeout_ms"?}` (bare commands resolve through `PATH`); a server that will not start or answer degrades loudly at boot (its creates re-ask live and refuse with an honest 400, never silent; frozen threads still hydrate); server tools freeze into a thread's manifest at creation and hydration never contacts the server (`docs/plans/plugin-api.md`) |
 
 The single-provider env trio (`BIFROST_BASE_URL`, `BIFROST_API_KEY`,
 `NEXUS_MODEL_DEFAULT`) is gone: the `provider` table in Postgres is the
