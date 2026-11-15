@@ -32,7 +32,36 @@ fn set_all(pairs: List(#(String, String))) -> Nil {
   envoy.unset("NEXUS_PLUGIN_TIMEOUT_MS")
   envoy.unset("NEXUS_PLUGIN_MAX_OUTPUT_CHARS")
   envoy.unset("NEXUS_MCP_SERVERS_JSON")
+  envoy.unset("NEXUS_WORKSPACE_ROOT")
+  envoy.unset("NEXUS_ENV_TIMEOUT_MS")
+  envoy.unset("NEXUS_ENV_MAX_OUTPUT_BYTES")
   list.each(pairs, fn(pair) { envoy.set(pair.0, pair.1) })
+}
+
+pub fn workspace_root_must_be_absolute_test() {
+  // Environments plan Phase 1: a relative root would resolve against
+  // the BEAM's cwd — refuse it loudly at load (smart-loop S6).
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="),
+    #("NEXUS_WORKSPACE_ROOT", "ws"),
+  ])
+  let assert Error(message) = config.load()
+  should.be_true(string.contains(message, "NEXUS_WORKSPACE_ROOT must be an"))
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="),
+    #("NEXUS_WORKSPACE_ROOT", "/srv/ws"),
+  ])
+  let assert Ok(cfg) = config.load()
+  should.equal(cfg.workspace_root, Some("/srv/ws"))
+}
+
+pub fn env_knob_bounds_test() {
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="),
+    #("NEXUS_ENV_TIMEOUT_MS", "10"),
+  ])
+  let assert Error(message) = config.load()
+  should.be_true(string.contains(message, "NEXUS_ENV_TIMEOUT_MS"))
 }
 
 pub fn load_requires_encryption_key_test() {

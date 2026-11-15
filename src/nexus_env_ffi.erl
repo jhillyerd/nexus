@@ -166,19 +166,18 @@ read_capped(Path, MaxBytes) ->
         _:_ -> {error, <<"read failed">>}
     end.
 
-read_loop(_Device, Max, Acc, _Chunk)
-    when byte_size(Acc) >= Max ->
-    {ok, {Acc, true}};
 read_loop(Device, Max, Acc, Chunk) ->
+    %% Read up to one byte PAST Max: truncation is claimed only when a
+    %% byte was actually cut, so a file of exactly Max bytes reports
+    %% truncated=false (the eager >= Max head clause this replaces
+    %% claimed truncation it never observed).
     case file:read(Device, min(Chunk, Max - byte_size(Acc) + 1)) of
         {ok, Data} ->
             New = <<Acc/binary, Data/binary>>,
-            case byte_size(New) >= Max + 1 of
+            case byte_size(New) > Max of
                 true -> {ok, {cut(New, Max), true}};
                 false -> read_loop(Device, Max, New, Chunk)
             end;
-        eof when byte_size(Acc) >= Max + 1 ->
-            {ok, {cut(Acc, Max), true}};
         eof ->
             {ok, {Acc, false}};
         {error, Reason} -> {error, reason_text(Reason)}

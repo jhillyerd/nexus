@@ -292,7 +292,24 @@ pub fn from_env(
   // never default membership; the timeout floor keeps a sub-second
   // bash deadline from configuring a broken tool (the loud-boot
   // philosophy, the codemode/plugin precedent).
-  let workspace_root = optional_string(get, "NEXUS_WORKSPACE_ROOT")
+  use workspace_root <- result.try(
+    case optional_string(get, "NEXUS_WORKSPACE_ROOT") {
+      // Absolute only: a relative root would silently resolve against
+      // the BEAM process's cwd, scattering workspaces wherever nexus
+      // happened to start (smart-loop S6) — the loud-boot philosophy.
+      None -> Ok(None)
+      Some(root) ->
+        case string.starts_with(root, "/") {
+          True -> Ok(Some(root))
+          False ->
+            Error(
+              "environment variable NEXUS_WORKSPACE_ROOT must be an"
+              <> " absolute path: "
+              <> root,
+            )
+        }
+    },
+  )
   use env_timeout_ms <- result.try(optional_min_int(
     get,
     "NEXUS_ENV_TIMEOUT_MS",

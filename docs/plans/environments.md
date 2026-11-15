@@ -330,9 +330,12 @@ mechanics discovered mid-build):
   it rides the registry-built starting transcript, and the write-
   behind lane lands it with the first `Send` — before any request is
   built nothing was ever sent, so hydration byte-determinism cannot
-  observe the gap (a create-then-crash-before-send thread loses the
-  status line in its empty replay and is swept by the boot prune as
-  never-used).
+  observe the gap. A restart between create and first send loses the
+  status line from the empty replay (no cache divergence: no request
+  ever existed); the boot sweep eventually reaps such a never-used
+  row, but only after its 15-minute grace window — inside that window
+  the dormant row simply replays without the line until used or
+  swept (recorded, benign).
 - **Boot's bot-tool validation closure is extracted** into
   `boot.bot_validate_tools(cfg, providers, foreign)` so the env gate
   is offline-testable without starting the tree.

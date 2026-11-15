@@ -275,15 +275,30 @@ type SelectMsg {
   Cancelled
 }
 
+/// The first-stdout-line state machine (the kill-tree marker):
+/// `Pending` — under the setsid wrapper, the pid line is still to
+/// come; `Leader(n)` — parsed, the child is its own group leader and
+/// `kill_tree` may signal the whole group; `Absent` — no marker is
+/// expected (wrapperless fallback) OR the first line was not one (a
+/// bash that syntax-errored before `printf` ever ran) — in both cases
+/// the kill degrades to port_close and every byte is ordinary output.
+/// The distinction matters because a parse failure must NOT re-arm
+/// `Pending`: the swallowed-diagnostic bug (smart-loop S1) was exactly
+/// that — an unparseable first line consumed itself and every
+/// successor as marker attempts.
+type Marker {
+  MarkerPending
+  MarkerLeader(Int)
+  MarkerAbsent
+}
+
 type BashState {
   BashState(
-    /// Bytes not yet through first-line parsing (only while the pgid
-    /// marker is expected and unparsed).
+    /// Bytes not yet through first-line parsing (non-empty only while
+    /// the marker is `Pending`).
     head: BitArray,
-    /// The parsed pgid — `Some` ONLY under the setsid wrapper (the
-    /// child is then its own group leader; without setsid the pid is
-    /// not a pgid and the kill must stay port_close-only).
-    pgid: Option(Int),
+    /// The marker state (see `Marker`).
+    marker: Marker,
     /// Collected output bytes past the marker (cap-checked).
     out: BitArray,
     /// Whether the over-cap kill already fired.
@@ -352,7 +367,15 @@ pub fn bash(
           max_output_bytes: max_output_bytes,
           expect_marker: expect_marker,
         ),
-        BashState(head: <<>>, pgid: None, out: <<>>, killed: False),
+        BashState(
+          head: <<>>,
+          marker: case expect_marker {
+            True -> MarkerPending
+            False -> MarkerAbsent
+          },
+          out: <<>>,
+          killed: False,
+        ),
       )
     }
   }
@@ -407,7 +430,7 @@ fn bash_loop(loop: BashLoop, state: BashState) -> Result(String, String) {
         // as data with the omission note (the command itself may have
         // been nowhere near done — the note says it was killed).
         True -> {
-          let state = kill_and_reap(loop, BashState(..state, out: state.out))
+          let state = kill_and_reap(loop, state)
           Ok(
             render_output(state, loop.max_output_bytes)
             <> "\n[... output exceeded "
@@ -435,7 +458,7 @@ fn bash_loop(loop: BashLoop, state: BashState) -> Result(String, String) {
 /// during a timeout/cap reap stays queued for the loop's next
 /// `cancel_pending` check, exactly as before.
 fn kill_and_reap(loop: BashLoop, state: BashState) -> BashState {
-  ffi_kill_tree(loop.p, option.to_result(state.pgid, Nil))
+  ffi_kill_tree(loop.p, marker_pgid(state.marker))
   let reap_selector =
     process.new_selector()
     |> process.select_record(tag: loop.p, fields: 1, mapping: decode_port_msg)
@@ -462,39 +485,53 @@ fn finish(
   }
 }
 
-/// Fold one data chunk into the state. While the pgid marker is
-/// expected and unparsed, the first newline splits it off (consumed —
-/// never shown); everything after accumulates under the byte cap,
-/// tripping `killed` (once) when cap + slack is passed. Without the
-/// marker expectation the bytes are plain output.
+/// Fold one data chunk into the state. While the marker is `Pending`,
+/// the first newline splits it off: a parseable pid arms the group
+/// kill (consumed — never shown); anything else is REAL OUTPUT — the
+/// child never printed a marker (a bash syntax error means `printf`
+/// never ran either) and the line folds into `out` with the marker
+/// permanently `Absent`, so the diagnostic the model needs to
+/// self-correct survives. Everything after accumulates under the byte
+/// cap, tripping `killed` (once) when cap + slack is passed.
 fn absorb(loop: BashLoop, state: BashState, bytes: BitArray) -> BashState {
-  case loop.expect_marker, state.pgid {
-    True, None -> {
+  case state.marker {
+    MarkerPending -> {
       let joined = bit_array.append(state.head, bytes)
       case ffi_split_line(joined) {
         Ok(#(line, rest)) -> {
-          let pgid = case bit_array.to_string(line) {
+          let marker = case bit_array.to_string(line) {
             Ok(text) ->
               case int.parse(string.trim(text)) {
-                Ok(n) -> Some(n)
-                Error(_) -> None
+                Ok(n) -> MarkerLeader(n)
+                Error(_) -> MarkerAbsent
               }
-            Error(_) -> None
+            Error(_) -> MarkerAbsent
           }
-          absorb_out(
-            BashState(..state, head: <<>>, pgid: pgid),
-            rest,
-            loop.max_output_bytes,
-          )
+          case marker {
+            MarkerLeader(_) ->
+              absorb_out(
+                BashState(..state, head: <<>>, marker: marker),
+                rest,
+                loop.max_output_bytes,
+              )
+            // The first line was NOT the marker: all of it (line and
+            // everything after) is output, and no marker is coming.
+            MarkerAbsent ->
+              absorb_out(
+                BashState(..state, head: <<>>, marker: MarkerAbsent),
+                joined,
+                loop.max_output_bytes,
+              )
+            MarkerPending -> BashState(..state, head: joined)
+          }
         }
         Error(_) ->
-          // No newline yet: the marker is one short line; if a
-          // wrapperless child never sends one, past the cap the head
-          // IS output.
+          // No newline yet: the marker is one short line; a head grown
+          // past the cap with no marker in sight is output (bounded).
           case bit_array.byte_size(joined) > loop.max_output_bytes {
             True ->
               absorb_out(
-                BashState(..state, head: <<>>, pgid: None),
+                BashState(..state, head: <<>>, marker: MarkerAbsent),
                 joined,
                 loop.max_output_bytes,
               )
@@ -502,7 +539,18 @@ fn absorb(loop: BashLoop, state: BashState, bytes: BitArray) -> BashState {
           }
       }
     }
-    _, _ -> absorb_out(state, bytes, loop.max_output_bytes)
+    MarkerLeader(_) | MarkerAbsent ->
+      absorb_out(state, bytes, loop.max_output_bytes)
+  }
+}
+
+/// The group-kill target: only a parsed `MarkerLeader` pgid may be
+/// signalled (any other child is not a group leader — port_close
+/// only).
+fn marker_pgid(marker: Marker) -> Result(Int, Nil) {
+  case marker {
+    MarkerLeader(n) -> Ok(n)
+    MarkerPending | MarkerAbsent -> Error(Nil)
   }
 }
 
@@ -522,9 +570,11 @@ fn absorb_out(
 /// result renders as an explicit marker (a bare empty tool result
 /// reads as breakage, not silence).
 fn render_output(state: BashState, max_output_bytes: Int) -> String {
-  let #(bytes, truncated) = case
-    bit_array.byte_size(state.out) > max_output_bytes
-  {
+  // A still-pending head is bytes the child produced (the marker line
+  // never completed — or never was one): on a terminal path they are
+  // output, not garbage to drop.
+  let all = bit_array.append(state.head, state.out)
+  let #(bytes, truncated) = case bit_array.byte_size(all) > max_output_bytes {
     True -> #(
       bit_array.slice(state.out, 0, max_output_bytes) |> result.unwrap(<<>>),
       True,

@@ -244,6 +244,28 @@ pub fn bash_output_cap_truncates_and_kills_test() {
     )
 }
 
+/// Smart-loop S1: when the first stdout line is NOT the pid marker (a
+/// bash syntax error means `printf` never ran either), the line is
+/// REAL OUTPUT — the diagnostic the model needs to self-correct must
+/// survive, and the marker expectation must not re-arm and swallow
+/// successor lines.
+pub fn bash_marker_parse_failure_keeps_output_test() {
+  let root = fresh_root()
+  let assert Ok(out) = bash(env_for(root), 5000, "echo 'unterminated")
+  let _ = simplifile.delete(root)
+  let assert True = string.contains(out, "exit status 2")
+  let assert True = string.contains(out, "unexpected EOF")
+}
+
+/// The marker-absent path keeps MULTI-line output in order.
+pub fn bash_non_integer_first_line_all_output_test() {
+  let root = fresh_root()
+  let assert Ok(out) = bash(env_for(root), 5000, "echo notanumber; echo hello")
+  let _ = simplifile.delete(root)
+  let assert True = string.contains(out, "notanumber")
+  let assert True = string.contains(out, "hello")
+}
+
 pub fn bash_empty_output_marker_test() {
   let root = fresh_root()
   let assert Ok("(no output)") = bash(env_for(root), 5000, "true")
@@ -286,6 +308,25 @@ pub fn fs_round_trip_test() {
   let assert Ok(listing) =
     env.list_dir(environment: e, arguments: "{\"target\":\"workspace\"}")
   let assert True = string.contains(listing, "sub/")
+  let _ = simplifile.delete(root)
+}
+
+/// Smart-loop S2: a file of EXACTLY the cap is not truncated —
+/// truncation is claimed only when a byte was actually cut.
+pub fn read_file_exact_cap_not_truncated_test() {
+  let root = fresh_root()
+  let e = env_for(root)
+  let assert Ok(_) =
+    env.write_file(
+      environment: e,
+      arguments: "{\"target\":\"workspace\",\"path\":\"exact.txt\",\"content\":\"abcd\"}",
+    )
+  let assert Ok("abcd") =
+    env.read_file(
+      max_output_bytes: 4,
+      environment: e,
+      arguments: "{\"target\":\"workspace\",\"path\":\"exact.txt\"}",
+    )
   let _ = simplifile.delete(root)
 }
 
