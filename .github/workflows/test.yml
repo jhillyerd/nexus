@@ -47,6 +47,12 @@ jobs:
           git -C "$GITHUB_WORKSPACE" fetch --quiet --depth 1 origin "$REF"
           git -C "$GITHUB_WORKSPACE" checkout --quiet --detach FETCH_HEAD
       - run: gleam deps download
+      - name: Gleam warnings gate
+        # Fails on ANY warning in this package (src and test). The flag is
+        # root-package-scoped: dependency warnings (gramps/mist ship some)
+        # are printed but do NOT fail the build, verified against a
+        # from-clean compile.
+        run: gleam build --warnings-as-errors
       - name: Apply schema
         run: gleam run -m nexus/store/migrate
       - name: Squirrel drift gate

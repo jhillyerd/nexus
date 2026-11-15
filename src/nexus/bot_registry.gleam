@@ -301,7 +301,7 @@ fn create_row(
     Error(bot.ReservedName) -> Error(ReservedName)
     // bot.BotError's remaining arms cannot escape validate_name (a
     // name-only check); the arm keeps the match total.
-    Error(other) -> Error(InvalidName)
+    Error(_) -> Error(InvalidName)
   })
   use model <- result.try(
     bot.validate_model(params.model) |> result.replace_error(InvalidModel),
@@ -343,7 +343,7 @@ fn update_row(
     Error(bot.ReservedName) -> Error(ReservedName)
     // bot.BotError's remaining arms cannot escape validate_name (a
     // name-only check); the arm keeps the match total.
-    Error(other) -> Error(InvalidName)
+    Error(_) -> Error(InvalidName)
   })
   use _model <- result.try(
     bot.validate_model(merged.model)

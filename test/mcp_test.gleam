@@ -880,7 +880,7 @@ pub fn feed_refuses_oversized_accumulation_before_concat_test() {
   let #(frames1, feed2) = mcp.feed(mcp.new_feed(), bit_array_from("partial-"))
   frames1 |> should.equal([])
   let big = string.repeat("x", mcp.max_frame_bytes + 1)
-  let assert #(frames2, _) = mcp.feed(feed2, bit_array_from(big <> "\nok\n"))
+  let #(frames2, _) = mcp.feed(feed2, bit_array_from(big <> "\nok\n"))
   frames2 |> should.equal([mcp.TooBig, mcp.Line("ok")])
 }
 
@@ -1055,8 +1055,7 @@ pub fn feed_exactly_cap_line_accepted_on_any_chunk_boundary_test() {
   // acceptance, matching the single-chunk path.
   let exact = string.repeat("y", mcp.max_frame_bytes)
   // One chunk, newline included.
-  let assert #(single, _) =
-    mcp.feed(mcp.new_feed(), bit_array_from(exact <> "\n"))
+  let #(single, _) = mcp.feed(mcp.new_feed(), bit_array_from(exact <> "\n"))
   single |> should.equal([mcp.Line(exact)])
   // Two chunks, newline in the second: same verdict.
   let #(_, feed_mid) = mcp.feed(mcp.new_feed(), bit_array_from(exact))
@@ -1113,7 +1112,7 @@ pub fn busy_stdin_is_not_diagnosed_as_dead_test() {
     )
   let name = adapter_name("busy")
   let probe = process.new_subject()
-  let assert Ok(started) =
+  let assert Ok(_) =
     mcp_adapter.start_probing(
       server: config.McpServer(
         name: "busy",
@@ -1127,7 +1126,7 @@ pub fn busy_stdin_is_not_diagnosed_as_dead_test() {
       transport: busy_transport,
       probe: probe,
     )
-  let assert Ok(events) = process.receive(probe, 5000)
+  let assert Ok(_) = process.receive(probe, 5000)
   // The initialize frame's send failed → Down with the BUSY reason,
   // honest and diagnosable.
   let reply = process.new_subject()
