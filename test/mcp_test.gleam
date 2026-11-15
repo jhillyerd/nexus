@@ -1010,3 +1010,29 @@ pub fn corrupt_row_ids_are_not_reminted_test() {
   // No s5 remint: the counter jumped past the skipped id.
   should.be_true(summary.id != "s5")
 }
+
+pub fn tools_list_duplicate_name_across_pages_fails_test() {
+  let fake = start_fake("dupxpage", 30_000)
+  complete_handshake(fake)
+  let reply = ask_list_tools(fake, 30_000)
+  // Page 1 names p1; the cursor continues onto a page that names p1
+  // AGAIN — each page's own check passes, the accumulated catalog must
+  // not.
+  let assert Ok(frame1) = process.receive(fake.to_server, 5000)
+  server_says(
+    fake,
+    "{\"jsonrpc\":\"2.0\",\"id\":"
+      <> int.to_string(extract_int_field_unsafe(frame1, "id"))
+      <> ",\"result\":{\"tools\":[{\"name\":\"p1\",\"inputSchema\":{\"type\":\"object\"}}],"
+      <> "\"nextCursor\":\"more\"}}",
+  )
+  let assert Ok(frame2) = process.receive(fake.to_server, 5000)
+  server_says(
+    fake,
+    "{\"jsonrpc\":\"2.0\",\"id\":"
+      <> int.to_string(extract_int_field_unsafe(frame2, "id"))
+      <> ",\"result\":{\"tools\":[{\"name\":\"p1\",\"inputSchema\":{\"type\":\"object\"}}]}}",
+  )
+  let assert Ok(Error(reason)) = process.receive(reply, 5000)
+  should.be_true(string.contains(reason, "duplicate"))
+}

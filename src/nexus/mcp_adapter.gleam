@@ -515,10 +515,20 @@ fn finish_list(
       )
     }
     _, _ -> {
-      list.each(list.append(askers, state.waiting), fn(asker) {
-        process.send(asker, Ok(acc))
-      })
-      State(..state, list: None, waiting: [])
+      // The catalog is complete: check duplicates across the
+      // ACCUMULATED pages — each page's own check cannot see a name
+      // repeated on a later page, and the freeze would silently pick
+      // the first. One loud refusal before anyone mounts or freezes.
+      let names = list.map(acc, fn(def) { def.name })
+      case list.length(names) == list.length(list.unique(names)) {
+        True -> {
+          list.each(list.append(askers, state.waiting), fn(asker) {
+            process.send(asker, Ok(acc))
+          })
+          State(..state, list: None, waiting: [])
+        }
+        False -> fail_list(state, askers, "duplicate tool name across pages")
+      }
     }
   }
 }
