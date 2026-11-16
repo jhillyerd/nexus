@@ -292,7 +292,28 @@ type SocketState {
     adapter: Subject(Msg),
     adapter_pid: process.Pid,
     frames: Subject(String),
+    max_frame_bytes: Int,
   )
+}
+
+/// The socket loop's custom messages: outbound frames (written HERE —
+/// only the socket owner may touch the connection) and the adapter's
+/// exit, which closes the socket.
+type SocketMsg {
+  Frame(String)
+  AdapterGone
+}
+
+/// The inbound frame bound (bytes): the receive-layer half of the
+/// external-transport cap rule. mist assembles a WS frame whole —
+/// there is no mid-frame hook — so this is the FIRST nexus-side touch:
+/// an oversized frame is refused and the connection closed before it
+/// is decoded, forwarded, or queued anywhere. Legitimate frames are
+/// far inside it (a result carries at most `max_output_chars` CHARS
+/// plus JSON envelope; 4 bytes/char covers the worst UTF-8 case, and
+/// the headroom absorbs the envelope and any protocol additions).
+pub fn max_frame_bytes(max_output_chars: Int) -> Int {
+  max_output_chars * 4 + 8192
 }
 
 fn init_socket(
@@ -301,15 +322,30 @@ fn init_socket(
   thread_subject: Subject(thread.Msg),
   row: node.Node,
   role: Role,
-) -> #(SocketState, option.Option(process.Selector(String))) {
+) -> #(SocketState, option.Option(process.Selector(SocketMsg))) {
   let frames = process.new_subject()
-  // Linked to THIS process (the socket owner): the pair die together.
+  // Linked to THIS process (the socket owner): the pair die together
+  // on ABNORMAL exits. The MONITOR below adds the normal-exit half:
+  // the adapter refuses an attach with `actor.stop()` (a normal exit,
+  // which does not rupture links), so the socket watches for its death
+  // and closes — queued frames flush first (they were sent before the
+  // stop, so they sit ahead of the DOWN in this mailbox).
   let assert Ok(adapter) =
     start_adapter(cfg, thread_id, thread_subject, row.name, role, frames)
   let assert Ok(adapter_pid) = process.subject_owner(adapter)
+  let monitor = process.monitor(adapter_pid)
   #(
-    SocketState(adapter: adapter, adapter_pid: adapter_pid, frames: frames),
-    Some(process.new_selector() |> process.select(frames)),
+    SocketState(
+      adapter: adapter,
+      adapter_pid: adapter_pid,
+      frames: frames,
+      max_frame_bytes: max_frame_bytes(cfg.env_max_output_bytes),
+    ),
+    Some(
+      process.new_selector()
+      |> process.select_map(frames, Frame)
+      |> process.select_specific_monitor(monitor, fn(_) { AdapterGone }),
+    ),
   )
 }
 
@@ -347,32 +383,51 @@ pub fn start_adapter(
 
 fn loop_socket(
   state: SocketState,
-  message: mist.WebsocketMessage(String),
+  message: mist.WebsocketMessage(SocketMsg),
   connection: mist.WebsocketConnection,
-) -> mist.Next(SocketState, String) {
+) -> mist.Next(SocketState, SocketMsg) {
   case message {
     mist.Text(text) ->
-      case node_protocol.decode_client_frame(text) {
-        Ok(frame) -> {
-          process.send(state.adapter, FrameIn(frame))
-          mist.continue(state)
-        }
-        Error(_) -> {
-          // Undecodable inbound frame: tell the client, keep the
-          // socket (a TUI mid-upgrade or a probing client should not
-          // lose its connection over one bad frame).
+      case string.byte_size(text) > state.max_frame_bytes {
+        True -> {
+          // Over the receive bound: refuse and close (the external-
+          // transport cap rule enforced at the first nexus-side touch
+          // — see `max_frame_bytes`).
           let _ =
             mist.send_text_frame(
               connection,
-              node_protocol.encode_error("unrecognized frame"),
+              node_protocol.encode_error("frame exceeds the size bound"),
             )
-          mist.continue(state)
+          mist.stop()
         }
+        False ->
+          case node_protocol.decode_client_frame(text) {
+            Ok(frame) -> {
+              process.send(state.adapter, FrameIn(frame))
+              mist.continue(state)
+            }
+            Error(_) -> {
+              // Undecodable inbound frame: tell the client, keep the
+              // socket (a TUI mid-upgrade or a probing client should
+              // not lose their connection over one bad frame).
+              let _ =
+                mist.send_text_frame(
+                  connection,
+                  node_protocol.encode_error("unrecognized frame"),
+                )
+              mist.continue(state)
+            }
+          }
       }
-    mist.Custom(frame) -> {
+    mist.Custom(Frame(frame)) -> {
       let _ = mist.send_text_frame(connection, frame)
       mist.continue(state)
     }
+    // The adapter exited normally (an attach refusal's `actor.stop()`):
+    // the refusal frame was queued ahead of the DOWN, so it flushed —
+    // close now so the node's client reconnects into the post-race
+    // state instead of sitting on a dead socket.
+    mist.Custom(AdapterGone) -> mist.stop()
     // Binary frames have no v1 meaning; the error frame says so.
     mist.Binary(_) -> {
       let _ =

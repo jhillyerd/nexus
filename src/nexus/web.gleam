@@ -1378,7 +1378,18 @@ fn create_node_row(
           #("created_at", json.int(row.created_at)),
         ]),
       )
-    Error(_) -> json_response(502, err_json("store unavailable"))
+    // A concurrent pair of the same name can lose the pre-check race
+    // and hit the unique index here: re-check before calling it a
+    // store failure — the loser deserves the same friendly 409.
+    Error(_) ->
+      case store.list_nodes() {
+        Error(_) -> json_response(502, err_json("store unavailable"))
+        Ok(rows) ->
+          case list.find(rows, fn(r) { r.name == name }) {
+            Ok(_) -> json_response(409, err_json("node name is already paired"))
+            Error(_) -> json_response(502, err_json("store unavailable"))
+          }
+      }
   }
 }
 

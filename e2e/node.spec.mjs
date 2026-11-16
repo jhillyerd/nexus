@@ -319,12 +319,19 @@ class FakeNode {
     this.url = url;
     this.frames = [];
     this.waiters = [];
-    this.closed = null;
+    this.closed = new Promise(() => {}); // settled per-connect
     this.closeCode = null;
     this.ws = null;
   }
 
   connect() {
+    // `closed` settles exactly once on close OR error (an abrupt server
+    // death may never complete the close handshake). It starts as a
+    // pending promise — NOT null — so `Promise.race` against it below
+    // genuinely waits.
+    let settleClosed;
+    this.closed = new Promise((r) => (settleClosed = r));
+    this._settleClosed = settleClosed;
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(this.url);
       this.ws = ws;
@@ -342,16 +349,16 @@ class FakeNode {
       });
       ws.addEventListener("close", (ev) => {
         this.closeCode = ev.code;
-        this.closed = new Promise((r) => r(ev.code));
+        this._settleClosed(ev.code);
         resolve(null);
       });
       ws.addEventListener("error", () => {
         // An abrupt server death can end in error WITHOUT a close
         // handshake (the peer never answers the close frame): settle
         // `closed` here too — the connection is over either way.
-        if (this.closed === null) {
+        if (this.closeCode === null) {
           this.closeCode = -1;
-          this.closed = new Promise((r) => r(-1));
+          this._settleClosed(-1);
           resolve(null);
         }
       });
@@ -629,22 +636,16 @@ async function main() {
     const bad = new FakeNode(
       `ws://127.0.0.1:${PORT}/node/ws?node=node-a&token=wrong&thread=${envThread}`,
     );
-    let failed = false;
-    try {
-      const opened = await bad.connect();
-      if (opened === null) failed = true;
-      if (!failed && bad.frames.length) {
-        throw new Error(`frames arrived on a bad-token socket: ${bad.frames[0]}`);
-      }
-      failed = true;
-    } catch (err) {
-      if (/closed before any frame|unexpected server response/i.test(err.message)) {
-        failed = true;
-      } else {
-        throw err;
-      }
+    // Refusal surfaces as an abrupt close (undici reports the 401 as an
+    // unexpected server response) or a connect that settles null; a
+    // socket that actually OPENED is a failure, frames or not.
+    const opened = await bad.connect();
+    if (opened !== null) {
+      throw new Error("bad-token socket unexpectedly connected");
     }
-    if (!failed) throw new Error("bad-token socket unexpectedly connected");
+    if (bad.frames.length) {
+      throw new Error(`frames arrived on a bad-token socket: ${bad.frames[0]}`);
+    }
   });
 
   await check("env role refused on a plain thread (403)", async () => {
@@ -653,15 +654,12 @@ async function main() {
       model: "smart",
     });
     const bad = new FakeNode(nodeUrl(plain.body.id));
-    try {
-      const opened = await bad.connect();
-      if (opened !== null && bad.frames.length) {
-        throw new Error(`frames arrived: ${bad.frames[0]}`);
-      }
-    } catch (err) {
-      if (!/closed before any frame|unexpected server response/i.test(err.message)) {
-        throw err;
-      }
+    const opened = await bad.connect();
+    if (opened !== null) {
+      throw new Error("env-role socket unexpectedly connected to a plain thread");
+    }
+    if (bad.frames.length) {
+      throw new Error(`frames arrived on a refused socket: ${bad.frames[0]}`);
     }
   });
 

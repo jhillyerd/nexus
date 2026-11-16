@@ -1237,14 +1237,22 @@ fn record_summary(record: Record) -> thread.ThreadSummary {
 fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
   case msg {
     EnvCapable(id, reply) -> {
-      // Read from the record the registry already holds (the frozen
-      // `ThreadSpec.toolset` — resolved names at create/hydrate), never a
+      // Read from what the registry already holds, never a
       // re-resolution: the answer is as frozen as the envelope it
-      // guards. A dormant thread answers without waking (the record's
-      // spec predates the actor), an unknown id is simply False.
+      // guards. A LIVE record answers from its `ThreadSpec.toolset`
+      // (resolved names at create/hydrate); a DORMANT thread answers
+      // from its STORED summary's manifest (the persisted frozen
+      // toolset) WITHOUT waking the actor; an unknown id is False.
       let capable = case dict.get(state.threads, id) {
         Ok(record) -> list.any(record.spec.toolset.names, env.is_env_name)
-        Error(_) -> False
+        Error(_) ->
+          case dict.get(state.dormant, id) {
+            Ok(summary) ->
+              list.any(summary.toolset, fn(entry) {
+                env.is_env_name(entry.name)
+              })
+            Error(_) -> False
+          }
       }
       process.send(reply, capable)
       actor.continue(state)

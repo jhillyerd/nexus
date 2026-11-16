@@ -1266,6 +1266,9 @@ pub fn node_pairing_round_trip_test() {
   should.equal(del, 204)
   let #(del2, _) = send_authorized(req(port, Delete, "/nodes/" <> node_id, ""))
   should.equal(del2, 204)
+  // The row is really gone, not just 204'd: the list no longer names it.
+  let #(_, after_revoke) = send_authorized(req(port, Get, "/nodes", ""))
+  should.be_false(string.contains(after_revoke, "proxmox-2"))
 
   // The admin surface stays behind the UI token.
   let assert Ok(unauth) =

@@ -210,6 +210,41 @@ pub fn event_tool_round_test() {
   ))
 }
 
+/// The remaining event kinds, pinned exactly (the additive-only
+/// contract means a byte change here is a protocol change).
+pub fn event_remaining_kinds_exact_test() {
+  node_protocol.event_frame(event("t1", thread.AssistantFull("done", Some(5))))
+  |> should.equal(Ok(
+    "{\"v\":1,\"type\":\"assistant\",\"text\":\"done\",\"at\":5}",
+  ))
+  node_protocol.event_frame(event("t1", thread.ReasoningFull("why")))
+  |> should.equal(Ok("{\"v\":1,\"type\":\"reasoning_full\",\"text\":\"why\"}"))
+  node_protocol.event_frame(event("t1", thread.Token("x ")))
+  |> should.equal(Ok("{\"v\":1,\"type\":\"token\",\"text\":\"x \"}"))
+  node_protocol.event_frame(event("t1", thread.Reasoning("hm")))
+  |> should.equal(Ok("{\"v\":1,\"type\":\"reasoning\",\"text\":\"hm\"}"))
+  node_protocol.event_frame(event("t1", thread.TurnStopped(9, Some(4))))
+  |> should.equal(Ok("{\"v\":1,\"type\":\"turn_stopped\",\"chars\":9,\"at\":4}"))
+  node_protocol.event_frame(event(
+    "t1",
+    thread.ToolCallDelta(0, Some("c1"), Some("bash"), "{\"tar"),
+  ))
+  |> should.equal(Ok(
+    "{\"v\":1,\"type\":\"tool_call_delta\",\"index\":0,\"id\":\"c1\",\"name\":\"bash\",\"fragment\":\"{\\\"tar\"}",
+  ))
+  node_protocol.event_frame(event("t1", thread.LoopStatus(2, 8, "tools")))
+  |> should.equal(Ok(
+    "{\"v\":1,\"type\":\"loop_status\",\"iteration\":2,\"max\":8,\"phase\":\"tools\"}",
+  ))
+  node_protocol.event_frame(event(
+    "t1",
+    thread.MetaUpdated(Some("new title"), ["a", "b"]),
+  ))
+  |> should.equal(Ok(
+    "{\"v\":1,\"type\":\"meta\",\"title\":\"new title\",\"tags\":[\"a\",\"b\"]}",
+  ))
+}
+
 pub fn event_turn_lifecycle_test() {
   let stats =
     openai.StreamStats(
@@ -223,15 +258,16 @@ pub fn event_turn_lifecycle_test() {
       saw_done: True,
       usage: None,
     )
-  let assert Ok(done) =
-    node_protocol.event_frame(event("t1", thread.TurnDone(stats, Some(77))))
-  should.be_true(string.contains(done, "\"type\":\"turn_done\""))
-  should.be_true(string.contains(done, "\"ttft_ms\":42"))
-  should.be_true(string.contains(done, "\"duration_ms\":1000"))
-  let assert Ok(failed) =
-    node_protocol.event_frame(event("t1", thread.TurnFailed("boom", None)))
-  should.be_true(string.contains(failed, "\"type\":\"turn_failed\""))
-  should.be_true(string.contains(failed, "\"reason\":\"boom\""))
+  node_protocol.event_frame(event("t1", thread.TurnDone(stats, Some(77))))
+  |> should.equal(Ok(
+    "{\"v\":1,\"type\":\"turn_done\",\"at\":77,\"stats\":{\"ttft_ms\":42,"
+    <> "\"duration_ms\":1000,\"token_deltas\":3,\"reasoning_deltas\":0,"
+    <> "\"tool_call_deltas\":2}}",
+  ))
+  node_protocol.event_frame(event("t1", thread.TurnFailed("boom", None)))
+  |> should.equal(Ok(
+    "{\"v\":1,\"type\":\"turn_failed\",\"reason\":\"boom\",\"at\":null}",
+  ))
 }
 
 // ---------------------------------------------------------------------------

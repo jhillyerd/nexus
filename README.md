@@ -201,8 +201,9 @@ request bodies.
 
 ### Routes
 
-All routes except `GET /healthz` require the configured token when
-`NEXUS_UI_TOKEN` is set.
+All routes except `GET /healthz` and `GET /node/ws` require the
+configured UI token when `NEXUS_UI_TOKEN` is set; `/node/ws` carries its
+own NODE-token auth against the `node` table instead.
 
 - `GET /` — authenticated chat page (Lustre server-component shell)
 - `GET /ws` — the server component's WebSocket transport
@@ -297,7 +298,8 @@ All routes except `GET /healthz` require the configured token when
   JSON client protocol (`"v":1`) serves an event plane (the thread's
   fan-out projected as frames), an MCP-shaped tool plane (`tools/call`
   down with the arguments verbatim, results up, `notifications/
-  cancelled` down), and user input (`{"type":"send","text":…}`).
+  cancelled` down), and user input (`{"v":1,"type":"send","text":…}` — every frame
+carries `"v":1`).
   `role=env` (default) attaches the node's machine as an environment
   target — refused (403) on threads whose toolset has no env tools;
   `role=viewer` joins any thread with events and send but no tool

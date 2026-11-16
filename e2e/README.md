@@ -122,7 +122,8 @@ The environments plan's remote-node proof (2b-4): a headless fake node
 the `/node/ws` client protocol v1 against a real nexus with its own fake
 OpenAI SSE provider scripting env-tool turns. Same preconditions as the
 browser suite (Postgres on 5433; the suite truncates and seeds itself)
-plus nothing else — no browser download, ~1 minute, loopback only:
+plus Node ≥ 22 (the suite uses the global `WebSocket`, which Node 20
+lacks) — no browser download, ~1 minute, loopback only:
 
 ```sh
 node e2e/node.spec.mjs
