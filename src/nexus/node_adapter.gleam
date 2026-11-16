@@ -595,14 +595,11 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
     }
     ThreadGone -> {
       // The thread actor died; the registry's replacement does not know
-      // this adapter. Say why, then stop — the socket closes and the
-      // node reconnects into the restarted thread.
-      send_frame(
-        state,
-        node_protocol.encode_error(
-          "thread actor exited — reconnecting required",
-        ),
-      )
+      // this adapter. Say why, then stop. The wording is deliberately
+      // neutral: the exit may be a restart (reconnecting lands on the
+      // replacement) OR a thread deletion (reconnecting will 404) —
+      // the node decides from its own retry policy.
+      send_frame(state, node_protocol.encode_error("thread actor exited"))
       actor.stop()
     }
     AttachAccepted(Error(reason)) -> {

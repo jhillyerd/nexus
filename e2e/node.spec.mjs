@@ -156,7 +156,7 @@ function startFakeProvider() {
         if (scenario === "nodebash" && !toolDone) {
           // Round 1: call bash on the attached node, echoing the user's
           // marker so the node can assert the arguments it receives.
-          // The argument JSON is deliberately NONCANONIMAL (reversed
+          // The argument JSON is deliberately NONCANONICAL (reversed
           // key order, odd spacing) so the e2e can prove the arguments
           // ride VERBATIM — a canonicalizing encoder would reorder them.
           const marker = /marker:(\S+)/.exec(userText)?.[1] ?? "plain";
