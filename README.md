@@ -395,7 +395,19 @@ by executing the four env tools LOCALLY, in its own workspace
 directory, through the same code the server runs for its own workspace
 (kill-tree, byte caps while reading, path confinement included).
 
-Pair a node, then run the TUI against one env-toolset thread:
+Pair a node and launch the TUI against one env-toolset thread with the
+bundled launcher — it derives the node name from the machine's
+hostname, replaces any stale row under that name, pairs fresh (the
+minted token lives only in the launcher's memory), and execs the TUI:
+
+```sh
+NEXUS_URL=http://127.0.0.1:8080 \
+NEXUS_UI_TOKEN="$NEXUS_UI_TOKEN" \
+NEXUS_THREAD='<thread id>' \
+bin/nexus-tui
+```
+
+Manually, the same dance is:
 
 ```sh
 token=$(curl -s -X POST -H "Authorization: Bearer $NEXUS_UI_TOKEN" \
