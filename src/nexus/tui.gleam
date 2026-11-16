@@ -42,6 +42,7 @@ import gleam/http/request
 import gleam/int
 import gleam/io
 import gleam/option.{None}
+import gleam/otp/actor
 import gleam/result
 import gleam/string
 import nexus/env
@@ -249,8 +250,25 @@ fn run(config: Config) -> Nil {
         })
         |> stratus.start
       {
-        Error(_) -> {
-          io.println("! nexus-tui: cannot connect to " <> config.base_url)
+        Error(start_error) -> {
+          // stratus maps handshake failures to a one-line reason that
+          // carries the status ("WebSocket handshake failed with
+          // status 401"): the body would name the failure exactly
+          // ("unknown node or bad token" vs "node auth required" vs
+          // 403's "thread has no workspace toolset"), but stratus does
+          // not expose it — the status still separates a token/name
+          // mismatch from a wrong path or a chat-only thread.
+          let detail = case start_error {
+            actor.InitFailed(message) -> message
+            actor.InitTimeout -> "handshake timed out"
+            actor.InitExited(_) -> "connection exited during handshake"
+          }
+          io.println(
+            "! nexus-tui: cannot connect to "
+            <> config.base_url
+            <> " — "
+            <> detail,
+          )
           halt(2)
         }
         Ok(started) -> {
