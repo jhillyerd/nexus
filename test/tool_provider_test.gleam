@@ -559,7 +559,10 @@ pub fn run_remote_cancel_re_signals_and_notifies_provider_test() {
   process.send(cancel, Nil)
   let assert Ok(RunReport(Error("cancelled"), True)) =
     process.receive(report, 2000)
-  let assert Ok(CallParts(ref, _)) = process.receive(calls, 0)
+  // Bounded wait (cubic review): the fake actor's CallParts delivery is
+  // not ordered with the runner's report — a zero-timeout receive here
+  // is a latent flake.
+  let assert Ok(CallParts(ref, _)) = process.receive(calls, 2000)
   let assert Ok(cancelled_ref) = process.receive(cancels, 2000)
   should.equal(cancelled_ref, ref)
 }

@@ -307,6 +307,13 @@ pub fn run(
 /// (never a badarg), so liveness is the monitor's business alone: an
 /// owner that died between the `is_alive` check and the dispatch
 /// answers through the immediate `noproc` DOWN, not a burned deadline.
+///
+/// Byte-cap posture (cubic review): the post-receipt truncation here
+/// is DISPLAY HYGIENE ONLY — an in-process reply is trusted code, the
+/// same posture as compiled plugins (`truncate`'s rule). NODE bytes
+/// are external provider content: the 2b-3 node adapter's TRANSPORT
+/// READ must cap while accumulating (the plugin-api external-transport
+/// rule), so no unbounded node result ever crosses into this seam.
 pub fn run_remote(
   provider provider: Subject(Msg),
   owner owner: process.Pid,

@@ -2669,7 +2669,7 @@ fn env_toolset(
 ) -> thread.Toolset {
   let base = toolset.runner
   let router: env.RemoteRouter = fn(target, tool, arguments, cancel) {
-    case route_env_ask(registry, thread_id, target) {
+    case route_env_ask(registry, thread_id, target, cancel) {
       Ok(exec) ->
         tool_provider.run_remote(
           provider: exec.sub,
@@ -2705,21 +2705,42 @@ fn env_toolset(
 
 /// The `RouteEnv` ask, built for the turn worker (environments plan
 /// Phase 2b-2): a worker-OWNED reply subject with a manual send +
-/// bounded receive — the `deliver_ask` pattern verbatim (`process.receive`
-/// is only legal on a subject the calling process created, and this
-/// closure only ever runs inside the per-turn worker). A slow or dead
-/// registry is a retryable tool error, never an `actor.call` panic.
+/// bounded select — the `deliver_ask` ask shape (`process.receive` is
+/// only legal on a subject the calling process created, and this
+/// closure only ever runs inside the per-turn worker) — with one
+/// hardening over it (cubic review): the select also races the TURN'S
+/// CANCEL subject, so a Stop while the ask is stalled answers
+/// "cancelled" at once instead of burning the fixed 5s budget before
+/// the tool deadline even starts. On the cancel path the one-shot Nil
+/// is RE-SIGNALLED (the codemode rule: an interruptible executor must
+/// put it back for the loop's LAST-call path). A slow or dead registry
+/// is a retryable tool error, never an `actor.call` panic.
 fn route_env_ask(
   registry: Subject(Msg),
   thread_id: String,
   target: String,
+  cancel: Subject(Nil),
 ) -> Result(thread.EnvExec, String) {
   let reply = process.new_subject()
   process.send(registry, RouteEnv(thread_id, target, reply))
-  case process.receive(reply, route_env_forward_timeout_ms) {
-    Ok(outcome) -> outcome
+  let selector =
+    process.new_selector()
+    |> process.select_map(reply, RouteReply)
+    |> process.select_map(cancel, fn(_) { RouteCancelled })
+  case process.selector_receive(selector, route_env_forward_timeout_ms) {
+    Ok(RouteReply(outcome)) -> outcome
+    Ok(RouteCancelled) -> {
+      process.send(cancel, Nil)
+      Error("cancelled")
+    }
     Error(Nil) -> Error("environment routing ask timed out")
   }
+}
+
+/// The routing ask's select messages (see `route_env_ask`).
+type RouteAskMsg {
+  RouteReply(Result(thread.EnvExec, String))
+  RouteCancelled
 }
 
 /// Wrap a toolset bundle's turn fn with THIS thread's delivery identity

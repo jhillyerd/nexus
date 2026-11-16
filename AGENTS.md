@@ -216,8 +216,8 @@ deltas; the rules that bite silently:
   attached list — self-healing and tail-addressable for small-context
   models; the UI renders it as a muted status line (`.turn.status`),
   not a bubble. It never triggers a turn; hydration re-derives the
-  roster from the newest persisted roster row (2b-1), never re-seeds
-  the constant.
+  roster from the newest persisted roster row (2b-1) — legacy env rows
+  without that prefix fall back to the `["workspace"]` seed.
 - **`bash` exec runs in the per-turn worker** (the codemode pattern):
   the executor selects over {port data, cancel, deadline}; cancel
   RE-SIGNALS the one-shot subject (the codemode rule) — and the
