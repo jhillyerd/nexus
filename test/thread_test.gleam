@@ -2500,3 +2500,41 @@ pub fn node_death_mid_turn_queues_lines_after_worker_done_test() {
     "target \"node-a\" is not attached. attached targets: workspace",
   ) = route_env(sess, "node-a")
 }
+
+pub fn route_env_names_pending_targets_mid_turn_test() {
+  // The routing ask's error names the EFFECTIVE roster (live + queued),
+  // not the turn-frozen one: mid-turn, an attach's execution registers
+  // immediately, so its name belongs in the honest list a typo'd or
+  // hallucinated call reads (CodeRabbit review).
+  let gate_request = process.new_subject()
+  let sess = start_with_env(gated_runner(gate_request))
+  let sub = join(sess)
+  let _ = expect_event(sub)
+
+  should.equal(thread.send_message(sess, "research it"), thread.Sent)
+  expect_user_echo(sub, "research it")
+
+  // Mid-turn roster-only attach of node-a: accepted (queued), no tail
+  // line yet — but the effective roster the ask names already has it.
+  let reply = process.new_subject()
+  process.send(sess, thread.AttachTarget("node-a", None, reply))
+  let assert Ok(Ok(Nil)) = process.receive(reply, 2000)
+  let assert Error(
+    "target \"typo\" is not attached. attached targets: workspace, node-a",
+  ) = route_env(sess, "typo")
+
+  // Release the worker; the queued line lands (the roster catches up to
+  // what the ask already reported).
+  let assert Ok(gate) = process.receive(gate_request, 5000)
+  process.send(gate, Nil)
+  drain_until_turn_done(sub)
+  let assert thread.ThreadEvent(
+    _,
+    _,
+    thread.UserEcho(
+      "attached targets: workspace, node-a.",
+      Some(_),
+      Some("system"),
+    ),
+  ) = expect_event(sub)
+}

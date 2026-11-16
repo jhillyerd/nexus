@@ -1776,13 +1776,17 @@ fn drop_exec(state: State, name: String) -> State {
 /// Resolve a non-workspace target for the per-turn worker's routing
 /// ask: `Ok` when a live execution entry exists, else the honest
 /// three-shape error (attached but its node is not connected /
-/// not attached, naming the live roster). Pure lookup — the reply
-/// never blocks on a call in flight.
+/// not attached, naming the EFFECTIVE roster — live plus the queued
+/// changes the pending queue makes imminent, so a mid-turn attach's
+/// already-routable name is listed and a mid-turn detach's stopped
+/// target is not, CodeRabbit review). Pure lookup — the reply never
+/// blocks on a call in flight.
 fn route_env(state: State, target: String) -> Result(EnvExec, String) {
+  let roster = preview_roster(state)
   case dict.get(state.env_execs, target) {
     Ok(entry) -> Ok(entry.exec)
     Error(_) ->
-      case list.contains(state.roster, target) {
+      case list.contains(roster, target) {
         True ->
           Error(
             "target \""
@@ -1794,10 +1798,25 @@ fn route_env(state: State, target: String) -> Result(EnvExec, String) {
             "target \""
             <> target
             <> "\" is not attached. attached targets: "
-            <> string.join(state.roster, ", "),
+            <> string.join(roster, ", "),
           )
       }
   }
+}
+
+/// The roster the PENDING queue makes effective: the live list plus
+/// the queued changes folded in arrival order (each already validated
+/// at enqueue against this same fold, so it succeeds; an impossible
+/// `Error` keeps the last good list). The VALIDATION baseline of
+/// `accept_roster_change` and the WORDING baseline of `route_env` —
+/// the effective list, not the turn-frozen one.
+fn preview_roster(state: State) -> List(String) {
+  list.fold(state.pending_roster, state.roster, fn(acc, queued) {
+    case compute_roster(acc, queued) {
+      Ok(next) -> next
+      Error(_) -> acc
+    }
+  })
 }
 
 /// Accept ONE roster change: validate against the CURRENT roster (or,
@@ -1817,13 +1836,7 @@ fn accept_roster_change(
   // already-queued changes apply first (the live roster is frozen for
   // the turn's duration), so validation sees the SAME list the drain
   // will — no duplicate attach or double detach can squeeze through.
-  let preview =
-    list.fold(state.pending_roster, state.roster, fn(acc, queued) {
-      case compute_roster(acc, queued) {
-        Ok(next) -> next
-        Error(_) -> acc
-      }
-    })
+  let preview = preview_roster(state)
   case compute_roster(preview, change) {
     Error(reason) -> #(state, Error(reason))
     Ok(new_roster) -> {
