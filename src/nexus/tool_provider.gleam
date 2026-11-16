@@ -295,6 +295,46 @@ pub fn run(
   }
 }
 
+/// The adapter executor against an EXPLICIT `(subject, pid)` pair —
+/// the environments plan's node execution path (Phase 2b-2). Identical
+/// contract to `run` — monitor armed before the dispatch, the cancel
+/// re-signal, the per-call deadline, central truncation — but the
+/// provider is addressed by the CAPTURED SUBJECT the thread actor's
+/// execution map handed out, not a registered name: a node adapter is
+/// per-thread-per-connection (two threads can host same-named nodes),
+/// so a global name would collide — the map is the registry. A
+/// captured-subject send is a plain message send to the owner's pid
+/// (never a badarg), so liveness is the monitor's business alone: an
+/// owner that died between the `is_alive` check and the dispatch
+/// answers through the immediate `noproc` DOWN, not a burned deadline.
+///
+/// Byte-cap posture (cubic review): the post-receipt truncation here
+/// is DISPLAY HYGIENE ONLY — an in-process reply is trusted code, the
+/// same posture as compiled plugins (`truncate`'s rule). NODE bytes
+/// are external provider content: the 2b-3 node adapter's TRANSPORT
+/// READ must cap while accumulating (the plugin-api external-transport
+/// rule), so no unbounded node result ever crosses into this seam.
+pub fn run_remote(
+  provider provider: Subject(Msg),
+  owner owner: process.Pid,
+  tool tool: String,
+  timeout_ms timeout_ms: Int,
+  max_output_chars max_output_chars: Int,
+  cancel cancel: Subject(Nil),
+  arguments arguments: String,
+) -> Result(String, String) {
+  case process.is_alive(owner) {
+    False -> Error("tool provider is unavailable")
+    True -> {
+      let reply = process.new_subject()
+      let ref = reference.new()
+      let mon = process.monitor(owner)
+      process.send(provider, Call(ref, tool, arguments, reply))
+      select(provider, ref, mon, reply, cancel, timeout_ms, max_output_chars)
+    }
+  }
+}
+
 fn select(
   subject: Subject(Msg),
   ref: Reference,

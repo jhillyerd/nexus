@@ -78,8 +78,75 @@ import simplifile
 /// roster (that is 2b's open seam: threading a live source through
 /// `ToolCtx`). `route` therefore fails fast on every non-`workspace`
 /// target, naming the snapshot's list in the error.
+/// The remote dispatch seam (environments plan Phase 2b-2): one call
+/// of an env tool against a NON-workspace target, executed by the
+/// attached node. Receives the target name, the UNQUALIFIED tool name
+/// ("bash", "read_file", …), the tool's RAW argument JSON, and the
+/// turn's cancel subject; answers with the tool result — `Ok`/`Error`
+/// exactly like a local execution (an `Error` is a failed tool result,
+/// never a loop error). Built by the registry's `env_toolset` wrapper
+/// (the bots-plan `Delivery` pattern): it asks the REGISTRY for the
+/// target's execution plane and runs the provider-protocol adapter
+/// executor against it, all inside the per-turn worker. Structural on
+/// purpose — the handle stays a plain value this leaf module can
+/// define without importing the seam that produces it.
+pub type RemoteRouter =
+  fn(String, String, String, Subject(Nil)) -> Result(String, String)
+
+/// The per-thread environment handle carried by `tools.ToolCtx`
+/// (injected by the registry's per-thread runner wrapper — the same
+/// injection point as the bots-plan `Delivery` identity). Carries the
+/// FROZEN resolved workspace root (persisted at creation, so a later
+/// config change can never re-aim an existing thread's files), the
+/// thread id (the per-thread directory derives from it), the ROSTER
+/// seed snapshot, and — Phase 2b-2 — the `remote` router closure every
+/// non-`workspace` target dispatches through.
+///
+/// `roster` remains the SEED snapshot (`["workspace"]` at
+/// create/hydrate): live routing consults the thread actor through the
+/// `remote` ask, never this list — it stays for `route`'s local
+/// fail-fast text and as a value the offline tests can build by hand.
 pub type Environment {
-  Environment(workspace_root: String, thread_id: String, roster: List(String))
+  Environment(
+    workspace_root: String,
+    thread_id: String,
+    roster: List(String),
+    remote: Option(RemoteRouter),
+  )
+}
+
+/// The executor fork every env tool takes after parsing its arguments
+/// (Phase 2b-2): `None` means `workspace` — the LOCAL Phase 1 path in
+/// this thread's own workspace continues; `Some(result)` is the call's
+/// FINAL result, dispatched WHOLE (tool name + raw arguments) to the
+/// attached node through the handle's router — the node executes the
+/// same four tools in ITS workspace, which is why the byte-identical
+/// wire schema makes this routing, never envelope mutation. A handle
+/// with no router wired (a hand-built test value; production wraps
+/// always wire one) fails fast with the honest not-routable wording,
+/// not a "not attached" lie about a name the live roster may carry.
+fn remote_result(
+  environment: Option(Environment),
+  target: String,
+  tool: String,
+  arguments: String,
+  cancel: Subject(Nil),
+) -> Option(Result(String, String)) {
+  case target {
+    "workspace" -> None
+    _ ->
+      case environment {
+        None -> Some(Error("this thread has no environment attached"))
+        Some(env) ->
+          case env.remote {
+            Some(router) -> Some(router(target, tool, arguments, cancel))
+            // No router wired (a hand-built test value; production
+            // wraps always wire one): fall through to the LOCAL path —
+            // `route` answers with the honest roster-naming error.
+            None -> None
+          }
+      }
+  }
 }
 
 /// The complete v1 attached-target list, in stable order. `workspace`
@@ -332,8 +399,8 @@ pub fn route(
               Error(
                 "target \""
                 <> target
-                <> "\" is attached but not routable yet (execution for"
-                <> " remote nodes arrives in Phase 2b)",
+                <> "\" is attached but not routable (its node is not"
+                <> " connected)",
               )
             False ->
               Error(
@@ -453,6 +520,23 @@ pub fn bash(
   arguments arguments: String,
 ) -> Result(String, String) {
   use args <- result.try(parse_bash_args(arguments))
+  case remote_result(environment, args.target, "bash", arguments, cancel) {
+    Some(result) -> result
+    None ->
+      bash_workspace(timeout_ms, max_output_bytes, environment, cancel, args)
+  }
+}
+
+/// The local `workspace` path (Phase 1): everything after the routing
+/// fork in `bash` — the route/ensure pair, the kill-tree wrapper, and
+/// the port select loop.
+fn bash_workspace(
+  timeout_ms: Int,
+  max_output_bytes: Int,
+  environment: Option(Environment),
+  cancel: Subject(Nil),
+  args: BashArgs,
+) -> Result(String, String) {
   use env <- result.try(route(environment, args.target))
   use _ <- result.try(ensure_workspace(env))
   use bash_path <- result.try(case ffi_resolve("bash") {
@@ -944,12 +1028,26 @@ fn parse_bash_args(arguments: String) -> Result(BashArgs, String) {
 pub fn read_file(
   max_output_bytes max_output_bytes: Int,
   environment environment: Option(Environment),
+  cancel cancel: Subject(Nil),
   arguments arguments: String,
 ) -> Result(String, String) {
   use args <- result.try(parse_path_args(arguments, "read_file"))
-  use env <- result.try(route(environment, args.target))
-  use _ <- result.try(ensure_workspace(env))
-  use path <- result.try(confined(env, args.path))
+  case remote_result(environment, args.target, "read_file", arguments, cancel) {
+    Some(result) -> result
+    None -> {
+      use env <- result.try(route(environment, args.target))
+      use _ <- result.try(ensure_workspace(env))
+      use path <- result.try(confined(env, args.path))
+      read_file_local(max_output_bytes, args, path)
+    }
+  }
+}
+
+fn read_file_local(
+  max_output_bytes: Int,
+  args: PathArgs,
+  path: String,
+) -> Result(String, String) {
   case regular_file(path) {
     // REGULAR FILES ONLY (cubic PR review): a workspace FIFO or device
     // node would block the turn worker's open/read indefinitely —
@@ -980,12 +1078,24 @@ pub fn read_file(
 /// directories as needed.
 pub fn write_file(
   environment environment: Option(Environment),
+  cancel cancel: Subject(Nil),
   arguments arguments: String,
 ) -> Result(String, String) {
   use args <- result.try(parse_write_args(arguments))
-  use env <- result.try(route(environment, args.target))
-  use _ <- result.try(ensure_workspace(env))
-  use path <- result.try(confined(env, args.path))
+  case
+    remote_result(environment, args.target, "write_file", arguments, cancel)
+  {
+    Some(result) -> result
+    None -> {
+      use env <- result.try(route(environment, args.target))
+      use _ <- result.try(ensure_workspace(env))
+      use path <- result.try(confined(env, args.path))
+      write_file_local(args, path)
+    }
+  }
+}
+
+fn write_file_local(args: WriteArgs, path: String) -> Result(String, String) {
   // An EXISTING non-regular target (a FIFO `bash` made) would block
   // the write until a reader arrives — refuse it; a not-yet-existing
   // path is a regular file to be created (cubic PR review). The
@@ -1016,12 +1126,22 @@ const list_dir_entry_cap = 500
 /// '/', capped at `list_dir_entry_cap` entries with an omission note.
 pub fn list_dir(
   environment environment: Option(Environment),
+  cancel cancel: Subject(Nil),
   arguments arguments: String,
 ) -> Result(String, String) {
   use args <- result.try(parse_path_args(arguments, "list_dir"))
-  use env <- result.try(route(environment, args.target))
-  use _ <- result.try(ensure_workspace(env))
-  use path <- result.try(confined(env, args.path))
+  case remote_result(environment, args.target, "list_dir", arguments, cancel) {
+    Some(result) -> result
+    None -> {
+      use env <- result.try(route(environment, args.target))
+      use _ <- result.try(ensure_workspace(env))
+      use path <- result.try(confined(env, args.path))
+      list_dir_local(args, path)
+    }
+  }
+}
+
+fn list_dir_local(args: PathArgs, path: String) -> Result(String, String) {
   case simplifile.is_directory(path) {
     Ok(False) -> Error("list_dir: not a directory: " <> args.path)
     _ ->

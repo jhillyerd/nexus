@@ -12,6 +12,7 @@ import nexus/loop
 import nexus/openai
 import nexus/thread
 import nexus/timing
+import nexus/tool_provider
 import nexus/tools
 import nexus/transcript
 import nexus/utility
@@ -2102,7 +2103,7 @@ fn attach(
   name: String,
 ) -> Result(Nil, String) {
   let reply = process.new_subject()
-  process.send(sess, thread.AttachTarget(name, reply))
+  process.send(sess, thread.AttachTarget(name, None, reply))
   let result = process.receive(reply, 2000)
   // The tail line fans out immediately (idle path): a system-author
   // UserEcho naming the CURRENT full list.
@@ -2140,13 +2141,13 @@ pub fn attach_refuses_reserved_and_duplicate_test() {
 
   // `workspace` is reserved and refused.
   let reply = process.new_subject()
-  process.send(sess, thread.AttachTarget("workspace", reply))
+  process.send(sess, thread.AttachTarget("workspace", None, reply))
   let assert Ok(Error("target name 'workspace' is reserved")) =
     process.receive(reply, 2000)
   // A duplicate live attach is refused.
   let assert Ok(Nil) = attach(sess, sub, "node-1")
   let reply2 = process.new_subject()
-  process.send(sess, thread.AttachTarget("node-1", reply2))
+  process.send(sess, thread.AttachTarget("node-1", None, reply2))
   let assert Ok(Error(reason)) = process.receive(reply2, 2000)
   reason |> should.equal("target \"node-1\" is already attached")
   // Detaching a non-attached name refuses.
@@ -2161,7 +2162,7 @@ pub fn attach_refuses_bad_charset_test() {
   let sub = join(sess)
   expect_event(sub) |> should.equal(scoped(thread.Hello("test-alias", 1, [])))
   let reply = process.new_subject()
-  process.send(sess, thread.AttachTarget("bad name", reply))
+  process.send(sess, thread.AttachTarget("bad name", None, reply))
   let assert Ok(Error(reason)) = process.receive(reply, 2000)
   should.be_true(string.contains(reason, "must match ^[a-zA-Z0-9_-]+$"))
 }
@@ -2186,7 +2187,7 @@ pub fn attach_mid_turn_queues_until_worker_done_test() {
   // Attach while the turn is in flight: accepted (queued), NO UserEcho
   // emitted yet.
   let reply = process.new_subject()
-  process.send(sess, thread.AttachTarget("proxmox-2", reply))
+  process.send(sess, thread.AttachTarget("proxmox-2", None, reply))
   let assert Ok(Ok(Nil)) = process.receive(reply, 2000)
   let snapshot = thread.snapshot(sess)
   // The committed transcript is STILL just system + user (the attach has
@@ -2225,12 +2226,12 @@ pub fn queued_roster_preview_fold_test() {
 
   // Queue an attach of "proxmox-2".
   let r1 = process.new_subject()
-  process.send(sess, thread.AttachTarget("proxmox-2", r1))
+  process.send(sess, thread.AttachTarget("proxmox-2", None, r1))
   let assert Ok(Ok(Nil)) = process.receive(r1, 2000)
   // A SECOND attach of the same name, still queued, refuses against the
   // preview (the live roster has not changed mid-turn).
   let r2 = process.new_subject()
-  process.send(sess, thread.AttachTarget("proxmox-2", r2))
+  process.send(sess, thread.AttachTarget("proxmox-2", None, r2))
   let assert Ok(Error("target \"proxmox-2\" is already attached")) =
     process.receive(r2, 2000)
   // A detach of the still-queued name is accepted — the preview lists it
@@ -2279,7 +2280,7 @@ pub fn queued_roster_drains_on_worker_down_test() {
 
   // Queue an attach while the worker parks mid-turn.
   let reply = process.new_subject()
-  process.send(sess, thread.AttachTarget("proxmox-2", reply))
+  process.send(sess, thread.AttachTarget("proxmox-2", None, reply))
   let assert Ok(Ok(Nil)) = process.receive(reply, 2000)
 
   // Release the gate: the worker kills itself → WorkerDown → TurnFailed,
@@ -2295,4 +2296,245 @@ pub fn queued_roster_drains_on_worker_down_test() {
     thread.UserEcho(text, Some(_), Some("system")),
   ) = expect_event(sub)
   should.equal(text, "attached targets: workspace, proxmox-2.")
+}
+
+// ---------------------------------------------------------------------------
+// Environment execution map (environments plan Phase 2b-2)
+// ---------------------------------------------------------------------------
+
+/// A parked fake NODE: it OWNS its subject (calls land in its mailbox
+/// and park forever), reports the plane back through a handshake
+/// subject, and lives until the test kills it — exactly the
+/// registration shape the 2b-3 node adapter will present.
+fn start_parked_node() -> #(process.Subject(tool_provider.Msg), process.Pid) {
+  let back = process.new_subject()
+  let pid =
+    process.spawn_unlinked(fn() {
+      let own = process.new_subject()
+      process.send(back, own)
+      process.sleep_forever()
+    })
+  let assert Ok(own) = process.receive(back, 2000)
+  #(own, pid)
+}
+
+fn route_env(
+  sess: process.Subject(thread.Msg),
+  target: String,
+) -> Result(thread.EnvExec, String) {
+  actor.call(sess, 2000, fn(reply) { thread.RouteEnv(target, reply) })
+}
+
+/// Wait (bounded) until the ask stops resolving — the DOWN signal is
+/// asynchronous, so the actor may answer one more Ok before it
+/// processes the death.
+fn await_route_gone(
+  sess: process.Subject(thread.Msg),
+  target: String,
+  tries: Int,
+) -> Nil {
+  case route_env(sess, target) {
+    Error(_) -> Nil
+    Ok(_) ->
+      case tries > 0 {
+        True -> {
+          process.sleep(20)
+          await_route_gone(sess, target, tries - 1)
+        }
+        False ->
+          panic as { "target still routable after the node died: " <> target }
+      }
+  }
+}
+
+fn attach_with_exec(
+  sess: process.Subject(thread.Msg),
+  sub: process.Subject(thread.ThreadEvent),
+  name: String,
+  plane: #(process.Subject(tool_provider.Msg), process.Pid),
+) -> Result(Nil, String) {
+  let reply = process.new_subject()
+  process.send(
+    sess,
+    thread.AttachTarget(name, Some(thread.EnvExec(plane.0, plane.1)), reply),
+  )
+  let result = process.receive(reply, 2000)
+  let assert thread.ThreadEvent(
+    _sid,
+    _v,
+    thread.UserEcho(text, Some(_stamp), Some("system")),
+  ) = expect_event(sub)
+  let assert Ok(r) = result
+  should.be_true(string.starts_with(text, "attached targets: "))
+  r
+}
+
+pub fn attach_with_exec_registers_routable_plane_test() {
+  let sess = start_with_env(happy_runner)
+  let sub = join(sess)
+  let _ = expect_event(sub)
+  let plane = start_parked_node()
+
+  // Attach with the execution plane: roster line lands AND the routing
+  // ask resolves the very same (subject, pid) pair.
+  let assert Ok(Nil) = attach_with_exec(sess, sub, "node-a", plane)
+  let assert Ok(thread.EnvExec(got_sub, got_pid)) = route_env(sess, "node-a")
+  should.equal(got_sub, plane.0)
+  should.equal(got_pid, plane.1)
+
+  // Detach drops the plane immediately: routing errors honestly and
+  // the roster line names the shrunken list.
+  let reply = process.new_subject()
+  process.send(sess, thread.DetachTarget("node-a", reply))
+  let assert Ok(Ok(Nil)) = process.receive(reply, 2000)
+  let assert thread.ThreadEvent(
+    _,
+    _,
+    thread.UserEcho("attached targets: workspace.", Some(_), Some("system")),
+  ) = expect_event(sub)
+  let assert Error(
+    "target \"node-a\" is not attached. attached targets: workspace",
+  ) = route_env(sess, "node-a")
+
+  process.kill(plane.1)
+}
+
+pub fn route_env_error_wording_test() {
+  let sess = start_with_env(happy_runner)
+  let sub = join(sess)
+  let _ = expect_event(sub)
+
+  // Not attached at all: the full live roster repeats.
+  let assert Error(
+    "target \"ghost\" is not attached. attached targets: workspace",
+  ) = route_env(sess, "ghost")
+
+  // Attached by NAME only (no execution plane — a roster-only attach):
+  // the error must not lie that it is absent.
+  let reply = process.new_subject()
+  process.send(sess, thread.AttachTarget("bare", None, reply))
+  let assert Ok(Ok(Nil)) = process.receive(reply, 2000)
+  let assert thread.ThreadEvent(
+    _,
+    _,
+    thread.UserEcho(
+      "attached targets: workspace, bare.",
+      Some(_),
+      Some("system"),
+    ),
+  ) = expect_event(sub)
+  let assert Error(
+    "target \"bare\" is attached but not routable (its node is not connected)",
+  ) = route_env(sess, "bare")
+}
+
+pub fn node_death_detaches_roster_and_map_test() {
+  let sess = start_with_env(happy_runner)
+  let sub = join(sess)
+  let _ = expect_event(sub)
+  let plane = start_parked_node()
+  let assert Ok(Nil) = attach_with_exec(sess, sub, "node-a", plane)
+
+  // The adapter process dies (socket closed / crash): the monitor's
+  // DOWN drops the routing entry and detaches through the same path as
+  // an explicit DetachTarget — roster line included, while idle.
+  process.kill(plane.1)
+  let assert thread.ThreadEvent(
+    _,
+    _,
+    thread.UserEcho("attached targets: workspace.", Some(_), Some("system")),
+  ) = expect_event(sub)
+  await_route_gone(sess, "node-a", 100)
+}
+
+pub fn node_death_mid_turn_queues_lines_after_worker_done_test() {
+  // A node dying while a turn is in flight: the roster lines (the
+  // queued attach, then the DOWN-driven detach) land AFTER the worker
+  // installs its transcript, in FIFO order — the honest sequence. The
+  // execution plane, meanwhile, was routable the moment the attach
+  // landed and dead the moment the node died, regardless of the queue.
+  let gate_request = process.new_subject()
+  let sess = start_with_env(gated_runner(gate_request))
+  let sub = join(sess)
+  let _ = expect_event(sub)
+  let plane = start_parked_node()
+
+  should.equal(thread.send_message(sess, "research it"), thread.Sent)
+  expect_user_echo(sub, "research it")
+
+  // Mid-turn attach with a plane: accepted (queued), routable NOW.
+  let reply = process.new_subject()
+  process.send(
+    sess,
+    thread.AttachTarget("node-a", Some(thread.EnvExec(plane.0, plane.1)), reply),
+  )
+  let assert Ok(Ok(Nil)) = process.receive(reply, 2000)
+  let assert Ok(thread.EnvExec(_, _)) = route_env(sess, "node-a")
+
+  // The node dies mid-turn: the DOWN-driven detach queues behind the
+  // attach; routing stops immediately.
+  process.kill(plane.1)
+  await_route_gone(sess, "node-a", 100)
+  // Nothing appended to the committed transcript yet.
+  should.equal(2, transcript.length(thread.snapshot(sess)))
+
+  // Release the worker: TurnDone, then attach line, then detach line.
+  let assert Ok(gate) = process.receive(gate_request, 5000)
+  process.send(gate, Nil)
+  drain_until_turn_done(sub)
+  let assert thread.ThreadEvent(
+    _,
+    _,
+    thread.UserEcho(
+      "attached targets: workspace, node-a.",
+      Some(_),
+      Some("system"),
+    ),
+  ) = expect_event(sub)
+  let assert thread.ThreadEvent(
+    _,
+    _,
+    thread.UserEcho("attached targets: workspace.", Some(_), Some("system")),
+  ) = expect_event(sub)
+  let assert Error(
+    "target \"node-a\" is not attached. attached targets: workspace",
+  ) = route_env(sess, "node-a")
+}
+
+pub fn route_env_names_pending_targets_mid_turn_test() {
+  // The routing ask's error names the EFFECTIVE roster (live + queued),
+  // not the turn-frozen one: mid-turn, an attach's execution registers
+  // immediately, so its name belongs in the honest list a typo'd or
+  // hallucinated call reads (CodeRabbit review).
+  let gate_request = process.new_subject()
+  let sess = start_with_env(gated_runner(gate_request))
+  let sub = join(sess)
+  let _ = expect_event(sub)
+
+  should.equal(thread.send_message(sess, "research it"), thread.Sent)
+  expect_user_echo(sub, "research it")
+
+  // Mid-turn roster-only attach of node-a: accepted (queued), no tail
+  // line yet — but the effective roster the ask names already has it.
+  let reply = process.new_subject()
+  process.send(sess, thread.AttachTarget("node-a", None, reply))
+  let assert Ok(Ok(Nil)) = process.receive(reply, 2000)
+  let assert Error(
+    "target \"typo\" is not attached. attached targets: workspace, node-a",
+  ) = route_env(sess, "typo")
+
+  // Release the worker; the queued line lands (the roster catches up to
+  // what the ask already reported).
+  let assert Ok(gate) = process.receive(gate_request, 5000)
+  process.send(gate, Nil)
+  drain_until_turn_done(sub)
+  let assert thread.ThreadEvent(
+    _,
+    _,
+    thread.UserEcho(
+      "attached targets: workspace, node-a.",
+      Some(_),
+      Some("system"),
+    ),
+  ) = expect_event(sub)
 }

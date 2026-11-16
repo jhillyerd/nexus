@@ -5,11 +5,13 @@
 //// offline-suite rule; the port machinery itself is the thing under
 //// test, so faking it would test nothing.
 
+import filepath
 import gleam/erlang/process
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/string
+import gleeunit/should
 import nexus/env
 import nexus/timing
 import simplifile
@@ -24,6 +26,7 @@ fn env_for(root: String) -> Option(env.Environment) {
     workspace_root: root,
     thread_id: "t1",
     roster: env.attached_targets(),
+    remote: None,
   ))
 }
 
@@ -134,10 +137,15 @@ pub fn route_names_live_roster_test() {
   // names. `workspace` still routes to execution; a non-workspace
   // member is attached-by-name but not routable yet (2b wires it).
   let env =
-    env.Environment(workspace_root: "/srv/nexus", thread_id: "s12", roster: [
-      "workspace",
-      "proxmox-2",
-    ])
+    env.Environment(
+      workspace_root: "/srv/nexus",
+      thread_id: "s12",
+      roster: [
+        "workspace",
+        "proxmox-2",
+      ],
+      remote: None,
+    )
   let assert Ok(_) = env.route(Some(env), "workspace")
   let assert Error(
     "target \"typo\" is not attached. attached targets: workspace, proxmox-2",
@@ -171,6 +179,7 @@ pub fn bash_runs_in_workspace_cwd_test() {
         workspace_root: root,
         thread_id: "t1",
         roster: env.attached_targets(),
+        remote: None,
       )),
     )
   let _ = simplifile.delete(root)
@@ -529,6 +538,7 @@ pub fn fs_round_trip_test() {
   let e = env_for(root)
   let assert Ok(msg) =
     env.write_file(
+      cancel: process.new_subject(),
       environment: e,
       arguments: "{\"target\":\"workspace\",\"path\":\"sub/dir/notes.md\",\"content\":\"hello workspace\"}",
     )
@@ -536,11 +546,16 @@ pub fn fs_round_trip_test() {
   let assert Ok("hello workspace") =
     env.read_file(
       max_output_bytes: 10_000,
+      cancel: process.new_subject(),
       environment: e,
       arguments: "{\"target\":\"workspace\",\"path\":\"sub/dir/notes.md\"}",
     )
   let assert Ok(listing) =
-    env.list_dir(environment: e, arguments: "{\"target\":\"workspace\"}")
+    env.list_dir(
+      cancel: process.new_subject(),
+      environment: e,
+      arguments: "{\"target\":\"workspace\"}",
+    )
   let assert True = string.contains(listing, "sub/")
   let _ = simplifile.delete(root)
 }
@@ -552,12 +567,14 @@ pub fn read_file_exact_cap_not_truncated_test() {
   let e = env_for(root)
   let assert Ok(_) =
     env.write_file(
+      cancel: process.new_subject(),
       environment: e,
       arguments: "{\"target\":\"workspace\",\"path\":\"exact.txt\",\"content\":\"abcd\"}",
     )
   let assert Ok("abcd") =
     env.read_file(
       max_output_bytes: 4,
+      cancel: process.new_subject(),
       environment: e,
       arguments: "{\"target\":\"workspace\",\"path\":\"exact.txt\"}",
     )
@@ -569,12 +586,14 @@ pub fn read_file_cap_truncates_test() {
   let e = env_for(root)
   let assert Ok(_) =
     env.write_file(
+      cancel: process.new_subject(),
       environment: e,
       arguments: "{\"target\":\"workspace\",\"path\":\"big.txt\",\"content\":\"0123456789abcdefghij\"}",
     )
   let assert Ok(text) =
     env.read_file(
       max_output_bytes: 4,
+      cancel: process.new_subject(),
       environment: e,
       arguments: "{\"target\":\"workspace\",\"path\":\"big.txt\"}",
     )
@@ -595,18 +614,21 @@ pub fn fifo_refused_by_fs_tools_test() {
   let assert Error("read_file: not a regular file: pipe") =
     env.read_file(
       max_output_bytes: 100,
+      cancel: process.new_subject(),
       environment: e,
       arguments: "{\"target\":\"workspace\",\"path\":\"pipe\"}",
     )
   // Writing one blocks until a reader appears — refused too.
   let assert Error("write_file: not a regular file: pipe2") =
     env.write_file(
+      cancel: process.new_subject(),
       environment: e,
       arguments: "{\"target\":\"workspace\",\"path\":\"pipe2\",\"content\":\"x\"}",
     )
   // Regular files are unaffected.
   let assert Ok(_) =
     env.write_file(
+      cancel: process.new_subject(),
       environment: e,
       arguments: "{\"target\":\"workspace\",\"path\":\"plain.txt\",\"content\":\"ok\"}",
     )
@@ -623,6 +645,7 @@ pub fn read_file_directory_refused_test() {
   let assert Error("read_file: not a regular file: .") =
     env.read_file(
       max_output_bytes: 100,
+      cancel: process.new_subject(),
       environment: e,
       arguments: "{\"target\":\"workspace\",\"path\":\".\"}",
     )
@@ -634,9 +657,14 @@ pub fn list_dir_root_and_missing_test() {
   let e = env_for(root)
   // Path omitted = the workspace root.
   let assert Ok("(empty)") =
-    env.list_dir(environment: e, arguments: "{\"target\":\"workspace\"}")
+    env.list_dir(
+      cancel: process.new_subject(),
+      environment: e,
+      arguments: "{\"target\":\"workspace\"}",
+    )
   let assert Error("list_dir: not a directory: nope") =
     env.list_dir(
+      cancel: process.new_subject(),
       environment: e,
       arguments: "{\"target\":\"workspace\",\"path\":\"nope\"}",
     )
@@ -653,12 +681,14 @@ pub fn path_escape_refused_test() {
   let assert Error("path escapes the workspace: ../../etc/passwd") =
     env.read_file(
       max_output_bytes: 100,
+      cancel: process.new_subject(),
       environment: e,
       arguments: "{\"target\":\"workspace\",\"path\":\"../../etc/passwd\"}",
     )
   let assert Error(_) =
     env.read_file(
       max_output_bytes: 100,
+      cancel: process.new_subject(),
       environment: e,
       arguments: "{\"target\":\"workspace\",\"path\":\"/etc/passwd\"}",
     )
@@ -667,6 +697,7 @@ pub fn path_escape_refused_test() {
   let assert Error("read_file: file not found") =
     env.read_file(
       max_output_bytes: 100,
+      cancel: process.new_subject(),
       environment: e,
       arguments: "{\"target\":\"workspace\",\"path\":\"sub/../x\"}",
     )
@@ -679,6 +710,7 @@ pub fn confinement_normalization_test() {
       workspace_root: "/srv/nexus",
       thread_id: "s12",
       roster: env.attached_targets(),
+      remote: None,
     )
   let assert Ok("/srv/nexus/s12") = env.confined(e, ".")
   // `a/../..` folds ABOVE the workspace root: refused (the pop is
@@ -697,6 +729,7 @@ pub fn workspace_dir_derivation_test() {
     workspace_root: "/srv/nx",
     thread_id: "s3",
     roster: env.attached_targets(),
+    remote: None,
   ))
   |> should_equal("/srv/nx/s3")
 }
@@ -712,4 +745,158 @@ fn should_equal(got: a, want: a) -> Nil {
         <> string.inspect(got)
       }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Remote dispatch (environments plan Phase 2b-2)
+// ---------------------------------------------------------------------------
+
+/// A capturing router: records `(target, tool, raw arguments)` into
+/// `seen` (same-process send — received after the executor returns)
+/// and answers a canned result.
+fn capture_router(
+  seen: process.Subject(#(String, String, String)),
+) -> env.RemoteRouter {
+  fn(target, tool, arguments, _cancel) {
+    process.send(seen, #(target, tool, arguments))
+    Ok("from the node: " <> tool)
+  }
+}
+
+pub fn remote_dispatch_routes_all_four_tools_test() {
+  let seen = process.new_subject()
+  let handle =
+    Some(env.Environment(
+      workspace_root: "/srv/nx",
+      thread_id: "t1",
+      roster: ["workspace", "node-a"],
+      remote: Some(capture_router(seen)),
+    ))
+  let cancel = process.new_subject()
+
+  // bash: the whole call goes to the node — tool name + RAW arguments.
+  let assert Ok("from the node: bash") =
+    env.bash(
+      timeout_ms: 5000,
+      max_output_bytes: 1000,
+      environment: handle,
+      cancel: cancel,
+      arguments: "{\"target\":\"node-a\",\"command\":\"uptime\"}",
+    )
+  let assert Ok(#(
+    "node-a",
+    "bash",
+    "{\"target\":\"node-a\",\"command\":\"uptime\"}",
+  )) = process.receive(seen, 1000)
+
+  let assert Ok("from the node: read_file") =
+    env.read_file(
+      max_output_bytes: 1000,
+      environment: handle,
+      cancel: cancel,
+      arguments: "{\"target\":\"node-a\",\"path\":\"x\"}",
+    )
+  let assert Ok(#(
+    "node-a",
+    "read_file",
+    "{\"target\":\"node-a\",\"path\":\"x\"}",
+  )) = process.receive(seen, 1000)
+
+  let assert Ok("from the node: write_file") =
+    env.write_file(
+      environment: handle,
+      cancel: cancel,
+      arguments: "{\"target\":\"node-a\",\"path\":\"x\",\"content\":\"y\"}",
+    )
+  let assert Ok(#(
+    "node-a",
+    "write_file",
+    "{\"target\":\"node-a\",\"path\":\"x\",\"content\":\"y\"}",
+  )) = process.receive(seen, 1000)
+
+  let assert Ok("from the node: list_dir") =
+    env.list_dir(
+      environment: handle,
+      cancel: cancel,
+      arguments: "{\"target\":\"node-a\"}",
+    )
+  let assert Ok(#("node-a", "list_dir", "{\"target\":\"node-a\"}")) =
+    process.receive(seen, 1000)
+}
+
+pub fn remote_errors_pass_through_test() {
+  // The router's Error is the tool result verbatim (a failed tool
+  // result, never a loop error).
+  let handle =
+    Some(env.Environment(
+      workspace_root: "/srv/nx",
+      thread_id: "t1",
+      roster: ["workspace", "node-a"],
+      remote: Some(fn(_t, _tool, _args, _c) {
+        Error("target \"node-a\" is not attached. attached targets: workspace")
+      }),
+    ))
+  let cancel = process.new_subject()
+  let assert Error(
+    "target \"node-a\" is not attached. attached targets: workspace",
+  ) =
+    env.bash(
+      timeout_ms: 5000,
+      max_output_bytes: 1000,
+      environment: handle,
+      cancel: cancel,
+      arguments: "{\"target\":\"node-a\",\"command\":\"uptime\"}",
+    )
+}
+
+pub fn remote_none_falls_back_to_local_route_test() {
+  // A handle with no router wired (a hand-built value): the local
+  // path's `route` answers — the honest not-routable wording, never a
+  // "not attached" lie about a name the roster snapshot carries.
+  let handle =
+    Some(env.Environment(
+      workspace_root: "/srv/nx",
+      thread_id: "t1",
+      roster: ["workspace", "node-a"],
+      remote: None,
+    ))
+  let cancel = process.new_subject()
+  let assert Error(reason) =
+    env.bash(
+      timeout_ms: 5000,
+      max_output_bytes: 1000,
+      environment: handle,
+      cancel: cancel,
+      arguments: "{\"target\":\"node-a\",\"command\":\"uptime\"}",
+    )
+  should.equal(
+    reason,
+    "target \"node-a\" is attached but not routable (its node is not connected)",
+  )
+}
+
+pub fn workspace_target_never_dispatches_remotely_test() {
+  // `workspace` stays the LOCAL path: the router must not fire, and a
+  // real write lands in the local workspace root.
+  let root = fresh_root()
+  let seen = process.new_subject()
+  let handle =
+    Some(env.Environment(
+      workspace_root: root,
+      thread_id: "t1",
+      roster: ["workspace"],
+      remote: Some(capture_router(seen)),
+    ))
+  let cancel = process.new_subject()
+  let assert Ok(_) =
+    env.write_file(
+      environment: handle,
+      cancel: cancel,
+      arguments: "{\"target\":\"workspace\",\"path\":\"local.txt\",\"content\":\"hi\"}",
+    )
+  let assert Ok(True) =
+    simplifile.is_file(filepath.join(filepath.join(root, "t1"), "local.txt"))
+  // No router call was recorded.
+  should.equal(Error(Nil), process.receive(seen, 0))
+  let _ = simplifile.delete(root)
 }

@@ -573,12 +573,13 @@ fn env_read_run(
   _timeout_ms: Int,
   max_bytes: Int,
   environment: Option(Environment),
-  _cancel: Subject(Nil),
+  cancel: Subject(Nil),
   arguments: String,
 ) -> Result(String, String) {
   env.read_file(
     max_output_bytes: max_bytes,
     environment: environment,
+    cancel: cancel,
     arguments: arguments,
   )
 }
@@ -587,20 +588,20 @@ fn env_write_run(
   _timeout_ms: Int,
   _max_bytes: Int,
   environment: Option(Environment),
-  _cancel: Subject(Nil),
+  cancel: Subject(Nil),
   arguments: String,
 ) -> Result(String, String) {
-  env.write_file(environment: environment, arguments: arguments)
+  env.write_file(environment: environment, cancel: cancel, arguments: arguments)
 }
 
 fn env_list_run(
   _timeout_ms: Int,
   _max_bytes: Int,
   environment: Option(Environment),
-  _cancel: Subject(Nil),
+  cancel: Subject(Nil),
   arguments: String,
 ) -> Result(String, String) {
-  env.list_dir(environment: environment, arguments: arguments)
+  env.list_dir(environment: environment, cancel: cancel, arguments: arguments)
 }
 
 fn env_spec(cfg: Config, schema: ChatCompletionTool, run: EnvRun) -> ToolSpec {

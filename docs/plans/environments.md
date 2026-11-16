@@ -157,7 +157,11 @@ committed; nothing new rolls back.
   per-call deadline) IS the fail-fast machinery above, verbatim. If env
   routing ever needs identity inside a provider call, the route is
   plugin-api phase 3's additive `Call` context growth (thread id,
-  environment handle) — not a new protocol field here.
+  environment handle) — not a new protocol field here. (As-built
+  delta, 2b-2: "named" became SUBJECT-addressed through the thread
+  actor's `target → EnvExec` map — same protocol, same executor —
+  because node names are unique per roster, not per instance; see
+  Phase 2b-2.)
 
 ### The workspace (v1: in-process)
 
@@ -444,30 +448,102 @@ the frozen envelope never changes. `gleam test` stays network-free
 
 ### Phase 2b — node registry + client protocol + TUI (follow-up)
 
-1. `node` table + migrate + squirrel queries; token auth for `/node/ws`.
-2. Client protocol v1 (event projection + tool plane + user input);
-   adapter actor with socket-linked lifecycle, registered as a named
-   provider actor at attach (the plugin-api seam); attach/detach roster
-   mechanics incl. replace-on-reconnect and refuse-duplicate-live —
-   consuming the live roster and the `target → execution subject` map
-   this slice's step 5 reserved. **Hydration re-derivation**: once
-   attach/detach are reachable AND persist roster rows, the actor's
-   `State.roster` must be REBUILT from the persisted roster rows at
-   lazy-start / Down-replacement / retry (the same replay-from-store
-   rule the Phase 1 roster row already follows) — today the seed
-   `["workspace"]` is never wrong because nothing can attach yet, but
-   2b makes reconstruction reachable and mandatory.
-3. Fail-fast paths for unknown target / mid-run detach / timeout through
-   the live tool plane (tool errors commit; UI unchanged) — `route`'s
-   live-roster error (2a step 1) plus the plugin-api adapter's
-   monitor-before-dispatch detach-mid-call answer.
-4. A headless **fake node** in `e2e/` (Node script speaking the client
-   protocol) driven by the integration spec — the browser suite cannot
-   exercise a TUI, but a raw WS client can: attach, receive events, serve
-   a call, detach mid-call.
-5. The TUI itself (separate binary, language TBD — the protocol is JSON;
-   a Gleam TUI could share decode types). Ships when the protocol is
-   proven by the fake node.
+Sliced for review into 2b-1 (node table + token auth, merged) →
+2b-2 (the live-routing execution seam, offline) → 2b-3 (the client
+protocol + adapter) → 2b-4 (fake-node e2e) → 2b-5 (the TUI).
+
+**2b-1 — node table + token auth + roster hydration re-derivation —
+IMPLEMENTED (#132).** The `node` table (singular, unquoted-safe;
+`node_name` unique index, `node_recency`), one-way SHA-256 token
+hashing with constant-time verify (`nexus/node`), the store seam
+(list/get/insert/touch/delete; revoke = row delete), and the plan's
+hydration re-derivation pulled EARLY (it was this phase's own open
+note): `ThreadSpec.roster` re-derives the current attached list from
+the newest persisted roster row, so a restart no longer re-seeds
+`["workspace"]` after nodes attached mid-life. `nexus/node` stays a
+leaf (no network, no store, no actor); node names validate through
+`env.valid_target_name` (one charset/reserved rule, no drift).
+
+**2b-2 — live target routing: the execution seam (offline-provable).**
+The design fork 2a's step 5 recorded as open is DECIDED here — an
+ASK, not a shared value or a global name:
+
+- **The thread actor owns the execution map**: `target → EnvExec` —
+  the attached node's `(Subject(tool_provider.Msg), Pid)`. The env
+  executors' routing ask reaches it through the REGISTRY (`RouteEnv`,
+  the `deliver_ask` precedent: a worker-owned reply subject, manual
+  send + bounded receive, honest timeout error), never a captured
+  thread subject (the runner wrap is built before the actor starts,
+  at create and hydrate alike).
+- **NOT a globally named provider actor.** The plan's earlier "named
+  provider actor" wording predates the collision: node names are
+  unique per ROSTER, not per instance — two threads can host
+  same-named nodes, so a global name would collide (and
+  `process.new_name` counter-suffixing cannot be re-derived anyway).
+  The PROTOCOL is still the plugin-api seam — the adapter speaks
+  `tool_provider.Msg`, and the adapter executor's
+  monitor-before-dispatch / cancel re-signal / per-call deadline
+  machinery is reused verbatim through a `run_remote(sub, pid, …)`
+  variant that addresses the provider by the map's explicit
+  (subject, pid) pair instead of a registered name.
+- **The `Environment` handle grows a `remote` router closure**
+  (`env.RemoteRouter`: target, tool, arguments, cancel → result),
+  injected by the registry's `env_toolset` wrapper exactly like the
+  bots-plan `Delivery` closure. The four env executors branch on
+  `target`: `workspace` runs the Phase 1 local path unchanged; any
+  other target dispatches the WHOLE call (tool name + raw arguments)
+  through the router — the node executes the same four tools in ITS
+  workspace, so the byte-identical wire schema is what makes this
+  routing, never envelope mutation.
+- **Execution registers immediately, even mid-turn.** `AttachTarget`
+  grows an optional `EnvExec`: the roster line obeys the turn
+  ordering (queued behind `WorkerDone`), but the execution map
+  mutates at once — routing is not transcript state, nothing to
+  clobber. A monitored node's DOWN drops the map entry immediately
+  and detaches through the SAME queueing rules as an explicit
+  `DetachTarget` (a queued attach followed by a node death drains as
+  attach-then-detach lines — the FIFO pending queue already produces
+  the honest sequence). In-flight calls answer via the executor's
+  monitor: an ordinary failed tool result.
+- Refuse-duplicate-live stays (an attach of a live name refuses; the
+  old entry's DOWN will detach it). **Replace-on-reconnect arrives
+  with the real adapter** (2b-3) — it needs the connection lifecycle
+  to be meaningful.
+- One knob each, reused: `NEXUS_ENV_TIMEOUT_MS` is the remote call
+  deadline; `NEXUS_ENV_MAX_OUTPUT_BYTES` the result truncation cap
+  (chars at the adapter boundary — display hygiene; the transport
+  itself caps while READING in 2b-3).
+
+**Tests.** `tool_provider_test` pins `run_remote` (ok / err / timeout
+/ cancel re-signal / provider death) against a fake subject-owned
+actor; `thread_test` pins the map (RouteEnv ask, attach/detach,
+DOWN-driven detach, mid-turn DOWN ordering); `thread_registry_test`
+pins the registry ask; `env_test` pins the executors' remote branch.
+All offline, fake actors only; `m3_prefix_test` untouched.
+
+**2b-3 — `/node/ws` client protocol v1 + node adapter actor.** The
+event projection + tool plane + user-input frames (`"v":1`,
+additive-only); token auth on the route (the 2b-1 table); the
+adapter actor with socket-linked lifecycle (the `ui_runtime`
+pattern) that ATTACHES with its `EnvExec` (consuming this slice's
+map), translates client-protocol frames to and from
+`tool_provider.Msg`, and handles replace-on-reconnect and
+refuse-duplicate-live at the connection level. The
+`GET /threads/<id>/state` dump (already shipped, #119) is the
+development side channel for the event projection. Fail-fast paths
+through the live tool plane are pinned here too (unknown target /
+mid-run detach / timeout — tool errors commit; UI unchanged):
+`route`'s live-roster error (2a step 1) plus the adapter executor's
+monitor-before-dispatch detach-mid-call answer (2b-2's `run_remote`).
+
+**2b-4 — a headless fake node in `e2e/`** (Node script speaking the
+client protocol) driven by the integration spec — the browser suite
+cannot exercise a TUI, but a raw WS client can: attach, receive
+events, serve a call, detach mid-call.
+
+**2b-5 — the TUI itself** (separate binary, language TBD — the
+protocol is JSON; a Gleam TUI could share decode types). Ships when
+the protocol is proven by the fake node.
 
 ### Phase 3 — deferred (recorded, not scheduled)
 

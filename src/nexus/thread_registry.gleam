@@ -221,6 +221,19 @@ pub type Msg {
   /// rule-1 exception class holds. The reply vocabulary is the tool's
   /// receipt: `Delivered(thread_id) | Busy | Refused(reason)`.
   Deliver(request: delivery.Request, reply: Subject(delivery.Reply))
+  /// Resolve a thread's non-workspace environment target to its
+  /// execution plane (environments plan Phase 2b-2): the per-turn
+  /// worker's ROUTING ask, forwarded to the live thread actor (manual
+  /// send + bounded receive on a registry-owned reply subject — the
+  /// same non-fatal pattern as the `Deliver` forward). `Error` carries
+  /// the thread actor's honest fail-fast wording verbatim (not
+  /// attached / attached but not routable), or the ask's own
+  /// unavailability/timeout text.
+  RouteEnv(
+    thread_id: String,
+    target: String,
+    reply: Subject(Result(thread.EnvExec, String)),
+  )
   /// Monitor plumbing (internal): a monitored thread actor exited.
   Down(pid: Pid, monitor: Monitor)
   /// Selector plumbing for non-process monitors; always ignored.
@@ -656,6 +669,36 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       actor.continue(state)
     }
 
+    RouteEnv(thread_id, target, reply) -> {
+      // The registry is the resolver of LIVE thread subjects (the
+      // runner wrap is built before the actor starts, at create and
+      // hydrate alike, so the env router closure can never capture one
+      // — it captures THIS registry and asks per call, the
+      // `deliver_ask` precedent). A brief, bounded block while the
+      // thread actor answers a pure lookup; an unresolvable thread is
+      // the honest unavailability, never a panic. `resolve_thread` may
+      // lazily start a dormant thread — the returned state is the one
+      // to keep.
+      case resolve_thread(state, thread_id) {
+        Error(_) -> {
+          process.send(reply, Error("thread is unavailable"))
+          actor.continue(state)
+        }
+        Ok(#(state, record)) -> {
+          let inner = process.new_subject()
+          process.send(record.subject, thread.RouteEnv(target, inner))
+          let outcome = case
+            process.receive(inner, route_env_forward_timeout_ms)
+          {
+            Ok(outcome) -> outcome
+            Error(Nil) -> Error("environment routing ask timed out")
+          }
+          process.send(reply, outcome)
+          actor.continue(state)
+        }
+      }
+    }
+
     _ -> handle_rest(state, msg)
   }
 }
@@ -1085,7 +1128,10 @@ fn start_new_thread(
           // through untouched).
           let spec = case workspace_root {
             Some(root) ->
-              thread.ThreadSpec(..spec, toolset: env_toolset(toolset, id, root))
+              thread.ThreadSpec(
+                ..spec,
+                toolset: env_toolset(toolset, id, root, state.self, state.cfg),
+              )
             None -> spec
           }
           let spec = case requested.bot_id, persisted {
@@ -1615,9 +1661,10 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
 
     MonitorNoise -> actor.continue(state)
 
-    // Create and Deliver cases are handled in `handle` before delegating
-    // here.
-    Create(..) | CreateWithToolset(..) | Deliver(..) -> actor.continue(state)
+    // Create, Deliver, and RouteEnv cases are handled in `handle`
+    // before delegating here.
+    Create(..) | CreateWithToolset(..) | Deliver(..) | RouteEnv(..) ->
+      actor.continue(state)
   }
 }
 
@@ -1774,7 +1821,8 @@ fn lazy_start(state: State, summary: StoredSummary) -> Resolved {
           // thread rehydrates its handle even after NEXUS_WORKSPACE_ROOT
           // changed or was removed (its files stay where they were).
           let resolved = case summary.workspace_root {
-            Some(root) -> env_toolset(resolved, summary.id, root)
+            Some(root) ->
+              env_toolset(resolved, summary.id, root, state.self, state.cfg)
             None -> resolved
           }
           // The delivery wrapper rides hydration too (bots P3c, #97): a
@@ -2230,6 +2278,13 @@ fn restart(
 /// the same 5s every other registry/thread ask in the repo uses.
 const delivery_ask_timeout_ms = 5000
 
+/// The env routing ask's budget: the worker-side ask into THIS registry
+/// and the registry's forward into the thread actor (environments plan
+/// Phase 2b-2). The thread side is a pure map lookup, so this bounds
+/// only scheduling — but a wedged actor must answer the WORKER with an
+/// honest timeout error, never a burned tool deadline.
+const route_env_forward_timeout_ms = 5000
+
 /// Handle one `Deliver` ask (always from the unlinked turn worker — the
 /// `bot_message` tool's `Delivery.deliver` closure). Guards, in the
 /// settled order: unknown target; self-addressing — any RESOLVED target
@@ -2598,15 +2653,36 @@ fn inbound_gate(state: State, bot_id: Option(String)) -> Result(Nil, String) {
 /// Wrap a toolset bundle's turn fn with THIS thread's environment
 /// handle (environments plan Phase 1). The bundle stays cached
 /// unwrapped (shared across threads of one toolset); the wrap is per
-/// thread, closing over the FROZEN root and the thread id. Plain
-/// threads unwrap to `None` inside their base runner call, and env
-/// tools on a handle-less thread error honestly at run time.
+/// thread, closing over the FROZEN root, the thread id, and — Phase
+/// 2b-2 — the REMOTE router closure: every non-`workspace` target an
+/// env tool names is asked through THIS registry (`RouteEnv`) and
+/// dispatched over the provider-protocol adapter executor against the
+/// thread actor's execution map. Plain threads unwrap to `None`
+/// inside their base runner call, and env tools on a handle-less
+/// thread error honestly at run time.
 fn env_toolset(
   toolset: thread.Toolset,
   thread_id: String,
   workspace_root: String,
+  registry: Subject(Msg),
+  cfg: Config,
 ) -> thread.Toolset {
   let base = toolset.runner
+  let router: env.RemoteRouter = fn(target, tool, arguments, cancel) {
+    case route_env_ask(registry, thread_id, target, cancel) {
+      Ok(exec) ->
+        tool_provider.run_remote(
+          provider: exec.sub,
+          owner: exec.pid,
+          tool: tool,
+          timeout_ms: cfg.env_timeout_ms,
+          max_output_chars: cfg.env_max_output_bytes,
+          cancel: cancel,
+          arguments: arguments,
+        )
+      Error(reason) -> Error(reason)
+    }
+  }
   thread.Toolset(
     ..toolset,
     runner: fn(endpoint, tr, cancel, delivery, _environment, on_event) {
@@ -2619,11 +2695,52 @@ fn env_toolset(
           workspace_root: workspace_root,
           thread_id: thread_id,
           roster: env.attached_targets(),
+          remote: Some(router),
         )),
         on_event,
       )
     },
   )
+}
+
+/// The `RouteEnv` ask, built for the turn worker (environments plan
+/// Phase 2b-2): a worker-OWNED reply subject with a manual send +
+/// bounded select — the `deliver_ask` ask shape (`process.receive` is
+/// only legal on a subject the calling process created, and this
+/// closure only ever runs inside the per-turn worker) — with one
+/// hardening over it (cubic review): the select also races the TURN'S
+/// CANCEL subject, so a Stop while the ask is stalled answers
+/// "cancelled" at once instead of burning the fixed 5s budget before
+/// the tool deadline even starts. On the cancel path the one-shot Nil
+/// is RE-SIGNALLED (the codemode rule: an interruptible executor must
+/// put it back for the loop's LAST-call path). A slow or dead registry
+/// is a retryable tool error, never an `actor.call` panic.
+fn route_env_ask(
+  registry: Subject(Msg),
+  thread_id: String,
+  target: String,
+  cancel: Subject(Nil),
+) -> Result(thread.EnvExec, String) {
+  let reply = process.new_subject()
+  process.send(registry, RouteEnv(thread_id, target, reply))
+  let selector =
+    process.new_selector()
+    |> process.select_map(reply, RouteReply)
+    |> process.select_map(cancel, fn(_) { RouteCancelled })
+  case process.selector_receive(selector, route_env_forward_timeout_ms) {
+    Ok(RouteReply(outcome)) -> outcome
+    Ok(RouteCancelled) -> {
+      process.send(cancel, Nil)
+      Error("cancelled")
+    }
+    Error(Nil) -> Error("environment routing ask timed out")
+  }
+}
+
+/// The routing ask's select messages (see `route_env_ask`).
+type RouteAskMsg {
+  RouteReply(Result(thread.EnvExec, String))
+  RouteCancelled
 }
 
 /// Wrap a toolset bundle's turn fn with THIS thread's delivery identity
