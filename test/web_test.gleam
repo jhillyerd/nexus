@@ -530,6 +530,11 @@ pub fn protected_route_matrix_test() {
     // Pico: the vendored stylesheet is served by us (never a CDN) and sits
     // behind the same token gate as the rest of the UI's assets.
     #(Get, ["css", "pico.min.css"]),
+    // Node pairing rows (environments 2b-3): UI-token-guarded admin
+    // surface, like providers and bots.
+    #(Get, ["nodes"]),
+    #(Post, ["nodes"]),
+    #(Delete, ["nodes", "n-1"]),
   ]
   |> list.each(fn(route) {
     let #(method, segments) = route
@@ -541,6 +546,9 @@ pub fn protected_route_matrix_test() {
   // an unknown path stays unprotected-but-404 like before.
   web.requires_auth(Get, ["models"]) |> should.be_false
   web.requires_auth(Delete, ["models"]) |> should.be_false
+  // /node/ws is NOT UI-token-guarded: it authenticates with its own
+  // node token against the node table (pre-upgrade, plain statuses).
+  web.requires_auth(Get, ["node", "ws"]) |> should.be_false
 }
 
 pub fn m3_page_hosts_server_component_test() {

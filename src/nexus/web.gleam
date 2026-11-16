@@ -1795,12 +1795,14 @@ pub fn requires_auth(method: Method, segments: List(String)) -> Bool {
     | Get, ["lustre", "runtime.mjs"]
     | Get, ["css", "pico.min.css"]
     | Get, ["ws"]
+    | Get, ["nodes"]
     -> True
     Post, ["threads"]
     | Post, ["threads", _, "send"]
     | Post, ["threads", _, "stop"]
     | Post, ["providers"]
     | Post, ["bots"]
+    | Post, ["nodes"]
     -> True
     Patch, ["threads", _]
     | Delete, ["threads", _]
@@ -1808,7 +1810,11 @@ pub fn requires_auth(method: Method, segments: List(String)) -> Bool {
     | Delete, ["providers", _]
     | Patch, ["bots", _]
     | Delete, ["bots", _]
+    | Delete, ["nodes", _]
     -> True
+    // `GET /node/ws` is deliberately ABSENT: it carries its own
+    // NODE-token auth against the `node` table (a node is not a
+    // browser), answered pre-upgrade as plain HTTP statuses.
     _, _ -> False
   }
 }

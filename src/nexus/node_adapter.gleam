@@ -130,32 +130,40 @@ pub fn websocket(
                   )
                 Ok(thread_subject) -> {
                   let role = role_from(req)
-                  case role, env_capable(registry, thread_id) {
-                    EnvRole, False ->
-                      json_response(
-                        403,
-                        json.object([
-                          #(
-                            "error",
-                            json.string("thread has no workspace toolset"),
-                          ),
-                        ]),
-                      )
-                    _, _ ->
-                      mist.websocket(
-                        request: req,
-                        on_init: fn(_conn) {
-                          init_socket(cfg, thread_id, thread_subject, row, role)
-                        },
-                        handler: loop_socket,
-                        // The clean stop for the NORMAL close path (the
-                        // ui_runtime close_socket rule): the link alone
-                        // covers ABNORMAL deaths — a crashed socket, the
-                        // replace-kill — because an actor's own normal
-                        // exit does not rupture links. Killing here is
-                        // exit-reason-agnostic for the thread actor's
-                        // monitor (any exit spends it) and immediate.
-                        on_close: fn(state) { process.kill(state.adapter_pid) },
+                  // The env-capability ask runs for the ENV role only:
+                  // a viewer connection never pays the registry round
+                  // trip (its join is ungated).
+                  case role {
+                    EnvRole ->
+                      case env_capable(registry, thread_id) {
+                        False ->
+                          json_response(
+                            403,
+                            json.object([
+                              #(
+                                "error",
+                                json.string("thread has no workspace toolset"),
+                              ),
+                            ]),
+                          )
+                        True ->
+                          node_upgrade(
+                            req,
+                            cfg,
+                            thread_id,
+                            thread_subject,
+                            row,
+                            role,
+                          )
+                      }
+                    ViewerRole ->
+                      node_upgrade(
+                        req,
+                        cfg,
+                        thread_id,
+                        thread_subject,
+                        row,
+                        role,
                       )
                   }
                 }
@@ -164,6 +172,30 @@ pub fn websocket(
         }
       }
   }
+}
+
+/// The mist upgrade, shared by both roles past their gates.
+fn node_upgrade(
+  req: Request(mist.Connection),
+  cfg: Config,
+  thread_id: String,
+  thread_subject: Subject(thread.Msg),
+  row: node.Node,
+  role: Role,
+) -> Response(mist.ResponseData) {
+  mist.websocket(
+    request: req,
+    on_init: fn(_conn) {
+      init_socket(cfg, thread_id, thread_subject, row, role)
+    },
+    handler: loop_socket,
+    // The clean stop for the NORMAL close path (the ui_runtime
+    // close_socket rule): the link alone covers ABNORMAL deaths — a
+    // crashed socket, the replace-kill — because an actor's own normal
+    // exit does not rupture links. Killing here is exit-reason-agnostic
+    // for the thread actor's monitor (any exit spends it) and immediate.
+    on_close: fn(state) { process.kill(state.adapter_pid) },
+  )
 }
 
 /// `(name, token)` from the query string, with the token also accepted
