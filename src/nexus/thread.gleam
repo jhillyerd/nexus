@@ -1746,6 +1746,14 @@ type ExecEntry {
   ExecEntry(exec: EnvExec, monitor: Monitor)
 }
 
+/// Replace `name`'s execution plane with a fresh connection's
+/// (Phase 2b-3, reconnect-replace): the old entry's monitor is spent
+/// and the old adapter KILLED — its linked socket dies with it, and its
+/// in-flight calls answer through the executor-side monitor as
+/// ordinary tool errors. The stale DOWN is inert for the map: the
+/// `WorkerDown` scan matches entries by pid, and the entry now carries
+/// the new one. A name with no live entry (a queued-attach leftover, or
+/// a name-only attach) simply registers.
 /// Register an execution plane under `name` (environments plan
 /// 2b-2). The monitor's DOWN funnels to `WorkerDown`, which scans this
 /// map for the dead pid, drops the entry, and detaches the target —
@@ -1770,6 +1778,20 @@ fn drop_exec(state: State, name: String) -> State {
       State(..state, env_execs: dict.delete(state.env_execs, name))
     }
     Error(_) -> state
+  }
+}
+
+fn replace_exec(state: State, name: String, plane: EnvExec) -> State {
+  case dict.get(state.env_execs, name) {
+    Ok(entry) -> {
+      process.demonitor_process(entry.monitor)
+      case entry.exec.pid == plane.pid {
+        False -> process.kill(entry.exec.pid)
+        True -> Nil
+      }
+      register_exec(state, name, plane)
+    }
+    Error(_) -> register_exec(state, name, plane)
   }
 }
 
@@ -1827,6 +1849,15 @@ fn preview_roster(state: State) -> List(String) {
 /// enqueue it for `WorkerDone`. The returned verdict is `Error` on
 /// refusal (nothing changed), `Ok(Nil)` on accept; the caller decides
 /// whether a reply subject hears it.
+///
+/// Replace-on-reconnect (Phase 2b-3): an attach CARRYING an execution
+/// plane whose name is already in the effective roster is a
+/// RECONNECTION, not a duplicate — the new connection's plane replaces
+/// the old one's immediately (the old adapter is killed; its linked
+/// socket dies with it), and NO roster line lands: the attached list is
+/// unchanged and the model's tail context already names the target. A
+/// name-only attach of a live name still refuses (the Phase 2a rule,
+/// pinned by tests).
 fn accept_roster_change(
   state: State,
   change: RosterChange,
@@ -1837,6 +1868,24 @@ fn accept_roster_change(
   // the turn's duration), so validation sees the SAME list the drain
   // will — no duplicate attach or double detach can squeeze through.
   let preview = preview_roster(state)
+  case change, exec {
+    RosterAttach(name), Some(plane) ->
+      case list.contains(preview, name) {
+        True -> #(replace_exec(state, name, plane), Ok(Nil))
+        False -> accept_fresh_roster_change(state, change, exec, preview)
+      }
+    _, _ -> accept_fresh_roster_change(state, change, exec, preview)
+  }
+}
+
+/// The pre-2b-3 path: a change against a roster that does not yet
+/// carry the attach's name (or any detach).
+fn accept_fresh_roster_change(
+  state: State,
+  change: RosterChange,
+  exec: Option(EnvExec),
+  preview: List(String),
+) -> #(State, Result(Nil, String)) {
   case compute_roster(preview, change) {
     Error(reason) -> #(state, Error(reason))
     Ok(new_roster) -> {

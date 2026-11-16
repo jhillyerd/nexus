@@ -283,6 +283,25 @@ All routes except `GET /healthz` require the configured token when
   `status` by an instant. A future abridged print/PDF view
   (`/threads/<id>/transcript`) is tracked in issue #117
 - `GET /healthz` — unauthenticated liveness probe
+- `GET /nodes` — paired remote nodes (id, name, stamps; the token
+  hash is never on the wire)
+- `POST /nodes` `{"name":"proxmox-2"}` — pair a node: 201 answering the
+  minted plaintext token EXACTLY ONCE (store keeps only its SHA-256
+  hash); duplicate name → `409`, reserved/invalid name → `400`
+- `DELETE /nodes/<id>` — revoke the node's token (204, idempotent;
+  future connections fail, a live one is not retroactively killed)
+- `GET /node/ws?node=<name>&token=<token>&thread=<id>&role=env|viewer`
+  — the remote-node WebSocket (environments plan): NODE-token auth
+  (distinct from the UI token; also accepted as `Authorization:
+  Bearer`), one thread per connection. The versioned, additive-only
+  JSON client protocol (`"v":1`) serves an event plane (the thread's
+  fan-out projected as frames), an MCP-shaped tool plane (`tools/call`
+  down with the arguments verbatim, results up, `notifications/
+  cancelled` down), and user input (`{"type":"send","text":…}`).
+  `role=env` (default) attaches the node's machine as an environment
+  target — refused (403) on threads whose toolset has no env tools;
+  `role=viewer` joins any thread with events and send but no tool
+  plane
 
 The browser UI does not use the JSON routes — it talks to the server
 component over `/ws`. The JSON surface is the scripting/e2e API (the

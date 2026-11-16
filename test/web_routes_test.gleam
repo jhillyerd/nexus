@@ -4,10 +4,12 @@
 //// registry (fake turn runner; no Bifrost, no network beyond loopback).
 
 import gleam/dict
+import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/http.{Delete, Get, Patch, Post}
 import gleam/http/request.{type Request}
 import gleam/int
+import gleam/json
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/otp/actor
@@ -181,7 +183,13 @@ fn start_server_with(
   // instead of surfacing later as connection-refused noise.
   let bound = process.new_subject()
   let assert Ok(_) =
-    mist.new(web.handler(cfg, registry_name, providers_name, bots_name))
+    mist.new(web.handler(
+      cfg,
+      registry_name,
+      providers_name,
+      bots_name,
+      persistence,
+    ))
     |> mist.bind("127.0.0.1")
     |> mist.port(0)
     |> mist.after_start(fn(port, _scheme, _ip) { process.send(bound, port) })
@@ -1217,4 +1225,119 @@ pub fn bots_allow_inbound_patch_round_trip_test() {
     send_authorized(req(port, Patch, "/bots/b404", "{\"allow_inbound\":true}")),
     #(404, "{\"error\":\"unknown bot\"}"),
   )
+}
+
+// ---------------------------------------------------------------------------
+// Node pairing routes + /node/ws pre-upgrade auth (environments 2b-3)
+// ---------------------------------------------------------------------------
+
+/// The minimal pairing surface: POST mints the row and answers the
+/// plaintext token ONCE (never the hash), duplicates refuse, the list
+/// carries no secrets, revoke is an idempotent row delete, and the
+/// UI token still guards the admin surface.
+pub fn node_pairing_round_trip_test() {
+  let #(_registry, port) = start_server()
+  let #(status, body) =
+    send_authorized(req(port, Post, "/nodes", "{\"name\":\"proxmox-2\"}"))
+  should.equal(status, 201)
+  should.be_true(string.contains(body, "\"name\":\"proxmox-2\""))
+  should.be_true(string.contains(body, "\"token\":\""))
+  should.be_false(string.contains(body, "token_hash"))
+  let assert Ok(node_id) = json.parse(body, decode.at(["id"], decode.string))
+
+  // A duplicate name is the friendly 409.
+  let #(dup, _dup_body) =
+    send_authorized(req(port, Post, "/nodes", "{\"name\":\"proxmox-2\"}"))
+  should.equal(dup, 409)
+
+  // The list carries the row, never the hash.
+  let #(list_status, listed) = send_authorized(req(port, Get, "/nodes", ""))
+  should.equal(list_status, 200)
+  should.be_true(string.contains(listed, "proxmox-2"))
+  should.be_false(string.contains(listed, "token_hash"))
+
+  // A reserved/invalid name refuses.
+  let #(reserved, _) =
+    send_authorized(req(port, Post, "/nodes", "{\"name\":\"workspace\"}"))
+  should.equal(reserved, 400)
+
+  // Revoke: 204, idempotent.
+  let #(del, _) = send_authorized(req(port, Delete, "/nodes/" <> node_id, ""))
+  should.equal(del, 204)
+  let #(del2, _) = send_authorized(req(port, Delete, "/nodes/" <> node_id, ""))
+  should.equal(del2, 204)
+
+  // The admin surface stays behind the UI token.
+  let assert Ok(unauth) =
+    hackney.send(req(port, Post, "/nodes", "{\"name\":\"x2\"}"))
+  should.equal(unauth.status, 401)
+}
+
+/// The pre-upgrade gates on /node/ws answer as ordinary HTTP statuses
+/// (a reconnecting client can tell bad token from bad path). The
+/// upgrade itself is the e2e fake node's to prove.
+pub fn node_ws_pre_upgrade_refusals_test() {
+  let #(_registry, port) = start_server()
+  let #(_, body) =
+    send_authorized(req(port, Post, "/nodes", "{\"name\":\"node-a\"}"))
+  let assert Ok(node_token) =
+    json.parse(body, decode.at(["token"], decode.string))
+
+  // A plain (non-env) thread for the role gate.
+  let #(thread_status, thread_body) =
+    send_authorized(req(
+      port,
+      Post,
+      "/threads",
+      "{\"provider\":\""
+        <> store_mock.fixture_provider_id
+        <> "\",\"model\":\"alias-a\"}",
+    ))
+  should.equal(thread_status, 201)
+  let assert Ok(thread_id) =
+    json.parse(thread_body, decode.at(["id"], decode.string))
+
+  // No credentials: 401.
+  let assert Ok(no_creds) =
+    hackney.send(req(port, Get, "/node/ws?thread=" <> thread_id, ""))
+  should.equal(no_creds.status, 401)
+
+  // Wrong token: 401 — identical to an unknown node, no oracle.
+  let assert Ok(bad_token) =
+    hackney.send(req(
+      port,
+      Get,
+      "/node/ws?node=node-a&token=wrong&thread=" <> thread_id,
+      "",
+    ))
+  should.equal(bad_token.status, 401)
+
+  // Right credentials, unknown thread: 404.
+  let assert Ok(no_thread) =
+    hackney.send(req(
+      port,
+      Get,
+      "/node/ws?node=node-a&token=" <> node_token <> "&thread=t-ghost",
+      "",
+    ))
+  should.equal(no_thread.status, 404)
+
+  // Missing thread parameter: 400.
+  let assert Ok(no_thread_param) =
+    hackney.send(req(port, Get, "/node/ws?node=node-a&token=" <> node_token, ""))
+  should.equal(no_thread_param.status, 400)
+
+  // Env role on a plain thread: 403, the UnknownToolset philosophy.
+  let assert Ok(no_env) =
+    hackney.send(req(
+      port,
+      Get,
+      "/node/ws?node=node-a&token=" <> node_token <> "&thread=" <> thread_id,
+      "",
+    ))
+  should.equal(no_env.status, 403)
+  // Viewer role skipping the gate is NOT pinned here: a plain GET
+  // cannot complete the WebSocket handshake (mist's upgrade path needs
+  // the Upgrade headers), so the viewer happy path belongs to the e2e
+  // fake node, which speaks real WS.
 }

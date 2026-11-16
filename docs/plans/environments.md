@@ -521,10 +521,10 @@ DOWN-driven detach, mid-turn DOWN ordering); `thread_registry_test`
 pins the registry ask; `env_test` pins the executors' remote branch.
 All offline, fake actors only; `m3_prefix_test` untouched.
 
-**2b-3 — `/node/ws` client protocol v1 + node adapter actor.** The
-event projection + tool plane + user-input frames (`"v":1`,
-additive-only); token auth on the route (the 2b-1 table); the
-adapter actor with socket-linked lifecycle (the `ui_runtime`
+**2b-3 — `/node/ws` client protocol v1 + node adapter actor —
+IMPLEMENTED.** The event projection + tool plane + user-input frames
+(`"v":1`, additive-only); token auth on the route (the 2b-1 table);
+the adapter actor with socket-linked lifecycle (the `ui_runtime`
 pattern) that ATTACHES with its `EnvExec` (consuming this slice's
 map), translates client-protocol frames to and from
 `tool_provider.Msg`, and handles replace-on-reconnect and
@@ -535,6 +535,81 @@ through the live tool plane are pinned here too (unknown target /
 mid-run detach / timeout — tool errors commit; UI unchanged):
 `route`'s live-roster error (2a step 1) plus the adapter executor's
 monitor-before-dispatch detach-mid-call answer (2b-2's `run_remote`).
+
+**As-built deltas** (2b-3 met code the design predates, plus
+mechanics discovered mid-build):
+
+- **The socket-owner process sends every frame; the adapter never
+touches the connection.** mist PANICS when a frame is sent from
+any process but the socket's owner (permessage-deflate state is
+process-local), so the adapter hands finished frame STRINGS to a
+`frames` subject the socket process created and selects on
+(`mist.Custom`), and the socket loop does the `send_text_frame` —
+the `ui_runtime` pattern with the direction inverted. Inbound, the
+socket loop decodes client frames and forwards them to the adapter's
+subject; undecodable frames answer an `error` frame and keep the
+socket. The adapter is linked to the socket process: a closed or
+crashed socket takes the adapter down (the thread actor's monitor
+detaches), a crashed adapter takes the socket down (the node's
+client reconnects into a fresh pair).
+- **Auth is name+token pair-verify, not hash lookup** —
+`/node/ws?node=<name>&token=<token>&thread=<id>&role=env|viewer`
+(the token also accepted as `Authorization: Bearer`): the named row
+loads through the EXISTING `get_node_by_name` and `node.verify_token`
+checks it constant-time — zero new store queries, and a wrong name
+and a wrong token answer the identical 401 (no oracle). `touch_node`
+marks last-seen at the route. Pre-upgrade failures answer as plain
+HTTP statuses (401/400/404/403) so a reconnecting client can tell
+bad token from bad path; the env-role gate on non-env threads
+("thread has no workspace toolset") is a new registry ask
+(`thread_registry.env_capable`, read from the record's FROZEN
+`spec.toolset` — dormant threads answer without waking).
+- **`tools/call` embeds the arguments VERBATIM.** The adapter builds
+the frame by string concatenation around the argument bytes (name
+JSON-encoded defensively; arguments PROVEN a JSON object by
+`node_protocol.valid_arguments` before dispatch — the env executors
+only route already-parsed object arguments, and a violation answers
+an ordinary ToolErr, never a malformed frame). MCP-shaped, not
+MCP-exact: `params.arguments` is the raw object, results flatten to
+one text, and a JSON-RPC error-object response decodes as a FAILED
+call — a hostile node cannot smuggle a success past a refused call.
+- **No adapter-side timers, on purpose.** The executor
+(`run_remote`) owns the deadline, monitor, and cancel re-signal; the
+adapter keeps none — a wedged node is answered by the executor's
+timeout, a dead adapter by its monitor, both as ordinary failed
+tool results. Result text caps at the boundary on receipt
+(`NEXUS_ENV_MAX_OUTPUT_BYTES` chars); WS frames arrive whole (the
+frame is the read unit — mist exposes no mid-frame cap), so the cap
+lands on the first nexus-side touch of the node's bytes.
+- **Replace-on-reconnect lives in the thread actor, not the
+adapter**: an attach CARRYING an execution plane whose name is
+already in the effective roster is a reconnection — the old plane's
+pid is killed (its linked socket dies with it; in-flight calls
+answer through the executor-side monitor), the new plane registers
+immediately, and NO roster line lands (the attached list is
+unchanged; the model's tail context already names the target). A
+name-only attach of a live name still refuses (the 2a rule,
+unamended). The stale DOWN is inert: the `WorkerDown` scan matches
+entries by pid, and the entry now carries the new one.
+- **A minimal node-pairing scripting API landed with the route**
+(UI-token-guarded): `GET /nodes` (rows, never the hash), `POST
+/nodes {"name":…}` → 201 answering the minted plaintext token
+EXACTLY ONCE (32 random bytes, URL-safe base64; only the SHA-256
+hash is stored), `DELETE /nodes/<id>` → 204 idempotent revoke. The
+settings-surface pairing UX stays plan-deferred — these routes are
+the curl/e2e path (the 2b-4 fake node pairs through them). A revoke
+is NOT retroactive: a live connection keeps running; reconnects
+fail.
+- **Offline pins**: `node_protocol_test` (every wire shape, exact
+strings), `node_adapter_test` (the actor against a fake thread
+speaking real `thread.Msg`: connect sequence, call round trip,
+error results, cancel + inert late response, non-object arguments,
+the boundary cap, send Sent/Busy/empty, viewer role, foreign-thread
+event filter, ListTools refusal, attach-refusal stop),
+`thread_test.attach_replaces_live_plane_test` (the replace
+semantics), `thread_registry_test.env_capable_ask_test`, and
+`web_routes_test` (the pairing round trip + the pre-upgrade
+refusals). The upgrade itself is the fake node's to prove (2b-4).
 
 **2b-4 — a headless fake node in `e2e/`** (Node script speaking the
 client protocol) driven by the integration spec — the browser suite

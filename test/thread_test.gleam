@@ -2399,6 +2399,72 @@ pub fn attach_with_exec_registers_routable_plane_test() {
   process.kill(plane.1)
 }
 
+/// Replace-on-reconnect (Phase 2b-3): a second connection for a live
+/// name REPLACES the roster entry — the new plane routes at once, NO
+/// roster line lands (the attached list is unchanged), the old plane's
+/// process is killed, and a name-only attach of the live name still
+/// refuses (the Phase 2a rule, unamended).
+pub fn attach_replaces_live_plane_test() {
+  let sess = start_with_env(happy_runner)
+  let sub = join(sess)
+  let _ = expect_event(sub)
+  let plane1 = start_parked_node()
+  let assert Ok(Nil) = attach_with_exec(sess, sub, "node-a", plane1)
+
+  // The reconnect: same name, fresh plane.
+  let plane2 = start_parked_node()
+  let reply = process.new_subject()
+  process.send(
+    sess,
+    thread.AttachTarget(
+      "node-a",
+      Some(thread.EnvExec(plane2.0, plane2.1)),
+      reply,
+    ),
+  )
+  let assert Ok(Ok(Nil)) = process.receive(reply, 2000)
+
+  // No roster line lands: the subscriber hears NOTHING (the list is
+  // unchanged — the model's tail context already names the target).
+  should.equal(process.receive(sub, 150), Error(Nil))
+
+  // Routing answers the NEW plane.
+  let assert Ok(thread.EnvExec(got_sub, got_pid)) = route_env(sess, "node-a")
+  should.equal(got_sub, plane2.0)
+  should.equal(got_pid, plane2.1)
+
+  // The OLD plane's process was killed (the linked socket died with
+  // it); its stale DOWN is inert for the map — the entry stays live.
+  await_dead(plane1.1, 20)
+  let assert Ok(thread.EnvExec(still_sub, still_pid)) =
+    route_env(sess, "node-a")
+  should.equal(still_sub, plane2.0)
+  should.equal(still_pid, plane2.1)
+
+  // A name-only attach of the live name still refuses (Phase 2a rule).
+  let plain = process.new_subject()
+  process.send(sess, thread.AttachTarget("node-a", None, plain))
+  let assert Ok(Error("target \"node-a\" is already attached")) =
+    process.receive(plain, 2000)
+
+  process.kill(plane2.1)
+}
+
+/// Wait (bounded) for a killed pid to register as dead.
+fn await_dead(pid: process.Pid, tries: Int) -> Nil {
+  case process.is_alive(pid) {
+    False -> Nil
+    True ->
+      case tries {
+        0 -> panic as "pid still alive after kill"
+        _ -> {
+          process.sleep(20)
+          await_dead(pid, tries - 1)
+        }
+      }
+  }
+}
+
 pub fn route_env_error_wording_test() {
   let sess = start_with_env(happy_runner)
   let sub = join(sess)

@@ -2141,6 +2141,36 @@ fn entry_names(entries: List(tools.ToolsetEntry)) -> List(String) {
 /// A create naming env tools without NEXUS_WORKSPACE_ROOT refuses with
 /// the honest reason (UnknownToolset, a 400-class client error) — there
 /// is no root to freeze.
+/// The `/node/ws` join-authorization ask (Phase 2b-3): env capability
+/// reads from the FROZEN toolset the registry carries — an env-toolset
+/// thread answers True (workspace root frozen at create), a plain
+/// thread False, an unknown id False. A dormant env thread answers
+/// without waking (the record's spec predates the actor).
+pub fn env_capable_ask_test() {
+  let root = "/tmp/nexus-env-capable-" <> int.to_string(timing.now_us())
+  let #(registry, _seam) =
+    start_registry_with_workspace(root, store_mock.seam(store_mock.start()))
+  let assert Ok(env_thread) =
+    thread_registry.create(
+      registry,
+      thread_registry.NewThread(
+        ..new_thread(store_mock.fixture_provider_id, "env-thread"),
+        toolset: Some(["bash"]),
+      ),
+    )
+  let assert Ok(plain_thread) =
+    thread_registry.create(
+      registry,
+      thread_registry.NewThread(
+        ..new_thread(store_mock.fixture_provider_id, "plain-thread"),
+        toolset: None,
+      ),
+    )
+  should.be_true(thread_registry.env_capable(registry, env_thread.id))
+  should.be_false(thread_registry.env_capable(registry, plain_thread.id))
+  should.be_false(thread_registry.env_capable(registry, "t-ghost"))
+}
+
 pub fn env_toolset_refused_without_workspace_root_test() {
   let registry = start_registry()
   thread_registry.create(
