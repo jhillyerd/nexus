@@ -2171,6 +2171,51 @@ pub fn env_capable_ask_test() {
 
 /// the honest reason (UnknownToolset, a 400-class client error) — there
 /// is no root to freeze.
+/// The dormant half of the ask (cubic review): rows hydrated at boot
+/// answer from the STORED manifest without waking — reachable only by
+/// a direct ask on the /node/ws path (the route's `get` wakes first),
+/// so it is pinned here at the seam it lives on.
+pub fn env_capable_dormant_thread_test() {
+  let seam = store_mock.seam(store_mock.start())
+  store_mock.ensure_fixture_provider(seam)
+  let assert Ok(Nil) =
+    seam.insert_thread(
+      store.StoredSummary(
+        id: "s-env-dormant",
+        provider_id: store_mock.fixture_provider_id,
+        model: "alpha",
+        meta: fresh_meta(),
+        toolset: thread_registry.plain_entries(["bash"]),
+        workspace_root: Some("/srv/dormant"),
+        roster: Some(#(
+          env.roster_attach_text("workspace", env.attached_targets()),
+          1_700_000_000,
+        )),
+        last_active_at: timing.wall_now_s(),
+        message_count: 1,
+      ),
+      "prompt",
+    )
+  let assert Ok(Nil) =
+    seam.insert_thread(
+      store.StoredSummary(
+        id: "s-plain-dormant",
+        provider_id: store_mock.fixture_provider_id,
+        model: "alpha",
+        meta: fresh_meta(),
+        toolset: thread_registry.plain_entries(["http_fetch"]),
+        workspace_root: None,
+        roster: None,
+        last_active_at: timing.wall_now_s(),
+        message_count: 1,
+      ),
+      "prompt",
+    )
+  let #(registry, _seam2) = start_registry_with_workspace("/srv/root", seam)
+  should.be_true(thread_registry.env_capable(registry, "s-env-dormant"))
+  should.be_false(thread_registry.env_capable(registry, "s-plain-dormant"))
+}
+
 pub fn env_toolset_refused_without_workspace_root_test() {
   let registry = start_registry()
   thread_registry.create(

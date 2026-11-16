@@ -298,8 +298,8 @@ own NODE-token auth against the `node` table instead.
   JSON client protocol (`"v":1`) serves an event plane (the thread's
   fan-out projected as frames), an MCP-shaped tool plane (`tools/call`
   down with the arguments verbatim, results up, `notifications/
-  cancelled` down), and user input (`{"v":1,"type":"send","text":…}` — every frame
-carries `"v":1`).
+  cancelled` down), and user input — every frame carries `"v":1`
+  (`{"v":1,"type":"send","text":…}`).
   `role=env` (default) attaches the node's machine as an environment
   target — refused (403) on threads whose toolset has no env tools;
   `role=viewer` joins any thread with events and send but no tool

@@ -22,6 +22,7 @@ import nexus/bot_registry
 import nexus/config.{type Config}
 import nexus/hackney
 import nexus/loop
+import nexus/node
 import nexus/openai
 import nexus/provider
 import nexus/provider_registry
@@ -1343,4 +1344,26 @@ pub fn node_ws_pre_upgrade_refusals_test() {
   // cannot complete the WebSocket handshake (mist's upgrade path needs
   // the Upgrade headers), so the viewer happy path belongs to the e2e
   // fake node, which speaks real WS.
+}
+
+/// The insert's failure mapping (cubic review): the lost pre-check
+/// race cannot be staged through the seam (the mock rejects against
+/// the same state the pre-check reads), so the mapping is pinned
+/// directly — present name answers the friendly 409, a genuinely
+/// failing store stays 502.
+pub fn node_insert_failure_test() {
+  let row =
+    node.Node(
+      id: "n-race",
+      name: "proxmox-2",
+      token_hash: node.hash_token("tok"),
+      created_at: 1_700_000_000,
+      last_seen_at: None,
+    )
+  web.node_insert_failure(Ok([row]), "proxmox-2")
+  |> should.equal(#(409, "node name is already paired"))
+  web.node_insert_failure(Ok([row]), "other-name")
+  |> should.equal(#(502, "store unavailable"))
+  web.node_insert_failure(Error("disk full"), "proxmox-2")
+  |> should.equal(#(502, "store unavailable"))
 }

@@ -1378,17 +1378,29 @@ fn create_node_row(
           #("created_at", json.int(row.created_at)),
         ]),
       )
-    // A concurrent pair of the same name can lose the pre-check race
-    // and hit the unique index here: re-check before calling it a
-    // store failure — the loser deserves the same friendly 409.
-    Error(_) ->
-      case store.list_nodes() {
-        Error(_) -> json_response(502, err_json("store unavailable"))
-        Ok(rows) ->
-          case list.find(rows, fn(r) { r.name == name }) {
-            Ok(_) -> json_response(409, err_json("node name is already paired"))
-            Error(_) -> json_response(502, err_json("store unavailable"))
-          }
+    Error(_) -> {
+      let #(status, message) = node_insert_failure(store.list_nodes(), name)
+      json_response(status, err_json(message))
+    }
+  }
+}
+
+/// The insert's failure mapping (cubic review): a concurrent pair of
+/// the same name can lose the pre-check race and hit the unique index —
+/// re-check before calling it a store failure, so the loser gets the
+/// same friendly 409. Pure over the re-listed rows (the race itself
+/// cannot be staged through the seam: the mock rejects against the
+/// same state the pre-check reads), hence offline-testable directly.
+pub fn node_insert_failure(
+  listing: Result(List(store.StoredNode), store.StoreError),
+  name: String,
+) -> #(Int, String) {
+  case listing {
+    Error(_) -> #(502, "store unavailable")
+    Ok(rows) ->
+      case list.find(rows, fn(r) { r.name == name }) {
+        Ok(_) -> #(409, "node name is already paired")
+        Error(_) -> #(502, "store unavailable")
       }
   }
 }

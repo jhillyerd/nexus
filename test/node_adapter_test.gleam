@@ -220,6 +220,15 @@ fn exec_of(rig: Rig) -> thread.EnvExec {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// The receive bound budgets for aggressive JSON escaping (an escaped
+/// surrogate pair is 12 wire bytes per char) plus envelope headroom,
+/// so a frame carrying a capped result always passes while hostile
+/// frames stay hard-bounded.
+pub fn max_frame_bytes_budgets_escaping_test() {
+  should.equal(node_adapter.max_frame_bytes(1024), 1024 * 12 + 16_384)
+  should.be_true(node_adapter.max_frame_bytes(1024) > 1024 * 6)
+}
+
 /// The connect sequence: Hello + replay arrive as event frames, the
 /// attach answer arrives as `attached` — the fake node's first breath.
 pub fn adapter_connect_sequence_test() {

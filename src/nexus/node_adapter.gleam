@@ -308,12 +308,16 @@ type SocketMsg {
 /// external-transport cap rule. mist assembles a WS frame whole —
 /// there is no mid-frame hook — so this is the FIRST nexus-side touch:
 /// an oversized frame is refused and the connection closed before it
-/// is decoded, forwarded, or queued anywhere. Legitimate frames are
-/// far inside it (a result carries at most `max_output_chars` CHARS
-/// plus JSON envelope; 4 bytes/char covers the worst UTF-8 case, and
-/// the headroom absorbs the envelope and any protocol additions).
+/// is decoded, forwarded, or queued anywhere. The budget must let
+/// every LEGITIMATE frame through: a node may JSON-escape aggressively
+/// (control chars as `\\uXXXX` are 6 bytes per char; an
+/// encoder-agnostic ceiling is an escaped surrogate pair, 12 bytes per
+/// char), so a result within `max_output_chars` can still be several
+/// times that in wire bytes — 12x plus headroom for the envelope keeps
+/// "capped result ⇒ frame accepted" true for any encoder while still
+/// bounding hostile frames hard.
 pub fn max_frame_bytes(max_output_chars: Int) -> Int {
-  max_output_chars * 4 + 8192
+  max_output_chars * 12 + 16_384
 }
 
 fn init_socket(
