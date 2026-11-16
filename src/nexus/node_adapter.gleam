@@ -500,68 +500,69 @@ fn adapter_initialiser(
   role: Role,
   frames: Subject(String),
 ) -> Result(actor.Initialised(State, Msg, Subject(Msg)), String) {
-  let events = process.new_subject()
-  // Join the fan-out exactly like a Lustre runtime: Hello + replay
-  // (mid-turn joins replay the display mirror) land on `events`.
-  process.send(thread_subject, thread.Join(events, 1))
-  // The execution plane THIS actor offers: its provider-protocol
-  // subject (a dedicated owned subject — `EnvExec.sub` is typed
-  // `Subject(tool_provider.Msg)`, selected into `Provider` below)
-  // and its pid (what the thread actor monitors).
-  let provider_sub = process.new_subject()
-  let attach_reply = process.new_subject()
-  case role {
-    EnvRole ->
-      process.send(
-        thread_subject,
-        thread.AttachTarget(
-          name,
-          Some(thread.EnvExec(provider_sub, process.self())),
-          attach_reply,
-        ),
-      )
-    // Viewer: no attach, no execution plane — the reply subject simply
-    // never fires (the selector mapping is harmless).
-    ViewerRole -> Nil
-  }
-  let state =
-    State(
-      thread: thread_subject,
-      thread_id: thread_id,
-      name: name,
-      role: role,
-      frames: frames,
-      pending: dict.new(),
-      next_id: 1,
-      max_output_chars: cfg.env_max_output_bytes,
-      self: self,
-    )
-  // Watch the thread actor itself (CodeRabbit review): its exit would
-  // otherwise strand this adapter on a dead subject with no cleanup.
-  let selector = case process.subject_owner(thread_subject) {
+  // Resolve and MONITOR the thread owner BEFORE any message to it
+  // (CodeRabbit review): in production the subject is NAMED — a
+  // registry restart re-registers a replacement under the same name —
+  // so messages and the owner lookup can otherwise disagree about
+  // WHICH actor. Monitor-first makes every interleaving self-healing:
+  // if the sends land on the replacement while the monitor holds the
+  // old owner, the old owner's DOWN fires and the node reconnects; the
+  // unhealable state (monitor on the live replacement, messages lost
+  // to the dead predecessor) cannot arise. An unresolvable owner fails
+  // the start — the socket drops and the client reconnects.
+  case process.subject_owner(thread_subject) {
+    Error(_) -> Error("thread actor unavailable")
     Ok(owner_pid) -> {
       let thread_mon = process.monitor(owner_pid)
-      process.new_selector()
-      |> process.select(self)
-      |> process.select_map(events, Event)
-      |> process.select_map(provider_sub, Provider)
-      |> process.select_map(attach_reply, AttachAccepted)
-      |> process.select_specific_monitor(thread_mon, fn(_) { ThreadGone })
+      let events = process.new_subject()
+      // Join the fan-out exactly like a Lustre runtime: Hello + replay
+      // (mid-turn joins replay the display mirror) land on `events`.
+      process.send(thread_subject, thread.Join(events, 1))
+      // The execution plane THIS actor offers: its provider-protocol
+      // subject (a dedicated owned subject — `EnvExec.sub` is typed
+      // `Subject(tool_provider.Msg)`, selected into `Provider` below)
+      // and its pid (what the thread actor monitors).
+      let provider_sub = process.new_subject()
+      let attach_reply = process.new_subject()
+      case role {
+        EnvRole ->
+          process.send(
+            thread_subject,
+            thread.AttachTarget(
+              name,
+              Some(thread.EnvExec(provider_sub, process.self())),
+              attach_reply,
+            ),
+          )
+        // Viewer: no attach, no execution plane — the reply subject
+        // simply never fires (the selector mapping is harmless).
+        ViewerRole -> Nil
+      }
+      let state =
+        State(
+          thread: thread_subject,
+          thread_id: thread_id,
+          name: name,
+          role: role,
+          frames: frames,
+          pending: dict.new(),
+          next_id: 1,
+          max_output_chars: cfg.env_max_output_bytes,
+          self: self,
+        )
+      actor.initialised(state)
+      |> actor.returning(self)
+      |> actor.selecting(
+        process.new_selector()
+        |> process.select(self)
+        |> process.select_map(events, Event)
+        |> process.select_map(provider_sub, Provider)
+        |> process.select_map(attach_reply, AttachAccepted)
+        |> process.select_specific_monitor(thread_mon, fn(_) { ThreadGone }),
+      )
+      |> Ok
     }
-    // An ownerless subject cannot be monitored; the other cleanup
-    // paths (socket close, the thread's own exec-map monitor while
-    // it lives) still bound this adapter's lifetime.
-    Error(_) ->
-      process.new_selector()
-      |> process.select(self)
-      |> process.select_map(events, Event)
-      |> process.select_map(provider_sub, Provider)
-      |> process.select_map(attach_reply, AttachAccepted)
   }
-  actor.initialised(state)
-  |> actor.returning(self)
-  |> actor.selecting(selector)
-  |> Ok
 }
 
 fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {

@@ -10,6 +10,7 @@
 import gleam/erlang/process.{type Subject}
 import gleam/erlang/reference
 import gleam/option.{type Option, None, Some}
+import gleam/otp/actor
 import gleam/string
 import gleeunit/should
 import nexus/config
@@ -531,6 +532,126 @@ pub fn adapter_thread_death_stops_test() {
   should.be_true(string.contains(frame, "thread actor exited"))
   process.send(rig.adapter, node_adapter.FrameIn(node_protocol.Ping))
   should.equal(process.receive(rig.frames, 200), Error(Nil))
+}
+
+/// The thread owner is resolved BEFORE any message (CodeRabbit): a
+/// named subject with NO registered actor fails the adapter start
+/// (the socket drops; the client reconnects) instead of starting a
+/// monitor-less zombie.
+pub fn adapter_missing_thread_owner_fails_start_test() {
+  let name = process.new_name("nexus_test_absent_thread")
+  let frames = process.new_subject()
+  node_adapter.start_adapter(
+    test_config(),
+    thread_id,
+    process.named_subject(name),
+    "node-a",
+    node_adapter.EnvRole,
+    frames,
+  )
+  |> should.equal(Error(Nil))
+}
+
+/// The production shape (CodeRabbit): the thread subject is NAMED, and
+/// a registry restart re-registers a REPLACEMENT under the same name.
+/// The adapter's monitor holds the owner it resolved before sending,
+/// so the replacement race is self-healing — the old owner's DOWN
+/// closes the connection, and the node reconnects into the
+/// replacement (fresh Join + AttachTarget).
+pub fn adapter_thread_replacement_named_subject_test() {
+  let name = process.new_name("nexus_test_named_thread")
+  let first_pid = start_named_fake(name)
+  let frames = process.new_subject()
+  let assert Ok(adapter) =
+    node_adapter.start_adapter(
+      test_config(),
+      thread_id,
+      process.named_subject(name),
+      "node-a",
+      node_adapter.EnvRole,
+      frames,
+    )
+  let _hello = next_frame(frames)
+  let _replay = next_frame(frames)
+  let _attached = next_frame(frames)
+
+  // The registry analog: the old actor dies, a fresh one registers
+  // under the SAME name (the adapter's Join/Attach went to the old
+  // one — the messages cannot transfer).
+  process.kill(first_pid)
+  let _second_pid = start_named_fake(name)
+
+  // The monitor's DOWN arrives: the honest error frame, then silence.
+  let assert Ok(frame) = process.receive(frames, 2000)
+  should.be_true(string.contains(frame, "thread actor exited"))
+  process.send(adapter, node_adapter.FrameIn(node_protocol.Ping))
+  should.equal(process.receive(frames, 200), Error(Nil))
+}
+
+/// A minimal NAMED thread fake: registers under `name` (the registry's
+/// production shape) and answers the adapter's three arms. Started from
+/// an UNLINKED wrapper so the test can kill the fake (the replacement)
+/// without the `killed` exit propagating over a link to the TEST
+/// process — actors started directly by a test are linked to it.
+fn start_named_fake(name: process.Name(thread.Msg)) -> process.Pid {
+  let back = process.new_subject()
+  let _wrapper =
+    process.spawn_unlinked(fn() {
+      let assert Ok(started) =
+        actor.new_with_initialiser(2000, fn(self) {
+          actor.initialised(NamedFake(None))
+          |> actor.returning(self)
+          |> actor.selecting(process.new_selector() |> process.select(self))
+          |> Ok
+        })
+        |> actor.named(name)
+        |> actor.on_message(named_fake_handle)
+        |> actor.start
+      process.send(back, started.pid)
+      process.sleep_forever()
+    })
+  let assert Ok(pid) = process.receive(back, 2000)
+  pid
+}
+
+type NamedFake {
+  NamedFake(sub: Option(Subject(thread.ThreadEvent)))
+}
+
+fn named_fake_handle(
+  state: NamedFake,
+  msg: thread.Msg,
+) -> actor.Next(NamedFake, thread.Msg) {
+  case msg {
+    thread.Join(sub, visit) -> {
+      process.send(
+        sub,
+        thread.ThreadEvent(thread_id, visit, thread.Hello("fake-alias", 2, [])),
+      )
+      process.send(
+        sub,
+        thread.ThreadEvent(
+          thread_id,
+          visit,
+          thread.UserEcho(
+            "attached targets: workspace.",
+            Some(1),
+            Some("system"),
+          ),
+        ),
+      )
+      actor.continue(NamedFake(..state, sub: Some(sub)))
+    }
+    thread.AttachTarget(_name, _exec, reply) -> {
+      process.send(reply, Ok(Nil))
+      actor.continue(state)
+    }
+    thread.Send(_text, _author, _depth, reply) -> {
+      process.send(reply, thread.Sent)
+      actor.continue(state)
+    }
+    _ -> actor.continue(state)
+  }
 }
 
 /// A refused attach (roster race) tells the node why, then the adapter
