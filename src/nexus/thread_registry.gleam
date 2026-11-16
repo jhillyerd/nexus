@@ -170,6 +170,11 @@ pub type Msg {
   /// (Phase 2: which lazily starts a hydrated actor). `Error(Nil)` for
   /// unknown ids or for threads whose restart failed.
   Get(id: String, reply: Subject(Result(Subject(thread.Msg), Nil)))
+  /// Does the thread's frozen toolset include environment tools?
+  /// (environments plan Phase 2b-3): the node route's join-authorization
+  /// check — an environment-role join is refused on threads with no
+  /// env tools, the `UnknownToolset` loud-refusal philosophy.
+  EnvCapable(id: String, reply: Subject(Bool))
   /// All threads (live + dormant), pinned first then most-recently-active
   /// first. Archiving does not hide a thread from the list — callers
   /// (HTTP, UI) filter by the `archived` flag.
@@ -1231,6 +1236,27 @@ fn record_summary(record: Record) -> thread.ThreadSummary {
 
 fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
   case msg {
+    EnvCapable(id, reply) -> {
+      // Read from what the registry already holds, never a
+      // re-resolution: the answer is as frozen as the envelope it
+      // guards. A LIVE record answers from its `ThreadSpec.toolset`
+      // (resolved names at create/hydrate); a DORMANT thread answers
+      // from its STORED summary's manifest (the persisted frozen
+      // toolset) WITHOUT waking the actor; an unknown id is False.
+      let capable = case dict.get(state.threads, id) {
+        Ok(record) -> list.any(record.spec.toolset.names, env.is_env_name)
+        Error(_) ->
+          case dict.get(state.dormant, id) {
+            Ok(summary) ->
+              list.any(summary.toolset, fn(entry) {
+                env.is_env_name(entry.name)
+              })
+            Error(_) -> False
+          }
+      }
+      process.send(reply, capable)
+      actor.continue(state)
+    }
     Get(id, reply) -> {
       let resolved = case dict.get(state.threads, id) {
         Ok(record) ->
@@ -2874,6 +2900,12 @@ pub fn get(
   id: String,
 ) -> Result(Subject(thread.Msg), Nil) {
   actor.call(registry, 5000, fn(reply) { Get(id:, reply:) })
+}
+
+/// Whether the thread's frozen toolset includes environment tools
+/// (the `/node/ws` join-authorization check, environments plan 2b-3).
+pub fn env_capable(registry: Subject(Msg), id: String) -> Bool {
+  actor.call(registry, 5000, fn(reply) { EnvCapable(id:, reply:) })
 }
 
 pub fn list_threads(registry: Subject(Msg)) -> List(thread.ThreadSummary) {

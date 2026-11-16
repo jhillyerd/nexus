@@ -243,6 +243,43 @@ deltas; the rules that bite silently:
   actor module; the `nexus/tools` bridge builds the ToolSpecs — the
   codemode cycle rule).
 
+## Node protocol invariants (environments 2b-3 shipped)
+
+`docs/plans/environments.md` §2b-3 carries the design and as-built
+ deltas; the rules that bite silently:
+
+- **Only the socket-owner process sends frames.** mist panics on a
+  WebSocket send from any other process (permessage-deflate state is
+  process-local), so the node adapter hands finished frame STRINGS to
+  a `frames` subject the socket loop selects on — never call
+  `mist.send_text_frame` from the adapter actor. The adapter is
+  LINKED to the socket process, and the route's `on_close` KILLS it:
+  the link covers abnormal deaths (crash, the replace-kill), but an
+  actor's own NORMAL exit does not rupture links — the graceful
+  client close needs the explicit kill or the adapter stays orphaned
+  and attached (the 2b-4 fake node's detach-mid-call check).
+- **The adapter keeps no timers.** `tool_provider.run_remote` owns
+  deadline, monitor, and cancel re-signal — a wedged node answers as
+  an executor timeout, a dead adapter as a monitor DOWN, both
+  ordinary tool errors. Result text caps at the boundary on receipt
+  (the frame is the WS read unit; mist exposes no mid-frame cap).
+- **`tools/call` arguments embed VERBATIM** (string concat around
+  argument bytes proven a JSON object first — `valid_arguments`; a
+  violation answers a ToolErr, never a malformed frame), and a
+  JSON-RPC error-object response is a FAILED call. The protocol is
+  `"v":1`, additive-only: changing a wire shape is a protocol change,
+  never a refactor (`node_protocol_test` pins exact strings).
+- **Replace-on-reconnect**: an attach carrying an execution plane
+  whose name is already live KILLS the old plane's pid and registers
+  the new one immediately, appending NO roster line (the list is
+  unchanged); name-only duplicate attaches still refuse. Node identity
+  is the authenticated `node` ROW — its name is the roster target.
+- **Node tokens are distinct from the UI token**: pair-verified
+  name+token against the `node` table pre-upgrade (401/400/404/403 as
+  plain statuses), `role=env` gated by `thread_registry.env_capable`
+  (the frozen toolset), `role=viewer` ungated. Revocation is a row
+  delete — future connections fail, live ones keep running.
+
 ## Plugin / tool-provider invariants (Phase 1 shipped)
 
 `docs/plans/plugin-api.md` carries the full design and as-built deltas;

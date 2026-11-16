@@ -14,6 +14,7 @@
 
 import gleam/bit_array
 import gleam/bytes_tree
+import gleam/crypto
 import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/http.{type Method, Delete, Get, Patch, Post}
@@ -29,9 +30,12 @@ import mist
 import nexus/bot
 import nexus/bot_registry
 import nexus/config.{type Config}
+import nexus/node
+import nexus/node_adapter
 import nexus/page
 import nexus/provider
 import nexus/provider_registry
+import nexus/store
 import nexus/thread
 import nexus/thread_create
 import nexus/thread_registry
@@ -51,6 +55,7 @@ pub fn handler(
   registry_name: process.Name(thread_registry.Msg),
   providers_name: process.Name(provider_registry.Msg),
   bots_name: process.Name(bot_registry.Msg),
+  store store: store.Store,
 ) -> fn(Request(mist.Connection)) -> Response(mist.ResponseData) {
   let registry = process.named_subject(registry_name)
   let providers = process.named_subject(providers_name)
@@ -135,6 +140,21 @@ pub fn handler(
             thread_create.models_timeout(cfg),
           )
         })
+      // The node WebSocket (environments plan Phase 2b-3): NODE-token
+      // auth against the `node` table, not the UI token — it does its
+      // own `protected` (a node is not a browser).
+      Get, ["node", "ws"] -> node_adapter.websocket(req, cfg, store, registry)
+      // Node pairing rows (environments plan Phase 2b-3): the minimal
+      // scripting surface over the 2b-1 table — list (no token hash on
+      // the wire), pair (the plaintext token answers ONCE, at create),
+      // revoke (a row delete; a live connection is not retroactively
+      // killed — reconnects fail). The settings-surface pairing UX is
+      // still plan-deferred; these routes are the curl/e2e path.
+      Get, ["nodes"] -> protected(cfg, req, fn() { nodes_response(store) })
+      Post, ["nodes"] ->
+        protected(cfg, req, fn() { create_node_response(req, store) })
+      Delete, ["nodes", id] ->
+        protected(cfg, req, fn() { delete_node_response(store, id) })
       _, _ -> json_response(404, err_json("not found"))
     }
   }
@@ -1238,6 +1258,170 @@ fn stop_response(
 }
 
 // ---------------------------------------------------------------------------
+// Node routes (environments plan Phase 2b-3)
+// ---------------------------------------------------------------------------
+
+/// The POST /nodes body: `{"name": …}` — everything else (id, token,
+/// hashes, stamps) is minted server-side.
+pub type NodeCreateFields {
+  NodeCreateFields(name: String)
+}
+
+pub fn node_create_fields_decoder() -> decode.Decoder(NodeCreateFields) {
+  use name <- decode.field("name", decode.string)
+  decode.success(NodeCreateFields(name:))
+}
+
+pub fn parse_node_create_json(body: String) -> Result(NodeCreateFields, Nil) {
+  json.parse(body, using: node_create_fields_decoder())
+  |> result.map_error(fn(_) { Nil })
+}
+
+fn read_node_create(
+  req: Request(mist.Connection),
+) -> Result(NodeCreateFields, Nil) {
+  case mist.read_body(req, max_body_limit: 1_000_000) {
+    Error(_) -> Error(Nil)
+    Ok(read) ->
+      case bit_array.to_string(read.body) {
+        Error(_) -> Error(Nil)
+        Ok(body) -> parse_node_create_json(body)
+      }
+  }
+}
+
+/// Rows without secrets: the token HASH never rides the wire (it is
+/// public-by-nature in the row, but there is no reason to serve it).
+fn node_json(row: store.StoredNode) -> Json {
+  json.object([
+    #("id", json.string(row.id)),
+    #("name", json.string(row.name)),
+    #("created_at", json.int(row.created_at)),
+    #("created_at_rfc3339", json.string(timing.wall_to_rfc3339(row.created_at))),
+    #("last_seen_at", case row.last_seen_at {
+      Some(at) -> json.int(at)
+      None -> json.null()
+    }),
+  ])
+}
+
+fn nodes_response(store: store.Store) -> Response(mist.ResponseData) {
+  case store.list_nodes() {
+    Ok(rows) ->
+      json_response(200, json.object([#("nodes", json.array(rows, node_json))]))
+    Error(_) -> json_response(502, err_json("store unavailable"))
+  }
+}
+
+/// Pair: validate the name, mint the token (32 random bytes, URL-safe
+/// base64 — query-string safe for `/node/ws?token=`), store only the
+/// hash, answer the plaintext EXACTLY ONCE. Collision with a live name
+/// is the friendly 409 (the schema's UNIQUE is the backstop).
+fn create_node_response(
+  req: Request(mist.Connection),
+  store: store.Store,
+) -> Response(mist.ResponseData) {
+  case read_node_create(req) {
+    Error(_) -> json_response(400, err_json("unreadable body"))
+    Ok(fields) ->
+      case node.valid_name(fields.name) {
+        Error(reason) -> json_response(400, err_json(reason))
+        Ok(name) ->
+          // Uniqueness pre-check against the loaded rows (the bot
+          // registry's pattern): the seam's single-error type cannot
+          // distinguish "missing" from "store down", but `list_nodes`
+          // answers unambiguously — the schema's UNIQUE is the
+          // cross-instance backstop either way.
+          case store.list_nodes() {
+            Error(_) -> json_response(502, err_json("store unavailable"))
+            Ok(rows) ->
+              case list.find(rows, fn(row) { row.name == name }) {
+                Ok(_) ->
+                  json_response(409, err_json("node name is already paired"))
+                Error(_) -> create_node_row(store, name)
+              }
+          }
+      }
+  }
+}
+
+fn create_node_row(
+  store: store.Store,
+  name: String,
+) -> Response(mist.ResponseData) {
+  let token =
+    crypto.strong_random_bytes(32)
+    |> bit_array.base64_url_encode(False)
+  let id =
+    crypto.strong_random_bytes(8)
+    |> bit_array.base16_encode
+    |> string.lowercase
+    |> fn(hex) { "n" <> hex }
+  let row =
+    node.Node(
+      id: id,
+      name: name,
+      token_hash: node.hash_token(token),
+      created_at: timing.wall_now_s(),
+      last_seen_at: option.None,
+    )
+  case store.insert_node(row) {
+    Ok(Nil) ->
+      json_response(
+        201,
+        json.object([
+          #("id", json.string(row.id)),
+          #("name", json.string(row.name)),
+          // The plaintext answers ONCE, here — the stored row carries
+          // only the hash, and no later route can recover it.
+          #("token", json.string(token)),
+          #("created_at", json.int(row.created_at)),
+        ]),
+      )
+    Error(_) -> {
+      let #(status, message) = node_insert_failure(store.list_nodes(), name)
+      json_response(status, err_json(message))
+    }
+  }
+}
+
+/// The insert's failure mapping (cubic review): a concurrent pair of
+/// the same name can lose the pre-check race and hit the unique index —
+/// re-check before calling it a store failure, so the loser gets the
+/// same friendly 409. Pure over the re-listed rows (the race itself
+/// cannot be staged through the seam: the mock rejects against the
+/// same state the pre-check reads), hence offline-testable directly.
+pub fn node_insert_failure(
+  listing: Result(List(store.StoredNode), store.StoreError),
+  name: String,
+) -> #(Int, String) {
+  case listing {
+    Error(_) -> #(502, "store unavailable")
+    Ok(rows) ->
+      case list.find(rows, fn(r) { r.name == name }) {
+        Ok(_) -> #(409, "node name is already paired")
+        Error(_) -> #(502, "store unavailable")
+      }
+  }
+}
+
+/// Revoke = row delete (the 2b-1 posture): the token's authority is
+/// gone at once for FUTURE connections; an already-live connection is
+/// not retroactively killed (v1 — documented in the plan's as-built
+/// deltas). Idempotent: deleting an absent id succeeds.
+fn delete_node_response(
+  store: store.Store,
+  id: String,
+) -> Response(mist.ResponseData) {
+  case store.delete_node(id) {
+    Ok(Nil) ->
+      response.new(204)
+      |> response.set_body(mist.Bytes(bytes_tree.new()))
+    Error(_) -> json_response(502, err_json("store unavailable"))
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Pure helpers (offline-testable)
 // ---------------------------------------------------------------------------
 
@@ -1634,12 +1818,14 @@ pub fn requires_auth(method: Method, segments: List(String)) -> Bool {
     | Get, ["lustre", "runtime.mjs"]
     | Get, ["css", "pico.min.css"]
     | Get, ["ws"]
+    | Get, ["nodes"]
     -> True
     Post, ["threads"]
     | Post, ["threads", _, "send"]
     | Post, ["threads", _, "stop"]
     | Post, ["providers"]
     | Post, ["bots"]
+    | Post, ["nodes"]
     -> True
     Patch, ["threads", _]
     | Delete, ["threads", _]
@@ -1647,7 +1833,11 @@ pub fn requires_auth(method: Method, segments: List(String)) -> Bool {
     | Delete, ["providers", _]
     | Patch, ["bots", _]
     | Delete, ["bots", _]
+    | Delete, ["nodes", _]
     -> True
+    // `GET /node/ws` is deliberately ABSENT: it carries its own
+    // NODE-token auth against the `node` table (a node is not a
+    // browser), answered pre-upgrade as plain HTTP statuses.
     _, _ -> False
   }
 }

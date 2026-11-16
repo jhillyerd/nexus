@@ -258,6 +258,7 @@ pub fn main() -> Nil {
               registry_name,
               provider_registry_name,
               bot_registry_name,
+              persist.seam(process.named_subject(store_name)),
             ))
             |> mist.bind(cfg.http_bind)
             |> mist.port(cfg.http_port)

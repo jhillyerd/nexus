@@ -114,3 +114,26 @@ this step — never hand-edit the JSON.
 
 Historical evidence and measured numbers:
 `docs/plans/completed/m3-verification.md`.
+
+## Fake-node suite (node protocol) — `node e2e/node.spec.mjs`
+
+The environments plan's remote-node proof (2b-4): a headless fake node
+(Node's built-in WebSocket — no Playwright, no new dependencies) speaking
+the `/node/ws` client protocol v1 against a real nexus with its own fake
+OpenAI SSE provider scripting env-tool turns. Same preconditions as the
+browser suite (Postgres on 5433; the suite truncates and seeds itself)
+plus Node ≥ 22 (the suite uses the global `WebSocket`, which Node 20
+lacks) — no browser download, ~1 minute, loopback only:
+
+```sh
+node e2e/node.spec.mjs
+```
+
+Checks (environments plan §2b-4): pairing through `POST /nodes`, the
+connect sequence (hello + roster-line replay + attached), a full remote
+tool round (arguments verbatim on the wire, the model's round-2 answer
+embedding the node's bytes), replace-on-reconnect (old socket dies, no
+roster line, message_count unchanged), detach mid-call (monitor-answered
+failed tool result, the round commits, the queued detach line lands),
+wrong-token 401, env-role 403 on a plain thread, and viewer role (events
++ send, no tool plane). Writes `e2e/node-report.json`.
