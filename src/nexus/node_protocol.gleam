@@ -386,11 +386,16 @@ fn server_shape(text: String) -> Result(ServerShape, Nil) {
     use v <- decode.field("v", decode.int)
     use kind <- decode.optional_field("type", "", decode.string)
     use method <- decode.optional_field("method", "", decode.string)
-    decode.success(case v == version, kind, method {
-      True, "", "tools/call" -> CallShape
-      True, "", "notifications/cancelled" -> CancelledShape
-      True, kind, "" -> EventShape(kind)
-      _, _, _ -> EventShape("")
+    use jsonrpc <- decode.optional_field("jsonrpc", "", decode.string)
+    decode.success(case v == version, kind, method, jsonrpc {
+      // The tool plane validates its JSON-RPC marker, mirroring
+      // decode_client_frame's response discrimination — a frame that
+      // falsifies or omits it cannot arrive as an executable request
+      // or a cancellation (cubic PR review).
+      True, "", "tools/call", "2.0" -> CallShape
+      True, "", "notifications/cancelled", "2.0" -> CancelledShape
+      True, kind, "", "" -> EventShape(kind)
+      _, _, _, _ -> EventShape("")
     })
   }
   json.parse(text, using: decoder) |> result.replace_error(Nil)

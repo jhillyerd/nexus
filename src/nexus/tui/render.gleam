@@ -129,19 +129,34 @@ pub fn undecodable() -> List(Render) {
   [Line("! undecodable frame from server")]
 }
 
-/// Emit rendered pieces to stdout. The REPL prompt re-appears only
-/// when the next input line is read — output arriving mid-line
-/// interleaves, the documented PoC jank (a full-screen TUI owns the
-/// whole screen and does not have this problem).
+/// Emit rendered pieces to stdout. A `Line` following open `Inline`
+/// streaming first terminates that stream — streamed answer text and
+/// the next chip otherwise share a line (cubic PR review). The REPL
+/// prompt re-appears only when the next input line is read — output
+/// arriving mid-line interleaves, the documented PoC jank (a
+/// full-screen TUI owns the whole screen and does not have this
+/// problem).
 pub fn emit(frames: List(Render)) -> Nil {
+  emit_loop(frames, False)
+}
+
+fn emit_loop(frames: List(Render), inline_open: Bool) -> Nil {
   case frames {
     [] -> Nil
     [piece, ..rest] -> {
-      case piece {
-        Line(text) -> io.println(text)
-        Inline(text) -> io.print(text)
+      let now_open = case piece {
+        Line(_) -> False
+        Inline(_) -> True
       }
-      emit(rest)
+      case piece, inline_open {
+        Line(text), True -> {
+          io.println("")
+          io.println(text)
+        }
+        Line(text), False -> io.println(text)
+        Inline(text), _ -> io.print(text)
+      }
+      emit_loop(rest, now_open)
     }
   }
 }

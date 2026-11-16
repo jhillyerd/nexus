@@ -154,7 +154,10 @@ function startFakeProvider() {
 
         if (scenario === "nodebash" && !toolDone) {
           const marker = /marker:(\S+)/.exec(userText)?.[1] ?? "plain";
-          const args = `{  "command" : "echo ${marker}" , "target":"${NODE_NAME}"}`;
+          // touch proves the command ran with cwd = the TUI's workspace
+          // (the marker file is asserted there, and absent from the
+          // server's workspace).
+          const args = `{  "command" : "echo ${marker} && touch tui-e2e-marker" , "target":"${NODE_NAME}"}`;
           sse(chunk({ role: "assistant", content: "" }));
           sse(chunk({ tool_calls: [{ index: 0, id: callId, type: "function", function: { name: "bash", arguments: "" } }] }));
           sse(chunk({ tool_calls: [{ index: 0, function: { arguments: args } }] }));
@@ -210,6 +213,11 @@ function seedProvider(port) {
 }
 
 function startNexus(providerPort, workspaceRoot) {
+  // Derive the server's Postgres settings from the selected database
+  // URL — reset/seed already honor E2E_DATABASE_URL, so a non-default
+  // URL must not leave the server pointed at the default database
+  // (cubic PR review).
+  const pg = new URL(DATABASE_URL);
   const env = {
     ...process.env,
     NEXUS_ENCRYPTION_KEY: ENC_KEY,
@@ -220,6 +228,11 @@ function startNexus(providerPort, workspaceRoot) {
     NEXUS_WORKSPACE_ROOT: workspaceRoot,
     NEXUS_ENV_TIMEOUT_MS: "20000",
     NEXUS_SYSTEM_PROMPT: "You are nexus under the node-TUI e2e test.",
+    NEXUS_PG_HOST: pg.hostname,
+    NEXUS_PG_PORT: pg.port || "5432",
+    NEXUS_PG_DATABASE: pg.pathname.slice(1),
+    NEXUS_PG_USER: decodeURIComponent(pg.username),
+    ...(pg.password ? { NEXUS_PG_PASSWORD: decodeURIComponent(pg.password) } : {}),
   };
   const child = spawn("gleam", ["run"], {
     cwd: ROOT,
@@ -404,9 +417,15 @@ async function main() {
     if (toolRow.is_error !== false) throw new Error(`tool row flagged error: ${toolRow.content}`);
     if (!/TUI-1/.test(toolRow.content ?? "")) throw new Error(`tool row content: ${toolRow.content}`);
     // The command ran in the TUI's OWN workspace (its workspace dir,
-    // scoped by the thread id), not the server's.
-    if (!existsSync(join(tuiWorkspace, envThread))) {
-      throw new Error("bash ran somewhere else: no workspace dir under the TUI's root");
+    // scoped by the thread id): the scripted command touched a marker
+    // file, asserted there and absent from the server's workspace —
+    // proving cwd routing, not just lazy dir creation (cubic PR
+    // review).
+    if (!existsSync(join(tuiWorkspace, envThread, "tui-e2e-marker"))) {
+      throw new Error("bash did not run in the TUI's workspace: no marker file");
+    }
+    if (existsSync(join(serverWorkspace, envThread, "tui-e2e-marker"))) {
+      throw new Error("marker landed in the SERVER workspace");
     }
     // The TUI rendered the round: the call chip, the result chip, and
     // the streaming answer closing with a turn-done line.

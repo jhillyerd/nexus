@@ -164,6 +164,7 @@ pub fn serve_node_call_routes_to_local_test() {
   // Lazy workspace creation still applies, scoped by the handle's
   // thread id.
   simplifile.is_directory(root <> "/srv-thread") |> should_equal(Ok(True))
+  let _ = simplifile.delete(root)
 }
 
 pub fn serve_node_call_file_tools_test() {
@@ -200,10 +201,12 @@ pub fn serve_node_call_file_tools_test() {
       cancel: cancel,
     )
   string.contains(listing, "a.txt") |> should_equal(True)
+  let _ = simplifile.delete(root)
 }
 
 pub fn serve_node_call_refusals_test() {
-  let handle = node_for(fresh_root())
+  let root = fresh_root()
+  let handle = node_for(root)
   let cancel = process.new_subject()
   // Unknown tool name: a node serves the four compiled env tools only.
   let assert Error(reason) =
@@ -237,12 +240,14 @@ pub fn serve_node_call_refusals_test() {
       max_output_bytes: 10_000,
       cancel: cancel,
     )
+  let _ = simplifile.delete(root)
 }
 
 pub fn serve_node_call_nonzero_exit_is_data_test() {
+  let root = fresh_root()
   let assert Ok(text) =
     env.serve_node_call(
-      handle: node_for(fresh_root()),
+      handle: node_for(root),
       tool: "bash",
       arguments: "{\"target\":\"tui-node\",\"command\":\"exit 7\"}",
       timeout_ms: 10_000,
@@ -250,6 +255,7 @@ pub fn serve_node_call_nonzero_exit_is_data_test() {
       cancel: process.new_subject(),
     )
   string.starts_with(text, "exit status 7") |> should_equal(True)
+  let _ = simplifile.delete(root)
 }
 
 pub fn route_names_live_roster_test() {

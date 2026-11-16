@@ -16,5 +16,10 @@ get_line(Prompt) ->
         % stdin_loop leaves cleanly instead of type-lying about a
         % tuple being a String.
         {error, _} -> {error, nil};
-        Line -> {ok, Line}
+        % io:get_line returns a CHARLIST (codepoint list) on a TTY and
+        % a binary on pipes — normalize both to a Gleam String (UTF-8
+        % binary); passing a charlist through typed as String crashed
+        % string.trim/JSON encoding on interactive input (cubic PR
+        % review).
+        Line -> {ok, unicode:characters_to_binary(Line)}
     end.

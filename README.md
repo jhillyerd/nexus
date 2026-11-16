@@ -405,7 +405,7 @@ token=$(curl -s -X POST -H "Authorization: Bearer $NEXUS_UI_TOKEN" \
 NEXUS_URL=http://127.0.0.1:8080 \
 NEXUS_NODE=laptop \
 NEXUS_NODE_TOKEN="$token" \
-NEXUS_THREAD=<thread id> \
+NEXUS_THREAD='<thread id>' \
 gleam run -m nexus/tui
 ```
 

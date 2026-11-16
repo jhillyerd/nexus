@@ -123,6 +123,11 @@ pub fn render_tool_chips_truncate_test() {
   let assert [render.Line(rendered_error)] =
     render.render(node_protocol.ToolResult("call_2", "bash", False, long))
   string.starts_with(rendered_error, "← bash ERROR: ") |> should.be_true
+  // The failed branch truncates through the same helper — pinned
+  // exactly so unbounded hostile error output cannot regress (cubic
+  // PR review).
+  rendered_error
+  |> should.equal("← bash ERROR: " <> string.repeat("x", 399) <> "…")
   // Every rendered piece is plain text: no markup, no escapes.
   let assert [render.Line(hostile)] =
     render.render(node_protocol.ToolResult(
@@ -263,8 +268,12 @@ pub fn execute_malformed_arguments_test() {
   string.contains(text, "target") |> should.be_true
 }
 
-/// The cancelled call path: a pre-signalled cancel subject resolves
-/// the bash call as an error carrying its partial output.
+/// The cancelled call path: a pre-signaled cancel subject is ALREADY
+/// in the executor's mailbox when the select loop starts (the port has
+/// not even spawned), so the cancel itself is deterministic; the
+/// command's output may or may not have flushed by the kill, so only
+/// the outcome flag and the cancel wording are asserted — never the
+/// partial content (cubic PR review: asserting `partial` was a race).
 pub fn execute_cancel_test() {
   let cancel = process.new_subject()
   process.send(cancel, Nil)
@@ -278,7 +287,8 @@ pub fn execute_cancel_test() {
       cancel: cancel,
     )
   outcome.0 |> should.be_true
-  string.contains(outcome.1, "partial") |> should.be_true
+  string.starts_with(outcome.1, "cancelled. partial output:")
+  |> should.be_true
 }
 
 /// The response half: an executed call encodes to the exact JSON-RPC

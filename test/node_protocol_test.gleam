@@ -337,38 +337,61 @@ pub fn decode_hello_test() {
 /// ThreadEvent that event_frame encodes decodes back to the same flat
 /// values.
 pub fn decode_event_round_trip_test() {
+  // Each sample carries its expected decoded frame — the round trip
+  // is asserted value-for-value, not just non-Unknown (cubic PR
+  // review: field regressions in text, stamps, ids, flags must fail).
   let samples = [
-    thread.UserEcho("hello", Some(1000), Some("system")),
-    thread.UserEcho("hello", None, None),
-    thread.AssistantFull("done", Some(1001)),
-    thread.ReasoningFull("thinking"),
-    thread.Token("fr"),
-    thread.Reasoning("why"),
-    thread.ToolCallAssembled(
-      "call_1",
-      "bash",
-      "{\"command\":\"echo hi\"}",
-      Some(1002),
+    #(
+      thread.UserEcho("hello", Some(1000), Some("system")),
+      node_protocol.UserLine("hello", Some(1000), Some("system")),
     ),
-    thread.ToolResult("call_1", "bash", True, "hi"),
-    thread.ToolResult("call_2", "bash", False, "nope"),
-    thread.LoopStatus(2, 8, "tools"),
-    thread.MetaUpdated(Some("title"), ["a", "b"]),
-    thread.MetaUpdated(None, []),
+    #(
+      thread.UserEcho("hello", None, None),
+      node_protocol.UserLine("hello", None, None),
+    ),
+    #(
+      thread.AssistantFull("done", Some(1001)),
+      node_protocol.AssistantFull("done", Some(1001)),
+    ),
+    #(thread.ReasoningFull("thinking"), node_protocol.ReasoningFull("thinking")),
+    #(thread.Token("fr"), node_protocol.Token("fr")),
+    #(thread.Reasoning("why"), node_protocol.Reasoning("why")),
+    #(
+      thread.ToolCallAssembled(
+        "call_1",
+        "bash",
+        "{\"command\":\"echo hi\"}",
+        Some(1002),
+      ),
+      node_protocol.ToolCall(
+        "call_1",
+        "bash",
+        "{\"command\":\"echo hi\"}",
+        Some(1002),
+      ),
+    ),
+    #(
+      thread.ToolResult("call_1", "bash", True, "hi"),
+      node_protocol.ToolResult("call_1", "bash", True, "hi"),
+    ),
+    #(
+      thread.ToolResult("call_2", "bash", False, "nope"),
+      node_protocol.ToolResult("call_2", "bash", False, "nope"),
+    ),
+    #(thread.LoopStatus(2, 8, "tools"), node_protocol.LoopStatus(2, 8, "tools")),
+    #(
+      thread.MetaUpdated(Some("title"), ["a", "b"]),
+      node_protocol.Meta(Some("title"), ["a", "b"]),
+    ),
+    #(thread.MetaUpdated(None, []), node_protocol.Meta(None, [])),
   ]
   samples
-  |> list.each(fn(kind) {
+  |> list.each(fn(sample) {
+    let #(kind, expected) = sample
     let assert Ok(frame) = node_protocol.event_frame(event("t1", kind))
-    let assert Ok(decoded) = node_protocol.decode_server_frame(frame)
-    decoded |> should_not_be_unknown
+    node_protocol.decode_server_frame(frame)
+    |> should.equal(Ok(expected))
   })
-}
-
-fn should_not_be_unknown(frame: node_protocol.ServerFrame) -> Nil {
-  case frame {
-    node_protocol.Unknown -> panic as "additive decode failed: got Unknown"
-    _ -> Nil
-  }
 }
 
 pub fn decode_turn_done_stats_test() {
