@@ -407,12 +407,19 @@ NEXUS_THREAD='<thread id>' \
 bin/nexus-tui
 ```
 
-Manually, the same dance is:
+Manually, the same dance is (delete the stale row first — a re-pair
+mints a fresh token, and rerunning without the delete is a 409):
 
 ```sh
-token=$(curl -s -X POST -H "Authorization: Bearer $NEXUS_UI_TOKEN" \
-  -H 'content-type: application/json' -d '{"name":"laptop"}' \
-  http://127.0.0.1:8080/nodes | jq -r .token)   # shown exactly once
+UI="Authorization: Bearer $NEXUS_UI_TOKEN"
+
+LAPTOP_ID=$(curl -s -H "$UI" \
+  http://127.0.0.1:8080/nodes | jq -r '.nodes[] | select(.name == "laptop") | .id')
+[ -n "$LAPTOP_ID" ] && curl -s -X DELETE -H "$UI" \
+  "http://127.0.0.1:8080/nodes/$LAPTOP_ID"
+
+token=$(curl -s -X POST -H "$UI" -H 'content-type: application/json' \
+  -d '{"name":"laptop"}' http://127.0.0.1:8080/nodes | jq -r .token)  # shown exactly once
 
 NEXUS_URL=http://127.0.0.1:8080 \
 NEXUS_NODE=laptop \

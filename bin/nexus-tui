@@ -11,9 +11,11 @@
 #
 # Required env:
 #   NEXUS_URL       server base URL, e.g. http://boss.home.arpa:8080
-#   NEXUS_UI_TOKEN  the server's UI token (guards the pairing API)
 #   NEXUS_THREAD    thread id to join (an env-toolset thread for role=env)
 # Optional env:
+#   NEXUS_UI_TOKEN  the server's UI token — OMIT it entirely when the
+#                   server itself runs without auth (its NEXUS_UI_TOKEN
+#                   unset): the pairing API then needs no header
 #   NEXUS_NODE      node name override (default: short hostname)
 #   NEXUS_ROLE      env (default) | viewer
 #
@@ -23,8 +25,15 @@
 set -euo pipefail
 
 : "${NEXUS_URL:?NEXUS_URL is required, e.g. http://boss.home.arpa:8080}"
-: "${NEXUS_UI_TOKEN:?NEXUS_UI_TOKEN is required — the server UI token}"
 : "${NEXUS_THREAD:?NEXUS_THREAD is required — a thread id, env-toolset for role=env}"
+
+# The UI token is OPTIONAL: the server explicitly supports running
+# without auth (its own NEXUS_UI_TOKEN unset), and then the pairing
+# API answers without any Authorization header (cubic PR review).
+AUTH=()
+if [ -n "${NEXUS_UI_TOKEN:-}" ]; then
+  AUTH=(-H "Authorization: Bearer $NEXUS_UI_TOKEN")
+fi
 
 BASE="${NEXUS_URL%/}"
 NODE="${NEXUS_NODE:-$(hostname -s 2>/dev/null || hostname | cut -d. -f1)}"
@@ -44,8 +53,6 @@ esac
 for tool in curl jq gleam; do
   command -v "$tool" >/dev/null || { echo "error: $tool is required" >&2; exit 1; }
 done
-
-AUTH=(-H "Authorization: Bearer $NEXUS_UI_TOKEN")
 
 # Replace any stale row under this name — the whole point of re-running
 # is a fresh pairing every launch.
