@@ -45,9 +45,24 @@ import nexus/env.{type Environment}
 import nexus/loop
 import nexus/openai
 import nexus/timing
+import nexus/tool_provider
 import nexus/tools
 import nexus/transcript.{type Transcript}
 import nexus/utility
+
+/// One attached remote environment's EXECUTION plane (environments plan
+/// Phase 2b-2): the node adapter's provider-protocol subject and the
+/// adapter process's pid, registered in the thread actor's execution
+/// map at attach. The subject speaks `tool_provider.Msg` — the
+/// plugin-api seam (the adapter executor's monitor/deadline/cancel
+/// machinery answers calls against exactly this pair via
+/// `tool_provider.run_remote`) — and the pid is what the actor monitors
+/// so a dying node detaches. A plain VALUE handed out by the `RouteEnv`
+/// ask: the per-turn worker dispatches against it directly, so a
+/// slow remote call never blocks this actor.
+pub type EnvExec {
+  EnvExec(sub: Subject(tool_provider.Msg), pid: Pid)
+}
 
 /// One fan-out delivery: the emitting thread's id and the receiving
 /// subscriber's current visit generation, stamped beside the payload
@@ -539,9 +554,31 @@ pub type Msg {
   /// carries `Ok(Nil)` on accept (now or queued) or `Error` on refusal.
   /// Does NOT trigger a turn; appends the tail roster line as a
   /// system-author status row (never a request-byte change).
-  AttachTarget(name: String, reply: Subject(Result(Nil, String)))
-  /// Detach a target from the live roster (symmetric to `AttachTarget`).
+  ///
+  /// Phase 2b-2: an attach may carry the target's EXECUTION plane. The
+  /// roster line still obeys the turn ordering above, but the execution
+  /// map registers IMMEDIATELY — routing is not transcript state, there
+  /// is nothing to clobber — so a freshly attached node serves calls
+  /// even while the announcing line queues behind the in-flight turn.
+  /// The adapter process is monitored: its DOWN detaches the target
+  /// through the same queueing rules as an explicit `DetachTarget`.
+  AttachTarget(
+    name: String,
+    exec: Option(EnvExec),
+    reply: Subject(Result(Nil, String)),
+  )
+  /// Detach a target from the live roster (symmetric to `AttachTarget`):
+  /// the roster line obeys the turn ordering; any execution entry drops
+  /// IMMEDIATELY (routing stops now).
   DetachTarget(name: String, reply: Subject(Result(Nil, String)))
+  /// Resolve a non-workspace target to its execution plane (environments
+  /// plan Phase 2b-2): the registry forwards the per-turn worker's ask
+  /// here. `Ok(EnvExec)` when the target has a live execution entry;
+  /// `Error` otherwise — the honest three-shape wording the plan's
+  /// fail-fast requires (not attached, naming the live roster / attached
+  /// but not routable / the target's node is not connected). A pure
+  /// lookup: the reply never blocks on a call in flight.
+  RouteEnv(target: String, reply: Subject(Result(EnvExec, String)))
   /// Current transcript (for M2 thread resume / tests).
   Snapshot(reply: Subject(Transcript))
   /// Current status for the registry's thread list (M2 §4.2).
@@ -681,17 +718,24 @@ type State {
     /// Phase 2 write-behind observer — the store's commit lane. Runs at
     /// commit points only, is a plain send, and never blocks.
     commit_hook: fn(Transcript) -> Nil,
-    /// The LIVE attached-target roster (environments plan Phase 2a): the
-    /// list `route` resolves against, in stable order with `workspace`
-    /// first (seeded `["workspace"]` on env-toolset threads, `[]` on
-    /// plain threads) and grown/shrunk by `AttachTarget`/`DetachTarget`.
-    /// Actor-owned: it is the SAME list the runner's `Environment.roster`
-    /// must reflect for `route` to see attach/detach — but the runner's
-    /// handle is a FROZEN value baked in at create/hydrate (Phase 1), so
-    /// this actor field is the source of truth until 2a's step-5 live
-    /// source threads it through. Names-only for now: the
-    /// `target → execution subject` map arrives with 2b's node adapter.
+    /// The LIVE attached-target roster (environments plan Phase 2a/2b):
+    /// the list the routing ask's errors name, in stable order with
+    /// `workspace` first (seeded `["workspace"]` on env-toolset
+    /// threads, `[]` on plain threads) and grown/shrunk by
+    /// `AttachTarget`/`DetachTarget` (re-derived from persisted roster
+    /// rows at hydrate, 2b-1). The MODEL-facing truth: the newest
+    /// roster line names it. EXECUTION truth lives beside it in
+    /// `env_execs` (2b-2) — the roster names targets, the map routes
+    /// them.
     roster: List(String),
+    /// The live EXECUTION map (environments plan Phase 2b-2): target
+    /// name → the attached node's execution plane. Keyed beside
+    /// `roster`, but a SEPARATE lifecycle decision: entries register at
+    /// attach and drop at detach/down IMMEDIATELY (execution routing is
+    /// not transcript state), while the roster line obeys the turn
+    /// ordering through `pending_roster`. The `RouteEnv` ask reads this
+    /// map — the roster names targets, the map routes them.
+    env_execs: dict.Dict(String, ExecEntry),
     /// Roster changes queued while a turn is in flight (environments
     /// plan Phase 2a ordering): an attach/detach landing mid-turn must
     /// NOT append to the transcript the worker still owns (an actor-side
@@ -831,6 +875,7 @@ fn start_builder(spec: ThreadSpec) {
       // roster rows (Phase 2b's hydration re-derivation), so a
       // restart never forgets an attached node.
       roster: roster,
+      env_execs: dict.new(),
       pending_roster: [],
       utility_apply: utility_apply,
     ))
@@ -1099,12 +1144,17 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
         }
       }
 
-    AttachTarget(name, reply) -> {
-      handle_roster_change(state, RosterAttach(name), reply)
+    AttachTarget(name, exec, reply) -> {
+      handle_roster_change(state, RosterAttach(name), exec, reply)
     }
 
     DetachTarget(name, reply) -> {
-      handle_roster_change(state, RosterDetach(name), reply)
+      handle_roster_change(state, RosterDetach(name), None, reply)
+    }
+
+    RouteEnv(target, reply) -> {
+      process.send(reply, route_env(state, target))
+      actor.continue(state)
     }
 
     Snapshot(reply) -> {
@@ -1535,6 +1585,30 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
         }
       })
       let state = State(..state, subs: dict.from_list(kept))
+      // An attached environment's execution plane whose owner died
+      // (environments plan Phase 2b-2): the node is gone. Drop the
+      // routing entry and detach the target through the SAME queueing
+      // rules as an explicit `DetachTarget` — the roster line may land
+      // behind the in-flight turn, routing stops immediately, and an
+      // in-flight CALL to the dead node answers through the caller's
+      // executor-side monitor (an ordinary failed tool result). A
+      // queued mid-turn attach followed by the node's death needs no
+      // special case: the pending FIFO applies the attach line, then
+      // this detach queues after it — the honest sequence.
+      let dead_targets =
+        dict.to_list(state.env_execs)
+        |> list.filter_map(fn(entry) {
+          case entry.1.exec.pid == worker {
+            True -> Ok(entry.0)
+            False -> Error(Nil)
+          }
+        })
+      let state =
+        list.fold(dead_targets, state, fn(state, name) {
+          let #(state, _verdict) =
+            accept_roster_change(state, RosterDetach(name), None)
+          state
+        })
       let is_current = case state.turn {
         Starting(candidate, ..) | Streaming(candidate, ..) ->
           candidate == worker
@@ -1665,16 +1739,80 @@ fn apply_roster_change(
   State(..state, roster: new_roster, transcript: tr, last_commit_s: stamped)
 }
 
-/// Handle one attach/detach: validate against the CURRENT roster (or,
-/// mid-turn, against the roster the already-queued changes will produce),
-/// then either apply immediately (idle) or enqueue for `WorkerDone`.
-/// A refused change replies `Error` and changes nothing; an accepted one
-/// replies `Ok(Nil)` (whether applied now or queued).
-fn handle_roster_change(
+/// One execution-map entry: the attached node's plane plus the owner
+/// monitor taken at registration (demonitored on an explicit detach;
+/// a DOWN spends it — the flush variant makes the spent case harmless).
+type ExecEntry {
+  ExecEntry(exec: EnvExec, monitor: Monitor)
+}
+
+/// Register an execution plane under `name` (environments plan
+/// 2b-2). The monitor's DOWN funnels to `WorkerDown`, which scans this
+/// map for the dead pid, drops the entry, and detaches the target —
+/// the fail-fast answer for a node that dies mid-call comes from the
+/// CALLER's executor-side monitor (`tool_provider.run_remote`), this
+/// one keeps the MAP honest.
+fn register_exec(state: State, name: String, exec: EnvExec) -> State {
+  let monitor = process.monitor(exec.pid)
+  State(
+    ..state,
+    env_execs: dict.insert(state.env_execs, name, ExecEntry(exec, monitor)),
+  )
+}
+
+/// Drop `name`'s execution entry (explicit detach or a refused map
+/// repair). Routing stops NOW — the roster line may still queue behind
+/// an in-flight turn. An absent name is a no-op.
+fn drop_exec(state: State, name: String) -> State {
+  case dict.get(state.env_execs, name) {
+    Ok(entry) -> {
+      process.demonitor_process(entry.monitor)
+      State(..state, env_execs: dict.delete(state.env_execs, name))
+    }
+    Error(_) -> state
+  }
+}
+
+/// Resolve a non-workspace target for the per-turn worker's routing
+/// ask: `Ok` when a live execution entry exists, else the honest
+/// three-shape error (attached but its node is not connected /
+/// not attached, naming the live roster). Pure lookup — the reply
+/// never blocks on a call in flight.
+fn route_env(state: State, target: String) -> Result(EnvExec, String) {
+  case dict.get(state.env_execs, target) {
+    Ok(entry) -> Ok(entry.exec)
+    Error(_) ->
+      case list.contains(state.roster, target) {
+        True ->
+          Error(
+            "target \""
+            <> target
+            <> "\" is attached but not routable (its node is not connected)",
+          )
+        False ->
+          Error(
+            "target \""
+            <> target
+            <> "\" is not attached. attached targets: "
+            <> string.join(state.roster, ", "),
+          )
+      }
+  }
+}
+
+/// Accept ONE roster change: validate against the CURRENT roster (or,
+/// mid-turn, against the roster the already-queued changes will
+/// produce), run the change's EXECUTION-plane side effect (which lands
+/// immediately — idle or mid-turn alike, routing is not transcript
+/// state), then either apply the roster line immediately (idle) or
+/// enqueue it for `WorkerDone`. The returned verdict is `Error` on
+/// refusal (nothing changed), `Ok(Nil)` on accept; the caller decides
+/// whether a reply subject hears it.
+fn accept_roster_change(
   state: State,
   change: RosterChange,
-  reply: Subject(Result(Nil, String)),
-) -> actor.Next(State, Msg) {
+  exec: Option(EnvExec),
+) -> #(State, Result(Nil, String)) {
   // The preview roster the change would act against: mid-turn, the
   // already-queued changes apply first (the live roster is frozen for
   // the turn's duration), so validation sees the SAME list the drain
@@ -1687,27 +1825,45 @@ fn handle_roster_change(
       }
     })
   case compute_roster(preview, change) {
-    Error(reason) -> {
-      process.send(reply, Error(reason))
-      actor.continue(state)
-    }
-    Ok(new_roster) ->
-      case state.turn {
-        Idle -> {
-          process.send(reply, Ok(Nil))
-          actor.continue(apply_roster_change(state, change, new_roster))
-        }
-        Starting(..) | Streaming(..) -> {
-          process.send(reply, Ok(Nil))
-          actor.continue(
-            State(
-              ..state,
-              pending_roster: list.append(state.pending_roster, [change]),
-            ),
-          )
-        }
+    Error(reason) -> #(state, Error(reason))
+    Ok(new_roster) -> {
+      // The execution-plane side effect lands NOW: an attach registers
+      // its plane (freshly attached nodes serve calls even while the
+      // announcing line queues), a detach drops it (routing stops).
+      let state = case change {
+        RosterAttach(name) ->
+          case exec {
+            Some(plane) -> register_exec(state, name, plane)
+            None -> state
+          }
+        RosterDetach(name) -> drop_exec(state, name)
       }
+      case state.turn {
+        Idle -> #(apply_roster_change(state, change, new_roster), Ok(Nil))
+        Starting(..) | Streaming(..) -> #(
+          State(
+            ..state,
+            pending_roster: list.append(state.pending_roster, [change]),
+          ),
+          Ok(Nil),
+        )
+      }
+    }
   }
+}
+
+/// Handle one attach/detach from a caller: `accept_roster_change` plus
+/// the reply. A refused change replies `Error` and changes nothing; an
+/// accepted one replies `Ok(Nil)` (whether applied now or queued).
+fn handle_roster_change(
+  state: State,
+  change: RosterChange,
+  exec: Option(EnvExec),
+  reply: Subject(Result(Nil, String)),
+) -> actor.Next(State, Msg) {
+  let #(state, verdict) = accept_roster_change(state, change, exec)
+  process.send(reply, verdict)
+  actor.continue(state)
 }
 
 /// Drain the queued roster changes after `WorkerDone`: the worker's

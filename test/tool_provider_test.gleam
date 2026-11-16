@@ -393,3 +393,195 @@ pub fn run_late_reply_is_inert_test() {
   )
   let assert Ok(CallParts(_, _)) = process.receive(calls, 0)
 }
+
+// ---------------------------------------------------------------------------
+// run_remote (environments plan Phase 2b-2)
+// ---------------------------------------------------------------------------
+
+/// An UNNAMED fake — the execution-plane shape the thread actor's map
+/// hands out: subject + pid, no registered name (node names are unique
+/// per roster, not per instance; the map is the registry). Same
+/// protocol handler as the named fake.
+fn start_fake_unnamed(
+  cfg: FakeCfg,
+) -> #(Subject(tool_provider.Msg), process.Pid) {
+  let assert Ok(started) =
+    actor.new(cfg)
+    |> actor.on_message(fn(cfg: FakeCfg, msg: tool_provider.Msg) {
+      case msg {
+        ListTools(reply) -> {
+          process.send(reply, Ok(cfg.tools))
+          actor.continue(cfg)
+        }
+        Call(ref, tool, arguments, reply) -> {
+          cfg.on_call(ref, tool, arguments, reply)
+          actor.continue(cfg)
+        }
+        Cancelled(ref) -> {
+          cfg.on_cancel(ref)
+          actor.continue(cfg)
+        }
+      }
+    })
+    |> actor.start
+  #(started.data, started.pid)
+}
+
+/// The `run_in_runner` shape against a (subject, pid) plane: the
+/// runner owns the cancel subject, hands it out through the gate, and
+/// reports the outcome plus whether the mandatory re-signal arrived.
+fn run_remote_in_runner(
+  plane: #(Subject(tool_provider.Msg), process.Pid),
+  timeout_ms: Int,
+  gate: Subject(Subject(Nil)),
+  report: Subject(RunReport),
+) -> Nil {
+  let cancel = process.new_subject()
+  process.send(gate, cancel)
+  let outcome =
+    tool_provider.run_remote(
+      provider: plane.0,
+      owner: plane.1,
+      tool: "fetch",
+      timeout_ms: timeout_ms,
+      max_output_chars: 1000,
+      cancel: cancel,
+      arguments: "{}",
+    )
+  let resignalled = case process.receive(cancel, 0) {
+    Ok(Nil) -> True
+    Error(Nil) -> False
+  }
+  process.send(report, RunReport(outcome:, resignalled:))
+}
+
+pub fn run_remote_round_trip_test() {
+  let plane =
+    start_fake_unnamed(FakeCfg(
+      tools: [def("fetch")],
+      on_call: fn(_ref, tool, _args, reply) {
+        case tool {
+          "fetch" -> process.send(reply, tool_provider.ToolOk("from the node"))
+          other ->
+            process.send(reply, tool_provider.ToolErr("no tool " <> other))
+        }
+      },
+      on_cancel: noop,
+    ))
+  let cancel = process.new_subject()
+  should.equal(
+    tool_provider.run_remote(
+      provider: plane.0,
+      owner: plane.1,
+      tool: "fetch",
+      timeout_ms: 2000,
+      max_output_chars: 100,
+      cancel: cancel,
+      arguments: "{}",
+    ),
+    Ok("from the node"),
+  )
+  should.equal(
+    tool_provider.run_remote(
+      provider: plane.0,
+      owner: plane.1,
+      tool: "bad",
+      timeout_ms: 2000,
+      max_output_chars: 100,
+      cancel: cancel,
+      arguments: "{}",
+    ),
+    Error("no tool bad"),
+  )
+}
+
+/// Wait (bounded) until the pid is gone — `kill` delivers
+/// asynchronously.
+fn await_dead(pid: process.Pid, tries: Int) -> Nil {
+  case process.is_alive(pid), tries > 0 {
+    False, _ -> Nil
+    True, True -> {
+      process.sleep(20)
+      await_dead(pid, tries - 1)
+    }
+    True, False -> panic as "owner survived the kill"
+  }
+}
+
+pub fn run_remote_unavailable_when_owner_is_dead_test() {
+  // An UNLINKED parked owner (the actor fakes are linked to this test
+  // process — killing one races an untrapped EXIT into the runner).
+  // Unlinked, the kill carries no exit signal here; the bounded
+  // liveness poll waits out the kill's asynchronous delivery.
+  let back = process.new_subject()
+  let pid =
+    process.spawn_unlinked(fn() {
+      process.send(back, process.new_subject())
+      process.sleep_forever()
+    })
+  let assert Ok(sub) = process.receive(back, 2000)
+  process.kill(pid)
+  await_dead(pid, 100)
+  let cancel = process.new_subject()
+  // The liveness check answers immediately — no dispatch, no burned
+  // deadline.
+  should.equal(
+    tool_provider.run_remote(
+      provider: sub,
+      owner: pid,
+      tool: "fetch",
+      timeout_ms: 2000,
+      max_output_chars: 100,
+      cancel: cancel,
+      arguments: "{}",
+    ),
+    Error("tool provider is unavailable"),
+  )
+}
+
+pub fn run_remote_cancel_re_signals_and_notifies_provider_test() {
+  let calls = process.new_subject()
+  let cancels = process.new_subject()
+  let plane =
+    start_fake_unnamed(
+      FakeCfg(
+        tools: [def("fetch")],
+        on_call: fn(ref, _tool, _args, reply) {
+          process.send(calls, CallParts(ref, reply))
+        },
+        on_cancel: fn(ref) { process.send(cancels, ref) },
+      ),
+    )
+  let runner_gate = process.new_subject()
+  let report = process.new_subject()
+  process.spawn(fn() { run_remote_in_runner(plane, 5000, runner_gate, report) })
+  let assert Ok(cancel) = process.receive(runner_gate, 2000)
+  process.send(cancel, Nil)
+  let assert Ok(RunReport(Error("cancelled"), True)) =
+    process.receive(report, 2000)
+  let assert Ok(CallParts(ref, _)) = process.receive(calls, 0)
+  let assert Ok(cancelled_ref) = process.receive(cancels, 2000)
+  should.equal(cancelled_ref, ref)
+}
+
+pub fn run_remote_answers_when_owner_dies_mid_call_test() {
+  let calls = process.new_subject()
+  let plane =
+    start_fake_unnamed(FakeCfg(
+      tools: [def("fetch")],
+      on_call: fn(ref, _tool, _args, _reply) {
+        process.send(calls, CallParts(ref, process.new_subject()))
+      },
+      on_cancel: noop,
+    ))
+  let runner_gate = process.new_subject()
+  let report = process.new_subject()
+  process.spawn(fn() { run_remote_in_runner(plane, 5000, runner_gate, report) })
+  let _cancel = process.receive(runner_gate, 2000)
+  let _ = process.receive(calls, 2000)
+  process.trap_exits(True)
+  process.kill(plane.1)
+  let assert Ok(RunReport(Error("tool provider is unavailable"), False)) =
+    process.receive(report, 2000)
+  process.trap_exits(False)
+}

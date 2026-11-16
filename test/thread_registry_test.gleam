@@ -2225,7 +2225,7 @@ pub fn env_toolset_runner_receives_environment_handle_test() {
     )
   let assert Ok(sess) = thread_registry.get(registry, summary.id)
   let assert thread.Sent = thread.send_message(sess, "run something")
-  let assert Ok(Some(env.Environment(got_root, id, roster))) =
+  let assert Ok(Some(env.Environment(got_root, id, roster, _remote))) =
     process.receive(seen, 5000)
   should.equal(got_root, root)
   should.equal(id, summary.id)
@@ -2375,7 +2375,7 @@ pub fn env_roster_legacy_row_falls_back_to_workspace_test() {
   // node-9.` and silently drop `workspace` forever (it is reserved, so
   // it could never re-enter).
   let reply = process.new_subject()
-  process.send(sess, thread.AttachTarget("node-9", reply))
+  process.send(sess, thread.AttachTarget("node-9", None, reply))
   let assert Ok(Ok(Nil)) = process.receive(reply, 2000)
 
   let snapshot = actor.call(sess, 5000, thread.Snapshot)
@@ -2458,13 +2458,87 @@ pub fn env_roster_rehydrates_from_persisted_attach_row_test() {
   // the ALREADY-attached `proxmox-2` refuses. (Phase 1's constant seed
   // would accept it — this pins the re-derivation, not the fallback.)
   let reply = process.new_subject()
-  process.send(sess, thread.AttachTarget("proxmox-2", reply))
+  process.send(sess, thread.AttachTarget("proxmox-2", None, reply))
   let assert Ok(Error(reason)) = process.receive(reply, 2000)
   reason |> should.equal("target \"proxmox-2\" is already attached")
 
   // And a genuinely NEW name still attaches (the roster is live, not
   // frozen at the seed).
   let reply2 = process.new_subject()
-  process.send(sess, thread.AttachTarget("node-9", reply2))
+  process.send(sess, thread.AttachTarget("node-9", None, reply2))
   let assert Ok(Ok(Nil)) = process.receive(reply2, 2000)
+}
+
+// ---------------------------------------------------------------------------
+// Environment routing ask (environments plan Phase 2b-2)
+// ---------------------------------------------------------------------------
+
+fn registry_route_env(
+  registry: process.Subject(thread_registry.Msg),
+  thread_id: String,
+  target: String,
+) -> Result(thread.EnvExec, String) {
+  let reply = process.new_subject()
+  process.send(registry, thread_registry.RouteEnv(thread_id, target, reply))
+  let assert Ok(outcome) = process.receive(reply, 5000)
+  outcome
+}
+
+pub fn route_env_refuses_unknown_thread_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  let #(registry, _seam) = start_registry_with_workspace("/srv/nx-ws", seam)
+  let assert Error("thread is unavailable") =
+    registry_route_env(registry, "no-such-thread", "node-a")
+}
+
+pub fn route_env_resolves_live_thread_and_attaches_plane_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  let #(registry, _seam) = start_registry_with_workspace("/srv/nx-ws", seam)
+
+  // An env-toolset thread through the REAL create path (the registry
+  // wraps its runner with the routing closure this ask serves).
+  let assert Ok(summary) =
+    thread_registry.create(
+      registry,
+      thread_registry.NewThread(
+        ..new_thread(store_mock.fixture_provider_id, "alpha"),
+        toolset: option.Some(["bash"]),
+      ),
+    )
+  let assert Ok(sess) = thread_registry.get(registry, summary.id)
+
+  // Before any attach: the honest not-attached wording via the FULL
+  // ask path (worker → registry → thread actor).
+  let assert Error(
+    "target \"node-a\" is not attached. attached targets: workspace",
+  ) = registry_route_env(registry, summary.id, "node-a")
+
+  // A parked fake node registers its plane; the ask resolves it.
+  let back = process.new_subject()
+  let node_pid =
+    process.spawn_unlinked(fn() {
+      let own = process.new_subject()
+      process.send(back, own)
+      process.sleep_forever()
+    })
+  let assert Ok(node_sub) = process.receive(back, 2000)
+  let reply = process.new_subject()
+  process.send(
+    sess,
+    thread.AttachTarget(
+      "node-a",
+      Some(thread.EnvExec(node_sub, node_pid)),
+      reply,
+    ),
+  )
+  let assert Ok(Ok(Nil)) = process.receive(reply, 2000)
+
+  let assert Ok(thread.EnvExec(got_sub, got_pid)) =
+    registry_route_env(registry, summary.id, "node-a")
+  should.equal(got_sub, node_sub)
+  should.equal(got_pid, node_pid)
+
+  process.kill(node_pid)
 }

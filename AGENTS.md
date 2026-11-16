@@ -197,16 +197,27 @@ deltas; the rules that bite silently:
   hydration rebuilds the handle from the ROW, never the config.
 - **Every env tool takes `target` as a free string** — the schema is
   byte-identical however many environments are attached; only
-  execution routing is dynamic. The v1 roster is the constant
-  `["workspace"]`; unknown targets fail fast as tool errors repeating
-  the attached list (tool errors are not loop errors — the round
-  commits).
-- **Roster changes ride MESSAGES, never the envelope.** The
-  creation-time attach appends a user-role row with the display-only
-  origin sidecar author `system` (which is exactly why a bot cannot
-  be NAMED `system`); the UI renders it as a muted status line
-  (`.turn.status`), not a bubble. It never triggers a turn and
-  persists with the first commit.
+  execution routing is dynamic. `workspace` runs the local Phase 1
+  path; any other target dispatches WHOLE (tool name + raw arguments)
+  through the handle's `remote` router closure (2b-2): a
+  registry-routed ask (`RouteEnv`) resolves the thread actor's
+  `target → EnvExec(subject, pid)` execution map, and the
+  provider-protocol adapter executor (`tool_provider.run_remote`)
+  carries the call — its monitor answers a node dying mid-call as an
+  ordinary tool error. Unknown targets fail fast as tool errors
+  repeating the attached list (tool errors are not loop errors — the
+  round commits). The map mutates at attach/detach/DOWN immediately,
+  even mid-turn (routing is not transcript state); only the ROSTER
+  LINE obeys the pending-behind-turn ordering.
+- **Roster changes ride MESSAGES, never the envelope.** Every
+  attach/detach (creation-time seed included) appends a user-role row
+  with the display-only origin sidecar author `system` (which is
+  exactly why a bot cannot be NAMED `system`) naming the CURRENT full
+  attached list — self-healing and tail-addressable for small-context
+  models; the UI renders it as a muted status line (`.turn.status`),
+  not a bubble. It never triggers a turn; hydration re-derives the
+  roster from the newest persisted roster row (2b-1), never re-seeds
+  the constant.
 - **`bash` exec runs in the per-turn worker** (the codemode pattern):
   the executor selects over {port data, cancel, deadline}; cancel
   RE-SIGNALS the one-shot subject (the codemode rule) — and the
