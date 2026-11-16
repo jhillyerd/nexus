@@ -640,7 +640,7 @@ fn named_fake_handle(
           ),
         ),
       )
-      actor.continue(NamedFake(..state, sub: Some(sub)))
+      actor.continue(NamedFake(Some(sub)))
     }
     thread.AttachTarget(_name, _exec, reply) -> {
       process.send(reply, Ok(Nil))
