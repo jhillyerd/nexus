@@ -2,7 +2,7 @@
 title: Nexus — environments (bot workspaces + remote paired TUI nodes)
 status: active
 tags: [computing, self-hosting, local-llm, agents, gleam, beam, environments]
-updated: 2026-11-15
+updated: 2026-11-16
 ---
 
 # Environments: one execution seam for bot workspaces and paired remote nodes
@@ -639,9 +639,68 @@ thread; viewer role (events + send + ping, no `attached`, no tool
 plane). It also caught the graceful-close lifecycle hole: see the
 on_close delta under 2b-3.
 
-**2b-5 — the TUI itself** (separate binary, language TBD — the
-protocol is JSON; a Gleam TUI could share decode types). Ships when
-the protocol is proven by the fake node.
+**2b-5 — the TUI itself — IMPLEMENTED as the Gleam REPL proof of
+concept.** The language question is decided (a Gleam TUI shares the
+codec for free), and the SHAPE is decided too: a line-oriented REPL
+now, the high-fidelity client later as a separate initiative (survey
+existing coding-agent TUIs and modify one — do not grow this PoC
+into it). Ships when the protocol is proven by the fake node — it
+was. What landed:
+
+- **The codec is now bidirectional.** `node_protocol` gained the
+  client half: `ServerFrame` + `decode_server_frame` (every event
+  kind, the connection frames, and the tool plane's request half; an
+  unknown KIND decodes as `Unknown` — forward-compatible by rule,
+  the renderer skips it; malformed JSON or a malformed KNOWN shape
+  refuses), plus the client→server encoders `encode_send` /
+  `encode_ping` / `encode_call_response`, all round-trip-pinned
+  against the decoders in `node_protocol_test`. One module owns the
+  whole wire.
+- **`params.arguments` decodes canonically.** The wire carries a RAW
+  JSON object (the encoder's verbatim property, unchanged and still
+  pinned by the encode tests + the fake-node e2e wire capture); the
+  Gleam client decodes the VALUE and re-encodes it compact —
+  execution reads values, not bytes. The recursive dynamic→Json
+  decoder hit the stdlib's warned-about trap (a self-referential
+  decoder constructed eagerly loops forever) — `decode.recursive` is
+  load-bearing.
+- **`env.serve_node_call` is the node-side twin of remote dispatch.**
+  The call arrived HERE because the server routed it to this node, so
+  the arguments' `target` names the NODE, not `workspace` — the
+  parsed target rewrites to the reserved local value and the Phase 1
+  local path runs unchanged (kill-tree, caps while reading, lexical
+  confinement inherited, not reimplemented). Unknown tool names
+  refuse; `tui_test` / `env_test` drive it with real bash in temp
+  workspaces, offline.
+- **The connection is a stratus actor obeying the socket-owner rule,
+  inverted.** Every frame send happens inside `on_message` (the
+  adapter-side lesson mirrored); user messages (stdin lines, finished
+  calls, quit) arrive through an actor-owned inbox created in the
+  connection's init and handed to main via a main-owned handoff
+  subject — the `gated_runner` ownership rule from AGENTS.md (send
+  across owners freely, never RECEIVE across them). `tools/call`
+  runs in a short-lived worker so a full deadline never stalls the
+  render loop; `notifications/cancelled` re-signals the in-flight
+  worker's cancel subject from a Dict registry (the codemode rule).
+- **Quit closes, then continues — never `stop()`.** `stop()` after
+  `close()` killed the actor before the close handshake finished, so
+  `on_close` (the halt-0 path) never fired — found by the e2e's
+  graceful-exit check. The stdin FFI is `io:get_line` over the group
+  leader (`nexus_tui_ffi`), eof modeled as `Error` so piped stdin
+  (the e2e) and a TTY take the same path.
+- **The renderer is pure**: `ServerFrame → List(Line | Inline)` in
+  `nexus/tui/render` — streaming tokens print inline, everything else
+  is a truncated display-only line, hostile text stays plain string
+  concatenation. Documented PoC jank: output arriving mid-line
+  interleaves with the half-typed line, and there is no input
+  history.
+- **`e2e/tui.spec.mjs` proves the real binary** with piped stdin
+  against the fake-provider server (the node.spec.mjs posture):
+  join + replay render + server-side attach, a full remote round the
+  TUI executes LOCALLY (noncanonical argument JSON proving the value
+  round-trip; the command's files land in the TUI's own workspace
+  dir), and stdin EOF → exit 0 with the queued detach line behind
+  the turn. 5 checks, ~1 minute, offline beyond loopback.
 
 ### Phase 3 — deferred (recorded, not scheduled)
 

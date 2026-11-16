@@ -14,3 +14,4 @@ e2e/integration-report.json
 e2e/cache-session.json
 e2e/cache-thread.json
 e2e/node-report.json
+e2e/tui-report.json

@@ -131,6 +131,127 @@ pub fn unknown_target_fails_fast_test() {
   ) = result
 }
 
+// ---------------------------------------------------------------------------
+// Node-side serving (2b-5: the TUI's tool plane)
+// ---------------------------------------------------------------------------
+
+fn node_for(root: String) -> env.Environment {
+  env.Environment(
+    workspace_root: root,
+    thread_id: "srv-thread",
+    roster: env.attached_targets(),
+    remote: None,
+  )
+}
+
+pub fn serve_node_call_routes_to_local_test() {
+  // The node IS the target the server routed to: arguments naming the
+  // NODE (not "workspace") execute on the Phase 1 local path anyway —
+  // the parsed target is rewritten to the reserved local value before
+  // route, so `route`'s honest not-routable refusal for attached-but-
+  // unroutable names never bites the node's own calls.
+  let root = fresh_root()
+  let assert Ok(text) =
+    env.serve_node_call(
+      handle: node_for(root),
+      tool: "bash",
+      arguments: "{\"target\":\"tui-node\",\"command\":\"echo served\"}",
+      timeout_ms: 10_000,
+      max_output_bytes: 10_000,
+      cancel: process.new_subject(),
+    )
+  string.contains(text, "served") |> should_equal(True)
+  // Lazy workspace creation still applies, scoped by the handle's
+  // thread id.
+  simplifile.is_directory(root <> "/srv-thread") |> should_equal(Ok(True))
+}
+
+pub fn serve_node_call_file_tools_test() {
+  let root = fresh_root()
+  let handle = node_for(root)
+  let cancel = process.new_subject()
+  let assert Ok(wrote) =
+    env.serve_node_call(
+      handle: handle,
+      tool: "write_file",
+      arguments: "{\"target\":\"tui-node\",\"path\":\"a.txt\",\"content\":\"data\"}",
+      timeout_ms: 10_000,
+      max_output_bytes: 10_000,
+      cancel: cancel,
+    )
+  let assert Ok(read) =
+    env.serve_node_call(
+      handle: handle,
+      tool: "read_file",
+      arguments: "{\"target\":\"tui-node\",\"path\":\"a.txt\"}",
+      timeout_ms: 10_000,
+      max_output_bytes: 10_000,
+      cancel: cancel,
+    )
+  wrote |> should_equal("wrote 4 bytes to a.txt")
+  read |> should_equal("data")
+  let assert Ok(listing) =
+    env.serve_node_call(
+      handle: handle,
+      tool: "list_dir",
+      arguments: "{\"target\":\"tui-node\",\"path\":\"\"}",
+      timeout_ms: 10_000,
+      max_output_bytes: 10_000,
+      cancel: cancel,
+    )
+  string.contains(listing, "a.txt") |> should_equal(True)
+}
+
+pub fn serve_node_call_refusals_test() {
+  let handle = node_for(fresh_root())
+  let cancel = process.new_subject()
+  // Unknown tool name: a node serves the four compiled env tools only.
+  let assert Error(reason) =
+    env.serve_node_call(
+      handle: handle,
+      tool: "web_search",
+      arguments: "{}",
+      timeout_ms: 10_000,
+      max_output_bytes: 10_000,
+      cancel: cancel,
+    )
+  reason |> should_equal("this node does not serve the tool \"web_search\"")
+  // Malformed arguments propagate the parser's error, not a crash.
+  let assert Error(_) =
+    env.serve_node_call(
+      handle: handle,
+      tool: "bash",
+      arguments: "{\"command\":\"echo hi\"}",
+      timeout_ms: 10_000,
+      max_output_bytes: 10_000,
+      cancel: cancel,
+    )
+  // Confinement still applies on the node side: an escaping path
+  // refuses exactly as it does in the server's own workspace.
+  let assert Error(_) =
+    env.serve_node_call(
+      handle: handle,
+      tool: "read_file",
+      arguments: "{\"target\":\"tui-node\",\"path\":\"../outside.txt\"}",
+      timeout_ms: 10_000,
+      max_output_bytes: 10_000,
+      cancel: cancel,
+    )
+}
+
+pub fn serve_node_call_nonzero_exit_is_data_test() {
+  let assert Ok(text) =
+    env.serve_node_call(
+      handle: node_for(fresh_root()),
+      tool: "bash",
+      arguments: "{\"target\":\"tui-node\",\"command\":\"exit 7\"}",
+      timeout_ms: 10_000,
+      max_output_bytes: 10_000,
+      cancel: process.new_subject(),
+    )
+  string.starts_with(text, "exit status 7") |> should_equal(True)
+}
+
 pub fn route_names_live_roster_test() {
   // The 2a observable: `route` reads the handle's ROSTER (not the
   // compiled constant), so an attached list is what the fail-fast error

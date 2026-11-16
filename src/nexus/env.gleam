@@ -1176,6 +1176,73 @@ fn list_dir_local(args: PathArgs, path: String) -> Result(String, String) {
   }
 }
 
+/// Serve one env-tool call ON THIS NODE (environments 2b-5): the
+/// node-side twin of the server's remote dispatch. The call arrived
+/// HERE because the server routed it to this node's connection, so the
+/// arguments' `target` names this node — the node translates it to the
+/// reserved local `"workspace"` in the parsed arguments and runs the
+/// Phase 1 local path UNCHANGED (kill-tree, caps enforced while
+/// reading, lexical confinement; the same code the server runs for its
+/// own workspace). Unknown tool names refuse: a node serves the four
+/// compiled env tools only. The TUI (`nexus/tui`) calls this from its
+/// tool-plane worker; offline tests drive it with real bash in a temp
+/// workspace, no socket required.
+pub fn serve_node_call(
+  handle handle: Environment,
+  tool tool: String,
+  arguments arguments: String,
+  timeout_ms timeout_ms: Int,
+  max_output_bytes max_output_bytes: Int,
+  cancel cancel: Subject(Nil),
+) -> Result(String, String) {
+  case tool {
+    "bash" ->
+      case parse_bash_args(arguments) {
+        Ok(args) ->
+          bash_workspace(
+            timeout_ms,
+            max_output_bytes,
+            Some(handle),
+            cancel,
+            BashArgs(..args, target: "workspace"),
+          )
+        Error(e) -> Error(e)
+      }
+    "read_file" ->
+      case parse_path_args(arguments, "read_file") {
+        Ok(args) -> {
+          use _ <- result.try(ensure_workspace(handle))
+          use path <- result.try(confined(handle, args.path))
+          read_file_local(
+            max_output_bytes,
+            PathArgs(..args, target: "workspace"),
+            path,
+          )
+        }
+        Error(e) -> Error(e)
+      }
+    "write_file" ->
+      case parse_write_args(arguments) {
+        Ok(args) -> {
+          use _ <- result.try(ensure_workspace(handle))
+          use path <- result.try(confined(handle, args.path))
+          write_file_local(WriteArgs(..args, target: "workspace"), path)
+        }
+        Error(e) -> Error(e)
+      }
+    "list_dir" ->
+      case parse_path_args(arguments, "list_dir") {
+        Ok(args) -> {
+          use _ <- result.try(ensure_workspace(handle))
+          use path <- result.try(confined(handle, args.path))
+          list_dir_local(PathArgs(..args, target: "workspace"), path)
+        }
+        Error(e) -> Error(e)
+      }
+    _ -> Error("this node does not serve the tool \"" <> tool <> "\"")
+  }
+}
+
 /// True when the path is a regular file; `Error` when it does not
 /// exist (or is unreadable) — the caller decides which answers are
 /// acceptable. `file_info` FOLLOWS symlinks, so a link to a regular
