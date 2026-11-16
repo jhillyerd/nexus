@@ -72,6 +72,26 @@ pub fn roster_texts_test() {
   |> should_equal("attached targets: workspace.")
 }
 
+pub fn roster_parse_roundtrips_test() {
+  // The inverse of the tail line (Phase 2b hydration re-derivation): a
+  // roster line parses back to its list, and a non-roster line is `None`.
+  // The serialized inputs come from the EMITTERS (attach/detach), so a
+  // change to the emitters cannot silently break hydration — the
+  // round-trip is asserted end to end, not against hardcoded strings.
+  env.roster_attach_text("proxmox-2", ["workspace", "proxmox-2"])
+  |> env.roster_parse
+  |> should_equal(Some(["workspace", "proxmox-2"]))
+  env.roster_detach_text("proxmox-2", ["workspace"])
+  |> env.roster_parse
+  |> should_equal(Some(["workspace"]))
+  // Not a roster line: a plain user message or bot-authored row is None.
+  env.roster_parse("what is the weather?")
+  |> should_equal(None)
+  // Tolerant of a missing trailing dot (defensive on hand-written rows).
+  env.roster_parse("attached targets: workspace")
+  |> should_equal(Some(["workspace"]))
+}
+
 pub fn valid_target_name_test() {
   let assert Ok(Nil) = env.valid_target_name("proxmox-2")
   let assert Ok(Nil) = env.valid_target_name("node_a_1")

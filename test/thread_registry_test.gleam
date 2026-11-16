@@ -2328,6 +2328,68 @@ pub fn env_toolset_hydrates_from_persisted_root_test() {
   ] = list.reverse(messages)
 }
 
+/// The legacy-wording fallback (Phase 1 → Phase 2a, environments plan
+/// §Phase 2a "tail-short form"): a dormant env thread whose creation
+/// roster row used the Phase 1 wording (`environment attached:
+/// "workspace". attached targets: workspace.`) does NOT match the 2a
+/// roster-line prefix, so the re-derivation's `None` branch must re-seed
+/// the constant `["workspace"]` (nothing could attach before 2a) rather
+/// than drop to `[]` and leave `workspace` unreachable (it is reserved,
+/// so it could never re-enter). Observed through the actor's guard: an
+/// attach of a NEW name succeeds, proving the roster still carries
+/// `workspace` (a `[]` roster would still allow the attach, so we pin
+/// the presence indirectly — the reserve refusal below is the direct
+/// assert).
+pub fn env_roster_legacy_row_falls_back_to_workspace_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  store_mock.ensure_fixture_provider(seam)
+
+  // Seed a dormant env thread whose creation roster row carries the
+  // LEGACY Phase 1 wording (no `attached targets: ` prefix).
+  let legacy_text =
+    "environment attached: \"workspace\". attached targets: workspace."
+  let assert Ok(Nil) =
+    seam.insert_thread(
+      store.StoredSummary(
+        id: "s77",
+        provider_id: store_mock.fixture_provider_id,
+        model: "alpha",
+        meta: fresh_meta(),
+        toolset: thread_registry.plain_entries(["bash"]),
+        workspace_root: Some("/srv/old-root"),
+        roster: Some(#(legacy_text, 1_700_000_000)),
+        last_active_at: timing.wall_now_s(),
+        message_count: 1,
+      ),
+      "prompt",
+    )
+
+  let #(registry, _seam2) = start_registry_with_workspace("/srv/new-root", seam)
+  let assert Ok(sess) = thread_registry.get(registry, "s77")
+
+  // The re-derived roster must still carry `workspace`: attach a NEW
+  // name, then read the committed transcript's tail. A correct
+  // `["workspace"]` seed yields `attached targets: workspace, node-9.`;
+  // a `[]` seed (the buggy fallback) would yield `attached targets:
+  // node-9.` and silently drop `workspace` forever (it is reserved, so
+  // it could never re-enter).
+  let reply = process.new_subject()
+  process.send(sess, thread.AttachTarget("node-9", reply))
+  let assert Ok(Ok(Nil)) = process.receive(reply, 2000)
+
+  let snapshot = actor.call(sess, 5000, thread.Snapshot)
+  let messages = transcript.messages(snapshot)
+  // The roster line appended by the attach names the full CURRENT list,
+  // workspace first.
+  let assert Ok(glopenai_chat.UserMessage(
+    content: glopenai_chat.UserTextContent(
+      "attached targets: workspace, node-9.",
+    ),
+    ..,
+  )) = list.last(messages)
+}
+
 fn fresh_meta() -> thread.ThreadMeta {
   thread.ThreadMeta(
     title: "",
@@ -2342,4 +2404,67 @@ fn fresh_meta() -> thread.ThreadMeta {
     // window, keyed on last_active_at.
     created_at: timing.wall_now_s(),
   )
+}
+
+/// Hydration re-derives the live roster from the PERSISTED rows
+/// (environments plan Phase 2b): a dormant env thread whose committed
+/// transcript carries an attach line (`attached targets: workspace,
+/// proxmox-2.`) must rehydrate with BOTH names in its roster — not just
+/// the `["workspace"]` seed the constant would produce. Observed through
+/// the actor's own guard: attaching an already-attached name refuses
+/// (a re-derived roster contains it), whereas on the Phase-1 seed it
+/// would be accepted.
+pub fn env_roster_rehydrates_from_persisted_attach_row_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  store_mock.ensure_fixture_provider(seam)
+
+  // Seed a dormant env thread: the creation-time roster row (workspace)
+  // rides the INSERT (as insert_thread persists it).
+  let assert Ok(Nil) =
+    seam.insert_thread(
+      store.StoredSummary(
+        id: "s77",
+        provider_id: store_mock.fixture_provider_id,
+        model: "alpha",
+        meta: fresh_meta(),
+        toolset: thread_registry.plain_entries(["bash"]),
+        workspace_root: Some("/srv/old-root"),
+        roster: Some(#(
+          env.roster_attach_text("workspace", env.attached_targets()),
+          1_700_000_000,
+        )),
+        last_active_at: timing.wall_now_s(),
+        message_count: 1,
+      ),
+      "prompt",
+    )
+
+  // Commit a transcript that appends an ATTACH line as a system-author
+  // user row — the persisted shape a live attach leaves behind.
+  let committed =
+    transcript.new("alpha", "prompt")
+    |> transcript.append_user("attached targets: workspace, proxmox-2.")
+    |> transcript.mark_origin(Some("system"), 0)
+    |> transcript.stamp(timing.wall_now_s())
+  seam.commit("s77", committed)
+  store_mock.await_commits(mock, 1)
+
+  // Hydrate: the re-derived roster must include `proxmox-2`.
+  let #(registry, _seam) = start_registry_with_workspace("/srv/new-root", seam)
+  let assert Ok(sess) = thread_registry.get(registry, "s77")
+
+  // The actor's own guard observes the re-derived roster: an attach of
+  // the ALREADY-attached `proxmox-2` refuses. (Phase 1's constant seed
+  // would accept it — this pins the re-derivation, not the fallback.)
+  let reply = process.new_subject()
+  process.send(sess, thread.AttachTarget("proxmox-2", reply))
+  let assert Ok(Error(reason)) = process.receive(reply, 2000)
+  reason |> should.equal("target \"proxmox-2\" is already attached")
+
+  // And a genuinely NEW name still attaches (the roster is live, not
+  // frozen at the seed).
+  let reply2 = process.new_subject()
+  process.send(sess, thread.AttachTarget("node-9", reply2))
+  let assert Ok(Ok(Nil)) = process.receive(reply2, 2000)
 }

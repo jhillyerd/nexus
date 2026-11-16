@@ -45,6 +45,7 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import glopenai/chat.{type ChatMessage}
 import nexus/bot
+import nexus/node
 import nexus/thread
 import nexus/tools.{type ToolsetEntry, ToolsetEntry}
 import nexus/transcript.{type Transcript}
@@ -186,6 +187,12 @@ pub type MessageRow {
 pub type StoredBot =
   bot.Bot
 
+/// A stored node row — the whole node entity plus its token HASH (no
+/// plaintext secret at rest; plaintext never reaches the store). Shared
+/// verbatim like `StoredBot`.
+pub type StoredNode =
+  node.Node
+
 /// Sanitized store error (already safe to log; never contains secrets).
 pub type StoreError =
   String
@@ -287,6 +294,20 @@ pub type Store {
     /// Bots pointing at this provider — the provider registry's delete
     /// guard's bot half (a store COUNT, never a bot-registry call).
     count_bots_for_provider: fn(String) -> Result(Int, StoreError),
+    // ---- node rows (docs/plans/environments.md, Phase 2b) ----
+    /// Every stored node, ordered by id (registry boot load). No
+    /// plaintext secret: the row carries only the token hash.
+    list_nodes: fn() -> Result(List(StoredNode), StoreError),
+    /// One stored node by its stable target NAME (the stateless
+    /// token-verification lookup key). `Error` for unknown names.
+    get_node_by_name: fn(String) -> Result(StoredNode, StoreError),
+    /// Persist a new node row (write-through at pair). Errors on
+    /// duplicate id or name, like the schema's constraints.
+    insert_node: fn(StoredNode) -> Result(Nil, StoreError),
+    /// Bump the node's last-seen stamp on an authenticated connect.
+    touch_node: fn(String) -> Result(Nil, StoreError),
+    /// Hard delete (token revoke): removes the node's authority.
+    delete_node: fn(String) -> Result(Nil, StoreError),
   )
 }
 

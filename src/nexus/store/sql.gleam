@@ -365,6 +365,28 @@ delete from bot where id = $1
   |> pog.execute(db)
 }
 
+/// Hard delete (token revoke): removing the row removes the node's
+/// authority.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn delete_node(
+  db: pog.Connection,
+  id: String,
+) -> Result(pog.Returned(Nil), pog.QueryError) {
+  let decoder = decode.map(decode.dynamic, fn(_) { Nil })
+
+  "-- Hard delete (token revoke): removing the row removes the node's
+-- authority.
+delete from node where id = $1
+"
+  |> pog.query
+  |> pog.parameter(pog.text(id))
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
 /// Hard delete of an unreferenced provider. While any thread or bot
 /// pins it, the thread_provider_id / bot.provider_id FKs (ON DELETE
 /// RESTRICT) refuse the delete — the registry's count-based 409
@@ -491,6 +513,62 @@ where id = $1
 "
   |> pog.query
   |> pog.parameter(pog.text(id))
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
+/// A row you get from running the `get_node_by_name` query
+/// defined in `./src/nexus/store/sql/get_node_by_name.sql`.
+///
+/// > 🐿️ This type definition was generated automatically using v4.7.0 of the
+/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub type GetNodeByNameRow {
+  GetNodeByNameRow(
+    id: String,
+    name: String,
+    token_hash: String,
+    created_s: Int,
+    last_seen_s: Int,
+  )
+}
+
+/// One node row by NAME (the stateless token-verification lookup key).
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn get_node_by_name(
+  db: pog.Connection,
+  name: String,
+) -> Result(pog.Returned(GetNodeByNameRow), pog.QueryError) {
+  let decoder = {
+    use id <- decode.field(0, decode.string)
+    use name <- decode.field(1, decode.string)
+    use token_hash <- decode.field(2, decode.string)
+    use created_s <- decode.field(3, decode.int)
+    use last_seen_s <- decode.field(4, decode.int)
+    decode.success(GetNodeByNameRow(
+      id:,
+      name:,
+      token_hash:,
+      created_s:,
+      last_seen_s:,
+    ))
+  }
+
+  "-- One node row by NAME (the stateless token-verification lookup key).
+select
+  id,
+  name,
+  token_hash,
+  extract(epoch from created_at)::int8 as created_s,
+  coalesce(extract(epoch from last_seen_at)::int8, 0) as last_seen_s
+from node
+where name = $1
+"
+  |> pog.query
+  |> pog.parameter(pog.text(name))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }
@@ -756,6 +834,43 @@ values ($1, $2, $3, $4, $5, nullif($6, ''), case when $8::boolean then null else
   |> pog.execute(db)
 }
 
+/// A new node row (environments plan Phase 2b): the remote paired-TUI
+/// node entity. `token_hash` is the SHA-256 digest of the bearer token
+/// (nexus/node.gleam) — NEVER the plaintext. `last_seen_at` is
+/// to_timestamp(nullif($5, 0)): the 0 sentinel — a fresh pair has never
+/// connected, so the column is NULL.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn insert_node(
+  db: pog.Connection,
+  arg_1: String,
+  arg_2: String,
+  arg_3: String,
+  arg_4: Float,
+  arg_5: Int,
+) -> Result(pog.Returned(Nil), pog.QueryError) {
+  let decoder = decode.map(decode.dynamic, fn(_) { Nil })
+
+  "-- A new node row (environments plan Phase 2b): the remote paired-TUI
+-- node entity. `token_hash` is the SHA-256 digest of the bearer token
+-- (nexus/node.gleam) — NEVER the plaintext. `last_seen_at` is
+-- to_timestamp(nullif($5, 0)): the 0 sentinel — a fresh pair has never
+-- connected, so the column is NULL.
+insert into node (id, name, token_hash, created_at, last_seen_at)
+values ($1, $2, $3, to_timestamp($4), to_timestamp(nullif($5, 0::bigint)))
+"
+  |> pog.query
+  |> pog.parameter(pog.text(arg_1))
+  |> pog.parameter(pog.text(arg_2))
+  |> pog.parameter(pog.text(arg_3))
+  |> pog.parameter(pog.float(arg_4))
+  |> pog.parameter(pog.int(arg_5))
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
 /// A new provider row. `api_key_encrypted` is the nexus/crypto envelope;
 /// the '' sentinel inserts NULL (a keyless provider) — Postgres exposes
 /// no parameter nullability, so squirrel parameters cannot be nullable
@@ -981,6 +1096,60 @@ select
   extract(epoch from created_at)::int8 as created_s,
   extract(epoch from updated_at)::int8 as updated_s
 from bot
+order by id
+"
+  |> pog.query
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
+/// A row you get from running the `list_nodes` query
+/// defined in `./src/nexus/store/sql/list_nodes.sql`.
+///
+/// > 🐿️ This type definition was generated automatically using v4.7.0 of the
+/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub type ListNodesRow {
+  ListNodesRow(
+    id: String,
+    name: String,
+    token_hash: String,
+    created_s: Int,
+    last_seen_s: Int,
+  )
+}
+
+/// All node rows (registry boot load), ordered by id.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn list_nodes(
+  db: pog.Connection,
+) -> Result(pog.Returned(ListNodesRow), pog.QueryError) {
+  let decoder = {
+    use id <- decode.field(0, decode.string)
+    use name <- decode.field(1, decode.string)
+    use token_hash <- decode.field(2, decode.string)
+    use created_s <- decode.field(3, decode.int)
+    use last_seen_s <- decode.field(4, decode.int)
+    decode.success(ListNodesRow(
+      id:,
+      name:,
+      token_hash:,
+      created_s:,
+      last_seen_s:,
+    ))
+  }
+
+  "-- All node rows (registry boot load), ordered by id.
+select
+  id,
+  name,
+  token_hash,
+  extract(epoch from created_at)::int8 as created_s,
+  coalesce(extract(epoch from last_seen_at)::int8, 0) as last_seen_s
+from node
 order by id
 "
   |> pog.query
@@ -1420,6 +1589,26 @@ where id = $2
 "
   |> pog.query
   |> pog.parameter(pog.text(arg_1))
+  |> pog.parameter(pog.text(id))
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
+/// Bump a node's last-seen stamp on an authenticated connect.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn touch_node(
+  db: pog.Connection,
+  id: String,
+) -> Result(pog.Returned(Nil), pog.QueryError) {
+  let decoder = decode.map(decode.dynamic, fn(_) { Nil })
+
+  "-- Bump a node's last-seen stamp on an authenticated connect.
+update node set last_seen_at = now() where id = $1
+"
+  |> pog.query
   |> pog.parameter(pog.text(id))
   |> pog.returning(decoder)
   |> pog.execute(db)

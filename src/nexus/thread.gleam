@@ -340,6 +340,13 @@ pub type ThreadSpec {
     /// thread's first exchange predates this actor, so it never attempts
     /// the utility-titles upgrade.
     hydrated: Bool,
+    /// The attached-target roster to SEED (environments plan Phase 2a/2b):
+    /// `["workspace"]` (or the registry's re-derived live list at
+    /// hydration) on env-toolset threads, `[]` on plain threads. The
+    /// registry derives it — fresh threads seed the constant, hydrated
+    /// threads re-derive from the persisted roster rows — so the actor
+    /// never guesses from the toolset names alone.
+    roster: List(String),
     /// Guarded title application — see `UtilityApply`.
     utility_apply: UtilityApply,
   )
@@ -780,6 +787,7 @@ fn start_builder(spec: ThreadSpec) {
     commit_hook: commit_hook,
     transcript: transcript,
     hydrated: hydrated,
+    roster: roster,
     utility_apply: utility_apply,
   ) = spec
   actor.new_with_initialiser(1000, fn(self) {
@@ -817,17 +825,12 @@ fn start_builder(spec: ThreadSpec) {
       metrics: [],
       last_commit_s: 0,
       commit_hook: commit_hook,
-      // Roster seed (environments plan Phase 2a): an env-toolset thread
-      // starts with `workspace` attached; a plain thread with none.
-      // Derived from the FROZEN toolset names — the same fact the
-      // registry used to freeze `workspace_root` — so the seed can never
-      // drift from whether env tools exist.
-      roster: case
-        toolset.names |> list.any(fn(name) { env.is_env_name(name) })
-      {
-        True -> env.attached_targets()
-        False -> []
-      },
+      // Roster seed (environments plan Phase 2a/2b): the registry
+      // derives it — fresh env threads seed `["workspace"]`, hydrated
+      // threads re-derive the CURRENT live list from the persisted
+      // roster rows (Phase 2b's hydration re-derivation), so a
+      // restart never forgets an attached node.
+      roster: roster,
       pending_roster: [],
       utility_apply: utility_apply,
     ))

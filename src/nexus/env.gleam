@@ -144,6 +144,45 @@ fn roster_line(attached: List(String)) -> String {
   "attached targets: " <> string.join(attached, ", ") <> "."
 }
 
+/// The roster-line prefix — the discriminator a hydration-side reader
+/// uses to recognise a persisted roster row (author `system` AND content
+/// carrying this prefix) among the transcript's user rows.
+pub const roster_prefix = "attached targets: "
+
+/// Parse a roster line back into its target list (the inverse of
+/// `roster_line`). `None` when the text is not a roster line (it does
+/// not carry `roster_prefix`). Used by the hydration re-derivation
+/// (environments plan Phase 2b): the newest persisted roster row names
+/// the CURRENT live list, so a restart rebuilds the actor's roster
+/// from the transcript tail instead of re-seeding `["workspace"]`.
+/// The empty list `[]` (a plain thread with no attached targets) parses
+/// back as `[]` — distinct from `None` (not a roster line).
+pub fn roster_parse(text: String) -> Option(List(String)) {
+  case string.starts_with(text, roster_prefix) {
+    False -> None
+    True -> {
+      // Strip the prefix, then a trailing '.' if the line carries one,
+      // then split on "," + trim each name (hand-crafted whitespace
+      // cannot leak a bad name).
+      let names =
+        text
+        |> string.drop_start(up_to: string.length(roster_prefix))
+        |> strip_trailing_dot
+        |> string.split(",")
+        |> list.map(string.trim)
+        |> list.filter(fn(n) { n != "" })
+      Some(names)
+    }
+  }
+}
+
+fn strip_trailing_dot(s: String) -> String {
+  case string.ends_with(s, ".") {
+    True -> string.drop_end(s, up_to: 1)
+    False -> s
+  }
+}
+
 /// Validate a proposed node/roster target name before it enters the
 /// live roster (environments plan Phase 2a): the charset rule shared
 /// with plugin tool half-names, `workspace` reserved (it is the

@@ -28,6 +28,7 @@ mork = ">= 1.12.0 and < 2.0.0"
 glua = ">= 2.0.0 and < 3.0.0"
 filepath = ">= 1.1.2 and < 2.0.0"
 simplifile = ">= 2.7.0 and < 3.0.0"
+gleam_crypto = ">= 1.6.0 and < 2.0.0"
 
 [dev_dependencies]
 gleeunit = ">= 1.0.0 and < 2.0.0"

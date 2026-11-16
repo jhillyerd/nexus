@@ -35,6 +35,7 @@ import gleam/result
 import gleam/string
 import nexus/bot
 import nexus/config.{type Config}
+import nexus/node
 import nexus/store
 import nexus/store/sql
 import nexus/thread
@@ -96,6 +97,12 @@ pub type Msg {
   UpdateBot(bot: store.StoredBot, reply: Subject(Result(Nil, String)))
   DeleteBot(id: String, reply: Subject(Result(Nil, String)))
   CountBotsForProvider(id: String, reply: Subject(Result(Int, String)))
+  // ---- node rows (docs/plans/environments.md, Phase 2b) ----
+  ListNodes(reply: Subject(Result(List(store.StoredNode), String)))
+  GetNodeByName(name: String, reply: Subject(Result(store.StoredNode, String)))
+  InsertNode(node: store.StoredNode, reply: Subject(Result(Nil, String)))
+  TouchNode(id: String, reply: Subject(Result(Nil, String)))
+  DeleteNode(id: String, reply: Subject(Result(Nil, String)))
 }
 
 type State {
@@ -284,6 +291,27 @@ pub fn seam(store_actor: Subject(Msg)) -> store.Store {
     count_bots_for_provider: fn(id) {
       actor.call(store_actor, call_timeout_ms, fn(reply) {
         CountBotsForProvider(id, reply)
+      })
+    },
+    list_nodes: fn() { actor.call(store_actor, call_timeout_ms, ListNodes) },
+    get_node_by_name: fn(name) {
+      actor.call(store_actor, call_timeout_ms, fn(reply) {
+        GetNodeByName(name, reply)
+      })
+    },
+    insert_node: fn(node) {
+      actor.call(store_actor, call_timeout_ms, fn(reply) {
+        InsertNode(node, reply)
+      })
+    },
+    touch_node: fn(id) {
+      actor.call(store_actor, call_timeout_ms, fn(reply) {
+        TouchNode(id, reply)
+      })
+    },
+    delete_node: fn(id) {
+      actor.call(store_actor, call_timeout_ms, fn(reply) {
+        DeleteNode(id, reply)
       })
     },
   )
@@ -742,6 +770,77 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       process.send(reply, result)
       actor.continue(state)
     }
+
+    // ---- node rows (docs/plans/environments.md, Phase 2b) ----
+    ListNodes(reply) -> {
+      let result =
+        sql.list_nodes(state.db)
+        |> result.map(fn(returned) {
+          returned.rows
+          |> list.map(fn(row) {
+            node_from_row(
+              row.id,
+              row.name,
+              row.token_hash,
+              row.created_s,
+              row.last_seen_s,
+            )
+          })
+        })
+        |> result.map_error(query_error)
+      process.send(reply, result)
+      actor.continue(state)
+    }
+
+    GetNodeByName(name, reply) -> {
+      // Empty result = unknown name; the caller decides (the stateless
+      // verification path refuses a lookup that finds no row).
+      let result = case sql.get_node_by_name(state.db, name) {
+        Error(error) -> Error(query_error(error))
+        Ok(pog.Returned(_, rows)) ->
+          case rows {
+            [row] ->
+              Ok(node_from_row(
+                row.id,
+                row.name,
+                row.token_hash,
+                row.created_s,
+                row.last_seen_s,
+              ))
+            _ -> Error("no stored node named " <> name)
+          }
+      }
+      process.send(reply, result)
+      actor.continue(state)
+    }
+
+    InsertNode(node, reply) -> {
+      let result =
+        sql.insert_node(
+          state.db,
+          node.id,
+          node.name,
+          node.token_hash,
+          int.to_float(node.created_at),
+          // The 0 sentinel writes NULL (never connected) — see
+          // insert_node.sql for the squirrel nullability rationale.
+          option.unwrap(node.last_seen_at, 0),
+        )
+        |> result.map(fn(_) { Nil })
+        |> result.map_error(query_error)
+      process.send(reply, result)
+      actor.continue(state)
+    }
+
+    TouchNode(id, reply) -> {
+      process.send(reply, update(sql.touch_node(state.db, id)))
+      actor.continue(state)
+    }
+
+    DeleteNode(id, reply) -> {
+      process.send(reply, update(sql.delete_node(state.db, id)))
+      actor.continue(state)
+    }
   }
 }
 
@@ -996,6 +1095,29 @@ fn bot_from_row(
     allow_inbound: allow_inbound,
     created_at: created_s,
     updated_at: updated_s,
+  )
+}
+
+/// A stored node row from either query shape (get-by-name / list select
+/// the same columns). Kept as one helper so the two row types cannot
+/// drift. `last_seen_s = 0` is the store's NULL sentinel (never
+/// connected) → `None`, matching `node.Node`.
+fn node_from_row(
+  id: String,
+  name: String,
+  token_hash: String,
+  created_s: Int,
+  last_seen_s: Int,
+) -> store.StoredNode {
+  node.Node(
+    id: id,
+    name: name,
+    token_hash: token_hash,
+    created_at: created_s,
+    last_seen_at: case last_seen_s {
+      0 -> option.None
+      stamp -> option.Some(stamp)
+    },
   )
 }
 
