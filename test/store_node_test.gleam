@@ -6,7 +6,6 @@
 //// constraint. The pog-backed implementation is drift-gated in CI by
 //// `squirrel check`; these pin the seam's SEMANTICS, not the SQL.
 
-import gleam/list
 import gleam/option.{None, Some}
 import gleeunit/should
 import nexus/node
@@ -36,14 +35,21 @@ pub fn node_pair_and_verify_roundtrip_test() {
 
   // Unknown name refuses (no row to verify against).
   seam.get_node_by_name("ghost") |> should.be_error
+}
 
-  // Boot load lists every node, id-sorted.
-  seam.insert_node(row("n2", "backup")) |> should.be_ok
+/// `list_nodes` returns nodes id-sorted, NOT insertion-sorted: insert a
+/// lexically-greater id first, then a lexically-lesser one, so an
+/// insertion-order (unsorted) implementation yields the wrong sequence
+/// and fails.
+pub fn node_list_is_id_sorted_not_insertion_sorted_test() {
+  let seam = store_mock.seam(store_mock.start())
+  // Insertion order: n9, then n2. Lexical order: n2, then n9.
+  seam.insert_node(row("n9", "zeta")) |> should.be_ok
+  seam.insert_node(row("n2", "alpha")) |> should.be_ok
   let assert Ok(nodes) = seam.list_nodes()
-  nodes |> list.length |> should.equal(2)
   let assert [a, b] = nodes
-  a.id |> should.equal("n1")
-  b.id |> should.equal("n2")
+  a.id |> should.equal("n2")
+  b.id |> should.equal("n9")
 }
 
 pub fn node_name_is_unique_test() {

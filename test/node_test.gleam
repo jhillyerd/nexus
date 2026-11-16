@@ -25,6 +25,13 @@ pub fn hash_token_is_hex_sha256_test() {
   let h = node.hash_token("secret-token")
   // 64 hex chars = 32 bytes.
   should.equal(string.length(h), 64)
+  // The KNOWN SHA-256 digest, hex (base16_encode = binary:encode_hex
+  // emits UPPERCASE on the BEAM) — pins both the algorithm (SHA-256,
+  // not a weaker one) and the encoding, so a regression in either fails.
+  should.equal(
+    h,
+    "930BBDC51B6AED5C2A5678FD6E28DEE7A05E8A4B643CFC0B4427C3EFB86C0D94",
+  )
   // Deterministic.
   should.equal(node.hash_token("secret-token"), h)
   // Distinct inputs, distinct digests.

@@ -75,9 +75,14 @@ pub fn roster_texts_test() {
 pub fn roster_parse_roundtrips_test() {
   // The inverse of the tail line (Phase 2b hydration re-derivation): a
   // roster line parses back to its list, and a non-roster line is `None`.
-  env.roster_parse("attached targets: workspace, proxmox-2.")
+  // The serialized inputs come from the EMITTERS (attach/detach), so a
+  // change to the emitters cannot silently break hydration — the
+  // round-trip is asserted end to end, not against hardcoded strings.
+  env.roster_attach_text("proxmox-2", ["workspace", "proxmox-2"])
+  |> env.roster_parse
   |> should_equal(Some(["workspace", "proxmox-2"]))
-  env.roster_parse("attached targets: workspace.")
+  env.roster_detach_text("proxmox-2", ["workspace"])
+  |> env.roster_parse
   |> should_equal(Some(["workspace"]))
   // Not a roster line: a plain user message or bot-authored row is None.
   env.roster_parse("what is the weather?")
