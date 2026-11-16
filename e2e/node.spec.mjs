@@ -156,10 +156,14 @@ function startFakeProvider() {
         if (scenario === "nodebash" && !toolDone) {
           // Round 1: call bash on the attached node, echoing the user's
           // marker so the node can assert the arguments it receives.
+          // The argument JSON is deliberately NONCANONIMAL (reversed
+          // key order, odd spacing) so the e2e can prove the arguments
+          // ride VERBATIM — a canonicalizing encoder would reorder them.
           const marker = /marker:(\S+)/.exec(userText)?.[1] ?? "plain";
+          const args = `{  "command" : "echo ${marker}" , "target":"node-a"}`;
           sse(chunk({ role: "assistant", content: "" }));
           sse(chunk({ tool_calls: [{ index: 0, id: callId, type: "function", function: { name: "bash", arguments: "" } }] }));
-          sse(chunk({ tool_calls: [{ index: 0, function: { arguments: `{"target":"node-a","command":"echo ${marker}"}` } }] }));
+          sse(chunk({ tool_calls: [{ index: 0, function: { arguments: args } }] }));
           sse(chunk({}, "tool_calls"));
           finish();
           return;
@@ -318,6 +322,7 @@ class FakeNode {
   constructor(url) {
     this.url = url;
     this.frames = [];
+    this.rawFrames = [];
     this.waiters = [];
     this.closed = new Promise(() => {}); // settled per-connect
     this.closeCode = null;
@@ -344,6 +349,7 @@ class FakeNode {
           reject(new Error(`non-JSON frame: ${ev.data}`));
           return;
         }
+        this.rawFrames.push(ev.data);
         this.frames.push(frame);
         this.waiters = this.waiters.filter((w) => !w(frame));
       });
@@ -486,14 +492,19 @@ async function main() {
       (f) => f.method === "tools/call" && f.params?.name === "bash",
       "tools/call",
     );
-    if (call.params.arguments?.target !== "node-a") {
-      throw new Error(`wrong target in arguments: ${JSON.stringify(call.params.arguments)}`);
-    }
-    if (call.params.arguments?.command !== "echo ROUND-1") {
-      throw new Error(`arguments not verbatim: ${JSON.stringify(call.params.arguments)}`);
+    if (call.params.arguments?.target !== "node-a" || call.params.arguments?.command !== "echo ROUND-1") {
+      throw new Error(`wrong arguments: ${JSON.stringify(call.params.arguments)}`);
     }
     if (call.v !== 1 || call.jsonrpc !== "2.0") {
       throw new Error(`frame envelope wrong: ${JSON.stringify(call)}`);
+    }
+    // VERBATIM at the byte level (CodeRabbit review): the fixture's
+    // noncanonical argument JSON must appear in the RAW frame text
+    // exactly — key order and spacing preserved, no re-encoding.
+    const verbatim = `{  "command" : "echo ROUND-1" , "target":"node-a"}`;
+    const rawCall = nodeA.rawFrames.find((raw) => raw.includes("tools/call"));
+    if (!rawCall || !rawCall.includes(verbatim)) {
+      throw new Error(`arguments not verbatim on the wire:\nwant substring: ${verbatim}\nraw: ${rawCall}`);
     }
     nodeA.answer(call.id, "node says: ROUND-1-DONE");
     const toolResult = await nodeA.waitFor(
@@ -653,6 +664,9 @@ async function main() {
       provider: "fakenode",
       model: "smart",
     });
+    if (plain.status !== 201) {
+      throw new Error(`plain thread creation returned ${plain.status}`);
+    }
     const bad = new FakeNode(nodeUrl(plain.body.id));
     const opened = await bad.connect();
     if (opened !== null) {
@@ -668,6 +682,9 @@ async function main() {
       provider: "fakenode",
       model: "smart",
     });
+    if (plain.status !== 201) {
+      throw new Error(`plain thread creation returned ${plain.status}`);
+    }
     const threadId = plain.body.id;
     const viewer = new FakeNode(nodeUrl(threadId, "&role=viewer"));
     const opened = await viewer.connect();

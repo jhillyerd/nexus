@@ -460,6 +460,14 @@ pub type Msg {
   Event(thread.ThreadEvent)
   /// The `AttachTarget` ask's answer.
   AttachAccepted(Result(Nil, String))
+  /// The thread actor's monitor fired: it exited (a registry restart
+  /// brings a FRESH actor — new subject, empty fan-out, empty exec
+  /// map), so this connection is a zombie: no events will ever arrive,
+  /// sends to the dead subject drop silently, and the restarted actor
+  /// no longer routes here. Tell the node and stop; the socket-side
+  /// monitor then closes the connection so the node reconnects into
+  /// the restarted thread (fresh Join + AttachTarget).
+  ThreadGone
 }
 
 type Pending {
@@ -528,15 +536,31 @@ fn adapter_initialiser(
       max_output_chars: cfg.env_max_output_bytes,
       self: self,
     )
+  // Watch the thread actor itself (CodeRabbit review): its exit would
+  // otherwise strand this adapter on a dead subject with no cleanup.
+  let selector = case process.subject_owner(thread_subject) {
+    Ok(owner_pid) -> {
+      let thread_mon = process.monitor(owner_pid)
+      process.new_selector()
+      |> process.select(self)
+      |> process.select_map(events, Event)
+      |> process.select_map(provider_sub, Provider)
+      |> process.select_map(attach_reply, AttachAccepted)
+      |> process.select_specific_monitor(thread_mon, fn(_) { ThreadGone })
+    }
+    // An ownerless subject cannot be monitored; the other cleanup
+    // paths (socket close, the thread's own exec-map monitor while
+    // it lives) still bound this adapter's lifetime.
+    Error(_) ->
+      process.new_selector()
+      |> process.select(self)
+      |> process.select_map(events, Event)
+      |> process.select_map(provider_sub, Provider)
+      |> process.select_map(attach_reply, AttachAccepted)
+  }
   actor.initialised(state)
   |> actor.returning(self)
-  |> actor.selecting(
-    process.new_selector()
-    |> process.select(self)
-    |> process.select_map(events, Event)
-    |> process.select_map(provider_sub, Provider)
-    |> process.select_map(attach_reply, AttachAccepted),
-  )
+  |> actor.selecting(selector)
   |> Ok
 }
 
@@ -567,6 +591,18 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
         ViewerRole -> Nil
       }
       actor.continue(state)
+    }
+    ThreadGone -> {
+      // The thread actor died; the registry's replacement does not know
+      // this adapter. Say why, then stop — the socket closes and the
+      // node reconnects into the restarted thread.
+      send_frame(
+        state,
+        node_protocol.encode_error(
+          "thread actor exited — reconnecting required",
+        ),
+      )
+      actor.stop()
     }
     AttachAccepted(Error(reason)) -> {
       // Refused at attach (e.g. a roster race): tell the node why, then

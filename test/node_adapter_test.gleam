@@ -511,6 +511,28 @@ pub fn adapter_filters_foreign_thread_events_test() {
   should.equal(next_frame(rig.frames), "{\"v\":1,\"type\":\"pong\"}")
 }
 
+/// The thread actor's death does not strand the connection
+/// (CodeRabbit): the adapter's monitor on the thread owner fires, the
+/// node hears why, and the adapter stops — the socket-side monitor
+/// closes the connection in production.
+pub fn adapter_thread_death_stops_test() {
+  let rig = start_rig(node_adapter.EnvRole)
+  let _hello = next_frame(rig.frames)
+  let _replay = next_frame(rig.frames)
+  let _attached = next_frame(rig.frames)
+
+  // Kill the fake thread's process: the adapter's monitor fires.
+  let assert Ok(thread_pid) = process.subject_owner(rig.fake)
+  process.kill(thread_pid)
+
+  // The honest error frame, then silence (the adapter is dead — a late
+  // ping is inert).
+  let assert Ok(frame) = process.receive(rig.frames, 2000)
+  should.be_true(string.contains(frame, "thread actor exited"))
+  process.send(rig.adapter, node_adapter.FrameIn(node_protocol.Ping))
+  should.equal(process.receive(rig.frames, 200), Error(Nil))
+}
+
 /// A refused attach (roster race) tells the node why, then the adapter
 /// stops — the linked socket dies with it.
 pub fn adapter_attach_refusal_stops_test() {
