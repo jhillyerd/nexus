@@ -148,7 +148,14 @@ pub fn websocket(
                           init_socket(cfg, thread_id, thread_subject, row, role)
                         },
                         handler: loop_socket,
-                        on_close: fn(_state) { Nil },
+                        // The clean stop for the NORMAL close path (the
+                        // ui_runtime close_socket rule): the link alone
+                        // covers ABNORMAL deaths — a crashed socket, the
+                        // replace-kill — because an actor's own normal
+                        // exit does not rupture links. Killing here is
+                        // exit-reason-agnostic for the thread actor's
+                        // monitor (any exit spends it) and immediate.
+                        on_close: fn(state) { process.kill(state.adapter_pid) },
                       )
                   }
                 }
@@ -249,7 +256,11 @@ fn json_response(status: Int, body: json.Json) -> Response(mist.ResponseData) {
 // ---------------------------------------------------------------------------
 
 type SocketState {
-  SocketState(adapter: Subject(Msg), frames: Subject(String))
+  SocketState(
+    adapter: Subject(Msg),
+    adapter_pid: process.Pid,
+    frames: Subject(String),
+  )
 }
 
 fn init_socket(
@@ -263,8 +274,9 @@ fn init_socket(
   // Linked to THIS process (the socket owner): the pair die together.
   let assert Ok(adapter) =
     start_adapter(cfg, thread_id, thread_subject, row.name, role, frames)
+  let assert Ok(adapter_pid) = process.subject_owner(adapter)
   #(
-    SocketState(adapter: adapter, frames: frames),
+    SocketState(adapter: adapter, adapter_pid: adapter_pid, frames: frames),
     Some(process.new_selector() |> process.select(frames)),
   )
 }

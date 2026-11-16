@@ -548,10 +548,15 @@ process-local), so the adapter hands finished frame STRINGS to a
 the `ui_runtime` pattern with the direction inverted. Inbound, the
 socket loop decodes client frames and forwards them to the adapter's
 subject; undecodable frames answer an `error` frame and keep the
-socket. The adapter is linked to the socket process: a closed or
-crashed socket takes the adapter down (the thread actor's monitor
-detaches), a crashed adapter takes the socket down (the node's
-client reconnects into a fresh pair).
+socket. The adapter is linked to the socket process: a crashed
+socket or the replace-kill takes the adapter down (the thread actor's
+monitor detaches), a crashed adapter takes the socket down (the
+node's client reconnects into a fresh pair). The GRACEFUL client
+close is the route's `on_close` KILLING the adapter (the
+`ui_runtime` `close_socket` rule): an actor's own normal exit does
+not rupture links, so the link alone leaves a closed socket's
+adapter orphaned and attached — found by the 2b-4 fake node's
+detach-mid-call check.
 - **Auth is name+token pair-verify, not hash lookup** —
 `/node/ws?node=<name>&token=<token>&thread=<id>&role=env|viewer`
 (the token also accepted as `Authorization: Bearer`): the named row
@@ -611,10 +616,28 @@ semantics), `thread_registry_test.env_capable_ask_test`, and
 `web_routes_test` (the pairing round trip + the pre-upgrade
 refusals). The upgrade itself is the fake node's to prove (2b-4).
 
-**2b-4 — a headless fake node in `e2e/`** (Node script speaking the
-client protocol) driven by the integration spec — the browser suite
-cannot exercise a TUI, but a raw WS client can: attach, receive
-events, serve a call, detach mid-call.
+**2b-4 — a headless fake node in `e2e/` — IMPLEMENTED (`e2e/node.spec.mjs`).**
+A Node script speaking the client protocol (Node's built-in WebSocket —
+zero new dependencies, no Playwright: the browser suite cannot exercise
+a TUI, but a raw WS client can). A DEDICATED loopback suite with its
+own fake OpenAI SSE provider scripting env-tool turns (`case:nodebash`,
+`case:nodehang`) — an as-built delta on "driven by the integration
+spec": the live-services smoke needs network and ~10 minutes; this
+suite is deterministic, offline-beyond-loopback, and runs in ~1 minute,
+which is what a protocol proof loop needs. Ten checks through the REAL
+socket and REAL thread actor: pairing via `POST /nodes`; the connect
+sequence (hello + replay with the roster lines + attached); a full
+remote tool round (arguments VERBATIM on the wire, node result →
+committed tool row → the model's round-2 answer embedding the node's
+bytes); replace-on-reconnect (old socket dies, NO roster line —
+message_count unchanged — new plane serves the next round, graceful
+close lands the detach line); detach mid-call (the node drops the
+socket with a call in flight → the executor-side monitor answers an
+ordinary failed tool result, the round commits, the queued detach line
+lands behind the turn); wrong-token 401; env-role 403 on a plain
+thread; viewer role (events + send + ping, no `attached`, no tool
+plane). It also caught the graceful-close lifecycle hole: see the
+on_close delta under 2b-3.
 
 **2b-5 — the TUI itself** (separate binary, language TBD — the
 protocol is JSON; a Gleam TUI could share decode types). Ships when

@@ -253,8 +253,11 @@ deltas; the rules that bite silently:
   process-local), so the node adapter hands finished frame STRINGS to
   a `frames` subject the socket loop selects on — never call
   `mist.send_text_frame` from the adapter actor. The adapter is
-  LINKED to the socket process; both directions of death are clean
-  (monitor-detach / client reconnect).
+  LINKED to the socket process, and the route's `on_close` KILLS it:
+  the link covers abnormal deaths (crash, the replace-kill), but an
+  actor's own NORMAL exit does not rupture links — the graceful
+  client close needs the explicit kill or the adapter stays orphaned
+  and attached (the 2b-4 fake node's detach-mid-call check).
 - **The adapter keeps no timers.** `tool_provider.run_remote` owns
   deadline, monitor, and cancel re-signal — a wedged node answers as
   an executor timeout, a dead adapter as a monitor DOWN, both
