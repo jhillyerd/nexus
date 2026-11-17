@@ -4,14 +4,17 @@
 //// later config gating), loud failure on unknown names, and codemode's
 //// last-position sibling capture being per-toolset.
 
+import gleam/dict
 import gleam/erlang/process
 import gleam/json
 import gleam/list
 import gleam/option
+import gleam/otp/actor
 import gleam/string
 import gleeunit/should
 import nexus/config
 import nexus/delivery
+import nexus/tool_provider
 import nexus/tools
 
 /// A config from env overrides; only `NEXUS_ENCRYPTION_KEY` is required,
@@ -54,8 +57,53 @@ pub fn default_names_searxng_gate_test() {
 
 pub fn default_names_codemode_gate_test() {
   let enabled = cfg([#("NEXUS_CODEMODE", "true")])
+  // Sorted catalog order; codemode's SCHEMA still registers last in
+  // `by_names_with` wherever the name sits.
   tools.default_names(enabled)
-  |> should.equal(["http_fetch", "codemode"])
+  |> should.equal(["codemode", "http_fetch"])
+}
+
+/// The env tools join the default exactly when a workspace root exists
+/// to freeze (the same usability gate a create applies to explicit env
+/// names), and stay out otherwise — the amended environments-plan rule.
+pub fn default_names_env_gate_test() {
+  let rooted = cfg([#("NEXUS_WORKSPACE_ROOT", "/srv/workspaces")])
+  tools.default_names(rooted)
+  |> should.equal([
+    "bash",
+    "http_fetch",
+    "list_dir",
+    "read_file",
+    "write_file",
+  ])
+}
+
+/// Everything usable on: the full catalog minus `bot_message` (the
+/// registry injects it into bot threads itself), in sorted catalog
+/// order — a future compiled tool joins the default automatically
+/// unless it needs its own gate line in `default_names`.
+pub fn default_names_everything_usable_test() {
+  let everything =
+    cfg([
+      #("NEXUS_CODEMODE", "true"),
+      #("NEXUS_SEARXNG_BASE_URL", "http://127.0.0.1:8888"),
+      #("NEXUS_WORKSPACE_ROOT", "/srv/workspaces"),
+    ])
+  tools.default_names(everything)
+  |> should.equal([
+    "bash",
+    "codemode",
+    "http_fetch",
+    "list_dir",
+    "read_file",
+    "web_search",
+    "write_file",
+  ])
+  // And the m3 golden's exact envelope is untouched by the widening:
+  // the smoke shape (SearxNG on, no codemode, no root) resolves to the
+  // same two names, same order, the fixture was captured with.
+  let smoke = cfg([#("NEXUS_SEARXNG_BASE_URL", "https://searx.example")])
+  tools.default_names(smoke) |> should.equal(["http_fetch", "web_search"])
 }
 
 // ---- default: the boot-frozen registry -----------------------------------
@@ -108,6 +156,120 @@ pub fn by_names_ignores_config_gates_test() {
   // Specs build in the snapshot's GIVEN order; only codemode itself is
   // canonicalized to last.
   names(specs) |> should.equal(["web_search", "http_fetch", "codemode"])
+}
+
+// ---- the pinnable catalog (issue #121) -------------------------------
+
+/// `catalog_names` is the ONE list: every name `is_compiled_name`
+/// accepts, in sorted display order, and nothing else — a future
+/// compiled tool cannot drift the registration guard away from the
+/// picker's checkbox list.
+pub fn catalog_names_match_is_compiled_name_test() {
+  let names = tools.catalog_names()
+  // The plain M3 four plus the four environment tools, at least.
+  should.be_true(list.length(names) >= 8)
+  list.each(names, fn(name) { tools.is_compiled_name(name) |> should.be_true })
+  should.equal(names, list.sort(list.unique(names), string.compare))
+  // Qualified names are never compiled names (the reserved separator).
+  tools.is_compiled_name("nexus_example__echo") |> should.be_false
+  tools.is_compiled_name("nope") |> should.be_false
+}
+
+/// tools.catalog (issue #121): compiled + plugin names enumerate
+/// without any ask; a mounted server contributes its QUALIFIED tool
+/// names through the live ListTools ask; a dead server degrades into
+/// `unavailable` (display honesty — its names still pass the save-side
+/// gate while mounted).
+pub fn catalog_enumerates_compiled_plugin_and_foreign_test() {
+  let server =
+    start_fake_mcp([
+      tool_provider.ToolDef("echo", "echoes", "{}"),
+      tool_provider.ToolDef("ping", "pings", "{}"),
+    ])
+  let dead = process.new_name("nexus_tools_test_dead")
+  // Any spec value serves — the enumeration reads the provider table's
+  // KEYS, never its specs.
+  let assert Ok([spec, ..]) = tools.by_names(plain(), ["http_fetch"])
+  let catalog =
+    tools.catalog(
+      dict.from_list([#("nexus_example__echo", spec)]),
+      dict.from_list([
+        #("mcpsrv", tools.ForeignServer(name: server, timeout_ms: 1000)),
+        #("dead", tools.ForeignServer(name: dead, timeout_ms: 1000)),
+      ]),
+      // Standard collect budget: every asker self-bounds inside the
+      // freeze budget, so the real deadline only guards a wedged asker.
+      tools.freeze_ask_ms + 2000,
+    )
+  catalog.names
+  |> should.equal([
+    "bash",
+    "bot_message",
+    "codemode",
+    "http_fetch",
+    "list_dir",
+    "mcpsrv__echo",
+    "mcpsrv__ping",
+    "nexus_example__echo",
+    "read_file",
+    "web_search",
+    "write_file",
+  ])
+  catalog.unavailable |> should.equal(["dead"])
+}
+
+/// The deadline-expiry path: a server whose asker never replies in
+/// time joins `unavailable` BY NAME — the picker omits its tools AND
+/// says so. A tiny collect deadline keeps the test fast; the asker's
+/// eventual reply lands on the (caller-owned, undrained) subject and
+/// is dropped.
+pub fn catalog_deadline_reports_silent_server_test() {
+  let silent = start_silent_mcp()
+  let catalog =
+    tools.catalog(
+      dict.new(),
+      dict.from_list([
+        #("slow", tools.ForeignServer(name: silent, timeout_ms: 1000)),
+      ]),
+      50,
+    )
+  catalog.names |> should.equal(tools.catalog_names())
+  catalog.unavailable |> should.equal(["slow"])
+}
+
+/// A minimal MCP-shaped fake: a named actor answering ListTools with a
+/// fixed catalog (tool_provider_test's fake, reduced to the arm the
+/// catalog enumeration exercises).
+/// Same shape, but answers NOTHING — the ListTools ask runs out its
+/// own clock inside the asker (which the real deadline outpaces here).
+fn start_silent_mcp() -> process.Name(tool_provider.Msg) {
+  let name = process.new_name("nexus_tools_test_silent")
+  let assert Ok(_started) =
+    actor.new(Nil)
+    |> actor.on_message(fn(state, _msg) { actor.continue(state) })
+    |> actor.named(name)
+    |> actor.start
+  name
+}
+
+fn start_fake_mcp(
+  defs: List(tool_provider.ToolDef),
+) -> process.Name(tool_provider.Msg) {
+  let name = process.new_name("nexus_tools_test_mcp")
+  let assert Ok(_started) =
+    actor.new(defs)
+    |> actor.on_message(fn(defs, msg) {
+      case msg {
+        tool_provider.ListTools(reply) -> {
+          process.send(reply, Ok(defs))
+          actor.continue(defs)
+        }
+        _ -> actor.continue(defs)
+      }
+    })
+    |> actor.named(name)
+    |> actor.start
+  name
 }
 
 // ---- codemode's host list is the TOOLSET, not the global default ------

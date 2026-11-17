@@ -214,6 +214,19 @@ pub fn main() -> Nil {
               // validation — a bot save must not depend on a server's
               // mood); the freeze happens per THREAD at create.
               bot_validate_tools(cfg, providers, foreign),
+              // The pinnable-catalog enumeration (issue #121): the
+              // forms' checkbox list reads the same ONE provider/foreign
+              // values the validate closure captured, through the same
+              // injected-fn rule (the actor stays tool-module-free).
+              // Unlike validation this DOES ask live per mounted server
+              // (bounded by the freeze budget inside tools.catalog) so
+              // the picker shows the servers' current tools; a failed
+              // server degrades into the catalog's `unavailable` list.
+              fn() {
+                let tools.Catalog(names, unavailable) =
+                  tools.catalog(providers, foreign, tools.freeze_ask_ms + 2000)
+                bot_registry.ToolCatalog(names, unavailable)
+              },
             )
           }),
         )

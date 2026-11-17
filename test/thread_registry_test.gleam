@@ -1674,9 +1674,12 @@ pub fn create_from_bot_orchestration_carries_bot_toolset_test() {
   store_mock.ensure_fixture_provider(seam)
   let cfg = test_config()
   let assert Ok(started_bots) =
-    bot_registry.start(seam, process.new_name("nexus_orch_bots"), fn(names) {
-      tools.by_names(cfg, names) |> result.replace(names)
-    })
+    bot_registry.start(
+      seam,
+      process.new_name("nexus_orch_bots"),
+      fn(names) { tools.by_names(cfg, names) |> result.replace(names) },
+      fn() { bot_registry.ToolCatalog([], []) },
+    )
   let bots = started_bots.data
   // The provider registry's live model list, fixed — inert now (creates
   // fetch nothing) but it keeps the rig strictly offline.
@@ -1809,11 +1812,12 @@ pub fn toolset_snapshot_survives_changed_default_config_test() {
     seam.insert_thread(stored_with_toolset("s-pin", ["web_search"]), "sys")
 
   // The next boot runs with codemode ON — its default tuple is now
-  // ["http_fetch", "codemode"].
+  // ["codemode", "http_fetch"] (the sorted catalog order; codemode's
+  // schema still registers last wherever the name sits).
   let codemode_on = config.Config(..test_config(), codemode: True)
   should.equal(tools.default_names(codemode_on), [
-    "http_fetch",
     "codemode",
+    "http_fetch",
   ])
   let spec_captor = process.new_subject()
   let booted = boot_with_config(seam, codemode_on, spec_captor)

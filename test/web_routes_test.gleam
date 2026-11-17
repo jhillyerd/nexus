@@ -159,9 +159,12 @@ fn start_server_with(
   // The REAL bot registry over the same mock store (bots plan P1):
   // plain start — no crypto, no fetcher to fake.
   let assert Ok(_bots) =
-    bot_registry.start(persistence, bots_name, fn(names) {
-      tools.by_names(cfg, names) |> result.replace(names)
-    })
+    bot_registry.start(
+      persistence,
+      bots_name,
+      fn(names) { tools.by_names(cfg, names) |> result.replace(names) },
+      fn() { bot_registry.ToolCatalog([], []) },
+    )
   let assert Ok(started) =
     thread_registry.start(
       cfg,

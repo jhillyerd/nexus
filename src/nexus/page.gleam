@@ -1071,6 +1071,32 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
 #app .provider-form .combo-wrap + small { display: block; margin: 0; }
 .provider-form-buttons { display: flex; gap: .3rem; }
 #app .provider-form-buttons button { font-size: .75rem; padding: .25rem .6rem; }
+/* The bot forms' tool picker (issue #121): a Pico fieldset holding a
+   controls row (All/None + an optional unavailable note) over a GRID
+   of checkbox labels — equal-width tracks via auto-fill, so the
+   checkboxes align into true columns (a flex-wrap list scatters each
+   row to wherever the longest name lands) and the count adapts to the
+   card's width. Checkboxes, borders, and focus rings are Pico's; only
+   the layout is patched, plus the height cap so a plugin-heavy
+   catalog cannot stretch the form card. */
+.tool-picker { display: flex; flex-direction: column; gap: .35rem; margin: 0;
+  padding: .45rem .55rem; border-radius: 10px; }
+.tool-picker legend { font-size: .7rem; font-weight: 600; text-transform: uppercase;
+  letter-spacing: .07em; opacity: .55; padding: 0 .25rem; }
+.tool-picker-controls { display: flex; align-items: center; gap: .3rem; flex-wrap: wrap; }
+#app .tool-picker-controls button { font-size: .7rem; padding: .15rem .5rem; margin: 0; }
+/* The Custom switch's row (fold control, issue #121): flex so the
+   Pico switch track and its label sit on one line. */
+.tool-picker-switch { display: flex; align-items: center; gap: .45rem; }
+.tool-picker-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(10.5rem, 1fr));
+  gap: .3rem 1rem; max-height: 10rem; overflow-y: auto; }
+/* overflow-wrap: anywhere lets a long qualified MCP/plugin name break
+   inside its track — and because `anywhere` (unlike break-word) also
+   shrinks the min-content size, the unbreakable word cannot blow the
+   equal-width column out of line. */
+.tool-picker-list .checkbox-field { display: flex; align-items: center; gap: .3rem; min-width: 0;
+  overflow-wrap: anywhere; }
+.tool-picker-list .muted, .tool-picker-controls .muted { font-size: .75rem; }
 /* Form visuals (borders, focus rings, filled backgrounds, dark mode) are
    Pico's, driven by the tokens above. Only the layout leftovers are
    patched: every form here is a flex row/column with explicit gaps, so

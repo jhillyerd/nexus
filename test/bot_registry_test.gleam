@@ -83,13 +83,39 @@ fn start_registry_with_validator(
   seam: store.Store,
   validate_tools: bot_registry.ValidateTools,
 ) -> process.Subject(bot_registry.Msg) {
+  start_registry_with_catalog(seam, validate_tools, fn() {
+    bot_registry.ToolCatalog([], [])
+  })
+}
+
+/// Same, with the picker-catalog seam injected (issue #121).
+fn start_registry_with_catalog(
+  seam: store.Store,
+  validate_tools: bot_registry.ValidateTools,
+  tool_catalog: bot_registry.CatalogFn,
+) -> process.Subject(bot_registry.Msg) {
   let assert Ok(started) =
     bot_registry.start(
       seam,
       process.new_name("nexus_bot_registry_test"),
       validate_tools,
+      tool_catalog,
     )
   started.data
+}
+
+/// The catalog ask (issue #121) answers the injected closure's value
+/// verbatim — the actor adds nothing, drops nothing.
+pub fn tool_catalog_ask_answers_the_closure_test() {
+  let mock = store_mock.start()
+  let registry =
+    start_registry_with_catalog(
+      store_mock.seam(mock),
+      fn(names) { Ok(names) },
+      fn() { bot_registry.ToolCatalog(["http_fetch"], ["mcpsrv"]) },
+    )
+  bot_registry.tool_catalog(registry, 5000)
+  |> should.equal(bot_registry.ToolCatalog(["http_fetch"], ["mcpsrv"]))
 }
 
 /// Boot load: rows seeded straight into the store appear in the

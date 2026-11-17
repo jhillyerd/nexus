@@ -49,6 +49,25 @@ import nexus/timing
 pub type ValidateTools =
   fn(List(String)) -> Result(List(String), String)
 
+/// The pinnable tool catalog (issue #121): every name a submitted
+/// toolset may contain, for the bot forms' checkbox list, plus the MCP
+/// servers whose live listing failed (their tools are display-omitted,
+/// never refused). A plain structural value on purpose — this actor
+/// stays decoupled from the tool modules, so boot's injected closure
+/// (see `CatalogFn`) builds it from the same ONE provider/foreign
+/// values the validate seam checks against.
+pub type ToolCatalog {
+  ToolCatalog(names: List(String), unavailable: List(String))
+}
+
+/// The catalog enumeration seam: boot wires
+/// `tools.catalog(providers, foreign)` wrapped into a `ToolCatalog` —
+/// the same ONE values the validate closure captured. Tests pass a
+/// canned value (the ask may block on live per-server asks inside the
+/// closure, so tests never wire a live one).
+pub type CatalogFn =
+  fn() -> ToolCatalog
+
 /// Closed error vocabulary for callers (the HTTP layer maps it onto
 /// 400/404/409/502, exactly like `provider_registry.RegistryError`).
 /// Fixed strings only.
@@ -108,6 +127,20 @@ pub type Msg {
   /// Hard delete. No guard: `thread.bot_id` is ON DELETE SET NULL
   /// (provenance only), so deleting a bot orphans nothing.
   Delete(id: String, reply: Subject(Result(Nil, RegistryError)))
+  /// The pinnable tool catalog (issue #121) — the same boot-injected
+  /// truth the validate seam checks against, enumerated for the bot
+  /// forms' checkbox list. The closure's live per-server asks must not
+  /// stall unrelated bot CRUD, so the actor does NOT run it inline: it
+  /// spawns an unlinked worker and the result comes back through
+  /// `CatalogDone`, replying to this ask's caller. The caller's
+  /// timeout (generous, fixed) is the bound if the worker dies.
+  /// (`Catalog`, not `ToolCatalog` — the type constructor below owns
+  /// that name.)
+  Catalog(reply: Subject(ToolCatalog))
+  /// Internal: the catalog worker's result, routed back through the
+  /// actor to reply to the ask it belongs to. Harmless if forged — it
+  /// just answers a catalog.
+  CatalogDone(reply: Subject(ToolCatalog), catalog: ToolCatalog)
 }
 
 type State {
@@ -121,6 +154,11 @@ type State {
     /// The catalog check every submitted toolset passes through (see
     /// `ValidateTools`).
     validate_tools: ValidateTools,
+    /// The pinnable-catalog enumeration (see `CatalogFn`, issue #121).
+    tool_catalog: CatalogFn,
+    /// The actor's own subject — the catalog worker routes its result
+    /// back through here (see the `Catalog` arm).
+    self: Subject(Msg),
   )
 }
 
@@ -128,11 +166,14 @@ type State {
 /// initialiser loads the whole table — an unreachable store fails start
 /// (and with the OneForAll root, the whole boot) loudly. `validate_tools`
 /// is the catalog check (boot wires `tools.by_names_with(cfg,
-/// providers, _)`; tests pass a pure list).
+/// providers, _)`; tests pass a pure list). `tool_catalog` enumerates
+/// the same catalog for the forms' picker (boot wires `tools.catalog`;
+/// tests pass a canned value).
 pub fn start(
   persistence: Store,
   name: process.Name(Msg),
   validate_tools: ValidateTools,
+  tool_catalog: CatalogFn,
 ) -> actor.StartResult(Subject(Msg)) {
   let builder =
     actor.new_with_initialiser(5000, fn(self) {
@@ -144,6 +185,8 @@ pub fn start(
             counter: max_bot_counter(rows),
             store: persistence,
             validate_tools: validate_tools,
+            tool_catalog: tool_catalog,
+            self: self,
           ))
           |> actor.returning(self)
           |> actor.selecting(process.new_selector() |> process.select(self))
@@ -286,6 +329,26 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
             }
           }
       }
+
+    Catalog(reply) -> {
+      // OFF the actor loop: the closure's live per-server asks (one
+      // freeze budget + slack, concurrent) must not stall unrelated
+      // bot CRUD behind them — the registry actor replies within
+      // microseconds and keeps serving. The unlinked worker runs the
+      // closure and routes the result back through `CatalogDone`; if
+      // the worker dies, no reply lands and the CALLER's timeout
+      // fires (the UI turns that into its degraded field).
+      process.spawn_unlinked(fn() {
+        let catalog = state.tool_catalog()
+        process.send(state.self, CatalogDone(reply, catalog))
+      })
+      actor.continue(state)
+    }
+
+    CatalogDone(reply, catalog) -> {
+      process.send(reply, catalog)
+      actor.continue(state)
+    }
   }
 }
 
@@ -434,4 +497,13 @@ pub fn delete_bot(
   id: String,
 ) -> Result(Nil, RegistryError) {
   actor.call(registry, crud_call_timeout_ms, fn(reply) { Delete(id, reply) })
+}
+
+/// The pinnable tool catalog (issue #121) — the bot forms' checkbox
+/// list's source. The budget must cover the closure's worst case (one
+/// freeze-budget ask per mounted MCP server) — generous and fixed,
+/// unlike the CRUD calls: a wedged server shows up as a slow picker,
+/// never as a false failure.
+pub fn tool_catalog(registry: Subject(Msg), timeout_ms: Int) -> ToolCatalog {
+  actor.call(registry, timeout_ms, fn(reply) { Catalog(reply) })
 }
