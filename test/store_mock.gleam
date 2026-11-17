@@ -428,18 +428,43 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
             None -> True
             Some(parent) -> dict.has_key(state.threads, parent)
           }
-          case bot_ok, parent_ok {
-            False, _ -> {
+          // thread_channel unique index: at most one channel per
+          // (parent, bot) (bot-channels plan, #123) — the mock mirrors
+          // the real store's rejection so tests fail the same way
+          // production would.
+          let channel_free = case
+            summary.meta.parent_thread_id,
+            summary.meta.bot_id
+          {
+            Some(parent), Some(bot_id) ->
+              state.threads
+              |> dict.values
+              |> list.any(fn(stored) {
+                stored.summary.meta.parent_thread_id == option.Some(parent)
+                && stored.summary.meta.bot_id == option.Some(bot_id)
+              })
+              |> fn(taken) { !taken }
+            _, _ -> True
+          }
+          case bot_ok, parent_ok, channel_free {
+            False, _, _ -> {
               let assert Some(bot_id) = summary.meta.bot_id
               process.send(reply, Error("unknown bot " <> bot_id))
               actor.continue(state)
             }
-            _, False -> {
+            _, False, _ -> {
               let assert Some(parent) = summary.meta.parent_thread_id
               process.send(reply, Error("unknown parent thread " <> parent))
               actor.continue(state)
             }
-            True, True -> {
+            _, _, False -> {
+              process.send(
+                reply,
+                Error("duplicate channel for parent/bot (thread_channel)"),
+              )
+              actor.continue(state)
+            }
+            True, True, True -> {
               process.send(reply, Ok(Nil))
               actor.continue(
                 State(

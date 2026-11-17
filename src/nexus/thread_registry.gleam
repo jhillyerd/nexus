@@ -1171,10 +1171,16 @@ fn start_new_thread(
                 None -> []
               },
               utility_apply: utility_apply_for(state.self, id),
-              // Bot channels (bot-channels plan, #123): the guard keys
-              // + the starting archived flag (fresh threads start
-              // active).
-              parent_thread_id: requested.parent_thread_id,
+              parent_thread_id: case requested.parent_thread_id, persisted {
+                // The channel guard keys ride only a PERSISTED channel
+                // (bot-channels plan, #123) — the same rule as the bot_id
+                // scrub above: an unpersisted create presents ordinary
+                // and behaves ordinary (the insert failed, so the store
+                // does not know the parent link and the registry's meta
+                // is scrubbed to match).
+                Some(_), True -> requested.parent_thread_id
+                _, _ -> None
+              },
               archived: False,
             )
           // The environment wrapper (environments plan Phase 1): the
@@ -1656,29 +1662,36 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
                 })
               // Notify every LIVE subtree member (bounded ask, the
               // non-fatal manual-send pattern): the actor flips its own
-              // refusal flag. Failure = the actor is DOWN — tolerated;
-              // the rehydrated replacement reads its archived state from
-              // the store (born archived), closing the stale-Send window
-              // by construction.
+              // refusal flag. Records with a failed start or a queued
+              // DOWN are skipped — their subject is dead (a send to an
+              // unregistered name would crash this actor) and the
+              // rehydrated replacement reads its archived state from the
+              // store (born archived), closing the stale-Send window by
+              // construction. A live actor that simply answers slowly
+              // within the bound is tolerated the same way.
               list.each(subtree, fn(sid) {
                 case dict.get(state.threads, sid) {
-                  Ok(record) -> {
-                    let reply_subject = process.new_subject()
-                    process.send(
-                      record.subject,
-                      thread.SetArchived(archived, reply_subject),
-                    )
-                    case process.receive(reply_subject, 5000) {
-                      Ok(_) -> Nil
-                      Error(_) ->
-                        io.println(
-                          "nexus registry: archive notify "
-                          <> sid
-                          <> " unreachable (actor down; rehydration will "
-                          <> "re-derive its archived state)",
+                  Ok(record) ->
+                    case record.start_error, process.is_alive(record.pid) {
+                      None, True -> {
+                        let reply_subject = process.new_subject()
+                        process.send(
+                          record.subject,
+                          thread.SetArchived(archived, reply_subject),
                         )
+                        case process.receive(reply_subject, 5000) {
+                          Ok(_) -> Nil
+                          Error(_) ->
+                            io.println(
+                              "nexus registry: archive notify "
+                              <> sid
+                              <> " unreachable (actor down; rehydration will "
+                              <> "re-derive its archived state)",
+                            )
+                        }
+                      }
+                      _, _ -> Nil
                     }
-                  }
                   Error(_) -> Nil
                 }
               })
@@ -1699,21 +1712,6 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
       // the deleted parent's id alone would orphan grandchild actors
       // whose rows are gone).
       let subtree = channel_subtree(state, id)
-      // Stop + kill every LIVE member (the parent's existing treatment,
-      // applied to each descendant: demonitor first so no DOWN can
-      // trigger a replacement — factory children are Temporary, only
-      // the registry restarts them — then the cancel-commit Stop, then
-      // the kill).
-      list.each(subtree, fn(sid) {
-        case dict.get(state.threads, sid) {
-          Ok(record) -> {
-            let _ = process.demonitor_process(record.monitor)
-            process.send(record.subject, thread.Stop)
-            process.kill(record.pid)
-          }
-          Error(_) -> Nil
-        }
-      })
       let known =
         dict.has_key(state.threads, id) || dict.has_key(state.dormant, id)
       case known {
@@ -1722,28 +1720,54 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
           actor.continue(state)
         }
         True -> {
-          // Hard delete in the store; Postgres cascades to the whole
-          // subtree's rows (parent_thread_id ON DELETE CASCADE).
+          // Hard delete in the store FIRST — the authority. On failure
+          // the registry keeps the whole subtree (live actors, records,
+          // dormant summaries, `dm` entries untouched): memory follows
+          // the acknowledged outcome, the same persistence-first rule
+          // as the archive cascade — a logged failure with memory
+          // dropped anyway would resurrect the tree from hydration
+          // while its actors are dead. Replying False maps to the
+          // route's 404; the delete is idempotent, retry re-runs it.
           case state.store.delete_thread(id) {
-            Ok(_) -> Nil
-            Error(error) -> log_store_error("delete_thread " <> id, error)
+            Error(error) -> {
+              log_store_error("delete_thread " <> id, error)
+              process.send(reply, False)
+              actor.continue(state)
+            }
+            Ok(_) -> {
+              // Stop + kill every LIVE member (the parent's existing
+              // treatment, applied to each descendant: demonitor first
+              // so no DOWN can trigger a replacement — factory children
+              // are Temporary, only the registry restarts them — then
+              // the cancel-commit Stop, then the kill).
+              list.each(subtree, fn(sid) {
+                case dict.get(state.threads, sid) {
+                  Ok(record) -> {
+                    let _ = process.demonitor_process(record.monitor)
+                    process.send(record.subject, thread.Stop)
+                    process.kill(record.pid)
+                  }
+                  Error(_) -> Nil
+                }
+              })
+              process.send(reply, True)
+              actor.continue(
+                State(
+                  ..state,
+                  threads: drop_ids(state.threads, subtree),
+                  dormant: drop_ids(state.dormant, subtree),
+                  // Stale `dm` entries pointing at dropped channels (as
+                  // sender or target) are dropped with the tree; any that
+                  // slip through are tolerated anyway (the known-ness check
+                  // repoints).
+                  dm: dict.filter(state.dm, fn(key, thread_id) {
+                    !list.contains(subtree, thread_id)
+                    && !list.contains(subtree, key.0)
+                  }),
+                ),
+              )
+            }
           }
-          process.send(reply, True)
-          actor.continue(
-            State(
-              ..state,
-              threads: drop_ids(state.threads, subtree),
-              dormant: drop_ids(state.dormant, subtree),
-              // Stale `dm` entries pointing at dropped channels (as
-              // sender or target) are dropped with the tree; any that
-              // slip through are tolerated anyway (the known-ness check
-              // repoints).
-              dm: dict.filter(state.dm, fn(key, thread_id) {
-                !list.contains(subtree, thread_id)
-                && !list.contains(subtree, key.0)
-              }),
-            ),
-          )
         }
       }
     }

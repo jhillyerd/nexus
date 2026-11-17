@@ -108,9 +108,12 @@ the rules that bite silently:
   updated anyway would hydrate back ACTIVE after restart. On store
   success the registry syncs memory (subtree metas + live-actor notify
   via bounded ask — the actor answers `thread.SetArchived` even MID-TURN)
-  and never `thread.Stop`s: an in-flight turn is preserved, and a failed
-  notify means the actor is DOWN (rehydration re-derives its archived
-  state — actors are born archived from the stored row). Restore is the
+  and never `thread.Stop`s: an in-flight turn is preserved. A notify
+  failure (the actor down, or unresponsive within the bounded ask) is
+  tolerated, never retried in place — the actor's replacement
+  rehydrates FROM THE STORE, so it is born with the right archived
+  state; dead or failed-start records are skipped outright (a send to
+  an unregistered name would crash the registry). Restore is the
   symmetric cascade.
 - **Deliveries refuse archived threads on BOTH ends.** Archived target:
   `deliver_to_thread`'s existing refusal, durable through restart (a

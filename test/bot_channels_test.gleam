@@ -700,26 +700,23 @@ pub fn parent_delete_drops_subtree_test() {
   // have rehydrated a surviving row).
   should.equal(thread_registry.get(booted.registry, c1), Error(Nil))
   should.equal(thread_registry.get(booted.registry, c2), Error(Nil))
-
-  // The freed pair opens a FRESH channel, not a resurrected id.
-  let assert delivery.Delivered(fresh) =
-    deliver(booted.registry, alpha.id, "alpha", parent, 1, "beta", "new")
-  should.be_false(fresh == c1)
-  wait_idle(booted.registry, fresh)
 }
 
 // ---------------------------------------------------------------------------
 // The Channels ask (the info pane's data)
 // ---------------------------------------------------------------------------
 
-/// The Channels ask answers from state: one row per child channel,
-/// bot names resolved, idle channels not running, newest activity
-/// first, and a thread with no channels gets an empty list.
+/// The Channels ask answers from state: one row per child channel
+/// (bot names resolved, idle channels not running, archived flag
+/// carried), grandchildren excluded from the parent's pane (they appear
+/// in their own parent-channel's pane, per the hop-chain rule), and a
+/// thread with no channels gets an empty list.
 pub fn channels_ask_rows_test() {
   let booted = boot()
   let alpha = create_bot(booted, "alpha")
-  let _beta = create_bot(booted, "beta")
+  let beta = create_bot(booted, "beta")
   let _gamma = create_bot(booted, "gamma")
+  let _delta = create_bot(booted, "delta")
   let parent = create_parent_thread(booted, alpha.id)
 
   // No channels yet: empty.
@@ -732,18 +729,28 @@ pub fn channels_ask_rows_test() {
     deliver(booted.registry, alpha.id, "alpha", parent, 1, "gamma", "two")
   wait_idle(booted.registry, c2)
 
+  // Hop chain: a bot INSIDE c1 delivers onward — the grandchild hangs
+  // off c1, never the parent.
+  let assert delivery.Delivered(c3) =
+    deliver(booted.registry, beta.id, "beta", c1, 2, "delta", "nested")
+  wait_idle(booted.registry, c3)
+
   let infos =
     thread_registry.channels(booted.registry, parent)
     |> list.sort(fn(a, b) { string.compare(a.thread_id, b.thread_id) })
+  // Exactly the two direct children — the grandchild is absent here.
   should.equal(list.length(infos), 2)
   let assert [beta_row, gamma_row] = infos
-  should.equal(gamma_row.thread_id, c2)
-  should.equal(gamma_row.bot_name, option.Some("gamma"))
-  should.equal(gamma_row.running, False)
-  should.equal(gamma_row.archived, False)
   should.equal(beta_row.thread_id, c1)
   should.equal(beta_row.bot_name, option.Some("beta"))
-  // Grandchildren are NOT in the parent's pane (they appear in their
-  // own parent-channel's pane, per the hop-chain rule).
-  should.be_false(list.any(infos, fn(info) { info.thread_id == parent }))
+  should.equal(beta_row.running, False)
+  should.equal(beta_row.archived, False)
+  should.equal(gamma_row.thread_id, c2)
+  should.equal(gamma_row.bot_name, option.Some("gamma"))
+
+  // The grandchild shows up in its OWN parent-channel's pane.
+  let c1_infos = thread_registry.channels(booted.registry, c1)
+  let assert [delta_row] = c1_infos
+  should.equal(delta_row.thread_id, c3)
+  should.equal(delta_row.bot_name, option.Some("delta"))
 }

@@ -351,10 +351,11 @@ instruction. So:
   adapter answers an error frame. A delivery that somehow surfaces the
   actor refusal maps to the ordinary `delivery.Refused(reason)`.
 - **`ChannelInfo` is richer than the design's reply sketch**: it adds
-  `archived` (the pane renders archived rows dimmed — the data has to
-  come from somewhere) and `bot_name: Option(String)` (None = the bot
-  was deleted; the pane's label fallback, P2). Names resolve through
-  the existing `sender_name_ask` bots handle, deduped per bot id.
+  `bot_id`, `archived` (the pane renders archived rows dimmed — the
+  data has to come from somewhere), and `bot_name: Option(String)`
+  (None = the bot was deleted; the pane's label fallback, P2). Names
+  resolve through the existing `sender_name_ask` bots handle, deduped
+  per bot id.
 - **Tests use REAL parent threads** (`create_parent_thread` rig): the
   delivery tests' synthetic `from_thread_id`s ("s-alpha", "s1"…)
   violated the parent FK the moment it existed, and one collided with
@@ -367,6 +368,18 @@ instruction. So:
   `thread_persistence_test.channel_parent_link_round_trips_test` pins
   the store round-trip (insert → list/get → find_channel + the parent
   FK's insert-time half).
+- **Cubic review deltas (PR #137)**: the archive notify skips records
+  with a failed start or queued DOWN (a send to an unregistered name
+  would crash the registry — the List/Channels alive discipline), the
+  delete cascade is store-first (a failed hard delete keeps memory and
+  replies `False` — the same persistence-first rule as the archive
+  cascade), `persist.find_channel` answers the corrupt duplicate-rows
+  case as a store ERROR instead of a panic, the mock store mirrors the
+  `thread_channel` unique index, an unpersisted channel's actor is
+  started ordinary (the guard keys ride only a persisted channel, the
+  `bot_id` scrub rule), and the plan's "bounded retries land the
+  notify on the rehydrated actor" is realized as "no in-place retry —
+  the rehydrated replacement is born archived".
 
 ### Phase 2 — the thread info pane (UI + e2e)
 

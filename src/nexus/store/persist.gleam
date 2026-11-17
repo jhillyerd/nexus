@@ -506,25 +506,26 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
     FindChannel(parent_thread_id, bot_id, reply) -> {
       let result =
         sql.find_channel(state.db, parent_thread_id, bot_id)
-        |> result.map(fn(returned) {
+        |> result.map_error(query_error)
+        |> result.try(fn(returned) {
           case returned.rows {
             // The partial unique index thread_channel guarantees at most
-            // one row per (parent, bot); more is corrupt state — a loud
-            // store error (never a miss), so the delivery path refuses
-            // retryably instead of creating behind ambiguity.
-            [] -> option.None
-            [row] -> option.Some(row.id)
+            // one row per (parent, bot); more is corrupt state — refused
+            // as a store ERROR (never a miss, and never a panic: this
+            // actor serves every store call), so the delivery path
+            // refuses retryably instead of creating behind ambiguity.
+            [] -> Ok(option.None)
+            [row] -> Ok(option.Some(row.id))
             _ ->
-              panic as {
+              Error(
                 "duplicate channel rows for parent "
                 <> parent_thread_id
                 <> " bot "
                 <> bot_id
-                <> " (thread_channel unique index violated)"
-              }
+                <> " (thread_channel unique index violated)",
+              )
           }
         })
-        |> result.map_error(query_error)
       process.send(reply, result)
       actor.continue(state)
     }
