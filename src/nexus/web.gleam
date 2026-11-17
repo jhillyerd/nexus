@@ -303,6 +303,8 @@ fn create_thread_response(
               system_prompt: None,
               toolset: tools,
               bot_id: None,
+              parent_thread_id: None,
+              title: "",
             )
           case thread_create.create_thread(providers, registry, requested) {
             Ok(summary) -> json_response(201, thread_summary_json(summary))
@@ -763,6 +765,10 @@ fn send_response(
             }
             thread.Busy ->
               json_response(409, err_json("a reply is already streaming"))
+            // An archived channel refuses human Sends (bot-channels
+            // plan, #123): same status as Busy — a 409 conflict with the
+            // honest reason, no transcript change.
+            thread.Refused(reason) -> json_response(409, err_json(reason))
           }
         }
       }

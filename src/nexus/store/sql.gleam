@@ -153,8 +153,15 @@ on conflict (thread_id, seq) do nothing
   |> pog.execute(db)
 }
 
-/// Runs the `archive` query
-/// defined in `./src/nexus/store/sql/archive.sql`.
+/// Archive ONE thread and CASCADE down its channel subtree (bot-channels
+/// plan, #123): parent_thread_id makes channels of channels (hop chains),
+/// and an archived parent cannot originate turns, so its whole descendant
+/// tree goes quiescent with it. ONE idempotent recursive statement is the
+/// authority — the registry syncs memory only from its acknowledged
+/// outcome, so a failed write leaves nothing archived (in memory or on
+/// disk). Archiving implicitly clears the pin everywhere it lands (the
+/// `archived ⇒ ¬pinned` invariant). Retried on a transient failure, the
+/// statement converges (already-archived rows just re-stamp).
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
@@ -165,8 +172,22 @@ pub fn archive(
 ) -> Result(pog.Returned(Nil), pog.QueryError) {
   let decoder = decode.map(decode.dynamic, fn(_) { Nil })
 
-  "update thread set archived_at = now(), pinned = false
-where id = $1
+  "-- Archive ONE thread and CASCADE down its channel subtree (bot-channels
+-- plan, #123): parent_thread_id makes channels of channels (hop chains),
+-- and an archived parent cannot originate turns, so its whole descendant
+-- tree goes quiescent with it. ONE idempotent recursive statement is the
+-- authority — the registry syncs memory only from its acknowledged
+-- outcome, so a failed write leaves nothing archived (in memory or on
+-- disk). Archiving implicitly clears the pin everywhere it lands (the
+-- `archived ⇒ ¬pinned` invariant). Retried on a transient failure, the
+-- statement converges (already-archived rows just re-stamp).
+with recursive tree as (
+  select id from thread where id = $1
+  union all
+  select t.id from thread t join tree on t.parent_thread_id = tree.id
+)
+update thread set archived_at = now(), pinned = false
+where id in (select id from tree)
 "
   |> pog.query
   |> pog.parameter(pog.text(id))
@@ -435,6 +456,58 @@ pub fn delete_thread(
   |> pog.execute(db)
 }
 
+/// A row you get from running the `find_channel` query
+/// defined in `./src/nexus/store/sql/find_channel.sql`.
+///
+/// > 🐿️ This type definition was generated automatically using v4.7.0 of the
+/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub type FindChannelRow {
+  FindChannelRow(id: String)
+}
+
+/// The channel re-derivation lookup (bot-channels plan, #123): find the
+/// existing DM channel for one (parent thread, target bot) pair. The
+/// registry consults this on a `dm` MAP MISS — a restart lost the map,
+/// and blind find-or-create would open a DUPLICATE channel behind the
+/// first post-restart delivery. The partial unique index thread_channel
+/// guarantees at most one row answers; the caller maps [] to "none, may
+/// create" and a row to "repoint the map and deliver". A store ERROR is
+/// never a miss: the caller refuses retryably instead of creating.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn find_channel(
+  db: pog.Connection,
+  parent_thread_id: String,
+  bot_id: String,
+) -> Result(pog.Returned(FindChannelRow), pog.QueryError) {
+  let decoder = {
+    use id <- decode.field(0, decode.string)
+    decode.success(FindChannelRow(id:))
+  }
+
+  "-- The channel re-derivation lookup (bot-channels plan, #123): find the
+-- existing DM channel for one (parent thread, target bot) pair. The
+-- registry consults this on a `dm` MAP MISS — a restart lost the map,
+-- and blind find-or-create would open a DUPLICATE channel behind the
+-- first post-restart delivery. The partial unique index thread_channel
+-- guarantees at most one row answers; the caller maps [] to \"none, may
+-- create\" and a row to \"repoint the map and deliver\". A store ERROR is
+-- never a miss: the caller refuses retryably instead of creating.
+select id
+from thread
+where parent_thread_id = $1
+  and bot_id = $2
+"
+  |> pog.query
+  |> pog.parameter(pog.text(parent_thread_id))
+  |> pog.parameter(pog.text(bot_id))
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
 /// A row you get from running the `get_bot` query
 /// defined in `./src/nexus/store/sql/get_bot.sql`.
 ///
@@ -671,6 +744,7 @@ pub type GetThreadRow {
     toolset: String,
     bot_id: Option(String),
     workspace_root: Option(String),
+    parent_thread_id: Option(String),
     created_s: Int,
     last_active_s: Int,
     message_count: Int,
@@ -709,9 +783,10 @@ pub fn get_thread(
     use toolset <- decode.field(11, decode.string)
     use bot_id <- decode.field(12, decode.optional(decode.string))
     use workspace_root <- decode.field(13, decode.optional(decode.string))
-    use created_s <- decode.field(14, decode.int)
-    use last_active_s <- decode.field(15, decode.int)
-    use message_count <- decode.field(16, decode.int)
+    use parent_thread_id <- decode.field(14, decode.optional(decode.string))
+    use created_s <- decode.field(15, decode.int)
+    use last_active_s <- decode.field(16, decode.int)
+    use message_count <- decode.field(17, decode.int)
     decode.success(GetThreadRow(
       id:,
       provider_id:,
@@ -727,6 +802,7 @@ pub fn get_thread(
       toolset:,
       bot_id:,
       workspace_root:,
+      parent_thread_id:,
       created_s:,
       last_active_s:,
       message_count:,
@@ -759,6 +835,7 @@ select
     where e.thread_id = thread.id) as toolset,
   bot_id,
   workspace_root,
+  parent_thread_id,
   extract(epoch from created_at)::int8 as created_s,
   extract(epoch from last_active_at)::int8 as last_active_s,
   message_count
@@ -927,6 +1004,9 @@ values ($1, $2, $3, nullif($4, ''::bytea), $5, $6, $7, to_timestamp($8), to_time
 /// NULL (see insert_bot.sql). workspace_root (environments plan Phase 1)
 /// is the RESOLVED root frozen at creation for env-carrying threads; the
 /// '' sentinel inserts NULL (the same nullif pattern as bot_id).
+/// parent_thread_id (bot-channels plan, #123) links a DM channel to its
+/// parent thread; the '' sentinel inserts NULL (ordinary threads). The
+/// FK + the partial unique index thread_channel enforce the identity.
 /// tags_manual is '{}' literally and tags_source is left to its column
 /// default 'auto' (utility-tags plan §3.5): a new thread has no tags and
 /// an open auto path.
@@ -951,6 +1031,7 @@ pub fn insert_thread(
   arg_13: String,
   arg_14: String,
   arg_15: Int,
+  arg_16: String,
 ) -> Result(pog.Returned(Nil), pog.QueryError) {
   let decoder = decode.map(decode.dynamic, fn(_) { Nil })
 
@@ -969,12 +1050,15 @@ pub fn insert_thread(
 -- NULL (see insert_bot.sql). workspace_root (environments plan Phase 1)
 -- is the RESOLVED root frozen at creation for env-carrying threads; the
 -- '' sentinel inserts NULL (the same nullif pattern as bot_id).
+-- parent_thread_id (bot-channels plan, #123) links a DM channel to its
+-- parent thread; the '' sentinel inserts NULL (ordinary threads). The
+-- FK + the partial unique index thread_channel enforce the identity.
 -- tags_manual is '{}' literally and tags_source is left to its column
 -- default 'auto' (utility-tags plan §3.5): a new thread has no tags and
 -- an open auto path.
 with new_thread as (
-  insert into thread (id, provider_id, title, title_source, model, system_prompt, pinned, tags, tags_manual, created_at, last_active_at, message_count, bot_id, workspace_root)
-  values ($1, $2, $3, $4, $5, $6, $7, $8, '{}', to_timestamp($9), to_timestamp($9), $10, nullif($11, ''), nullif($13, ''))
+  insert into thread (id, provider_id, title, title_source, model, system_prompt, pinned, tags, tags_manual, created_at, last_active_at, message_count, bot_id, workspace_root, parent_thread_id)
+  values ($1, $2, $3, $4, $5, $6, $7, $8, '{}', to_timestamp($9), to_timestamp($9), $10, nullif($11, ''), nullif($13, ''), nullif($16, ''))
   returning id
 ),
 manifest as (
@@ -1017,6 +1101,7 @@ on conflict (thread_id, seq) do nothing
   |> pog.parameter(pog.text(arg_13))
   |> pog.parameter(pog.text(arg_14))
   |> pog.parameter(pog.int(arg_15))
+  |> pog.parameter(pog.text(arg_16))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }
@@ -1252,6 +1337,7 @@ pub type ListSummariesRow {
     toolset: String,
     bot_id: Option(String),
     workspace_root: Option(String),
+    parent_thread_id: Option(String),
     created_s: Int,
     last_active_s: Int,
     message_count: Int,
@@ -1286,9 +1372,10 @@ pub fn list_summaries(
     use toolset <- decode.field(10, decode.string)
     use bot_id <- decode.field(11, decode.optional(decode.string))
     use workspace_root <- decode.field(12, decode.optional(decode.string))
-    use created_s <- decode.field(13, decode.int)
-    use last_active_s <- decode.field(14, decode.int)
-    use message_count <- decode.field(15, decode.int)
+    use parent_thread_id <- decode.field(13, decode.optional(decode.string))
+    use created_s <- decode.field(14, decode.int)
+    use last_active_s <- decode.field(15, decode.int)
+    use message_count <- decode.field(16, decode.int)
     decode.success(ListSummariesRow(
       id:,
       provider_id:,
@@ -1303,6 +1390,7 @@ pub fn list_summaries(
       toolset:,
       bot_id:,
       workspace_root:,
+      parent_thread_id:,
       created_s:,
       last_active_s:,
       message_count:,
@@ -1332,6 +1420,7 @@ select
     where e.thread_id = thread.id) as toolset,
   bot_id,
   workspace_root,
+  parent_thread_id,
   extract(epoch from created_at)::int8 as created_s,
   extract(epoch from last_active_at)::int8 as last_active_s,
   message_count
@@ -1614,8 +1703,11 @@ update node set last_seen_at = now() where id = $1
   |> pog.execute(db)
 }
 
-/// Runs the `unarchive` query
-/// defined in `./src/nexus/store/sql/unarchive.sql`.
+/// Unarchive ONE thread and its channel subtree (bot-channels plan,
+/// #123) — the symmetric twin of archive.sql: restoring a parent restores
+/// everything that cascade-archived with it (unambiguous today because
+/// channels have no individual archive affordance). ONE idempotent
+/// recursive statement, the same authority rule as archive.sql.
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
@@ -1626,8 +1718,18 @@ pub fn unarchive(
 ) -> Result(pog.Returned(Nil), pog.QueryError) {
   let decoder = decode.map(decode.dynamic, fn(_) { Nil })
 
-  "update thread set archived_at = null
-where id = $1
+  "-- Unarchive ONE thread and its channel subtree (bot-channels plan,
+-- #123) — the symmetric twin of archive.sql: restoring a parent restores
+-- everything that cascade-archived with it (unambiguous today because
+-- channels have no individual archive affordance). ONE idempotent
+-- recursive statement, the same authority rule as archive.sql.
+with recursive tree as (
+  select id from thread where id = $1
+  union all
+  select t.id from thread t join tree on t.parent_thread_id = tree.id
+)
+update thread set archived_at = null
+where id in (select id from tree)
 "
   |> pog.query
   |> pog.parameter(pog.text(id))

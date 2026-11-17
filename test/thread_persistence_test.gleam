@@ -14,6 +14,7 @@ import gleam/otp/actor
 import gleam/otp/factory_supervisor
 import gleam/string
 import gleeunit/should
+import nexus/bot
 import nexus/config
 import nexus/loop
 import nexus/openai
@@ -386,6 +387,8 @@ fn new_thread(provider_id: String, model: String) -> thread_registry.NewThread {
     system_prompt: None,
     toolset: None,
     bot_id: None,
+    parent_thread_id: None,
+    title: "",
   )
 }
 
@@ -432,6 +435,84 @@ pub fn write_behind_persists_in_order_test() {
   should.equal(
     transcript.request_body(rebuilt, loop_options()),
     transcript.request_body(thread.snapshot(record.subject), loop_options()),
+  )
+}
+
+/// Bot channels (bot-channels plan, #123): the parent link, the
+/// deterministic channel title, and the pair lookup round-trip through
+/// the store — insert → list/get → find_channel — plus the parent FK's
+/// insert-time half (an unknown parent refuses, like the real
+/// thread_parent_thread_id_fkey).
+pub fn channel_parent_link_round_trips_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  store_mock.ensure_fixture_provider(seam)
+  // The channel FKs both ways: store the bot the channel points at.
+  let assert Ok(_) =
+    seam.insert_bot(bot.Bot(
+      id: "b1",
+      name: "beta",
+      description: "",
+      provider_id: store_mock.fixture_provider_id,
+      model: "alpha",
+      system_prompt: None,
+      tools: None,
+      allow_inbound: True,
+      created_at: 1_700_000_000,
+      updated_at: 1_700_000_000,
+    ))
+  let parent = stored_summary("s1", None, None, "")
+  let assert Ok(_) = seam.insert_thread(parent, "prompt")
+  let channel = stored_summary("s2", Some("s1"), Some("b1"), "beta")
+  let assert Ok(_) = seam.insert_thread(channel, "prompt")
+
+  // list_summaries (the boot load) carries the parent link.
+  let assert Ok(#(summaries, _)) = seam.list_summaries()
+  let assert [stored] = list.filter(summaries, fn(s) { s.id == "s2" })
+  should.equal(stored.meta.parent_thread_id, Some("s1"))
+  should.equal(stored.meta.bot_id, Some("b1"))
+  should.equal(stored.meta.title, "beta")
+  // get_thread (hydration's read) carries it too.
+  let assert Ok(stored_thread) = seam.get_thread("s2")
+  should.equal(stored_thread.summary.meta.parent_thread_id, Some("s1"))
+  // find_channel answers the pair; a different bot is a miss.
+  should.equal(seam.find_channel("s1", "b1"), Ok(Some("s2")))
+  should.equal(seam.find_channel("s1", "b2"), Ok(None))
+  // The FK's insert-time half: an unknown parent refuses.
+  let orphan = stored_summary("s3", Some("s-missing"), None, "")
+  should.equal(
+    seam.insert_thread(orphan, "prompt"),
+    Error("unknown parent thread s-missing"),
+  )
+}
+
+fn stored_summary(
+  id: String,
+  parent: option.Option(String),
+  bot_id: option.Option(String),
+  title: String,
+) -> store.StoredSummary {
+  store.StoredSummary(
+    id: id,
+    provider_id: store_mock.fixture_provider_id,
+    model: "alpha",
+    meta: thread.ThreadMeta(
+      title: title,
+      title_source: thread.AutoTitle,
+      pinned: False,
+      tags: [],
+      tags_manual: [],
+      tags_source: thread.AutoTags,
+      archived: False,
+      bot_id: bot_id,
+      parent_thread_id: parent,
+      created_at: 1_700_000_000,
+    ),
+    toolset: [],
+    workspace_root: None,
+    roster: None,
+    last_active_at: 1_700_000_000,
+    message_count: 1,
   )
 }
 
@@ -635,6 +716,7 @@ fn stored(id: String) -> store.StoredSummary {
       tags_source: thread.AutoTags,
       archived: False,
       bot_id: None,
+      parent_thread_id: None,
       created_at: timing.wall_now_s(),
     ),
     last_active_at: timing.wall_now_s(),

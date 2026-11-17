@@ -56,6 +56,15 @@ pub type Msg {
     system_prompt: String,
     reply: Subject(Result(Nil, String)),
   )
+  /// The channel re-derivation lookup (bot-channels plan, #123):
+  /// find the existing channel row for one (parent thread, target bot)
+  /// pair — `Ok(None)` = no row, may create; `Ok(Some(id))` = repoint;
+  /// `Error` = store outage, the caller refuses retryably.
+  FindChannel(
+    parent_thread_id: String,
+    bot_id: String,
+    reply: Subject(Result(option.Option(String), String)),
+  )
   /// Write-behind turn commit (fire-and-forget, ordered by arrival).
   Commit(id: String, transcript: Transcript)
   SetTitle(id: String, title: String, reply: Subject(Result(Nil, String)))
@@ -195,6 +204,11 @@ pub fn seam(store_actor: Subject(Msg)) -> store.Store {
     insert_thread: fn(summary, system_prompt) {
       actor.call(store_actor, call_timeout_ms, fn(reply) {
         InsertThread(summary, system_prompt, reply)
+      })
+    },
+    find_channel: fn(parent_thread_id, bot_id) {
+      actor.call(store_actor, call_timeout_ms, fn(reply) {
+        FindChannel(parent_thread_id, bot_id, reply)
       })
     },
     commit: fn(id, transcript) {
@@ -378,6 +392,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
                         tags_manual: row.tags_manual,
                         tags_source: tags_source(row.tags_source),
                         bot_id: row.bot_id,
+                        parent_thread_id: row.parent_thread_id,
                         created_at: row.created_s,
                       ),
                       toolset: entries,
@@ -465,6 +480,10 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
             option.Some(#(_text, stamp)) -> stamp
             option.None -> 0
           },
+          // The parent link (bot-channels plan, #123, $16): the ''
+          // sentinel inserts NULL (ordinary threads) — the same nullif
+          // pattern as bot_id/workspace_root above.
+          option.unwrap(summary.meta.parent_thread_id, ""),
         )
         |> result.map(fn(_) { Nil })
         |> result.map_error(query_error)
@@ -480,6 +499,32 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           )
         Error(_) -> state
       }
+      process.send(reply, result)
+      actor.continue(state)
+    }
+
+    FindChannel(parent_thread_id, bot_id, reply) -> {
+      let result =
+        sql.find_channel(state.db, parent_thread_id, bot_id)
+        |> result.map(fn(returned) {
+          case returned.rows {
+            // The partial unique index thread_channel guarantees at most
+            // one row per (parent, bot); more is corrupt state — a loud
+            // store error (never a miss), so the delivery path refuses
+            // retryably instead of creating behind ambiguity.
+            [] -> option.None
+            [row] -> option.Some(row.id)
+            _ ->
+              panic as {
+                "duplicate channel rows for parent "
+                <> parent_thread_id
+                <> " bot "
+                <> bot_id
+                <> " (thread_channel unique index violated)"
+              }
+          }
+        })
+        |> result.map_error(query_error)
       process.send(reply, result)
       actor.continue(state)
     }
@@ -1051,6 +1096,9 @@ fn stored_summary_from_row(
           tags_source: tags_source(row.tags_source),
           // Provenance pointer (bots plan P1): NULL = created without a bot.
           bot_id: row.bot_id,
+          // The parent link (bot-channels plan, #123): NULL = an ordinary
+          // thread; Some = a bot channel hanging off its parent.
+          parent_thread_id: row.parent_thread_id,
           created_at: row.created_s,
         ),
         // The frozen toolset manifest (plugin-api plan Phase 2): a

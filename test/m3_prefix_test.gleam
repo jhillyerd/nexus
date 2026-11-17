@@ -357,6 +357,8 @@ fn new_thread(provider_id: String, model: String) -> thread_registry.NewThread {
     system_prompt: None,
     toolset: None,
     bot_id: None,
+    parent_thread_id: None,
+    title: "",
   )
 }
 

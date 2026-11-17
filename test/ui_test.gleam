@@ -3260,6 +3260,7 @@ pub fn send_moves_previous_day_row_into_today_immediately_test() {
           tags_manual: [],
           tags_source: thread.AutoTags,
           bot_id: None,
+          parent_thread_id: None,
           created_at: yesterday,
         ),
         toolset: thread_registry.plain_entries(
@@ -3751,6 +3752,8 @@ fn new_thread(provider_id: String, model: String) -> thread_registry.NewThread {
     system_prompt: None,
     toolset: None,
     bot_id: None,
+    parent_thread_id: None,
+    title: "",
   )
 }
 

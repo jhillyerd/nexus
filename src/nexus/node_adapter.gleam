@@ -639,6 +639,12 @@ fn handle_client_frame(
               )
               actor.continue(state)
             }
+            // An archived channel refuses human Sends (bot-channels
+            // plan, #123): the honest reason rides the error frame.
+            thread.Refused(reason) -> {
+              send_frame(state, node_protocol.encode_error(reason))
+              actor.continue(state)
+            }
           }
         }
       }

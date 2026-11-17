@@ -218,6 +218,14 @@ pub type Store {
     load_messages: fn(String) -> Result(List(MessageRow), StoreError),
     /// Persist a new thread row (write-through at create).
     insert_thread: fn(StoredSummary, String) -> Result(Nil, StoreError),
+    /// The channel re-derivation lookup (bot-channels plan, #123): the
+    /// existing channel row for one (parent thread, target bot) pair, if
+    /// any. `Ok(None)` = no row, the caller may create; `Ok(Some(id))` =
+    /// a channel already exists — repoint the map and deliver; `Error` =
+    /// a store outage, which the caller NEVER treats as a miss (a
+    /// transient outage must not duplicate a channel that may well
+    /// exist) — it refuses with the retryable vocabulary instead.
+    find_channel: fn(String, String) -> Result(Option(String), StoreError),
     /// Write-behind turn commit: enqueue the (full, immutable) committed
     /// transcript. The store appends the delta past what it already
     /// persisted, in seq order, then bumps recency + count. Replay of an

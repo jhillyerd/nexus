@@ -71,6 +71,63 @@ The persistence layer lives in `sql/schema.sql` + `src/nexus/store/sql/`.
   it — that commit is deliberately unstamped, never UI-clock), and
   replay events carry `stamped_at`. The UI never reads a clock to stamp
   a line.
+- **`thread.parent_thread_id` is routing/display metadata, never a
+  request byte** (bot-channels plan, docs/plans/bot-channels.md). It is
+  `NULL` on every ordinary thread; `ON DELETE CASCADE` is decided (a
+  channel is meaningless outside its parent — `SET NULL` would resurrect
+  orphaned channels into the sidebar). The partial unique index
+  `thread_channel` on `(parent_thread_id, bot_id)` IS the channel
+  identity: one DM thread per (parent, target bot), and the guarantee
+  `find_channel` re-derivation matches unambiguously against.
+
+## Bot channel invariants (Phase 1 shipped)
+
+`docs/plans/bot-channels.md` carries the design and as-built deltas;
+the rules that bite silently:
+
+- **Channels are second-class, and the sidebar filter is REGISTRY-SIDE,
+  never SQL.** The `List` projection excludes threads with a parent, so
+  the store stays complete and `Get` / `GET /threads/<id>/state` keep
+  answering for channels (the debug dump is never a UI data source).
+  Utility titles/tags never run on a channel: `create_dm` persists the
+  target bot's name as the title directly, the actor's `arm_utility`
+  no-ops on `spec.parent_thread_id`, and the guarded `AutoTitle` ask
+  refuses a non-empty title anyway (the heuristic skip).
+- **The `dm` map is keyed `(from_thread_id, target_bot_id)`** — one
+  channel per parent thread, so parallel parents neither serialize on a
+  pair-wide busy lock nor share a transcript (#123). A map miss
+  RE-DERIVES through the store (`find_channel`) before creating: a hit
+  repoints the map and delivers; `Ok(None)` creates; a store ERROR
+  refuses retryably ("target lookup failed; try again") and NEVER falls
+  through to creation — a transient outage must not duplicate a channel
+  that may well exist.
+- **The archive cascade is PERSISTENCE-FIRST.** ONE idempotent recursive
+  store update (archive.sql's CTE over `parent_thread_id`) is the
+  authority — the registry must NOT inherit the memory-first
+  `write_through_or_log` habit here: a logged failure with memory
+  updated anyway would hydrate back ACTIVE after restart. On store
+  success the registry syncs memory (subtree metas + live-actor notify
+  via bounded ask — the actor answers `thread.SetArchived` even MID-TURN)
+  and never `thread.Stop`s: an in-flight turn is preserved, and a failed
+  notify means the actor is DOWN (rehydration re-derives its archived
+  state — actors are born archived from the stored row). Restore is the
+  symmetric cascade.
+- **Deliveries refuse archived threads on BOTH ends.** Archived target:
+  `deliver_to_thread`'s existing refusal, durable through restart (a
+  re-derived archived row is refused, never resurrected). Archived
+  sender: the guard FIRST in the delivery chain ("sender thread is
+  archived") — archive does not cancel turns, so an in-flight turn can
+  still call `bot_message`, and without the check `create_dm` would open
+  a brand-new ACTIVE channel under an archived parent. Archived CHANNELS
+  additionally refuse their own human Sends at the actor
+  (`SendResult.Refused`); ordinary archived threads refuse nothing there
+  (their human Send behavior is unchanged).
+- **Delete cleanup is transitive.** Hop chains make channels of
+  channels, and the FK deletes the whole subtree — so the registry's
+  cleanup walks `parent_thread_id` to a fixpoint (live + dormant),
+  demonitors and kills every live descendant, drops each one's
+  records/dormant summaries and `dm` entries, then deletes the root (the
+  store CASCADE removes the rows).
 
 ## Changing the schema or queries
 

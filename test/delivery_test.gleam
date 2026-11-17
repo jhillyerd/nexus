@@ -200,6 +200,8 @@ fn create_bot_thread(
         system_prompt: None,
         toolset: None,
         bot_id: Some(bot_id),
+        parent_thread_id: None,
+        title: "",
       ),
       bundle,
     )
@@ -277,6 +279,61 @@ fn blocking_runner() -> thread.TurnRunner {
     let _ = process.selector_receive(selector, 10_000)
     thread.StreamStopped(tr)
   }
+}
+
+/// A REAL originating thread for `bot` (bot-channels plan, #123): the
+/// parent a channel hangs off. Deliveries name its id as `from_thread_id`
+/// — the persisted channel's `parent_thread_id` FK requires the row, and
+/// the sender-archived guard reads the parent's record. Its runner never
+/// streams (these tests turn only the DM channels), so it completes
+/// instantly if one ever fires.
+fn create_parent_thread(
+  booted: Booted,
+  bot_id: String,
+) -> thread.ThreadSummary {
+  let specs = tools.by_names(test_config(), []) |> result.unwrap([])
+  let assert Ok(summary) =
+    thread_registry.create_with_toolset(
+      booted.registry,
+      thread_registry.NewThread(
+        provider_id: store_mock.fixture_provider_id,
+        model: "alpha",
+        system_prompt: None,
+        toolset: None,
+        bot_id: Some(bot_id),
+        parent_thread_id: None,
+        title: "",
+      ),
+      thread.Toolset(
+        names: [],
+        specs: specs,
+        runner: fn(_endpoint, tr, _cancel, _delivery, _environment, _on_event) {
+          thread.StreamDone(completed_stats(), tr)
+        },
+        utility_runner: fn(_endpoint, _tr, _cancel, _allow_pass) {
+          Error("no utility call in this test")
+        },
+      ),
+    )
+  summary
+}
+
+/// The stored channel row for one (parent thread, target bot) pair —
+/// the persisted half of the channel identity (bot-channels plan,
+/// #123). Channels are second-class: absent from `list_threads`, so the
+/// store is how tests observe them.
+fn stored_channel(
+  booted: Booted,
+  parent_id: String,
+  bot_id: String,
+) -> store.StoredSummary {
+  let assert Ok(#(summaries, _)) = booted.seam.list_summaries()
+  let assert [summary] =
+    list.filter(summaries, fn(s) {
+      s.meta.parent_thread_id == option.Some(parent_id)
+      && s.meta.bot_id == option.Some(bot_id)
+    })
+  summary
 }
 
 fn deliver(
@@ -395,6 +452,7 @@ pub fn deliver_archived_target_test() {
   let alpha = create_bot(booted, "alpha", allow_inbound: True)
   let beta = create_bot(booted, "beta", allow_inbound: True)
   let beta_thread = create_bot_thread(booted, beta.id, blocking_runner())
+  let alpha_parent = create_parent_thread(booted, alpha.id)
 
   let assert Ok(subject) = thread_registry.get(booted.registry, beta_thread.id)
   should.equal(
@@ -403,7 +461,15 @@ pub fn deliver_archived_target_test() {
   )
   let _ = subject
 
-  deliver(booted.registry, alpha.id, "alpha", "s1", 1, beta_thread.id, "hi")
+  deliver(
+    booted.registry,
+    alpha.id,
+    "alpha",
+    alpha_parent.id,
+    1,
+    beta_thread.id,
+    "hi",
+  )
   |> should.equal(delivery.Refused("target thread is archived"))
 }
 
@@ -451,11 +517,15 @@ pub fn deliver_hop_depth_chain_test() {
 
   // Hops 1..4 land (b1→b2→b3→b4); each delivered line carries its hop
   // number as the target's origin depth — the arithmetic the wrapper
-  // reproduces per turn from the initiating message's sidecar.
+  // reproduces per turn from the initiating message's sidecar. The
+  // initiating parent is a REAL b1 thread (bot-channels plan, #123): the
+  // first hop's channel hangs off it.
+  let assert [b1, ..] = bots
+  let b1_parent = create_parent_thread(booted, b1.id)
   let chain =
     list.index_fold(
       list.take(bots, 4),
-      "s-chain",
+      b1_parent.id,
       fn(from_thread_id, bot, index) {
         let depth = index + 1
         let assert [target, ..] = list.drop(bots, index + 1)
@@ -551,6 +621,8 @@ pub fn deliver_hint_only_when_tool_present_test() {
         system_prompt: None,
         toolset: None,
         bot_id: Some(quiet.id),
+        parent_thread_id: None,
+        title: "",
       ),
       thread.Toolset(
         names: [],
@@ -581,58 +653,85 @@ pub fn deliver_hint_only_when_tool_present_test() {
   should.equal(origin, Some(transcript.Origin("alpha", 1)))
 }
 
-/// A name-addressed delivery find-or-creates the per-pair DM thread from
-/// the TARGET bot, delivers the prefixed line (model-visible identity
-/// rides content only), marks the display sidecar, and the receipt names
-/// the DM thread. A second name delivery reuses the same thread.
+/// A name-addressed delivery find-or-creates the per-PARENT channel
+/// (bot-channels plan, #123) from the TARGET bot, delivers the prefixed
+/// line (model-visible identity rides content only), marks the display
+/// sidecar, and the receipt names the channel. The channel hangs off the
+/// originating thread with the target bot's name as its deterministic
+/// title, and is second-class: absent from `list_threads`, observable
+/// through the store. A second name delivery reuses the SAME channel.
 pub fn deliver_by_name_creates_dm_test() {
   let booted = boot()
   let alpha = create_bot(booted, "alpha", allow_inbound: True)
   let beta = create_bot(booted, "beta", allow_inbound: True)
+  let alpha_parent = create_parent_thread(booted, alpha.id)
 
   let reply =
     deliver(
       booted.registry,
       alpha.id,
       "alpha",
-      "s-alpha",
+      alpha_parent.id,
       1,
       "beta",
       "hello beta",
     )
   let assert delivery.Delivered(dm_id) = reply
 
-  // The DM thread exists, belongs to the TARGET bot, and carries the
+  // The channel exists, belongs to the TARGET bot, hangs off the
+  // originating thread with the deterministic title, and carries the
   // delivered line: the From prefix names the sender + the sender's
   // thread (so the target can reply precisely), and the origin sidecar
   // records author + hop depth for the UI badge.
+  let stored = stored_channel(booted, alpha_parent.id, beta.id)
+  should.equal(stored.id, dm_id)
+  should.equal(stored.meta.title, "beta")
+  should.equal(stored.meta.parent_thread_id, option.Some(alpha_parent.id))
   let #(text, origin) = last_user_line(booted.registry, dm_id)
   should.equal(
     text,
-    "From alpha (thread s-alpha): hello beta"
-      <> "\n\n(reply via the bot_message tool with to \"s-alpha\" — a plain"
+    "From alpha (thread "
+      <> alpha_parent.id
+      <> "): hello beta"
+      <> "\n\n(reply via the bot_message tool with to \""
+      <> alpha_parent.id
+      <> "\" — a plain"
       <> " reply stays in this thread and never reaches the sender)",
   )
   should.equal(origin, Some(transcript.Origin("alpha", 1)))
 
-  let assert Ok(dm_summary) =
-    list.find(thread_registry.list_threads(booted.registry), fn(s) {
+  // Second-class confirmation: the sidebar list projection does not
+  // carry the channel (the info pane's `Channels` ask is its surface).
+  should.be_false(
+    list.any(thread_registry.list_threads(booted.registry), fn(s) {
       s.id == dm_id
-    })
-  should.equal(dm_summary.bot_id, Some(beta.id))
+    }),
+  )
 
-  // The second name-addressed delivery reuses the SAME DM thread (the
-  // in-memory pair map) — no fresh thread per message.
+  // The second name-addressed delivery reuses the SAME channel (the
+  // in-memory (parent, bot) map) — no fresh thread per message.
   // Already waited above; re-check so a slow DM turn cannot race Busy.
   wait_idle(booted.registry, dm_id)
   let assert delivery.Delivered(dm_id2) =
-    deliver(booted.registry, alpha.id, "alpha", "s-alpha", 1, "beta", "again")
+    deliver(
+      booted.registry,
+      alpha.id,
+      "alpha",
+      alpha_parent.id,
+      1,
+      "beta",
+      "again",
+    )
   should.equal(dm_id2, dm_id)
   let #(text2, _) = last_user_line(booted.registry, dm_id)
   should.equal(
     text2,
-    "From alpha (thread s-alpha): again"
-      <> "\n\n(reply via the bot_message tool with to \"s-alpha\" — a plain"
+    "From alpha (thread "
+      <> alpha_parent.id
+      <> "): again"
+      <> "\n\n(reply via the bot_message tool with to \""
+      <> alpha_parent.id
+      <> "\" — a plain"
       <> " reply stays in this thread and never reaches the sender)",
   )
 }
@@ -652,6 +751,8 @@ pub fn deliver_by_thread_id_direct_test() {
         system_prompt: None,
         toolset: None,
         bot_id: None,
+        parent_thread_id: None,
+        title: "",
       ),
       thread.Toolset(
         names: [],
@@ -711,14 +812,10 @@ pub fn bot_message_tool_delivers_end_to_end_test() {
     "delivered to beta in thread s",
   ))
 
-  // And the line landed in the DM thread with wrapper-computed depth 1.
-  let dm_id = case
-    thread_registry.list_threads(booted.registry)
-    |> list.find(fn(s) { s.bot_id == Some(beta.id) })
-  {
-    Ok(summary) -> summary.id
-    Error(_) -> panic as "DM thread not found"
-  }
+  // And the line landed in the channel with wrapper-computed depth 1
+  // (bot-channels plan, #123: found through the store — the channel is
+  // second-class and absent from `list_threads`).
+  let dm_id = stored_channel(booted, alpha_thread.id, beta.id).id
   let #(text, origin) = last_user_line(booted.registry, dm_id)
   should.equal(
     text,
@@ -774,13 +871,7 @@ pub fn bot_message_tool_depth_arithmetic_test() {
     "delivered to zeta in thread s",
   ))
 
-  let dm_id = case
-    thread_registry.list_threads(booted.registry)
-    |> list.find(fn(s) { s.bot_id == Some(zeta.id) })
-  {
-    Ok(summary) -> summary.id
-    Error(_) -> panic as "DM thread not found"
-  }
+  let dm_id = stored_channel(booted, epsilon_thread.id, zeta.id).id
   should.equal(last_user_depth(booted.registry, dm_id), 2)
 }
 

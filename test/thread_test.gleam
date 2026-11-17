@@ -390,6 +390,8 @@ fn start_with(runner: thread.TurnRunner) -> process.Subject(thread.Msg) {
       hydrated: False,
       roster: [],
       utility_apply: no_utility_apply,
+      parent_thread_id: None,
+      archived: False,
     ))
   started.data
 }
@@ -412,6 +414,8 @@ fn start_with_env(runner: thread.TurnRunner) -> process.Subject(thread.Msg) {
       hydrated: False,
       roster: ["workspace"],
       utility_apply: no_utility_apply,
+      parent_thread_id: None,
+      archived: False,
     ))
   started.data
 }
@@ -653,6 +657,8 @@ pub fn selected_alias_is_frozen_test() {
       hydrated: False,
       roster: [],
       utility_apply: no_utility_apply,
+      parent_thread_id: None,
+      archived: False,
     )
   let assert Ok(started) = thread.start_with_spec(spec)
   let sess = started.data
@@ -696,6 +702,8 @@ pub fn runner_receives_frozen_endpoint_test() {
       hydrated: False,
       roster: [],
       utility_apply: no_utility_apply,
+      parent_thread_id: None,
+      archived: False,
     )
   let assert Ok(started) = thread.start_with_spec(spec)
   let sess = started.data
@@ -1512,6 +1520,8 @@ fn start_with_utility(
       hydrated: False,
       roster: [],
       utility_apply: u_apply,
+      parent_thread_id: None,
+      archived: False,
     ))
   started.data
 }

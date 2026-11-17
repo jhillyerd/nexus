@@ -310,6 +310,8 @@ fn create(
         system_prompt: None,
         toolset: None,
         bot_id: None,
+        parent_thread_id: None,
+        title: "",
       ),
       toolset(happy_runner),
     )

@@ -2047,6 +2047,10 @@ fn send_effect(model: Model, text: String) -> Effect(Msg) {
             dispatch(SendAccepted)
           }
           thread.Busy -> dispatch(SendRejected("busy"))
+          // An archived channel refuses human Sends (bot-channels plan,
+          // #123): same rejection surface as busy, with the honest
+          // reason text.
+          thread.Refused(reason) -> dispatch(SendRejected(reason))
         }
       }
       Error(_) -> dispatch(SendRejected("gone"))
@@ -2113,6 +2117,8 @@ fn create_effect(model: Model, alias: String) -> Effect(Msg) {
                   system_prompt: None,
                   toolset: None,
                   bot_id: None,
+                  parent_thread_id: None,
+                  title: "",
                 )
               case thread_create.create_thread(providers, registry, requested) {
                 Ok(summary) -> Ok(summary)

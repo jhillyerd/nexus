@@ -209,6 +209,8 @@ fn new_thread(provider_id: String, model: String) -> thread_registry.NewThread {
     system_prompt: None,
     toolset: None,
     bot_id: None,
+    parent_thread_id: None,
+    title: "",
   )
 }
 
@@ -640,6 +642,7 @@ fn seed_with_tags(seam: store.Store, id: String, tags: List(String)) -> Nil {
           tags_manual: [],
           tags_source: thread.AutoTags,
           bot_id: None,
+          parent_thread_id: None,
           created_at: 1_700_000_000,
         ),
         last_active_at: 1_700_000_000,
@@ -991,6 +994,7 @@ fn seed_at(
           tags_manual: [],
           tags_source: thread.AutoTags,
           bot_id: None,
+          parent_thread_id: None,
           created_at: last_active_at,
         ),
         last_active_at: last_active_at,
@@ -1296,6 +1300,7 @@ fn stored_with_toolset(id: String, names: List(String)) -> store.StoredSummary {
       tags_source: thread.AutoTags,
       archived: False,
       bot_id: None,
+      parent_thread_id: None,
       created_at: timing.wall_now_s(),
     ),
     toolset: thread_registry.plain_entries(names),
@@ -1373,6 +1378,8 @@ pub fn create_from_bot_freezes_columns_and_provenance_test() {
         system_prompt: Some("be terse"),
         toolset: None,
         bot_id: Some("b1"),
+        parent_thread_id: None,
+        title: "",
       ),
       toolset(happy_runner),
     )
@@ -1412,6 +1419,8 @@ pub fn create_from_null_prompt_bot_freezes_config_default_test() {
         system_prompt: None,
         toolset: None,
         bot_id: Some("b2"),
+        parent_thread_id: None,
+        title: "",
       ),
       toolset(happy_runner),
     )
@@ -1443,6 +1452,8 @@ pub fn toolset_snapshot_persisted_at_creation_test() {
         system_prompt: None,
         toolset: Some(["http_fetch"]),
         bot_id: None,
+        parent_thread_id: None,
+        title: "",
       ),
     )
   let assert Ok(stored) = seam.get_thread(explicit.id)
@@ -1475,6 +1486,8 @@ pub fn chat_only_toolset_create_test() {
         system_prompt: None,
         toolset: Some([]),
         bot_id: None,
+        parent_thread_id: None,
+        title: "",
       ),
     )
   let assert Ok(stored) = seam.get_thread(summary.id)
@@ -1491,6 +1504,8 @@ pub fn chat_only_toolset_create_test() {
         system_prompt: None,
         toolset: Some([]),
         bot_id: None,
+        parent_thread_id: None,
+        title: "",
       ),
     )
   let assert Ok(second_stored) = seam.get_thread(second.id)
@@ -1511,6 +1526,8 @@ pub fn unknown_toolset_create_refused_test() {
       system_prompt: None,
       toolset: Some(["nope"]),
       bot_id: None,
+      parent_thread_id: None,
+      title: "",
     ),
   )
   |> should.equal(
@@ -1564,6 +1581,8 @@ pub fn plugin_toolset_create_resolves_through_provider_table_test() {
         system_prompt: None,
         toolset: Some(["http_fetch", "example__echo"]),
         bot_id: None,
+        parent_thread_id: None,
+        title: "",
       ),
     )
   let assert Ok(stored) = seam.get_thread(summary.id)
@@ -1581,6 +1600,8 @@ pub fn plugin_toolset_create_resolves_through_provider_table_test() {
       system_prompt: None,
       toolset: Some(["nosuch__thing"]),
       bot_id: None,
+      parent_thread_id: None,
+      title: "",
     ),
   )
   // Plugin-api Phase 2: a QUALIFIED name whose server half is not a
@@ -1610,6 +1631,8 @@ pub fn create_from_bot_toolset_snapshot_test() {
         system_prompt: None,
         toolset: Some(["http_fetch"]),
         bot_id: Some("b-tools"),
+        parent_thread_id: None,
+        title: "",
       ),
     )
   let assert Ok(stored) = seam.get_thread(summary.id)
@@ -1631,6 +1654,8 @@ pub fn create_from_bot_toolset_snapshot_test() {
         system_prompt: None,
         toolset: None,
         bot_id: Some("b-default"),
+        parent_thread_id: None,
+        title: "",
       ),
     )
   let assert Ok(stored) = seam.get_thread(from_default_bot.id)
@@ -1650,6 +1675,8 @@ pub fn create_from_bot_toolset_snapshot_test() {
         system_prompt: None,
         toolset: None,
         bot_id: None,
+        parent_thread_id: None,
+        title: "",
       ),
     )
   let assert Ok(stored) = seam.get_thread(plain.id)
@@ -1916,6 +1943,7 @@ pub fn dormant_summary_carries_bot_provenance_test() {
           tags_manual: [],
           tags_source: thread.AutoTags,
           bot_id: Some("b1"),
+          parent_thread_id: None,
           created_at: 1_700_000_000,
         ),
         last_active_at: 1_700_000_000,
@@ -2024,6 +2052,7 @@ pub fn bot_delete_scrubs_cached_provenance_test() {
             tags_manual: [],
             tags_source: thread.AutoTags,
             bot_id: Some(bot),
+            parent_thread_id: None,
             created_at: 1_700_000_000,
           ),
           last_active_at: 1_700_000_000,
@@ -2056,6 +2085,8 @@ pub fn bot_delete_scrubs_cached_provenance_test() {
         system_prompt: Some("p"),
         toolset: None,
         bot_id: Some("b1"),
+        parent_thread_id: None,
+        title: "",
       ),
       toolset(happy_runner),
     )
@@ -2118,6 +2149,8 @@ pub fn unpersisted_create_carries_no_provenance_test() {
         system_prompt: Some("p"),
         toolset: None,
         bot_id: Some("b1"),
+        parent_thread_id: None,
+        title: "",
       ),
       toolset(happy_runner),
     )
@@ -2158,6 +2191,8 @@ pub fn env_capable_ask_test() {
       thread_registry.NewThread(
         ..new_thread(store_mock.fixture_provider_id, "env-thread"),
         toolset: Some(["bash"]),
+        parent_thread_id: None,
+        title: "",
       ),
     )
   let assert Ok(plain_thread) =
@@ -2166,6 +2201,8 @@ pub fn env_capable_ask_test() {
       thread_registry.NewThread(
         ..new_thread(store_mock.fixture_provider_id, "plain-thread"),
         toolset: None,
+        parent_thread_id: None,
+        title: "",
       ),
     )
   should.be_true(thread_registry.env_capable(registry, env_thread.id))
@@ -2227,6 +2264,8 @@ pub fn env_toolset_refused_without_workspace_root_test() {
     thread_registry.NewThread(
       ..new_thread(store_mock.fixture_provider_id, "alpha"),
       toolset: Some(["bash", "read_file"]),
+      parent_thread_id: None,
+      title: "",
     ),
   )
   |> should.equal(
@@ -2250,6 +2289,8 @@ pub fn env_toolset_create_freezes_root_and_appends_roster_test() {
       thread_registry.NewThread(
         ..new_thread(store_mock.fixture_provider_id, "alpha"),
         toolset: Some(["bash"]),
+        parent_thread_id: None,
+        title: "",
       ),
     )
   // The persisted row carries the frozen root.
@@ -2481,6 +2522,7 @@ fn fresh_meta() -> thread.ThreadMeta {
     bot_id: None,
     // Recent: the boot sweep prunes never-used rows past its grace
     // window, keyed on last_active_at.
+    parent_thread_id: None,
     created_at: timing.wall_now_s(),
   )
 }
@@ -2584,6 +2626,8 @@ pub fn route_env_resolves_live_thread_and_attaches_plane_test() {
       thread_registry.NewThread(
         ..new_thread(store_mock.fixture_provider_id, "alpha"),
         toolset: option.Some(["bash"]),
+        parent_thread_id: None,
+        title: "",
       ),
     )
   let assert Ok(sess) = thread_registry.get(registry, summary.id)
