@@ -1085,6 +1085,9 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
   letter-spacing: .07em; opacity: .55; padding: 0 .25rem; }
 .tool-picker-controls { display: flex; align-items: center; gap: .3rem; flex-wrap: wrap; }
 #app .tool-picker-controls button { font-size: .7rem; padding: .15rem .5rem; margin: 0; }
+/* The Custom switch's row (fold control, issue #121): flex so the
+   Pico switch track and its label sit on one line. */
+.tool-picker-switch { display: flex; align-items: center; gap: .45rem; }
 .tool-picker-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(10.5rem, 1fr));
   gap: .3rem 1rem; max-height: 10rem; overflow-y: auto; }
 .tool-picker-list .checkbox-field { display: flex; align-items: center; gap: .3rem; min-width: 0; }

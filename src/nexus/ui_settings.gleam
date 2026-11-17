@@ -122,12 +122,17 @@ pub type State {
     bot_aliases: Dict(String, AliasState),
     /// The tool picker (issue #121): the pinnable catalog, fetched on
     /// the first bot-form open (add or edit — they are mutually
-    /// exclusive, so one slot serves whichever is open), and the
-    /// currently ticked names, seeded from the edited bot's stored
-    /// toolset (add starts unticked: no ticks saves as the DEFAULT
-    /// set, the blank-means-default rule).
+    /// exclusive, so one slot serves whichever is open), the currently
+    /// ticked names, and the Custom switch. OFF the picker is folded:
+    /// the bot saves as the DEFAULT set (every tool that works in this
+    /// deployment, including ones added later). ON the checkboxes
+    /// unfold; an EMPTY selection saves as chat-only — the switch is
+    /// what disambiguates empty from default, retiring the old
+    /// chat-only checkbox. Seeded from the edited bot's stored toolset
+    /// (`Some` = ON, ticks = names; `None` = OFF).
     bot_tools: ToolCatalogState,
     bot_tools_picked: List(String),
+    bot_tools_custom: Bool,
     /// Which tab the page's left rail shows. Both sections stay in the
     /// DOM (the inactive one `hidden`, like the forms) so uncontrolled
     /// form state survives tab switches; this only picks the visible one.
@@ -181,8 +186,9 @@ pub type Msg {
   BotEditProviderPicked(bot_id: String, provider_id: String)
   /// The add-bot form submitted. `system_prompt` blank = the global
   /// default (resolved when a thread is created from the bot).
-  /// `tools` is the raw comma-separated field; `chat_only` is the
-  /// checkbox state (bots plan P2 — parsing happens in the effect).
+  /// `tools` is the raw free-text field (only rendered in the degraded
+  /// picker mode); the toolset itself follows the Custom switch
+  /// (parsing happens in the effect).
   BotSubmitted(
     name: String,
     description: String,
@@ -190,7 +196,6 @@ pub type Msg {
     model: String,
     system_prompt: String,
     tools: String,
-    chat_only: Bool,
   )
   /// Toggling open carries the bot's provider (the select's
   /// preselected value) for the same combobox scoping, and its stored
@@ -200,8 +205,9 @@ pub type Msg {
   /// The edit form submitted: blank name/model/provider keep the stored
   /// values; a blank system prompt CLEARS back to the default (a real
   /// change — the two field classes in `bot.BotUpdate`). The tools field
-  /// is always present (prefilled), so the patch replaces — untouched
-  /// resubmits the stored list verbatim (bots plan P2).
+  /// rides only for the degraded picker mode; the toolset always
+  /// replaces, following the Custom switch — untouched resubmits the
+  /// stored state verbatim (bots plan P2).
   BotEditSubmitted(
     id: String,
     name: String,
@@ -210,7 +216,6 @@ pub type Msg {
     model: String,
     system_prompt: String,
     tools: String,
-    chat_only: Bool,
   )
   /// The row's inbound gate toggled (bots plan P3a): `allow` is the NEW
   /// value. A one-field PATCH — nothing else on the row moves.
@@ -237,12 +242,14 @@ pub type Msg {
   /// rides).
   BotAliasesFailed(provider_id: String)
   // ---- Tool picker (issue #121) ----
+  /// The Custom switch flipped: OFF folds the picker (default set), ON
+  /// unfolds the checkboxes (empty selection = chat-only).
+  BotToolsCustomToggled
   /// One picker checkbox flipped.
   BotToolToggled(name: String)
   /// The picker's All/None toggles: All ticks every catalog name, None
-  /// clears the picks — which saves as the DEFAULT toolset unless
-  /// chat-only is checked (the blank-means-default rule, expressed as
-  /// an empty selection).
+  /// clears the picks — which, saved with the switch ON, is chat-only
+  /// (no tools at all).
   BotToolsAll
   BotToolsNone
   /// The pinnable tool catalog landed (dispatched by the picker fetch
@@ -290,6 +297,7 @@ pub fn init() -> State {
     bot_aliases: dict.new(),
     bot_tools: ToolCatalogIdle,
     bot_tools_picked: [],
+    bot_tools_custom: False,
     tab: ProvidersTab,
   )
 }
@@ -491,11 +499,15 @@ pub fn update(
           providers,
           models_timeout_ms,
         )
-      // The tool picker (issue #121): a fresh form starts unticked
-      // (no ticks saves as the default set), and the catalog fetches
-      // on the first open (cached per connection).
+      // The tool picker (issue #121): a fresh form starts with the
+      // switch OFF (default set), and the catalog fetches on the first
+      // open (cached per connection).
       let #(state, tools_fetch) = case opening {
-        True -> ensure_tool_catalog(State(..state, bot_tools_picked: []), bots)
+        True ->
+          ensure_tool_catalog(
+            State(..state, bot_tools_picked: [], bot_tools_custom: False),
+            bots,
+          )
         False -> #(state, effect.none())
       }
       #(state, effect.batch([fetch, tools_fetch]), [])
@@ -525,12 +537,11 @@ pub fn update(
       model,
       system_prompt,
       tools_text,
-      chat_only,
     ) -> {
-      // The toolset's channel follows the picker's state (issue #121):
-      // the ticks when the catalog is in play, the free-text field's
-      // rule when the fetch degraded.
-      let tools = form_toolset(state, tools_text, chat_only)
+      // The toolset's channel is the Custom switch (issue #121): OFF
+      // saves the default set; ON the ticks (or, degraded, the text
+      // field) are the toolset, empty = chat-only.
+      let tools = form_toolset(state, tools_text)
       #(
         State(..state, bots_open: False),
         create_bot_effect(
@@ -552,10 +563,11 @@ pub fn update(
 
     BotEditToggled(id, provider_id, tools) -> {
       // Opening scopes the model combobox to the bot's own provider
-      // (the select's preselected value), seeds the picker's ticks
-      // from the bot's stored toolset (a chat-only bot seeds none —
-      // its checkbox is the state), and fetches the catalog unless
-      // cached; closing clears the slot.
+      // (the select's preselected value), seeds the picker from the
+      // bot's stored toolset — switch ON for any explicit set (a
+      // chat-only bot unfolds to an empty grid), OFF for the default —
+      // and fetches the catalog unless cached; closing clears the
+      // slot.
       let opening = state.bot_edit != Some(id)
       let #(state, fetch) =
         scope_bot_form(
@@ -580,7 +592,11 @@ pub fn update(
       let #(state, tools_fetch) = case opening {
         True ->
           ensure_tool_catalog(
-            State(..state, bot_tools_picked: option.unwrap(tools, [])),
+            State(
+              ..state,
+              bot_tools_picked: option.unwrap(tools, []),
+              bot_tools_custom: option.is_some(tools),
+            ),
             bots,
           )
         False -> #(state, effect.none())
@@ -596,13 +612,12 @@ pub fn update(
       model,
       system_prompt,
       tools_text,
-      chat_only,
     ) -> {
-      // The toolset's channel follows the picker's state (see
-      // `BotSubmitted`): the ticks are always present — the edit form
-      // seeds them from the stored toolset — so an untouched form
-      // resubmits the stored list verbatim (bots plan P2).
-      let tools = form_toolset(state, tools_text, chat_only)
+      // The toolset's channel is the Custom switch (see
+      // `BotSubmitted`): the ticks are always seeded on open, so an
+      // untouched form resubmits the stored state verbatim (bots plan
+      // P2).
+      let tools = form_toolset(state, tools_text)
       #(
         State(..state, bot_edit: None),
         update_bot_effect(
@@ -698,6 +713,16 @@ pub fn update(
       }
 
     // ---- Tool picker (issue #121) ----
+    BotToolsCustomToggled ->
+      // Flip the Custom switch: OFF folds the picker (the submitted
+      // toolset is the DEFAULT set regardless of any ticks), ON unfolds
+      // the checkboxes (an empty selection saves as chat-only).
+      #(
+        State(..state, bot_tools_custom: !state.bot_tools_custom),
+        effect.none(),
+        [],
+      )
+
     BotToolToggled(name) ->
       // Flip one tick. The list's order is catalog order for known
       // names (`order_toolset` re-derives it at submit), so insertion
@@ -1110,20 +1135,11 @@ fn bot_row(
             None -> ""
           },
         ),
-        // The tool picker (issue #121): catalog checkboxes + All/None
-        // toggles over the ticks seeded from the bot's stored toolset;
-        // degrades to the free-text field when the fetch failed. The
-        // chat-only checkbox below keeps its wins-over-ticks rule.
+        // The tool picker (issue #121): the Custom switch folds it —
+        // OFF the bot saves as the default set, ON the checkboxes
+        // unfold over the ticks seeded from the stored toolset (empty
+        // saves chat-only).
         bot_tools_picker(state),
-        html.label([attr.class("checkbox-field")], [
-          html.input([
-            attr.type_("checkbox"),
-            attr.name("chat_only"),
-            attr.value("on"),
-            attr.checked(b.tools == Some([])),
-          ]),
-          html.text("Chat only (no tools)"),
-        ]),
         html.div([attr.class("provider-form-buttons")], [
           html.button([attr.type_("submit")], [html.text("Save")]),
           html.button(
@@ -1240,16 +1256,8 @@ fn add_bot_form(state: State, provider_list: List(Provider)) -> Element(Msg) {
         "",
       ),
       // The tool picker (issue #121), same as the editor's: a fresh
-      // form starts unticked — no ticks saves as the default set.
+      // form starts switch-OFF — the default set.
       bot_tools_picker(state),
-      html.label([attr.class("checkbox-field")], [
-        html.input([
-          attr.type_("checkbox"),
-          attr.name("chat_only"),
-          attr.value("on"),
-        ]),
-        html.text("Chat only (no tools)"),
-      ]),
       html.div([attr.class("provider-form-buttons")], [
         html.button([attr.type_("submit")], [html.text("Add bot")]),
         html.button(
@@ -1274,97 +1282,145 @@ fn add_bot_form(state: State, provider_list: List(Provider)) -> Element(Msg) {
 /// the picker is controlled state — only the degraded field rides the
 /// submit's form data (as `tools`).
 fn bot_tools_picker(state: State) -> Element(Msg) {
-  case state.bot_tools {
-    ToolCatalogFailed ->
-      html.div([], [
-        html.input([
-          attr.type_("text"),
-          attr.name("tools"),
-          attr.value(string.join(state.bot_tools_picked, ", ")),
-          attr.placeholder("Tools, comma-separated (blank = default)"),
-          attr.aria("label", "Bot tools"),
+  // The Custom switch folds the picker (issue #121, toggle edition).
+  // OFF the bot saves as the DEFAULT set — every tool that works in
+  // this deployment, including ones added later — and only the switch
+  // and that promise render. ON the boxes unfold; an EMPTY selection
+  // saves as chat-only (the switch is what disambiguates empty from
+  // default — the retired checkbox's whole job). A failed catalog
+  // fetch degrades ON to the free-text field (the combobox's
+  // graceful-degradation rule). The switch is a Pico `role=switch` —
+  // the vendored theme styles it as a toggle, no custom CSS.
+  html.fieldset(
+    [attr.class("tool-picker")],
+    list.append(
+      [
+        html.legend([], [html.text("Tools")]),
+        html.label([attr.class("checkbox-field tool-picker-switch")], [
+          html.input([
+            attr.type_("checkbox"),
+            attr.attribute("role", "switch"),
+            attr.checked(state.bot_tools_custom),
+            attr.aria("label", "Custom tools"),
+            event.on_click(BotToolsCustomToggled),
+          ]),
+          html.text("Custom tools"),
         ]),
-        html.span([attr.class("muted")], [
-          html.text("tool list unavailable — enter names, comma-separated"),
-        ]),
-      ])
-    catalog -> {
-      let boxes = case catalog {
-        ToolCatalogOk(bot_registry.ToolCatalog(names, _unavailable)) -> {
-          let unknown =
-            list.filter(state.bot_tools_picked, fn(name) {
-              !list.contains(names, name)
-            })
-          list.append(
-            list.map(names, fn(name) {
-              tool_checkbox(
-                name,
-                list.contains(state.bot_tools_picked, name),
-                "",
-              )
-            }),
-            list.map(unknown, fn(name) {
-              tool_checkbox(name, True, "(not in catalog)")
-            }),
-          )
-        }
-        // Idle/loading: the seeded ticks render alone — a tick is only
-        // "not in catalog" once there is a catalog to be absent from;
-        // the full list joins when the fetch settles.
-        _ ->
-          list.map(state.bot_tools_picked, fn(name) {
-            tool_checkbox(name, True, "")
-          })
-      }
-      let controls = case catalog {
-        ToolCatalogOk(bot_registry.ToolCatalog(_, unavailable)) ->
-          list.append(
-            [
-              html.button(
-                [
-                  attr.type_("button"),
-                  attr.title("Tick every listed tool"),
-                  event.on_click(BotToolsAll),
-                ],
-                [html.text("All")],
-              ),
-              html.button(
-                [
-                  attr.type_("button"),
-                  attr.title(
-                    "Untick all — an empty selection saves as the default toolset",
+      ],
+      case state.bot_tools_custom {
+        False -> [
+          html.span([attr.class("muted")], [
+            html.text(
+              "default: every tool that works in this deployment, "
+              <> "including ones added later",
+            ),
+          ]),
+        ]
+        True ->
+          case state.bot_tools {
+            ToolCatalogFailed -> [
+              html.div([], [
+                html.input([
+                  attr.type_("text"),
+                  attr.name("tools"),
+                  attr.value(string.join(state.bot_tools_picked, ", ")),
+                  attr.placeholder(
+                    "Tools, comma-separated (blank = none, chat only)",
                   ),
-                  event.on_click(BotToolsNone),
-                ],
-                [html.text("None")],
-              ),
-            ],
-            case unavailable {
-              [] -> []
-              _ -> [
+                  attr.aria("label", "Bot tools"),
+                ]),
                 html.span([attr.class("muted")], [
                   html.text(
-                    "unavailable (not listed): "
-                    <> string.join(unavailable, ", "),
+                    "tool list unavailable — enter names, comma-separated",
                   ),
                 ]),
-              ]
-            },
-          )
-        _ -> []
-      }
-      html.fieldset([attr.class("tool-picker")], [
-        html.legend([], [html.text("Tools")]),
-        html.div([attr.class("tool-picker-controls")], controls),
-        html.div([attr.class("tool-picker-list")], boxes),
-        case catalog {
-          ToolCatalogOk(_) -> element.none()
-          _ ->
-            html.span([attr.class("muted")], [html.text("loading tool list…")])
-        },
-      ])
-    }
-  }
+              ]),
+            ]
+            catalog -> {
+              let boxes = case catalog {
+                ToolCatalogOk(bot_registry.ToolCatalog(names, _unavailable)) -> {
+                  let unknown =
+                    list.filter(state.bot_tools_picked, fn(name) {
+                      !list.contains(names, name)
+                    })
+                  list.append(
+                    list.map(names, fn(name) {
+                      tool_checkbox(
+                        name,
+                        list.contains(state.bot_tools_picked, name),
+                        "",
+                      )
+                    }),
+                    list.map(unknown, fn(name) {
+                      tool_checkbox(name, True, "(not in catalog)")
+                    }),
+                  )
+                }
+                // Idle/loading: the seeded ticks render alone — a tick
+                // is only "not in catalog" once there is a catalog to
+                // be absent from; the full list joins when the fetch
+                // settles.
+                _ ->
+                  list.map(state.bot_tools_picked, fn(name) {
+                    tool_checkbox(name, True, "")
+                  })
+              }
+              let controls = case catalog {
+                ToolCatalogOk(bot_registry.ToolCatalog(_, unavailable)) ->
+                  list.append(
+                    [
+                      html.button(
+                        [
+                          attr.type_("button"),
+                          attr.title("Tick every listed tool"),
+                          event.on_click(BotToolsAll),
+                        ],
+                        [html.text("All")],
+                      ),
+                      html.button(
+                        [
+                          attr.type_("button"),
+                          attr.title(
+                            "Untick all — saving with nothing ticked sends no tools at all",
+                          ),
+                          event.on_click(BotToolsNone),
+                        ],
+                        [html.text("None")],
+                      ),
+                    ],
+                    case unavailable {
+                      [] -> []
+                      _ -> [
+                        html.span([attr.class("muted")], [
+                          html.text(
+                            "unavailable (not listed): "
+                            <> string.join(unavailable, ", "),
+                          ),
+                        ]),
+                      ]
+                    },
+                  )
+                _ -> []
+              }
+              list.append(
+                [
+                  html.div([attr.class("tool-picker-controls")], controls),
+                  html.div([attr.class("tool-picker-list")], boxes),
+                ],
+                case catalog {
+                  ToolCatalogOk(_) -> []
+                  _ -> [
+                    html.span([attr.class("muted")], [
+                      html.text("loading tool list…"),
+                    ]),
+                  ]
+                },
+              )
+            }
+          }
+      },
+    ),
+  )
 }
 
 /// One picker checkbox. Hostile-text rule: a tool name (reachable
@@ -1918,61 +1974,55 @@ fn set_bot_inbound_effect(
   })
 }
 
-/// The form's tool fields → the bot's three-state toolset (bots plan
-/// P2) — the DEGRADED channel (issue #121): used only while the picker
-/// catalog fetch has failed, over the free-text field that replaces
-/// the checkbox list. The chat-only checkbox wins (`Some([])`);
-/// otherwise the comma-separated names (trimmed, blanks dropped) —
-/// none left means the default set (`None`). An explicit empty list is
-/// unreachable from the form without the checkbox, which is the point:
-/// blank MEANS the default here.
-fn parse_tools_field(text: String, chat_only: Bool) -> Option(List(String)) {
-  case chat_only {
-    True -> Some([])
-    False ->
-      case
-        text
-        |> string.split(",")
-        |> list.map(string.trim)
-        |> list.filter(fn(name) { name != "" })
-      {
-        [] -> None
-        names -> Some(names)
+/// The degraded free-text field → an explicit name list (trimmed,
+/// blanks dropped); blank is `None`, which `form_toolset` lifts to
+/// chat-only in the switch-ON mode this field only renders in. The
+/// DEFAULT state is unreachable here by construction — the switch is
+/// OFF and the whole field is folded away.
+fn parse_tools_field(text: String) -> Option(List(String)) {
+  case
+    text
+    |> string.split(",")
+    |> list.map(string.trim)
+    |> list.filter(fn(name) { name != "" })
+  {
+    [] -> None
+    names -> Some(names)
+  }
+}
+
+/// The submitted form's toolset — the Custom switch is the channel
+/// (issue #121, toggle edition). OFF: the DEFAULT set (`None`), the
+/// folded picker ignored entirely. ON: the ticks are the toolset, and
+/// an EMPTY selection is chat-only (`Some([])`) — the switch is what
+/// disambiguates empty from default, which is why the old chat-only
+/// checkbox retired. The degraded free-text field (only rendered ON)
+/// parses the same rule: blank text = chat-only.
+fn form_toolset(state: State, tools_text: String) -> Option(List(String)) {
+  case state.bot_tools_custom {
+    False -> None
+    True ->
+      case state.bot_tools {
+        ToolCatalogFailed ->
+          case parse_tools_field(tools_text) {
+            None -> Some([])
+            some -> some
+          }
+        _ -> picked_to_toolset(state.bot_tools_picked, state.bot_tools)
       }
   }
 }
 
-/// The submitted form's toolset channel (issue #121): the picker's
-/// ticks whenever the catalog is in play (loading, settled — the
-/// degraded field does not render then), the free-text rule when the
-/// fetch failed. While loading there are no boxes and no text field,
-/// so both channels agree on the default.
-fn form_toolset(
-  state: State,
-  tools_text: String,
-  chat_only: Bool,
-) -> Option(List(String)) {
-  case state.bot_tools {
-    ToolCatalogFailed -> parse_tools_field(tools_text, chat_only)
-    _ -> picked_to_toolset(state.bot_tools_picked, chat_only, state.bot_tools)
-  }
-}
-
-/// The picker's ticks → the bot's three-state toolset: the same rule
-/// as `parse_tools_field`, over the checkbox selection (chat-only
-/// wins; no ticks means the default set).
+/// The picker's ticks → the toolset: empty = chat-only (the Custom
+/// switch is ON — see `form_toolset`), else the ticks in catalog
+/// order.
 fn picked_to_toolset(
   picked: List(String),
-  chat_only: Bool,
   catalog: ToolCatalogState,
 ) -> Option(List(String)) {
-  case chat_only {
-    True -> Some([])
-    False ->
-      case picked {
-        [] -> None
-        names -> Some(order_toolset(names, catalog))
-      }
+  case picked {
+    [] -> Some([])
+    names -> Some(order_toolset(names, catalog))
   }
 }
 
@@ -2233,7 +2283,6 @@ fn bot_submitted() -> attr.Attribute(Msg) {
           model,
           result.unwrap(prompt, ""),
           result.unwrap(tools, ""),
-          result.is_ok(form_field(entries, "chat_only")),
         )
       _, _, _, _, _, _ -> Ignored
     }
@@ -2262,7 +2311,6 @@ fn bot_edit_submitted(id: String) -> attr.Attribute(Msg) {
           model,
           result.unwrap(prompt, ""),
           result.unwrap(tools, ""),
-          result.is_ok(form_field(entries, "chat_only")),
         )
       _, _, _, _, _, _ -> Ignored
     }

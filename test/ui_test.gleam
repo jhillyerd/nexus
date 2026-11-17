@@ -4026,6 +4026,8 @@ pub fn view_settings_bots_tools_display_test() {
   should.be_true(string.contains(editing, "checked"))
   should.be_true(string.contains(editing, ">http_fetch<"))
 
+  // Chat-only (Some([])) now seeds the Custom switch ON over an empty
+  // grid — the retired chat-only checkbox is gone from the form.
   let editing_chat_only =
     new_model()
     |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
@@ -4035,7 +4037,9 @@ pub fn view_settings_bots_tools_display_test() {
     |> step(ui.SettingsToggled)
     |> step(ui.Settings(ui_settings.BotEditToggled("b2", "p1", Some([]))))
     |> view_string
+  should.be_true(string.contains(editing_chat_only, ">Custom tools<"))
   should.be_true(string.contains(editing_chat_only, "checked"))
+  should_not_contain(editing_chat_only, "Chat only (no tools)")
 }
 
 /// The tool picker (issue #121): the settled catalog renders as
@@ -4069,8 +4073,9 @@ pub fn view_settings_bots_tool_picker_test() {
   let open_b1 =
     ui.Settings(ui_settings.BotEditToggled("b1", "p1", Some(["http_fetch"])))
 
-  // The settled picker: four catalog boxes, All/None controls, the
-  // seeded tick the only checked one.
+  // The settled picker: four catalog boxes, the Custom switch (ON —
+  // the edit seeded an explicit set), All/None controls, the seeded
+  // tick the only ticked box.
   let settled =
     base
     |> step(open_b1)
@@ -4083,8 +4088,9 @@ pub fn view_settings_bots_tool_picker_test() {
   should.be_true(string.contains(settled, ">web_search<"))
   // The picker renders once per form instance — the add form plus each
   // row's hidden editor, three with two bots — all reflecting the ONE
-  // shared picker state, so counts are ×3 (ticked http_fetch only).
-  should.equal(count_occurrences(settled, "checked"), 3)
+  // shared picker state, so counts are ×3 (the ON switch + the ticked
+  // http_fetch each render a `checked` attribute).
+  should.equal(count_occurrences(settled, "checked"), 6)
 
   // All ticks everything, None clears back to the default-set state,
   // a single flip re-ticks one box.
@@ -4094,7 +4100,7 @@ pub fn view_settings_bots_tool_picker_test() {
     |> step(ui.Settings(ui_settings.BotToolsLoaded(catalog)))
     |> step(ui.Settings(ui_settings.BotToolsAll))
     |> view_string
-  should.equal(count_occurrences(all, "checked"), 12)
+  should.equal(count_occurrences(all, "checked"), 15)
 
   let none_then_one =
     base
@@ -4103,7 +4109,7 @@ pub fn view_settings_bots_tool_picker_test() {
     |> step(ui.Settings(ui_settings.BotToolsNone))
     |> step(ui.Settings(ui_settings.BotToolToggled("web_search")))
     |> view_string
-  should.equal(count_occurrences(none_then_one, "checked"), 3)
+  should.equal(count_occurrences(none_then_one, "checked"), 6)
   should.be_true(string.contains(none_then_one, ">web_search<"))
 
   // A kept stored-but-unknown name renders as a ticked "(not in
@@ -4120,10 +4126,27 @@ pub fn view_settings_bots_tool_picker_test() {
     )
     |> step(ui.Settings(ui_settings.BotToolsLoaded(catalog)))
     |> view_string
-  should.equal(count_occurrences(stale, "checked"), 6)
+  should.equal(count_occurrences(stale, "checked"), 9)
   should.be_true(string.contains(stale, "(not in catalog)"))
   should.be_true(string.contains(stale, "&lt;script&gt;alert(2)&lt;/script&gt;"))
   should_not_contain(stale, "<script>alert(2)</script>")
+
+  // Flipping the Custom switch OFF folds the grid: no boxes, no
+  // All/None, just the default-set promise; the switch itself unticks.
+  let folded =
+    base
+    |> step(open_b1)
+    |> step(ui.Settings(ui_settings.BotToolsLoaded(catalog)))
+    |> step(ui.Settings(ui_settings.BotToolsCustomToggled))
+    |> view_string
+  should.be_true(string.contains(folded, ">Custom tools<"))
+  should.be_true(string.contains(
+    folded,
+    "default: every tool that works in this deployment",
+  ))
+  should_not_contain(folded, ">All<")
+  should_not_contain(folded, ">http_fetch<")
+  should.equal(count_occurrences(folded, "checked"), 0)
 
   // A failed fetch degrades to the free-text field (the combobox's
   // graceful-degradation rule), prefilled with the stored list.
@@ -4146,14 +4169,15 @@ fn count_occurrences(haystack: String, needle: String) -> Int {
   list.length(string.split(haystack, needle)) - 1
 }
 
-/// The picker's submit channel (issue #121), pinned end-to-end over a
-/// REAL runtime and a REAL bot registry: opening the add form fetches
-/// the canned catalog through the injected seam, ticking two boxes and
-/// submitting creates a bot whose stored toolset is the TICKS in
-/// catalog order; no ticks saves as the default set (None); the
-/// chat-only checkbox wins over ticks (Some([])). The degraded
-/// free-text channel is the view test's concern — this pins the picker
-/// channel's three states landing in the store.
+/// The picker's submit channel (issue #121, toggle edition), pinned
+/// end-to-end over a REAL runtime and a REAL bot registry: flipping
+/// the Custom switch ON unfolds the fetched catalog, ticking two boxes
+/// and submitting creates a bot whose stored toolset is the TICKS in
+/// catalog order; the switch ON with nothing ticked saves chat-only
+/// (Some([])); the switch OFF saves the default set (None) regardless
+/// of any stale ticks. The degraded free-text channel is the view
+/// test's concern — this pins the three switch states landing in the
+/// store.
 pub fn bot_picker_submit_roundtrip_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
@@ -4224,6 +4248,12 @@ pub fn bot_picker_submit_roundtrip_test() {
       ),
     ),
   )
+  // OFF only the switch renders, so flip the Custom switch ON before
+  // waiting for the unfolded picker.
+  lustre.send(
+    to: runtime,
+    message: lustre.dispatch(ui.Settings(ui_settings.BotToolsCustomToggled)),
+  )
   let _ = wait_for_patch(client, "bot_message", 40)
 
   // Tick http_fetch + codemode and submit — the stored toolset is the
@@ -4251,18 +4281,21 @@ pub fn bot_picker_submit_roundtrip_test() {
         "smart",
         "",
         "",
-        False,
       )),
     ),
   )
 
-  // Chat-only wins over ticks; nothing ticked saves as the default
-  // set (the blank-means-default rule, picker edition).
+  // B: the switch still ON — None clears every tick, and saving with
+  // nothing ticked is chat-only, Some([]).
   lustre.send(
     to: runtime,
     message: lustre.dispatch(
       ui.Settings(ui_settings.BotToolToggled("web_search")),
     ),
+  )
+  lustre.send(
+    to: runtime,
+    message: lustre.dispatch(ui.Settings(ui_settings.BotToolsNone)),
   )
   lustre.send(
     to: runtime,
@@ -4274,15 +4307,14 @@ pub fn bot_picker_submit_roundtrip_test() {
         "smart",
         "",
         "",
-        True,
       )),
     ),
   )
-  // None clears the ticks (an empty selection saves as the default
-  // set), then C submits with nothing ticked and chat-only unchecked.
+  // C: the switch flips OFF — the default set, regardless of any ticks
+  // the folded picker still holds.
   lustre.send(
     to: runtime,
-    message: lustre.dispatch(ui.Settings(ui_settings.BotToolsNone)),
+    message: lustre.dispatch(ui.Settings(ui_settings.BotToolsCustomToggled)),
   )
   lustre.send(
     to: runtime,
@@ -4294,7 +4326,6 @@ pub fn bot_picker_submit_roundtrip_test() {
         "smart",
         "",
         "",
-        False,
       )),
     ),
   )
