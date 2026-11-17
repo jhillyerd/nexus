@@ -846,3 +846,116 @@ pub fn channels_ask_rows_test() {
   should.equal(delta_row.thread_id, c3)
   should.equal(delta_row.bot_name, option.Some("delta"))
 }
+
+// ---------------------------------------------------------------------------
+// The pane's reverse lookup (bot-channels plan Phase 2)
+// ---------------------------------------------------------------------------
+
+/// `channel_of` resolves a CHANNEL's context — parent, bot pointer,
+/// frozen creation title, archived flag — and refuses everything that is
+/// not one: the ordinary parent and unknown ids alike answer Error, so
+/// the UI's breadcrumb/highlight mapping can never misfire on an
+/// ordinary selection.
+pub fn channel_of_resolves_channel_context_test() {
+  let booted = boot()
+  let alpha = create_bot(booted, "alpha")
+  let beta = create_bot(booted, "beta")
+  let parent = create_parent_thread(booted, alpha.id)
+
+  let assert delivery.Delivered(c1) =
+    deliver(booted.registry, alpha.id, "alpha", parent, 0, "beta", "check it")
+
+  let channel = stored_channel(booted, parent, beta.id)
+  should.equal(channel.id, c1)
+  let assert Ok(ctx) = thread_registry.channel_of(booted.registry, c1)
+  should.equal(ctx.parent_id, parent)
+  should.equal(ctx.bot_id, option.Some(beta.id))
+  // The frozen title is the target bot's name (create_dm's
+  // deterministic title) — the header's deleted-bot fallback.
+  should.equal(ctx.title, "beta")
+  should.equal(ctx.archived, False)
+
+  // Ordinary thread and unknown id: not a channel, either of them.
+  should.equal(thread_registry.channel_of(booted.registry, parent), Error(Nil))
+  should.equal(
+    thread_registry.channel_of(booted.registry, "no-such-thread"),
+    Error(Nil),
+  )
+}
+
+/// Post-restart the channel sits in the registry's dormant summaries
+/// (boot hydrates lazily) — the pane's reverse lookup answers from that
+/// dict too, so a reload with a channel as the last-selected thread
+/// restores the breadcrumb and the parent highlight.
+pub fn channel_of_answers_dormant_channels_test() {
+  let booted = boot()
+  let alpha = create_bot(booted, "alpha")
+  let beta = create_bot(booted, "beta")
+  let parent = create_parent_thread(booted, alpha.id)
+  let assert delivery.Delivered(c1) =
+    deliver(booted.registry, alpha.id, "alpha", parent, 0, "beta", "check it")
+
+  let booted2 = boot_over(booted.seam, refused_endpoint())
+  let assert Ok(ctx) = thread_registry.channel_of(booted2.registry, c1)
+  should.equal(ctx.parent_id, parent)
+  should.equal(ctx.bot_id, option.Some(beta.id))
+  should.equal(ctx.title, "beta")
+}
+
+/// The pane's rows carry the frozen title beside the resolved bot name —
+/// the deleted-bot fallback the UI renders (the as-built amended the
+/// plan's "falls back to the id": the frozen name reads as a name).
+pub fn channel_rows_carry_frozen_title_test() {
+  let booted = boot()
+  let alpha = create_bot(booted, "alpha")
+  let beta = create_bot(booted, "beta")
+  let parent = create_parent_thread(booted, alpha.id)
+  let assert delivery.Delivered(c1) =
+    deliver(booted.registry, alpha.id, "alpha", parent, 0, "beta", "check it")
+
+  let assert [row] = thread_registry.channels(booted.registry, parent)
+  should.equal(row.thread_id, c1)
+  should.equal(row.bot_name, option.Some("beta"))
+  should.equal(row.title, "beta")
+
+  // After the bot is deleted, `bot_name` resolves to None while the
+  // frozen title survives — exactly the fallback pair the pane needs.
+  let assert Ok(Nil) = bot_registry.delete_bot(booted.bots, beta.id)
+  let assert [row] = thread_registry.channels(booted.registry, parent)
+  should.equal(row.bot_name, None)
+  should.equal(row.title, "beta")
+}
+
+/// The per-thread HTTP routes' resolution (with_thread): the summary for
+/// ANY id — channels included, which the `List` projection hides. The
+/// Phase 1 projection accidentally 404'd every per-thread route on a
+/// channel (state/delete/send); `summary_of` + the get-first ordering in
+/// `web.with_thread` restore the "Get/state keep answering" contract.
+pub fn summary_of_answers_for_channels_test() {
+  let booted = boot()
+  let alpha = create_bot(booted, "alpha")
+  let beta = create_bot(booted, "beta")
+  let parent = create_parent_thread(booted, alpha.id)
+  let assert delivery.Delivered(c1) =
+    deliver(booted.registry, alpha.id, "alpha", parent, 0, "beta", "check it")
+
+  // Live channel: full summary, parent provenance intact.
+  let assert Ok(summary) = thread_registry.summary_of(booted.registry, c1)
+  should.equal(summary.id, c1)
+  should.equal(summary.bot_id, option.Some(beta.id))
+  should.equal(summary.title, "beta")
+
+  // Dormant channel: the store snapshot answers the same way (the
+  // provenance pointer rides the stored meta).
+  let booted2 = boot_over(booted.seam, refused_endpoint())
+  let assert Ok(summary) = thread_registry.summary_of(booted2.registry, c1)
+  should.equal(summary.id, c1)
+  should.equal(summary.bot_id, option.Some(beta.id))
+
+  // The parent (ordinary) still answers, and an unknown id refuses.
+  let assert Ok(_) = thread_registry.summary_of(booted2.registry, parent)
+  should.equal(
+    thread_registry.summary_of(booted2.registry, "no-such-thread"),
+    Error(Nil),
+  )
+}

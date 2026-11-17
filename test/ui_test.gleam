@@ -4967,3 +4967,415 @@ fn wait_until_dead(pid: process.Pid, attempts: Int) -> Nil {
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// Thread info pane (bot-channels plan Phase 2, #123)
+// ---------------------------------------------------------------------------
+
+/// One pane row (the `Channels` ask's reply shape, registry-side).
+fn channel_info(
+  thread_id: String,
+  bot_name: Option(String),
+  running: Bool,
+  archived: Bool,
+) -> thread_registry.ChannelInfo {
+  thread_registry.ChannelInfo(
+    thread_id: thread_id,
+    bot_id: option.map(bot_name, fn(_) { "bot-1" }),
+    bot_name: bot_name,
+    title: "RelayBeta",
+    running: running,
+    archived: archived,
+    last_active_s: timing.wall_now_s() - 3600,
+  )
+}
+
+/// The channel-context a selection carries once the pane's reverse
+/// lookup (or a row click) has landed: parent `s-parent`.
+fn with_ctx(model: ui.Model) -> ui.Model {
+  step(
+    model,
+    ui.ChannelResolved(
+      option.unwrap(model.selected, ""),
+      Ok(thread_registry.ChannelContext(
+        parent_id: "s-parent",
+        bot_id: Some("bot-1"),
+        title: "RelayBeta",
+        archived: False,
+      )),
+    ),
+  )
+}
+
+/// A pane row click resolves against the viewed parent: the channel
+/// becomes the selection through the ordinary Join machinery, the
+/// clicked row SEEDS the context (no ask in the loop — the next refresh
+/// re-derives the same truth), the pane closes, and the view resets
+/// (visit bump, log clear) like any selection change.
+pub fn channel_row_selection_seeds_context_test() {
+  let model =
+    new_model()
+    |> step(ui.ThreadsLoaded([summary("s-parent", False)]))
+    |> step(ui.Select("s-parent"))
+    |> step(ui.UserEcho("hello", None, None))
+  let info = channel_info("s-channel", Some("RelayBeta"), False, False)
+  let model = step(model, ui.PaneToggled)
+  model.pane_open |> should.be_true
+  let model = step(model, ui.ChannelRowSelected(info))
+  model.selected |> should.equal(Some("s-channel"))
+  model.pane_open |> should.be_false
+  model.log |> should.equal([])
+  let assert Some(ctx) = model.channel_ctx
+  ctx.parent_id |> should.equal("s-parent")
+  ctx.bot_id |> should.equal(Some("bot-1"))
+  ctx.title |> should.equal("RelayBeta")
+  ctx.archived |> should.be_false
+}
+
+/// Selection-without-listing: a channel is never a sidebar row (the
+/// registry projection hides channels from the list), and the PARENT's
+/// row carries the highlight instead — exactly one row selected either
+/// way, `aria-current` included.
+pub fn channel_selection_highlights_parent_row_test() {
+  let model =
+    new_model()
+    |> step(ui.ThreadsLoaded([summary("s-parent", False)]))
+    |> with_ctx
+  let html = view_string(model)
+  should_contain(html, "thread-row selected")
+  should_contain(html, "aria-current=\"true\"")
+  // The channel id rides no row: only listed summaries render rows.
+  should_not_contain(html, "data-thread-id=\"s-channel\"")
+}
+
+/// The pane renders one row per channel: dot state, `↳ <bot name>`,
+/// relative age, chevron — all text nodes. The running channel pulses
+/// (class), the idle one does not.
+pub fn pane_renders_channel_rows_test() {
+  let model =
+    new_model()
+    |> step(ui.ThreadsLoaded([summary("s-parent", False)]))
+    |> step(ui.Select("s-parent"))
+    |> step(
+      ui.ChannelsLoaded("s-parent", [
+        channel_info("s-ch-1", Some("RelayBeta"), True, False),
+        channel_info("s-ch-2", Some("Scout"), False, False),
+      ]),
+    )
+    |> step(ui.PaneToggled)
+  let html = view_string(model)
+  should_contain(html, "↳ RelayBeta")
+  should_contain(html, "↳ Scout")
+  should_contain(html, "ch-dot run")
+  should_contain(html, "ch-dot idle")
+  should_contain(html, "1h")
+  should_contain(html, "›")
+  // Rows navigate: each carries its thread id for the click.
+  should_contain(html, "data-thread-id=\"s-ch-1\"")
+  should_contain(html, "data-thread-id=\"s-ch-2\"")
+}
+
+/// The header badge counts RUNNING channels and renders nothing when
+/// the thread has none (the ambient signal exists only where channels
+/// exist). Idle rows keep the button (the pane is still the way in) but
+/// hide the count chip and the pulse.
+pub fn badge_counts_running_channels_test() {
+  let model =
+    new_model()
+    |> step(ui.ThreadsLoaded([summary("s-parent", False)]))
+    |> step(ui.Select("s-parent"))
+  // No channels: no badge at all.
+  view_string(model) |> should_not_contain("id=\"info-btn\"")
+  let idle =
+    model
+    |> step(ui.ChannelsLoaded("s-parent", [
+      channel_info("s-ch-1", Some("RelayBeta"), False, False),
+    ]))
+  let idle_html = view_string(idle)
+  should_contain(idle_html, "id=\"info-btn\"")
+  should_not_contain(idle_html, "class=\"n\"")
+  should_not_contain(idle_html, "info-dot live")
+  let running =
+    model
+    |> step(ui.ChannelsLoaded("s-parent", [
+      channel_info("s-ch-1", Some("RelayBeta"), False, False),
+      channel_info("s-ch-2", Some("Scout"), True, False),
+    ]))
+  let running_html = view_string(running)
+  should_contain(running_html, "<span class=\"n\">1</span>")
+  should_contain(running_html, "info-dot live")
+}
+
+/// Viewing a channel swaps the header to `‹ <parent title>` plus the
+/// channel's label (the bot's name; the frozen title when the bot row
+/// is gone), with the archive chip when archived. All text nodes.
+pub fn channel_breadcrumb_renders_test() {
+  let model =
+    new_model()
+    |> step(ui.ThreadsLoaded([summary("s-parent", False)]))
+    |> with_ctx
+  let html = view_string(model)
+  should_contain(html, "id=\"crumb\"")
+  should_contain(html, "‹ ")
+  should_contain(html, "RelayBeta")
+  should_not_contain(html, "ch-archived-chip")
+  let archived =
+    step(
+      model,
+      // The stamp must name the SELECTION (the guard drops replies for
+      // other ids): the archived chip is a ctx flip on the viewed
+      // channel, not a selection change.
+      ui.ChannelResolved(
+        "s-parent",
+        Ok(thread_registry.ChannelContext(
+          parent_id: "s-parent",
+          bot_id: None,
+          title: "OldHat",
+          archived: True,
+        )),
+      ),
+    )
+  let archived_html = view_string(archived)
+  should_contain(archived_html, "ch-archived-chip")
+  // Deleted bot: the frozen creation title stands in for the name.
+  should_contain(archived_html, "OldHat")
+}
+/// Pane rows are hostile text: a bot name carrying markup renders as
+/// inert text — the same pin the roster lines and turn lines carry.
+pub fn pane_rows_escape_hostile_labels_test() {
+  let payload = "<script>alert(1)</script>"
+  let model =
+    new_model()
+    |> step(ui.ThreadsLoaded([summary("s-parent", False)]))
+    |> step(ui.Select("s-parent"))
+    |> step(
+      ui.ChannelsLoaded("s-parent", [
+        thread_registry.ChannelInfo(
+          thread_id: "s-ch-1",
+          bot_id: Some("bot-1"),
+          bot_name: Some(payload),
+          title: payload,
+          running: False,
+          archived: False,
+          last_active_s: timing.wall_now_s(),
+        ),
+      ]),
+    )
+    |> step(ui.PaneToggled)
+  let html = view_string(model)
+  should_not_contain(html, "<script>")
+  should_contain(html, "&lt;script&gt;alert(1)&lt;/script&gt;")
+}
+
+/// The deleted-bot fallback is the frozen creation title (the as-built
+/// amended the plan's "falls back to the id" — `create_dm` titled the
+/// channel with the bot's name, so the fallback still reads as a name).
+/// The row and the header label both use it.
+pub fn deleted_bot_label_falls_back_to_title_test() {
+  let model =
+    new_model()
+    |> step(ui.ThreadsLoaded([summary("s-parent", False)]))
+    |> step(ui.Select("s-parent"))
+    |> step(
+      ui.ChannelsLoaded("s-parent", [
+        channel_info("s-ch-1", None, False, False),
+      ]),
+    )
+    |> step(ui.PaneToggled)
+  let html = view_string(model)
+  should_contain(html, "↳ RelayBeta")
+  // The header badge's aria label never shows a raw bot pointer either.
+  should_contain(html, "aria-label=\"Thread info — 0 running\"")
+}
+
+/// An archived channel renders dimmed WITH its archive badge and stays
+/// navigable: the row still selects it (read-only transcript, the actor
+/// refuses Sends — never hidden).
+pub fn archived_channel_row_stays_navigable_test() {
+  let info = channel_info("s-ch-1", Some("OldHat"), False, True)
+  let model =
+    new_model()
+    |> step(ui.ThreadsLoaded([summary("s-parent", False)]))
+    |> step(ui.Select("s-parent"))
+    |> step(ui.ChannelsLoaded("s-parent", [info]))
+    |> step(ui.PaneToggled)
+  let html = view_string(model)
+  should_contain(html, "ch archived")
+  should_contain(html, ">archived</span>")
+  let model = step(model, ui.ChannelRowSelected(info))
+  model.selected |> should.equal(Some("s-ch-1"))
+  let assert Some(ctx) = model.channel_ctx
+  ctx.archived |> should.be_true
+}
+
+/// A channel selection survives a list refresh on the context's word:
+/// channels are absent from the (channel-free) list, so the
+/// list-only rule would drop the selection — and its transcript — on
+/// the very first refresh after a reload (`Flags.thread` naming a
+/// channel is a supported state). The resolution rides the same effect
+/// as the list and lands first; this is the update half of that order.
+pub fn threads_loaded_keeps_channel_selection_test() {
+  let model =
+    new_model_with_thread(Some("s-channel"))
+    |> step(ui.ChannelResolved(
+      "s-channel",
+      Ok(thread_registry.ChannelContext(
+        parent_id: "s-parent",
+        bot_id: Some("bot-1"),
+        title: "RelayBeta",
+        archived: False,
+      )),
+    ))
+    |> step(ui.ThreadsLoaded([summary("s-parent", False)]))
+  model.selected |> should.equal(Some("s-channel"))
+  model.model_label |> should.equal("connecting…")
+  // Once the context is gone (the channel was deleted — CASCADE), the
+  // next refresh drops the selection and the ordinary auto-select picks
+  // a replacement; the dropped channel's pane state goes with it (the
+  // `switched` rule), so the replacement is never dressed in it.
+  let model =
+    step(
+      model,
+      ui.ChannelResolved("s-channel", Error(Nil)),
+    )
+    |> step(ui.ThreadsLoaded([summary("s-parent", False)]))
+  model.selected |> should.equal(Some("s-parent"))
+  model.channel_ctx |> should.equal(None)
+  model.channels |> should.equal([])
+}
+
+/// The context reply is stamped with the id it was asked for: a
+/// selection change while the ask ran must not dress the new selection
+/// in the old thread's context.
+pub fn channel_resolved_drops_stale_stamp_test() {
+  let model =
+    new_model()
+    |> step(ui.ThreadsLoaded([summary("s-1", False)]))
+    |> step(ui.Select("s-1"))
+    |> step(ui.ChannelResolved(
+      "s-other",
+      Ok(thread_registry.ChannelContext(
+        parent_id: "s-parent",
+        bot_id: Some("bot-1"),
+        title: "RelayBeta",
+        archived: False,
+      )),
+    ))
+  model.channel_ctx |> should.equal(None)
+}
+
+/// The rows reply is stamped with the parent it was asked for: rows for
+/// a thread that is no longer selected never render.
+pub fn channels_loaded_drops_stale_parent_test() {
+  let model =
+    new_model()
+    |> step(ui.ThreadsLoaded([summary("s-1", False)]))
+    |> step(ui.Select("s-1"))
+    |> step(
+      ui.ChannelsLoaded("s-other", [
+        channel_info("s-ch-1", Some("RelayBeta"), False, False),
+      ]),
+    )
+  model.channels |> should.equal([])
+}
+
+/// Pane state is per-selection: any selection change (and entering
+/// Settings) closes the popover and clears the rows, like `pop`.
+pub fn pane_closes_on_selection_change_and_settings_test() {
+  let model =
+    new_model()
+    |> step(ui.ThreadsLoaded([summary("s-1", False)]))
+    |> step(ui.Select("s-1"))
+    |> step(ui.ChannelsLoaded("s-1", [
+      channel_info("s-ch-1", Some("RelayBeta"), False, False),
+    ]))
+    |> step(ui.PaneToggled)
+  model.pane_open |> should.be_true
+  // A DIFFERENT selection closes it; the same-id Select is a deliberate
+  // no-op (the guard exists so a stray re-click cannot reset the view).
+  let model =
+    model
+    |> step(ui.ThreadsLoaded([
+      summary("s-1", False),
+      summary("s-2", False),
+    ]))
+    |> step(ui.Select("s-2"))
+  model.pane_open |> should.be_false
+  model.channels |> should.equal([])
+  model.channel_ctx |> should.equal(None)
+  let model =
+    model
+    |> step(ui.ChannelsLoaded("s-1", [
+      channel_info("s-ch-1", Some("RelayBeta"), False, False),
+    ]))
+    |> step(ui.PaneToggled)
+    |> step(ui.SettingsToggled)
+  model.pane_open |> should.be_false
+}
+
+/// The composer hints say something true or nothing at all: the channel
+/// hint exactly while a channel is viewed, the pane hint while the
+/// selected thread actually has channels.
+pub fn composer_hints_follow_context_test() {
+  let plain =
+    new_model()
+    |> step(ui.ThreadsLoaded([summary("s-parent", False)]))
+    |> step(ui.Select("s-parent"))
+  view_string(plain) |> should_not_contain("hint-child")
+  view_string(plain) |> should_not_contain("hint-parent")
+  let with_rows =
+    plain
+    |> step(ui.ChannelsLoaded("s-parent", [
+      channel_info("s-ch-1", Some("RelayBeta"), False, False),
+    ]))
+  view_string(with_rows) |> should_contain("hint-parent")
+  view_string(with_rows) |> should_not_contain("hint-child")
+  let in_channel = with_rows |> with_ctx
+  let html = view_string(in_channel)
+  should_contain(html, "hint-child")
+  // Text nodes are HTML-escaped (the apostrophe rides as &#39;): the
+  // assert stops before the quoted title.
+  should_contain(html, "bot channel of")
+}
+
+/// The Details section renders the selected thread's metadata: an
+/// ordinary selection reads the summary (bot, provider·model, created
+/// age); a channel selection reads the context (bot, parent). Text
+/// nodes throughout.
+pub fn pane_details_render_from_summary_and_ctx_test() {
+  let model =
+    new_model()
+    |> step(ui.ThreadsLoaded([summary("s-parent", False)]))
+    |> step(ui.Select("s-parent"))
+    |> step(ui.PaneToggled)
+  let html = view_string(model)
+  should_contain(html, "Provider / model")
+  should_contain(html, "Created")
+  // created_at 0 renders as years-ago; the shape is what is pinned.
+  should_contain(html, "ago")
+  let in_channel = model |> with_ctx
+  let html = view_string(in_channel)
+  should_contain(html, ">Parent</span>")
+  // The parent's DISPLAY title (the untitled fallback), not the id.
+  should_contain(html, "Untitled thread")
+  should_not_contain(html, "Provider / model")
+}
+
+/// Toggling the pane open re-asks for fresh rows (the effect carries
+/// the ask; here we pin the update half: opening on a selection with
+/// rows keeps them, and the badge's aria state follows).
+pub fn pane_toggle_aria_tracks_open_state_test() {
+  let model =
+    new_model()
+    |> step(ui.ThreadsLoaded([summary("s-parent", False)]))
+    |> step(ui.Select("s-parent"))
+    |> step(ui.ChannelsLoaded("s-parent", [
+      channel_info("s-ch-1", Some("RelayBeta"), False, False),
+    ]))
+  let closed_html = view_string(model)
+  should_contain(closed_html, "aria-expanded=\"false\"")
+  should_not_contain(closed_html, ">Thread info<")
+  let open_html = model |> step(ui.PaneToggled) |> view_string
+  should_contain(open_html, "aria-expanded=\"true\"")
+  should_contain(open_html, "Thread info")
+}

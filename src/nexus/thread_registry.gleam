@@ -278,6 +278,25 @@ pub type Msg {
   /// new cross-registry edge, §8 holds). The store is never consulted at
   /// ask time: the boot load already has every summary.
   Channels(parent_id: String, reply: Subject(List(ChannelInfo)))
+  /// The pane's reverse lookup (bot-channels plan Phase 2): is `id` a
+  /// CHANNEL, and of which parent? `Ok` carries the context the UI needs
+  /// to render a selected channel — the parent id (breadcrumb + sidebar
+  /// highlight), the bot pointer, the frozen creation title, and the
+  /// archived flag (the header's archive chip). `Error(Nil)` when the id
+  /// is unknown or names an ordinary thread. Answered FROM STATE (§8):
+  /// live record metas + dormant summaries — the boot load already has
+  /// every row, so the store is never consulted at ask time.
+  ChannelOf(id: String, reply: Subject(Result(ChannelContext, Nil)))
+  /// The per-thread HTTP routes' resolution (bot-channels plan Phase 2
+  /// finding): the sidebar projection hides channels, so `List` cannot
+  /// address one — but the routes still must (Get/state/delete/send keep
+  /// answering for channels; the debug dump is never a UI data source).
+  /// `Error(Nil)` when the id is unknown. Answered FROM STATE (§8): a
+  /// live record summarises through its actor (the List arm's describe
+  /// discipline), a dormant summary reads its store snapshot; an actor
+  /// killed a moment ago answers from its meta rather than blocking.
+  /// No lazy start — `Get` owns that, and the routes ask it first.
+  SummaryOf(id: String, reply: Subject(Result(thread.ThreadSummary, Nil)))
   /// Selector plumbing for non-process monitors; always ignored.
   MonitorNoise
 }
@@ -285,16 +304,33 @@ pub type Msg {
 /// One channel row of the `Channels` ask (bot-channels plan, #123).
 /// Display-only — rides no transcript and no request. `bot_name` is the
 /// resolved display name (None = the bot was deleted since creation; the
-/// pane falls back to the id). `archived` drives the pane's dimmed
-/// rendering (archived channels stay navigable, never hidden).
+/// pane falls back to `title` — the target bot's name frozen at creation,
+/// which channels keep forever: the utility-title arm never runs on
+/// them). `archived` drives the pane's dimmed rendering (archived
+/// channels stay navigable, never hidden).
 pub type ChannelInfo {
   ChannelInfo(
     thread_id: String,
     bot_id: Option(String),
     bot_name: Option(String),
+    title: String,
     running: Bool,
     archived: Bool,
     last_active_s: Int,
+  )
+}
+
+/// The pane's reverse-lookup answer (bot-channels plan Phase 2): what
+/// the UI needs about the SELECTED thread when that thread is a channel.
+/// Display-only. `title` is the frozen creation title (the target bot's
+/// name at `create_dm` time) — the header's label fallback when the bot
+/// row is gone (`bot_id` is then None: rehydrate NULLs the pointer).
+pub type ChannelContext {
+  ChannelContext(
+    parent_id: String,
+    bot_id: Option(String),
+    title: String,
+    archived: Bool,
   )
 }
 
@@ -1892,6 +1928,7 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
             thread_id: record.id,
             bot_id: record.meta.bot_id,
             bot_name: None,
+            title: record.meta.title,
             running: running,
             archived: record.meta.archived,
             // Until the first commit, a channel's activity is its
@@ -1913,6 +1950,7 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
             thread_id: summary.id,
             bot_id: summary.meta.bot_id,
             bot_name: None,
+            title: summary.meta.title,
             running: False,
             archived: summary.meta.archived,
             last_active_s: summary.last_active_at,
@@ -1957,6 +1995,76 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
           }
         })
       process.send(reply, infos)
+      actor.continue(state)
+    }
+
+    ChannelOf(id, reply) -> {
+      // FROM STATE (§8): the boot load carries every thread — a live
+      // record's meta or a dormant summary's meta. A hit whose meta has
+      // NO parent is an ordinary thread (`Error(Nil)`); a miss is an
+      // unknown id (`Error(Nil)` too — the caller treats both as "not a
+      // channel"; a deleted channel's CASCADE parent is equally gone,
+      // so no stale context can survive a delete).
+      let live =
+        state.threads
+        |> dict.values()
+        |> list.find(fn(record) { record.id == id })
+      let dormant =
+        state.dormant
+        |> dict.values()
+        |> list.find(fn(summary) { summary.id == id })
+      let answer = case live, dormant {
+        Ok(record), _ ->
+          case record.meta.parent_thread_id {
+            Some(parent) ->
+              Ok(ChannelContext(
+                parent_id: parent,
+                bot_id: record.meta.bot_id,
+                title: record.meta.title,
+                archived: record.meta.archived,
+              ))
+            None -> Error(Nil)
+          }
+        Error(_), Ok(summary) ->
+          case summary.meta.parent_thread_id {
+            Some(parent) ->
+              Ok(ChannelContext(
+                parent_id: parent,
+                bot_id: summary.meta.bot_id,
+                title: summary.meta.title,
+                archived: summary.meta.archived,
+              ))
+            None -> Error(Nil)
+          }
+        Error(_), Error(_) -> Error(Nil)
+      }
+      process.send(reply, answer)
+      actor.continue(state)
+    }
+
+    SummaryOf(id, reply) -> {
+      // FROM STATE (§8) — the sibling of `ChannelOf` for the per-thread
+      // HTTP routes: the sidebar projection hides channels, so `List`
+      // cannot address one and `with_thread` must not lean on it. A live
+      // record summarises through its actor (the List arm's describe
+      // discipline: a thread killed a moment ago answers from its meta
+      // rather than blocking on a dead subject); a dormant summary reads
+      // its store snapshot. NO lazy start — `Get` owns that, and the
+      // routes ask it before this, so an unknown id never reaches here
+      // and a dormant one is already live.
+      let answer = case dict.get(state.threads, id) {
+        Ok(record) ->
+          case record.start_error, process.is_alive(record.pid) {
+            None, True -> Ok(summarise(record, thread.describe(record.subject)))
+            _, _ -> Ok(meta_summary(record))
+          }
+        Error(_) ->
+          case dict.get(state.dormant, id) {
+            Ok(summary) -> Ok(stored_summary_as(summary))
+            Error(_) -> Error(Nil)
+          }
+      }
+      process.send(reply, answer)
       actor.continue(state)
     }
 
@@ -2591,6 +2699,31 @@ fn summarise(
       committed -> committed
     },
     metrics: status.metrics,
+  )
+}
+
+/// A record's summary without its actor (the `SummaryOf` dead-actor
+/// branch): the hydrated transcript is the best in-memory count,
+/// streaming is False, metric history is in-memory only. Ordering falls
+/// back to creation — the actor is gone, so nothing newer is knowable
+/// here; the route asked `Get` first, which retried the restart.
+fn meta_summary(record: Record) -> thread.ThreadSummary {
+  thread.ThreadSummary(
+    id: record.id,
+    provider_id: record.provider_id,
+    model: record.model,
+    title: record.meta.title,
+    title_source: record.meta.title_source,
+    pinned: record.meta.pinned,
+    tags: record.meta.tags,
+    archived: record.meta.archived,
+    bot_id: record.meta.bot_id,
+    message_count:
+      transcript.messages(record.spec.transcript) |> list.length,
+    streaming: False,
+    created_at: record.meta.created_at,
+    last_active_at: record.meta.created_at,
+    metrics: [],
   )
 }
 
@@ -3493,6 +3626,28 @@ pub fn channels(
   parent_id: String,
 ) -> List(ChannelInfo) {
   actor.call(registry, 5000, fn(reply) { Channels(parent_id, reply) })
+}
+
+/// The pane's reverse lookup (bot-channels plan Phase 2): `Ok(context)`
+/// when `id` names a channel (parent + bot + frozen title + archived,
+/// from state), `Error(Nil)` when it is ordinary or unknown — see the
+/// `ChannelOf` message.
+pub fn channel_of(
+  registry: Subject(Msg),
+  id: String,
+) -> Result(ChannelContext, Nil) {
+  actor.call(registry, 5000, fn(reply) { ChannelOf(id, reply) })
+}
+
+/// The per-thread HTTP routes' resolution (bot-channels plan Phase 2):
+/// the full summary for ANY thread id — channels included, which the
+/// `List` projection deliberately hides. `Error(Nil)` when unknown. See
+/// the `SummaryOf` message.
+pub fn summary_of(
+  registry: Subject(Msg),
+  id: String,
+) -> Result(thread.ThreadSummary, Nil) {
+  actor.call(registry, 5000, fn(reply) { SummaryOf(id, reply) })
 }
 
 /// Manual rename — marks the title manual so auto-generation can never

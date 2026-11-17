@@ -358,6 +358,25 @@ pub type Model {
     /// direct parse on a miss (render is pure, so a stale hit is
     /// impossible — equal text means equal tree).
     md_cache: dict.Dict(String, List(Element(Msg))),
+    // ---- Thread info pane (bot-channels plan Phase 2, #123) ----
+    /// The SELECTED thread's channel rows — the pane's Channels section
+    /// and the header badge's count, refreshed by the same effect that
+    /// loads the thread list (event-driven re-asks, never a poll: a
+    /// channel finishing elsewhere lands on the next refresh, the same
+    /// staleness class the sidebar rows already accept). Empty for a
+    /// thread with no channels — the badge renders nothing then.
+    channels: List(thread_registry.ChannelInfo),
+    /// Set when the SELECTED thread is itself a CHANNEL (the pane's
+    /// reverse lookup): the parent id (breadcrumb + sidebar highlight),
+    /// the bot pointer (header label), the frozen creation title (the
+    /// deleted-bot fallback), and the archived flag (the header chip).
+    /// None on every ordinary selection — cleared by Select, deselect,
+    /// and the ended-selection sweep; a stale value can only ever name
+    /// the current selection's context.
+    channel_ctx: Option(thread_registry.ChannelContext),
+    /// The popover's visibility. Pure display state — like `pop`, closed
+    /// by any selection change and by entering Settings.
+    pane_open: Bool,
   )
 }
 
@@ -497,6 +516,32 @@ pub type Msg {
   /// A registry mutation failed (thread vanished mid-edit); surfaces a
   /// note in the log instead of failing silently.
   ThreadOpFailed(String)
+  // ---- Thread info pane (bot-channels plan Phase 2, #123) ----
+  /// The header's `info ▸ N` button toggled the popover.
+  PaneToggled
+  /// A channel row in the pane's Channels section was clicked: the
+  /// channel becomes the selection (selection-without-listing — the
+  /// sidebar stays human-shaped and the parent's row highlights). The
+  /// pane closes (the mock: navigating un-targets the popover), and the
+  /// clicked row's data seeds `channel_ctx` immediately — the ask that
+  /// would re-derive it rides the next list refresh.
+  ChannelRowSelected(thread_registry.ChannelInfo)
+  /// The selected thread's channel rows landed (the `Channels` ask in
+  /// `threads_effect`), stamped with the parent they were asked FOR: a
+  /// selection change between effect start and dispatch drops the stale
+  /// reply (the `ChannelResolved` rule).
+  ChannelsLoaded(parent_id: String, rows: List(thread_registry.ChannelInfo))
+  /// The selected thread's channel-context resolution landed (the
+  /// `ChannelOf` ask in `threads_effect`), stamped with the id it was
+  /// asked for — a selection change mid-effect must not apply another
+  /// thread's context. Dispatched BEFORE the list in the same effect
+  /// closure, so `after_threads` always sees it: a channel selection is
+  /// not in the (channel-free) list and would otherwise be dropped as
+  /// vanished on the very first refresh after a reload.
+  ChannelResolved(
+    asked_id: String,
+    ctx: Result(thread_registry.ChannelContext, Nil),
+  )
 }
 
 /// Translate a `thread.EventKind` into a typed component message.
@@ -583,6 +628,9 @@ pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
       confirm_delete: None,
       pop: None,
       md_cache: dict.new(),
+      channels: [],
+      channel_ctx: None,
+      pane_open: False,
     )
   #(model, events_effect())
 }
@@ -781,7 +829,9 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       // Manual toggle, both directions: it also latches `settings_manual`,
       // which stops the first-run auto-open rule from re-opening the
       // settings page on every empty-list refresh (mirroring the
-      // `create_auto` latch for the create panel).
+      // `create_auto` latch for the create panel). The info pane closes:
+      // it is chat-context display state (like `pop`), and re-opening is
+      // one click away on the way back.
       Model(
         ..model,
         view: case model.view {
@@ -789,6 +839,7 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           SettingsView -> ChatView
         },
         settings_manual: True,
+        pane_open: False,
       ),
       effect.none(),
     )
@@ -917,12 +968,26 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             effect.batch([
               leave_effect(next, prev),
               join_effect(next, id),
+              // The pane's asks captured the OLD selection (or none —
+              // the boot auto-selection): fetch the new one's rows and
+              // context here, or a thread with channels selected by the
+              // auto-selection never sees its badge until an unrelated
+              // refresh lands (the flaky-badge e2e finding).
+              channels_effect(next),
+              resolve_effect(next),
             ]),
           )
         }
         Some(id), None -> {
           let next = Model(..next, visit: next.visit + 1)
-          #(next, join_effect(next, id))
+          #(
+            next,
+            effect.batch([
+              join_effect(next, id),
+              channels_effect(next),
+              resolve_effect(next),
+            ]),
+          )
         }
         None, _ -> #(next, effect.none())
       }
@@ -966,14 +1031,33 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               // An explicit pick re-arms the refresh auto-selection
               // window (see `suppress_autoselect`).
               suppress_autoselect: False,
+              // Pane state is per-selection: the sidebar lists only
+              // ordinary threads, so a ROW click is never a channel —
+              // but the BREADCRUMB can be: hop chains make channels of
+              // channels, so a grandchild's crumb targets a channel.
+              // The context clears here and the re-resolution restores
+              // it (ChannelOf answers Error(Nil) for ordinary targets,
+              // so the ordinary path is untouched), and the fresh
+              // selection's own rows load below. The popover closes
+              // with the selection it was opened on (the `pop` rule).
+              channel_ctx: None,
+              channels: [],
+              pane_open: False,
             )
           let eff = case model.selected {
             Some(current) ->
               effect.batch([
                 leave_effect(model, current),
                 join_effect(next, id),
+                channels_effect(next),
+                resolve_effect(next),
               ])
-            None -> join_effect(next, id)
+            None ->
+              effect.batch([
+                join_effect(next, id),
+                channels_effect(next),
+                resolve_effect(next),
+              ])
           }
           #(next, eff)
         }
@@ -1479,6 +1563,105 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       ]),
       effect.none(),
     )
+
+    // ---- Thread info pane (bot-channels plan Phase 2, #123) ----
+    PaneToggled -> #(Model(..model, pane_open: !model.pane_open), {
+      // Opening re-asks: the badge refreshes on the usual events, but
+      // the moment the user opens the pane is when freshness matters —
+      // a channel that finished while the thread sat idle must not
+      // show a stale dot (the ask is state-only, so it is cheap).
+      let registry = model.registry
+      case model.pane_open, model.selected {
+        False, Some(id) ->
+          effect.from(fn(dispatch) {
+            dispatch(ChannelsLoaded(id, thread_registry.channels(registry, id)))
+          })
+        _, _ -> effect.none()
+      }
+    })
+
+    ChannelsLoaded(parent_id, rows) ->
+      case model.selected {
+        // The stamp rule (see the msg): rows asked for a thread that is
+        // no longer selected are dropped — a pane never renders another
+        // thread's channels.
+        Some(id) if id == parent_id -> #(
+          Model(..model, channels: rows),
+          effect.none(),
+        )
+        _ -> #(model, effect.none())
+      }
+
+    ChannelResolved(asked_id, ctx) ->
+      case model.selected {
+        Some(id) if id == asked_id -> #(
+          Model(..model, channel_ctx: option.from_result(ctx)),
+          effect.none(),
+        )
+        _ -> #(model, effect.none())
+      }
+
+    ChannelRowSelected(info) ->
+      case model.selected {
+        // The pane belongs to a selection; without one there are no rows
+        // to click. Picking the viewed channel's OWN row cannot happen
+        // (the pane lists the selection's children, never itself).
+        Some(parent) if parent != info.thread_id -> {
+          // Selection-without-listing (the plan): the channel takes the
+          // main chat area via the ordinary Join/replay machinery — it
+          // is a full thread actor, nothing new in the event path. The
+          // sidebar highlights the PARENT's row instead (see
+          // `thread_row`), the header swaps to the breadcrumb, and the
+          // clicked row seeds the context immediately — the re-deriving
+          // ask rides the next refresh and must land on the same truth.
+          let next =
+            Model(
+              ..model,
+              selected: Some(info.thread_id),
+              visit: model.visit + 1,
+              log: [],
+              flushed: [],
+              bubble: None,
+              bubble_hidden: True,
+              thinking: None,
+              streaming: False,
+              pending: [],
+              loop: None,
+              guard: False,
+              turn_base: 0,
+              model_label: "connecting…",
+              pop: None,
+              suppress_autoselect: False,
+              channel_ctx: Some(thread_registry.ChannelContext(
+                parent_id: parent,
+                bot_id: info.bot_id,
+                title: info.title,
+                archived: info.archived,
+              )),
+              // The new selection's OWN children (hop chains make
+              // channels of channels — its pane lists grandchildren).
+              channels: [],
+              // Navigating un-targets the popover (the mock: the pane
+              // shows for one thread at a time).
+              pane_open: False,
+            )
+          let eff = case model.selected {
+            Some(current) ->
+              effect.batch([
+                leave_effect(model, current),
+                join_effect(next, info.thread_id),
+                channels_effect(next),
+              ])
+            None ->
+              effect.batch([
+                join_effect(next, info.thread_id),
+                channels_effect(next),
+              ])
+          }
+          #(next, eff)
+        }
+        _ -> #(model, effect.none())
+      }
   }
 }
 
@@ -1763,6 +1946,10 @@ fn deselect(model: Model, label: String) -> Model {
     model_label: label,
     pop: None,
     suppress_autoselect: True,
+    // Pane state is per-selection (the Select rule).
+    channels: [],
+    channel_ctx: None,
+    pane_open: False,
   )
 }
 
@@ -1777,7 +1964,16 @@ fn after_threads(model: Model, summaries: List(thread.ThreadSummary)) -> Model {
   let active = list.filter(summaries, fn(summary) { !summary.archived })
   let selected = case model.selected {
     Some(id) ->
-      case list.any(summaries, fn(s) { s.id == id }) {
+      case
+        // A channel selection never appears in the list (the registry
+        // projection hides channels from the sidebar) — it stays valid
+        // on the context's word (`channel_ctx` is only ever Some for
+        // the current selection: every setter/clearer is keyed to it).
+        // The ask that resolves it rides the SAME effect as this list
+        // and dispatches first, so the context is always in hand here.
+        list.any(summaries, fn(s) { s.id == id })
+        || option.is_some(model.channel_ctx)
+      {
         True -> Some(id)
         False -> None
       }
@@ -1789,6 +1985,11 @@ fn after_threads(model: Model, summaries: List(thread.ThreadSummary)) -> Model {
     None, _, _ -> None
   }
   let ended = option.is_some(model.selected) && option.is_none(selected)
+  // Pane state is per-selection: when the refresh swaps the selection
+  // (a dropped thread replaced by the auto-select, or any other identity
+  // change), the old thread's rows and context must not dress the new
+  // one — the same rule as `pop` below.
+  let switched = model.selected != selected
   Model(
     ..model,
     threads: summaries,
@@ -1877,6 +2078,18 @@ fn after_threads(model: Model, summaries: List(thread.ThreadSummary)) -> Model {
       True -> None
       False -> model.pop
     },
+    // Pane state is per-selection (the Select rule): a vanished channel
+    // takes its context and rows with it — either ended outright or
+    // swapped for an auto-selected replacement — so no stale badge or
+    // breadcrumb survives the refresh.
+    channels: case ended || switched {
+      True -> []
+      False -> model.channels
+    },
+    channel_ctx: case ended || switched {
+      True -> None
+      False -> model.channel_ctx
+    },
   )
 }
 
@@ -1957,9 +2170,62 @@ pub fn pick_provider(
 
 fn threads_effect(model: Model) -> Effect(Msg) {
   let registry = model.registry
+  let selected = model.selected
   effect.from(fn(dispatch) {
+    // The pane's two asks ride EVERY list refresh (the plan's rule: the
+    // pane re-asks on the same messages the sidebar already updates —
+    // turn terminals, meta updates, sends, the connect cascade), so the
+    // badge and rows are as fresh as the list itself. Dispatch order
+    // matters for the first: the resolution must be IN the model before
+    // the summaries land, because `after_threads` keeps a channel
+    // selection on the context's word — a channel never appears in the
+    // (channel-free) list, and without the resolved context its own
+    // first refresh would drop it as vanished. The stamped ids drop
+    // replies for a selection that changed while the asks ran.
+    case selected {
+      Some(id) ->
+        dispatch(ChannelResolved(id, thread_registry.channel_of(registry, id)))
+      None -> Nil
+    }
     dispatch(ThreadsLoaded(thread_registry.list_threads(registry)))
+    case selected {
+      Some(id) ->
+        dispatch(ChannelsLoaded(id, thread_registry.channels(registry, id)))
+      None -> Nil
+    }
   })
+}
+
+/// The pane's context-resolution ask, dispatched on its own (the
+/// `ChannelOf` half of `threads_effect`): reused when the selection
+/// changes under a refresh — the boot auto-selection — since that
+/// effect's closure captured the old selection. Stamped, so a reply
+/// for a superseded selection is dropped.
+fn resolve_effect(model: Model) -> Effect(Msg) {
+  let registry = model.registry
+  case model.selected {
+    Some(id) ->
+      effect.from(fn(dispatch) {
+        dispatch(ChannelResolved(id, thread_registry.channel_of(registry, id)))
+      })
+    None -> effect.none()
+  }
+}
+
+/// The selected thread's channel rows (the pane + the header badge).
+/// A dedicated effect for selection changes and pane opens; the every-
+/// refresh case rides `threads_effect` (the plan's re-ask rule). The
+/// reply is stamped by the ask itself (`ChannelsLoaded`) and dropped if
+/// the selection moved meanwhile.
+fn channels_effect(model: Model) -> Effect(Msg) {
+  let registry = model.registry
+  case model.selected {
+    Some(id) ->
+      effect.from(fn(dispatch) {
+        dispatch(ChannelsLoaded(id, thread_registry.channels(registry, id)))
+      })
+    None -> effect.none()
+  }
 }
 
 fn join_effect(model: Model, id: String) -> Effect(Msg) {
@@ -2207,9 +2473,43 @@ pub fn view(model: Model) -> Element(Msg) {
   html.div([attr.id("app")], [
     html.header([], [
       html.h1([], [html.text("nexus")]),
+      // Viewing a channel: the breadcrumb back to the parent (the mock's
+      // `‹ <parent title>`). A plain Select — the parent is an ordinary
+      // thread in the list — nothing new in the event path. Renders as a
+      // text node; hostile titles stay inert.
+      case model.channel_ctx, model.view {
+        Some(ctx), ChatView ->
+          html.button(
+            [
+              attr.id("crumb"),
+              attr.class("crumb"),
+              attr.type_("button"),
+              attr.title("Back to the parent thread"),
+              attr.aria("label", "Back to " <> parent_title(model)),
+              event.on_click(Select(ctx.parent_id)),
+            ],
+            [html.text("‹ " <> parent_title(model))],
+          )
+        _, _ -> element.none()
+      },
       html.span([attr.id("model"), attr.class("muted")], [
         html.text(header_title(model)),
       ]),
+      // The archived chip rides the header while an archived channel is
+      // viewed (the mock): the actor refuses Sends, so the state must be
+      // legible before the composer says so.
+      case model.channel_ctx, model.view {
+        Some(ctx), ChatView ->
+          case ctx.archived {
+            True ->
+              html.span([attr.class("ch-archived-chip")], [
+                html.text("archived"),
+              ])
+            False -> element.none()
+          }
+        _, _ -> element.none()
+      },
+      info_button(model),
       // The connection state is a labelled group, not a bare dot
       // (ui-polish F8): the dot plus a text twin, so the state stays
       // legible without color. The label flips with the dot via the
@@ -2287,7 +2587,203 @@ pub fn view(model: Model) -> Element(Msg) {
     // not inside the chat pane: it overlays whatever view is up, and its
     // `<dialog>` is position-fixed anyway. Renders nothing when closed.
     tool_pop(model),
+    // The thread info pane (bot-channels Phase 2): the same top-level
+    // `<dialog>` overlay pattern, opened by the header badge. Renders
+    // nothing when closed.
+    info_pane(model),
   ])
+}
+
+/// The header's `info ▸ N` badge (the mock): a dot + the word + the
+/// count of RUNNING channels. Renders NOTHING while the selected thread
+/// has no channels — the ambient signal exists only where channels
+/// exist, and the sidebar stays human-shaped. The dot pulses only while
+/// something is actually running (a pulse with nothing behind it would
+/// lie), and the count chip hides at zero; the button still opens the
+/// pane for the idle rows.
+fn info_button(model: Model) -> Element(Msg) {
+  let running =
+    model.channels |> list.filter(fn(info) { info.running }) |> list.length
+  case model.view, model.channels {
+    ChatView, [_first, ..] ->
+      html.button(
+        [
+          attr.id("info-btn"),
+          attr.class("infobtn"),
+          attr.type_("button"),
+          attr.aria("expanded", bool_aria(model.pane_open)),
+          attr.aria("label", "Thread info — "
+            <> int.to_string(running)
+            <> " running"),
+          event.on_click(PaneToggled),
+        ],
+        [
+          html.span([attr.class(case running > 0 {
+            True -> "info-dot live"
+            False -> "info-dot"
+          })], [html.text("●")]),
+          html.span([], [html.text("info")]),
+          case running > 0 {
+            True ->
+              html.span([attr.class("n")], [html.text(int.to_string(running))])
+            False -> element.none()
+          },
+        ],
+      )
+    _, _ -> element.none()
+  }
+}
+
+/// The thread info pane (the mock, the `tool_pop` overlay precedent):
+/// Channels — the selected thread's DM channels, one row each; Details —
+/// the selected thread's metadata; Environments — the placeholder the
+/// environments plan's roster will fill. Click-outside dismissal rides
+/// the same invisible hit layer `tool_pop` uses (a server component
+/// cannot stop an event's bubble).
+fn info_pane(model: Model) -> Element(Msg) {
+  case model.pane_open {
+    False -> element.none()
+    True ->
+      html.dialog([attr.open(True)], [
+        html.div([attr.class("info-pop-hit"), event.on_click(PaneToggled)], []),
+        html.article([attr.class("info-pop")], [
+          html.header([], [
+            html.h2([], [html.text("Thread info")]),
+            html.button(
+              [
+                attr.type_("button"),
+                attr.class("close"),
+                attr.aria("label", "Close"),
+                attr.title("Close"),
+                event.on_click(PaneToggled),
+              ],
+              [html.text("×")],
+            ),
+          ]),
+          html.section([attr.class("sec")], [
+            html.h3([], [html.text("Channels")]),
+            case model.channels {
+              [] ->
+                html.p([attr.class("sec-none")], [
+                  html.text("no channels"),
+                ])
+              rows ->
+                html.div([attr.class("ch-list")], list.map(rows, channel_row))
+            },
+          ]),
+          details_section(model),
+          html.section([attr.class("sec")], [
+            html.h3([], [html.text("Environments")]),
+            html.p([attr.class("sec-none")], [html.text("none attached")]),
+          ]),
+        ]),
+      ])
+  }
+}
+
+/// One Channels row (the mock): running dot, `↳ <bot name>` label,
+/// archive badge when archived, `rel_time` age, chevron. Hostile text
+/// rule: names, titles and ages are text nodes — a bot name (or a
+/// deleted bot's frozen title) carrying markup renders inert. Archived
+/// rows keep their chevron: reading is allowed, the row navigates like
+/// any other.
+fn channel_row(info: thread_registry.ChannelInfo) -> Element(Msg) {
+  let label = case info.bot_name {
+    Some(name) -> name
+    None ->
+      case info.title {
+        "" -> info.thread_id
+        titled -> titled
+      }
+  }
+  html.button(
+    [
+      attr.class(case info.archived {
+        True -> "ch archived"
+        False -> "ch"
+      }),
+      attr.type_("button"),
+      attr.data("thread-id", info.thread_id),
+      attr.aria("label", "Open channel " <> label),
+      event.on_click(ChannelRowSelected(info)),
+    ],
+    [
+      html.span([attr.class(case info.running {
+        True -> "ch-dot run"
+        False -> "ch-dot idle"
+      })], [html.text("●")]),
+      html.span([attr.class("nm")], [html.text("↳ " <> label)]),
+      case info.archived {
+        True ->
+          html.span([attr.class("badge")], [html.text("archived")])
+        False -> element.none()
+      },
+      html.span([attr.class("age")], [
+        html.text(rel_time(timing.wall_now_s(), info.last_active_s)),
+      ]),
+      html.span([attr.class("chev")], [html.text("›")]),
+    ],
+  )
+}
+
+/// The Details section: the SELECTED thread's metadata, from the summary
+/// the header already renders from when it is in the list (every
+/// ordinary thread), from the channel context otherwise (a selected
+/// channel is not listed — the frozen creation title and bot pointer
+/// stand in; provider/model live on the channel's frozen config, which
+/// the pane does not reach for a channel). The toolset chips the mock
+/// shows are deferred: summaries carry no toolset, and plumbing
+/// `thread_toolset` through the store's summary query is its own
+/// change. All values render as text nodes.
+fn details_section(model: Model) -> Element(Msg) {
+  let rows = case model.selected, model.channel_ctx {
+    None, _ -> []
+    Some(_), Some(ctx) ->
+      [
+        #("Bot", bot_display(model, ctx.bot_id) |> option.unwrap("—")),
+        #("Parent", parent_title(model)),
+      ]
+    Some(id), None ->
+      case summary_by_id(model, id) {
+        Ok(summary) ->
+          [
+            #(
+              "Bot",
+              bot_display(model, summary.bot_id) |> option.unwrap("—"),
+            ),
+            #(
+              "Provider / model",
+              provider_name(model, summary.provider_id) <> " · "
+              <> summary.model,
+            ),
+            #(
+              "Created",
+              rel_time(timing.wall_now_s(), summary.created_at) <> " ago",
+            ),
+          ]
+        Error(_) -> []
+      }
+  }
+  html.section([attr.class("sec")], [
+    html.h3([], [html.text("Details")]),
+    html.div(
+      [attr.class("kv-list")],
+      list.map(rows, fn(row) {
+        let #(k, v) = row
+        html.div([attr.class("kv")], [
+          html.span([attr.class("k")], [html.text(k)]),
+          html.span([], [html.text(v)]),
+        ])
+      }),
+    ),
+  ])
+}
+
+fn provider_name(model: Model, provider_id: String) -> String {
+  case list.find(model.provider_list, fn(p) { p.id == provider_id }) {
+    Ok(p) -> p.name
+    Error(_) -> provider_id
+  }
 }
 
 fn sidebar(model: Model) -> Element(Msg) {
@@ -2467,6 +2963,13 @@ fn provider_options(model: Model) -> List(Element(Msg)) {
   }
 }
 
+/// The selected thread's parent id when it is a channel (the pane's
+/// selection-without-listing mapping): `Some(parent)` while a channel is
+/// viewed, None otherwise.
+fn channel_ctx_of(model: Model) -> Option(String) {
+  model.channel_ctx |> option.map(fn(ctx) { ctx.parent_id })
+}
+
 /// The tag-filter input. Uncontrolled like the composer: its text rides the
 /// `input` event, and programmatic changes (chip click, clear) rotate the
 /// key so the client replaces the element with the new value baked in —
@@ -2617,15 +3120,48 @@ fn bucket_groups(
 /// The header's thread context (ui-polish F8): the selected thread's
 /// title. An untitled thread falls back to "Untitled thread" (the
 /// row-title rule); with nothing selected the `model_label` fallbacks
-/// ("connecting…", "thread ended") keep their feedback role.
+/// ("connecting…", "thread ended") keep their feedback role. A selected
+/// CHANNEL is not in the list (the sidebar projection hides channels) —
+/// its label is the target bot's name, falling back to the frozen
+/// creation title when the bot row is gone (rehydrate NULLs the
+/// pointer; `create_dm` titled the channel with the name, so the
+/// fallback still reads as a name).
 fn header_title(model: Model) -> String {
-  case model.selected {
-    Some(id) ->
-      case list.find(model.threads, fn(s) { s.id == id }) {
-        Ok(summary) -> display_title(summary)
-        Error(_) -> model.model_label
+  case model.channel_ctx {
+    Some(ctx) ->
+      case bot_display(model, ctx.bot_id) {
+        Some(bot_name) -> bot_name
+        None ->
+          case ctx.title {
+            "" -> "channel"
+            titled -> titled
+          }
       }
-    None -> model.model_label
+    None ->
+      case model.selected {
+        Some(id) ->
+          case list.find(model.threads, fn(s) { s.id == id }) {
+            Ok(summary) -> display_title(summary)
+            Error(_) -> model.model_label
+          }
+        None -> model.model_label
+      }
+  }
+}
+
+/// The selected channel's parent's display title (the breadcrumb's
+/// label). The parent is an ordinary thread and the FK CASCADE means it
+/// outlives the channel, so the list lookup always resolves — the id
+/// fallback covers only the transient window before the first list
+/// lands.
+fn parent_title(model: Model) -> String {
+  case model.channel_ctx {
+    None -> ""
+    Some(ctx) ->
+      case list.find(model.threads, fn(s) { s.id == ctx.parent_id }) {
+        Ok(summary) -> display_title(summary)
+        Error(_) -> ctx.parent_id
+      }
   }
 }
 
@@ -2646,7 +3182,11 @@ fn display_title(summary: thread.ThreadSummary) -> String {
 /// Everything is escaped text nodes — no innerHTML anywhere.
 fn thread_row(model: Model, summary: thread.ThreadSummary) -> Element(Msg) {
   let id = summary.id
-  let selected = model.selected == Some(id)
+  // Selection-without-listing (bot-channels plan, #123): while a CHANNEL
+  // is viewed, the sidebar highlights the PARENT's row — the channel
+  // itself is never listed (`channel_ctx` is Some only for the current
+  // selection, so exactly one row carries the highlight either way).
+  let selected = model.selected == Some(id) || channel_ctx_of(model) == Some(id)
   let title = display_title(summary)
   // The subtitle is provenance + age (#107): a bot-sourced thread leads
   // with the bot's name (provenance — bots plan P1); a deleted bot shows
@@ -2841,7 +3381,38 @@ fn chat(model: Model) -> Element(Msg) {
     ]),
     loop_chip(model),
     composer(model, has_thread),
+    // The composer hints (the mock): the channel view names the parent
+    // it hangs off; a thread WITH channels points at the pane, so the
+    // hidden rows are discoverable. Both are plain text nodes.
+    composer_hints(model),
   ])
+}
+
+/// The muted lines under the composer (the mock's `.hint`s). Rendered
+/// only when they say something true: the channel hint exactly while a
+/// channel is viewed, the pane hint while the selected thread actually
+/// has channels.
+fn composer_hints(model: Model) -> Element(Msg) {
+  let child = case model.channel_ctx, model.view {
+    Some(_), ChatView ->
+      [html.div([attr.id("hint-child"), attr.class("hint")], [
+        html.text("You're viewing a bot channel of \""
+          <> parent_title(model)
+          <> "\""),
+      ])]
+    _, _ -> []
+  }
+  let parent = case model.channels, model.view {
+    [_, ..], ChatView ->
+      [html.div([attr.id("hint-parent"), attr.class("hint")], [
+        html.text("Channels are hidden from the sidebar — they live under info"),
+      ])]
+    _, _ -> []
+  }
+  case list.append(child, parent) {
+    [] -> element.none()
+    hints -> html.div([attr.id("composer-hints")], hints)
+  }
 }
 
 /// Server-rendered "jump to latest" control, hidden until the page

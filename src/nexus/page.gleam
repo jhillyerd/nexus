@@ -1271,6 +1271,80 @@ details.turn.reasoning.live > summary { color: color-mix(in srgb, currentColor 8
 #app .tool-pop.done .tool-status { color: #2e9e5b; }
 #app .tool-pop.failed { border-color: color-mix(in srgb, #c0392b 55%, transparent); }
 #app .tool-pop.failed .tool-status { color: #c0392b; }
+
+/* Thread info pane (bot-channels Phase 2, nexus/ui info_pane): the
+   tool_pop overlay pattern again — Pico styles <dialog open> as the
+   centered overlay, the article is the card, .info-pop-hit is the
+   invisible click-outside catcher. The card is narrower than the tool
+   popup's (it is a summary, not a transcript) and keeps the proportional
+   (non-mono) face: labels and ages, not code. #app-prefix per the
+   cascade traps. */
+#app .info-pop { position: relative; width: min(30rem, 92vw);
+  border: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
+#app .info-pop > header { display: flex; align-items: baseline; gap: .6rem;
+  position: sticky; top: 0; padding-right: 2.4rem; margin: 0;
+  background: var(--pico-card-background-color); }
+#app .info-pop > header h2 { font-size: .85rem; margin: 0; }
+#app .info-pop .close { position: absolute; top: .35rem; right: .55rem; background-image: none;
+  width: auto; height: auto; padding: 0 .3rem; margin: 0; border: none; font-size: 1.4rem;
+  line-height: 1.3; opacity: .55; }
+#app .info-pop .close:hover, #app .info-pop .close:focus { opacity: 1; }
+#app .info-pop-hit { position: absolute; inset: 0; }
+#app .info-pop .sec { margin: 0; padding: .55rem 1rem .6rem; border-top: 1px solid
+  color-mix(in srgb, currentColor 12%, transparent); }
+#app .info-pop h3 { margin: 0 0 .4rem; font-size: .7rem; font-weight: 600; text-transform: uppercase;
+  letter-spacing: .07em; opacity: .55; }
+#app .info-pop .sec-none { margin: 0; font-size: .8rem; opacity: .6; }
+/* Channels rows: full-width buttons reading as one list (the mock's
+   `.ch`): dot, `↳ name`, archive badge, age, chevron. */
+#app .ch-list { display: flex; flex-direction: column; gap: .15rem; }
+#app .ch { display: flex; align-items: baseline; gap: .5rem; width: 100%;
+  padding: .3rem .45rem; border: none; border-radius: 7px; background: none;
+  color: inherit; font-size: .84rem; text-align: left; cursor: pointer; }
+#app .ch:hover { background: color-mix(in srgb, currentColor 10%, transparent); }
+#app .ch .nm { flex: 1; overflow-wrap: anywhere; text-align: left; }
+#app .ch .age { font-size: .74rem; opacity: .6; }
+#app .ch .chev { opacity: .5; }
+#app .ch .badge { font-size: .66rem; border: 1px solid
+  color-mix(in srgb, currentColor 25%, transparent); border-radius: 999px;
+  padding: .05rem .45rem; opacity: .75; }
+/* Archived rows dim but keep their chevron: still navigable (reading is
+   allowed), never hidden (the plan). */
+#app .ch.archived .nm, #app .ch.archived .age { opacity: .55; }
+#app .ch-dot { font-size: .7rem; }
+#app .ch-dot.idle { opacity: .35; }
+#app .ch-dot.run { color: #3b82f6; }
+/* The header badge (the mock's .infobtn): dot + word + running count.
+   The dot pulses only while a channel is actually running. */
+#app .infobtn { display: inline-flex; align-items: baseline; gap: .45rem;
+  font-size: .8rem; padding: .28rem .7rem; }
+#app .infobtn .info-dot { font-size: .8rem; opacity: .45; }
+#app .infobtn .info-dot.live { color: #3b82f6; opacity: 1;
+  animation: info-pulse 1.6s ease-in-out infinite; }
+@keyframes info-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
+#app .infobtn .n { font-size: .7rem; background: #3b82f6; color: #fff;
+  border-radius: 999px; padding: .05rem .45rem; line-height: 1.4; }
+/* The breadcrumb back to the parent (viewing a channel): reads as a
+   link, not a CTA. */
+#app .crumb { border: none; background: none; color: #3b82f6; padding: .28rem 0;
+  font-size: .8rem; cursor: pointer; overflow-wrap: anywhere; text-align: left; }
+#app .crumb:hover { text-decoration: underline; }
+/* The archived chip beside the header title while an archived channel
+   is viewed — the same chip language as the pane's badge. */
+#app .ch-archived-chip { font-size: .66rem; border: 1px solid
+  color-mix(in srgb, currentColor 25%, transparent); border-radius: 999px;
+  padding: .1rem .5rem; opacity: .75; }
+/* Details key-value rows (the mock's .kv): tiny-caps label, value text. */
+#app .kv-list { display: flex; flex-direction: column; gap: .2rem; }
+#app .info-pop .kv { display: flex; gap: .6rem; font-size: .82rem; }
+#app .info-pop .kv .k { min-width: 8.5rem; opacity: .55;
+  text-transform: uppercase; font-size: .66rem; letter-spacing: .05em;
+  padding-top: .15rem; }
+#app .info-pop .kv span:last-child { overflow-wrap: anywhere; }
+/* Composer hints (the mock's .hint lines): muted, under the composer. */
+#composer-hints { display: flex; flex-direction: column; gap: .15rem;
+  padding: .2rem 1rem .5rem; }
+#app .hint { font-size: .74rem; opacity: .55; }
 /* Collapsed chips flow like spans, not blocks: consecutive collapsible
    lines (committed reasoning + tool chips) render inside one .chip-row —
    a wrapping flex line, so each chip sizes to its label on a shared row

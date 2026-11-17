@@ -201,13 +201,19 @@ fn with_thread(
   then: fn(thread.ThreadSummary, process.Subject(thread.Msg)) ->
     Response(mist.ResponseData),
 ) -> Response(mist.ResponseData) {
-  let summaries = thread_registry.list_threads(registry)
-  case list.find(summaries, fn(summary) { summary.id == id }) {
+  // Get FIRST (it owns the lazy-start/retry discipline — a dormant
+  // channel hydrates here, exactly as before), then the summary from
+  // `summary_of`: the sidebar projection hides channels, so `List`
+  // cannot address one and every per-thread route must (bot-channels
+  // Phase 2 — the state dump is the scripting/e2e API, and the delete
+  // cascade's cleanup path is how scripts retire a channel). The summary
+  // ask runs after the actor is live, so its describe is accurate.
+  case thread_registry.get(registry, id) {
     Error(_) -> json_response(404, err_json("thread not found"))
-    Ok(summary) ->
-      case thread_registry.get(registry, id) {
-        Ok(subject) -> then(summary, subject)
+    Ok(subject) ->
+      case thread_registry.summary_of(registry, id) {
         Error(_) -> json_response(503, err_json("thread unavailable"))
+        Ok(summary) -> then(summary, subject)
       }
   }
 }

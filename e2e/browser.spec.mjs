@@ -2036,7 +2036,12 @@ async function main() {
       // into the shared world (cubic PR review).
       const made = { bots: [], threads: [] };
       const cleanup = async () => {
-        for (const id of made.threads) {
+        // CHILDREN FIRST: deleting a parent cascades its channel subtree
+        // (the bot-channels Phase 1 FK + the transitive registry cleanup
+        // — by design), so a channel deleted after its parent 404s. The
+        // made.threads array is parent-then-channel; reversed, each
+        // delete finds its row still there.
+        for (const id of [...made.threads].reverse()) {
           eq(
             (await page.request.delete(`${base}/threads/${id}`, { headers })).status(),
             204,
@@ -2091,26 +2096,46 @@ async function main() {
         });
         eq(sent.status(), 202, "send accepted");
 
-        // Beta's DM thread appears (registry find-or-create from Beta),
-        // carries Beta's provenance, and completes a turn over the
-        // authored line — the fake gateway's marker-less default answers
-        // plain text, so the turn commits (message_count 3: system +
-        // authored line + assistant answer).
+        // Beta's DM thread is a CHANNEL since the bot-channels plan
+        // (Phase 1): hidden from `/threads` (the registry-side projection
+        // keeps the sidebar human-shaped), discovered instead through
+        // Alpha's committed receipt — the debug side channel's exact
+        // audience (scripting/e2e). The receipt names the DM thread; the
+        // channel's own state dump reports its turn settling (message
+        // count 3: system + authored line + assistant answer).
         const betaThread = await poll(
           async () => {
-            const { threads } = await (
-              await page.request.get(`${base}/threads`, { headers })
+            const state = await (
+              await page.request.get(`${base}/threads/${alphaThread}/state`, { headers })
             ).json();
-            const found = threads.find(
-              (s) => s.bot_id === betaId && s.id !== alphaThread,
+            const receipt = (state.messages ?? []).find(
+              (m) =>
+                m.role === "tool" &&
+                String(m.content).includes("delivered to RelayBeta in thread"),
             );
-            return found && !found.streaming && found.message_count >= 3
-              ? found
+            const id = /thread (s\d+)/.exec(receipt?.content ?? "")?.[1];
+            return id ?? null;
+          },
+          { timeout: 30_000, interval: 500, message: "delivery receipt lands" },
+        );
+        const settled = await poll(
+          async () => {
+            const state = await (
+              await page.request.get(`${base}/threads/${betaThread}/state`, { headers })
+            ).json();
+            return state.status?.streaming === false &&
+              (state.status?.message_count ?? 0) >= 3
+              ? state
               : null;
           },
           { timeout: 30_000, interval: 500, message: "Beta DM turn completes" },
         );
-        made.threads.push(betaThread.id);
+        eq(
+          settled.summary?.bot_id ?? null,
+          betaId,
+          "the channel hangs off Beta's provenance",
+        );
+        made.threads.push(betaThread);
 
         // Model-visible bytes: the gateway records raw request strings, so
         // parse them. Beta's recorded request carries the authored user
@@ -2169,22 +2194,31 @@ async function main() {
           );
         assert(receipt, "receipt landed as Alpha's tool result");
         const receiptThread = /thread (s\d+)/.exec(receipt.content)?.[1];
-        eq(receiptThread, betaThread.id, "receipt names the DM thread");
+        eq(receiptThread, betaThread, "receipt names the DM thread");
 
         // Display proof (issue #122): in the UI the authored line folds up
         // as a bot chip instead of reading as the user's own bubble. The
-        // browser joins Beta's DM thread after the turn settled, so this
-        // exercises the replay path — the live path renders the same
-        // UserEcho shape (nexus/ui bot_turn, pinned offline in ui_test).
-        // Collapsed by default, the summary names the sender, the body
-        // carries the note, and no plain user bubble renders for it.
+        // channel is never a sidebar row (second-class), so the browser
+        // reaches it through the parent's thread info pane — the pane
+        // row navigates the main chat area to the channel, exercising
+        // the replay path. The live path renders the same UserEcho shape
+        // (nexus/ui bot_turn, pinned offline in ui_test). Collapsed by
+        // default, the summary names the sender, the body carries the
+        // note, and no plain user bubble renders for it.
         await page.goto(`${base}/?token=${TOKEN}`);
         await connected(page);
         await page
           .locator(
-            `#thread-list .thread-row[data-thread-id="${betaThread.id}"] .thread-main`,
+            `#thread-list .thread-row[data-thread-id="${alphaThread}"] .thread-main`,
           )
           .click();
+        await page.locator("#info-btn").waitFor({ timeout: 15_000 });
+        await page.locator("#info-btn").click();
+        const paneRow = page.locator(
+          `.info-pop .ch[data-thread-id="${betaThread}"]`,
+        );
+        await paneRow.waitFor({ timeout: 15_000 });
+        await paneRow.click();
         const botChip = page.locator("details.turn.bot");
         await botChip.waitFor({ timeout: 15_000 });
         const chip = await botChip.evaluate((el) => ({
@@ -2210,6 +2244,210 @@ async function main() {
           await page.locator(".turn.user").count(),
           0,
           "the authored line is not a plain user bubble",
+        );
+      } finally {
+        await cleanup();
+      }
+    });
+
+    // -- 17d. bot channels Phase 2: the thread info pane drives channel
+    // navigation ----------------------------------------------
+    // Same relay rig, pane-shaped UI proof (bot-channels plan Phase 2):
+    // the parent thread's header badge appears once the Channels ask
+    // lands, the pane lists Beta's channel with its ↳ label, clicking
+    // the row navigates the main chat area to the channel transcript
+    // (selection-without-listing — the sidebar highlights the PARENT and
+    // never lists the channel), the breadcrumb + composer hint mark the
+    // channel view, and the crumb returns to the parent. The offline
+    // ui_test pins the render shapes; this pins the live loop: the ask
+    // riding the connect cascade, the replay through the ordinary Join
+    // machinery, and the CSS being actually loaded.
+    await test("bots: the thread info pane navigates per-parent channels", async () => {
+      const headers = {
+        authorization: `Bearer ${TOKEN}`,
+        "content-type": "application/json",
+      };
+      const made = { bots: [], threads: [] };
+      const cleanup = async () => {
+        // CHILDREN FIRST: deleting a parent cascades its channel subtree
+        // (the bot-channels Phase 1 FK + the transitive registry cleanup
+        // — by design), so a channel deleted after its parent 404s. The
+        // made.threads array is parent-then-channel; reversed, each
+        // delete finds its row still there.
+        for (const id of [...made.threads].reverse()) {
+          eq(
+            (await page.request.delete(`${base}/threads/${id}`, { headers })).status(),
+            204,
+            `thread ${id} deleted`,
+          );
+        }
+        for (const id of made.bots) {
+          eq(
+            (await page.request.delete(`${base}/bots/${id}`, { headers })).status(),
+            204,
+            `bot ${id} deleted`,
+          );
+        }
+      };
+      try {
+        const mkBot = async (name) => {
+          const res = await page.request.post(`${base}/bots`, {
+            data: {
+              name,
+              provider: "fake",
+              model: "smart",
+              description: `${name} pane smoke`,
+            },
+            headers,
+          });
+          eq(res.status(), 201, `bot ${name} created`);
+          const id = (await res.json()).id;
+          made.bots.push(id);
+          return id;
+        };
+        const alphaId = await mkBot("PaneAlpha");
+        const betaId = await mkBot("PaneBeta");
+
+        const created = await page.request.post(`${base}/threads`, {
+          data: { bot: alphaId },
+          headers,
+        });
+        eq(created.status(), 201, "parent thread created");
+        const alphaThread = (await created.json()).id;
+        made.threads.push(alphaThread);
+
+        // Deliver: the channel opens as a side effect of the turn. The
+        // channel is hidden from `/threads` (the second-class
+        // projection), so discovery rides Alpha's committed receipt in
+        // the debug side channel — then the channel's own state dump
+        // reports the turn settling.
+        const sent = await page.request.post(
+          `${base}/threads/${alphaThread}/send`,
+          { data: { text: `case:relay PaneBeta|pane-note-9` }, headers },
+        );
+        eq(sent.status(), 202, "send accepted");
+        const betaThread = await poll(
+          async () => {
+            const state = await (
+              await page.request.get(`${base}/threads/${alphaThread}/state`, { headers })
+            ).json();
+            const receipt = (state.messages ?? []).find(
+              (m) =>
+                m.role === "tool" &&
+                String(m.content).includes("delivered to PaneBeta in thread"),
+            );
+            return /thread (s\d+)/.exec(receipt?.content ?? "")?.[1] ?? null;
+          },
+          { timeout: 30_000, interval: 500, message: "delivery receipt lands" },
+        );
+        await poll(
+          async () => {
+            const state = await (
+              await page.request.get(`${base}/threads/${betaThread}/state`, { headers })
+            ).json();
+            return state.status?.streaming === false &&
+              (state.status?.message_count ?? 0) >= 3
+              ? state
+              : null;
+          },
+          { timeout: 30_000, interval: 500, message: "Beta channel turn completes" },
+        );
+        made.threads.push(betaThread);
+
+        // The UI, on the parent: select Alpha's thread and wait for the
+        // badge — proof the Channels ask rode the connect cascade.
+        await page.goto(`${base}/?token=${TOKEN}`);
+        await connected(page);
+        await page
+          .locator(
+            `#thread-list .thread-row[data-thread-id="${alphaThread}"] .thread-main`,
+          )
+          .click();
+        const badge = page.locator("#info-btn");
+        await badge.waitFor({ timeout: 15_000 });
+        // The discoverability hint rides the same data.
+        eq(
+          await page.locator("#hint-parent").count(),
+          1,
+          "pane hint points at the badge",
+        );
+
+        // Open the pane: one row, Beta's channel, ↳ label + age + chevron.
+        await badge.click();
+        const paneRow = page.locator(
+          `.info-pop .ch[data-thread-id="${betaThread}"]`,
+        );
+        await paneRow.waitFor({ timeout: 15_000 });
+        const rowText = await paneRow.textContent();
+        assert(
+          rowText.includes("↳ PaneBeta"),
+          `row names the target bot: "${rowText}"`,
+        );
+        assert(rowText.includes("›"), `row carries the chevron: "${rowText}"`);
+        eq(
+          await page.locator(".info-pop .ch").count(),
+          1,
+          "exactly the one channel row",
+        );
+
+        // Selection-without-listing: the row navigates the main chat area
+        // to the channel; the pane closes; the sidebar highlights the
+        // PARENT and never lists the channel.
+        await paneRow.click();
+        await page
+          .locator("#crumb")
+          .waitFor({ timeout: 15_000 });
+        eq(
+          await page.locator("#layout").getAttribute("data-selected"),
+          betaThread,
+          "channel selected into the main chat area",
+        );
+        eq(
+          await page.locator(".info-pop").count(),
+          0,
+          "pane closed on navigation",
+        );
+        eq(
+          await page
+            .locator(
+              `#thread-list .thread-row.selected[data-thread-id="${alphaThread}"]`,
+            )
+            .count(),
+          1,
+          "parent row carries the highlight",
+        );
+        eq(
+          await page.locator(`#thread-list .thread-row[data-thread-id="${betaThread}"]`).count(),
+          0,
+          "channel is not a sidebar row",
+        );
+        const crumb = await page.locator("#crumb").textContent();
+        assert(crumb.startsWith("‹ "), `breadcrumb reads as back: "${crumb}"`);
+        const hint = await page.locator("#hint-child").textContent();
+        assert(
+          hint.includes("bot channel of"),
+          `composer hint names the parent context: "${hint}"`,
+        );
+
+        // The channel transcript is the real thing through the ordinary
+        // replay path: Alpha's authored line renders as the collapsed bot
+        // chip (the same shape the sidebar-joined channel renders).
+        const botChip = page.locator("details.turn.bot");
+        await botChip.waitFor({ timeout: 15_000 });
+        const body = await botChip.evaluate(
+          (el) => el.querySelector(".bot-body")?.textContent ?? "",
+        );
+        assert(body.includes("pane-note-9"), "chip body carries the note");
+
+        // The crumb returns to the parent.
+        await page.locator("#crumb").click();
+        await poll(
+          async () =>
+            (await page.locator("#layout").getAttribute("data-selected")) ===
+            alphaThread
+              ? true
+              : null,
+          { timeout: 15_000, interval: 250, message: "crumb re-selects the parent" },
         );
       } finally {
         await cleanup();
