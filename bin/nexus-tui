@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+#
+# nexus-tui — pair THIS machine as a nexus node and launch the node TUI.
+#
+# The (short) hostname is the node name. Any existing row under that
+# name is deleted first: a re-pair mints a fresh token, and old tokens
+# stop working the moment their row is gone (revocation is a row
+# delete — a live connection survives until it disconnects, but
+# reconnects fail). The minted token lives only in this process's
+# memory: never echoed, never written to disk.
+#
+# Required env:
+#   NEXUS_URL       server base URL, e.g. http://boss.home.arpa:8080
+#   NEXUS_THREAD    thread id to join (an env-toolset thread for role=env)
+# Optional env:
+#   NEXUS_UI_TOKEN  the server's UI token — OMIT it entirely when the
+#                   server itself runs without auth (its NEXUS_UI_TOKEN
+#                   unset): the pairing API then needs no header
+#   NEXUS_NODE      node name override (default: short hostname)
+#   NEXUS_ROLE      env (default) | viewer
+#
+# Requires curl, jq, and gleam. Run from anywhere inside the repo
+# (the script cds to the repo root for `gleam run`).
+
+set -euo pipefail
+
+: "${NEXUS_URL:?NEXUS_URL is required, e.g. http://boss.home.arpa:8080}"
+: "${NEXUS_THREAD:?NEXUS_THREAD is required — a thread id, env-toolset for role=env}"
+
+# The UI token is OPTIONAL: the server explicitly supports running
+# without auth (its own NEXUS_UI_TOKEN unset), and then the pairing
+# API answers without any Authorization header (cubic PR review).
+AUTH=()
+if [ -n "${NEXUS_UI_TOKEN:-}" ]; then
+  AUTH=(-H "Authorization: Bearer $NEXUS_UI_TOKEN")
+fi
+
+BASE="${NEXUS_URL%/}"
+NODE="${NEXUS_NODE:-$(hostname -s 2>/dev/null || hostname | cut -d. -f1)}"
+NODE=$(printf '%s' "$NODE" | tr '[:upper:]' '[:lower:]')
+
+case "$NODE" in
+  workspace)
+    echo "error: 'workspace' is a reserved node name" >&2
+    exit 1
+    ;;
+  "" | *[^a-zA-Z0-9_-]*)
+    echo "error: node name '$NODE' must be non-empty [a-zA-Z0-9_-]+" >&2
+    exit 1
+    ;;
+esac
+
+for tool in curl jq gleam; do
+  command -v "$tool" >/dev/null || { echo "error: $tool is required" >&2; exit 1; }
+done
+
+# Replace any stale row under this name — the whole point of re-running
+# is a fresh pairing every launch.
+ids=$(curl -sf "${AUTH[@]}" "$BASE/nodes" \
+      | jq -r --arg n "$NODE" '.nodes[]? | select(.name == $n) | .id' || true)
+for id in $ids; do
+  curl -sf -X DELETE "${AUTH[@]}" "$BASE/nodes/$id" >/dev/null
+  echo "replaced stale node row '$NODE' ($id)"
+done
+
+# Pair fresh: the plaintext token answers exactly once (201).
+nl=$'\n'
+response=$(curl -s -w "$nl%{http_code}" -X POST "${AUTH[@]}" \
+                -H 'content-type: application/json' \
+                -d "{\"name\":\"$NODE\"}" "$BASE/nodes")
+code=${response##*"$nl"}
+body=${response%%"$nl"*}
+if [ "$code" != "201" ]; then
+  echo "error: pairing failed (HTTP $code): $body" >&2
+  exit 1
+fi
+token=$(printf '%s' "$body" | jq -r '.token')
+if [ -z "$token" ] || [ "$token" = "null" ]; then
+  echo "error: pairing response carried no token" >&2
+  exit 1
+fi
+echo "paired as '$NODE'"
+
+# The TUI reads its own env; exec replaces the shell (Ctrl-C handling
+# stays with the TUI) and NEXUS_ROLE etc. pass through untouched.
+cd "$(dirname "$0")/.."
+exec env \
+  NEXUS_URL="$BASE" \
+  NEXUS_NODE="$NODE" \
+  NEXUS_NODE_TOKEN="$token" \
+  NEXUS_THREAD="$NEXUS_THREAD" \
+  gleam run -m nexus/tui

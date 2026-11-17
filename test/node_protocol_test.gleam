@@ -6,6 +6,7 @@
 
 import gleam/dynamic/decode
 import gleam/json
+import gleam/list
 import gleam/option.{None, Some}
 import gleam/string
 import gleeunit/should
@@ -280,6 +281,237 @@ pub fn encode_connection_frames_test() {
   node_protocol.encode_pong() |> should.equal("{\"v\":1,\"type\":\"pong\"}")
   node_protocol.encode_error("nope")
   |> should.equal("{\"v\":1,\"type\":\"error\",\"message\":\"nope\"}")
+}
+
+// ---------------------------------------------------------------------------
+// Client → server encode (the Gleam TUI's sending half, 2b-5)
+// ---------------------------------------------------------------------------
+
+pub fn encode_send_test() {
+  node_protocol.encode_send("run the deploy")
+  |> should.equal("{\"v\":1,\"type\":\"send\",\"text\":\"run the deploy\"}")
+}
+
+/// Hostile text escapes through the json encoder — a send cannot
+/// shape the frame.
+pub fn encode_send_hostile_text_test() {
+  let frame = node_protocol.encode_send("say \"hi\"\nnewline")
+  node_protocol.decode_client_frame(frame)
+  |> should.equal(Ok(node_protocol.Send("say \"hi\"\nnewline")))
+}
+
+pub fn encode_ping_test() {
+  node_protocol.encode_ping()
+  |> should.equal("{\"v\":1,\"type\":\"ping\"}")
+}
+
+pub fn encode_call_response_ok_test() {
+  node_protocol.encode_call_response(3, False, "node says: hi")
+  |> should.equal(
+    "{\"v\":1,\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{"
+    <> "\"content\":[{\"type\":\"text\",\"text\":\"node says: hi\"}],"
+    <> "\"isError\":false}}",
+  )
+}
+
+/// The response flag is the wire's own isError (the fake node's
+/// answer(id, text, isError) shape); decoding flips it to ok-ness.
+pub fn encode_call_response_error_test() {
+  let frame = node_protocol.encode_call_response(7, True, "boom")
+  node_protocol.decode_client_frame(frame)
+  |> should.equal(Ok(node_protocol.CallResponse(7, False, "boom")))
+}
+
+// ---------------------------------------------------------------------------
+// Server → client decode (the TUI's receive half, 2b-5)
+// ---------------------------------------------------------------------------
+
+pub fn decode_hello_test() {
+  node_protocol.decode_server_frame(
+    "{\"v\":1,\"type\":\"hello\",\"model\":\"smart\",\"messages\":3}",
+  )
+  |> should.equal(Ok(node_protocol.Hello("smart", 3)))
+}
+
+/// Encode→decode round-trip over the real projection: the same
+/// ThreadEvent that event_frame encodes decodes back to the same flat
+/// values.
+pub fn decode_event_round_trip_test() {
+  // Each sample carries its expected decoded frame — the round trip
+  // is asserted value-for-value, not just non-Unknown (cubic PR
+  // review: field regressions in text, stamps, ids, flags must fail).
+  let samples = [
+    #(
+      thread.UserEcho("hello", Some(1000), Some("system")),
+      node_protocol.UserLine("hello", Some(1000), Some("system")),
+    ),
+    #(
+      thread.UserEcho("hello", None, None),
+      node_protocol.UserLine("hello", None, None),
+    ),
+    #(
+      thread.AssistantFull("done", Some(1001)),
+      node_protocol.AssistantFull("done", Some(1001)),
+    ),
+    #(thread.ReasoningFull("thinking"), node_protocol.ReasoningFull("thinking")),
+    #(thread.Token("fr"), node_protocol.Token("fr")),
+    #(thread.Reasoning("why"), node_protocol.Reasoning("why")),
+    #(
+      thread.ToolCallAssembled(
+        "call_1",
+        "bash",
+        "{\"command\":\"echo hi\"}",
+        Some(1002),
+      ),
+      node_protocol.ToolCall(
+        "call_1",
+        "bash",
+        "{\"command\":\"echo hi\"}",
+        Some(1002),
+      ),
+    ),
+    #(
+      thread.ToolResult("call_1", "bash", True, "hi"),
+      node_protocol.ToolResult("call_1", "bash", True, "hi"),
+    ),
+    #(
+      thread.ToolResult("call_2", "bash", False, "nope"),
+      node_protocol.ToolResult("call_2", "bash", False, "nope"),
+    ),
+    #(thread.LoopStatus(2, 8, "tools"), node_protocol.LoopStatus(2, 8, "tools")),
+    #(
+      thread.MetaUpdated(Some("title"), ["a", "b"]),
+      node_protocol.Meta(Some("title"), ["a", "b"]),
+    ),
+    #(thread.MetaUpdated(None, []), node_protocol.Meta(None, [])),
+  ]
+  samples
+  |> list.each(fn(sample) {
+    let #(kind, expected) = sample
+    let assert Ok(frame) = node_protocol.event_frame(event("t1", kind))
+    node_protocol.decode_server_frame(frame)
+    |> should.equal(Ok(expected))
+  })
+}
+
+pub fn decode_turn_done_stats_test() {
+  node_protocol.decode_server_frame(
+    "{\"v\":1,\"type\":\"turn_done\",\"at\":77,\"stats\":{"
+    <> "\"ttft_ms\":42,\"duration_ms\":1000,\"token_deltas\":3,"
+    <> "\"reasoning_deltas\":0,\"tool_call_deltas\":2}}",
+  )
+  |> should.equal(
+    Ok(node_protocol.TurnDone(
+      node_protocol.TurnStats(
+        ttft_ms: Some(42),
+        duration_ms: 1000,
+        token_deltas: 3,
+        reasoning_deltas: 0,
+        tool_call_deltas: 2,
+      ),
+      Some(77),
+    )),
+  )
+  // ttft is optional at the wire (null reads None).
+  node_protocol.decode_server_frame(
+    "{\"v\":1,\"type\":\"turn_done\",\"at\":null,\"stats\":{"
+    <> "\"ttft_ms\":null,\"duration_ms\":5,\"token_deltas\":0,"
+    <> "\"reasoning_deltas\":0,\"tool_call_deltas\":0}}",
+  )
+  |> should.equal(
+    Ok(node_protocol.TurnDone(
+      node_protocol.TurnStats(
+        ttft_ms: None,
+        duration_ms: 5,
+        token_deltas: 0,
+        reasoning_deltas: 0,
+        tool_call_deltas: 0,
+      ),
+      None,
+    )),
+  )
+}
+
+pub fn decode_user_author_optional_test() {
+  node_protocol.decode_server_frame(
+    "{\"v\":1,\"type\":\"user\",\"text\":\"attached targets: workspace.\","
+    <> "\"at\":null,\"author\":\"system\"}",
+  )
+  |> should.equal(
+    Ok(node_protocol.UserLine(
+      "attached targets: workspace.",
+      None,
+      Some("system"),
+    )),
+  )
+}
+
+pub fn decode_tool_call_delta_test() {
+  node_protocol.decode_server_frame(
+    "{\"v\":1,\"type\":\"tool_call_delta\",\"index\":0,\"id\":\"call_1\","
+    <> "\"name\":null,\"fragment\":\"{\"}",
+  )
+  |> should.equal(Ok(node_protocol.ToolCallDelta(0, Some("call_1"), None, "{")))
+}
+
+pub fn decode_connection_frames_test() {
+  node_protocol.decode_server_frame(
+    "{\"v\":1,\"type\":\"attached\",\"target\":\"node-a\"}",
+  )
+  |> should.equal(Ok(node_protocol.Attached("node-a")))
+  node_protocol.decode_server_frame("{\"v\":1,\"type\":\"pong\"}")
+  |> should.equal(Ok(node_protocol.Pong))
+  node_protocol.decode_server_frame(
+    "{\"v\":1,\"type\":\"error\",\"message\":\"refused\"}",
+  )
+  |> should.equal(Ok(node_protocol.ProtocolError("refused")))
+}
+
+/// The tool plane's request half: the mirror of encode_call_request.
+/// The wire carries arguments VERBATIM (an encoder property, pinned by
+/// the encode tests and the fake-node e2e wire capture); the decoded
+/// representation re-encodes the VALUE canonically — what a node's
+/// executors read round-trips exactly.
+pub fn decode_call_request_test() {
+  let arguments = "{\"target\": \"node-a\", \"command\":\"echo  spaced  \"}"
+  let frame = node_protocol.encode_call_request(11, "bash", arguments)
+  let assert Ok(node_protocol.CallRequest(11, "bash", decoded)) =
+    node_protocol.decode_server_frame(frame)
+  arg_field(decoded, "target") |> should.equal("node-a")
+  arg_field(decoded, "command") |> should.equal("echo  spaced  ")
+}
+
+fn arg_field(arguments: String, name: String) -> String {
+  let assert Ok(value) =
+    json.parse(arguments, using: {
+      use field <- decode.field(name, decode.string)
+      decode.success(field)
+    })
+  value
+}
+
+pub fn decode_cancelled_test() {
+  node_protocol.decode_server_frame(node_protocol.encode_cancelled(9))
+  |> should.equal(Ok(node_protocol.Cancelled(9)))
+}
+
+/// Additive growth: an event KIND this client predates decodes as
+/// Unknown — forward-compatible by rule — while malformed JSON and a
+/// malformed KNOWN shape refuse.
+pub fn decode_unknown_and_malformed_test() {
+  node_protocol.decode_server_frame("{\"v\":1,\"type\":\"telemetry_v2\"}")
+  |> should.equal(Ok(node_protocol.Unknown))
+  node_protocol.decode_server_frame("{\"v\":2,\"type\":\"send\"}")
+  |> should.equal(Ok(node_protocol.Unknown))
+  node_protocol.decode_server_frame("not json at all")
+  |> should.equal(Error(Nil))
+  node_protocol.decode_server_frame("{\"v\":1,\"type\":\"user\"}")
+  |> should.equal(Error(Nil))
+  node_protocol.decode_server_frame(
+    "{\"v\":1,\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
+    <> "\"params\":{\"name\":\"bash\"}}",
+  )
+  |> should.equal(Error(Nil))
 }
 
 // ---------------------------------------------------------------------------

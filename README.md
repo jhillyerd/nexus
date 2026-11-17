@@ -303,7 +303,9 @@ own NODE-token auth against the `node` table instead.
   `role=env` (default) attaches the node's machine as an environment
   target — refused (403) on threads whose toolset has no env tools;
   `role=viewer` joins any thread with events and send but no tool
-  plane
+  plane. The reference client is the bundled node TUI (a REPL-style
+  proof of concept — see the TUI section below); the protocol codec is
+  shared (`nexus/node_protocol` owns both directions of the wire).
 
 The browser UI does not use the JSON routes — it talks to the server
 component over `/ws`. The JSON surface is the scripting/e2e API (the
@@ -381,6 +383,57 @@ headers.
 > Local-dev note: a non-flake Erlang needs `libcrypto` on the loader path,
 > e.g. `LD_LIBRARY_PATH=$(nix build --print-out-paths nixpkgs#openssl)/lib`.
 > The flake devShell handles this.
+
+## Node TUI (proof of concept)
+
+The bundled remote-node client is a Gleam REPL — a proof of concept for
+the environments plan's `/node/ws` protocol, not the eventual
+high-fidelity TUI (that is a separate future initiative). It dials OUT
+to nexus, renders the event plane as plain lines, sends your typed
+lines to the thread, and — as `role=env` — serves `tools/call` frames
+by executing the four env tools LOCALLY, in its own workspace
+directory, through the same code the server runs for its own workspace
+(kill-tree, byte caps while reading, path confinement included).
+
+Pair a node and launch the TUI against one env-toolset thread with the
+bundled launcher — it derives the node name from the machine's
+hostname, replaces any stale row under that name, pairs fresh (the
+minted token lives only in the launcher's memory), and execs the TUI:
+
+```sh
+NEXUS_URL=http://127.0.0.1:8080 \
+NEXUS_UI_TOKEN="$NEXUS_UI_TOKEN" \
+NEXUS_THREAD='<thread id>' \
+bin/nexus-tui
+```
+
+Manually, the same dance is (delete the stale row first — a re-pair
+mints a fresh token, and rerunning without the delete is a 409):
+
+```sh
+UI="Authorization: Bearer $NEXUS_UI_TOKEN"
+
+LAPTOP_ID=$(curl -s -H "$UI" \
+  http://127.0.0.1:8080/nodes | jq -r '.nodes[] | select(.name == "laptop") | .id')
+[ -n "$LAPTOP_ID" ] && curl -s -X DELETE -H "$UI" \
+  "http://127.0.0.1:8080/nodes/$LAPTOP_ID"
+
+token=$(curl -s -X POST -H "$UI" -H 'content-type: application/json' \
+  -d '{"name":"laptop"}' http://127.0.0.1:8080/nodes | jq -r .token)  # shown exactly once
+
+NEXUS_URL=http://127.0.0.1:8080 \
+NEXUS_NODE=laptop \
+NEXUS_NODE_TOKEN="$token" \
+NEXUS_THREAD='<thread id>' \
+gleam run -m nexus/tui
+```
+
+Optional: `NEXUS_ROLE=viewer` (events + send, no tool plane; default
+`env`), `NEXUS_NODE_WORKSPACE=<dir>` (default `./node-workspace`), and
+the shared knobs `NEXUS_ENV_TIMEOUT_MS` / `NEXUS_ENV_MAX_OUTPUT_BYTES`
+(same floors as the server). Type a line to send it; `/quit` (or stdin
+EOF) leaves cleanly. It is a REPL: output arriving while you type
+interleaves with the half-typed line, and there is no input history.
 
 ## Audit tool
 

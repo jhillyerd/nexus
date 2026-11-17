@@ -543,6 +543,13 @@ Separate OS processes from the same codebase — none of them are actors:
   schema-apply path.
 - `nexus/dev_seed` — out-of-band first-provider seeding (CI / compose
   bootstrap, before the server exists).
+- `nexus/tui` — the node TUI (environments plan 2b-5): a REPL-style
+  proof-of-concept client that dials OUT to `/node/ws`, renders the
+  event plane as plain lines, sends user turns, and serves `tools/call`
+  by running the env tools locally through `env.serve_node_call`. A
+  stratus WebSocket actor owns the socket (the socket-owner rule);
+  stdin lines and finished calls enter through an actor-owned inbox
+  subject handed out at init (the `gated_runner` ownership rule).
 - `audit/ttft` — standalone warm/cold TTFT audit harness, deliberately
   decoupled from the server's config module.
 - `gleam test` — fully offline; persistence goes through the in-memory
