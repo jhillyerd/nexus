@@ -674,8 +674,9 @@ pub fn archive_no_cancel_of_parent_turn_test() {
 
 /// Deleting a parent drops the whole descendant tree — direct children
 /// AND grandchildren (the FK cascades rows; the registry drops the
-/// actors, records, and dm entries transitively) — and the freed pair
-/// opens a FRESH channel on the next delivery.
+/// actors, records, and dm entries transitively). The deleted pair is
+/// simply gone: a deleted thread has no actor or worker that could
+/// originate a next delivery, so no fresh channel can ever hang off it.
 pub fn parent_delete_drops_subtree_test() {
   let booted = boot()
   let alpha = create_bot(booted, "alpha")
