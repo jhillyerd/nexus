@@ -158,13 +158,17 @@ pub fn attached_targets() -> List(String) {
   ["workspace"]
 }
 
+/// The four compiled-in environment tool names — the single source the
+/// catalog's `is_env_name` (and, through it, `tools.catalog_names`)
+/// derives from.
+pub fn tool_names() -> List(String) {
+  ["bash", "read_file", "write_file", "list_dir"]
+}
+
 /// True for the four compiled-in environment tool names (the catalog's
 /// `is_compiled_name` lookup delegates here).
 pub fn is_env_name(name: String) -> Bool {
-  case name {
-    "bash" | "read_file" | "write_file" | "list_dir" -> True
-    _ -> False
-  }
+  list.contains(tool_names(), name)
 }
 
 /// The thread's workspace directory: `<root>/<thread id>`. Lazy —

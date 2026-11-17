@@ -4,14 +4,17 @@
 //// later config gating), loud failure on unknown names, and codemode's
 //// last-position sibling capture being per-toolset.
 
+import gleam/dict
 import gleam/erlang/process
 import gleam/json
 import gleam/list
 import gleam/option
+import gleam/otp/actor
 import gleam/string
 import gleeunit/should
 import nexus/config
 import nexus/delivery
+import nexus/tool_provider
 import nexus/tools
 
 /// A config from env overrides; only `NEXUS_ENCRYPTION_KEY` is required,
@@ -108,6 +111,86 @@ pub fn by_names_ignores_config_gates_test() {
   // Specs build in the snapshot's GIVEN order; only codemode itself is
   // canonicalized to last.
   names(specs) |> should.equal(["web_search", "http_fetch", "codemode"])
+}
+
+// ---- the pinnable catalog (issue #121) -------------------------------
+
+/// `catalog_names` is the ONE list: every name `is_compiled_name`
+/// accepts, in sorted display order, and nothing else — a future
+/// compiled tool cannot drift the registration guard away from the
+/// picker's checkbox list.
+pub fn catalog_names_match_is_compiled_name_test() {
+  let names = tools.catalog_names()
+  // The plain M3 four plus the four environment tools, at least.
+  should.be_true(list.length(names) >= 8)
+  list.each(names, fn(name) { tools.is_compiled_name(name) |> should.be_true })
+  should.equal(names, list.sort(list.unique(names), string.compare))
+  // Qualified names are never compiled names (the reserved separator).
+  tools.is_compiled_name("nexus_example__echo") |> should.be_false
+  tools.is_compiled_name("nope") |> should.be_false
+}
+
+/// tools.catalog (issue #121): compiled + plugin names enumerate
+/// without any ask; a mounted server contributes its QUALIFIED tool
+/// names through the live ListTools ask; a dead server degrades into
+/// `unavailable` (display honesty — its names still pass the save-side
+/// gate while mounted).
+pub fn catalog_enumerates_compiled_plugin_and_foreign_test() {
+  let server =
+    start_fake_mcp([
+      tool_provider.ToolDef("echo", "echoes", "{}"),
+      tool_provider.ToolDef("ping", "pings", "{}"),
+    ])
+  let dead = process.new_name("nexus_tools_test_dead")
+  // Any spec value serves — the enumeration reads the provider table's
+  // KEYS, never its specs.
+  let assert Ok([spec, ..]) = tools.by_names(plain(), ["http_fetch"])
+  let catalog =
+    tools.catalog(
+      dict.from_list([#("nexus_example__echo", spec)]),
+      dict.from_list([
+        #("mcpsrv", tools.ForeignServer(name: server, timeout_ms: 1000)),
+        #("dead", tools.ForeignServer(name: dead, timeout_ms: 1000)),
+      ]),
+    )
+  catalog.names
+  |> should.equal([
+    "bash",
+    "bot_message",
+    "codemode",
+    "http_fetch",
+    "list_dir",
+    "mcpsrv__echo",
+    "mcpsrv__ping",
+    "nexus_example__echo",
+    "read_file",
+    "web_search",
+    "write_file",
+  ])
+  catalog.unavailable |> should.equal(["dead"])
+}
+
+/// A minimal MCP-shaped fake: a named actor answering ListTools with a
+/// fixed catalog (tool_provider_test's fake, reduced to the arm the
+/// catalog enumeration exercises).
+fn start_fake_mcp(
+  defs: List(tool_provider.ToolDef),
+) -> process.Name(tool_provider.Msg) {
+  let name = process.new_name("nexus_tools_test_mcp")
+  let assert Ok(_started) =
+    actor.new(defs)
+    |> actor.on_message(fn(defs, msg) {
+      case msg {
+        tool_provider.ListTools(reply) -> {
+          process.send(reply, Ok(defs))
+          actor.continue(defs)
+        }
+        _ -> actor.continue(defs)
+      }
+    })
+    |> actor.named(name)
+    |> actor.start
+  name
 }
 
 // ---- codemode's host list is the TOOLSET, not the global default ------

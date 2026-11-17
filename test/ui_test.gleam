@@ -2422,7 +2422,7 @@ pub fn settings_tab_switch_stands_forms_down_test() {
   assert_settings_transients_down(step(with_bot_add, bots))
 
   let with_bot_edit =
-    step(base, ui.Settings(ui_settings.BotEditToggled("b1", "p1")))
+    step(base, ui.Settings(ui_settings.BotEditToggled("b1", "p1", None)))
   with_bot_edit.settings.bot_edit |> should.equal(Some("b1"))
   assert_settings_transients_down(step(with_bot_edit, bots))
 
@@ -2741,7 +2741,7 @@ pub fn bot_edit_model_combobox_scopes_to_bot_provider_test() {
     |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
     |> step(ui.BotsLoaded([bot_row("b1", "Writer", "", None)]))
     |> step(ui.SettingsToggled)
-    |> step(ui.Settings(ui_settings.BotEditToggled("b1", "p1")))
+    |> step(ui.Settings(ui_settings.BotEditToggled("b1", "p1", None)))
   model.settings.bot_alias_provider |> should.equal(option.Some("p1"))
 
   let html =
@@ -3149,7 +3149,9 @@ pub fn meta_updated_refreshes_sidebar_test() {
     )
   let bots_name = process.new_name("nexus_ui_bots")
   let assert Ok(started_bots) =
-    bot_registry.start(seam, bots_name, fn(names) { Ok(names) })
+    bot_registry.start(seam, bots_name, fn(names) { Ok(names) }, fn() {
+      bot_registry.ToolCatalog([], [])
+    })
   let bots = started_bots.data
   let providers = started_providers.data
   let factory_name = process.new_name("nexus_ui_factory")
@@ -3289,7 +3291,9 @@ pub fn send_moves_previous_day_row_into_today_immediately_test() {
     )
   let bots_name = process.new_name("nexus_ui_bots")
   let assert Ok(started_bots) =
-    bot_registry.start(seam, bots_name, fn(names) { Ok(names) })
+    bot_registry.start(seam, bots_name, fn(names) { Ok(names) }, fn() {
+      bot_registry.ToolCatalog([], [])
+    })
   let bots = started_bots.data
   let providers = started_providers.data
   let factory_name = process.new_name("nexus_ui_factory_row")
@@ -3399,7 +3403,9 @@ pub fn connect_with_configured_provider_never_notes_no_provider_test() {
     )
   let bots_name = process.new_name("nexus_ui_bots")
   let assert Ok(started_bots) =
-    bot_registry.start(seam, bots_name, fn(names) { Ok(names) })
+    bot_registry.start(seam, bots_name, fn(names) { Ok(names) }, fn() {
+      bot_registry.ToolCatalog([], [])
+    })
   let bots = started_bots.data
   let providers = started_providers.data
   let factory_name = process.new_name("nexus_ui_factory")
@@ -3554,7 +3560,9 @@ pub fn thread_switch_drops_left_thread_stream_test() {
     )
   let bots_name = process.new_name("nexus_ui_bots")
   let assert Ok(started_bots) =
-    bot_registry.start(seam, bots_name, fn(names) { Ok(names) })
+    bot_registry.start(seam, bots_name, fn(names) { Ok(names) }, fn() {
+      bot_registry.ToolCatalog([], [])
+    })
   let bots = started_bots.data
   let providers = started_providers.data
   let factory_name = process.new_name("nexus_ui_factory_leak")
@@ -3648,7 +3656,9 @@ pub fn meta_updated_from_other_thread_refreshes_sidebar_test() {
     )
   let bots_name = process.new_name("nexus_ui_bots")
   let assert Ok(started_bots) =
-    bot_registry.start(seam, bots_name, fn(names) { Ok(names) })
+    bot_registry.start(seam, bots_name, fn(names) { Ok(names) }, fn() {
+      bot_registry.ToolCatalog([], [])
+    })
   let bots = started_bots.data
   let providers = started_providers.data
   let factory_name = process.new_name("nexus_ui_factory_meta")
@@ -3937,7 +3947,7 @@ pub fn view_settings_bots_section_test() {
     |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
     |> step(ui.BotsLoaded([bot_row("b1", "Writer", "", Some("be terse"))]))
     |> step(ui.SettingsToggled)
-    |> step(ui.Settings(ui_settings.BotEditToggled("b1", "p1")))
+    |> step(ui.Settings(ui_settings.BotEditToggled("b1", "p1", None)))
     |> view_string
   should.be_true(string.contains(editing, ">Edit bot<"))
   should.be_true(string.contains(editing, "value=\"Writer\""))
@@ -4005,9 +4015,16 @@ pub fn view_settings_bots_tools_display_test() {
       ]),
     )
     |> step(ui.SettingsToggled)
-    |> step(ui.Settings(ui_settings.BotEditToggled("b3", "p1")))
+    |> step(
+      ui.Settings(ui_settings.BotEditToggled("b3", "p1", Some(["http_fetch"]))),
+    )
     |> view_string
-  should.be_true(string.contains(editing, "value=\"http_fetch\""))
+  // The picker seeds the stored toolset: http_fetch renders as a
+  // ticked box (the catalog has not landed in this offline view, so
+  // the seeded ticks render alone over the loading note).
+  should.be_true(string.contains(editing, "type=\"checkbox\""))
+  should.be_true(string.contains(editing, "checked"))
+  should.be_true(string.contains(editing, ">http_fetch<"))
 
   let editing_chat_only =
     new_model()
@@ -4016,9 +4033,298 @@ pub fn view_settings_bots_tools_display_test() {
       ui.BotsLoaded([bot_row_with_tools("b2", "quiet", "", None, Some([]))]),
     )
     |> step(ui.SettingsToggled)
-    |> step(ui.Settings(ui_settings.BotEditToggled("b2", "p1")))
+    |> step(ui.Settings(ui_settings.BotEditToggled("b2", "p1", Some([]))))
     |> view_string
   should.be_true(string.contains(editing_chat_only, "checked"))
+}
+
+/// The tool picker (issue #121): the settled catalog renders as
+/// checkboxes under All/None toggles; ticks seed from the edited bot
+/// and flip per box; All/None set/clear the whole selection; a kept
+/// unknown name renders as a ticked "(not in catalog)" box with
+/// hostile names as inert text; a failed fetch degrades to the
+/// free-text field.
+pub fn view_settings_bots_tool_picker_test() {
+  let catalog =
+    bot_registry.ToolCatalog(
+      ["bot_message", "codemode", "http_fetch", "web_search"],
+      [],
+    )
+  let base =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(
+      ui.BotsLoaded([
+        bot_row_with_tools("b1", "tooled", "", None, Some(["http_fetch"])),
+        bot_row_with_tools(
+          "b2",
+          "stale",
+          "",
+          None,
+          Some(["http_fetch", "<script>alert(2)</script>"]),
+        ),
+      ]),
+    )
+    |> step(ui.SettingsToggled)
+  let open_b1 =
+    ui.Settings(ui_settings.BotEditToggled("b1", "p1", Some(["http_fetch"])))
+
+  // The settled picker: four catalog boxes, All/None controls, the
+  // seeded tick the only checked one.
+  let settled =
+    base
+    |> step(open_b1)
+    |> step(ui.Settings(ui_settings.BotToolsLoaded(catalog)))
+    |> view_string
+  should.be_true(string.contains(settled, ">Tools<"))
+  should.be_true(string.contains(settled, ">All<"))
+  should.be_true(string.contains(settled, ">None<"))
+  should.be_true(string.contains(settled, ">bot_message<"))
+  should.be_true(string.contains(settled, ">web_search<"))
+  // The picker renders once per form instance — the add form plus each
+  // row's hidden editor, three with two bots — all reflecting the ONE
+  // shared picker state, so counts are ×3 (ticked http_fetch only).
+  should.equal(count_occurrences(settled, "checked"), 3)
+
+  // All ticks everything, None clears back to the default-set state,
+  // a single flip re-ticks one box.
+  let all =
+    base
+    |> step(open_b1)
+    |> step(ui.Settings(ui_settings.BotToolsLoaded(catalog)))
+    |> step(ui.Settings(ui_settings.BotToolsAll))
+    |> view_string
+  should.equal(count_occurrences(all, "checked"), 12)
+
+  let none_then_one =
+    base
+    |> step(open_b1)
+    |> step(ui.Settings(ui_settings.BotToolsLoaded(catalog)))
+    |> step(ui.Settings(ui_settings.BotToolsNone))
+    |> step(ui.Settings(ui_settings.BotToolToggled("web_search")))
+    |> view_string
+  should.equal(count_occurrences(none_then_one, "checked"), 3)
+  should.be_true(string.contains(none_then_one, ">web_search<"))
+
+  // A kept stored-but-unknown name renders as a ticked "(not in
+  // catalog)" box beside the catalog boxes; a hostile "name" is
+  // escaped text, never markup.
+  let stale =
+    base
+    |> step(
+      ui.Settings(ui_settings.BotEditToggled(
+        "b2",
+        "p1",
+        Some(["http_fetch", "<script>alert(2)</script>"]),
+      )),
+    )
+    |> step(ui.Settings(ui_settings.BotToolsLoaded(catalog)))
+    |> view_string
+  should.equal(count_occurrences(stale, "checked"), 6)
+  should.be_true(string.contains(stale, "(not in catalog)"))
+  should.be_true(string.contains(stale, "&lt;script&gt;alert(2)&lt;/script&gt;"))
+  should_not_contain(stale, "<script>alert(2)</script>")
+
+  // A failed fetch degrades to the free-text field (the combobox's
+  // graceful-degradation rule), prefilled with the stored list.
+  let degraded =
+    base
+    |> step(open_b1)
+    |> step(ui.Settings(ui_settings.BotToolsFetchFailed))
+    |> view_string
+  should.be_true(string.contains(
+    degraded,
+    "tool list unavailable — enter names, comma-separated",
+  ))
+  should.be_true(string.contains(degraded, "value=\"http_fetch\""))
+}
+
+/// Occurrences of `needle` in `haystack` — the picker assertions count
+/// `checked` attributes (lustre omits the false-boolean entirely, so
+/// the count is exactly the ticked boxes).
+fn count_occurrences(haystack: String, needle: String) -> Int {
+  list.length(string.split(haystack, needle)) - 1
+}
+
+/// The picker's submit channel (issue #121), pinned end-to-end over a
+/// REAL runtime and a REAL bot registry: opening the add form fetches
+/// the canned catalog through the injected seam, ticking two boxes and
+/// submitting creates a bot whose stored toolset is the TICKS in
+/// catalog order; no ticks saves as the default set (None); the
+/// chat-only checkbox wins over ticks (Some([])). The degraded
+/// free-text channel is the view test's concern — this pins the picker
+/// channel's three states landing in the store.
+pub fn bot_picker_submit_roundtrip_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  store_mock.ensure_fixture_provider(seam)
+
+  // Real registries over the offline seams — the add form's open
+  // effect asks both (the alias fetch fails offline; the catalog
+  // fetch settles from the canned closure).
+  let assert Ok(started_providers) =
+    provider_registry.start_with_model_fetcher(
+      test_config(),
+      seam,
+      process.new_name("nexus_ui_providers"),
+      fn(_endpoint) { Error(openai.Transport("offline test")) },
+    )
+  let bots_name = process.new_name("nexus_ui_bots")
+  let assert Ok(started_bots) =
+    bot_registry.start(seam, bots_name, fn(names) { Ok(names) }, fn() {
+      bot_registry.ToolCatalog(
+        ["bot_message", "codemode", "http_fetch", "web_search"],
+        [],
+      )
+    })
+  let bots = started_bots.data
+  let providers = started_providers.data
+  let factory_name = process.new_name("nexus_ui_factory")
+  let assert Ok(_factory) =
+    factory_supervisor.start(thread_registry.factory_builder(factory_name))
+  let assert Ok(started_registry) =
+    thread_registry.start_with_toolset(
+      test_config(),
+      factory_supervisor.get_by_name(factory_name),
+      process.new_name("nexus_ui_registry"),
+      seam,
+      toolset(unused_turn_runner),
+      fn() { [] },
+      fixture_resolver(),
+      bots_name,
+      dict.new(),
+      dict.new(),
+    )
+  let registry = started_registry.data
+
+  let assert Ok(runtime) =
+    lustre.start_server_component(
+      ui_runtime.app(),
+      ui.Flags(
+        registry: registry,
+        providers: providers,
+        bots: bots,
+        models_timeout_ms: 60_000,
+        thread: None,
+      ),
+    )
+  let client = process.new_subject()
+  server_component.register_subject(client)
+  |> lustre.send(to: runtime)
+
+  // Open the settings page, then the add form: the catalog fetch
+  // settles from the canned closure and the picker renders the four
+  // names.
+  lustre.send(to: runtime, message: lustre.dispatch(ui.SettingsToggled))
+  lustre.send(
+    to: runtime,
+    message: lustre.dispatch(
+      ui.Settings(
+        ui_settings.BotAddToggled(Some(store_mock.fixture_provider_id)),
+      ),
+    ),
+  )
+  let _ = wait_for_patch(client, "bot_message", 40)
+
+  // Tick http_fetch + codemode and submit — the stored toolset is the
+  // ticks in CATALOG order (the envelope order of the resolved
+  // schemas), not tick order.
+  lustre.send(
+    to: runtime,
+    message: lustre.dispatch(
+      ui.Settings(ui_settings.BotToolToggled("http_fetch")),
+    ),
+  )
+  lustre.send(
+    to: runtime,
+    message: lustre.dispatch(
+      ui.Settings(ui_settings.BotToolToggled("codemode")),
+    ),
+  )
+  lustre.send(
+    to: runtime,
+    message: lustre.dispatch(
+      ui.Settings(ui_settings.BotSubmitted(
+        "Picker A",
+        "",
+        store_mock.fixture_provider_id,
+        "smart",
+        "",
+        "",
+        False,
+      )),
+    ),
+  )
+
+  // Chat-only wins over ticks; nothing ticked saves as the default
+  // set (the blank-means-default rule, picker edition).
+  lustre.send(
+    to: runtime,
+    message: lustre.dispatch(
+      ui.Settings(ui_settings.BotToolToggled("web_search")),
+    ),
+  )
+  lustre.send(
+    to: runtime,
+    message: lustre.dispatch(
+      ui.Settings(ui_settings.BotSubmitted(
+        "Picker B",
+        "",
+        store_mock.fixture_provider_id,
+        "smart",
+        "",
+        "",
+        True,
+      )),
+    ),
+  )
+  // None clears the ticks (an empty selection saves as the default
+  // set), then C submits with nothing ticked and chat-only unchecked.
+  lustre.send(
+    to: runtime,
+    message: lustre.dispatch(ui.Settings(ui_settings.BotToolsNone)),
+  )
+  lustre.send(
+    to: runtime,
+    message: lustre.dispatch(
+      ui.Settings(ui_settings.BotSubmitted(
+        "Picker C",
+        "",
+        store_mock.fixture_provider_id,
+        "smart",
+        "",
+        "",
+        False,
+      )),
+    ),
+  )
+
+  let rows = poll_bots(bots, 40)
+  let assert [a, b, c] = rows
+  a.name |> should.equal("Picker A")
+  a.tools |> should.equal(Some(["codemode", "http_fetch"]))
+  b.tools |> should.equal(Some([]))
+  c.tools |> should.equal(None)
+}
+
+/// Poll the bot registry until its rows appear (the runtime's effects
+/// cross process boundaries) or the attempts run out.
+fn poll_bots(
+  bots: process.Subject(bot_registry.Msg),
+  attempts: Int,
+) -> List(store.StoredBot) {
+  case bot_registry.list_bots(bots) {
+    Ok([]) if attempts > 0 -> {
+      process.sleep(25)
+      poll_bots(bots, attempts - 1)
+    }
+    Ok(rows) -> rows
+    Error(_) if attempts > 0 -> {
+      process.sleep(25)
+      poll_bots(bots, attempts - 1)
+    }
+    Error(_) -> []
+  }
 }
 
 /// The inbound gate toggle (bots plan P3a, issue #95): the row's control
@@ -4382,7 +4688,9 @@ fn start_offline_registries(
     )
   let bots_name = process.new_name("nexus_ui_create_bots")
   let assert Ok(started_bots) =
-    bot_registry.start(seam, bots_name, fn(names) { Ok(names) })
+    bot_registry.start(seam, bots_name, fn(names) { Ok(names) }, fn() {
+      bot_registry.ToolCatalog([], [])
+    })
   let factory_name = process.new_name("nexus_ui_create_factory")
   let assert Ok(_factory) =
     factory_supervisor.start(thread_registry.factory_builder(factory_name))

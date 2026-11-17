@@ -124,18 +124,23 @@ pub type ToolsetEntry {
 /// milliseconds; the boot ask (no caller, no budget) stays at 10 s.
 pub const freeze_ask_ms = 4000
 
-/// The complete compiled-in tool name set. Plugin-api plan: `__` is
-/// the reserved provider separator, so a compiled name containing it
-/// would admit a colliding qualified name — `is_compiled_name` is the
-/// registration-time guard's lookup, and every future compiled tool
-/// must keep its name `__`-free. The four environment tools
+/// Every compiled-in tool name, in display order (issue #121's checkbox
+/// list reads this; so does `is_compiled_name`, which is now derived
+/// from it — one list, no drift). The four environment tools
 /// (environments plan Phase 1) are compiled names like any other —
 /// never in the DEFAULT set.
+pub fn catalog_names() -> List(String) {
+  ["http_fetch", "web_search", "bot_message", "codemode", ..env.tool_names()]
+  |> list.sort(string.compare)
+}
+
+/// Plugin-api plan: `__` is the reserved provider separator, so a
+/// compiled name containing it would admit a colliding qualified name —
+/// `is_compiled_name` is the registration-time guard's lookup, and every
+/// future compiled tool must keep its name `__`-free and add itself to
+/// `catalog_names`.
 pub fn is_compiled_name(name: String) -> Bool {
-  case name {
-    "http_fetch" | "web_search" | "bot_message" | "codemode" -> True
-    other -> env.is_env_name(other)
-  }
+  list.contains(catalog_names(), name)
 }
 
 /// The default M3 toolset's NAMES, derived from the global config — the
@@ -237,6 +242,100 @@ pub fn by_names_with(
 pub fn default(cfg: Config) -> List(ToolSpec) {
   let assert Ok(specs) = by_names(cfg, default_names(cfg))
   specs
+}
+
+/// The pinnable catalog (issue #121): every tool name a bot save can
+/// accept, for the bot forms' checkbox list. Compiled names are static;
+/// plugin names are the boot-built provider table's keys (both ONE
+/// values shared with the validation closure — the same threading rule);
+/// FOREIGN names come from ONE bounded live `ListTools` ask per distinct
+/// mounted server — the freeze's shape (a wedged server stalls its own
+/// ask at the freeze budget, never the others) — so a server that has
+/// come and gone since boot still shows truthfully here. A server whose
+/// ask fails DEGRADES: its name lands in `unavailable` and its tools are
+/// simply not listed (the save-side gate still passes any
+/// `<server>__<tool>` while the server is mounted, so this is display
+/// honesty, never a refusal). Names come back sorted and deduplicated;
+/// the order is display-only (a picked toolset's envelope order is the
+/// picker's catalog order).
+pub type Catalog {
+  Catalog(names: List(String), unavailable: List(String))
+}
+
+pub fn catalog(
+  providers: ProviderTable,
+  foreign: Dict(String, ForeignServer),
+) -> Catalog {
+  let plain =
+    catalog_names()
+    |> list.append(dict.keys(providers))
+    |> list.unique
+  // One bounded live ask per DISTINCT mounted server, asked
+  // CONCURRENTLY (the mcp boot probe's shape — one spawned asker per
+  // server, one shared reply subject owned by the CALLING process, so
+  // the receive is legal): the caller blocks once for the whole
+  // collection (~budget + slack) instead of once per server, so the
+  // bot forms' picker stays fast no matter how many servers are
+  // mounted. A failed or silent server DEGRADES: its name lands in
+  // `unavailable`, its tools are display-omitted — the save-side gate
+  // still passes any `<server>__<tool>` while the server is mounted,
+  // so this is display honesty, never a refusal.
+  let reply = process.new_subject()
+  dict.each(foreign, fn(server, mount) {
+    process.spawn_unlinked(fn() {
+      process.send(reply, #(
+        server,
+        tool_provider.list_tools(mount.name, freeze_ask_ms),
+      ))
+    })
+  })
+  let #(foreign_names, unavailable) =
+    collect_catalog(reply, dict.size(foreign), freeze_ask_ms + 2000, [], [])
+  Catalog(
+    names: list.sort(
+      list.unique(list.append(plain, foreign_names)),
+      string.compare,
+    ),
+    unavailable: list.sort(list.unique(unavailable), string.compare),
+  )
+}
+
+/// Collect the spawned per-server ask results off the shared subject,
+/// within the overall deadline (the mcp boot probe's collection rule).
+/// A result that never lands counts as that server being unavailable —
+/// logged nowhere here (the caller renders the name), never a hang.
+fn collect_catalog(
+  reply: Subject(#(String, Result(List(tool_provider.ToolDef), String))),
+  remaining: Int,
+  deadline_ms: Int,
+  names: List(String),
+  unavailable: List(String),
+) -> #(List(String), List(String)) {
+  case remaining {
+    0 -> #(names, unavailable)
+    _ ->
+      case process.receive(reply, deadline_ms) {
+        Error(Nil) -> #(names, unavailable)
+        Ok(#(server, Ok(defs))) ->
+          collect_catalog(
+            reply,
+            remaining - 1,
+            deadline_ms,
+            list.append(
+              names,
+              list.map(defs, fn(def) {
+                tool_provider.qualified(server, def.name)
+              }),
+            ),
+            unavailable,
+          )
+        Ok(#(server, Error(_))) ->
+          collect_catalog(reply, remaining - 1, deadline_ms, names, [
+            server,
+            ..unavailable
+          ])
+      }
+  }
 }
 
 /// The full ENTRY resolution (plugin-api plan Phase 2): compiled ∪

@@ -1674,9 +1674,12 @@ pub fn create_from_bot_orchestration_carries_bot_toolset_test() {
   store_mock.ensure_fixture_provider(seam)
   let cfg = test_config()
   let assert Ok(started_bots) =
-    bot_registry.start(seam, process.new_name("nexus_orch_bots"), fn(names) {
-      tools.by_names(cfg, names) |> result.replace(names)
-    })
+    bot_registry.start(
+      seam,
+      process.new_name("nexus_orch_bots"),
+      fn(names) { tools.by_names(cfg, names) |> result.replace(names) },
+      fn() { bot_registry.ToolCatalog([], []) },
+    )
   let bots = started_bots.data
   // The provider registry's live model list, fixed — inert now (creates
   // fetch nothing) but it keeps the rig strictly offline.

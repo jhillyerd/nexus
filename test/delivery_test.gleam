@@ -103,9 +103,14 @@ fn boot() -> Booted {
   store_mock.ensure_fixture_provider(seam)
   let bots_name = process.new_name("nexus_delivery_bot_registry")
   let assert Ok(started_bots) =
-    bot_registry.start(seam, bots_name, fn(names) {
-      tools.by_names(test_config(), names) |> result.replace(names)
-    })
+    bot_registry.start(
+      seam,
+      bots_name,
+      fn(names) {
+        tools.by_names(test_config(), names) |> result.replace(names)
+      },
+      fn() { bot_registry.ToolCatalog([], []) },
+    )
   let factory_name = process.new_name("nexus_delivery_factory")
   let assert Ok(_factory) =
     factory_supervisor.start(thread_registry.factory_builder(factory_name))
