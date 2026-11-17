@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Dev server launcher — run from the main checkout or any worktree.
 #
-#   etc/dev-server.sh [--reset | -r]
+#   etc/dev-server [--reset | -r]
 #
 # --reset (or -r) tears down the dev database first (compose `down -v`, which
 # deletes the named volume), so everything after starts against an empty
@@ -31,7 +31,7 @@ for arg in "$@"; do
       exit 0
       ;;
     *)
-      echo "dev-server.sh: unknown argument '$arg' (try --help)" >&2
+      echo "dev-server: unknown argument '$arg' (try --help)" >&2
       exit 2
       ;;
   esac
@@ -64,7 +64,7 @@ if [ "$reset" = 1 ]; then
   # `nexus-db-data` volume, from any worktree. No `--remove-orphans`: this
   # reset owns the db container and nothing else, and orphan cleanup would
   # also tear down containers this file does not define.
-  echo "dev-server.sh: --reset, destroying the dev database volume"
+  echo "dev-server: --reset, destroying the dev database volume"
   docker compose --project-name nexus down -v
 fi
 

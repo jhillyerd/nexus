@@ -9,7 +9,7 @@
 ////
 ////     DATABASE_URL=postgres://nexus@127.0.0.1:5433/nexus \
 ////       gleam run -m nexus/store/migrate
-////   # (etc/dev-server.sh runs this on every dev boot)
+////   # (bin/dev-server runs this on every dev boot)
 ////
 //// The schema is written idempotently (`create table if not exists`), so
 //// re-running is safe. Statements are split by a quote-aware scanner

@@ -11,7 +11,7 @@
 #
 #   DATABASE_URL=postgres://nexus@127.0.0.1:5433/nexus \
 #     gleam run -m nexus/store/migrate
-#   # (etc/dev-server.sh does this for you)
+#   # (bin/dev-server does this for you)
 #
 # Deliberately no bind mounts: they would embed a worktree-specific host
 # path in the compose config hash, and `up` would recreate the singleton
