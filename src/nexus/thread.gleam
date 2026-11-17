@@ -291,6 +291,12 @@ pub fn utility_runner(
 pub type SendResult {
   Sent
   Busy
+  /// Refused without taking the line (bot-channels plan, #123): an
+  /// ARCHIVED CHANNEL refuses human Sends — archived is quiescent (the
+  /// delivery path's existing "target thread is archived" rule, applied
+  /// to the channel's own Send surface). The reason is display text for
+  /// the UI/web; it never enters any transcript.
+  Refused(String)
 }
 
 /// Everything needed to construct one thread actor. The starting
@@ -364,6 +370,19 @@ pub type ThreadSpec {
     roster: List(String),
     /// Guarded title application — see `UtilityApply`.
     utility_apply: UtilityApply,
+    /// The parent thread id (bot-channels plan, #123): `Some` ONLY on
+    /// bot channels. The utility arm keys its channel guard off this —
+    /// a channel's purpose is known at creation (the target bot's name
+    /// is its title), so `arm_utility` no-ops and no model title/tag
+    /// call ever fires for one.
+    parent_thread_id: Option(String),
+    /// The STARTING archived flag, from the same fact the registry's
+    /// meta holds at start time (`False` on fresh creates; a hydrated
+    /// channel rehydrates born-archived from its stored row — the
+    /// archive cascade's no-stale-Send rule). Live changes ride the
+    /// `SetArchived` message from the registry's cascade; this is only
+    /// the value at actor birth, never a request byte.
+    archived: Bool,
   )
 }
 
@@ -455,6 +474,15 @@ pub type ThreadMeta {
     /// deleting a bot never changes an existing thread, which is why the
     /// column is ON DELETE SET NULL in the schema).
     bot_id: Option(String),
+    /// The parent thread this thread hangs off (bot-channels plan, #123):
+    /// `Some` ONLY on bot channels — DM threads created by `bot_message`
+    /// delivery, keyed per parent so parallel parents never share one
+    /// transcript or serialize on one busy target. `None` on every
+    /// ordinary thread. Routing/display metadata riding beside the
+    /// transcript — never a request byte. Persisted as
+    /// `thread.parent_thread_id` (FK CASCADE: a channel is meaningless
+    /// outside its parent's context).
+    parent_thread_id: Option(String),
     /// Wall-clock epoch seconds at creation (display ordering only).
     created_at: Int,
   )
@@ -547,6 +575,14 @@ pub type Msg {
   )
   /// Cancel the in-flight turn, if any.
   Stop
+  /// The registry's archive cascade flagged this thread (bot-channels
+  /// plan, #123): update the live `archived` flag so an archived channel
+  /// refuses human Sends from now on. A bounded ask — the actor answers
+  /// promptly even MID-TURN (the loop never blocks on its worker, §8
+  /// fairness rule), so the cascade never has to stop a live actor: the
+  /// in-flight turn is preserved untouched. Display state only — no
+  /// transcript or request-byte change.
+  SetArchived(archived: Bool, reply: Subject(Nil))
   /// Attach a target to the live roster (environments plan Phase 2a).
   /// The name is validated (charset, `workspace` reserved, no duplicate
   /// live) and the change applies immediately when the thread is idle, or
@@ -770,6 +806,18 @@ type State {
     /// and the guarded title application, both run by the unlinked worker.
     utility_runner: UtilityRunner,
     utility_apply: UtilityApply,
+    /// The parent thread id (bot-channels plan, #123): `Some` ONLY on bot
+    /// channels. Keys the utility-arm guard (a channel never runs it) —
+    /// display/routing metadata, never a request byte.
+    parent_thread_id: Option(String),
+    /// The LIVE archived flag (bot-channels plan, #123): born from the
+    /// spec (a hydrated channel starts archived; a fresh thread does
+    /// not), updated by the registry's archive-cascade notify so an
+    /// archived channel refuses human Sends without a restart. Never a
+    /// request byte. Ordinary threads carry the flag too (the cascade
+    /// keeps it true uniformly) but refuse nothing — their human Send
+    /// behavior is unchanged.
+    archived: Bool,
   )
 }
 
@@ -833,6 +881,8 @@ fn start_builder(spec: ThreadSpec) {
     hydrated: hydrated,
     roster: roster,
     utility_apply: utility_apply,
+    parent_thread_id: parent_thread_id,
+    archived: archived,
   ) = spec
   actor.new_with_initialiser(1000, fn(self) {
     actor.initialised(State(
@@ -868,6 +918,11 @@ fn start_builder(spec: ThreadSpec) {
       self: self,
       metrics: [],
       last_commit_s: 0,
+      // Bot channels (bot-channels plan, #123): the guard keys + the
+      // starting archived flag ride the spec (the registry derives both
+      // — a hydrated channel is born archived from its stored row).
+      parent_thread_id: parent_thread_id,
+      archived: archived,
       commit_hook: commit_hook,
       // Roster seed (environments plan Phase 2a/2b): the registry
       // derives it — fresh env threads seed `["workspace"]`, hydrated
@@ -1049,85 +1104,32 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
     }
 
     Send(text, author, depth, reply) -> {
-      // A utility side-call in flight never blocks a send: cancel it and
-      // proceed normally — the thread must never report `Busy` because of
-      // a side call (required fairness on serialized backends: the side
-      // call would otherwise queue the user's turn behind it). The
-      // cancelled attempt does not consume `utility_attempted`; the next
-      // turn-commit point re-arms the debounce.
-      let state = cancel_utility(state)
-      case state.turn {
-        Idle -> {
-          // One stamp for the append AND the echo broadcast, so the
-          // sender's bubble and every other tab's (and a reload's replay)
-          // render the same wall-clock age for the same message. The
-          // origin mark rides immediately after (same call-after-append
-          // rule): display-only provenance, never a request byte. An
-          // authored send must mark BEFORE the mirror is built from `tr`,
-          // so a mid-turn join replays the author like the live echo.
-          let stamped = timing.wall_now_s()
-          let tr =
-            state.transcript
-            |> transcript.append_user(text)
-            |> transcript.mark_origin(author, depth)
-            |> transcript.stamp(stamped)
-          // The echo's author is READ BACK from the sidecar the mark just
-          // populated — the same read side every replay uses — so live and
-          // persisted display metadata agree by construction: an author
-          // mark_origin dropped (e.g. Some("")) is absent here too, never
-          // Some("") live but None on replay. One source, one shape.
-          emit(
-            state,
-            UserEcho(
-              text,
-              Some(stamped),
-              transcript.origin_at(tr, transcript.length(tr) - 1)
-                |> option.map(fn(origin) { origin.author }),
-            ),
-          )
-          let worker =
-            process.spawn_unlinked(fn() {
-              let cancel = process.new_subject()
-              let pid = process.self()
-              process.send(state.self, TurnStarted(pid, cancel))
-              let on_event = fn(event) {
-                process.send(state.self, WorkerEvent(pid, event))
-              }
-              // The runner is the registry-built bundle's turn fn —
-              // wrapped per thread with the delivery identity on bot
-              // threads (bots P3c) and the environment handle on
-              // env-carrying threads (environments Phase 1), both of
-              // which ignore these arguments and build their own
-              // contexts from the thread's frozen values.
-              let outcome =
-                state.runner(state.endpoint, tr, cancel, None, None, on_event)
-              process.send(state.self, WorkerDone(pid, outcome))
-            })
-          let monitor = process.monitor(worker)
-          process.send(reply, Sent)
-          // Write-behind: hand the committed transcript to the store's
-          // lane (a plain send — never blocks the actor).
-          let _ = state.commit_hook(tr)
-          actor.continue(
-            State(
-              ..state,
-              transcript: tr,
-              turn: Starting(worker, monitor, False, timing.now_us()),
-              // The mirror starts from the send-time transcript (user
-              // message included): a mid-turn join replays it while the
-              // worker streams the reply.
-              turn_view: Some(LiveTurn(tr, "", "")),
-              // The user message is committed the moment it is appended
-              // (even a failed turn keeps it), so activity starts here.
-              last_commit_s: timing.wall_now_s(),
-            ),
-          )
-        }
-        Streaming(..) | Starting(..) -> {
-          process.send(reply, Busy)
+      // An ARCHIVED CHANNEL refuses human Sends (bot-channels plan,
+      // #123): archived is quiescent — the same rule the delivery path
+      // applies to archived targets ("target thread is archived"), now
+      // on the channel's own Send surface. Ordinary threads carry the
+      // flag too but refuse nothing: their human Send behavior is
+      // unchanged (the registry owns their archive UX). The refusal
+      // takes no line, appends nothing, starts no turn — and wins over
+      // Busy (an archived channel answers the same whether mid-turn or
+      // idle).
+      case state.archived && option.is_some(state.parent_thread_id) {
+        True -> {
+          process.send(reply, Refused("thread is archived"))
           actor.continue(state)
         }
+        False -> start_send_turn(state, text, author, depth, reply)
       }
+    }
+
+    SetArchived(archived, reply) -> {
+      // The registry's archive cascade (bot-channels plan, #123): flip
+      // the live flag and answer immediately — even MID-TURN (the actor
+      // loop never blocks on its worker). The in-flight turn continues
+      // untouched: no cancel, no rollback — the archive mechanic never
+      // stops a turn (the no-cancel rule). Display state only.
+      process.send(reply, Nil)
+      actor.continue(State(..state, archived: archived))
     }
 
     Stop ->
@@ -1671,6 +1673,98 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
   }
 }
 
+/// The Send arm's turn path, extracted so the archived-channel refusal can
+/// sit in front of it (bot-channels plan, #123). The ONE turn-machine
+/// path, unchanged: cancel any utility side call, then append + commit +
+/// spawn the worker, or answer Busy.
+fn start_send_turn(
+  state: State,
+  text: String,
+  author: Option(String),
+  depth: Int,
+  reply: Subject(SendResult),
+) -> actor.Next(State, Msg) {
+  // A utility side-call in flight never blocks a send: cancel it and
+  // proceed normally — the thread must never report `Busy` because of
+  // a side call (required fairness on serialized backends: the side
+  // call would otherwise queue the user's turn behind it). The
+  // cancelled attempt does not consume `utility_attempted`; the next
+  // turn-commit point re-arms the debounce.
+  let state = cancel_utility(state)
+  case state.turn {
+    Idle -> {
+      // One stamp for the append AND the echo broadcast, so the
+      // sender's bubble and every other tab's (and a reload's replay)
+      // render the same wall-clock age for the same message. The
+      // origin mark rides immediately after (same call-after-append
+      // rule): display-only provenance, never a request byte. An
+      // authored send must mark BEFORE the mirror is built from `tr`,
+      // so a mid-turn join replays the author like the live echo.
+      let stamped = timing.wall_now_s()
+      let tr =
+        state.transcript
+        |> transcript.append_user(text)
+        |> transcript.mark_origin(author, depth)
+        |> transcript.stamp(stamped)
+      // The echo's author is READ BACK from the sidecar the mark just
+      // populated — the same read side every replay uses — so live and
+      // persisted display metadata agree by construction: an author
+      // mark_origin dropped (e.g. Some("")) is absent here too, never
+      // Some("") live but None on replay. One source, one shape.
+      emit(
+        state,
+        UserEcho(
+          text,
+          Some(stamped),
+          transcript.origin_at(tr, transcript.length(tr) - 1)
+            |> option.map(fn(origin) { origin.author }),
+        ),
+      )
+      let worker =
+        process.spawn_unlinked(fn() {
+          let cancel = process.new_subject()
+          let pid = process.self()
+          process.send(state.self, TurnStarted(pid, cancel))
+          let on_event = fn(event) {
+            process.send(state.self, WorkerEvent(pid, event))
+          }
+          // The runner is the registry-built bundle's turn fn —
+          // wrapped per thread with the delivery identity on bot
+          // threads (bots P3c) and the environment handle on
+          // env-carrying threads (environments Phase 1), both of
+          // which ignore these arguments and build their own
+          // contexts from the thread's frozen values.
+          let outcome =
+            state.runner(state.endpoint, tr, cancel, None, None, on_event)
+          process.send(state.self, WorkerDone(pid, outcome))
+        })
+      let monitor = process.monitor(worker)
+      process.send(reply, Sent)
+      // Write-behind: hand the committed transcript to the store's
+      // lane (a plain send — never blocks the actor).
+      let _ = state.commit_hook(tr)
+      actor.continue(
+        State(
+          ..state,
+          transcript: tr,
+          turn: Starting(worker, monitor, False, timing.now_us()),
+          // The mirror starts from the send-time transcript (user
+          // message included): a mid-turn join replays it while the
+          // worker streams the reply.
+          turn_view: Some(LiveTurn(tr, "", "")),
+          // The user message is committed the moment it is appended
+          // (even a failed turn keeps it), so activity starts here.
+          last_commit_s: timing.wall_now_s(),
+        ),
+      )
+    }
+    Streaming(..) | Starting(..) -> {
+      process.send(reply, Busy)
+      actor.continue(state)
+    }
+  }
+}
+
 /// Fan one payload out to every subscriber, stamped with this thread's
 /// id AND each subscriber's current visit generation — the two
 /// subscriber-side filter keys (see `ThreadEvent`).
@@ -1975,35 +2069,51 @@ fn cancel_utility(state: State) -> State {
 /// message re-checks every condition at fire time, so racing timers are
 /// harmless.
 fn arm_utility(state: State, committed: Bool) -> State {
-  case
-    committed || state.utility_pending,
-    state.utility_attempted,
-    state.cfg.utility_enabled,
-    state.utility,
-    transcript.length(state.transcript) >= 3
-  {
-    True, False, True, UtilityIdle, True -> {
-      process.send_after(state.self, state.cfg.utility_delay_ms, UtilityStart)
-      State(..state, utility_pending: False)
-    }
-    // A FAILED turn with an attempt still in flight (necessarily one the
-    // turn's own Send cancelled): neither this turn nor the attempt has a
-    // delivery point, so record the trigger as owed — the attempt's
-    // cancelled completion must re-arm instead of stranding the thread's
-    // only try. (With a COMMITTED turn this is branch one's delivery; the
-    // attempt's completion needs this only when the turn failed.)
-    False, False, True, UtilityStarting(..), True ->
-      State(..state, utility_pending: True)
-    False, False, True, UtilityRunning(..), True ->
-      State(..state, utility_pending: True)
-    // The side call is still busy (e.g. a cancelled-but-unreported
-    // worker): record the trigger as OWED — finish_utility delivers it
-    // when this attempt completes. Dropping it here would silently spend
-    // the re-arm a cancelled attempt is entitled to (the once-flag is
-    // still unset, so the next commit point would arm again — but there
-    // may never be one).
-    True, False, True, _, _ -> State(..state, utility_pending: True)
-    _, _, _, _, _ -> State(..state, utility_pending: False)
+  case state.parent_thread_id {
+    // A CHANNEL never runs the utility arm (bot-channels plan, #123):
+    // its purpose is known at creation — the target bot's name is its
+    // title, set at insert — so a model call to title/tag it would
+    // spend tokens discovering what we already know and its tags would
+    // pollute the shared tag corpus. One guard keyed off the spec's
+    // parent id: no attempt is armed, no completion fires, the
+    // PASS machinery never engages, and `title_source`/`tags_source`
+    // stay 'auto' untouched.
+    Some(_) -> State(..state, utility_pending: False)
+    None ->
+      case
+        committed || state.utility_pending,
+        state.utility_attempted,
+        state.cfg.utility_enabled,
+        state.utility,
+        transcript.length(state.transcript) >= 3
+      {
+        True, False, True, UtilityIdle, True -> {
+          process.send_after(
+            state.self,
+            state.cfg.utility_delay_ms,
+            UtilityStart,
+          )
+          State(..state, utility_pending: False)
+        }
+        // A FAILED turn with an attempt still in flight (necessarily one the
+        // turn's own Send cancelled): neither this turn nor the attempt has a
+        // delivery point, so record the trigger as owed — the attempt's
+        // cancelled completion must re-arm instead of stranding the thread's
+        // only try. (With a COMMITTED turn this is branch one's delivery; the
+        // attempt's completion needs this only when the turn failed.)
+        False, False, True, UtilityStarting(..), True ->
+          State(..state, utility_pending: True)
+        False, False, True, UtilityRunning(..), True ->
+          State(..state, utility_pending: True)
+        // The side call is still busy (e.g. a cancelled-but-unreported
+        // worker): record the trigger as OWED — finish_utility delivers it
+        // when this attempt completes. Dropping it here would silently spend
+        // the re-arm a cancelled attempt is entitled to (the once-flag is
+        // still unset, so the next commit point would arm again — but there
+        // may never be one).
+        True, False, True, _, _ -> State(..state, utility_pending: True)
+        _, _, _, _, _ -> State(..state, utility_pending: False)
+      }
   }
 }
 

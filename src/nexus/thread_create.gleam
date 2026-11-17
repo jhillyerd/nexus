@@ -126,6 +126,12 @@ pub fn create_thread_from_bot(
           // never silently narrowed.
           toolset: bot.tools,
           bot_id: Some(bot.id),
+          // A user-facing create-from-bot is an ORDINARY thread (never a
+          // channel): no parent, open auto-title path (bot-channels
+          // plan, #123 — channels are born only from `bot_message`
+          // delivery).
+          parent_thread_id: option.None,
+          title: "",
         ),
       )
   }
@@ -176,5 +182,7 @@ pub fn describe(problem: CreateProblem) -> String {
       "toolset unavailable: " <> reason
     CreateFailed(thread_registry.StartFailed(reason)) ->
       "thread unavailable: " <> reason
+    CreateFailed(thread_registry.ChannelPersistFailed) ->
+      "channel could not be persisted"
   }
 }

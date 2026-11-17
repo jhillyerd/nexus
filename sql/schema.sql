@@ -111,6 +111,12 @@ CREATE TABLE IF NOT EXISTS thread (
   bot_id         text REFERENCES bot(id) ON DELETE SET NULL,   -- provenance/display only (bots plan P1): which bot the frozen
                                                 -- columns were sourced from. Never joined at request-encoding time;
                                                 -- deleting the bot NULLs it — the thread is self-contained.
+  parent_thread_id text REFERENCES thread(id) ON DELETE CASCADE, -- bot channels (docs/plans/bot-channels.md, #123): the parent thread a
+                                                -- DM channel hangs off (the thread whose turn originated the
+                                                -- bot_message). NULL on every ordinary thread. Routing/display only —
+                                                -- never a request byte. CASCADE, decided: a channel is meaningless
+                                                -- outside its parent's context (SET NULL would resurrect orphaned
+                                                -- channels into the sidebar after a parent delete).
   workspace_root text                          -- environments plan Phase 1: the RESOLVED workspace root frozen at
                                                 -- creation (NULL = no env tools; the '' sentinel inserts NULL).
                                                 -- The per-thread dir derives from it (<root>/<id>), so a later
@@ -163,6 +169,18 @@ END $$;
 CREATE INDEX IF NOT EXISTS thread_recency ON thread (archived_at, last_active_at DESC);
 CREATE INDEX IF NOT EXISTS thread_tags ON thread USING gin (tags);
 CREATE INDEX IF NOT EXISTS thread_bot ON thread (bot_id);
+
+-- The channel identity (bot-channels plan, #123): (parent_thread_id,
+-- bot_id) uniquely identifies a channel — one DM thread per (parent,
+-- target bot) — and enforcing it means `find_channel` re-derivation can
+-- never match ambiguously. The leading column also serves the
+-- parent_thread_id = $1 child-list scan, so no separate plain index is
+-- needed. Partial: ordinary threads (NULL parent) never participate. The
+-- column itself lands as a CREATE-only edit in the base CREATE TABLE
+-- above (the squash-migrations-into-the-base-CREATEs policy — no ALTER
+-- upgrades; dev instances recreate, cecd906).
+CREATE UNIQUE INDEX IF NOT EXISTS thread_channel ON thread (parent_thread_id, bot_id)
+  WHERE parent_thread_id IS NOT NULL;
 
 -- Remote paired TUI nodes (environments plan Phase 2b): a machine running
 -- the nexus TUI client that dials OUT to nexus over WebSocket and serves

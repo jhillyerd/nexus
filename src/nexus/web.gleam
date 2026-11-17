@@ -303,6 +303,8 @@ fn create_thread_response(
               system_prompt: None,
               toolset: tools,
               bot_id: None,
+              parent_thread_id: None,
+              title: "",
             )
           case thread_create.create_thread(providers, registry, requested) {
             Ok(summary) -> json_response(201, thread_summary_json(summary))
@@ -337,6 +339,9 @@ fn create_problem_status(problem: thread_create.CreateProblem) -> Int {
     thread_create.CreateFailed(thread_registry.UnknownToolset(_)) -> 400
     thread_create.CreateFailed(thread_registry.ProviderFailed(_)) -> 502
     thread_create.CreateFailed(thread_registry.StartFailed(_)) -> 503
+    // A channel create whose row insert failed: the store side refused,
+    // same class as an unavailable provider (502).
+    thread_create.CreateFailed(thread_registry.ChannelPersistFailed) -> 502
   }
 }
 
@@ -763,6 +768,10 @@ fn send_response(
             }
             thread.Busy ->
               json_response(409, err_json("a reply is already streaming"))
+            // An archived channel refuses human Sends (bot-channels
+            // plan, #123): same status as Busy — a 409 conflict with the
+            // honest reason, no transcript change.
+            thread.Refused(reason) -> json_response(409, err_json(reason))
           }
         }
       }

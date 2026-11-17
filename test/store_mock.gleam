@@ -62,6 +62,15 @@ pub type MockMsg {
     system_prompt: String,
     reply: Subject(Result(Nil, String)),
   )
+  /// The channel re-derivation lookup (bot-channels plan, #123) — the
+  /// mock mirrors find_channel.sql: scan the rows for the one whose
+  /// (parent, bot) matches. Failure injection rides seam overrides, not
+  /// this handler.
+  FindChannel(
+    parent_thread_id: String,
+    bot_id: String,
+    reply: Subject(Result(option.Option(String), String)),
+  )
   /// The write-behind lane: fire-and-forget, ordered by arrival. Also the
   /// replay path — applying the same (or an older) transcript again is a
   /// no-op apart from the recency bump.
@@ -215,6 +224,9 @@ pub fn seam(mock: Subject(MockMsg)) -> Store {
     load_messages: fn(id) { call(mock, 5000, fn(r) { LoadMessages(id, r) }) },
     insert_thread: fn(summary, system_prompt) {
       call(mock, 5000, fn(r) { InsertThread(summary, system_prompt, r) })
+    },
+    find_channel: fn(parent_thread_id, bot_id) {
+      call(mock, 5000, fn(r) { FindChannel(parent_thread_id, bot_id, r) })
     },
     commit: fn(id, transcript) { process.send(mock, Commit(id, transcript)) },
     set_title: fn(id, title) {
@@ -409,13 +421,50 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
             None -> True
             Some(bot_id) -> dict.has_key(state.bots, bot_id)
           }
-          case bot_ok {
-            False -> {
+          // thread_parent_thread_id_fkey: a non-NULL parent link must
+          // reference a stored thread (bot-channels plan, #123). CASCADE
+          // is the delete-time half, mirrored by DeleteThread below.
+          let parent_ok = case summary.meta.parent_thread_id {
+            None -> True
+            Some(parent) -> dict.has_key(state.threads, parent)
+          }
+          // thread_channel unique index: at most one channel per
+          // (parent, bot) (bot-channels plan, #123) — the mock mirrors
+          // the real store's rejection so tests fail the same way
+          // production would.
+          let channel_free = case
+            summary.meta.parent_thread_id,
+            summary.meta.bot_id
+          {
+            Some(parent), Some(bot_id) ->
+              state.threads
+              |> dict.values
+              |> list.any(fn(stored) {
+                stored.summary.meta.parent_thread_id == option.Some(parent)
+                && stored.summary.meta.bot_id == option.Some(bot_id)
+              })
+              |> fn(taken) { !taken }
+            _, _ -> True
+          }
+          case bot_ok, parent_ok, channel_free {
+            False, _, _ -> {
               let assert Some(bot_id) = summary.meta.bot_id
               process.send(reply, Error("unknown bot " <> bot_id))
               actor.continue(state)
             }
-            True -> {
+            _, False, _ -> {
+              let assert Some(parent) = summary.meta.parent_thread_id
+              process.send(reply, Error("unknown parent thread " <> parent))
+              actor.continue(state)
+            }
+            _, _, False -> {
+              process.send(
+                reply,
+                Error("duplicate channel for parent/bot (thread_channel)"),
+              )
+              actor.continue(state)
+            }
+            True, True, True -> {
               process.send(reply, Ok(Nil))
               actor.continue(
                 State(
@@ -462,6 +511,24 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
           }
         }
       }
+
+    FindChannel(parent_thread_id, bot_id, reply) -> {
+      let found =
+        state.threads
+        |> dict.values
+        |> list.find(fn(stored) {
+          stored.summary.meta.parent_thread_id == option.Some(parent_thread_id)
+          && stored.summary.meta.bot_id == option.Some(bot_id)
+        })
+      process.send(
+        reply,
+        Ok(case found {
+          Ok(stored) -> option.Some(stored.summary.id)
+          Error(_) -> option.None
+        }),
+      )
+      actor.continue(state)
+    }
 
     Commit(id, transcript) -> {
       let events = [EvCommit(id, transcript.length(transcript)), ..state.events]
@@ -631,43 +698,85 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
     }
 
     Archive(id, reply) -> {
+      // Mirrors archive.sql's recursive CTE (bot-channels plan, #123):
+      // the statement is the authority and cascades DOWN the
+      // parent_thread_id subtree, clearing pins everywhere it lands —
+      // so the mock cascades too, not just the named row.
+      let subtree = channel_subtree(state.threads, id)
+      let threads =
+        list.fold(subtree, state.threads, fn(threads, sid) {
+          case dict.get(threads, sid) {
+            Ok(stored) ->
+              dict.insert(
+                threads,
+                sid,
+                Stored(
+                  ..stored,
+                  summary: store.StoredSummary(
+                    ..stored.summary,
+                    meta: thread.ThreadMeta(
+                      ..stored.summary.meta,
+                      archived: True,
+                      pinned: False,
+                    ),
+                  ),
+                ),
+              )
+            Error(_) -> threads
+          }
+        })
       process.send(reply, Ok(Nil))
       actor.continue(
-        State(
-          ..update(state, id, fn(summary) {
-            store.StoredSummary(
-              ..summary,
-              meta: thread.ThreadMeta(
-                ..summary.meta,
-                archived: True,
-                pinned: False,
-              ),
-            )
-          }),
-          events: [EvArchive(id), ..state.events],
-        ),
+        State(..state, threads: threads, events: [EvArchive(id), ..state.events]),
       )
     }
 
     Unarchive(id, reply) -> {
+      // The symmetric twin (bot-channels plan, #123): restoring a
+      // parent restores its channel subtree.
+      let subtree = channel_subtree(state.threads, id)
+      let threads =
+        list.fold(subtree, state.threads, fn(threads, sid) {
+          case dict.get(threads, sid) {
+            Ok(stored) ->
+              dict.insert(
+                threads,
+                sid,
+                Stored(
+                  ..stored,
+                  summary: store.StoredSummary(
+                    ..stored.summary,
+                    meta: thread.ThreadMeta(
+                      ..stored.summary.meta,
+                      archived: False,
+                    ),
+                  ),
+                ),
+              )
+            Error(_) -> threads
+          }
+        })
       process.send(reply, Ok(Nil))
       actor.continue(
-        State(
-          ..update(state, id, fn(summary) {
-            store.StoredSummary(
-              ..summary,
-              meta: thread.ThreadMeta(..summary.meta, archived: False),
-            )
-          }),
-          events: [EvUnarchive(id), ..state.events],
-        ),
+        State(..state, threads: threads, events: [
+          EvUnarchive(id),
+          ..state.events
+        ]),
       )
     }
 
     DeleteThread(id, reply) -> {
+      // Mirrors delete_thread.sql + the FK's ON DELETE CASCADE
+      // (bot-channels plan, #123): deleting a parent removes its whole
+      // channel subtree (hop chains make channels of channels).
+      let subtree = channel_subtree(state.threads, id)
+      let threads =
+        list.fold(subtree, state.threads, fn(threads, sid) {
+          dict.delete(threads, sid)
+        })
       process.send(reply, Ok(Nil))
       actor.continue(
-        State(..state, threads: dict.delete(state.threads, id), events: [
+        State(..state, threads: threads, events: [
           EvDeleteThread(id),
           ..state.events
         ]),
@@ -677,12 +786,27 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
     PruneNeverUsed(reply) -> {
       // Same contract as prune_never_used.sql: never-used (system
       // prompt only, auto-titled, unpinned) AND older than the grace
-      // window that protects a concurrent server's fresh empty.
+      // window that protects a concurrent server's fresh empty. A
+      // parent with a channel child is NEVER swept — the FK's CASCADE
+      // would take the child's committed history with it (mirrors the
+      // SQL's not-exists child check).
+      let parents_with_children =
+        state.threads
+        |> dict.values
+        |> list.filter_map(fn(stored) {
+          case stored.summary.meta.parent_thread_id {
+            option.Some(parent) -> Ok(parent)
+            option.None -> Error(Nil)
+          }
+        })
       let cutoff = timing.wall_now_s() - prune_grace_s
       let ids =
         state.threads
         |> dict.values
-        |> list.filter(fn(stored) { never_used(stored.summary, cutoff) })
+        |> list.filter(fn(stored) {
+          never_used(stored.summary, cutoff)
+          && !list.contains(parents_with_children, stored.summary.id)
+        })
         |> list.map(fn(stored) { stored.summary.id })
         |> list.sort(string.compare)
       let threads =
@@ -1185,6 +1309,47 @@ fn update_stored(state: State, id: String, f: fn(Stored) -> Stored) -> State {
     Ok(stored) ->
       State(..state, threads: dict.insert(state.threads, id, f(stored)))
     Error(_) -> state
+  }
+}
+
+/// The channel subtree of `root` over the stored rows (bot-channels
+/// plan, #123): a fixpoint walk over `parent_thread_id` — hop chains
+/// make channels of channels, so archive/unarchive/delete must reach
+/// grandchildren too, exactly like the SQL's recursive CTE / CASCADE.
+fn channel_subtree(
+  threads: dict.Dict(String, Stored),
+  root: String,
+) -> List(String) {
+  let children_of = fn(parent) {
+    threads
+    |> dict.values
+    |> list.filter_map(fn(stored) {
+      case stored.summary.meta.parent_thread_id {
+        Some(id) if id == parent -> Ok(stored.summary.id)
+        _ -> Error(Nil)
+      }
+    })
+  }
+  grow_subtree(children_of, [root], [root])
+}
+
+fn grow_subtree(
+  children_of: fn(String) -> List(String),
+  frontier: List(String),
+  acc: List(String),
+) -> List(String) {
+  case frontier {
+    [] -> acc
+    [head, ..rest] -> {
+      let fresh =
+        children_of(head)
+        |> list.filter(fn(id) { !list.contains(acc, id) })
+      grow_subtree(
+        children_of,
+        list.append(rest, fresh),
+        list.append(acc, fresh),
+      )
+    }
   }
 }
 

@@ -1,8 +1,8 @@
 ---
 title: Nexus — bot channels (per-parent DM threads + the thread info pane)
-status: active
+status: active — Phase 1 shipped, Phase 2 (the pane) next
 tags: [nexus, bots, threads, agents, kv-cache, gleam, beam]
-updated: 2026-11-15
+updated: 2026-11-17
 ---
 
 # Bot channels: per-parent DM threads + the thread info pane
@@ -291,7 +291,7 @@ instruction. So:
 
 ## Phases
 
-### Phase 1 — schema, routing, re-derivation (offline-provable)
+### Phase 1 — schema, routing, re-derivation (offline-provable) — SHIPPED
 
 1. `sql/schema.sql`: column + index (idempotent); migrate re-applied;
    squirrel regen (`sql.gleam` committed; CI `squirrel check`).
@@ -321,6 +321,103 @@ instruction. So:
    refuses durably (no re-derivation escape hatch); parent-delete
    drops the whole descendant tree (direct children AND grandchildren);
    `m3_prefix_test` golden untouched; `gleam test` stays offline.
+
+#### As-built deltas (2026-11-17)
+
+- **The column landed CREATE-only** (squash-into-the-base-CREATEs
+  policy, cecd906 — the same shape environments Phase 1 took): the
+  design's `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` statement was
+  dropped; `parent_thread_id` lives in the base `CREATE TABLE thread`,
+  and the only added statement is the `thread_channel` unique index.
+  `migrate_test.schema_is_the_entire_schema_test` pins 15 statements
+  and still exactly ONE non-CREATE.
+- **`NewThread` gained `title: String`** beside `parent_thread_id`:
+  `""` opens the auto path (every ordinary create), and `create_dm`
+  passes the target bot's name — the deterministic title rides the ONE
+  creation path instead of a post-insert mutation.
+- **`ThreadSpec` carries `parent_thread_id` AND a starting `archived`
+  flag.** A hydrated channel is born archived from its stored row; the
+  Down/retry rehydrate paths re-derive `archived` from the record's
+  synced meta, so a replacement actor is always born with the right
+  refusal state (the no-stale-Send window closed by construction — the
+  notify failure case needs no special recovery beyond the ordinary
+  restart machinery).
+- **The live-actor notify is `thread.Msg.SetArchived(archived, reply)`**
+  (bounded ask; the actor answers mid-turn). Its user-visible edge:
+  `SendResult` gained `Refused(String)` — an ARCHIVED CHANNEL refuses
+  its own human Sends; ordinary archived threads refuse nothing (their
+  Send behavior is unchanged, per today's UX). web maps it to 409
+  `err_json(reason)`; ui dispatches `SendRejected(reason)`; the node
+  adapter answers an error frame. A delivery that somehow surfaces the
+  actor refusal maps to the ordinary `delivery.Refused(reason)`.
+- **`ChannelInfo` is richer than the design's reply sketch**: it adds
+  `bot_id`, `archived` (the pane renders archived rows dimmed — the
+  data has to come from somewhere), and `bot_name: Option(String)`
+  (None = the bot was deleted; the pane's label fallback, P2). Names
+  resolve through the existing `sender_name_ask` bots handle, deduped
+  per bot id.
+- **Tests use REAL parent threads** (`create_parent_thread` rig): the
+  delivery tests' synthetic `from_thread_id`s ("s-alpha", "s1"…)
+  violated the parent FK the moment it existed, and one collided with
+  the real archived thread it was testing against. Channels are found
+  through the STORE (`stored_channel` rig), not `list_threads` — the
+  second-class filter hides them from the sidebar projection.
+- **`test/bot_channels_test.gleam`** carries the matrix (the busy
+  windows ride a mist black-hole listener on loopback that never
+  responds — a stream against it hangs for the 1s sse timeout);
+  `thread_persistence_test.channel_parent_link_round_trips_test` pins
+  the store round-trip (insert → list/get → find_channel + the parent
+  FK's insert-time half).
+- **Cubic review deltas (PR #137)**: the archive notify skips records
+  with a failed start or queued DOWN (a send to an unregistered name
+  would crash the registry — the List/Channels alive discipline), the
+  delete cascade is store-first (a failed hard delete keeps memory and
+  replies `False` — the same persistence-first rule as the archive
+  cascade), `persist.find_channel` answers the corrupt duplicate-rows
+  case as a store ERROR instead of a panic, the mock store mirrors the
+  `thread_channel` unique index, an unpersisted channel's actor is
+  started ordinary (the guard keys ride only a persisted channel, the
+  `bot_id` scrub rule), and the plan's "bounded retries land the
+  notify on the rehydrated actor" is realized as "no in-place retry —
+  the rehydrated replacement is born archived".
+- **CodeRabbit review deltas (PR #137)**: the boot sweep skips parents
+  with channel children (`prune_never_used.sql` gains the `not exists`
+  child check — CASCADE would otherwise take a channel's committed
+  history with a crashed-mid-first-turn parent swept after the grace
+  window); the delete path shares the archive notify's send discipline
+  (failed-start / queued-DOWN records are skipped — the kill is the
+  real stop); a stale `dm` hit is dropped and re-derived, never a blind
+  `create_dm`; a channel create whose insert failed is REFUSED
+  (`ChannelPersistFailed` — refined from the cubic "started ordinary"
+  stopgap: an unpersisted channel is unreachable by re-derivation and
+  must not strand an exchange behind a Delivered reply); unknown
+  senders are refused ("sender thread is gone" — Delete does not stop
+  an in-flight turn worker); `sender_name_ask` resolves the named owner
+  before sending (a bot registry mid-restart degrades the pane's names,
+  it does not panic the registry). Deliberately NOT taken: an overall
+  deadline on the channels() name fold (each ask is already bounded at
+  5 s; after the owner check the realistic unavailability resolves
+  instantly, and a wedged-but-registered bot registry stalls every bot
+  delivery identically — revisit if a wedge is ever observed).
+- **Cubic review deltas, round 2 (PR #137)**: the archive guard reads
+  dormant summaries too (the deleted-sender guard admits dormant
+  senders; `sender_archived` failing open there would let an orphaned
+  worker open a new ACTIVE channel under an archived dormant parent);
+  every named-subject send in the registry now rides `try_send_named`
+  (the provider adapter's rescued `try_send` — owner resolution
+  instant-refuses, the rescued send closes the check→send window no
+  is_alive/process.named check can: archive notify, delete cascade,
+  `sender_name_ask`); the mock store's sweep mirror excludes parents
+  with channel children like the SQL (plus the boot regression test);
+  and plan-reference asides stay out of `.sql` comments (they are
+  copied into generated `sql.gleam` — provenance lives in the Gleam
+  docs). NOT taken: serializing the boot sweep against concurrent
+  channel inserts — the sweep runs inside the registry actor's
+  initialiser, before any channel writer on the node exists; the race
+  needs two nodes sharing one database (outside the supported
+  topology), and Postgres' FK KEY SHARE lock already orders an
+  insert-vs-delete race deterministically (the insert commits first or
+  fails, never corrupts).
 
 ### Phase 2 — the thread info pane (UI + e2e)
 

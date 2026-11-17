@@ -41,6 +41,7 @@ fn summary(id: String, bot_id: option.Option(String)) -> store.StoredSummary {
       tags_source: thread.AutoTags,
       archived: False,
       bot_id: bot_id,
+      parent_thread_id: None,
       created_at: 1_700_000_000,
     ),
     last_active_at: 1_700_000_000,

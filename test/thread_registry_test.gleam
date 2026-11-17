@@ -209,6 +209,8 @@ fn new_thread(provider_id: String, model: String) -> thread_registry.NewThread {
     system_prompt: None,
     toolset: None,
     bot_id: None,
+    parent_thread_id: None,
+    title: "",
   )
 }
 
@@ -383,6 +385,47 @@ pub fn get_reports_gone_thread_after_failed_restart_test() {
   // The registry survived and restarted it: get works, list works.
   let assert Ok(_subject) = thread_registry.get(registry, a.id)
   thread_registry.list_threads(registry) |> list.length |> should.equal(1)
+}
+
+/// The delete cascade must survive a record whose named subject has no
+/// owner behind it (CodeRabbit PR review on #137): a failed restart
+/// leaves `start_error` set and the name unregistered — a send to it
+/// panics the registry (the archive notify has skipped such records
+/// since the cubic PR review; the delete path now shares that
+/// discipline). The kill is the real stop for such a record; Stop is
+/// the graceful cancel-commit for live actors only.
+pub fn delete_survives_a_failed_start_record_test() {
+  // The Down replacement rehydrates (the mock seam holds the rows), and
+  // this starter refuses any HYDRATED argument — exactly the restart —
+  // so the record is left with a failed start and no live actor. It is
+  // hidden from `list_threads` (the unavailable discipline) and its GET
+  // retries the rehydrate, which the starter refuses again.
+  let #(registry, seam) =
+    start_registry_keeping_seam_with(
+      fn(argument: thread_registry.ChildArgument) {
+        case argument.spec.hydrated {
+          True -> Error(actor.InitFailed("restarted child refused"))
+          False -> thread_registry.thread_child(argument)
+        }
+      },
+      store_mock.seam(store_mock.start()),
+    )
+  let a = create(registry, "alpha", happy_runner)
+  process.kill(a.pid)
+  wait_for_down(a.pid)
+
+  // Setup state, not just the outcome: hidden from listings, but the
+  // store row stands — the delete has something real to remove.
+  thread_registry.list_threads(registry) |> should.equal([])
+  let assert Ok(_) = seam.get_thread(a.id)
+
+  // Deleting the failed-start record must complete: the dead subject is
+  // skipped, the store row goes, and the registry keeps answering.
+  thread_registry.delete_thread(registry, a.id) |> should.be_true
+  seam.get_thread(a.id)
+  |> should.equal(Error("no stored thread " <> a.id))
+  thread_registry.get(registry, a.id) |> should.equal(Error(Nil))
+  thread_registry.delete_thread(registry, a.id) |> should.be_false
 }
 
 /// A child starter that cannot produce an actor: `Create` must report the
@@ -640,6 +683,7 @@ fn seed_with_tags(seam: store.Store, id: String, tags: List(String)) -> Nil {
           tags_manual: [],
           tags_source: thread.AutoTags,
           bot_id: None,
+          parent_thread_id: None,
           created_at: 1_700_000_000,
         ),
         last_active_at: 1_700_000_000,
@@ -991,6 +1035,7 @@ fn seed_at(
           tags_manual: [],
           tags_source: thread.AutoTags,
           bot_id: None,
+          parent_thread_id: None,
           created_at: last_active_at,
         ),
         last_active_at: last_active_at,
@@ -1022,6 +1067,41 @@ fn seed_env(seam: store.Store, id: String, message_count: Int) -> Nil {
         roster: None,
         last_active_at: 1_700_000_000,
         message_count: message_count,
+      ),
+      "test system prompt",
+    )
+  Nil
+}
+
+/// A used channel row hanging off `parent` — the boot-sweep regression
+/// rig: committed history (message_count 3) behind the parent link.
+fn seed_channel(seam: store.Store, id: String, parent: String) -> Nil {
+  store_mock.ensure_fixture_provider(seam)
+  let assert Ok(Nil) =
+    seam.insert_thread(
+      store.StoredSummary(
+        id: id,
+        provider_id: store_mock.fixture_provider_id,
+        model: "alpha",
+        meta: thread.ThreadMeta(
+          title: "beta",
+          title_source: thread.AutoTitle,
+          pinned: False,
+          tags: [],
+          tags_manual: [],
+          tags_source: thread.AutoTags,
+          archived: False,
+          bot_id: None,
+          parent_thread_id: option.Some(parent),
+          created_at: 1_700_000_000,
+        ),
+        toolset: thread_registry.plain_entries(
+          tools.default_names(test_config()),
+        ),
+        workspace_root: None,
+        roster: None,
+        last_active_at: 1_700_000_060,
+        message_count: 3,
       ),
       "test system prompt",
     )
@@ -1080,6 +1160,39 @@ pub fn boot_sweep_deletes_never_used_threads_test() {
     })
     |> list.flatten
   swept |> should.equal(["s1", "s2", "s7"])
+}
+
+/// A parent with a channel child is NEVER swept, however empty and
+/// stale it looks on the sweep's own filters: the FK's CASCADE would
+/// delete the child's committed history with it. A parent looks
+/// never-used until its first turn commits, so a crash mid-first-turn
+/// plus a restart past the grace window is exactly this state
+/// (CodeRabbit PR review on #137).
+pub fn boot_sweep_spares_parent_with_channel_child_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  // The parent is sweeps-eligible on EVERY filter: empty, auto-titled,
+  // unpinned, far past the grace window.
+  seed(seam, "s-parent", "", thread.AutoTitle, False, False, 1)
+  // Its channel carries committed history (count 3 — it survives on
+  // its own filters too; the parent is what needs the child check).
+  seed_channel(seam, "s-child", "s-parent")
+
+  let registry = start_registry_over(seam)
+  // The parent survives the sweep and lists (the channel is
+  // second-class: stored, never listed).
+  listed_ids(registry) |> should.equal(["s-parent"])
+  let swept =
+    store_mock.events(mock)
+    |> list.filter_map(fn(event) {
+      case event {
+        store_mock.EvPruneNeverUsed(ids) -> Ok(ids)
+        _ -> Error(Nil)
+      }
+    })
+    |> list.flatten
+  swept |> should.equal([])
+  let assert Ok(_) = seam.get_thread("s-child")
 }
 
 /// A never-used row inside the grace window is swept by a LATER boot,
@@ -1296,6 +1409,7 @@ fn stored_with_toolset(id: String, names: List(String)) -> store.StoredSummary {
       tags_source: thread.AutoTags,
       archived: False,
       bot_id: None,
+      parent_thread_id: None,
       created_at: timing.wall_now_s(),
     ),
     toolset: thread_registry.plain_entries(names),
@@ -1373,6 +1487,8 @@ pub fn create_from_bot_freezes_columns_and_provenance_test() {
         system_prompt: Some("be terse"),
         toolset: None,
         bot_id: Some("b1"),
+        parent_thread_id: None,
+        title: "",
       ),
       toolset(happy_runner),
     )
@@ -1412,6 +1528,8 @@ pub fn create_from_null_prompt_bot_freezes_config_default_test() {
         system_prompt: None,
         toolset: None,
         bot_id: Some("b2"),
+        parent_thread_id: None,
+        title: "",
       ),
       toolset(happy_runner),
     )
@@ -1443,6 +1561,8 @@ pub fn toolset_snapshot_persisted_at_creation_test() {
         system_prompt: None,
         toolset: Some(["http_fetch"]),
         bot_id: None,
+        parent_thread_id: None,
+        title: "",
       ),
     )
   let assert Ok(stored) = seam.get_thread(explicit.id)
@@ -1475,6 +1595,8 @@ pub fn chat_only_toolset_create_test() {
         system_prompt: None,
         toolset: Some([]),
         bot_id: None,
+        parent_thread_id: None,
+        title: "",
       ),
     )
   let assert Ok(stored) = seam.get_thread(summary.id)
@@ -1491,6 +1613,8 @@ pub fn chat_only_toolset_create_test() {
         system_prompt: None,
         toolset: Some([]),
         bot_id: None,
+        parent_thread_id: None,
+        title: "",
       ),
     )
   let assert Ok(second_stored) = seam.get_thread(second.id)
@@ -1511,6 +1635,8 @@ pub fn unknown_toolset_create_refused_test() {
       system_prompt: None,
       toolset: Some(["nope"]),
       bot_id: None,
+      parent_thread_id: None,
+      title: "",
     ),
   )
   |> should.equal(
@@ -1564,6 +1690,8 @@ pub fn plugin_toolset_create_resolves_through_provider_table_test() {
         system_prompt: None,
         toolset: Some(["http_fetch", "example__echo"]),
         bot_id: None,
+        parent_thread_id: None,
+        title: "",
       ),
     )
   let assert Ok(stored) = seam.get_thread(summary.id)
@@ -1581,6 +1709,8 @@ pub fn plugin_toolset_create_resolves_through_provider_table_test() {
       system_prompt: None,
       toolset: Some(["nosuch__thing"]),
       bot_id: None,
+      parent_thread_id: None,
+      title: "",
     ),
   )
   // Plugin-api Phase 2: a QUALIFIED name whose server half is not a
@@ -1610,6 +1740,8 @@ pub fn create_from_bot_toolset_snapshot_test() {
         system_prompt: None,
         toolset: Some(["http_fetch"]),
         bot_id: Some("b-tools"),
+        parent_thread_id: None,
+        title: "",
       ),
     )
   let assert Ok(stored) = seam.get_thread(summary.id)
@@ -1631,6 +1763,8 @@ pub fn create_from_bot_toolset_snapshot_test() {
         system_prompt: None,
         toolset: None,
         bot_id: Some("b-default"),
+        parent_thread_id: None,
+        title: "",
       ),
     )
   let assert Ok(stored) = seam.get_thread(from_default_bot.id)
@@ -1650,6 +1784,8 @@ pub fn create_from_bot_toolset_snapshot_test() {
         system_prompt: None,
         toolset: None,
         bot_id: None,
+        parent_thread_id: None,
+        title: "",
       ),
     )
   let assert Ok(stored) = seam.get_thread(plain.id)
@@ -1916,6 +2052,7 @@ pub fn dormant_summary_carries_bot_provenance_test() {
           tags_manual: [],
           tags_source: thread.AutoTags,
           bot_id: Some("b1"),
+          parent_thread_id: None,
           created_at: 1_700_000_000,
         ),
         last_active_at: 1_700_000_000,
@@ -2024,6 +2161,7 @@ pub fn bot_delete_scrubs_cached_provenance_test() {
             tags_manual: [],
             tags_source: thread.AutoTags,
             bot_id: Some(bot),
+            parent_thread_id: None,
             created_at: 1_700_000_000,
           ),
           last_active_at: 1_700_000_000,
@@ -2056,6 +2194,8 @@ pub fn bot_delete_scrubs_cached_provenance_test() {
         system_prompt: Some("p"),
         toolset: None,
         bot_id: Some("b1"),
+        parent_thread_id: None,
+        title: "",
       ),
       toolset(happy_runner),
     )
@@ -2118,6 +2258,8 @@ pub fn unpersisted_create_carries_no_provenance_test() {
         system_prompt: Some("p"),
         toolset: None,
         bot_id: Some("b1"),
+        parent_thread_id: None,
+        title: "",
       ),
       toolset(happy_runner),
     )
@@ -2158,6 +2300,8 @@ pub fn env_capable_ask_test() {
       thread_registry.NewThread(
         ..new_thread(store_mock.fixture_provider_id, "env-thread"),
         toolset: Some(["bash"]),
+        parent_thread_id: None,
+        title: "",
       ),
     )
   let assert Ok(plain_thread) =
@@ -2166,6 +2310,8 @@ pub fn env_capable_ask_test() {
       thread_registry.NewThread(
         ..new_thread(store_mock.fixture_provider_id, "plain-thread"),
         toolset: None,
+        parent_thread_id: None,
+        title: "",
       ),
     )
   should.be_true(thread_registry.env_capable(registry, env_thread.id))
@@ -2227,6 +2373,8 @@ pub fn env_toolset_refused_without_workspace_root_test() {
     thread_registry.NewThread(
       ..new_thread(store_mock.fixture_provider_id, "alpha"),
       toolset: Some(["bash", "read_file"]),
+      parent_thread_id: None,
+      title: "",
     ),
   )
   |> should.equal(
@@ -2250,6 +2398,8 @@ pub fn env_toolset_create_freezes_root_and_appends_roster_test() {
       thread_registry.NewThread(
         ..new_thread(store_mock.fixture_provider_id, "alpha"),
         toolset: Some(["bash"]),
+        parent_thread_id: None,
+        title: "",
       ),
     )
   // The persisted row carries the frozen root.
@@ -2481,6 +2631,7 @@ fn fresh_meta() -> thread.ThreadMeta {
     bot_id: None,
     // Recent: the boot sweep prunes never-used rows past its grace
     // window, keyed on last_active_at.
+    parent_thread_id: None,
     created_at: timing.wall_now_s(),
   )
 }
@@ -2584,6 +2735,8 @@ pub fn route_env_resolves_live_thread_and_attaches_plane_test() {
       thread_registry.NewThread(
         ..new_thread(store_mock.fixture_provider_id, "alpha"),
         toolset: option.Some(["bash"]),
+        parent_thread_id: None,
+        title: "",
       ),
     )
   let assert Ok(sess) = thread_registry.get(registry, summary.id)

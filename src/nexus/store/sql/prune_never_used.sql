@@ -16,9 +16,20 @@
 -- The grace window protects a thread another concurrently-running
 -- server created moments ago and still holds live — it stays empty
 -- until its first turn commits. 15 minutes is far past any first turn.
+--
+-- Parents with channel children are NEVER swept: the FK's CASCADE
+-- would take the channels' committed history with them — a parent
+-- looks never-used until its first turn commits, so a crash
+-- mid-first-turn plus a restart after the grace window is exactly the
+-- state where an old parent row still hangs a channel with durable
+-- transcripts. The child check reads the same table CASCADE would
+-- delete from.
 delete from thread
 where (message_count <= 1 or (workspace_root is not null and message_count <= 2))
   and title_source = 'auto'
   and pinned = false
   and last_active_at < now() - interval '15 minutes'
+  and not exists (
+    select 1 from thread c where c.parent_thread_id = thread.id
+  )
 returning id

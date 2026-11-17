@@ -136,6 +136,7 @@ fn fresh_meta() -> thread.ThreadMeta {
     tags_source: thread.AutoTags,
     archived: False,
     bot_id: None,
+    parent_thread_id: None,
     created_at: 1_700_000_000,
   )
 }
