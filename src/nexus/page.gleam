@@ -1072,20 +1072,22 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
 .provider-form-buttons { display: flex; gap: .3rem; }
 #app .provider-form-buttons button { font-size: .75rem; padding: .25rem .6rem; }
 /* The bot forms' tool picker (issue #121): a Pico fieldset holding a
-   controls row (All/None + an optional unavailable note) over a
-   wrapped list of checkbox labels. Checkboxes, borders, and focus
-   rings are Pico's; only the layout is patched — the box list must
-   wrap compactly and cap its height so a plugin-heavy catalog cannot
-   stretch the form card. */
+   controls row (All/None + an optional unavailable note) over a GRID
+   of checkbox labels — equal-width tracks via auto-fill, so the
+   checkboxes align into true columns (a flex-wrap list scatters each
+   row to wherever the longest name lands) and the count adapts to the
+   card's width. Checkboxes, borders, and focus rings are Pico's; only
+   the layout is patched, plus the height cap so a plugin-heavy
+   catalog cannot stretch the form card. */
 .tool-picker { display: flex; flex-direction: column; gap: .35rem; margin: 0;
   padding: .45rem .55rem; border-radius: 10px; }
 .tool-picker legend { font-size: .7rem; font-weight: 600; text-transform: uppercase;
   letter-spacing: .07em; opacity: .55; padding: 0 .25rem; }
 .tool-picker-controls { display: flex; align-items: center; gap: .3rem; flex-wrap: wrap; }
 #app .tool-picker-controls button { font-size: .7rem; padding: .15rem .5rem; margin: 0; }
-.tool-picker-list { display: flex; flex-wrap: wrap; gap: .2rem .8rem;
-  max-height: 10rem; overflow-y: auto; }
-.tool-picker-list .checkbox-field { display: inline-flex; align-items: center; gap: .3rem; }
+.tool-picker-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(10.5rem, 1fr));
+  gap: .3rem 1rem; max-height: 10rem; overflow-y: auto; }
+.tool-picker-list .checkbox-field { display: flex; align-items: center; gap: .3rem; min-width: 0; }
 .tool-picker-list .muted, .tool-picker-controls .muted { font-size: .75rem; }
 /* Form visuals (borders, focus rings, filled backgrounds, dark mode) are
    Pico's, driven by the tokens above. Only the layout leftovers are
