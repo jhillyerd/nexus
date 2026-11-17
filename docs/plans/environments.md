@@ -66,8 +66,14 @@ adapter, never as this transport).
 - **Env tools are ordinary compiled-in tools** (`bash`, `read_file`,
   `write_file`, `list_dir`), frozen into `thread.toolset` at creation like
   any other names — via a bot template or an explicit create flag. They
-  are **never in the default toolset**: a config flip must not change the
-  default envelope (same reasoning as the SearxNG gate on `web_search`).
+  are gated OUT of the default toolset while no workspace root is
+  configured: a config flip must not change the default envelope (same
+  reasoning as the SearxNG gate on `web_search`). *As-built delta
+  (post-#121 picker, pre-deployment operator call):* the default toolset
+  is now "every catalog tool that works in this deployment", so WITH a
+  root configured the env four JOIN the default (and future compiled
+  tools join automatically via `catalog_names`) — the stability property
+  is unchanged, the posture is deliberately richer.
 - Every env tool takes a **`target: string` parameter** — a free string,
   not an enum. The schema is byte-identical whether zero or five nodes are
   attached; per-node tools (`bash_on_proxmox2`) are structurally

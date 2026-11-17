@@ -57,8 +57,53 @@ pub fn default_names_searxng_gate_test() {
 
 pub fn default_names_codemode_gate_test() {
   let enabled = cfg([#("NEXUS_CODEMODE", "true")])
+  // Sorted catalog order; codemode's SCHEMA still registers last in
+  // `by_names_with` wherever the name sits.
   tools.default_names(enabled)
-  |> should.equal(["http_fetch", "codemode"])
+  |> should.equal(["codemode", "http_fetch"])
+}
+
+/// The env tools join the default exactly when a workspace root exists
+/// to freeze (the same usability gate a create applies to explicit env
+/// names), and stay out otherwise — the amended environments-plan rule.
+pub fn default_names_env_gate_test() {
+  let rooted = cfg([#("NEXUS_WORKSPACE_ROOT", "/srv/workspaces")])
+  tools.default_names(rooted)
+  |> should.equal([
+    "bash",
+    "http_fetch",
+    "list_dir",
+    "read_file",
+    "write_file",
+  ])
+}
+
+/// Everything usable on: the full catalog minus `bot_message` (the
+/// registry injects it into bot threads itself), in sorted catalog
+/// order — a future compiled tool joins the default automatically
+/// unless it needs its own gate line in `default_names`.
+pub fn default_names_everything_usable_test() {
+  let everything =
+    cfg([
+      #("NEXUS_CODEMODE", "true"),
+      #("NEXUS_SEARXNG_BASE_URL", "http://127.0.0.1:8888"),
+      #("NEXUS_WORKSPACE_ROOT", "/srv/workspaces"),
+    ])
+  tools.default_names(everything)
+  |> should.equal([
+    "bash",
+    "codemode",
+    "http_fetch",
+    "list_dir",
+    "read_file",
+    "web_search",
+    "write_file",
+  ])
+  // And the m3 golden's exact envelope is untouched by the widening:
+  // the smoke shape (SearxNG on, no codemode, no root) resolves to the
+  // same two names, same order, the fixture was captured with.
+  let smoke = cfg([#("NEXUS_SEARXNG_BASE_URL", "https://searx.example")])
+  tools.default_names(smoke) |> should.equal(["http_fetch", "web_search"])
 }
 
 // ---- default: the boot-frozen registry -----------------------------------

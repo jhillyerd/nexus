@@ -187,14 +187,22 @@ stays open, one runtime per connection.
 `docs/plans/environments.md` carries the full design and as-built
 deltas; the rules that bite silently:
 
-- **Env tools are compiled names that never join the default set.**
+- **Env tools join the default set only while a root can be frozen.**
   `bash`, `read_file`, `write_file`, `list_dir` resolve through the
   catalog config-INDEPENDENTLY (a snapshot pins past a removed
   `NEXUS_WORKSPACE_ROOT`, like `web_search` past SearxNG) — but a
   CREATE or BOT SAVE naming them refuses while no root can be frozen
   ("workspace tools require NEXUS_WORKSPACE_ROOT to be set", a 400).
-  The RESOLVED root freezes per thread onto `thread.workspace_root`;
-  hydration rebuilds the handle from the ROW, never the config.
+  The default toolset is "every catalog tool that works in this
+  deployment" (amended pre-deployment, operator call): `default_names`
+  includes the env four exactly when the config has a root, so the
+  default envelope stays a pure function of the boot config — the
+  config-stability property the original never-in-default rule
+  protected. `bot_message` is never in the human default: the registry
+  injects it into bot-default threads itself, and a plain thread has no
+  delivery identity to send from. The RESOLVED root freezes per thread
+  onto `thread.workspace_root`; hydration rebuilds the handle from the
+  ROW, never the config.
 - **Every env tool takes `target` as a free string** — the schema is
   byte-identical however many environments are attached; only
   execution routing is dynamic. `workspace` runs the local Phase 1

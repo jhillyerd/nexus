@@ -659,10 +659,15 @@ async function main() {
     }
   });
 
-  await check("env role refused on a plain thread (403)", async () => {
+  await check("env role refused on a non-env thread (403)", async () => {
+    // An EXPLICIT non-env toolset: under the amended default policy
+    // (default = every tool that works here), a no-tools thread on this
+    // rooted server carries the env four and is env-capable — the
+    // refusal gate is exercised by a snapshot that truly lacks them.
     const plain = await api("POST", "/threads", {
       provider: "fakenode",
       model: "smart",
+      tools: ["http_fetch"],
     });
     if (plain.status !== 201) {
       throw new Error(`plain thread creation returned ${plain.status}`);
@@ -675,6 +680,27 @@ async function main() {
     if (bad.frames.length) {
       throw new Error(`frames arrived on a refused socket: ${bad.frames[0]}`);
     }
+  });
+
+  // The amended default policy pinned live: a default thread (no
+  // explicit tools) on this rooted server carries the env tools, so the
+  // env-role plane ATTACHES to it.
+  await check("env role attaches to a default thread on a rooted server", async () => {
+    const def = await api("POST", "/threads", {
+      provider: "fakenode",
+      model: "smart",
+    });
+    if (def.status !== 201) {
+      throw new Error(`default thread creation returned ${def.status}`);
+    }
+    const node = new FakeNode(nodeUrl(def.body.id));
+    const opened = await node.connect();
+    if (opened === null) {
+      throw new Error("env socket closed at connect on a default thread");
+    }
+    await node.waitFor((f) => f.type === "hello", "default-thread env hello");
+    node.ws.close();
+    await Promise.race([node.closed, sleep(3000)]);
   });
 
   await check("viewer role: events + send, no tool plane", async () => {

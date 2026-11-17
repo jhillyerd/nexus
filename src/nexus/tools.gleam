@@ -126,9 +126,10 @@ pub const freeze_ask_ms = 4000
 
 /// Every compiled-in tool name, in display order (issue #121's checkbox
 /// list reads this; so does `is_compiled_name`, which is now derived
-/// from it — one list, no drift). The four environment tools
-/// (environments plan Phase 1) are compiled names like any other —
-/// never in the DEFAULT set.
+/// from it — one list, no drift). `default_names` filters this list by
+/// per-tool usability, so a tool added here surfaces in the picker AND
+/// the default set in one edit (unless it needs its own gate line
+/// there).
 pub fn catalog_names() -> List(String) {
   ["http_fetch", "web_search", "bot_message", "codemode", ..env.tool_names()]
   |> list.sort(string.compare)
@@ -143,21 +144,35 @@ pub fn is_compiled_name(name: String) -> Bool {
   list.contains(catalog_names(), name)
 }
 
-/// The default M3 toolset's NAMES, derived from the global config — the
-/// selection half of the `default(cfg)` split (bots plan P2 prep, #76).
-/// `web_search` is selected only when a SearxNG base URL is configured;
-/// `codemode` only when its flag is on — with the flag off the list is
-/// exactly the pre-codemode registry (KV-cache contract rule 4). The
-/// order here is the wire order of the resolved schemas.
+/// The default toolset's NAMES: every catalog tool that WORKS in this
+/// deployment — the operator's "everything usable" posture, with tools
+/// added to nexus later joining automatically (the catalog is the
+/// source; the live-template NULL bots and plain threads track it). The
+/// filter drops exactly the tools that would error or refuse here:
+/// `bot_message` (the registry injects it into bot-default threads
+/// itself — a plain thread has no delivery identity to send from),
+/// `web_search` without a SearxNG base URL and `codemode` with the flag
+/// off (the existing gates; with the flag off the codemode schema stays
+/// out — KV-cache contract rule 4), and the environment tools without a
+/// workspace root to freeze (the same usability gate a create applies
+/// to explicit env names). The result is a pure function of the boot
+/// config, so the default envelope stays config-stable (the
+/// environments plan's stated concern for keeping env tools out —
+/// amended: with a root configured they join the default). A future
+/// compiled tool joins automatically unless it needs its own gate line
+/// here. The order is the sorted catalog order — the wire order of the
+/// resolved schemas, with codemode still registering last wherever
+/// named (`by_names_with`).
 pub fn default_names(cfg: Config) -> List(String) {
-  let names = case cfg.searxng_base_url {
-    Some(_) -> ["http_fetch", "web_search"]
-    None -> ["http_fetch"]
-  }
-  case cfg.codemode {
-    True -> list.append(names, ["codemode"])
-    False -> names
-  }
+  catalog_names()
+  |> list.filter(fn(name) {
+    case name {
+      "bot_message" -> False
+      "web_search" -> option.is_some(cfg.searxng_base_url)
+      "codemode" -> cfg.codemode
+      name -> !env.is_env_name(name) || option.is_some(cfg.workspace_root)
+    }
+  })
 }
 
 /// Resolve tool NAMES into specs against the compiled-in catalog — the
