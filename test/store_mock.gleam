@@ -786,12 +786,27 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
     PruneNeverUsed(reply) -> {
       // Same contract as prune_never_used.sql: never-used (system
       // prompt only, auto-titled, unpinned) AND older than the grace
-      // window that protects a concurrent server's fresh empty.
+      // window that protects a concurrent server's fresh empty. A
+      // parent with a channel child is NEVER swept — the FK's CASCADE
+      // would take the child's committed history with it (mirrors the
+      // SQL's not-exists child check).
+      let parents_with_children =
+        state.threads
+        |> dict.values
+        |> list.filter_map(fn(stored) {
+          case stored.summary.meta.parent_thread_id {
+            option.Some(parent) -> Ok(parent)
+            option.None -> Error(Nil)
+          }
+        })
       let cutoff = timing.wall_now_s() - prune_grace_s
       let ids =
         state.threads
         |> dict.values
-        |> list.filter(fn(stored) { never_used(stored.summary, cutoff) })
+        |> list.filter(fn(stored) {
+          never_used(stored.summary, cutoff)
+          && !list.contains(parents_with_children, stored.summary.id)
+        })
         |> list.map(fn(stored) { stored.summary.id })
         |> list.sort(string.compare)
       let threads =

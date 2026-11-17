@@ -1566,12 +1566,12 @@ pub type PruneNeverUsedRow {
 /// until its first turn commits. 15 minutes is far past any first turn.
 ///
 /// Parents with channel children are NEVER swept: the FK's CASCADE
-/// (bot-channels plan, #123) would take the channels' committed history
-/// with them — a parent looks never-used until its first turn commits,
-/// so a crash mid-first-turn plus a restart after the grace window is
-/// exactly the state where an old parent row still hangs a channel with
-/// durable transcripts. The child check reads the same table CASCADE
-/// would delete from.
+/// would take the channels' committed history with them — a parent
+/// looks never-used until its first turn commits, so a crash
+/// mid-first-turn plus a restart after the grace window is exactly the
+/// state where an old parent row still hangs a channel with durable
+/// transcripts. The child check reads the same table CASCADE would
+/// delete from.
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
@@ -1604,12 +1604,12 @@ pub fn prune_never_used(
 -- until its first turn commits. 15 minutes is far past any first turn.
 --
 -- Parents with channel children are NEVER swept: the FK's CASCADE
--- (bot-channels plan, #123) would take the channels' committed history
--- with them — a parent looks never-used until its first turn commits,
--- so a crash mid-first-turn plus a restart after the grace window is
--- exactly the state where an old parent row still hangs a channel with
--- durable transcripts. The child check reads the same table CASCADE
--- would delete from.
+-- would take the channels' committed history with them — a parent
+-- looks never-used until its first turn commits, so a crash
+-- mid-first-turn plus a restart after the grace window is exactly the
+-- state where an old parent row still hangs a channel with durable
+-- transcripts. The child check reads the same table CASCADE would
+-- delete from.
 delete from thread
 where (message_count <= 1 or (workspace_root is not null and message_count <= 2))
   and title_source = 'auto'

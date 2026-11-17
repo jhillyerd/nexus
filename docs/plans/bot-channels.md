@@ -399,6 +399,25 @@ instruction. So:
   5 s; after the owner check the realistic unavailability resolves
   instantly, and a wedged-but-registered bot registry stalls every bot
   delivery identically — revisit if a wedge is ever observed).
+- **Cubic review deltas, round 2 (PR #137)**: the archive guard reads
+  dormant summaries too (the deleted-sender guard admits dormant
+  senders; `sender_archived` failing open there would let an orphaned
+  worker open a new ACTIVE channel under an archived dormant parent);
+  every named-subject send in the registry now rides `try_send_named`
+  (the provider adapter's rescued `try_send` — owner resolution
+  instant-refuses, the rescued send closes the check→send window no
+  is_alive/process.named check can: archive notify, delete cascade,
+  `sender_name_ask`); the mock store's sweep mirror excludes parents
+  with channel children like the SQL (plus the boot regression test);
+  and plan-reference asides stay out of `.sql` comments (they are
+  copied into generated `sql.gleam` — provenance lives in the Gleam
+  docs). NOT taken: serializing the boot sweep against concurrent
+  channel inserts — the sweep runs inside the registry actor's
+  initialiser, before any channel writer on the node exists; the race
+  needs two nodes sharing one database (outside the supported
+  topology), and Postgres' FK KEY SHARE lock already orders an
+  insert-vs-delete race deterministically (the insert commits first or
+  fails, never corrupts).
 
 ### Phase 2 — the thread info pane (UI + e2e)
 

@@ -400,20 +400,30 @@ pub fn delete_survives_a_failed_start_record_test() {
   // so the record is left with a failed start and no live actor. It is
   // hidden from `list_threads` (the unavailable discipline) and its GET
   // retries the rehydrate, which the starter refuses again.
-  let registry =
-    start_registry_with(fn(argument: thread_registry.ChildArgument) {
-      case argument.spec.hydrated {
-        True -> Error(actor.InitFailed("restarted child refused"))
-        False -> thread_registry.thread_child(argument)
-      }
-    })
+  let #(registry, seam) =
+    start_registry_keeping_seam_with(
+      fn(argument: thread_registry.ChildArgument) {
+        case argument.spec.hydrated {
+          True -> Error(actor.InitFailed("restarted child refused"))
+          False -> thread_registry.thread_child(argument)
+        }
+      },
+      store_mock.seam(store_mock.start()),
+    )
   let a = create(registry, "alpha", happy_runner)
   process.kill(a.pid)
   wait_for_down(a.pid)
 
+  // Setup state, not just the outcome: hidden from listings, but the
+  // store row stands — the delete has something real to remove.
+  thread_registry.list_threads(registry) |> should.equal([])
+  let assert Ok(_) = seam.get_thread(a.id)
+
   // Deleting the failed-start record must complete: the dead subject is
   // skipped, the store row goes, and the registry keeps answering.
   thread_registry.delete_thread(registry, a.id) |> should.be_true
+  seam.get_thread(a.id)
+  |> should.equal(Error("no stored thread " <> a.id))
   thread_registry.get(registry, a.id) |> should.equal(Error(Nil))
   thread_registry.delete_thread(registry, a.id) |> should.be_false
 }
@@ -1063,6 +1073,41 @@ fn seed_env(seam: store.Store, id: String, message_count: Int) -> Nil {
   Nil
 }
 
+/// A used channel row hanging off `parent` — the boot-sweep regression
+/// rig: committed history (message_count 3) behind the parent link.
+fn seed_channel(seam: store.Store, id: String, parent: String) -> Nil {
+  store_mock.ensure_fixture_provider(seam)
+  let assert Ok(Nil) =
+    seam.insert_thread(
+      store.StoredSummary(
+        id: id,
+        provider_id: store_mock.fixture_provider_id,
+        model: "alpha",
+        meta: thread.ThreadMeta(
+          title: "beta",
+          title_source: thread.AutoTitle,
+          pinned: False,
+          tags: [],
+          tags_manual: [],
+          tags_source: thread.AutoTags,
+          archived: False,
+          bot_id: None,
+          parent_thread_id: option.Some(parent),
+          created_at: 1_700_000_000,
+        ),
+        toolset: thread_registry.plain_entries(
+          tools.default_names(test_config()),
+        ),
+        workspace_root: None,
+        roster: None,
+        last_active_at: 1_700_000_060,
+        message_count: 3,
+      ),
+      "test system prompt",
+    )
+  Nil
+}
+
 fn listed_ids(registry: process.Subject(thread_registry.Msg)) -> List(String) {
   thread_registry.list_threads(registry)
   |> list.map(fn(summary) { summary.id })
@@ -1115,6 +1160,39 @@ pub fn boot_sweep_deletes_never_used_threads_test() {
     })
     |> list.flatten
   swept |> should.equal(["s1", "s2", "s7"])
+}
+
+/// A parent with a channel child is NEVER swept, however empty and
+/// stale it looks on the sweep's own filters: the FK's CASCADE would
+/// delete the child's committed history with it. A parent looks
+/// never-used until its first turn commits, so a crash mid-first-turn
+/// plus a restart past the grace window is exactly this state
+/// (CodeRabbit PR review on #137).
+pub fn boot_sweep_spares_parent_with_channel_child_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  // The parent is sweeps-eligible on EVERY filter: empty, auto-titled,
+  // unpinned, far past the grace window.
+  seed(seam, "s-parent", "", thread.AutoTitle, False, False, 1)
+  // Its channel carries committed history (count 3 — it survives on
+  // its own filters too; the parent is what needs the child check).
+  seed_channel(seam, "s-child", "s-parent")
+
+  let registry = start_registry_over(seam)
+  // The parent survives the sweep and lists (the channel is
+  // second-class: stored, never listed).
+  listed_ids(registry) |> should.equal(["s-parent"])
+  let swept =
+    store_mock.events(mock)
+    |> list.filter_map(fn(event) {
+      case event {
+        store_mock.EvPruneNeverUsed(ids) -> Ok(ids)
+        _ -> Error(Nil)
+      }
+    })
+    |> list.flatten
+  swept |> should.equal([])
+  let assert Ok(_) = seam.get_thread("s-child")
 }
 
 /// A never-used row inside the grace window is swept by a LATER boot,

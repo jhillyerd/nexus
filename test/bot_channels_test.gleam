@@ -612,6 +612,37 @@ pub fn channel_persist_failure_refuses_test() {
   )
 }
 
+/// An ARCHIVED parent that is DORMANT refuses deliveries too (cubic PR
+/// review on #137): the deleted-sender guard admits dormant senders, so
+/// the archive guard must read the dormant summary's meta — failing
+/// open there would let a worker orphaned by a registry restart open a
+/// BRAND-NEW ACTIVE channel under an archived parent.
+pub fn dormant_archived_sender_refuses_test() {
+  let booted = boot()
+  let alpha = create_bot(booted, "alpha")
+  let _beta = create_bot(booted, "beta")
+  let _gamma = create_bot(booted, "gamma")
+  let parent = create_parent_thread(booted, alpha.id)
+  let assert delivery.Delivered(c1) =
+    deliver(booted.registry, alpha.id, "alpha", parent, 1, "beta", "hello")
+  wait_idle(booted.registry, c1)
+
+  // Archive the parent, then restart: it demotes to a dormant stored
+  // summary carrying its archived flag.
+  should.equal(
+    thread_registry.set_archived(booted.registry, parent, True),
+    True,
+  )
+  let booted2 = boot_over(booted.seam, refused_endpoint())
+
+  // A delivery FROM the dormant archived parent to a FRESH target is
+  // refused before any find-or-create: nothing new opens under an
+  // archived parent.
+  deliver(booted2.registry, alpha.id, "alpha", parent, 1, "gamma", "new")
+  |> should.equal(delivery.Refused("sender thread is archived"))
+  should.equal(stored_channel_count(booted2, parent), 1)
+}
+
 /// An ARCHIVED CHANNEL refuses deliveries from its parent DURABLY —
 /// including after a restart, where re-derivation re-finds the archived
 /// row instead of resurrecting or recreating it. Reading stays allowed.

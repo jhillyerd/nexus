@@ -115,11 +115,15 @@ the rules that bite silently:
   the actor but not an in-flight turn worker, and the parent FK would
   refuse anything it tried to create anyway. Dormant senders count as
   known (a worker orphaned by a registry restart delivers normally).
-- **Cross-registry name asks resolve the NAMED OWNER first.**
-  `sender_name_ask` checks `process.named(bots_name)` before sending: a
-  send to an unregistered name panics the caller, which — from the
-  channels arm — is this registry (a bot registry mid-restart must
-  degrade the pane's name to None, not crash the spine).
+- **Cross-registry name asks resolve the NAMED OWNER first, and the
+  send itself runs rescued.** `try_send_named` (the provider adapter's
+  `try_send` discipline): `process.named` answers instantly for a name
+  nobody holds, and the rescued send closes the check→send window no
+  liveness check can — a bot registry or descendant actor dying
+  mid-window is "best not sent", never a crashed registry. All three
+  named-subject sends ride it: `sender_name_ask` (channels arm +
+  delivery path), the archive notify, and the delete cascade's
+  `thread.Stop`.
 - **The archive cascade is PERSISTENCE-FIRST.** ONE idempotent recursive
   store update (archive.sql's CTE over `parent_thread_id`) is the
   authority — the registry must NOT inherit the memory-first
@@ -149,9 +153,9 @@ the rules that bite silently:
   cleanup walks `parent_thread_id` to a fixpoint (live + dormant),
   demonitors and kills every live descendant, drops each one's
   records/dormant summaries and `dm` entries, then deletes the root (the
-  store CASCADE removes the rows). The same send discipline as the
+  store CASCADE removes the rows). The same try_send discipline as the
   archive notify applies on the way down: failed-start and queued-DOWN
-  records are skipped (the kill is the real stop), never sent to.
+  records are skipped (the kill is the real stop), never crashed into.
 - **The boot sweep never takes a parent with channel children.**
   `prune_never_used.sql` carries `not exists (select 1 from thread c
   where c.parent_thread_id = thread.id)`: a parent looks never-used

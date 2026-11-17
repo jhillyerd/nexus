@@ -1700,22 +1700,27 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
               // Notify every LIVE subtree member (bounded ask, the
               // non-fatal manual-send pattern): the actor flips its own
               // refusal flag. Records with a failed start or a queued
-              // DOWN are skipped — their subject is dead (a send to an
-              // unregistered name would crash this actor) and the
-              // rehydrated replacement reads its archived state from the
-              // store (born archived), closing the stale-Send window by
-              // construction. A live actor that simply answers slowly
-              // within the bound is tolerated the same way.
+              // DOWN are skipped — their subject is dead — and no
+              // liveness check closes the check→send window, so the
+              // send itself runs rescued (try_send_named, the provider
+              // adapter's discipline): a dying descendant is the
+              // tolerated skip, never a crashed registry. The
+              // rehydrated replacement reads its archived state from
+              // the store (born archived), closing the stale-Send
+              // window by construction. A live actor that simply
+              // answers slowly within the bound is tolerated the same
+              // way.
               list.each(subtree, fn(sid) {
                 case dict.get(state.threads, sid) {
-                  Ok(record) ->
-                    case record.start_error, process.is_alive(record.pid) {
-                      None, True -> {
-                        let reply_subject = process.new_subject()
-                        process.send(
-                          record.subject,
-                          thread.SetArchived(archived, reply_subject),
-                        )
+                  Ok(record) -> {
+                    let reply_subject = process.new_subject()
+                    case
+                      try_send_named(
+                        record.name,
+                        thread.SetArchived(archived, reply_subject),
+                      )
+                    {
+                      True ->
                         case process.receive(reply_subject, 5000) {
                           Ok(_) -> Nil
                           Error(_) ->
@@ -1726,9 +1731,9 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
                               <> "re-derive its archived state)",
                             )
                         }
-                      }
-                      _, _ -> Nil
+                      False -> Nil
                     }
+                  }
                   Error(_) -> Nil
                 }
               })
@@ -1781,16 +1786,16 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
                 case dict.get(state.threads, sid) {
                   Ok(record) -> {
                     let _ = process.demonitor_process(record.monitor)
-                    // The archive notify's discipline: a record with a
-                    // failed start or a queued DOWN has no owner behind
-                    // its named subject — a send to the unregistered
-                    // name would crash THIS actor (CodeRabbit PR review
-                    // on #137). The kill below is the real stop; Stop
-                    // is the graceful cancel-commit for live actors.
-                    case record.start_error, process.is_alive(record.pid) {
-                      None, True -> process.send(record.subject, thread.Stop)
-                      _, _ -> Nil
-                    }
+                    // The archive notify's try_send discipline: a record
+                    // with a failed start or a queued DOWN has no owner
+                    // behind its named subject, and no liveness check
+                    // closes the check→send window (the actor can exit
+                    // between the two) — the send itself runs rescued,
+                    // so a dying descendant can never take THIS actor
+                    // down mid-delete (CodeRabbit PR review on #137).
+                    // The kill below is the real stop; Stop is the
+                    // graceful cancel-commit for live actors.
+                    let _ = try_send_named(record.name, thread.Stop)
                     process.kill(record.pid)
                   }
                   Error(_) -> Nil
@@ -2964,7 +2969,17 @@ fn thread_known(state: State, id: String) -> Bool {
 fn sender_archived(state: State, from_thread_id: String) -> Bool {
   case dict.get(state.threads, from_thread_id) {
     Ok(record) -> record.meta.archived
-    Error(_) -> False
+    // Dormant senders (the deleted-sender guard admits them — an
+    // orphaned worker outliving a registry restart delivers to a
+    // rehydrating thread) read the stored summary: its meta carries the
+    // archived flag a restart must not drop, or an archived dormant
+    // parent could open a BRAND-NEW ACTIVE channel (CodeRabbit PR
+    // review on #137).
+    Error(_) ->
+      case dict.get(state.dormant, from_thread_id) {
+        Ok(summary) -> summary.meta.archived
+        Error(_) -> False
+      }
   }
 }
 
@@ -3389,22 +3404,38 @@ fn sender_name_ask(
   bot_id: String,
 ) -> Result(String, Nil) {
   // The bot registry may be mid-restart: a send to an unregistered
-  // name panics the caller — from the channels arm, THIS registry.
-  // Resolve the owner first; none is the same honest verdict as a
-  // timeout (the pane falls back, the delivery errors) and it arrives
-  // instantly instead of after the full bound (CodeRabbit PR review
-  // on #137).
-  case process.named(bots_name) {
-    Error(_) -> Error(Nil)
-    Ok(_) -> {
-      let reply = process.new_subject()
-      let bots = process.named_subject(bots_name)
-      process.send(bots, bot_registry.Get(bot_id, reply))
+  // name panics the caller — from the channels arm, THIS registry —
+  // and no liveness check closes the check→send window. try_send_named
+  // resolves the owner and rescues the send: none or gone is the same
+  // honest verdict as a timeout (the pane falls back, the delivery
+  // errors) and it arrives instantly instead of after the full bound
+  // (CodeRabbit PR review on #137).
+  let reply = process.new_subject()
+  case try_send_named(bots_name, bot_registry.Get(bot_id, reply)) {
+    False -> Error(Nil)
+    True ->
       case process.receive(reply, delivery_ask_timeout_ms) {
         Ok(Ok(bot)) -> Ok(bot.name)
         _ -> Error(Nil)
       }
-    }
+  }
+}
+
+/// A best-effort send to a NAMED subject's owner — the provider
+/// adapter's `try_send` discipline, for name-resolved targets. The
+/// pinned `process.send` on a NamedSubject is `let assert Ok(pid) =
+/// named(name)`: it badargs on an unregistered name, and an actor that
+/// dies between an owner check and the send unregisters itself in that
+/// window, so no liveness check makes the plain send safe. Resolving
+/// the owner (an instant `False` for a name nobody holds) and running
+/// the send under the catch-all turns every failure shape into "best
+/// not sent".
+fn try_send_named(to: process.Name(msg), msg: msg) -> Bool {
+  case process.named(to) {
+    Error(_) -> False
+    Ok(_) ->
+      rescue.rescue(fn() { process.send(process.named_subject(to), msg) })
+      |> result.is_ok
   }
 }
 
