@@ -280,9 +280,11 @@ As built (see the deltas below the list):
 
 1. Env tools (`bash`, `read_file`, `write_file`, `list_dir`) in the
    compiled catalog, each with `target`; `workspace_root` config
-   (`NEXUS_WORKSPACE_ROOT`); `default_names` unchanged (env tools
+   (`NEXUS_WORKSPACE_ROOT`). `default_names` as of the post-#121
+   picker (see the amended design bullet above): the env four join the
+   default exactly while a root is configured; without one they stay
    opt-in via bot template or create flag — the HTTP create body's
-   `tools` field carries it, `UnknownToolset` semantics reused).
+   `tools` field carries it, `UnknownToolset` semantics reused.
 2. Workspace execution (port exec with cwd default, timeout,
    kill-on-cancel, byte caps at read, canonical-path fs tools); the
    per-thread frozen workspace root; `ToolCtx` environment handle;

@@ -197,6 +197,9 @@ pub fn catalog_enumerates_compiled_plugin_and_foreign_test() {
         #("mcpsrv", tools.ForeignServer(name: server, timeout_ms: 1000)),
         #("dead", tools.ForeignServer(name: dead, timeout_ms: 1000)),
       ]),
+      // Standard collect budget: every asker self-bounds inside the
+      // freeze budget, so the real deadline only guards a wedged asker.
+      tools.freeze_ask_ms + 2000,
     )
   catalog.names
   |> should.equal([
@@ -215,9 +218,40 @@ pub fn catalog_enumerates_compiled_plugin_and_foreign_test() {
   catalog.unavailable |> should.equal(["dead"])
 }
 
+/// The deadline-expiry path: a server whose asker never replies in
+/// time joins `unavailable` BY NAME — the picker omits its tools AND
+/// says so. A tiny collect deadline keeps the test fast; the asker's
+/// eventual reply lands on the (caller-owned, undrained) subject and
+/// is dropped.
+pub fn catalog_deadline_reports_silent_server_test() {
+  let silent = start_silent_mcp()
+  let catalog =
+    tools.catalog(
+      dict.new(),
+      dict.from_list([
+        #("slow", tools.ForeignServer(name: silent, timeout_ms: 1000)),
+      ]),
+      50,
+    )
+  catalog.names |> should.equal(tools.catalog_names())
+  catalog.unavailable |> should.equal(["slow"])
+}
+
 /// A minimal MCP-shaped fake: a named actor answering ListTools with a
 /// fixed catalog (tool_provider_test's fake, reduced to the arm the
 /// catalog enumeration exercises).
+/// Same shape, but answers NOTHING — the ListTools ask runs out its
+/// own clock inside the asker (which the real deadline outpaces here).
+fn start_silent_mcp() -> process.Name(tool_provider.Msg) {
+  let name = process.new_name("nexus_tools_test_silent")
+  let assert Ok(_started) =
+    actor.new(Nil)
+    |> actor.on_message(fn(state, _msg) { actor.continue(state) })
+    |> actor.named(name)
+    |> actor.start
+  name
+}
+
 fn start_fake_mcp(
   defs: List(tool_provider.ToolDef),
 ) -> process.Name(tool_provider.Msg) {

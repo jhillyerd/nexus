@@ -224,7 +224,7 @@ pub fn main() -> Nil {
               // server degrades into the catalog's `unavailable` list.
               fn() {
                 let tools.Catalog(names, unavailable) =
-                  tools.catalog(providers, foreign)
+                  tools.catalog(providers, foreign, tools.freeze_ask_ms + 2000)
                 bot_registry.ToolCatalog(names, unavailable)
               },
             )

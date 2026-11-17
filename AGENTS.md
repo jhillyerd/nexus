@@ -193,9 +193,10 @@ deltas; the rules that bite silently:
   `NEXUS_WORKSPACE_ROOT`, like `web_search` past SearxNG) — but a
   CREATE or BOT SAVE naming them refuses while no root can be frozen
   ("workspace tools require NEXUS_WORKSPACE_ROOT to be set", a 400).
-  The default toolset is "every catalog tool that works in this
-  deployment" (amended pre-deployment, operator call): `default_names`
-  includes the env four exactly when the config has a root, so the
+  The default toolset is every usable COMPILED-IN catalog tool
+  (amended pre-deployment, operator call): `default_names` includes
+  the env four exactly when the config has a root — plugin and MCP
+  tools stay explicit-only (explicit toolset or bot template) — so the
   default envelope stays a pure function of the boot config — the
   config-stability property the original never-in-default rule
   protected. `bot_message` is never in the human default: the registry

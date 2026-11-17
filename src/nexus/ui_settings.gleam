@@ -40,6 +40,7 @@ import nexus/bot.{type Bot}
 import nexus/bot_registry
 import nexus/provider.{type Provider}
 import nexus/provider_registry
+import nexus/rescue
 import nexus/utility
 
 /// Which settings category the page's tab rail shows. Providers is the
@@ -124,8 +125,9 @@ pub type State {
     /// the first bot-form open (add or edit — they are mutually
     /// exclusive, so one slot serves whichever is open), the currently
     /// ticked names, and the Custom switch. OFF the picker is folded:
-    /// the bot saves as the DEFAULT set (every tool that works in this
-    /// deployment, including ones added later). ON the checkboxes
+    /// the bot saves as the DEFAULT set (every built-in tool that
+    /// works in this deployment, including ones added later). ON the
+    /// checkboxes
     /// unfold; an EMPTY selection saves as chat-only — the switch is
     /// what disambiguates empty from default, retiring the old
     /// chat-only checkbox. Seeded from the edited bot's stored toolset
@@ -1311,8 +1313,8 @@ fn bot_tools_picker(state: State) -> Element(Msg) {
         False -> [
           html.span([attr.class("muted")], [
             html.text(
-              "default: every tool that works in this deployment, "
-              <> "including ones added later",
+              "default: every built-in tool that works in this "
+              <> "deployment, including ones added later",
             ),
           ]),
         ]
@@ -1862,8 +1864,16 @@ fn ensure_tool_catalog(
 fn bot_tools_effect(bots: Subject(bot_registry.Msg)) -> Effect(Msg) {
   effect.from(fn(dispatch) {
     process.spawn_unlinked(fn() {
-      let catalog = bot_registry.tool_catalog(bots, catalog_ask_ms)
-      dispatch(BotToolsLoaded(catalog))
+      // The ask panics (gleam_erlang call semantics) if the registry
+      // never answers within the budget — a wedged catalog worker or a
+      // dead registry. Rescue turns that into the degraded field
+      // instead of a stuck "loading tool list…".
+      case
+        rescue.rescue(fn() { bot_registry.tool_catalog(bots, catalog_ask_ms) })
+      {
+        Ok(catalog) -> dispatch(BotToolsLoaded(catalog))
+        Error(_) -> dispatch(BotToolsFetchFailed)
+      }
     })
     Nil
   })

@@ -129,11 +129,18 @@ pub type Msg {
   Delete(id: String, reply: Subject(Result(Nil, RegistryError)))
   /// The pinnable tool catalog (issue #121) — the same boot-injected
   /// truth the validate seam checks against, enumerated for the bot
-  /// forms' checkbox list. The ask can block on live per-server asks
-  /// (bounded by the freeze budget), so the UI calls it off its loop
-  /// and under a generous timeout. (`Catalog`, not `ToolCatalog` — the
-  /// type constructor below owns that name.)
+  /// forms' checkbox list. The closure's live per-server asks must not
+  /// stall unrelated bot CRUD, so the actor does NOT run it inline: it
+  /// spawns an unlinked worker and the result comes back through
+  /// `CatalogDone`, replying to this ask's caller. The caller's
+  /// timeout (generous, fixed) is the bound if the worker dies.
+  /// (`Catalog`, not `ToolCatalog` — the type constructor below owns
+  /// that name.)
   Catalog(reply: Subject(ToolCatalog))
+  /// Internal: the catalog worker's result, routed back through the
+  /// actor to reply to the ask it belongs to. Harmless if forged — it
+  /// just answers a catalog.
+  CatalogDone(reply: Subject(ToolCatalog), catalog: ToolCatalog)
 }
 
 type State {
@@ -149,6 +156,9 @@ type State {
     validate_tools: ValidateTools,
     /// The pinnable-catalog enumeration (see `CatalogFn`, issue #121).
     tool_catalog: CatalogFn,
+    /// The actor's own subject — the catalog worker routes its result
+    /// back through here (see the `Catalog` arm).
+    self: Subject(Msg),
   )
 }
 
@@ -176,6 +186,7 @@ pub fn start(
             store: persistence,
             validate_tools: validate_tools,
             tool_catalog: tool_catalog,
+            self: self,
           ))
           |> actor.returning(self)
           |> actor.selecting(process.new_selector() |> process.select(self))
@@ -320,11 +331,22 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       }
 
     Catalog(reply) -> {
-      // The closure may block on live per-server asks (bounded by the
-      // freeze budget inside the closure) — the actor stalls with it,
-      // exactly like the provider registry stalls on a live model
-      // fetch. The UI asks off its loop and under a generous timeout.
-      process.send(reply, state.tool_catalog())
+      // OFF the actor loop: the closure's live per-server asks (one
+      // freeze budget + slack, concurrent) must not stall unrelated
+      // bot CRUD behind them — the registry actor replies within
+      // microseconds and keeps serving. The unlinked worker runs the
+      // closure and routes the result back through `CatalogDone`; if
+      // the worker dies, no reply lands and the CALLER's timeout
+      // fires (the UI turns that into its degraded field).
+      process.spawn_unlinked(fn() {
+        let catalog = state.tool_catalog()
+        process.send(state.self, CatalogDone(reply, catalog))
+      })
+      actor.continue(state)
+    }
+
+    CatalogDone(reply, catalog) -> {
+      process.send(reply, catalog)
       actor.continue(state)
     }
   }

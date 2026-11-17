@@ -280,6 +280,7 @@ pub type Catalog {
 pub fn catalog(
   providers: ProviderTable,
   foreign: Dict(String, ForeignServer),
+  collect_deadline_ms: Int,
 ) -> Catalog {
   let plain =
     catalog_names()
@@ -289,12 +290,14 @@ pub fn catalog(
   // CONCURRENTLY (the mcp boot probe's shape — one spawned asker per
   // server, one shared reply subject owned by the CALLING process, so
   // the receive is legal): the caller blocks once for the whole
-  // collection (~budget + slack) instead of once per server, so the
-  // bot forms' picker stays fast no matter how many servers are
-  // mounted. A failed or silent server DEGRADES: its name lands in
-  // `unavailable`, its tools are display-omitted — the save-side gate
-  // still passes any `<server>__<tool>` while the server is mounted,
-  // so this is display honesty, never a refusal.
+  // collection instead of once per server, so the bot forms' picker
+  // stays fast no matter how many servers are mounted. Boot passes
+  // freeze_ask_ms + slack (every asker self-bounds inside the freeze
+  // budget; the deadline is defensive). A failed or silent server
+  // DEGRADES: its name lands in `unavailable`, its tools are
+  // display-omitted — the save-side gate still passes any
+  // `<server>__<tool>` while the server is mounted, so this is display
+  // honesty, never a refusal.
   let reply = process.new_subject()
   dict.each(foreign, fn(server, mount) {
     process.spawn_unlinked(fn() {
@@ -305,7 +308,7 @@ pub fn catalog(
     })
   })
   let #(foreign_names, unavailable) =
-    collect_catalog(reply, dict.size(foreign), freeze_ask_ms + 2000, [], [])
+    collect_catalog(reply, dict.keys(foreign), collect_deadline_ms, [], [])
   Catalog(
     names: list.sort(
       list.unique(list.append(plain, foreign_names)),
@@ -316,25 +319,29 @@ pub fn catalog(
 }
 
 /// Collect the spawned per-server ask results off the shared subject,
-/// within the overall deadline (the mcp boot probe's collection rule).
-/// A result that never lands counts as that server being unavailable —
-/// logged nowhere here (the caller renders the name), never a hang.
-fn collect_catalog(
+/// within the deadline (the mcp boot probe's collection rule). The
+/// PENDING server names are tracked, not a count: a result that never
+/// lands within the budget joins `unavailable` with its NAME — the
+/// picker omits its tools AND says so, never silently. (Each asker
+/// self-bounds inside the freeze budget, so the deadline is defensive;
+/// this path keeps it honest.) Public for the timeout-path test — pass
+/// a tiny deadline instead of sleeping for the real one.
+pub fn collect_catalog(
   reply: Subject(#(String, Result(List(tool_provider.ToolDef), String))),
-  remaining: Int,
+  pending: List(String),
   deadline_ms: Int,
   names: List(String),
   unavailable: List(String),
 ) -> #(List(String), List(String)) {
-  case remaining {
-    0 -> #(names, unavailable)
+  case pending {
+    [] -> #(names, unavailable)
     _ ->
       case process.receive(reply, deadline_ms) {
-        Error(Nil) -> #(names, unavailable)
+        Error(Nil) -> #(names, list.append(unavailable, pending))
         Ok(#(server, Ok(defs))) ->
           collect_catalog(
             reply,
-            remaining - 1,
+            list.filter(pending, fn(p) { p != server }),
             deadline_ms,
             list.append(
               names,
@@ -345,10 +352,13 @@ fn collect_catalog(
             unavailable,
           )
         Ok(#(server, Error(_))) ->
-          collect_catalog(reply, remaining - 1, deadline_ms, names, [
-            server,
-            ..unavailable
-          ])
+          collect_catalog(
+            reply,
+            list.filter(pending, fn(p) { p != server }),
+            deadline_ms,
+            names,
+            [server, ..unavailable],
+          )
       }
   }
 }

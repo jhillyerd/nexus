@@ -1090,7 +1090,12 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
 .tool-picker-switch { display: flex; align-items: center; gap: .45rem; }
 .tool-picker-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(10.5rem, 1fr));
   gap: .3rem 1rem; max-height: 10rem; overflow-y: auto; }
-.tool-picker-list .checkbox-field { display: flex; align-items: center; gap: .3rem; min-width: 0; }
+/* overflow-wrap: anywhere lets a long qualified MCP/plugin name break
+   inside its track — and because `anywhere` (unlike break-word) also
+   shrinks the min-content size, the unbreakable word cannot blow the
+   equal-width column out of line. */
+.tool-picker-list .checkbox-field { display: flex; align-items: center; gap: .3rem; min-width: 0;
+  overflow-wrap: anywhere; }
 .tool-picker-list .muted, .tool-picker-controls .muted { font-size: .75rem; }
 /* Form visuals (borders, focus rings, filled backgrounds, dark mode) are
    Pico's, driven by the tokens above. Only the layout leftovers are

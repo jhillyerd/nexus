@@ -4142,7 +4142,7 @@ pub fn view_settings_bots_tool_picker_test() {
   should.be_true(string.contains(folded, ">Custom tools<"))
   should.be_true(string.contains(
     folded,
-    "default: every tool that works in this deployment",
+    "default: every built-in tool that works in this deployment",
   ))
   should_not_contain(folded, ">All<")
   should_not_contain(folded, ">http_fetch<")
