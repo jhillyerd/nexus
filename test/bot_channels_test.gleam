@@ -552,6 +552,66 @@ pub fn sender_archived_refuses_test() {
   should.equal(stored_channel_count(booted, parent), 1)
 }
 
+/// A delivery whose SENDER is unknown to the registry is refused before
+/// target resolution (CodeRabbit PR review on #137): Delete stops the
+/// actor but not an in-flight turn worker, so a delivery can arrive from
+/// a parent that is already gone — the parent FK would refuse any
+/// channel create it triggered, and starting it anyway would strand the
+/// exchange on an unpersisted phantom behind a Delivered reply.
+pub fn unknown_sender_refuses_test() {
+  let booted = boot()
+  let alpha = create_bot(booted, "alpha")
+  let _beta = create_bot(booted, "beta")
+
+  deliver(
+    booted.registry,
+    alpha.id,
+    "alpha",
+    "s-never-existed",
+    1,
+    "beta",
+    "from a deleted parent",
+  )
+  |> should.equal(delivery.Refused("sender thread is gone"))
+  // The pair opened no channel.
+  should.equal(stored_channel_count(booted, "s-never-existed"), 0)
+}
+
+/// A CHANNEL create whose thread-row insert failed is refused outright
+/// (CodeRabbit PR review on #137): without the persisted parent link the
+/// channel is unreachable by re-derivation, and starting it anyway would
+/// strand the exchange on an unpersisted phantom thread behind a
+/// Delivered reply. Ordinary creates keep the Phase 1 unpersisted
+/// fallback, so the failing insert is scoped to channel rows.
+pub fn channel_persist_failure_refuses_test() {
+  let base = store_mock.seam(store_mock.start())
+  let persistence =
+    store.Store(
+      ..base,
+      insert_thread: fn(summary: store.StoredSummary, prompt: String) {
+        case summary.meta.parent_thread_id {
+          option.Some(_) -> Error("channel insert refused (simulated outage)")
+          option.None -> base.insert_thread(summary, prompt)
+        }
+      },
+    )
+  let booted = boot_over(persistence, refused_endpoint())
+  let alpha = create_bot(booted, "alpha")
+  let _beta = create_bot(booted, "beta")
+  let parent = create_parent_thread(booted, alpha.id)
+
+  deliver(booted.registry, alpha.id, "alpha", parent, 1, "beta", "hello")
+  |> should.equal(delivery.Refused("target bot's thread could not be started"))
+  // No channel row landed, and no phantom thread started — the parent
+  // is the only thread the registry lists.
+  should.equal(stored_channel_count(booted, parent), 0)
+  should.equal(
+    thread_registry.list_threads(booted.registry)
+      |> list.any(fn(summary) { summary.id != parent }),
+    False,
+  )
+}
+
 /// An ARCHIVED CHANNEL refuses deliveries from its parent DURABLY —
 /// including after a restart, where re-derivation re-finds the archived
 /// row instead of resurrecting or recreating it. Reading stays allowed.

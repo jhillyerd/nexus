@@ -412,11 +412,12 @@ fn last_user_depth(
 pub fn deliver_unknown_target_test() {
   let booted = boot()
   let alpha = create_bot(booted, "alpha", allow_inbound: True)
+  let parent = create_parent_thread(booted, alpha.id)
 
-  deliver(booted.registry, alpha.id, "alpha", "s999", 1, "s4242", "hi")
+  deliver(booted.registry, alpha.id, "alpha", parent.id, 1, "s4242", "hi")
   |> should.equal(delivery.Refused("unknown target"))
 
-  deliver(booted.registry, alpha.id, "alpha", "s999", 1, "nobody", "hi")
+  deliver(booted.registry, alpha.id, "alpha", parent.id, 1, "nobody", "hi")
   |> should.equal(delivery.Refused("unknown target"))
 }
 
@@ -608,6 +609,7 @@ pub fn deliver_hint_only_when_tool_present_test() {
   let booted = boot()
   let alpha = create_bot(booted, "alpha", allow_inbound: True)
   let quiet = create_bot(booted, "quiet", allow_inbound: True)
+  let alpha_parent = create_parent_thread(booted, alpha.id)
 
   // A bot thread frozen WITHOUT the delivery tool (the same shape an
   // explicit bot toolset or a pre-P3c snapshot hydrates to).
@@ -641,7 +643,7 @@ pub fn deliver_hint_only_when_tool_present_test() {
       booted.registry,
       alpha.id,
       "alpha",
-      "s-alpha",
+      alpha_parent.id,
       1,
       summary.id,
       "hello there",
@@ -649,7 +651,10 @@ pub fn deliver_hint_only_when_tool_present_test() {
   should.equal(tid, summary.id)
   wait_idle(booted.registry, summary.id)
   let #(text, origin) = last_user_line(booted.registry, summary.id)
-  should.equal(text, "From alpha (thread s-alpha): hello there")
+  should.equal(
+    text,
+    "From alpha (thread " <> alpha_parent.id <> "): hello there",
+  )
   should.equal(origin, Some(transcript.Origin("alpha", 1)))
 }
 
@@ -741,6 +746,7 @@ pub fn deliver_by_name_creates_dm_test() {
 pub fn deliver_by_thread_id_direct_test() {
   let booted = boot()
   let alpha = create_bot(booted, "alpha", allow_inbound: True)
+  let alpha_parent = create_parent_thread(booted, alpha.id)
   let specs = tools.by_names(test_config(), []) |> result.unwrap([])
   let assert Ok(human) =
     thread_registry.create_with_toolset(
@@ -769,14 +775,17 @@ pub fn deliver_by_thread_id_direct_test() {
       booted.registry,
       alpha.id,
       "alpha",
-      "s-alpha",
+      alpha_parent.id,
       1,
       human.id,
       "dropping a note",
     )
   should.equal(tid, human.id)
   let #(text, origin) = last_user_line(booted.registry, human.id)
-  should.equal(text, "From alpha (thread s-alpha): dropping a note")
+  should.equal(
+    text,
+    "From alpha (thread " <> alpha_parent.id <> "): dropping a note",
+  )
   should.equal(origin, Some(transcript.Origin("alpha", 1)))
 }
 
@@ -852,12 +861,14 @@ pub fn bot_message_tool_depth_arithmetic_test() {
   // initiator — it spawns epsilon's scripted turn, which runs the tool.
   // (A HUMAN send here would reset the depth to 0 — that reset is the
   // spec, and the chain test covers multi-hop arithmetic separately.)
+  let outbound = create_bot(booted, "outbound", allow_inbound: True)
+  let outbound_parent = create_parent_thread(booted, outbound.id)
   let assert delivery.Delivered(_) =
     deliver(
       booted.registry,
-      create_bot(booted, "outbound", allow_inbound: True).id,
+      outbound.id,
       "outbound",
-      "s-outbound",
+      outbound_parent.id,
       1,
       epsilon_thread.id,
       "your turn",

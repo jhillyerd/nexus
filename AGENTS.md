@@ -100,7 +100,26 @@ the rules that bite silently:
   repoints the map and delivers; `Ok(None)` creates; a store ERROR
   refuses retryably ("target lookup failed; try again") and NEVER falls
   through to creation — a transient outage must not duplicate a channel
-  that may well exist.
+  that may well exist. A STALE HIT (entry present, thread gone from
+  both dicts) is not a creation license either: the entry is dropped
+  and the miss path runs — the store may still hold the row, so
+  re-derivation answers, never a blind `create_dm`.
+- **A channel create that cannot persist is REFUSED, never started**
+  (CodeRabbit PR review): without the parent row the channel is
+  unreachable by re-derivation, so a failed insert answers
+  `ChannelPersistFailed` ("target bot's thread could not be started")
+  instead of starting an unpersisted phantom ordinary thread behind a
+  Delivered reply. Ordinary (parent-less) creates keep the Phase 1
+  unpersisted fallback. Unknown SENDERS are refused too ("sender thread
+  is gone", beside the archive guard first in the chain): Delete stops
+  the actor but not an in-flight turn worker, and the parent FK would
+  refuse anything it tried to create anyway. Dormant senders count as
+  known (a worker orphaned by a registry restart delivers normally).
+- **Cross-registry name asks resolve the NAMED OWNER first.**
+  `sender_name_ask` checks `process.named(bots_name)` before sending: a
+  send to an unregistered name panics the caller, which — from the
+  channels arm — is this registry (a bot registry mid-restart must
+  degrade the pane's name to None, not crash the spine).
 - **The archive cascade is PERSISTENCE-FIRST.** ONE idempotent recursive
   store update (archive.sql's CTE over `parent_thread_id`) is the
   authority — the registry must NOT inherit the memory-first
@@ -130,7 +149,15 @@ the rules that bite silently:
   cleanup walks `parent_thread_id` to a fixpoint (live + dormant),
   demonitors and kills every live descendant, drops each one's
   records/dormant summaries and `dm` entries, then deletes the root (the
-  store CASCADE removes the rows).
+  store CASCADE removes the rows). The same send discipline as the
+  archive notify applies on the way down: failed-start and queued-DOWN
+  records are skipped (the kill is the real stop), never sent to.
+- **The boot sweep never takes a parent with channel children.**
+  `prune_never_used.sql` carries `not exists (select 1 from thread c
+  where c.parent_thread_id = thread.id)`: a parent looks never-used
+  until its first turn commits, so a crash mid-first-turn plus a late
+  restart would otherwise sweep it and CASCADE-delete a channel whose
+  history is long since durable (CodeRabbit PR review).
 
 ## Changing the schema or queries
 

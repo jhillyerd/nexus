@@ -182,5 +182,7 @@ pub fn describe(problem: CreateProblem) -> String {
       "toolset unavailable: " <> reason
     CreateFailed(thread_registry.StartFailed(reason)) ->
       "thread unavailable: " <> reason
+    CreateFailed(thread_registry.ChannelPersistFailed) ->
+      "channel could not be persisted"
   }
 }

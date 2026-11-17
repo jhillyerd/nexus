@@ -339,6 +339,9 @@ fn create_problem_status(problem: thread_create.CreateProblem) -> Int {
     thread_create.CreateFailed(thread_registry.UnknownToolset(_)) -> 400
     thread_create.CreateFailed(thread_registry.ProviderFailed(_)) -> 502
     thread_create.CreateFailed(thread_registry.StartFailed(_)) -> 503
+    // A channel create whose row insert failed: the store side refused,
+    // same class as an unavailable provider (502).
+    thread_create.CreateFailed(thread_registry.ChannelPersistFailed) -> 502
   }
 }
 

@@ -126,7 +126,24 @@ pub type CreateError {
   /// (bots plan P2 — a bot can go stale past an upgrade). A 400-class
   /// client error: the create is refused, never silently narrowed.
   UnknownToolset(reason: String)
+  /// A CHANNEL create whose thread-row insert failed (CodeRabbit PR
+  /// review on #137): refused outright — without the persisted parent
+  /// link the channel is unreachable by re-derivation, and starting it
+  /// anyway would strand the delivery on an unpersisted phantom thread
+  /// behind a Delivered reply. Ordinary (parent-less) creates keep the
+  /// Phase 1 unpersisted fallback, so this arm is reachable only from
+  /// the delivery path. A store-side failure: 502-class.
+  ChannelPersistFailed
   StartFailed(reason: String)
+}
+
+/// The tail of `start_new_thread` resolved: the channel-persistence
+/// refusal kept apart from the factory's start result, so each failure
+/// arm keeps its own vocabulary (and the factory's diagnostic reason).
+type Starting {
+  ChannelStarted(actor.Started(process.Subject(thread.Msg)))
+  ChannelRefused
+  ChannelStartRefused(reason: String)
 }
 
 /// Why a provider id could not be turned into a frozen endpoint. The
@@ -1208,13 +1225,30 @@ fn start_new_thread(
               )
             _, _ -> spec
           }
-          case
-            factory_supervisor.start_child(
-              state.factory,
-              ChildArgument(spec:, name:),
-            )
-          {
-            Ok(started) -> {
+          // The channel-persistence refusal (bot-channels plan, #123;
+          // CodeRabbit PR review on #137): a channel create whose insert
+          // failed never starts — without the parent row it is
+          // unreachable by re-derivation and would be restarted as an
+          // ordinary unpersisted thread, swallowing the exchange behind
+          // a Delivered lie. Ordinary creates keep the Phase 1
+          // unpersisted fallback (the scrub above already presents them
+          // ordinary). No actor starts, no dm entry is mapped, and the
+          // delivery answers an honest refusal.
+          let starting = case requested.parent_thread_id, persisted {
+            Some(_), False -> ChannelRefused
+            _, _ ->
+              case
+                factory_supervisor.start_child(
+                  state.factory,
+                  ChildArgument(spec:, name:),
+                )
+              {
+                Ok(started) -> ChannelStarted(started)
+                Error(reason) -> ChannelStartRefused(string.inspect(reason))
+              }
+          }
+          case starting {
+            ChannelStarted(started) -> {
               let record =
                 Record(
                   id: id,
@@ -1238,14 +1272,20 @@ fn start_new_thread(
                 Ok(record),
               )
             }
-            Error(reason) -> {
-              // The child failed to start AFTER the row landed: delete the
+            ChannelRefused -> #(
+              State(..state, counter: counter),
+              Error(ChannelPersistFailed),
+            )
+            ChannelStartRefused(reason) -> {
+              // A failed START (factory refused the child) deletes the
               // ghost row, or the next create would reuse this id against
               // a durable half-thread and a restart would hydrate it
               // (cubic PR review). The counter stays bumped either way —
               // minted ids never recycle (the boot-sweep rule) — and the
               // unpersisted lane (insert failed, no row, no child) just
               // pays the counter bump for the same monotonic guarantee.
+              // The CHANNEL-persistence refusal above carries no ghost
+              // row either (persisted is False — no delete runs).
               let state = case persisted {
                 True ->
                   case state.store.delete_thread(id) {
@@ -1257,10 +1297,7 @@ fn start_new_thread(
                   }
                 False -> state
               }
-              #(
-                State(..state, counter: counter),
-                Error(StartFailed(string.inspect(reason))),
-              )
+              #(State(..state, counter: counter), Error(StartFailed(reason)))
             }
           }
         }
@@ -1744,7 +1781,16 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
                 case dict.get(state.threads, sid) {
                   Ok(record) -> {
                     let _ = process.demonitor_process(record.monitor)
-                    process.send(record.subject, thread.Stop)
+                    // The archive notify's discipline: a record with a
+                    // failed start or a queued DOWN has no owner behind
+                    // its named subject — a send to the unregistered
+                    // name would crash THIS actor (CodeRabbit PR review
+                    // on #137). The kill below is the real stop; Stop
+                    // is the graceful cancel-commit for live actors.
+                    case record.start_error, process.is_alive(record.pid) {
+                      None, True -> process.send(record.subject, thread.Stop)
+                      _, _ -> Nil
+                    }
                     process.kill(record.pid)
                   }
                   Error(_) -> Nil
@@ -2640,67 +2686,82 @@ fn deliver_message(
   state: State,
   request: delivery.Request,
 ) -> #(State, delivery.Reply) {
-  case sender_archived(state, request.from_thread_id) {
-    // The sender-side archive guard (bot-channels plan, #123), FIRST in
-    // the chain: archive does not cancel turns, so a turn already in
-    // flight when its parent was archived keeps running and can still
-    // call `bot_message` — without this check `create_dm` would open a
-    // BRAND-NEW ACTIVE channel under an archived parent (existing
-    // channels refuse via their archived rows; only the creation path
-    // could escape). In-memory: the registry owns the sender's record —
-    // the worker's parent thread is live by construction, so this costs
-    // nothing. A refusal here can create nothing (it precedes
-    // find-or-create).
-    True -> #(state, delivery.Refused("sender thread is archived"))
-    False ->
-      case classify_target(state, request.to) {
-        MissingTarget -> #(state, delivery.Refused("unknown target"))
-        // A store outage during the bot-name lookup is not an "unknown
-        // target" — the honest verdict names the failure so the sender can
-        // retry instead of giving up on a target that may well exist
-        // (cubic PR review).
-        LookupUnavailable -> #(
-          state,
-          delivery.Refused("target lookup failed; try again"),
-        )
-        FoundBot(bot) ->
-          case bot.id == request.from_bot_id {
-            True -> #(state, delivery.Refused("self-addressed delivery"))
-            False ->
-              // The name path pre-checks the gate and the hop count BEFORE
-              // find-or-create: a refused delivery must not leave a fresh,
-              // never-used DM thread behind. The resolved-thread path
-              // re-checks both below (idempotent — one store read extra at
-              // most), which is where the settled guard order lives.
-              case bot.allow_inbound {
-                False -> #(
-                  state,
-                  delivery.Refused(
-                    "target does not accept inbound bot messages",
-                  ),
-                )
-                True ->
-                  case request.depth > state.cfg.max_bot_hops {
-                    True -> #(state, delivery.Refused("max bot hops exceeded"))
-                    False ->
-                      case find_or_create_dm(state, request, bot) {
-                        #(state, Ok(record)) ->
-                          deliver_to_thread(state, request, record)
-                        #(state, Error(reason)) -> #(
+  case thread_known(state, request.from_thread_id) {
+    // The deleted-sender guard (CodeRabbit PR review on #137), FIRST
+    // beside the archive guard: Delete stops the actor but an in-flight
+    // turn worker can still deliver — its parent row is already gone
+    // (the parent FK would refuse any create it triggered), so the
+    // honest verdict is refusal, never a phantom channel behind a
+    // Delivered reply. Dormant senders count as known (an orphaned
+    // worker outliving a registry restart delivers to a rehydrating
+    // thread normally).
+    False -> #(state, delivery.Refused("sender thread is gone"))
+    True ->
+      case sender_archived(state, request.from_thread_id) {
+        // The sender-side archive guard (bot-channels plan, #123),
+        // FIRST in the chain: archive does not cancel turns, so a turn
+        // already in flight when its parent was archived keeps running
+        // and can still call `bot_message` — without this check
+        // `create_dm` would open a BRAND-NEW ACTIVE channel under an
+        // archived parent (existing channels refuse via their archived
+        // rows; only the creation path could escape). In-memory: the
+        // registry owns the sender's record — the worker's parent
+        // thread is live by construction, so this costs nothing. A
+        // refusal here can create nothing (it precedes find-or-create).
+        True -> #(state, delivery.Refused("sender thread is archived"))
+        False ->
+          case classify_target(state, request.to) {
+            MissingTarget -> #(state, delivery.Refused("unknown target"))
+            // A store outage during the bot-name lookup is not an "unknown
+            // target" — the honest verdict names the failure so the sender can
+            // retry instead of giving up on a target that may well exist
+            // (cubic PR review).
+            LookupUnavailable -> #(
+              state,
+              delivery.Refused("target lookup failed; try again"),
+            )
+            FoundBot(bot) ->
+              case bot.id == request.from_bot_id {
+                True -> #(state, delivery.Refused("self-addressed delivery"))
+                False ->
+                  // The name path pre-checks the gate and the hop count BEFORE
+                  // find-or-create: a refused delivery must not leave a fresh,
+                  // never-used DM thread behind. The resolved-thread path
+                  // re-checks both below (idempotent — one store read extra at
+                  // most), which is where the settled guard order lives.
+                  case bot.allow_inbound {
+                    False -> #(
+                      state,
+                      delivery.Refused(
+                        "target does not accept inbound bot messages",
+                      ),
+                    )
+                    True ->
+                      case request.depth > state.cfg.max_bot_hops {
+                        True -> #(
                           state,
-                          delivery.Refused(reason),
+                          delivery.Refused("max bot hops exceeded"),
                         )
+                        False ->
+                          case find_or_create_dm(state, request, bot) {
+                            #(state, Ok(record)) ->
+                              deliver_to_thread(state, request, record)
+                            #(state, Error(reason)) -> #(
+                              state,
+                              delivery.Refused(reason),
+                            )
+                          }
                       }
                   }
               }
-          }
-        FoundThread(state, record) ->
-          case record.meta.bot_id {
-            Some(bot_id) if bot_id == request.from_bot_id -> #(
-              state,
-              delivery.Refused("self-addressed delivery"),
-            )
-            _ -> deliver_to_thread(state, request, record)
+            FoundThread(state, record) ->
+              case record.meta.bot_id {
+                Some(bot_id) if bot_id == request.from_bot_id -> #(
+                  state,
+                  delivery.Refused("self-addressed delivery"),
+                )
+                _ -> deliver_to_thread(state, request, record)
+              }
           }
       }
   }
@@ -2827,11 +2888,25 @@ fn find_or_create_dm(
         // the next delivery retries the SAME thread instead of opening a
         // duplicate DM behind a transient failure (cubic PR review).
         Error(_) if known -> #(state, Error("target thread unavailable"))
-        // Absent from both dicts: deleted behind the map — open a fresh
-        // one and repoint the entry. Live-map only: after a restart the
-        // map starts empty and re-derivation answers first, so a deleted
-        // channel can never be re-entered here (CASCADE dropped its row).
-        Error(_) -> create_dm(state, request, bot)
+        // Absent from both dicts: the map entry is STALE — but the
+        // store may still hold the row (for example one written by
+        // another instance sharing the database). Drop the entry and
+        // take the miss path: re-derivation delivers into a stored
+        // channel, creates only when no row exists, and refuses
+        // retryably on a store error — a blind create_dm here would
+        // attempt a duplicate insert the unique index rejects (and
+        // strand the delivery on an unpersisted thread). The arm is
+        // live-map only: after a restart the map starts empty and
+        // re-derivation answers first (CodeRabbit PR review on #137).
+        Error(_) ->
+          find_or_create_dm(
+            State(
+              ..state,
+              dm: dict.delete(state.dm, #(request.from_thread_id, bot.id)),
+            ),
+            request,
+            bot,
+          )
       }
     }
     Error(_) ->
@@ -2882,9 +2957,10 @@ fn thread_known(state: State, id: String) -> Bool {
 /// The sender-side archive guard (bot-channels plan, #123): a delivery
 /// may not ORIGINATE from an archived thread — archive does not cancel
 /// turns, so the check rides the delivery path, not the loop. Pure
-/// memory: the sender is the worker's parent thread, a live record of
-/// this registry. Unknown senders (unreachable in practice) fail open —
-/// the target-side guards below still apply.
+/// memory: the sender is the worker's parent thread, a record of this
+/// registry. Unknown senders are refused upstream (the deleted-sender
+/// guard — a worker whose parent was deleted mid-turn), so this only
+/// ever answers for known records.
 fn sender_archived(state: State, from_thread_id: String) -> Bool {
   case dict.get(state.threads, from_thread_id) {
     Ok(record) -> record.meta.archived
@@ -3312,12 +3388,23 @@ fn sender_name_ask(
   bots_name: process.Name(bot_registry.Msg),
   bot_id: String,
 ) -> Result(String, Nil) {
-  let reply = process.new_subject()
-  let bots = process.named_subject(bots_name)
-  process.send(bots, bot_registry.Get(bot_id, reply))
-  case process.receive(reply, delivery_ask_timeout_ms) {
-    Ok(Ok(bot)) -> Ok(bot.name)
-    _ -> Error(Nil)
+  // The bot registry may be mid-restart: a send to an unregistered
+  // name panics the caller — from the channels arm, THIS registry.
+  // Resolve the owner first; none is the same honest verdict as a
+  // timeout (the pane falls back, the delivery errors) and it arrives
+  // instantly instead of after the full bound (CodeRabbit PR review
+  // on #137).
+  case process.named(bots_name) {
+    Error(_) -> Error(Nil)
+    Ok(_) -> {
+      let reply = process.new_subject()
+      let bots = process.named_subject(bots_name)
+      process.send(bots, bot_registry.Get(bot_id, reply))
+      case process.receive(reply, delivery_ask_timeout_ms) {
+        Ok(Ok(bot)) -> Ok(bot.name)
+        _ -> Error(Nil)
+      }
+    }
   }
 }
 

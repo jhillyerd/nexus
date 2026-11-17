@@ -387,6 +387,37 @@ pub fn get_reports_gone_thread_after_failed_restart_test() {
   thread_registry.list_threads(registry) |> list.length |> should.equal(1)
 }
 
+/// The delete cascade must survive a record whose named subject has no
+/// owner behind it (CodeRabbit PR review on #137): a failed restart
+/// leaves `start_error` set and the name unregistered — a send to it
+/// panics the registry (the archive notify has skipped such records
+/// since the cubic PR review; the delete path now shares that
+/// discipline). The kill is the real stop for such a record; Stop is
+/// the graceful cancel-commit for live actors only.
+pub fn delete_survives_a_failed_start_record_test() {
+  // The Down replacement rehydrates (the mock seam holds the rows), and
+  // this starter refuses any HYDRATED argument — exactly the restart —
+  // so the record is left with a failed start and no live actor. It is
+  // hidden from `list_threads` (the unavailable discipline) and its GET
+  // retries the rehydrate, which the starter refuses again.
+  let registry =
+    start_registry_with(fn(argument: thread_registry.ChildArgument) {
+      case argument.spec.hydrated {
+        True -> Error(actor.InitFailed("restarted child refused"))
+        False -> thread_registry.thread_child(argument)
+      }
+    })
+  let a = create(registry, "alpha", happy_runner)
+  process.kill(a.pid)
+  wait_for_down(a.pid)
+
+  // Deleting the failed-start record must complete: the dead subject is
+  // skipped, the store row goes, and the registry keeps answering.
+  thread_registry.delete_thread(registry, a.id) |> should.be_true
+  thread_registry.get(registry, a.id) |> should.equal(Error(Nil))
+  thread_registry.delete_thread(registry, a.id) |> should.be_false
+}
+
 /// A child starter that cannot produce an actor: `Create` must report the
 /// failure instead of crashing the registry (plan §8).
 pub fn startup_failure_is_surfaced_not_a_crash_test() {

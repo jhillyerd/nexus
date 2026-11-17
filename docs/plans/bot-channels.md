@@ -380,6 +380,25 @@ instruction. So:
   `bot_id` scrub rule), and the plan's "bounded retries land the
   notify on the rehydrated actor" is realized as "no in-place retry —
   the rehydrated replacement is born archived".
+- **CodeRabbit review deltas (PR #137)**: the boot sweep skips parents
+  with channel children (`prune_never_used.sql` gains the `not exists`
+  child check — CASCADE would otherwise take a channel's committed
+  history with a crashed-mid-first-turn parent swept after the grace
+  window); the delete path shares the archive notify's send discipline
+  (failed-start / queued-DOWN records are skipped — the kill is the
+  real stop); a stale `dm` hit is dropped and re-derived, never a blind
+  `create_dm`; a channel create whose insert failed is REFUSED
+  (`ChannelPersistFailed` — refined from the cubic "started ordinary"
+  stopgap: an unpersisted channel is unreachable by re-derivation and
+  must not strand an exchange behind a Delivered reply); unknown
+  senders are refused ("sender thread is gone" — Delete does not stop
+  an in-flight turn worker); `sender_name_ask` resolves the named owner
+  before sending (a bot registry mid-restart degrades the pane's names,
+  it does not panic the registry). Deliberately NOT taken: an overall
+  deadline on the channels() name fold (each ask is already bounded at
+  5 s; after the owner check the realistic unavailability resolves
+  instantly, and a wedged-but-registered bot registry stalls every bot
+  delivery identically — revisit if a wedge is ever observed).
 
 ### Phase 2 — the thread info pane (UI + e2e)
 
