@@ -708,20 +708,35 @@ pub fn m3_page_thread_url_script_test() {
     "if (!(entry && entry.nexusBoot)) return;",
   ))
   // The popstate retry enforces its deadline even without mutations
-  // (timer, expiry checked BEFORE clicking), cancels itself when a
-  // newer navigation has won, and is cancelled before every new
-  // attempt — a stale observer must never re-click an old id over a
-  // fresher selection.
+  // (the timer runs the same expiry as the observer), stands down when
+  // a newer navigation has won (the navigation epoch: a stale retry
+  // must never reload against a fresher selection — and the armed-id
+  // check alone cannot tell 'stale' from 'still wanted'), and is
+  // cancelled before every new attempt. At expiry it falls back to a
+  // full load of the entry's url: ids with no sidebar row (channels
+  // are second-class) would otherwise lose the navigation silently —
+  // the load path resolves them via Flags.thread.
   should.be_true(string.contains(html, "    stopRetry();"))
-  should.be_true(string.contains(html, "    var armed = currentId();"))
+  should.be_true(string.contains(html, "  var navEpoch = 0;"))
+  should.be_true(string.contains(html, "navEpoch += 1;"))
   should.be_true(string.contains(
     html,
-    "      if (Date.now() > deadline) { stopRetry(); return; }",
+    "      if (epoch !== navEpoch) { stopRetry(); return; }",
+  ))
+  should.be_true(string.contains(html, "if (Date.now() > deadline) {"))
+  should.be_true(string.contains(html, "location.assign(location.href);"))
+  // The TIMER runs the same guards as the observer (a quiet shadow
+  // root must not skip the expiry): pinned as one contiguous fragment
+  // so the assertion matches the timer's block, not the observer's.
+  should.be_true(string.contains(
+    html,
+    "if (epoch !== navEpoch) { stopRetry(); return; }\n      if (current !== null && current !== armedId) { stopRetry(); return; }\n      giveUpOrReload();\n    }, 2050);",
   ))
   should.be_true(string.contains(
     html,
-    "    retryTimer = setTimeout(stopRetry, 2050);",
+    "      if (epoch !== navEpoch) { stopRetry(); return; }",
   ))
+  should.be_true(string.contains(html, "      giveUpOrReload();\n"))
   // popstate drives the server's Select path through a synthetic click
   // on the row, never by touching the rendered tree's content.
   should.be_true(string.contains(html, "window.addEventListener('popstate'"))

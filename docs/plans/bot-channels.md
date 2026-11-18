@@ -1,6 +1,6 @@
 ---
 title: Nexus — bot channels (per-parent DM threads + the thread info pane)
-status: active — Phase 1 shipped, Phase 2 (the pane) next
+status: active — Phase 1 + Phase 2 (the pane) implemented, review pending
 tags: [nexus, bots, threads, agents, kv-cache, gleam, beam]
 updated: 2026-11-17
 ---
@@ -436,6 +436,99 @@ instruction. So:
    integration `case:relay` scenario unchanged at the protocol level;
    the full browser suite re-run (the offline suite cannot see visual
    regressions — the mock is the visual reference).
+
+#### As-built deltas (2026-11-17)
+
+- **No `ThreadSummary` change.** Step 1 resolved differently: the List
+  projection stays channel-free, and the UI's channel context comes from
+  TWO stamped registry asks instead — the new `ChannelOf(id)` (the
+  reverse lookup: parent id, bot pointer, frozen creation title,
+  archived; answered FROM STATE, live metas + dormant summaries, §8) and
+  the existing `Channels(parent_id)`. Both ride `threads_effect` — the
+  plan's "re-asks on the same messages" rule, no polling; the pane is
+  exactly as fresh as the sidebar. The accepted staleness window: a
+  channel finishing while its parent sits idle and eventless shows a
+  stale dot until the next refresh — the same class the sidebar rows
+  already accept. Opening the pane re-asks (that is when freshness
+  matters).
+- **A Phase 1 gap the e2e smoke exposed and Phase 2 fixed: the registry
+  gained `SummaryOf(id)`.** `web.with_thread` resolved threads through
+  the channel-free `List`, so every route that goes through it 404'd on
+  a channel — the state dump, send, stop, and the shareable thread page
+  (the Phase 1 commit's "Get/state keep answering" claim was true of
+  the store and `Get`, not of these routes; DELETE never went through
+  `with_thread` — its registry ask already answered for channels — and
+  PATCH still does not, see the follow-up below).
+  `with_thread` now asks `Get` FIRST (the lazy-start/retry discipline
+  unchanged — a dormant channel hydrates exactly as before) then
+  `summary_of`: a live record summarises through its actor (the List
+  arm's describe discipline), a dormant summary reads its store
+  snapshot, a dead actor answers from its meta rather than blocking.
+- **`ChannelInfo` carries `title`** — the as-built amended the pane's
+  deleted-bot fallback from "the id" to the frozen creation title
+  (`create_dm` named the channel after the target bot, and channels
+  keep it forever — the utility-title arm never runs on them, so the
+  fallback still reads as a name). `ChannelContext` carries the same
+  title for the header label; the pane row and the header fall back
+  identically.
+- **The pane asks dispatch from THREE places.** The connect/refresh
+  cascade (`threads_effect` — resolution dispatched BEFORE the list in
+  one closure, so `after_threads` always sees the context when it
+  decides selection validity); explicit selection changes (`Select`,
+  `ChannelRowSelected` — the row click seeds the context from the
+  clicked row, no ask in the loop; `Select` also RE-RESOLVES, because
+  its "a row click is never a channel" reasoning covers the sidebar
+  but not the breadcrumb: a hop chain's crumb targets a channel-parent,
+  and without the re-resolution the selection sat contextless until an
+  unrelated refresh — the round-1 should-finding of the DeepSeek
+  smart-loop review); and the
+  `ThreadsLoaded` switch branches — the boot auto-selection changes the
+  selection AFTER the cascade captured `None`, so a thread selected by
+  auto-select must fetch its own rows there (the flaky-badge e2e
+  finding: the badge otherwise waited for an unrelated refresh).
+- **Known follow-up (out of scope here, smart-loop round-2 nit):**
+  `PATCH /threads/<id>` still resolves through the channel-free
+  `list_threads`, so it 404s on a channel — pre-existing Phase 1
+  behavior; pin/rename/tags on a second-class channel (frozen title,
+  never pinnable) is not a case this plan targets. Fold into the next
+  touch of the per-thread routes if one ever matters.
+- **`after_threads` keeps a channel selection on the context's word**
+  (`channel_ctx` is only ever Some for the current selection: every
+  setter/clearer is keyed to it), and clears pane state when the
+  selection identity changes — a dropped channel replaced by the
+  auto-select must not hand its rows and badge to the replacement
+  (the same rule as `pop`). A deleted channel resolves `Error(Nil)` on
+  the next refresh and the ordinary auto-select takes over.
+- **Reload/route flag**: `Flags.thread` naming a channel is a supported
+  state — the resolution lands before the first list, the chat replays
+  the channel, the sidebar highlights the parent, the breadcrumb names
+  it. No deep-link format changes.
+- **Pane Details show no toolset chips** (the mock's): summaries carry
+  no toolset, and plumbing `thread_toolset` through the store summary
+  query is its own change. The section renders Bot / Provider·model /
+  Created for an ordinary selection and Bot / Parent for a selected
+  channel. Environments stays the placeholder ("none attached").
+- **e2e (17c + new 17d)**: the relay smoke discovers the channel through
+  Alpha's committed receipt in the state dump (channels are absent from
+  `/threads` — the debug side channel is the scripting API exactly for
+  this) and its display-proof drives the PANE; 17d drives badge → pane →
+  row → channel navigation → crumb-back end-to-end, pinning the parent
+  highlight, the missing sidebar row, the composer hints, and the replay
+  chip through the ordinary Join path. Both clean up CHILDREN-FIRST: a
+  parent delete cascades the channel subtree (by design), so deleting
+  the parent first would 404 the channel's own delete. The integration
+  scenario (`services.mjs`) is byte-identical.
+- **Tests**: `ui_test` carries the pane matrix (rows with dots/ages/
+  labels; badge counts, hidden without channels, pulse only when
+  running; breadcrumb + archived chip; hostile label payloads inert;
+  deleted-bot title fallback; archived row dimmed AND navigable;
+  context-stamped keeps across refreshes + dropped-on-error;
+  ChannelsLoaded/ChannelResolved stamp guards; pane closes on selection
+  change and Settings; hint truth rules; Details shapes for both
+  selection kinds; the auto-selection fetch gap). `bot_channels_test`
+  carries `channel_of` (live + dormant + ordinary/unknown refusals),
+  `summary_of` for channels (live + dormant), and the frozen-title row
+  field including the deleted-bot case.
 
 ## Cache gate
 

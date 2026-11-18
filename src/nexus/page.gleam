@@ -267,7 +267,7 @@ fn thread_js() -> String {
   <> "    if (retry) { retry.disconnect(); retry = null; }\n"
   <> "    if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }\n"
   <> "  };\n"
-  <> "  var revealAndClick = function (id) {\n"
+  <> "  var revealAndClick = function (id, epoch) {\n"
   <> "    // Cancel any older retry FIRST — even when this navigation's\n"
   <> "    // own click succeeds: a stale observer firing on this switch's\n"
   <> "    // re-render would re-click its old id and hijack the newer\n"
@@ -287,31 +287,70 @@ fn thread_js() -> String {
   <> "    // whether or not an un-hide click fired — giving up here would\n"
   <> "    // lose the navigation silently.\n"
   <> "    var deadline = Date.now() + 2000;\n"
-  <> "    var armed = currentId();\n"
-  <> "    retry = new MutationObserver(function () {\n"
-  <> "      // Deadline BEFORE acting: an observer that only thinks on\n"
-  <> "      // mutations would otherwise keep clicking past its expiry. A\n"
-  <> "      // selection change since arming means a newer navigation won —\n"
-  <> "      // this retry is stale and must not fight it (the designed case\n"
-  <> "      // — un-hide, re-render, click — leaves the selection untouched\n"
-  <> "      // until this retry's own click lands).\n"
+  <> "    var armedId = currentId();\n"
+  <> "    // Expiry acts (it does not merely cancel): an ordinary hidden row\n"
+  <> "    // clicks within the window; what NEVER clicks is a channel id\n"
+  <> "    // (second-class — no sidebar row exists) or a deleted one. A\n"
+  <> "    // silent give-up would lose the navigation permanently, so fall\n"
+  <> "    // back to a full load of the entry's url — the load path\n"
+  <> "    // resolves any id (Flags.thread + the pane's channel resolution),\n"
+  <> "    // at the cost of one reload for exactly the cases the click\n"
+  <> "    // cannot serve. It must not fire against a NEWER navigation\n"
+  <> "    // decision though: a newer popstate (the epoch moved) or any\n"
+  <> "    // selection change since arming (the user clicked another\n"
+  <> "    // thread — armedId catches it, since a normal sidebar click\n"
+  <> "    // leaves the epoch untouched) stands this attempt down without\n"
+  <> "    // reloading.\n"
+  <> "    var giveUpOrReload = function () {\n"
+  <> "      stopRetry();\n"
+  <> "      // A newer popstate means THIS attempt is stale — stand down\n"
+  <> "      // without reloading: the armed-id check is not enough, because a\n"
+  <> "      // newer navigation can land on the same id for different reasons\n"
+  <> "      // (the stale-expiry reload hit exactly this).\n"
   <> "      var current = currentId();\n"
-  <> "      if (Date.now() > deadline) { stopRetry(); return; }\n"
-  <> "      if (current !== null && current !== armed) { stopRetry(); return; }\n"
+  <> "      if (epoch !== navEpoch) return;\n"
+  <> "      if (current !== null && current !== armedId) return;\n"
+  <> "      location.assign(location.href);\n"
+  <> "    };\n"
+  <> "    retry = new MutationObserver(function () {\n"
+  <> "      // Stale-navigation guard BEFORE the deadline: a selection change\n"
+  <> "      // since arming means a newer navigation won — this retry is\n"
+  <> "      // stale and must not fight it, and must never fire the expiry's\n"
+  <> "      // reload against a newer navigation (the designed case —\n"
+  <> "      // un-hide, re-render, click — leaves the selection untouched\n"
+  <> "      // until this retry's own click lands).\n"
+  <> "      // A newer popstate (the navigation epoch moved) means THIS\n"
+  <> "      // attempt is stale — stand down without fighting it, and never\n"
+  <> "      // fire the expiry's reload against a newer navigation.\n"
+  <> "      var current = currentId();\n"
+  <> "      if (epoch !== navEpoch) { stopRetry(); return; }\n"
+  <> "      if (current !== null && current !== armedId) { stopRetry(); return; }\n"
+  <> "      if (Date.now() > deadline) { giveUpOrReload(); return; }\n"
   <> "      if (clickRow(id)) stopRetry();\n"
   <> "    });\n"
   <> "    retry.observe(root, { childList: true, subtree: true });\n"
-  <> "    // Mutations are not guaranteed after arming: the timer enforces\n"
-  <> "    // the deadline (with slack for a mutation landing right on it)\n"
-  <> "    // even if the shadow root goes quiet.\n"
-  <> "    retryTimer = setTimeout(stopRetry, 2050);\n"
+  <> "    // Mutations are not guaranteed after arming — and the expiry must\n"
+  <> "    // ACT even on a quiet shadow root (a channel navigation's whole\n"
+  <> "    // point): the timer runs the same expiry, not a bare cancel.\n"
+  <> "    retryTimer = setTimeout(function () {\n"
+  <> "      var current = currentId();\n"
+  <> "      if (epoch !== navEpoch) { stopRetry(); return; }\n"
+  <> "      if (current !== null && current !== armedId) { stopRetry(); return; }\n"
+  <> "      giveUpOrReload();\n"
+  <> "    }, 2050);\n"
   <> "  };\n"
+  <> "  // The navigation epoch: every popstate is a NEWER navigation\n"
+  <> "  // decision, so any retry armed for an earlier one stands down —\n"
+  <> "  // even when the newer navigation lands on the same id (the armed\n"
+  <> "  // id alone cannot tell 'stale' from 'still wanted').\n"
+  <> "  var navEpoch = 0;\n"
   <> "  window.addEventListener('popstate', function () {\n"
+  <> "    navEpoch += 1;\n"
   <> "    var id = threadFromLocation();\n"
   <> "    urlId = id; // the url is already the state — never rewrite it here\n"
   <> "    var current = currentId();\n"
   <> "    if (!id || id === current) return;\n"
-  <> "    revealAndClick(id);\n"
+  <> "    revealAndClick(id, navEpoch);\n"
   <> "  });\n"
   <> "  // Selection mirror: every data-selected change persists into\n"
   <> "  // storage (reconnect/reload restore) and, when it is a REAL\n"
@@ -1271,6 +1310,86 @@ details.turn.reasoning.live > summary { color: color-mix(in srgb, currentColor 8
 #app .tool-pop.done .tool-status { color: #2e9e5b; }
 #app .tool-pop.failed { border-color: color-mix(in srgb, #c0392b 55%, transparent); }
 #app .tool-pop.failed .tool-status { color: #c0392b; }
+
+/* Thread info pane (bot-channels Phase 2, nexus/ui info_pane): the
+   tool_pop overlay pattern again — Pico styles <dialog open> as the
+   centered overlay, the article is the card, .info-pop-hit is the
+   invisible click-outside catcher. The card is narrower than the tool
+   popup's (it is a summary, not a transcript) and keeps the proportional
+   (non-mono) face: labels and ages, not code. #app-prefix per the
+   cascade traps. */
+#app .info-pop { position: relative; width: min(30rem, 92vw);
+  border: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
+#app .info-pop > header { display: flex; align-items: baseline; gap: .6rem;
+  position: sticky; top: 0; padding-right: 2.4rem; margin: 0;
+  background: var(--pico-card-background-color); }
+#app .info-pop > header h2 { font-size: .85rem; margin: 0; }
+#app .info-pop .close { position: absolute; top: .35rem; right: .55rem; background-image: none;
+  width: auto; height: auto; padding: 0 .3rem; margin: 0; border: none; font-size: 1.4rem;
+  line-height: 1.3; opacity: .55; }
+#app .info-pop .close:hover, #app .info-pop .close:focus { opacity: 1; }
+#app .info-pop-hit { position: absolute; inset: 0; }
+#app .info-pop .sec { margin: 0; padding: .55rem 1rem .6rem; border-top: 1px solid
+  color-mix(in srgb, currentColor 12%, transparent); }
+#app .info-pop h3 { margin: 0 0 .4rem; font-size: .7rem; font-weight: 600; text-transform: uppercase;
+  letter-spacing: .07em; opacity: .55; }
+#app .info-pop .sec-none { margin: 0; font-size: .8rem; opacity: .6; }
+/* Channels rows: full-width buttons reading as one list (the mock's
+   `.ch`): dot, `↳ name`, archive badge, age, chevron. */
+#app .ch-list { display: flex; flex-direction: column; gap: .15rem; }
+#app .ch { display: flex; align-items: baseline; gap: .5rem; width: 100%;
+  padding: .3rem .45rem; border: none; border-radius: 7px; background: none;
+  color: inherit; font-size: .84rem; text-align: left; cursor: pointer; }
+#app .ch:hover { background: color-mix(in srgb, currentColor 10%, transparent); }
+#app .ch .nm { flex: 1; overflow-wrap: anywhere; text-align: left; }
+#app .ch .age { font-size: .74rem; opacity: .6; }
+#app .ch .chev { opacity: .5; }
+#app .ch .badge { font-size: .66rem; border: 1px solid
+  color-mix(in srgb, currentColor 25%, transparent); border-radius: 999px;
+  padding: .05rem .45rem; opacity: .75; }
+/* Archived rows dim but keep their chevron: still navigable (reading is
+   allowed), never hidden (the plan). */
+#app .ch.archived .nm, #app .ch.archived .age { opacity: .55; }
+#app .ch-dot { font-size: .7rem; }
+#app .ch-dot.idle { opacity: .35; }
+#app .ch-dot.run { color: #3b82f6; }
+/* The header badge (the mock's .infobtn): dot + word + running count.
+   The dot pulses only while a channel is actually running. */
+#app .infobtn { display: inline-flex; align-items: baseline; gap: .45rem;
+  font-size: .8rem; padding: .28rem .7rem; }
+#app .infobtn .info-dot { font-size: .8rem; opacity: .45; }
+#app .infobtn .info-dot.live { color: #3b82f6; opacity: 1;
+  animation: info-pulse 1.6s ease-in-out infinite; }
+@keyframes info-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
+/* Vestibular safety: the badge dot is the shell's only infinite
+   animation — honor the OS reduced-motion preference by rendering it
+   static (the count chip still reads the running state). */
+@media (prefers-reduced-motion: reduce) {
+  #app .infobtn .info-dot.live { animation: none; opacity: 1; }
+}
+#app .infobtn .n { font-size: .7rem; background: #3b82f6; color: #fff;
+  border-radius: 999px; padding: .05rem .45rem; line-height: 1.4; }
+/* The breadcrumb back to the parent (viewing a channel): reads as a
+   link, not a CTA. */
+#app .crumb { border: none; background: none; color: #3b82f6; padding: .28rem 0;
+  font-size: .8rem; cursor: pointer; overflow-wrap: anywhere; text-align: left; }
+#app .crumb:hover { text-decoration: underline; }
+/* The archived chip beside the header title while an archived channel
+   is viewed — the same chip language as the pane's badge. */
+#app .ch-archived-chip { font-size: .66rem; border: 1px solid
+  color-mix(in srgb, currentColor 25%, transparent); border-radius: 999px;
+  padding: .1rem .5rem; opacity: .75; }
+/* Details key-value rows (the mock's .kv): tiny-caps label, value text. */
+#app .kv-list { display: flex; flex-direction: column; gap: .2rem; }
+#app .info-pop .kv { display: flex; gap: .6rem; font-size: .82rem; }
+#app .info-pop .kv .k { min-width: 8.5rem; opacity: .55;
+  text-transform: uppercase; font-size: .66rem; letter-spacing: .05em;
+  padding-top: .15rem; }
+#app .info-pop .kv span:last-child { overflow-wrap: anywhere; }
+/* Composer hints (the mock's .hint lines): muted, under the composer. */
+#composer-hints { display: flex; flex-direction: column; gap: .15rem;
+  padding: .2rem 1rem .5rem; }
+#app .hint { font-size: .74rem; opacity: .55; }
 /* Collapsed chips flow like spans, not blocks: consecutive collapsible
    lines (committed reasoning + tool chips) render inside one .chip-row —
    a wrapping flex line, so each chip sizes to its label on a shared row
