@@ -1400,7 +1400,21 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
                 True -> retry_rehydrate(state, record)
                 False -> Missing
               }
-            None -> Subject(record.subject)
+            None ->
+              // A dead actor with its DOWN still queued passes the same
+              // retry: a subject to a dead process is useless to every
+              // caller (the routes ask it and would crash), and the
+              // restart is exactly the failed-start machinery. The stale
+              // Down for the OLD pid arrives later and misses the
+              // replaced record (find_by_pid) — ignored.
+              case process.is_alive(record.pid) {
+                True -> Subject(record.subject)
+                False ->
+                  case record.persisted {
+                    True -> retry_rehydrate(state, record)
+                    False -> Missing
+                  }
+              }
           }
         Error(_) ->
           // Phase 2: a stored-but-not-live id lazily starts hydrated.
@@ -2004,15 +2018,11 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
       // NO parent is an ordinary thread (`Error(Nil)`); a miss is an
       // unknown id (`Error(Nil)` too — the caller treats both as "not a
       // channel"; a deleted channel's CASCADE parent is equally gone,
-      // so no stale context can survive a delete).
-      let live =
-        state.threads
-        |> dict.values()
-        |> list.find(fn(record) { record.id == id })
-      let dormant =
-        state.dormant
-        |> dict.values()
-        |> list.find(fn(summary) { summary.id == id })
+      // so no stale context can survive a delete). Direct dict lookups:
+      // both maps are keyed by id — a scan would be O(live + dormant)
+      // per pane open (the cubic PR review nit).
+      let live = dict.get(state.threads, id)
+      let dormant = dict.get(state.dormant, id)
       let answer = case live, dormant {
         Ok(record), _ ->
           case record.meta.parent_thread_id {

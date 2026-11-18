@@ -374,6 +374,13 @@ pub type Model {
     /// and the ended-selection sweep; a stale value can only ever name
     /// the current selection's context.
     channel_ctx: Option(thread_registry.ChannelContext),
+    /// The selection awaiting its `ChannelResolved` reply, if any. The
+    /// validity third-state in `after_threads`: in-list (ordinary),
+    /// context (channel), or pending (resolution in flight — keep, a
+    /// queued list refresh must not drop the selection in the window).
+    /// Cleared by the stamped reply (Ok or Error) and on any selection
+    /// change that clears or seeds the context instead.
+    channel_pending: Option(String),
     /// The popover's visibility. Pure display state — like `pop`, closed
     /// by any selection change and by entering Settings.
     pane_open: Bool,
@@ -630,6 +637,17 @@ pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
       md_cache: dict.new(),
       channels: [],
       channel_ctx: None,
+      // A selection whose channel-context resolution is still in flight
+      // (set by selection changes whose target is NOT in the loaded
+      // list — i.e. it can only be a channel; an in-list target is
+      // already known-ordinary and never needs it). `after_threads`
+      // keeps the selection while it matches, so a list refresh queued
+      // BEFORE the selection change cannot drop a channel selection in
+      // the window before its resolution lands. Boot sets None: the
+      // connect cascade is one ordered closure (resolution before
+      // list), so no window exists there. Cleared by the stamped reply
+      // — Ok or Error alike: the window is over either way.
+      channel_pending: None,
       pane_open: False,
     )
   #(model, events_effect())
@@ -962,7 +980,20 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       let #(next, eff) = case next.selected, model.selected {
         Some(id), Some(prev) if prev == id -> #(next, effect.none())
         Some(id), Some(prev) -> {
-          let next = Model(..next, visit: next.visit + 1)
+          let next =
+            Model(
+              ..next,
+              visit: next.visit + 1,
+              // The new selection's resolution is in flight (batched
+              // below) — hold it against any further queued refresh,
+              // but only when it is absent from this list (only a
+              // channel can be): an in-list selection is known-ordinary
+              // and keeps today's vanish-on-refresh semantics.
+              channel_pending: case list.any(summaries, fn(s) { s.id == id }) {
+                True -> None
+                False -> Some(id)
+              },
+            )
           #(
             next,
             effect.batch([
@@ -979,7 +1010,15 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           )
         }
         Some(id), None -> {
-          let next = Model(..next, visit: next.visit + 1)
+          let next =
+            Model(
+              ..next,
+              visit: next.visit + 1,
+              channel_pending: case list.any(summaries, fn(s) { s.id == id }) {
+                True -> None
+                False -> Some(id)
+              },
+            )
           #(
             next,
             effect.batch([
@@ -1038,9 +1077,22 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               // The context clears here and the re-resolution restores
               // it (ChannelOf answers Error(Nil) for ordinary targets,
               // so the ordinary path is untouched), and the fresh
-              // selection's own rows load below. The popover closes
-              // with the selection it was opened on (the `pop` rule).
+              // selection's own rows load below. Until the resolution
+              // lands, `channel_pending` holds the selection against
+              // any list refresh queued before this click — without it
+              // the channel would be dropped as vanished in that
+              // window (the crumb race). Set ONLY for a target absent
+              // from the loaded list (only a channel can be): an
+              // ordinary selection keeps today's vanish-on-refresh
+              // semantics. The popover closes with the selection it
+              // was opened on (the `pop` rule).
               channel_ctx: None,
+              channel_pending: case
+                list.any(model.threads, fn(s) { s.id == id })
+              {
+                True -> None
+                False -> Some(id)
+              },
               channels: [],
               pane_open: False,
             )
@@ -1595,7 +1647,14 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     ChannelResolved(asked_id, ctx) ->
       case model.selected {
         Some(id) if id == asked_id -> #(
-          Model(..model, channel_ctx: option.from_result(ctx)),
+          Model(
+            ..model,
+            channel_ctx: option.from_result(ctx),
+            // The window is over either way: Ok means the context is
+            // in hand, Error means the id is not a channel (ordinary
+            // or deleted) — the next refresh may drop the selection.
+            channel_pending: None,
+          ),
           effect.none(),
         )
         _ -> #(model, effect.none())
@@ -1641,23 +1700,28 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               // The new selection's OWN children (hop chains make
               // channels of channels — its pane lists grandchildren).
               channels: [],
+              // The clicked row seeded the context — no validity window
+              // (unlike Select, nothing is awaited), so pending stays
+              // None. The re-resolution below CONFIRMS the seed against
+              // the registry: rows are loaded moments before the click,
+              // but an archive (or delete) landing in between would
+              // otherwise render from the stale row until some later
+              // refresh (the cubic PR review finding).
+              channel_pending: None,
               // Navigating un-targets the popover (the mock: the pane
               // shows for one thread at a time).
               pane_open: False,
             )
-          let eff = case model.selected {
-            Some(current) ->
-              effect.batch([
-                leave_effect(model, current),
-                join_effect(next, info.thread_id),
-                channels_effect(next),
-              ])
-            None ->
-              effect.batch([
-                join_effect(next, info.thread_id),
-                channels_effect(next),
-              ])
-          }
+          // The outer match guarantees a selection (the pane belongs
+          // to one), so the leave always fires and the batches build
+          // from `parent` directly.
+          let eff =
+            effect.batch([
+              leave_effect(model, parent),
+              join_effect(next, info.thread_id),
+              channels_effect(next),
+              resolve_effect(next),
+            ])
           #(next, eff)
         }
         _ -> #(model, effect.none())
@@ -1949,6 +2013,7 @@ fn deselect(model: Model, label: String) -> Model {
     // Pane state is per-selection (the Select rule).
     channels: [],
     channel_ctx: None,
+    channel_pending: None,
     pane_open: False,
   )
 }
@@ -1970,9 +2035,15 @@ fn after_threads(model: Model, summaries: List(thread.ThreadSummary)) -> Model {
         // on the context's word (`channel_ctx` is only ever Some for
         // the current selection: every setter/clearer is keyed to it).
         // The ask that resolves it rides the SAME effect as this list
-        // and dispatches first, so the context is always in hand here.
+        // and dispatches first, so the context is always in hand here —
+        // except when this list was queued BEFORE the selection change
+        // (a refresh in flight across a crumb click): `channel_pending`
+        // holds the selection for that window, and the stamped reply
+        // settles it (Error clears pending, so a deleted selection
+        // drops on the NEXT refresh — a bounded one-refresh grace).
         list.any(summaries, fn(s) { s.id == id })
         || option.is_some(model.channel_ctx)
+        || model.channel_pending == Some(id)
       {
         True -> Some(id)
         False -> None
@@ -2090,6 +2161,10 @@ fn after_threads(model: Model, summaries: List(thread.ThreadSummary)) -> Model {
       True -> None
       False -> model.channel_ctx
     },
+    channel_pending: case ended || switched {
+      True -> None
+      False -> model.channel_pending
+    },
   )
 }
 
@@ -2171,29 +2246,35 @@ pub fn pick_provider(
 fn threads_effect(model: Model) -> Effect(Msg) {
   let registry = model.registry
   let selected = model.selected
-  effect.from(fn(dispatch) {
-    // The pane's two asks ride EVERY list refresh (the plan's rule: the
-    // pane re-asks on the same messages the sidebar already updates —
-    // turn terminals, meta updates, sends, the connect cascade), so the
-    // badge and rows are as fresh as the list itself. Dispatch order
-    // matters for the first: the resolution must be IN the model before
-    // the summaries land, because `after_threads` keeps a channel
-    // selection on the context's word — a channel never appears in the
-    // (channel-free) list, and without the resolved context its own
-    // first refresh would drop it as vanished. The stamped ids drop
-    // replies for a selection that changed while the asks ran.
-    case selected {
-      Some(id) ->
-        dispatch(ChannelResolved(id, thread_registry.channel_of(registry, id)))
-      None -> Nil
-    }
-    dispatch(ThreadsLoaded(thread_registry.list_threads(registry)))
-    case selected {
-      Some(id) ->
-        dispatch(ChannelsLoaded(id, thread_registry.channels(registry, id)))
-      None -> Nil
-    }
-  })
+  effect.from(fn(dispatch) { load_threads_asks(registry, selected, dispatch) })
+}
+
+/// The body of a thread-list refresh, shared by `threads_effect` (the
+/// connect cascade and every event-driven refresh) and `mutate_effect`
+/// (registry mutations: delete, archive, pin, rename, tags). The two
+/// pane asks ride EVERY refresh (the plan's re-ask rule): the resolution
+/// must land BEFORE the summaries (dispatch order within one effect is
+/// delivery order, and `after_threads` consults the context to decide
+/// selection validity), and the rows keep the badge honest across the
+/// mutation — deleting a viewed channel's parent, or archiving it, must
+/// not leave the selection or the rows stale. The stamped ids drop
+/// replies for a selection that changed while the asks ran.
+fn load_threads_asks(
+  registry: process.Subject(thread_registry.Msg),
+  selected: Option(String),
+  dispatch: fn(Msg) -> Nil,
+) -> Nil {
+  case selected {
+    Some(id) ->
+      dispatch(ChannelResolved(id, thread_registry.channel_of(registry, id)))
+    None -> Nil
+  }
+  dispatch(ThreadsLoaded(thread_registry.list_threads(registry)))
+  case selected {
+    Some(id) ->
+      dispatch(ChannelsLoaded(id, thread_registry.channels(registry, id)))
+    None -> Nil
+  }
 }
 
 /// The pane's context-resolution ask, dispatched on its own (the
@@ -2308,8 +2389,11 @@ fn send_effect(model: Model, text: String) -> Effect(Msg) {
             // the top the moment the message lands. Waiting for the
             // reply's TurnDone refresh left the row under Yesterday for
             // the whole turn. The first-message case also lands the new
-            // title here; the turn's own events follow.
-            dispatch(ThreadsLoaded(thread_registry.list_threads(registry)))
+            // title here; the turn's own events follow. The pane asks
+            // ride along (the shared refresh shape): a send into a
+            // parent is what CREATES channels — the relay — so the
+            // badge must move on this refresh, not a later one.
+            load_threads_asks(registry, id, dispatch)
             dispatch(SendAccepted)
           }
           thread.Busy -> dispatch(SendRejected("busy"))
@@ -2453,9 +2537,17 @@ fn mutate_effect(
   run: fn(process.Subject(thread_registry.Msg)) -> Bool,
 ) -> Effect(Msg) {
   let registry = model.registry
+  let selected = model.selected
   effect.from(fn(dispatch) {
     case run(registry) {
-      True -> dispatch(ThreadsLoaded(thread_registry.list_threads(registry)))
+      // The SAME refresh shape as threads_effect (see
+      // `load_threads_asks`): a mutation that removes or flips the
+      // viewed thread's row — deleting its parent (CASCADE takes the
+      // channel), archiving it — must re-resolve the selection and
+      // refresh the pane rows, or a deleted channel stayed selected on
+      // the cached context's word until some unrelated refresh
+      // (the cubic PR review finding).
+      True -> load_threads_asks(registry, selected, dispatch)
       False -> dispatch(ThreadOpFailed("thread is gone"))
     }
   })

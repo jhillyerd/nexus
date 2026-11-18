@@ -43,6 +43,9 @@ import { startServices, UTILITY_REPLY_DELAY_MS } from "./services.mjs";
 
 const ROOT = new URL("..", import.meta.url).pathname;
 const TOKEN = "e2e-token";
+// The main instance's address — module-level so shared rig helpers (relayRig)
+// reach it without threading a parameter (the guard instance uses its own).
+const base = "http://127.0.0.1:18081";
 const results = [];
 let current = null;
 // Hoisted so failure diagnostics (dumpPageState) can reach the live page.
@@ -126,6 +129,106 @@ function eq(actual, expected, message) {
   if (actual !== expected) {
     throw new Error(`${message}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
   }
+}
+
+/// The shared bot-channel rig (the relay smoke and the pane smoke):
+/// two bots named `<prefix>Alpha`/`<prefix>Beta`, a parent thread FROM
+/// Alpha, the `case:relay` send, and the channel discovered through
+/// Alpha's committed receipt in the state dump (channels are absent
+/// from `/threads` — the debug side channel is the scripting API),
+/// polled until Beta's turn settles (message_count 3: system + authored
+/// line + assistant answer). Returns the ids and a cleanup that deletes
+/// CHILDREN FIRST — deleting a parent cascades its channel subtree (the
+/// bot-channels Phase 1 FK + the transitive registry cleanup, by
+/// design), so a channel deleted after its parent would 404. Cleanup
+/// asserts every delete so a leak fails loudly; call it in a `finally`.
+async function relayRig(prefix, note) {
+  const headers = {
+    authorization: `Bearer ${TOKEN}`,
+    "content-type": "application/json",
+  };
+  const made = { bots: [], threads: [] };
+  const mkBot = async (name) => {
+    const res = await page.request.post(`${base}/bots`, {
+      data: {
+        name,
+        provider: "fake",
+        model: "smart",
+        description: `${name} relay smoke`,
+      },
+      headers,
+    });
+    eq(res.status(), 201, `bot ${name} created`);
+    const id = (await res.json()).id;
+    made.bots.push(id);
+    return id;
+  };
+  const alphaId = await mkBot(`${prefix}Alpha`);
+  const betaId = await mkBot(`${prefix}Beta`);
+
+  // A thread FROM Alpha (the shared orchestration re-validates the
+  // alias against the fake gateway's live list).
+  const created = await page.request.post(`${base}/threads`, {
+    data: { bot: alphaId },
+    headers,
+  });
+  eq(created.status(), 201, "thread from bot created");
+  const alphaThread = (await created.json()).id;
+  made.threads.push(alphaThread);
+
+  // Relay: the scripted scenario emits bot_message(to: "<prefix>Beta",
+  // text: the note) — the target is everything before the `|`, so names
+  // with spaces stay addressable — then answers after the receipt.
+  const sent = await page.request.post(`${base}/threads/${alphaThread}/send`, {
+    data: { text: `case:relay ${prefix}Beta|${note}` },
+    headers,
+  });
+  eq(sent.status(), 202, "send accepted");
+
+  const betaThread = await poll(
+    async () => {
+      const state = await (
+        await page.request.get(`${base}/threads/${alphaThread}/state`, { headers })
+      ).json();
+      const receipt = (state.messages ?? []).find(
+        (m) =>
+          m.role === "tool" &&
+          String(m.content).includes(`delivered to ${prefix}Beta in thread`),
+      );
+      return /thread (s\d+)/.exec(receipt?.content ?? "")?.[1] ?? null;
+    },
+    { timeout: 30_000, interval: 500, message: "delivery receipt lands" },
+  );
+  const settled = await poll(
+    async () => {
+      const state = await (
+        await page.request.get(`${base}/threads/${betaThread}/state`, { headers })
+      ).json();
+      return state.status?.streaming === false &&
+        (state.status?.message_count ?? 0) >= 3
+        ? state
+        : null;
+    },
+    { timeout: 30_000, interval: 500, message: "Beta DM turn completes" },
+  );
+
+  const cleanup = async () => {
+    for (const id of [...made.threads].reverse()) {
+      eq(
+        (await page.request.delete(`${base}/threads/${id}`, { headers })).status(),
+        204,
+        `thread ${id} deleted`,
+      );
+    }
+    for (const id of made.bots) {
+      eq(
+        (await page.request.delete(`${base}/bots/${id}`, { headers })).status(),
+        204,
+        `bot ${id} deleted`,
+      );
+    }
+  };
+  return { betaId, alphaThread, betaThread, settled, note, cleanup };
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -390,19 +493,17 @@ function extendsRequest(prevBody, nextBody) {
 async function main() {
   console.log("starting controlled services…");
   const services = await startServices();
-  const mainPort = 18081;
   const guardPort = 18082;
   await resetDatabase();
   await seedProvider(services.bifrostPort);
-  const main = startNexus({ port: mainPort, maxToolIterations: 8, ...pick(services) });
+  const main = startNexus({ port: 18081, maxToolIterations: 8, ...pick(services) });
   let guard = startNexus({ port: guardPort, maxToolIterations: 2, ...pick(services) });
-  const base = `http://127.0.0.1:${mainPort}`;
   const guardBase = `http://127.0.0.1:${guardPort}`;
 
   let browser = null;
   let exitCode = 0;
   try {
-    await waitHealthy(mainPort);
+    await waitHealthy(18081);
     await waitHealthy(guardPort);
     console.log("nexus up; launching chromium…");
     browser = await chromium.launch({
@@ -2027,115 +2128,16 @@ async function main() {
     // turn. The gateway's recorded request bodies are the model-visible
     // ground truth (issue #97's e2e smoke).
     await test("bots: bot-to-bot relay delivers an authored user turn", async () => {
-      const headers = {
-        authorization: `Bearer ${TOKEN}`,
-        "content-type": "application/json",
-      };
-      // Cleanup runs even when an assertion mid-test throws — the suite
-      // continues into later tests, and relay threads/bots must not leak
-      // into the shared world (cubic PR review).
-      const made = { bots: [], threads: [] };
-      const cleanup = async () => {
-        // CHILDREN FIRST: deleting a parent cascades its channel subtree
-        // (the bot-channels Phase 1 FK + the transitive registry cleanup
-        // — by design), so a channel deleted after its parent 404s. The
-        // made.threads array is parent-then-channel; reversed, each
-        // delete finds its row still there.
-        for (const id of [...made.threads].reverse()) {
-          eq(
-            (await page.request.delete(`${base}/threads/${id}`, { headers })).status(),
-            204,
-            `thread ${id} deleted`,
-          );
-        }
-        for (const id of made.bots) {
-          eq(
-            (await page.request.delete(`${base}/bots/${id}`, { headers })).status(),
-            204,
-            `bot ${id} deleted`,
-          );
-        }
-      };
+      // The shared rig (see relayRig): bots, parent thread, relay send,
+      // channel discovery + settle, children-first cleanup.
+      const { betaId, alphaThread, betaThread, settled, note, cleanup } =
+        await relayRig("Relay", "relay-note-123");
       try {
-        const mkBot = async (name) => {
-          const res = await page.request.post(`${base}/bots`, {
-            data: {
-              name,
-              provider: "fake",
-              model: "smart",
-              description: `${name} relay smoke`,
-            },
-            headers,
-          });
-          eq(res.status(), 201, `bot ${name} created`);
-          const id = (await res.json()).id;
-          made.bots.push(id);
-          return id;
-        };
-        const alphaId = await mkBot("RelayAlpha");
-        const betaId = await mkBot("RelayBeta");
-
-        // A thread FROM Alpha (the shared orchestration re-validates the
-        // alias against the fake gateway's live list).
-        const created = await page.request.post(`${base}/threads`, {
-          data: { bot: alphaId },
-          headers,
-        });
-        eq(created.status(), 201, "thread from bot created");
-        const alphaThread = (await created.json()).id;
-        made.threads.push(alphaThread);
-
-        // Relay: the scripted scenario emits bot_message(to: "RelayBeta",
-        // text: the note) — the target is everything before the `|`, so
-        // names with spaces stay addressable — then answers after the
-        // receipt.
-        const note = "relay-note-123";
-        const sent = await page.request.post(`${base}/threads/${alphaThread}/send`, {
-          data: { text: `case:relay RelayBeta|${note}` },
-          headers,
-        });
-        eq(sent.status(), 202, "send accepted");
-
-        // Beta's DM thread is a CHANNEL since the bot-channels plan
-        // (Phase 1): hidden from `/threads` (the registry-side projection
-        // keeps the sidebar human-shaped), discovered instead through
-        // Alpha's committed receipt — the debug side channel's exact
-        // audience (scripting/e2e). The receipt names the DM thread; the
-        // channel's own state dump reports its turn settling (message
-        // count 3: system + authored line + assistant answer).
-        const betaThread = await poll(
-          async () => {
-            const state = await (
-              await page.request.get(`${base}/threads/${alphaThread}/state`, { headers })
-            ).json();
-            const receipt = (state.messages ?? []).find(
-              (m) =>
-                m.role === "tool" &&
-                String(m.content).includes("delivered to RelayBeta in thread"),
-            );
-            const id = /thread (s\d+)/.exec(receipt?.content ?? "")?.[1];
-            return id ?? null;
-          },
-          { timeout: 30_000, interval: 500, message: "delivery receipt lands" },
-        );
-        const settled = await poll(
-          async () => {
-            const state = await (
-              await page.request.get(`${base}/threads/${betaThread}/state`, { headers })
-            ).json();
-            return state.status?.streaming === false &&
-              (state.status?.message_count ?? 0) >= 3
-              ? state
-              : null;
-          },
-          { timeout: 30_000, interval: 500, message: "Beta DM turn completes" },
-        );
         eq(
           settled.summary?.bot_id ?? null,
           betaId,
           "the channel hangs off Beta's provenance",
         );
-        made.threads.push(betaThread);
 
         // Model-visible bytes: the gateway records raw request strings, so
         // parse them. Beta's recorded request carries the authored user
@@ -2263,96 +2265,13 @@ async function main() {
     // riding the connect cascade, the replay through the ordinary Join
     // machinery, and the CSS being actually loaded.
     await test("bots: the thread info pane navigates per-parent channels", async () => {
-      const headers = {
-        authorization: `Bearer ${TOKEN}`,
-        "content-type": "application/json",
-      };
-      const made = { bots: [], threads: [] };
-      const cleanup = async () => {
-        // CHILDREN FIRST: deleting a parent cascades its channel subtree
-        // (the bot-channels Phase 1 FK + the transitive registry cleanup
-        // — by design), so a channel deleted after its parent 404s. The
-        // made.threads array is parent-then-channel; reversed, each
-        // delete finds its row still there.
-        for (const id of [...made.threads].reverse()) {
-          eq(
-            (await page.request.delete(`${base}/threads/${id}`, { headers })).status(),
-            204,
-            `thread ${id} deleted`,
-          );
-        }
-        for (const id of made.bots) {
-          eq(
-            (await page.request.delete(`${base}/bots/${id}`, { headers })).status(),
-            204,
-            `bot ${id} deleted`,
-          );
-        }
-      };
+      // The shared rig (see relayRig): bots, parent thread, relay send,
+      // channel discovery + settle, children-first cleanup.
+      const { alphaThread, betaThread, note, cleanup } = await relayRig(
+        "Pane",
+        "pane-note-9",
+      );
       try {
-        const mkBot = async (name) => {
-          const res = await page.request.post(`${base}/bots`, {
-            data: {
-              name,
-              provider: "fake",
-              model: "smart",
-              description: `${name} pane smoke`,
-            },
-            headers,
-          });
-          eq(res.status(), 201, `bot ${name} created`);
-          const id = (await res.json()).id;
-          made.bots.push(id);
-          return id;
-        };
-        const alphaId = await mkBot("PaneAlpha");
-        const betaId = await mkBot("PaneBeta");
-
-        const created = await page.request.post(`${base}/threads`, {
-          data: { bot: alphaId },
-          headers,
-        });
-        eq(created.status(), 201, "parent thread created");
-        const alphaThread = (await created.json()).id;
-        made.threads.push(alphaThread);
-
-        // Deliver: the channel opens as a side effect of the turn. The
-        // channel is hidden from `/threads` (the second-class
-        // projection), so discovery rides Alpha's committed receipt in
-        // the debug side channel — then the channel's own state dump
-        // reports the turn settling.
-        const sent = await page.request.post(
-          `${base}/threads/${alphaThread}/send`,
-          { data: { text: `case:relay PaneBeta|pane-note-9` }, headers },
-        );
-        eq(sent.status(), 202, "send accepted");
-        const betaThread = await poll(
-          async () => {
-            const state = await (
-              await page.request.get(`${base}/threads/${alphaThread}/state`, { headers })
-            ).json();
-            const receipt = (state.messages ?? []).find(
-              (m) =>
-                m.role === "tool" &&
-                String(m.content).includes("delivered to PaneBeta in thread"),
-            );
-            return /thread (s\d+)/.exec(receipt?.content ?? "")?.[1] ?? null;
-          },
-          { timeout: 30_000, interval: 500, message: "delivery receipt lands" },
-        );
-        await poll(
-          async () => {
-            const state = await (
-              await page.request.get(`${base}/threads/${betaThread}/state`, { headers })
-            ).json();
-            return state.status?.streaming === false &&
-              (state.status?.message_count ?? 0) >= 3
-              ? state
-              : null;
-          },
-          { timeout: 30_000, interval: 500, message: "Beta channel turn completes" },
-        );
-        made.threads.push(betaThread);
 
         // The UI, on the parent: select Alpha's thread and wait for the
         // badge — proof the Channels ask rode the connect cascade.

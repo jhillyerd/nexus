@@ -5035,17 +5035,76 @@ pub fn channel_row_selection_seeds_context_test() {
 /// Selection-without-listing: a channel is never a sidebar row (the
 /// registry projection hides channels from the list), and the PARENT's
 /// row carries the highlight instead — exactly one row selected either
-/// way, `aria-current` included.
+/// way, `aria-current` included. The channel is selected through the
+/// PANE (row click), so the highlight can only come from the
+/// `channel_ctx_of` mapping: `model.selected` names the channel, which
+/// matches no listed row.
 pub fn channel_selection_highlights_parent_row_test() {
+  let info = channel_info("s-channel", Some("RelayBeta"), False, False)
   let model =
     new_model()
     |> step(ui.ThreadsLoaded([summary("s-parent", False)]))
-    |> with_ctx
+    |> step(ui.Select("s-parent"))
+    |> step(ui.ChannelsLoaded("s-parent", [info]))
+    |> step(ui.ChannelRowSelected(info))
+  model.selected |> should.equal(Some("s-channel"))
   let html = view_string(model)
   should_contain(html, "thread-row selected")
   should_contain(html, "aria-current=\"true\"")
-  // The channel id rides no row: only listed summaries render rows.
   should_not_contain(html, "data-thread-id=\"s-channel\"")
+}
+
+/// The crumb race: a list refresh queued BEFORE a selection change
+/// lands after it, and a channel is absent from every list. The pending
+/// marker holds the selection for that window; the stamped reply
+/// settles it — Error (the id is ordinary or deleted) clears pending,
+/// and the NEXT refresh drops the selection into the ordinary
+/// auto-select path: a bounded one-refresh grace, never a permanent
+/// ghost.
+pub fn pending_resolution_holds_channel_selection_test() {
+  let model =
+    new_model()
+    |> step(ui.ThreadsLoaded([summary("s-parent", False)]))
+    |> step(ui.Select("s-parent"))
+    // The crumb: Select a channel id (not in any list).
+    |> step(ui.Select("s-channel"))
+    |> step(ui.ThreadsLoaded([summary("s-parent", False)]))
+  model.selected |> should.equal(Some("s-channel"))
+  model.channel_pending |> should.equal(Some("s-channel"))
+  // The resolution lands and refuses: not a channel (or deleted).
+  let model = step(model, ui.ChannelResolved("s-channel", Error(Nil)))
+  model.channel_pending |> should.equal(None)
+  model.channel_ctx |> should.equal(None)
+  // Held no longer — the next refresh drops it (auto-select replaces).
+  let model = step(model, ui.ThreadsLoaded([summary("s-parent", False)]))
+  model.selected |> should.equal(Some("s-parent"))
+  model.channel_pending |> should.equal(None)
+}
+
+/// The same window, resolved Ok: the context pins the selection and
+/// pending clears — the selection is now held the ordinary way.
+pub fn pending_resolution_ok_pins_context_test() {
+  let model =
+    new_model()
+    |> step(ui.ThreadsLoaded([summary("s-parent", False)]))
+    |> step(ui.Select("s-parent"))
+    |> step(ui.Select("s-channel"))
+    |> step(ui.ThreadsLoaded([summary("s-parent", False)]))
+    |> step(ui.ChannelResolved(
+      "s-channel",
+      Ok(thread_registry.ChannelContext(
+        parent_id: "s-parent",
+        bot_id: Some("bot-1"),
+        title: "RelayBeta",
+        archived: False,
+      )),
+    ))
+  model.channel_pending |> should.equal(None)
+  let assert Some(ctx) = model.channel_ctx
+  ctx.parent_id |> should.equal("s-parent")
+  // Held by the context now: a further refresh keeps the selection.
+  let model = step(model, ui.ThreadsLoaded([summary("s-parent", False)]))
+  model.selected |> should.equal(Some("s-channel"))
 }
 
 /// The pane renders one row per channel: dot state, `↳ <bot name>`,

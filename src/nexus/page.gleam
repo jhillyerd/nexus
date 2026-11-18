@@ -1322,6 +1322,12 @@ details.turn.reasoning.live > summary { color: color-mix(in srgb, currentColor 8
 #app .infobtn .info-dot.live { color: #3b82f6; opacity: 1;
   animation: info-pulse 1.6s ease-in-out infinite; }
 @keyframes info-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
+/* Vestibular safety: the badge dot is the shell's only infinite
+   animation — honor the OS reduced-motion preference by rendering it
+   static (the count chip still reads the running state). */
+@media (prefers-reduced-motion: reduce) {
+  #app .infobtn .info-dot.live { animation: none; opacity: 1; }
+}
 #app .infobtn .n { font-size: .7rem; background: #3b82f6; color: #fff;
   border-radius: 999px; padding: .05rem .45rem; line-height: 1.4; }
 /* The breadcrumb back to the parent (viewing a channel): reads as a

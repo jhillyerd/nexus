@@ -453,9 +453,12 @@ instruction. So:
   matters).
 - **A Phase 1 gap the e2e smoke exposed and Phase 2 fixed: the registry
   gained `SummaryOf(id)`.** `web.with_thread` resolved threads through
-  the channel-free `List`, so EVERY per-thread HTTP route 404'd on a
-  channel — state, delete, send (the Phase 1 commit's "Get/state keep
-  answering" claim was true of the store and `Get`, not of the routes).
+  the channel-free `List`, so every route that goes through it 404'd on
+  a channel — the state dump, send, stop, and the shareable thread page
+  (the Phase 1 commit's "Get/state keep answering" claim was true of
+  the store and `Get`, not of these routes; DELETE never went through
+  `with_thread` — its registry ask already answered for channels — and
+  PATCH still does not, see the follow-up below).
   `with_thread` now asks `Get` FIRST (the lazy-start/retry discipline
   unchanged — a dormant channel hydrates exactly as before) then
   `summary_of`: a live record summarises through its actor (the List
@@ -477,7 +480,8 @@ instruction. So:
   its "a row click is never a channel" reasoning covers the sidebar
   but not the breadcrumb: a hop chain's crumb targets a channel-parent,
   and without the re-resolution the selection sat contextless until an
-  unrelated refresh — the smart-loop round-1 should); and the
+  unrelated refresh — the round-1 should-finding of the DeepSeek
+  smart-loop review); and the
   `ThreadsLoaded` switch branches — the boot auto-selection changes the
   selection AFTER the cascade captured `None`, so a thread selected by
   auto-select must fetch its own rows there (the flaky-badge e2e
