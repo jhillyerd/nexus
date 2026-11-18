@@ -170,8 +170,10 @@ env overrides: NEXUS_NODE, NEXUS_ROLE, NEXUS_THREAD (still wins over the grant's
 
 - **State file** `${XDG_STATE_HOME:-$HOME/.local/state}/nexus/tui-<host>-<node>.json`,
   mode `0600`, content `{server, node, token, thread}` (`server` is
-  the server's BASE URL — never the pairing URL; the code dies at the
-  exchange) — keyed per (server, node name), so two threads on one
+  the server's BASE URL — the launcher never persists the pairing
+  URL; the code is stored only as a hash, and the grant itself stays
+  redeemable until expiry or revocation) — keyed per (server, node
+  name), so two threads on one
   host work via distinct `NEXUS_NODE` names (one live TUI per name:
   the second connection replaces the first — shipped
   replace-on-reconnect).
