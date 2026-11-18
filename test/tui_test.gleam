@@ -14,6 +14,7 @@ import gleeunit/should
 import nexus/env
 import nexus/node_protocol
 import nexus/timing
+import nexus/tui
 import nexus/tui/render
 import nexus/tui/tools
 import simplifile
@@ -306,4 +307,40 @@ pub fn response_frame_test() {
     <> "\"content\":[{\"type\":\"text\",\"text\":\"boom\"}],"
     <> "\"isError\":true}}",
   )
+}
+
+// ---------------------------------------------------------------------------
+// Entry point: the handshake-status parse behind the launcher's re-pair
+// signal (tui-pairing plan Phase B — exit 4 on 401)
+// ---------------------------------------------------------------------------
+
+/// stratus's exact upgrade-failure shape: "WebSocket handshake failed
+/// with status " + the code. The 401 answer is what bin/nexus-tui
+/// re-pairs on.
+pub fn handshake_status_upgrade_test() {
+  tui.handshake_status("WebSocket handshake failed with status 401")
+  |> should.equal(Some(401))
+  tui.handshake_status("WebSocket handshake failed with status 403")
+  |> should.equal(Some(403))
+}
+
+/// Non-status reasons (timeouts, transport failures, other stratus
+/// reasons) answer None and keep the plain connect-failure exit — the
+/// launcher must never re-pair on those.
+pub fn handshake_status_non_status_test() {
+  tui.handshake_status("handshake timed out")
+  |> should.equal(None)
+  tui.handshake_status("connection exited during handshake")
+  |> should.equal(None)
+  tui.handshake_status("WebSocket handshake failed: ConnectionRefused")
+  |> should.equal(None)
+}
+
+/// A status-shaped prefix without digits parses as nothing rather than
+/// misreading a word as a code.
+pub fn handshake_status_garbled_test() {
+  tui.handshake_status("WebSocket handshake failed with status ")
+  |> should.equal(None)
+  tui.handshake_status("WebSocket handshake failed with status oops")
+  |> should.equal(None)
 }

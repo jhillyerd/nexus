@@ -2,7 +2,7 @@
 title: Nexus — TUI pairing grants (web-minted pairing URLs for nexus-tui)
 status: active
 tags: [computing, self-hosting, local-llm, agents, gleam, beam, environments, tui]
-updated: 2026-11-16
+updated: 2026-11-18
 ---
 
 # TUI pairing grants: mint a pairing URL in the web UI, launch nexus-tui with it
@@ -244,7 +244,8 @@ IMPLEMENTED
   bumped); `node_test` for the mint/verify helpers; `migrate_test`
   idempotency.
 
-### Phase B — script pairing mode + state file (the UX fix)
+### Phase B — script pairing mode + state file (the UX fix) —
+IMPLEMENTED (2026-11-18)
 
 - `bin/nexus-tui`: pair-url arg / `NEXUS_PAIR_URL`, state read/write
   (`jq`, `0600`), `401` re-pair path, `--reset`, delete-and-re-pair
@@ -253,6 +254,39 @@ IMPLEMENTED
   server setup), pair via URL, kill the client, relaunch with the state
   file → same node row (assert through `GET /nodes`), transcript
   replayed.
+
+As-built deltas:
+
+- **The 401 signal is an EXIT CODE, not stdout scraping.**
+  `nexus/tui` parses the status out of stratus's handshake-failure
+  reason (`handshake_status`, offline-pinned) and halts 4 on 401
+  (credential rejected — node row revoked or swept), keeping 2 for
+  every other connect failure. The launcher re-pairs on 4 (when it
+  holds a pairing URL) and propagates everything else verbatim; the
+  bare relaunch turns 4 into "credential rejected — pair again".
+- **State discovery is by node name**, not only by the (server, node)
+  key: a bare `nexus-tui` relaunch does not know the host, so the
+  launcher `jq`-filters `tui-*.json` on the stored `.node`. One match
+  connects; several match → exit 2 listing them (disambiguate by
+  relaunching with the pairing URL or setting `NEXUS_URL`); none →
+  the usage message. With a pairing URL given, only the matching
+  server's file qualifies.
+- **`NEXUS_URL` is gone from the launcher** — the pairing URL and the
+  state file carry the server base; `NEXUS_URL` survives only as the
+  ambiguity disambiguator above. The old admin-token pairing path
+  (`POST /nodes` + `NEXUS_UI_TOKEN`) is unchanged as a route for
+  scripting; the launcher no longer uses it, and the
+  delete-stale-row-then-re-pair behavior is removed as planned.
+- **The state file stores the EFFECTIVE thread** — the grant's, unless
+  `NEXUS_THREAD` overrode it at pair time — so a relaunch reproduces
+  exactly the working configuration; the token is written 0600 via a
+  same-directory tmp file + rename, never resting world-readable.
+- **e2e seeds grants via psql** (hex `sha256(code)`, one-hour expiry,
+  pinned to the suite's env thread) — the schema row is the contract
+  the store seam writes; grants then live through the whole launcher
+  flow: exchange → 0600 state → SIGKILL + stored-credential relaunch
+  (same node row, replay rendered) → revoked credential refuses with
+  exit 4 → a fresh URL re-pairs and replaces the row.
 
 A + B together are the whole UX fix; they land first.
 
