@@ -294,8 +294,11 @@ require the configured UI token when `NEXUS_UI_TOKEN` is set;
   pairing exchange (tui-pairing plan): redeems a web-minted 1-hour,
   multi-use pairing code for a node token plus the grant's pinned
   `thread_id` — no UI token, the code is the auth. Expired/revoked/
-  unknown codes answer one merged `404`; a taken name answers the same
-  friendly `409` as `POST /nodes`
+  unknown codes answer one merged `404`, checked before the
+  name-collision test, so a dead code looks identical whatever the
+  name; with a live code, a taken name answers the same friendly `409`
+  as `POST /nodes` (that order also keeps anonymous callers from
+  enumerating node names with a garbage code)
 - `DELETE /nodes/<id>` — revoke the node's token (204, idempotent;
   future connections fail, a live one is not retroactively killed)
 - `GET /node/ws?node=<name>&token=<token>&thread=<id>&role=env|viewer`

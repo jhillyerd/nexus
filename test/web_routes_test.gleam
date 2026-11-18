@@ -1501,10 +1501,10 @@ pub fn node_grant_exchange_round_trip_test() {
   let assert Ok(reserved) = pair(live_code, "workspace")
   should.equal(reserved.status, 400)
 
-  // THE CROSSING CASE (smart-loop R1, S1): an invalid name must answer
-  // 400 even with a BOGUS code — with the code check first, this probe
-  // distinguished live (400) from bogus (404) codes: the oracle the
-  // merged 404 exists to prevent. Name gate first, unconditionally.
+  // THE CROSSING CASE: an invalid name must answer 400 even with a
+  // BOGUS code — with the code check first, this probe distinguished
+  // live (400) from bogus (404) codes: the oracle the merged 404
+  // exists to prevent. Name gate first, unconditionally.
   let assert Ok(crossing) = pair("not-a-real-code-at-all", "workspace")
   should.equal(crossing.status, 400)
   let assert Ok(crossing2) = pair("not-a-real-code-at-all", "bad name")

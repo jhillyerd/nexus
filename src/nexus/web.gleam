@@ -1509,12 +1509,16 @@ fn node_pair_response(
     Error(_) -> json_response(400, err_json("unreadable body"))
     Ok(fields) ->
       // The name gate runs BEFORE the code check — the ordering is
-      // load-bearing (smart-loop R1, S1): with the code first, an
-      // invalid-name probe distinguishes a live code (400, name check
-      // reached) from a bogus one (404, short-circuit) — exactly the
-      // oracle the merged 404 exists to prevent. Name-first, an
-      // invalid name answers 400 unconditionally and code state is
-      // observable only through an otherwise-valid redemption.
+      // load-bearing: with the code first, an invalid-name probe
+      // distinguishes a live code (400, name check reached) from a
+      // bogus one (404, short-circuit) — exactly the oracle the
+      // merged 404 exists to prevent. Name-first, an invalid name
+      // answers 400 unconditionally, and code state shows only through
+      // an otherwise-valid redemption: free name → 201/404, taken name
+      // → 409. The collision check deliberately stays AFTER the code
+      // check — the reverse order would let an anonymous caller
+      // enumerate node names with a garbage code (409 taken vs 404
+      // free).
       case node.valid_name(fields.name) {
         Error(reason) -> json_response(400, err_json(reason))
         Ok(name) ->

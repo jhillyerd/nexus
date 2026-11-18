@@ -98,7 +98,11 @@ a deliberate absence in `requires_auth` with the same comment.
   `201 {id, name, token, thread_id}`. The grant's thread rides along —
   the TUI host needs zero thread knowledge.
 - `409` name-already-paired keeps today's friendly path (the same
-  `node name is already paired` the admin route answers). **A code must
+  `node name is already paired` the admin route answers), surfacing
+  only for a LIVE code: the code check deliberately precedes the
+  collision check, because the reverse order would let an anonymous
+  caller enumerate node names with a garbage code (409 taken vs 404
+  free). **A code must
   never authorize taking over an existing name** — that would escalate a
   grant beyond mint-new. A lost state file with the row still live 409s;
   the SCRIPT's error output (Phase B) adds the pointer to the info
