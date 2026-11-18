@@ -10,7 +10,7 @@
 %% hackney 1.25) ssl:connect(Sock, Opts) waits with no timeout at all.
 start_silent_listener(Port) ->
     case gen_tcp:listen(Port, [binary, {packet, raw}, {active, false},
-                               {reuseaddr, true}]) of
+                               {reuseaddr, true}, {ip, {127, 0, 0, 1}}]) of
         {ok, Listener} ->
             spawn(fun() -> accept_loop(Listener) end),
             {ok, nil};

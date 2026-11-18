@@ -140,29 +140,43 @@ fn now_ms() -> Int
 /// a loop error) within roughly 2×timeout + slack, instead of never.
 pub fn stalled_tls_handshake_is_deadline_bounded_test() {
   let assert Ok(_) = start_silent_listener(silent_tls_port)
-  let started = now_ms()
-  let result =
-    net.fetch(
-      "https://127.0.0.1:" <> int.to_string(silent_tls_port) <> "/",
-      [],
-      20_000,
-      // 1s budget → 4s hard deadline: fast enough to keep the suite
-      // snappy, long enough that the deadline (not a fast TLS refusal)
-      // is what ends the call.
-      1000,
-      True,
-      3,
-    )
-  let elapsed = now_ms() - started
-  // The deadline floor proves the stall really happened and was waited
-  // out (a fast failure would mean the listener answered TLS somehow);
-  // the ceiling proves the deadline fired — pre-fix this call NEVER
-  // returned and hung the whole suite.
-  should.be_true(elapsed >= 3500)
-  should.be_true(elapsed < 15_000)
-  // net.fetch surfaces the FFI error verbatim; the "fetch failed: " prefix
-  // is added by the http_fetch tool adapter above it.
-  let assert Error("timeout (hard deadline)") = result
+  // The fetch runs in a worker that reports back through a subject: if
+  // the deadline itself regresses (the bug this test guards), the
+  // receive below times out and the suite FAILS loudly instead of
+  // hanging forever inside net.fetch.
+  let reporter = process.new_subject()
+  process.spawn(fn() {
+    let started = now_ms()
+    let result =
+      net.fetch(
+        "https://127.0.0.1:" <> int.to_string(silent_tls_port) <> "/",
+        [],
+        20_000,
+        // 1s budget → 4s hard deadline: fast enough to keep the suite
+        // snappy, long enough that the deadline (not a fast TLS refusal)
+        // is what ends the call.
+        1000,
+        True,
+        3,
+      )
+    process.send(reporter, #(now_ms() - started, result))
+  })
+  // The deadline is 4s; 20s of receive slack before declaring it dead.
+  case process.receive(reporter, 20_000) {
+    Ok(#(elapsed, result)) -> {
+      // The deadline floor proves the stall really happened and was
+      // waited out (a fast failure would mean the listener answered TLS
+      // somehow); the ceiling proves the deadline fired — pre-fix this
+      // call NEVER returned and hung the whole suite.
+      should.be_true(elapsed >= 3500)
+      should.be_true(elapsed < 15_000)
+      // net.fetch surfaces the FFI error verbatim; the "fetch failed: "
+      // prefix is added by the http_fetch tool adapter above it.
+      let assert Error("timeout (hard deadline)") = result
+    }
+    Error(Nil) ->
+      panic as "stalled-TLS fetch never returned: the hard deadline did not fire"
+  }
 }
 
 // ---------------------------------------------------------------------------

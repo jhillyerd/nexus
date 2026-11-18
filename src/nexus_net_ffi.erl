@@ -21,18 +21,20 @@ bounded_get(Url, Headers, MaxBytes, TimeoutMs) ->
     %% TLS handshake with ssl:connect(Sock, Opts) — the two-argument form,
     %% no timeout, i.e. infinity — and {recv_timeout, T} only starts after
     %% the request has been sent. A host that completes the TCP connect
-    %% but stalls (or is MITM'd/stalled by a middlebox in) the TLS
-    %% handshake therefore hangs hackney:request forever, which wedged a
-    %% live http_fetch turn worker (thread s2 on plastic.home.arpa,
-    %% 2026-11-17). Same class as hackney PR #781 / GHSA-gp9c-pm5m-5cxr
-    %% (fixed in hackney 4.0.1; nexus pins 1.x). Until the dependency is
-    %% bumped, bound it here: run the fetch in a throwaway worker and kill
-    %% it at the deadline — gen_tcp/ssl sockets die with their owner
-    %% process, so the kill also closes the connection. 2*T + slack covers
-    %% the legitimate worst case (connect_timeout + one recv_timeout for
-    %% the response head); anything slower answers as a deadline error,
-    %% which is tool DATA for the model, never a turn error.
-    Deadline = 2 * TimeoutMs + 2000,
+    %% but stalls the TLS handshake therefore hangs hackney:request
+    %% forever — the bug class fixed upstream in hackney 4.0.1 (PR #781 /
+    %% GHSA-gp9c-pm5m-5cxr; nexus pins 1.x), which is when this wrapper
+    %% can go. Until then, bound it here: run the fetch in a throwaway
+    %% worker and kill it at the deadline — gen_tcp/ssl sockets die with
+    %% their owner process, so the kill also closes the connection. The
+    %% deadline bounds the WHOLE hop — connect, handshake, response head,
+    %% AND body streaming — so 2*T + slack is only the normal-path worst
+    %% case; a slow-dribbling body can also hit it and answers as a
+    %% deadline error, which is tool DATA for the model, never a turn
+    %% error. Clamped at 0 so no caller can make `after` raise badarg
+    %% with a negative value (config load rejects those loudly; this is
+    %% defense in depth at the FFI boundary).
+    Deadline = max(0, 2 * TimeoutMs + 2000),
     Owner = self(),
     Ref = make_ref(),
     Pid = spawn(fun() ->
