@@ -43,9 +43,12 @@ import lustre/event
 import lustre/server_component
 import nexus/bot.{type Bot}
 import nexus/bot_registry
+import nexus/env
+import nexus/node
 import nexus/provider.{type Provider}
 import nexus/provider_registry
 import nexus/rescue
+import nexus/store
 import nexus/thread.{type ThreadEvent}
 import nexus/thread_create
 import nexus/thread_registry
@@ -78,6 +81,21 @@ pub type Flags {
     bots: Subject(bot_registry.Msg),
     models_timeout_ms: Int,
     thread: Option(String),
+    /// The store seam (tui-pairing plan Phase C): the info pane's
+    /// Environments section reads node + grant rows through it and
+    /// mints/revokes through it. The first UI-side store access —
+    /// architecturally identical to the web routes, which call the seam
+    /// directly from request processes (the pool is process-safe). No
+    /// node/grant registry ACTOR was added: the rows carry no in-memory
+    /// state or lifecycle (unlike providers/bots), so an actor would be
+    /// ceremony.
+    store: store.Store,
+    /// The server's own origin as boot knows it (the configured bind
+    /// and port): the base of a minted pairing URL. The page shell's
+    /// `pairing_js` rewrites the URL to the BROWSING origin on mount —
+    /// a `0.0.0.0` bind or a LAN hostname must not leak into the link
+    /// the operator copies for a TUI host.
+    pair_base: String,
   )
 }
 
@@ -208,11 +226,17 @@ pub type Model {
     registry: Subject(thread_registry.Msg),
     /// The bot registry subject (Settings Bots CRUD, start-from-bot).
     bots: Subject(bot_registry.Msg),
+    /// The store seam (see Flags): the info pane's Environments reads
+    /// and grant/node writes go through it, from unlinked workers only.
+    store: store.Store,
     /// The shared live-model budget (`thread_create.models_timeout`):
     /// every list_models call this connection makes — the picker
     /// reload, the Settings Test control, the bot-form comboboxes.
     /// (The create path fetches nothing: aliases are not validated.)
     models_timeout_ms: Int,
+    /// The minted pairing URL's base (see Flags): rewritten to the
+    /// browsing origin by the page shell's `pairing_js`.
+    pair_base: String,
     // Long-lived subscription to the selected thread's events, owned by
     // this connection's runtime (one runtime per /ws client since the
     // per-client break; a reload is a new subject, and the thread actor
@@ -384,6 +408,34 @@ pub type Model {
     /// The popover's visibility. Pure display state — like `pop`, closed
     /// by any selection change and by entering Settings.
     pane_open: Bool,
+    // ---- Thread info pane: Environments (tui-pairing plan Phase C) ----
+    /// Node + grant rows as of the pane's last open/refresh. Loaded by
+    /// the pane-open effect (store reads in an unlinked worker — see
+    /// `env_load_effect`), refreshed after each mint/revoke the same
+    /// way. Roster TARGET NAMES are not stored here: they re-derive
+    /// from the UI's own log at render (the newest roster row wins,
+    /// exactly the server's hydration rule), so a live attach/detach
+    /// broadcast updates the section with no extra ask.
+    env_nodes: List(node.Node),
+    /// Every stored grant; the pane filters to the selected thread's
+    /// (`grant.thread_id`) at render. Expired-but-unswept rows still
+    /// render — labelled "expired", revoke-able — because the boot
+    /// sweep only collects them at the next restart.
+    env_grants: List(node.Grant),
+    /// The ONE-TIME mint display: the plaintext code exists only in
+    /// this client's memory (the server stores the hash), so the URL
+    /// renders only while this session holds it. Cleared on selection
+    /// change, a newer mint, or revoking that grant; a lost URL is
+    /// re-minted — cheap by design (the token-answers-once precedent).
+    grant_minted: Option(#(String, node.Grant)),
+    /// The single mint in flight (the `create_pending` rule): the mint
+    /// button disables, the guard releases on `GrantMinted` /
+    /// `GrantMintFailed` alike, so a refused mint never locks the pane.
+    grant_minting: Bool,
+    /// The section's last failure note (a store hiccup, a refused
+    /// revoke). Cleared by the next successful load and on selection
+    /// change; display-only, never a chat-log line.
+    env_error: Option(String),
   )
 }
 
@@ -549,6 +601,39 @@ pub type Msg {
     asked_id: String,
     ctx: Result(thread_registry.ChannelContext, Nil),
   )
+  // ---- Thread info pane: Environments (tui-pairing plan Phase C) ----
+  /// The pane's store reads landed (nodes + grants, the `env_load_effect`
+  /// / `env_revoke_effect` workers), stamped with the selection they
+  /// were asked FOR: a selection change between effect start and
+  /// dispatch drops the stale reply (the `ChannelsLoaded` rule). Also
+  /// the self-refresh of a completed revoke (delete, then re-read).
+  EnvLoaded(
+    id: Option(String),
+    nodes: List(node.Node),
+    grants: List(node.Grant),
+  )
+  /// The pane's store reads failed (a store hiccup) or a worker crashed
+  /// — every exit dispatches, so no pending state wedges (the `rescue`
+  /// contract). Surfaces as the section's muted note, never a log line.
+  EnvFailed(id: Option(String), reason: String)
+  /// The "Pair a TUI…" button: arms the single-mint guard and spawns
+  /// the mint worker. One mint at a time (the `create_pending` rule).
+  GrantMintRequested
+  /// A mint landed: the row is persisted (write-through at mint) and
+  /// the ONE-TIME URL display takes the plaintext code. Stamped with
+  /// the grant's thread: a mint answering for a superseded selection is
+  /// dropped (the guard releases regardless — it is section-level).
+  GrantMinted(code: String, grant: node.Grant)
+  /// The mint's insert failed or the worker crashed: the guard releases
+  /// and the section notes the reason.
+  GrantMintFailed(reason: String)
+  /// A roster row's Revoke button: delete the NODE row (token revoke;
+  /// a live connection survives until it disconnects — the shipped
+  /// posture). The worker re-reads and dispatches `EnvLoaded`.
+  NodeRevokeRequested(id: String)
+  /// A grant row's Revoke button: delete the grant row (future
+  /// exchanges answer the merged unknown/expired 404). Same self-refresh.
+  GrantRevokeRequested(id: String)
 }
 
 /// Translate a `thread.EventKind` into a typed component message.
@@ -589,7 +674,9 @@ pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
       providers: flags.providers,
       registry: flags.registry,
       bots: flags.bots,
+      store: flags.store,
       models_timeout_ms: flags.models_timeout_ms,
+      pair_base: flags.pair_base,
       events: None,
       provider: None,
       provider_list: [],
@@ -649,6 +736,11 @@ pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
       // — Ok or Error alike: the window is over either way.
       channel_pending: None,
       pane_open: False,
+      env_nodes: [],
+      env_grants: [],
+      grant_minted: None,
+      grant_minting: False,
+      env_error: None,
     )
   #(model, events_effect())
 }
@@ -1095,6 +1187,14 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               },
               channels: [],
               pane_open: False,
+              // Pane state is per-selection (the same rule the channel
+              // rows above follow): the fresh selection's rows load on
+              // its next pane open, and a minted URL belongs to the
+              // thread it was minted for.
+              env_nodes: [],
+              env_grants: [],
+              grant_minted: None,
+              env_error: None,
             )
           let eff = case model.selected {
             Some(current) ->
@@ -1622,12 +1722,25 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       // the moment the user opens the pane is when freshness matters —
       // a channel that finished while the thread sat idle must not
       // show a stale dot (the ask is state-only, so it is cheap).
+      // Phase C: the Environments section loads on the same open —
+      // but through the unlinked-worker path, because its reads hit
+      // Postgres through the seam instead of registry memory. It does
+      // NOT ride the every-refresh cascade the channels ask rides
+      // (that would put a store read behind every commit bump); it
+      // refreshes on open and after each mint/revoke instead — the
+      // same freshness contract, scoped to when the section is used.
       let registry = model.registry
       case model.pane_open, model.selected {
         False, Some(id) ->
-          effect.from(fn(dispatch) {
-            dispatch(ChannelsLoaded(id, thread_registry.channels(registry, id)))
-          })
+          effect.batch([
+            effect.from(fn(dispatch) {
+              dispatch(ChannelsLoaded(
+                id,
+                thread_registry.channels(registry, id),
+              ))
+            }),
+            env_load_effect(model),
+          ])
         _, _ -> effect.none()
       }
     })
@@ -1659,6 +1772,93 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         )
         _ -> #(model, effect.none())
       }
+
+    // ---- Thread info pane: Environments (tui-pairing plan Phase C) ----
+    // The pane's store reads/writes all run OFF the runtime loop (they
+    // hit Postgres through the seam — the `models_effect` pattern, with
+    // the `rescue` wrap: every worker exit dispatches, no wedged state).
+    // Replies are stamped with the selection they were asked for.
+    EnvLoaded(id, nodes, grants) ->
+      case model.selected == id {
+        // A self-refresh that no longer carries the displayed mint's
+        // grant (it was revoked — or swept) drops the one-time URL
+        // display with it: a revoked code must not linger.
+        True -> {
+          let grant_minted = case model.grant_minted {
+            Some(#(code, g)) ->
+              case list.any(grants, fn(other) { other.id == g.id }) {
+                True -> Some(#(code, g))
+                False -> None
+              }
+            None -> None
+          }
+          #(
+            Model(
+              ..model,
+              env_nodes: nodes,
+              env_grants: grants,
+              env_error: None,
+              grant_minted: grant_minted,
+            ),
+            effect.none(),
+          )
+        }
+        False -> #(model, effect.none())
+      }
+
+    EnvFailed(id, reason) ->
+      case model.selected == id {
+        True -> #(Model(..model, env_error: Some(reason)), effect.none())
+        False -> #(model, effect.none())
+      }
+
+    GrantMintRequested ->
+      case model.grant_minting, model.selected {
+        // The single-mint guard (the `create_pending` rule): a mint
+        // already in flight cannot queue a second one behind it.
+        False, Some(id) -> #(
+          Model(..model, grant_minting: True),
+          env_mint_effect(model, id),
+        )
+        _, _ -> #(model, effect.none())
+      }
+
+    GrantMinted(code, grant) -> #(
+      Model(
+        ..model,
+        // The guard releases ALWAYS (section-level, not per-thread);
+        // only the one-time display is stamped: a mint answering for a
+        // superseded selection is dropped.
+        grant_minting: False,
+        grant_minted: case model.selected == grant.thread_id {
+          True -> Some(#(code, grant))
+          False -> model.grant_minted
+        },
+        // The row IS persisted (the write-through succeeded — this msg
+        // only lands then), so the grants list reflects it immediately
+        // instead of waiting for the next pane open.
+        env_grants: case model.selected == grant.thread_id {
+          True -> [grant, ..model.env_grants]
+          False -> model.env_grants
+        },
+      ),
+      effect.none(),
+    )
+
+    GrantMintFailed(reason) -> #(
+      Model(..model, grant_minting: False, env_error: Some(reason)),
+      effect.none(),
+    )
+
+    NodeRevokeRequested(id) -> #(
+      model,
+      env_revoke_effect(model, RevokeNode(id)),
+    )
+
+    GrantRevokeRequested(id) -> #(
+      model,
+      env_revoke_effect(model, RevokeGrant(id)),
+    )
 
     ChannelRowSelected(info) ->
       case model.selected {
@@ -1711,6 +1911,12 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               // Navigating un-targets the popover (the mock: the pane
               // shows for one thread at a time).
               pane_open: False,
+              // Pane state is per-selection (the Select rule): the
+              // navigated-to channel's rows load on its next pane open.
+              env_nodes: [],
+              env_grants: [],
+              grant_minted: None,
+              env_error: None,
             )
           // The outer match guarantees a selection (the pane belongs
           // to one), so the leave always fires and the batches build
@@ -2015,6 +2221,10 @@ fn deselect(model: Model, label: String) -> Model {
     channel_ctx: None,
     channel_pending: None,
     pane_open: False,
+    env_nodes: [],
+    env_grants: [],
+    grant_minted: None,
+    env_error: None,
   )
 }
 
@@ -2174,6 +2384,25 @@ fn after_threads(model: Model, summaries: List(thread.ThreadSummary)) -> Model {
     channel_pending: case ended || switched {
       True -> None
       False -> model.channel_pending
+    },
+    // Pane state is per-selection (the Select rule): the environment
+    // rows and the one-time mint display belong to the ended thread and
+    // go with it.
+    env_nodes: case ended || switched {
+      True -> []
+      False -> model.env_nodes
+    },
+    env_grants: case ended || switched {
+      True -> []
+      False -> model.env_grants
+    },
+    grant_minted: case ended || switched {
+      True -> None
+      False -> model.grant_minted
+    },
+    env_error: case ended || switched {
+      True -> None
+      False -> model.env_error
     },
   )
 }
@@ -2538,6 +2767,122 @@ fn create_from_bot_effect(model: Model, bot_id: String) -> Effect(Msg) {
   })
 }
 
+// ---------------------------------------------------------------------------
+// Thread info pane: Environments (tui-pairing plan Phase C)
+// ---------------------------------------------------------------------------
+
+/// Which stored row a pane revoke targets (the two Revoke buttons of
+/// the Environments section).
+type EnvRevoke {
+  RevokeNode(id: String)
+  RevokeGrant(id: String)
+}
+
+/// The pane's one store read: node rows (the roster's last-seen ages
+/// and revoke targets) plus grant rows (the pairing links list). A
+/// store error is the caller's Error — the workers wrap it below.
+fn env_read(
+  store: store.Store,
+) -> Result(#(List(node.Node), List(node.Grant)), String) {
+  case store.list_nodes() {
+    Error(error) -> Error(error)
+    Ok(nodes) ->
+      case store.list_node_grants() {
+        Error(error) -> Error(error)
+        Ok(grants) -> Ok(#(nodes, grants))
+      }
+  }
+}
+
+/// The pane-open load (also every mint/revoke's self-refresh): spawn
+/// UNLINKED (the `models_effect` pattern) — these reads hit Postgres
+/// through the seam, and a wedged store must not freeze this
+/// connection's UI. The `rescue` wrap dispatches on every exit path,
+/// so the reply always lands and nothing pending wedges. The reply is
+/// stamped with the selection it was asked FOR (the `ChannelsLoaded`
+/// rule): a selection change between effect start and dispatch drops
+/// it. Unlike the channels ask this does NOT ride the every-refresh
+/// cascade — a store read behind every commit bump would be real
+/// per-commit work; the section refreshes on open and after each of
+/// its own mutations instead.
+fn env_load_effect(model: Model) -> Effect(Msg) {
+  let store = model.store
+  let selected = model.selected
+  effect.from(fn(dispatch) {
+    process.spawn_unlinked(fn() {
+      let outcome = rescue.rescue(fn() { env_read(store) })
+      case outcome {
+        Ok(Ok(#(nodes, grants))) -> dispatch(EnvLoaded(selected, nodes, grants))
+        Ok(Error(reason)) -> dispatch(EnvFailed(selected, reason))
+        Error(crash) -> dispatch(EnvFailed(selected, crash))
+      }
+    })
+    Nil
+  })
+}
+
+/// The mint worker (the "Pair a TUI…" button): mint the grant row
+/// (hash-only at rest; the plaintext code answers ONCE, here, like a
+/// node token) and write it through the seam. Purely side-effect-free
+/// with respect to the THREAD — one `node_grant` insert, no transcript
+/// row, no roster change, no thread-actor ask — so it cannot disturb
+/// connected environments or an in-flight turn, and a new mint never
+/// invalidates an earlier grant (independent rows, each with its own
+/// expiry). Same unlinked + rescue contract as `env_load_effect`.
+fn env_mint_effect(model: Model, thread_id: String) -> Effect(Msg) {
+  let store = model.store
+  effect.from(fn(dispatch) {
+    process.spawn_unlinked(fn() {
+      let outcome =
+        rescue.rescue(fn() {
+          let #(code, grant) =
+            node.mint_grant(Some(thread_id), timing.wall_now_s())
+          case store.insert_node_grant(grant) {
+            Ok(_) -> Ok(#(code, grant))
+            Error(error) -> Error(error)
+          }
+        })
+      case outcome {
+        Ok(Ok(#(code, grant))) -> dispatch(GrantMinted(code, grant))
+        Ok(Error(reason)) -> dispatch(GrantMintFailed(reason))
+        Error(crash) -> dispatch(GrantMintFailed(crash))
+      }
+    })
+    Nil
+  })
+}
+
+/// A Revoke button's worker: delete the row, then re-read both lists
+/// and dispatch the stamped `EnvLoaded` — one round trip, the section
+/// refreshes itself (a failed delete dispatches `EnvFailed` and leaves
+/// the lists alone). Idempotent deletes: revoking an already-vanished
+/// row still refreshes to truth.
+fn env_revoke_effect(model: Model, revoke: EnvRevoke) -> Effect(Msg) {
+  let store = model.store
+  let selected = model.selected
+  effect.from(fn(dispatch) {
+    process.spawn_unlinked(fn() {
+      let outcome =
+        rescue.rescue(fn() {
+          let deleted = case revoke {
+            RevokeNode(id) -> store.delete_node(id)
+            RevokeGrant(id) -> store.delete_node_grant(id)
+          }
+          case deleted {
+            Error(error) -> Error(error)
+            Ok(_) -> env_read(store)
+          }
+        })
+      case outcome {
+        Ok(Ok(#(nodes, grants))) -> dispatch(EnvLoaded(selected, nodes, grants))
+        Ok(Error(reason)) -> dispatch(EnvFailed(selected, reason))
+        Error(crash) -> dispatch(EnvFailed(selected, crash))
+      }
+    })
+    Nil
+  })
+}
+
 /// Run one registry metadata mutation, then refresh the thread list so
 /// the sidebar reflects it immediately (pins re-order, archive hides,
 /// delete drops the row). A `False` reply means the thread vanished
@@ -2696,18 +3041,20 @@ pub fn view(model: Model) -> Element(Msg) {
   ])
 }
 
-/// The header's `info ▸ N` badge (the mock): a dot + the word + the
-/// count of RUNNING channels. Renders NOTHING while the selected thread
-/// has no channels — the ambient signal exists only where channels
-/// exist, and the sidebar stays human-shaped. The dot pulses only while
-/// something is actually running (a pulse with nothing behind it would
-/// lie), and the count chip hides at zero; the button still opens the
-/// pane for the idle rows.
+/// The header's `info ▸ N` button: a dot + the word + the count of
+/// RUNNING channels. Renders for EVERY selected thread since Phase C
+/// (tui-pairing): the pane is the Environments/mint surface, so it must
+/// be reachable on a channel-less thread too — the count chip hides at
+/// zero and the dot stays gray there (the AMBIENT signal still exists
+/// only where channels exist, and the sidebar stays human-shaped; the
+/// bot-channels Phase 2 rule, amended for reachability). The dot
+/// pulses only while something is actually running (a pulse with
+/// nothing behind it would lie).
 fn info_button(model: Model) -> Element(Msg) {
   let running =
     model.channels |> list.filter(fn(info) { info.running }) |> list.length
-  case model.view, model.channels {
-    ChatView, [_first, ..] ->
+  case model.view, model.selected {
+    ChatView, Some(_) ->
       html.button(
         [
           attr.id("info-btn"),
@@ -2780,13 +3127,234 @@ fn info_pane(model: Model) -> Element(Msg) {
             },
           ]),
           details_section(model),
-          html.section([attr.class("sec")], [
-            html.h3([], [html.text("Environments")]),
-            html.p([attr.class("sec-none")], [html.text("none attached")]),
-          ]),
+          env_section(model),
         ]),
       ])
   }
+}
+
+/// The pane's Environments section (tui-pairing plan Phase C): the
+/// thread's environment roster (the newest roster row in the log — the
+/// server's own hydration rule — joined with the store's node rows for
+/// last-seen ages and revokes), the "Pair a TUI…" mint with its ONE-TIME
+/// URL display, and the selected thread's pairing grants. Everything
+/// rendered is a Lustre text node — roster target names are transcript
+/// text (hostile-text rule), codes and node names are server-minted but
+/// still rendered inert.
+fn env_section(model: Model) -> Element(Msg) {
+  html.section([attr.class("sec")], [
+    html.h3([], [html.text("Environments")]),
+    case env_roster(model) {
+      // No roster row anywhere: the thread was created without a
+      // workspace — no env tools, so no TUI could serve it. The mint
+      // button does not render (an unpinnable TUI is not mintable).
+      None -> html.p([attr.class("sec-none")], [html.text("no environment")])
+      Some(targets) ->
+        html.div(
+          [attr.class("env-list")],
+          list.flatten([
+            list.map(targets, fn(target) { env_row(model, target) }),
+            [mint_area(model)],
+            [grants_area(model)],
+          ]),
+        )
+    },
+    case model.env_error {
+      Some(reason) ->
+        html.p([attr.class("sec-none env-err")], [
+          html.text("environments: " <> reason),
+        ])
+      None -> element.none()
+    },
+  ])
+}
+
+/// The selected thread's live roster, re-derived from the UI's own log
+/// the SAME way the server re-derives at hydration: the newest
+/// system-authored roster row wins (each row names the full CURRENT
+/// list, so the newest is the truth). The log is newest-first, so the
+/// first hit wins. None = no roster row at all: no environment.
+fn env_roster(model: Model) -> Option(List(String)) {
+  model.log
+  |> list.find_map(fn(line) {
+    case line {
+      UserLine(text, Some("system"), _) ->
+        case env.roster_parse(text) {
+          Some(targets) -> Ok(targets)
+          None -> Error(Nil)
+        }
+      _ -> Error(Nil)
+    }
+  })
+  |> option.from_result
+}
+
+/// One roster row. `workspace` is the thread's own (local) environment
+/// — nothing to revoke. A node target joins its stored row: the
+/// last-seen age beside a Revoke button (a token-row delete; a live
+/// connection survives until it disconnects — the shipped posture). A
+/// rostered target with NO row (revoked, or swept while the pane sat
+/// open) renders without either — no credential to revoke.
+fn env_row(model: Model, target: String) -> Element(Msg) {
+  case target {
+    "workspace" ->
+      html.div([attr.class("env-row")], [
+        html.span([attr.class("nm")], [html.text(target)]),
+        html.span([attr.class("age")], [
+          html.text("local workspace"),
+        ]),
+      ])
+    _ ->
+      case list.find(model.env_nodes, fn(n) { n.name == target }) {
+        Ok(n) ->
+          html.div([attr.class("env-row")], [
+            html.span([attr.class("nm")], [html.text(target)]),
+            html.span([attr.class("age")], [html.text(last_seen_label(n))]),
+            html.button(
+              [
+                attr.type_("button"),
+                attr.class("mini"),
+                attr.attribute("data-revoke-node", n.id),
+                event.on_click(NodeRevokeRequested(n.id)),
+              ],
+              [html.text("Revoke")],
+            ),
+          ])
+        Error(_) ->
+          html.div([attr.class("env-row")], [
+            html.span([attr.class("nm")], [html.text(target)]),
+            html.span([attr.class("age")], [html.text("no credential")]),
+          ])
+      }
+  }
+}
+
+/// A node's last-seen age (`age_label` handles the "just now" case).
+fn last_seen_label(n: node.Node) -> String {
+  case n.last_seen_at {
+    None -> "never connected"
+    Some(at) -> "last seen " <> age_label(timing.wall_now_s(), at)
+  }
+}
+
+/// The mint area: the "Pair a TUI…" button while nothing is displayed;
+/// once a mint lands, the ONE-TIME pairing URL (the code exists only in
+/// this client's memory — the server stores the hash), a copy button
+/// (the page shell's `pairing_js` writes the clipboard), and the
+/// expiry, ticking via the timestamps script's `[data-expires]` span.
+fn mint_area(model: Model) -> Element(Msg) {
+  case model.grant_minted {
+    Some(#(code, grant)) -> {
+      let url = model.pair_base <> "/pair/" <> code
+      html.div([attr.class("pair-area")], [
+        html.p([attr.class("pair-note")], [
+          html.text(
+            "pairing URL — shown once; copy it now. A lost URL is re-minted.",
+          ),
+        ]),
+        html.div([attr.class("pair-url-row")], [
+          html.code(
+            [attr.id("pair-url"), attr.attribute("data-pair-url", code)],
+            [html.text(url)],
+          ),
+          html.button(
+            [
+              attr.type_("button"),
+              attr.class("pair-copy"),
+              attr.attribute("data-pair-copy", code),
+            ],
+            [html.text("Copy")],
+          ),
+        ]),
+        html.p([attr.class("sec-none")], [
+          html.span(
+            [
+              attr.attribute("data-expires", int.to_string(grant.expires_at)),
+            ],
+            [html.text(expires_in_label(timing.wall_now_s(), grant.expires_at))],
+          ),
+        ]),
+      ])
+    }
+    None ->
+      html.div([attr.class("pair-area")], [
+        html.button(
+          [
+            attr.type_("button"),
+            attr.id("pair-tui"),
+            attr.disabled(model.grant_minting),
+            event.on_click(GrantMintRequested),
+          ],
+          [
+            html.text(case model.grant_minting {
+              True -> "pairing…"
+              False -> "Pair a TUI…"
+            }),
+          ],
+        ),
+      ])
+  }
+}
+
+/// Pure label for a grant's remaining window: "expires in 42m", the
+/// last-minute "expires <1m", and "expired" past it. The page shell's
+/// timestamps script re-renders `[data-expires]` spans on its 30s tick
+/// with the same thresholds (its rel_time/label twin rule).
+pub fn expires_in_label(now: Int, expires_at: Int) -> String {
+  let left = expires_at - now
+  case left <= 0, left < 60 {
+    True, _ -> "expired"
+    False, True -> "expires <1m"
+    False, False -> "expires in " <> int.to_string(left / 60) <> "m"
+  }
+}
+
+/// The selected thread's pairing links (the pane filters the loaded
+/// grants by `thread_id` at render). Each renders its state line —
+/// "active · expires in 42m · paired 2 TUIs" — with revoke; expired-
+/// but-unswept rows stay listed (labelled) because the boot sweep only
+/// collects them at the next restart.
+fn grants_area(model: Model) -> Element(Msg) {
+  let mine = case model.selected {
+    Some(id) -> list.filter(model.env_grants, fn(g) { g.thread_id == Some(id) })
+    None -> []
+  }
+  case mine {
+    [] -> element.none()
+    grants ->
+      html.div(
+        [attr.class("grant-list")],
+        list.map(grants, fn(g) {
+          html.div([attr.class("env-row grant-row")], [
+            html.span([attr.class("nm")], [html.text(grant_state(g))]),
+            html.button(
+              [
+                attr.type_("button"),
+                attr.class("mini"),
+                attr.attribute("data-revoke-grant", g.id),
+                event.on_click(GrantRevokeRequested(g.id)),
+              ],
+              [html.text("Revoke")],
+            ),
+          ])
+        }),
+      )
+  }
+}
+
+/// A grant's state line. `use_count` is diagnostics (the pane's "paired
+/// K TUIs"); there is no max_uses in v1 — multi-use is the feature.
+fn grant_state(g: node.Grant) -> String {
+  let now = timing.wall_now_s()
+  let state = case node.grant_live(g, now) {
+    True -> "active"
+    False -> "expired"
+  }
+  let paired = case g.use_count {
+    1 -> "paired 1 TUI"
+    n -> "paired " <> int.to_string(n) <> " TUIs"
+  }
+  state <> " · " <> expires_in_label(now, g.expires_at) <> " · " <> paired
 }
 
 /// One Channels row (the mock): running dot, `↳ <bot name>` label,

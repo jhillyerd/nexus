@@ -34,6 +34,7 @@ import lustre/server_component.{type ClientMessage}
 import mist
 import nexus/bot_registry
 import nexus/provider_registry
+import nexus/store
 import nexus/thread_registry
 import nexus/ui
 
@@ -74,6 +75,8 @@ pub fn websocket(
   providers: Subject(provider_registry.Msg),
   bots: Subject(bot_registry.Msg),
   models_timeout_ms: Int,
+  store: store.Store,
+  pair_base: String,
 ) -> Response(mist.ResponseData) {
   mist.websocket(
     request: req,
@@ -84,6 +87,8 @@ pub fn websocket(
         providers,
         bots,
         models_timeout_ms,
+        store,
+        pair_base,
       ))
     },
     handler: loop_socket,
@@ -95,13 +100,17 @@ pub fn websocket(
 /// shared live-model budget (the ONE `list_models` timeout rule — the
 /// UI's picker and its create path both use it), plus the
 /// client-supplied last-selected thread from the route's query string
-/// (the page shell persists it; see `nexus/page`).
+/// (the page shell persists it; see `nexus/page`). The store seam and
+/// the mint URL's base ride along for the info pane's Environments
+/// section (tui-pairing plan Phase C).
 fn runtime_flags(
   req: Request(mist.Connection),
   registry: Subject(thread_registry.Msg),
   providers: Subject(provider_registry.Msg),
   bots: Subject(bot_registry.Msg),
   models_timeout_ms: Int,
+  store: store.Store,
+  pair_base: String,
 ) -> Flags {
   ui.Flags(
     registry: registry,
@@ -109,6 +118,8 @@ fn runtime_flags(
     bots: bots,
     models_timeout_ms: models_timeout_ms,
     thread: query_param(req, "thread"),
+    store: store,
+    pair_base: pair_base,
   )
 }
 

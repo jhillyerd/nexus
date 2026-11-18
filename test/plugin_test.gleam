@@ -60,6 +60,7 @@ fn test_config() -> config.Config {
     workspace_root: None,
     env_timeout_ms: 60_000,
     env_max_output_bytes: 100_000,
+    node_idle_days: 7,
   )
 }
 

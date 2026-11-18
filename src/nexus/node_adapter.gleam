@@ -152,6 +152,7 @@ pub fn websocket(
                             cfg,
                             thread_id,
                             thread_subject,
+                            store,
                             row,
                             role,
                           )
@@ -162,6 +163,7 @@ pub fn websocket(
                         cfg,
                         thread_id,
                         thread_subject,
+                        store,
                         row,
                         role,
                       )
@@ -180,6 +182,7 @@ fn node_upgrade(
   cfg: Config,
   thread_id: String,
   thread_subject: Subject(thread.Msg),
+  store: Store,
   row: node.Node,
   role: Role,
 ) -> Response(mist.ResponseData) {
@@ -194,7 +197,18 @@ fn node_upgrade(
     // crashed socket, the replace-kill — because an actor's own normal
     // exit does not rupture links. Killing here is exit-reason-agnostic
     // for the thread actor's monitor (any exit spends it) and immediate.
-    on_close: fn(state) { process.kill(state.adapter_pid) },
+    // The last-seen bump rides the same clean close (tui-pairing plan,
+    // hygiene): a TUI connected right up to a server shutdown must
+    // carry a FRESH stamp into the next boot's idle-node sweep, or the
+    // sweep — which runs before any reconnect can re-stamp it — would
+    // take a still-in-use credential. Best-effort like the connect-time
+    // touch; an ABNORMAL death (crash, replace-kill) skips it, which is
+    // exactly the "crashed TUI" case the idle window exists for.
+    on_close: fn(state) {
+      process.kill(state.adapter_pid)
+      let _ = store.touch_node(state.node_id)
+      Nil
+    },
   )
 }
 
@@ -247,7 +261,9 @@ fn env_capable(
 /// Stateless per-connection verify: the named row's stored hash against
 /// the presented token (`node.verify_token`, constant-time). A wrong
 /// name and a wrong token answer identically — the 401 carries no
-/// oracle. `touch_node` (last-seen) is best-effort at the route.
+/// oracle. `touch_node` (last-seen) is best-effort at the route AND at
+/// the clean close (the idle-node sweep's freshness contract — see
+/// `node_upgrade`'s on_close).
 fn authenticate(
   store: Store,
   name: String,
@@ -293,6 +309,9 @@ type SocketState {
     adapter_pid: process.Pid,
     frames: Subject(String),
     max_frame_bytes: Int,
+    /// The authenticated row's id, for the clean-close last-seen bump
+    /// (see `node_upgrade`'s on_close).
+    node_id: String,
   )
 }
 
@@ -344,6 +363,7 @@ fn init_socket(
       adapter_pid: adapter_pid,
       frames: frames,
       max_frame_bytes: max_frame_bytes(cfg.env_max_output_bytes),
+      node_id: row.id,
     ),
     Some(
       process.new_selector()

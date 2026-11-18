@@ -37,7 +37,9 @@
 // Usage: node e2e/browser.spec.mjs   (see e2e/README.md)
 
 import { spawn } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { chromium } from "playwright";
 import { startServices, UTILITY_REPLY_DELAY_MS } from "./services.mjs";
 
@@ -319,6 +321,9 @@ function seedProvider(bifrostPort) {
     NEXUS_ENCRYPTION_KEY: ENC_KEY,
     NEXUS_SEED_PROVIDER_NAME: "fake",
     NEXUS_SEED_PROVIDER_BASE_URL: `http://127.0.0.1:${bifrostPort}/v1`,
+    // A NEXUS_SEED_PROVIDER_API_KEY in the CALLER's shell would key
+    // the seeded provider and break the suite's keyless pins — strip it.
+    NEXUS_SEED_PROVIDER_API_KEY: "",
   };
   return new Promise((resolve, reject) => {
     const child = spawn("gleam", ["run", "-m", "nexus/dev_seed"], {
@@ -337,7 +342,7 @@ function seedProvider(bifrostPort) {
   });
 }
 
-function startNexus({ port, bifrostPort, searxPort, maxToolIterations }) {
+function startNexus({ port, bifrostPort, searxPort, maxToolIterations, workspaceRoot }) {
   const env = {
     ...process.env,
     NEXUS_ENCRYPTION_KEY: ENC_KEY,
@@ -350,6 +355,10 @@ function startNexus({ port, bifrostPort, searxPort, maxToolIterations }) {
     NEXUS_SEARXNG_BASE_URL: `http://127.0.0.1:${searxPort}`,
     NEXUS_SYSTEM_PROMPT:
       "You are nexus under e2e test. Follow the case: markers exactly.",
+    // Set only for the pairing-pane instance (tui-pairing Phase C): the
+    // main instances deliberately have NO root, so their threads carry
+    // no env tools and the byte-prefix envelopes stay as captured.
+    ...(workspaceRoot ? { NEXUS_WORKSPACE_ROOT: workspaceRoot } : {}),
   };
   const child = spawn("gleam", ["run"], {
     cwd: ROOT,
@@ -513,12 +522,25 @@ async function main() {
   const main = startNexus({ port: 18081, maxToolIterations: 8, ...pick(services) });
   let guard = startNexus({ port: guardPort, maxToolIterations: 2, ...pick(services) });
   const guardBase = `http://127.0.0.1:${guardPort}`;
+  // The pairing-pane instance (tui-pairing Phase C): its own
+  // NEXUS_WORKSPACE_ROOT — the mint surface needs an env-carrying
+  // thread (a roster row to re-derive), and the main instances must
+  // keep their env-less default toolsets for the byte-prefix pins.
+  const pairPort = 18083;
+  const pair = startNexus({
+    port: pairPort,
+    maxToolIterations: 8,
+    ...pick(services),
+    workspaceRoot: mkdtempSync(join(tmpdir(), "nexus-e2e-pair-")),
+  });
+  const pairBase = `http://127.0.0.1:${pairPort}`;
 
   let browser = null;
   let exitCode = 0;
   try {
     await waitHealthy(18081);
     await waitHealthy(guardPort);
+    await waitHealthy(pairPort);
     console.log("nexus up; launching chromium…");
     browser = await chromium.launch({
       headless: true,
@@ -2425,6 +2447,129 @@ async function main() {
       }
     });
 
+    // -- 17e. tui-pairing Phase C: the info pane mints pairing URLs -----
+    // The pane's Environments section against the workspace-rooted
+    // instance: the creation roster row is what the section re-derives
+    // from (the newest roster row wins — the server's own hydration
+    // rule), the mint renders the ONE-TIME URL with the copy control and
+    // the expiry countdown, the REAL public exchange redeems the code
+    // from the DOM (no auth — the code is the auth), and revoke kills
+    // both the row and the display, dead-code verified against the
+    // merged 404. Hostile-text rendering of roster rows is pinned
+    // offline (ui_test); existing selectors are untouched by the badge
+    // reachability change (the pane renders for every selection now).
+    await test("pairing: the info pane mints a pairing URL, exchanges, revokes", async () => {
+      const created = await page.request.post(`${pairBase}/threads`, {
+        headers: { authorization: `Bearer ${TOKEN}` },
+        data: { provider: "fake", model: "smart" },
+      });
+      eq(created.status(), 201, "env thread created on the workspace instance");
+      const thread = await created.json();
+
+      try {
+        await page.goto(`${pairBase}/?token=${TOKEN}`);
+        await connected(page);
+        await page
+          .locator(
+            `#thread-list .thread-row[data-thread-id="${thread.id}"] .thread-main`,
+          )
+          .click();
+        // The badge renders for every selection (Phase C); open the pane.
+        await page.locator("#info-btn").click();
+        const mintBtn = page.locator("#pair-tui");
+        await mintBtn.waitFor({ timeout: 15_000 });
+        const roster = await page
+          .locator(".info-pop .env-row")
+          .first()
+          .textContent();
+        assert(
+          roster.includes("workspace") && roster.includes("local workspace"),
+          `roster row renders: "${roster}"`,
+        );
+
+        // Mint: the one-time URL, origin-corrected by pairing_js to the
+        // BROWSING origin; code shape is 32 random bytes, URL-safe
+        // base64 (43 chars, no padding).
+        await mintBtn.click();
+        const url = page.locator("#pair-url");
+        await url.waitFor({ timeout: 15_000 });
+        await poll(
+          async () =>
+            /\/pair\/[A-Za-z0-9_-]{43}$/.test(await url.textContent()),
+          {
+            timeout: 15_000,
+            interval: 200,
+            message: "pairing URL rendered (origin-corrected)",
+          },
+        );
+        const code = await url.getAttribute("data-pair-url");
+        assert(/^[A-Za-z0-9_-]{43}$/.test(code), `code shape: "${code}"`);
+        eq(await page.locator("[data-pair-copy]").count(), 1, "copy button");
+        const expiry = await page.locator("[data-expires]").textContent();
+        assert(expiry.includes("expires in"), `expiry countdown: "${expiry}"`);
+
+        // The REAL exchange with the DOM's code: no auth header — the
+        // code is the auth — and the answer carries the pinned thread.
+        // The node name is unique PER RUN: a node row outlives its
+        // thread (the cleanup only cascades the grant), so a static
+        // name would 409 the next run's exchange.
+        const nodeName = `browser-pair-${Date.now()}`;
+        const exchange = await page.request.post(`${pairBase}/nodes/pair`, {
+          data: { code, name: nodeName },
+        });
+        eq(exchange.status(), 201, "public exchange accepted the minted code");
+        const paired = await exchange.json();
+        eq(paired.thread_id, thread.id, "exchange answers the pinned thread");
+        assert(
+          typeof paired.token === "string" && paired.token.length >= 40,
+          "token answered ONCE, at exchange",
+        );
+
+        // The grants list reflects the exchange on the NEXT pane open
+        // (the open re-asks; the use_count bump was a route-side
+        // best-effort write this client never saw mid-session). Close
+        // through the pane's own close control — the hit layer covers
+        // the badge while the pane is up.
+        await page.locator(".info-pop .close").click();
+        await page.locator("#info-btn").click();
+        await poll(
+          async () =>
+            (await page.locator(".info-pop .grant-row").textContent()).includes(
+              "paired 1 TUI",
+            ),
+          {
+            timeout: 15_000,
+            interval: 250,
+            message: "grant row shows the exchange's paired count",
+          },
+        );
+
+        // Revoke: the worker deletes and re-reads — the grant row goes,
+        // and the one-time display drops with it (a revoked code must
+        // not linger).
+        await page.locator("[data-revoke-grant]").click();
+        await poll(
+          async () =>
+            (await page.locator(".info-pop .grant-row").count()) === 0,
+          { timeout: 15_000, interval: 200, message: "grant row gone" },
+        );
+        eq(await page.locator("#pair-url").count(), 0, "display dropped");
+
+        // The revoked code is dead: the merged unknown/expired 404 (the
+        // route must not become a code oracle).
+        const after = await page.request.post(`${pairBase}/nodes/pair`, {
+          data: { code, name: `${nodeName}-2` },
+        });
+        eq(after.status(), 404, "revoked code answers the merged 404");
+      } finally {
+        // The thread delete cascades its grant; the node row is
+        // unique-named per run, so the next run cannot 409 on the name.
+        await page.request.delete(`${pairBase}/threads/${thread.id}`, {
+          headers: { authorization: `Bearer ${TOKEN}` },
+        });
+      }
+    });
+
     // -- 18. utility tags: model title + tags land as inert chips --------
     // The ui-made thread's first exchange (providers test, above) armed
     // its utility attempt, and nothing manual ever touched that row, so
@@ -2666,6 +2811,7 @@ async function main() {
     );
     if (browser) await browser.close().catch(() => {});
     if (page) await page.close().catch(() => {});
+    await pair.stop();
     await main.stop();
     await guard.stop();
     await services.close();

@@ -20,6 +20,7 @@ import gleam/erlang/process
 import gleam/http.{type Method, Delete, Get, Patch, Post}
 import gleam/http/request.{type Request}
 import gleam/http/response.{type Response}
+import gleam/int
 import gleam/json.{type Json}
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -138,6 +139,8 @@ pub fn handler(
             providers,
             bots,
             thread_create.models_timeout(cfg),
+            store,
+            pair_base(cfg),
           )
         })
       // The node WebSocket (environments plan Phase 2b-3): NODE-token
@@ -2018,4 +2021,14 @@ pub fn requires_auth(method: Method, segments: List(String)) -> Bool {
 pub fn parse_text_json(body: String) -> Result(String, Nil) {
   json.parse(body, using: text_decoder())
   |> result.map_error(fn(_) { Nil })
+}
+
+/// The server's own origin as boot knows it: the base of a minted
+/// pairing URL (tui-pairing plan Phase C). Best effort only — a
+/// `0.0.0.0` bind renders a non-dialable host, which is why the page
+/// shell's `pairing_js` rewrites the displayed URL to the BROWSING
+/// origin on mount (the operator copies the link for a TUI host that
+/// must reach the same origin they are using right now).
+fn pair_base(cfg: Config) -> String {
+  "http://" <> cfg.http_bind <> ":" <> int.to_string(cfg.http_port)
 }

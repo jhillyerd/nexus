@@ -287,6 +287,13 @@ pub fn main() -> Nil {
           // earlier runs while hydrating. The tool schema is still frozen
           // before any thread can exist: the registry built it from the
           // global config at its own start.
+          // Boot hygiene (tui-pairing plan): expired pairing grants and
+          // idle node credentials are pure garbage — logged-and-ignored
+          // through the seam (see persist.boot_sweeps).
+          persist.boot_sweeps(
+            cfg,
+            persist.seam(process.named_subject(store_name)),
+          )
           io.println(
             "listening on http://"
             <> cfg.http_bind

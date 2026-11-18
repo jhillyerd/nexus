@@ -162,6 +162,7 @@ fn test_config() -> config.Config {
     // The boundary cap the adapter applies to node results on receipt
     // (small so `adapter_caps_node_result_test` stays cheap).
     env_max_output_bytes: 1024,
+    node_idle_days: 7,
     max_bot_hops: 4,
   )
 }

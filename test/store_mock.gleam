@@ -48,6 +48,7 @@ pub type Event {
   EvInsertNodeGrant(id: String)
   EvTouchNodeGrant(id: String)
   EvDeleteNodeGrant(id: String)
+  EvDeleteIdleNodes(days: Int)
 }
 
 pub type MockMsg {
@@ -124,6 +125,7 @@ pub type MockMsg {
   TouchNodeGrant(id: String, reply: Subject(Result(Nil, String)))
   DeleteNodeGrant(id: String, reply: Subject(Result(Nil, String)))
   DeleteExpiredNodeGrants(reply: Subject(Result(Nil, String)))
+  DeleteIdleNodes(days: Int, reply: Subject(Result(List(String), String)))
   // ---- test-only introspection ----
   Events(reply: Subject(List(Event)))
   Rows(reply: Subject(List(#(String, List(store.MessageRow)))))
@@ -300,6 +302,9 @@ pub fn seam(mock: Subject(MockMsg)) -> Store {
     },
     delete_expired_node_grants: fn() {
       call(mock, 5000, DeleteExpiredNodeGrants)
+    },
+    delete_idle_nodes: fn(days) {
+      call(mock, 5000, fn(r) { DeleteIdleNodes(days, r) })
     },
   )
 }
@@ -1406,6 +1411,31 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
             list.map(expired_ids, EvDeleteNodeGrant),
             state.events,
           ),
+        ),
+      )
+    }
+
+    DeleteIdleNodes(days, reply) -> {
+      // The boot sweep's SQL semantics: `coalesce(last_seen_at,
+      // created_at) < now - days`, one day = 86400 epoch seconds. The
+      // swept NAMES ride the reply (the boot log names them).
+      let now = timing.wall_now_s()
+      let cutoff = now - days * 86_400
+      let #(kept, swept) =
+        state.nodes
+        |> dict.values
+        |> list.partition(fn(node_) {
+          option.unwrap(node_.last_seen_at, node_.created_at) >= cutoff
+        })
+      let swept_names = list.map(swept, fn(node_) { node_.name })
+      process.send(reply, Ok(swept_names))
+      actor.continue(
+        State(
+          ..state,
+          nodes: list.fold(kept, dict.new(), fn(acc, node_) {
+            dict.insert(acc, node_.id, node_)
+          }),
+          events: [EvDeleteIdleNodes(days), ..state.events],
         ),
       )
     }

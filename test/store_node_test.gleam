@@ -7,10 +7,12 @@
 //// `squirrel check`; these pin the seam's SEMANTICS, not the SQL.
 
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/option.{type Option, None, Some}
 import gleeunit/should
+import nexus/config
 import nexus/node
 import nexus/store
+import nexus/store/persist
 import nexus/timing
 import store_mock
 
@@ -179,4 +181,131 @@ pub fn grant_unpinned_thread_roundtrip_test() {
   seam.insert_node_grant(grant) |> should.be_ok
   let assert Ok([row]) = seam.list_node_grants()
   should.equal(row.thread_id, None)
+}
+
+// ---------------------------------------------------------------------------
+// Boot sweeps (tui-pairing plan, hygiene): persist.boot_sweeps over the
+// mock seam — expired grants and idle node credentials are garbage, and
+// NEXUS_NODE_IDLE_DAYS=0 disables the node half entirely.
+// ---------------------------------------------------------------------------
+
+fn sweep_config(node_idle_days: Int) -> config.Config {
+  config.Config(
+    encryption_key: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+    sse_first_response_timeout_ms: 1000,
+    stream_idle_timeout_ms: 1000,
+    http_bind: "127.0.0.1",
+    http_port: 8080,
+    ui_token: None,
+    system_prompt: "test system prompt",
+    max_tool_iterations: 8,
+    http_fetch_max_bytes: 20_000,
+    http_fetch_timeout_ms: 2000,
+    http_fetch_allow_private: False,
+    searxng_base_url: None,
+    searxng_token: None,
+    pg_host: "127.0.0.1",
+    pg_port: 5433,
+    pg_database: "nexus",
+    pg_user: "nexus",
+    pg_password: None,
+    utility_enabled: False,
+    utility_delay_ms: 1500,
+    codemode: False,
+    codemode_timeout_ms: 30_000,
+    codemode_max_output_chars: 32_768,
+    plugins: [],
+    plugin_timeout_ms: 30_000,
+    plugin_max_output_chars: 32_768,
+    mcp_servers: [],
+    workspace_root: None,
+    env_timeout_ms: 60_000,
+    env_max_output_bytes: 262_144,
+    node_idle_days: node_idle_days,
+    max_bot_hops: 4,
+  )
+}
+
+/// The full sweep: expired grants go, live grants stay; nodes past the
+/// idle window go (never-connected rows from created_at, connected rows
+/// from last_seen), fresh ones stay. The swept NAMES come back for the
+/// boot log.
+pub fn boot_sweeps_take_expired_grants_and_idle_nodes_test() {
+  let seam = store_mock.seam(store_mock.start())
+  let now = timing.wall_now_s()
+  // mint_grant stamps expires_at = now_s + ttl, so the row helper
+  // overrides it explicitly (the grant_expiry_sweep_test pattern).
+  let grant_at = fn(id: String, expires_at: Int) {
+    let #(_, grant) = node.mint_grant(None, expires_at - node.grant_ttl_s)
+    node.Grant(..grant, id: id, expires_at: expires_at)
+  }
+  let expired = grant_at("g-expired", now - 60)
+  let #(_, live) = node.mint_grant(None, now + 60)
+  seam.insert_node_grant(expired) |> should.be_ok
+  seam.insert_node_grant(live) |> should.be_ok
+  // Old-node: never connected, created 8d ago; stale-node: connected,
+  // last seen 10d ago; fresh-node: connected 1h ago.
+  let node_at = fn(id: String, name: String, created: Int, seen: Option(Int)) {
+    node.Node(
+      id: id,
+      name: name,
+      token_hash: "aabbcc",
+      created_at: created,
+      last_seen_at: seen,
+    )
+  }
+  seam.insert_node(node_at("n-old", "old-host", now - 8 * 86_400, None))
+  |> should.be_ok
+  seam.insert_node(node_at(
+    "n-stale",
+    "stale-host",
+    now - 30 * 86_400,
+    Some(now - 10 * 86_400),
+  ))
+  |> should.be_ok
+  seam.insert_node(node_at(
+    "n-fresh",
+    "fresh-host",
+    now - 7200,
+    Some(now - 3600),
+  ))
+  |> should.be_ok
+
+  persist.boot_sweeps(sweep_config(7), seam)
+
+  let assert Ok(grants) = seam.list_node_grants()
+  grants
+  |> list.map(fn(g) { g.id })
+  |> should.equal([live.id])
+  let assert Ok(nodes) = seam.list_nodes()
+  nodes |> list.map(fn(n) { n.name }) |> should.equal(["fresh-host"])
+}
+
+/// `NEXUS_NODE_IDLE_DAYS=0` disables the node sweep only — expired
+/// grants still go (pure garbage, no config in front of them).
+pub fn boot_sweeps_zero_idle_days_disables_node_sweep_test() {
+  let seam = store_mock.seam(store_mock.start())
+  let now = timing.wall_now_s()
+  let grant_at = fn(id: String, expires_at: Int) {
+    let #(_, grant) = node.mint_grant(None, expires_at - node.grant_ttl_s)
+    node.Grant(..grant, id: id, expires_at: expires_at)
+  }
+  let expired = grant_at("g-expired", now - 60)
+  seam.insert_node_grant(expired) |> should.be_ok
+  let stale =
+    node.Node(
+      id: "n-ancient",
+      name: "ancient-host",
+      token_hash: "aabbcc",
+      created_at: now - 400 * 86_400,
+      last_seen_at: Some(now - 400 * 86_400),
+    )
+  seam.insert_node(stale) |> should.be_ok
+
+  persist.boot_sweeps(sweep_config(0), seam)
+
+  let assert Ok(grants) = seam.list_node_grants()
+  grants |> should.equal([])
+  let assert Ok(nodes) = seam.list_nodes()
+  nodes |> list.map(fn(n) { n.name }) |> should.equal(["ancient-host"])
 }

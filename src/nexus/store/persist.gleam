@@ -118,6 +118,9 @@ pub type Msg {
   TouchNodeGrant(id: String, reply: Subject(Result(Nil, String)))
   DeleteNodeGrant(id: String, reply: Subject(Result(Nil, String)))
   DeleteExpiredNodeGrants(reply: Subject(Result(Nil, String)))
+  /// Boot sweep (tui-pairing plan hygiene): delete idle node rows,
+  /// replying with the swept names.
+  DeleteIdleNodes(days: Int, reply: Subject(Result(List(String), String)))
 }
 
 type State {
@@ -354,6 +357,11 @@ pub fn seam(store_actor: Subject(Msg)) -> store.Store {
     },
     delete_expired_node_grants: fn() {
       actor.call(store_actor, call_timeout_ms, DeleteExpiredNodeGrants)
+    },
+    delete_idle_nodes: fn(days) {
+      actor.call(store_actor, call_timeout_ms, fn(reply) {
+        DeleteIdleNodes(days, reply)
+      })
     },
   )
 }
@@ -958,6 +966,14 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       process.send(reply, update(sql.delete_expired_node_grants(state.db)))
       actor.continue(state)
     }
+    DeleteIdleNodes(days, reply) -> {
+      let deleted = case sql.delete_idle_nodes(state.db, days) {
+        Ok(returned) -> Ok(list.map(returned.rows, fn(row) { row.name }))
+        Error(error) -> Error(query_error(error))
+      }
+      process.send(reply, deleted)
+      actor.continue(state)
+    }
   }
 }
 
@@ -1362,5 +1378,56 @@ fn tags_source(text: String) -> thread.TagsSource {
   case text {
     "manual" -> thread.ManualTags
     _ -> thread.AutoTags
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Boot sweeps (docs/plans/tui-pairing.md, hygiene)
+// ---------------------------------------------------------------------------
+
+/// Boot hygiene, run from `main` after the supervision tree is up, through
+/// the SEAM (never inside the store actor's own initialiser — an
+/// `actor.call` to self would block the initialiser on the actor it is
+/// still building):
+///
+/// - expired pairing grants are pure garbage (the plaintext died at
+///   mint; the row's only remaining purpose was refusing codes);
+/// - nodes idle past `NEXUS_NODE_IDLE_DAYS` lose their credential — a
+///   crashed TUI has a week by default to relaunch and re-stamp
+///   last_seen; `0` disables the sweep entirely.
+///
+/// Both are logged-and-ignored: a failure deletes nothing and the next
+/// boot retries — the same posture as the registry's prune_never_used
+/// sweep. Ordering is unconstrained (unlike the thread prune, no
+/// hydration depends on these rows being gone first), so running them
+/// once the tree is already serving costs nothing but a moment of
+/// latency-free garbage collection.
+pub fn boot_sweeps(cfg: Config, db: store.Store) -> Nil {
+  case db.delete_expired_node_grants() {
+    Ok(_) -> io.println("boot sweep: expired node grants deleted")
+    Error(error) ->
+      io.println("boot sweep: expired node grants NOT swept: " <> error)
+  }
+  case cfg.node_idle_days {
+    0 ->
+      io.println(
+        "boot sweep: node idle sweep disabled (NEXUS_NODE_IDLE_DAYS=0)",
+      )
+    days ->
+      case db.delete_idle_nodes(days) {
+        Ok([]) ->
+          io.println(
+            "boot sweep: no node idle past " <> int.to_string(days) <> "d",
+          )
+        Ok(names) ->
+          io.println(
+            "boot sweep: deleted idle nodes (>"
+            <> int.to_string(days)
+            <> "d): "
+            <> string.join(names, ", "),
+          )
+        Error(error) ->
+          io.println("boot sweep: idle nodes NOT swept: " <> error)
+      }
   }
 }
