@@ -647,15 +647,19 @@ async function main() {
     await sleep(500);
     const l = startLauncher({ stateHome });
     pairLauncher = l;
-    await poll(() => (l.stdout().includes("-- joined thread — model smart") ? l.stdout() : null), {
-      message: "relaunched tui never joined",
-      timeout: 45_000,
-    });
-    // The transcript replayed: the roster line naming this node renders
-    // on the TUI's own stdout.
-    if (!l.stdout().includes("system: attached targets: workspace, tui-pair-node.")) {
-      throw new Error(`relaunch stdout missing replayed roster line: ${l.stdout()}`);
-    }
+    // Joined AND replayed in one poll: the roster line arrives in
+    // frames after the hello — asserting it outside a poll races the
+    // replay (cubic).
+    await poll(
+      () => {
+        const out = l.stdout();
+        return out.includes("-- joined thread — model smart") &&
+          out.includes("system: attached targets: workspace, tui-pair-node.")
+          ? out
+          : null;
+      },
+      { message: "relaunch never joined with the replayed roster", timeout: 45_000 },
+    );
     // Still the SAME node row — connecting with the stored token never
     // re-pairs (no second row, no fresh token).
     const rows = await pairNodeRows();

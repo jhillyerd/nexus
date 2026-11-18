@@ -271,9 +271,9 @@ As-built deltas:
   relaunching with the pairing URL or setting `NEXUS_URL`); none →
   the usage message. With a pairing URL given, only the matching
   server's file qualifies.
-- **`NEXUS_URL` is gone from the launcher** — the pairing URL and the
-  state file carry the server base; `NEXUS_URL` survives only as the
-  ambiguity disambiguator above. The old admin-token pairing path
+- **`NEXUS_URL` is no longer a pairing input** — the pairing URL and
+  the state file carry the server base; `NEXUS_URL` survives only as
+  the ambiguity disambiguator above. The old admin-token pairing path
   (`POST /nodes` + `NEXUS_UI_TOKEN`) is unchanged as a route for
   scripting; the launcher no longer uses it, and the
   delete-stale-row-then-re-pair behavior is removed as planned.

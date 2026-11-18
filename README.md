@@ -425,11 +425,16 @@ node row (and its identity) survives. If the stored credential is
 ever rejected (the node row was revoked, or swept by idle expiry),
 the TUI exits 4: with a pairing URL the launcher re-pairs and tries
 once more; without one it exits 4 with "credential rejected — pair
-again". The pairing code itself never rests anywhere — the URL dies
-at the exchange, and the state file stores only the server base, node
-name, token, and thread. Two hosts can pair from one URL (grants are
-multi-use for their one-hour life); two threads on one host work via
-distinct `NEXUS_NODE` names (each gets its own state file).
+again". The pairing code never rests anywhere: the launcher does not
+persist the URL (the state file stores only the server base, node
+name, token, and thread), the server stores the code only as a hash,
+and the grant itself stays redeemable — by anyone holding the URL —
+until it expires or is revoked. Two hosts can pair from one URL
+(grants are multi-use for their one-hour life) — each under its own
+`NEXUS_NODE` name, since names are unique and a second exchange under
+a taken name 409s (hosts sharing a short hostname must override the
+default). Two threads on one host work the same way: distinct
+`NEXUS_NODE` names, each with its own state file.
 
 Manually, the analogous dance through the raw API (UI-token pairing
 stays available to scripts — delete the stale row first, since a
