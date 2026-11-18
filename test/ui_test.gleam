@@ -5088,19 +5088,23 @@ pub fn badge_counts_running_channels_test() {
   view_string(model) |> should_not_contain("id=\"info-btn\"")
   let idle =
     model
-    |> step(ui.ChannelsLoaded("s-parent", [
-      channel_info("s-ch-1", Some("RelayBeta"), False, False),
-    ]))
+    |> step(
+      ui.ChannelsLoaded("s-parent", [
+        channel_info("s-ch-1", Some("RelayBeta"), False, False),
+      ]),
+    )
   let idle_html = view_string(idle)
   should_contain(idle_html, "id=\"info-btn\"")
   should_not_contain(idle_html, "class=\"n\"")
   should_not_contain(idle_html, "info-dot live")
   let running =
     model
-    |> step(ui.ChannelsLoaded("s-parent", [
-      channel_info("s-ch-1", Some("RelayBeta"), False, False),
-      channel_info("s-ch-2", Some("Scout"), True, False),
-    ]))
+    |> step(
+      ui.ChannelsLoaded("s-parent", [
+        channel_info("s-ch-1", Some("RelayBeta"), False, False),
+        channel_info("s-ch-2", Some("Scout"), True, False),
+      ]),
+    )
   let running_html = view_string(running)
   should_contain(running_html, "<span class=\"n\">1</span>")
   should_contain(running_html, "info-dot live")
@@ -5140,6 +5144,7 @@ pub fn channel_breadcrumb_renders_test() {
   // Deleted bot: the frozen creation title stands in for the name.
   should_contain(archived_html, "OldHat")
 }
+
 /// Pane rows are hostile text: a bot name carrying markup renders as
 /// inert text — the same pin the roster lines and turn lines carry.
 pub fn pane_rows_escape_hostile_labels_test() {
@@ -5234,10 +5239,7 @@ pub fn threads_loaded_keeps_channel_selection_test() {
   // a replacement; the dropped channel's pane state goes with it (the
   // `switched` rule), so the replacement is never dressed in it.
   let model =
-    step(
-      model,
-      ui.ChannelResolved("s-channel", Error(Nil)),
-    )
+    step(model, ui.ChannelResolved("s-channel", Error(Nil)))
     |> step(ui.ThreadsLoaded([summary("s-parent", False)]))
   model.selected |> should.equal(Some("s-parent"))
   model.channel_ctx |> should.equal(None)
@@ -5286,28 +5288,34 @@ pub fn pane_closes_on_selection_change_and_settings_test() {
     new_model()
     |> step(ui.ThreadsLoaded([summary("s-1", False)]))
     |> step(ui.Select("s-1"))
-    |> step(ui.ChannelsLoaded("s-1", [
-      channel_info("s-ch-1", Some("RelayBeta"), False, False),
-    ]))
+    |> step(
+      ui.ChannelsLoaded("s-1", [
+        channel_info("s-ch-1", Some("RelayBeta"), False, False),
+      ]),
+    )
     |> step(ui.PaneToggled)
   model.pane_open |> should.be_true
   // A DIFFERENT selection closes it; the same-id Select is a deliberate
   // no-op (the guard exists so a stray re-click cannot reset the view).
   let model =
     model
-    |> step(ui.ThreadsLoaded([
-      summary("s-1", False),
-      summary("s-2", False),
-    ]))
+    |> step(
+      ui.ThreadsLoaded([
+        summary("s-1", False),
+        summary("s-2", False),
+      ]),
+    )
     |> step(ui.Select("s-2"))
   model.pane_open |> should.be_false
   model.channels |> should.equal([])
   model.channel_ctx |> should.equal(None)
   let model =
     model
-    |> step(ui.ChannelsLoaded("s-1", [
-      channel_info("s-ch-1", Some("RelayBeta"), False, False),
-    ]))
+    |> step(
+      ui.ChannelsLoaded("s-1", [
+        channel_info("s-ch-1", Some("RelayBeta"), False, False),
+      ]),
+    )
     |> step(ui.PaneToggled)
     |> step(ui.SettingsToggled)
   model.pane_open |> should.be_false
@@ -5325,9 +5333,11 @@ pub fn composer_hints_follow_context_test() {
   view_string(plain) |> should_not_contain("hint-parent")
   let with_rows =
     plain
-    |> step(ui.ChannelsLoaded("s-parent", [
-      channel_info("s-ch-1", Some("RelayBeta"), False, False),
-    ]))
+    |> step(
+      ui.ChannelsLoaded("s-parent", [
+        channel_info("s-ch-1", Some("RelayBeta"), False, False),
+      ]),
+    )
   view_string(with_rows) |> should_contain("hint-parent")
   view_string(with_rows) |> should_not_contain("hint-child")
   let in_channel = with_rows |> with_ctx
@@ -5369,9 +5379,11 @@ pub fn pane_toggle_aria_tracks_open_state_test() {
     new_model()
     |> step(ui.ThreadsLoaded([summary("s-parent", False)]))
     |> step(ui.Select("s-parent"))
-    |> step(ui.ChannelsLoaded("s-parent", [
-      channel_info("s-ch-1", Some("RelayBeta"), False, False),
-    ]))
+    |> step(
+      ui.ChannelsLoaded("s-parent", [
+        channel_info("s-ch-1", Some("RelayBeta"), False, False),
+      ]),
+    )
   let closed_html = view_string(model)
   should_contain(closed_html, "aria-expanded=\"false\"")
   should_not_contain(closed_html, ">Thread info<")

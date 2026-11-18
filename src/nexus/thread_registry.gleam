@@ -2718,8 +2718,7 @@ fn meta_summary(record: Record) -> thread.ThreadSummary {
     tags: record.meta.tags,
     archived: record.meta.archived,
     bot_id: record.meta.bot_id,
-    message_count:
-      transcript.messages(record.spec.transcript) |> list.length,
+    message_count: transcript.messages(record.spec.transcript) |> list.length,
     streaming: False,
     created_at: record.meta.created_at,
     last_active_at: record.meta.created_at,

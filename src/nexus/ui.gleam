@@ -2612,16 +2612,22 @@ fn info_button(model: Model) -> Element(Msg) {
           attr.class("infobtn"),
           attr.type_("button"),
           attr.aria("expanded", bool_aria(model.pane_open)),
-          attr.aria("label", "Thread info — "
-            <> int.to_string(running)
-            <> " running"),
+          attr.aria(
+            "label",
+            "Thread info — " <> int.to_string(running) <> " running",
+          ),
           event.on_click(PaneToggled),
         ],
         [
-          html.span([attr.class(case running > 0 {
-            True -> "info-dot live"
-            False -> "info-dot"
-          })], [html.text("●")]),
+          html.span(
+            [
+              attr.class(case running > 0 {
+                True -> "info-dot live"
+                False -> "info-dot"
+              }),
+            ],
+            [html.text("●")],
+          ),
           html.span([], [html.text("info")]),
           case running > 0 {
             True ->
@@ -2708,14 +2714,18 @@ fn channel_row(info: thread_registry.ChannelInfo) -> Element(Msg) {
       event.on_click(ChannelRowSelected(info)),
     ],
     [
-      html.span([attr.class(case info.running {
-        True -> "ch-dot run"
-        False -> "ch-dot idle"
-      })], [html.text("●")]),
+      html.span(
+        [
+          attr.class(case info.running {
+            True -> "ch-dot run"
+            False -> "ch-dot idle"
+          }),
+        ],
+        [html.text("●")],
+      ),
       html.span([attr.class("nm")], [html.text("↳ " <> label)]),
       case info.archived {
-        True ->
-          html.span([attr.class("badge")], [html.text("archived")])
+        True -> html.span([attr.class("badge")], [html.text("archived")])
         False -> element.none()
       },
       html.span([attr.class("age")], [
@@ -2738,29 +2748,23 @@ fn channel_row(info: thread_registry.ChannelInfo) -> Element(Msg) {
 fn details_section(model: Model) -> Element(Msg) {
   let rows = case model.selected, model.channel_ctx {
     None, _ -> []
-    Some(_), Some(ctx) ->
-      [
-        #("Bot", bot_display(model, ctx.bot_id) |> option.unwrap("—")),
-        #("Parent", parent_title(model)),
-      ]
+    Some(_), Some(ctx) -> [
+      #("Bot", bot_display(model, ctx.bot_id) |> option.unwrap("—")),
+      #("Parent", parent_title(model)),
+    ]
     Some(id), None ->
       case summary_by_id(model, id) {
-        Ok(summary) ->
-          [
-            #(
-              "Bot",
-              bot_display(model, summary.bot_id) |> option.unwrap("—"),
-            ),
-            #(
-              "Provider / model",
-              provider_name(model, summary.provider_id) <> " · "
-              <> summary.model,
-            ),
-            #(
-              "Created",
-              rel_time(timing.wall_now_s(), summary.created_at) <> " ago",
-            ),
-          ]
+        Ok(summary) -> [
+          #("Bot", bot_display(model, summary.bot_id) |> option.unwrap("—")),
+          #(
+            "Provider / model",
+            provider_name(model, summary.provider_id) <> " · " <> summary.model,
+          ),
+          #(
+            "Created",
+            rel_time(timing.wall_now_s(), summary.created_at) <> " ago",
+          ),
+        ]
         Error(_) -> []
       }
   }
@@ -3394,19 +3398,21 @@ fn chat(model: Model) -> Element(Msg) {
 /// has channels.
 fn composer_hints(model: Model) -> Element(Msg) {
   let child = case model.channel_ctx, model.view {
-    Some(_), ChatView ->
-      [html.div([attr.id("hint-child"), attr.class("hint")], [
-        html.text("You're viewing a bot channel of \""
-          <> parent_title(model)
-          <> "\""),
-      ])]
+    Some(_), ChatView -> [
+      html.div([attr.id("hint-child"), attr.class("hint")], [
+        html.text(
+          "You're viewing a bot channel of \"" <> parent_title(model) <> "\"",
+        ),
+      ]),
+    ]
     _, _ -> []
   }
   let parent = case model.channels, model.view {
-    [_, ..], ChatView ->
-      [html.div([attr.id("hint-parent"), attr.class("hint")], [
+    [_, ..], ChatView -> [
+      html.div([attr.id("hint-parent"), attr.class("hint")], [
         html.text("Channels are hidden from the sidebar — they live under info"),
-      ])]
+      ]),
+    ]
     _, _ -> []
   }
   case list.append(child, parent) {
