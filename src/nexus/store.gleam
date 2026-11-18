@@ -193,6 +193,12 @@ pub type StoredBot =
 pub type StoredNode =
   node.Node
 
+/// A stored pairing grant row (docs/plans/tui-pairing.md) — the whole
+/// entity plus the code HASH, never the plaintext code. Shared
+/// verbatim like `StoredNode`.
+pub type StoredGrant =
+  node.Grant
+
 /// Sanitized store error (already safe to log; never contains secrets).
 pub type StoreError =
   String
@@ -316,6 +322,23 @@ pub type Store {
     touch_node: fn(String) -> Result(Nil, StoreError),
     /// Hard delete (token revoke): removes the node's authority.
     delete_node: fn(String) -> Result(Nil, StoreError),
+    // ---- node pairing grants (docs/plans/tui-pairing.md, Phase A) ----
+    /// Every stored grant, ordered by id. The exchange scans these
+    /// against a presented code (constant-time verify; grants are few —
+    /// one-hour rows) and the info pane / e2e read the same list.
+    list_node_grants: fn() -> Result(List(StoredGrant), StoreError),
+    /// Persist a new grant row (write-through at mint). Errors on
+    /// duplicate id, like the schema's constraint.
+    insert_node_grant: fn(StoredGrant) -> Result(Nil, StoreError),
+    /// Record a successful exchange: use_count + 1, last_used_at now
+    /// (best-effort at the route, like `touch_node`).
+    touch_node_grant: fn(String) -> Result(Nil, StoreError),
+    /// Revoke a grant (row delete — future exchanges answer the merged
+    /// unknown/expired 404). Idempotent like `delete_node`.
+    delete_node_grant: fn(String) -> Result(Nil, StoreError),
+    /// Boot sweep (Phase D wires the call): expired grants are pure
+    /// garbage — the plaintext died at mint.
+    delete_expired_node_grants: fn() -> Result(Nil, StoreError),
   )
 }
 

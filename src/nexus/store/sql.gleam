@@ -386,6 +386,28 @@ delete from bot where id = $1
   |> pog.execute(db)
 }
 
+/// Boot sweep (tui-pairing plan Phase D wires the call): expired
+/// grants are pure garbage — the plaintext is gone the moment the mint
+/// answered, so the row's only remaining purpose was refusing codes.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn delete_expired_node_grants(
+  db: pog.Connection,
+) -> Result(pog.Returned(Nil), pog.QueryError) {
+  let decoder = decode.map(decode.dynamic, fn(_) { Nil })
+
+  "-- Boot sweep (tui-pairing plan Phase D wires the call): expired
+-- grants are pure garbage — the plaintext is gone the moment the mint
+-- answered, so the row's only remaining purpose was refusing codes.
+delete from node_grant where expires_at < now()
+"
+  |> pog.query
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
 /// Hard delete (token revoke): removing the row removes the node's
 /// authority.
 ///
@@ -401,6 +423,30 @@ pub fn delete_node(
   "-- Hard delete (token revoke): removing the row removes the node's
 -- authority.
 delete from node where id = $1
+"
+  |> pog.query
+  |> pog.parameter(pog.text(id))
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
+/// Revoke a pairing grant: removing the row removes the code's
+/// authority (future exchanges 404 — the merged unknown/expired
+/// answer). Idempotent like delete_node.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn delete_node_grant(
+  db: pog.Connection,
+  id: String,
+) -> Result(pog.Returned(Nil), pog.QueryError) {
+  let decoder = decode.map(decode.dynamic, fn(_) { Nil })
+
+  "-- Revoke a pairing grant: removing the row removes the code's
+-- authority (future exchanges 404 — the merged unknown/expired
+-- answer). Idempotent like delete_node.
+delete from node_grant where id = $1
 "
   |> pog.query
   |> pog.parameter(pog.text(id))
@@ -948,6 +994,51 @@ values ($1, $2, $3, to_timestamp($4), to_timestamp(nullif($5, 0::bigint)))
   |> pog.execute(db)
 }
 
+/// A new pairing grant row (tui-pairing plan Phase A). `code_hash` is
+/// the SHA-256 digest of the pairing code (nexus/node.gleam) — NEVER
+/// the plaintext. `thread_id` uses the '' sentinel (the insert_bot /
+/// insert_thread nullif pattern): v1 mints always pin a thread, NULL is
+/// the reserved future unpinned shape. `last_used_at` rides the same
+/// 0-sentinel convention as insert_node's last_seen_at: a fresh grant
+/// has never been exchanged.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn insert_node_grant(
+  db: pog.Connection,
+  arg_1: String,
+  arg_2: String,
+  arg_3: String,
+  arg_4: Float,
+  arg_5: Float,
+  arg_6: Int,
+  arg_7: Int,
+) -> Result(pog.Returned(Nil), pog.QueryError) {
+  let decoder = decode.map(decode.dynamic, fn(_) { Nil })
+
+  "-- A new pairing grant row (tui-pairing plan Phase A). `code_hash` is
+-- the SHA-256 digest of the pairing code (nexus/node.gleam) — NEVER
+-- the plaintext. `thread_id` uses the '' sentinel (the insert_bot /
+-- insert_thread nullif pattern): v1 mints always pin a thread, NULL is
+-- the reserved future unpinned shape. `last_used_at` rides the same
+-- 0-sentinel convention as insert_node's last_seen_at: a fresh grant
+-- has never been exchanged.
+insert into node_grant (id, code_hash, thread_id, created_at, expires_at, use_count, last_used_at)
+values ($1, $2, nullif($3, ''), to_timestamp($4), to_timestamp($5), $6, to_timestamp(nullif($7, 0::bigint)))
+"
+  |> pog.query
+  |> pog.parameter(pog.text(arg_1))
+  |> pog.parameter(pog.text(arg_2))
+  |> pog.parameter(pog.text(arg_3))
+  |> pog.parameter(pog.float(arg_4))
+  |> pog.parameter(pog.float(arg_5))
+  |> pog.parameter(pog.int(arg_6))
+  |> pog.parameter(pog.int(arg_7))
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
 /// A new provider row. `api_key_encrypted` is the nexus/crypto envelope;
 /// the '' sentinel inserts NULL (a keyless provider) — Postgres exposes
 /// no parameter nullability, so squirrel parameters cannot be nullable
@@ -1181,6 +1272,76 @@ select
   extract(epoch from created_at)::int8 as created_s,
   extract(epoch from updated_at)::int8 as updated_s
 from bot
+order by id
+"
+  |> pog.query
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
+/// A row you get from running the `list_node_grants` query
+/// defined in `./src/nexus/store/sql/list_node_grants.sql`.
+///
+/// > 🐿️ This type definition was generated automatically using v4.7.0 of the
+/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub type ListNodeGrantsRow {
+  ListNodeGrantsRow(
+    id: String,
+    code_hash: String,
+    thread_id: Option(String),
+    created_s: Int,
+    expires_s: Int,
+    use_count: Int,
+    last_used_s: Int,
+  )
+}
+
+/// All pairing grant rows (id-ordered, the list_nodes shape). The
+/// exchange scans these against a presented code with the constant-time
+/// verify (grants are few — one-hour rows), and the info pane / e2e
+/// read the same list. No secrets ride the select: the code HASH is
+/// public by nature, the plaintext never rests.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn list_node_grants(
+  db: pog.Connection,
+) -> Result(pog.Returned(ListNodeGrantsRow), pog.QueryError) {
+  let decoder = {
+    use id <- decode.field(0, decode.string)
+    use code_hash <- decode.field(1, decode.string)
+    use thread_id <- decode.field(2, decode.optional(decode.string))
+    use created_s <- decode.field(3, decode.int)
+    use expires_s <- decode.field(4, decode.int)
+    use use_count <- decode.field(5, decode.int)
+    use last_used_s <- decode.field(6, decode.int)
+    decode.success(ListNodeGrantsRow(
+      id:,
+      code_hash:,
+      thread_id:,
+      created_s:,
+      expires_s:,
+      use_count:,
+      last_used_s:,
+    ))
+  }
+
+  "-- All pairing grant rows (id-ordered, the list_nodes shape). The
+-- exchange scans these against a presented code with the constant-time
+-- verify (grants are few — one-hour rows), and the info pane / e2e
+-- read the same list. No secrets ride the select: the code HASH is
+-- public by nature, the plaintext never rests.
+select
+  id,
+  code_hash,
+  thread_id,
+  extract(epoch from created_at)::int8 as created_s,
+  extract(epoch from expires_at)::int8 as expires_s,
+  use_count,
+  coalesce(extract(epoch from last_used_at)::int8, 0) as last_used_s
+from node_grant
 order by id
 "
   |> pog.query
@@ -1715,6 +1876,34 @@ pub fn touch_node(
 
   "-- Bump a node's last-seen stamp on an authenticated connect.
 update node set last_seen_at = now() where id = $1
+"
+  |> pog.query
+  |> pog.parameter(pog.text(id))
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
+/// Record a successful exchange under this grant (best-effort at the
+/// route, like touch_node): diagnostics for the info pane — how many
+/// TUIs paired, when last. use_count is server-side increment, so two
+/// concurrent exchanges cannot lose a count.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn touch_node_grant(
+  db: pog.Connection,
+  id: String,
+) -> Result(pog.Returned(Nil), pog.QueryError) {
+  let decoder = decode.map(decode.dynamic, fn(_) { Nil })
+
+  "-- Record a successful exchange under this grant (best-effort at the
+-- route, like touch_node): diagnostics for the info pane — how many
+-- TUIs paired, when last. use_count is server-side increment, so two
+-- concurrent exchanges cannot lose a count.
+update node_grant
+set use_count = use_count + 1, last_used_at = now()
+where id = $1
 "
   |> pog.query
   |> pog.parameter(pog.text(id))

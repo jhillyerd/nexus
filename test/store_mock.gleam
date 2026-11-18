@@ -45,6 +45,9 @@ pub type Event {
   EvInsertNode(id: String)
   EvTouchNode(id: String)
   EvDeleteNode(id: String)
+  EvInsertNodeGrant(id: String)
+  EvTouchNodeGrant(id: String)
+  EvDeleteNodeGrant(id: String)
 }
 
 pub type MockMsg {
@@ -115,6 +118,12 @@ pub type MockMsg {
   InsertNode(node: store.StoredNode, reply: Subject(Result(Nil, String)))
   TouchNode(id: String, reply: Subject(Result(Nil, String)))
   DeleteNode(id: String, reply: Subject(Result(Nil, String)))
+  // ---- node pairing grants (docs/plans/tui-pairing.md, Phase A) ----
+  ListNodeGrants(reply: Subject(Result(List(store.StoredGrant), String)))
+  InsertNodeGrant(grant: store.StoredGrant, reply: Subject(Result(Nil, String)))
+  TouchNodeGrant(id: String, reply: Subject(Result(Nil, String)))
+  DeleteNodeGrant(id: String, reply: Subject(Result(Nil, String)))
+  DeleteExpiredNodeGrants(reply: Subject(Result(Nil, String)))
   // ---- test-only introspection ----
   Events(reply: Subject(List(Event)))
   Rows(reply: Subject(List(#(String, List(store.MessageRow)))))
@@ -124,6 +133,8 @@ pub type MockMsg {
   Bots(reply: Subject(List(StoredBot)))
   /// Every stored node, id-sorted — for direct row assertions.
   Nodes(reply: Subject(List(store.StoredNode)))
+  /// Every stored grant, id-sorted — for direct row assertions.
+  Grants(reply: Subject(List(store.StoredGrant)))
   /// Test-only: truncate a thread's stored rows back to `keep_rows` and
   /// its persisted message count to `messages` to model a crash between
   /// commits — the next Commit re-emits the delta, which is exactly the
@@ -156,6 +167,7 @@ type State {
     providers: Dict(String, store.StoredProvider),
     bots: Dict(String, StoredBot),
     nodes: Dict(String, store.StoredNode),
+    grants: Dict(String, store.StoredGrant),
     events: List(Event),
   )
 }
@@ -205,6 +217,7 @@ pub fn start() -> Subject(MockMsg) {
           providers: dict.new(),
           bots: dict.new(),
           nodes: dict.new(),
+          grants: dict.new(),
           events: [],
         ),
       )
@@ -275,6 +288,19 @@ pub fn seam(mock: Subject(MockMsg)) -> Store {
     insert_node: fn(row) { call(mock, 5000, fn(r) { InsertNode(row, r) }) },
     touch_node: fn(id) { call(mock, 5000, fn(r) { TouchNode(id, r) }) },
     delete_node: fn(id) { call(mock, 5000, fn(r) { DeleteNode(id, r) }) },
+    list_node_grants: fn() { call(mock, 5000, ListNodeGrants) },
+    insert_node_grant: fn(row) {
+      call(mock, 5000, fn(r) { InsertNodeGrant(row, r) })
+    },
+    touch_node_grant: fn(id) {
+      call(mock, 5000, fn(r) { TouchNodeGrant(id, r) })
+    },
+    delete_node_grant: fn(id) {
+      call(mock, 5000, fn(r) { DeleteNodeGrant(id, r) })
+    },
+    delete_expired_node_grants: fn() {
+      call(mock, 5000, DeleteExpiredNodeGrants)
+    },
   )
 }
 
@@ -306,6 +332,11 @@ pub fn bots(mock: Subject(MockMsg)) -> List(store.StoredBot) {
 /// Every stored node, id-sorted — for direct row assertions.
 pub fn nodes(mock: Subject(MockMsg)) -> List(store.StoredNode) {
   call(mock, 5000, Nodes)
+}
+
+/// Every stored grant, id-sorted — for direct row assertions.
+pub fn grants(mock: Subject(MockMsg)) -> List(store.StoredGrant) {
+  call(mock, 5000, Grants)
 }
 
 /// Truncate a thread's stored rows (models a crash between commits so
@@ -1254,6 +1285,114 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
         |> dict.values
         |> list.sort(fn(a, b) { string.compare(a.id, b.id) })
       process.send(reply, nodes)
+      actor.continue(state)
+    }
+
+    // ---- node pairing grants (docs/plans/tui-pairing.md, Phase A) ----
+    ListNodeGrants(reply) -> {
+      let grants =
+        state.grants
+        |> dict.values
+        |> list.sort(fn(a, b) { string.compare(a.id, b.id) })
+      process.send(reply, Ok(grants))
+      actor.continue(state)
+    }
+
+    InsertNodeGrant(grant, reply) ->
+      // node_grant_pkey, like the schema's constraint. Codes are
+      // 256-bit random — no unique hash index to model.
+      case dict.has_key(state.grants, grant.id) {
+        True -> {
+          process.send(reply, Error("node grant " <> grant.id <> " exists"))
+          actor.continue(state)
+        }
+        False -> {
+          process.send(reply, Ok(Nil))
+          actor.continue(
+            State(
+              ..state,
+              grants: dict.insert(state.grants, grant.id, grant),
+              events: [EvInsertNodeGrant(grant.id), ..state.events],
+            ),
+          )
+        }
+      }
+
+    TouchNodeGrant(id, reply) ->
+      // Like the SQL `update ... where id = $1`: a missing row is a
+      // silent no-op, and use_count is server-side increment (no lost
+      // counts under concurrency).
+      case dict.get(state.grants, id) {
+        Error(_) -> {
+          process.send(reply, Ok(Nil))
+          actor.continue(state)
+        }
+        Ok(grant) -> {
+          let stamped =
+            node.Grant(
+              ..grant,
+              use_count: grant.use_count + 1,
+              last_used_at: Some(timing.wall_now_s()),
+            )
+          process.send(reply, Ok(Nil))
+          actor.continue(
+            State(
+              ..state,
+              grants: dict.insert(state.grants, id, stamped),
+              events: [EvTouchNodeGrant(id), ..state.events],
+            ),
+          )
+        }
+      }
+
+    DeleteNodeGrant(id, reply) -> {
+      case dict.has_key(state.grants, id) {
+        False -> {
+          process.send(reply, Ok(Nil))
+          actor.continue(state)
+        }
+        True -> {
+          process.send(reply, Ok(Nil))
+          actor.continue(
+            State(..state, grants: dict.delete(state.grants, id), events: [
+              EvDeleteNodeGrant(id),
+              ..state.events
+            ]),
+          )
+        }
+      }
+    }
+
+    DeleteExpiredNodeGrants(reply) -> {
+      // The boot sweep's semantics: `expires_at < now()` deletes,
+      // an exactly-now expiry survives (the SQL's strict <).
+      let now = timing.wall_now_s()
+      let #(kept, expired) =
+        list.partition(dict.values(state.grants), fn(grant) {
+          grant.expires_at >= now
+        })
+      let expired_ids = list.map(expired, fn(grant) { grant.id })
+      process.send(reply, Ok(Nil))
+      actor.continue(
+        State(
+          ..state,
+          grants: list.fold(kept, dict.new(), fn(acc, grant) {
+            dict.insert(acc, grant.id, grant)
+          }),
+          events: list.append(
+            list.map(expired_ids, EvDeleteNodeGrant),
+            state.events,
+          ),
+        ),
+      )
+    }
+
+    Grants(reply) -> {
+      let grants =
+        state.grants
+        |> dict.values
+        |> list.sort(fn(a, b) { string.compare(a.id, b.id) })
+      process.send(reply, grants)
       actor.continue(state)
     }
 

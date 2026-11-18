@@ -209,6 +209,30 @@ CREATE TABLE IF NOT EXISTS node (
 CREATE UNIQUE INDEX IF NOT EXISTS node_name ON node (name);
 CREATE INDEX IF NOT EXISTS node_recency ON node (last_seen_at DESC);
 
+-- TUI pairing grants (docs/plans/tui-pairing.md, Phase A): a web-minted,
+-- short-lived, MULTI-USE invite authorizing the minting of node
+-- credentials without the UI token — the pairing UX deferred from
+-- environments Phase 2b. `code_hash` is the SHA-256 digest of the
+-- pairing code (nexus/node.gleam), NEVER the plaintext: the code
+-- answers exactly once, at mint, exactly like a node token. thread_id
+-- pins the grant to the issuing thread (v1 mints always pin; NULL is
+-- reserved for a future unpinned shape — no extra work now, just no
+-- migration later) and CASCADEs with it: a pairing URL for a deleted
+-- thread is meaningless. use_count / last_used_at are diagnostics for
+-- the info pane; no max_uses in v1 — pairing several hosts from one
+-- URL is the feature.
+CREATE TABLE IF NOT EXISTS node_grant (
+  id           text PRIMARY KEY,
+  code_hash    text NOT NULL,                  -- hex digest of the pairing code, never plaintext
+  thread_id    text REFERENCES thread(id) ON DELETE CASCADE,  -- NULL = reserved for future unpinned grants
+  created_at   timestamptz NOT NULL,
+  expires_at   timestamptz NOT NULL,           -- created_at + 1h: the grant's whole life
+  use_count    int NOT NULL DEFAULT 0,         -- exchanges performed under this grant
+  last_used_at timestamptz                     -- bumped on each successful exchange
+);
+
+CREATE INDEX IF NOT EXISTS node_grant_expiry ON node_grant (expires_at);
+
 CREATE TABLE IF NOT EXISTS thread_message (
   id           bigserial PRIMARY KEY,
   thread_id   text NOT NULL REFERENCES thread(id) ON DELETE CASCADE,

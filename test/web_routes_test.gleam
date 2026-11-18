@@ -26,8 +26,10 @@ import nexus/node
 import nexus/openai
 import nexus/provider
 import nexus/provider_registry
+import nexus/store
 import nexus/thread
 import nexus/thread_registry
+import nexus/timing
 import nexus/tools
 import nexus/transcript
 import nexus/web
@@ -116,12 +118,40 @@ fn start_server() -> #(process.Subject(thread_registry.Msg), Int) {
   #(registry, port)
 }
 
-/// The full rig: factory + store mock + REAL provider registry (per-base-
-/// URL model fetcher, so tests can tell providers apart) + thread
-/// registry + mist. `extra` runs against the fresh provider registry
-/// before the server starts — used to set up colliding providers.
+/// A rig whose store is seeded before the server starts — the pairing
+/// exchange's grant rows (tui-pairing plan Phase A): there is
+/// deliberately NO HTTP mint route (the web UI mints through the
+/// server component), so offline tests seed the mock directly and
+/// exercise the exchange exactly as a TUI host would.
+fn start_server_with_grants(
+  seed: fn(store.Store) -> Nil,
+) -> #(process.Subject(thread_registry.Msg), Int) {
+  let #(registry, _providers, port) =
+    start_server_rig(fn(_providers) { Nil }, seed)
+  #(registry, port)
+}
+
+/// The full rig behind every start_server variant: factory + store mock
+/// + REAL provider registry (per-base-URL model fetcher, so tests can
+/// tell providers apart) + thread registry + mist.
 fn start_server_with(
   extra: fn(process.Subject(provider_registry.Msg)) -> Nil,
+) -> #(
+  process.Subject(thread_registry.Msg),
+  process.Subject(provider_registry.Msg),
+  Int,
+) {
+  start_server_rig(extra, fn(_store) { Nil })
+}
+
+/// `extra` runs against the fresh provider registry before the server
+/// starts — used to set up colliding providers; `seed` runs against
+/// the mock store before the server starts — the pairing-exchange
+/// tests' grant rows land there (no HTTP mint route exists by design;
+/// the web UI mints through the server component).
+fn start_server_rig(
+  extra: fn(process.Subject(provider_registry.Msg)) -> Nil,
+  seed: fn(store.Store) -> Nil,
 ) -> #(
   process.Subject(thread_registry.Msg),
   process.Subject(provider_registry.Msg),
@@ -136,6 +166,7 @@ fn start_server_with(
     factory_supervisor.start(thread_registry.factory_builder(factory_name))
   let persistence = store_mock.seam(store_mock.start())
   store_mock.ensure_fixture_provider(persistence)
+  seed(persistence)
   // The REAL provider registry over the same mock store, with the live
   // model fetch replaced by a fixed alias list — offline, like the rest
   // of the suite. The thread registry resolves through it exactly like
@@ -1371,4 +1402,88 @@ pub fn node_insert_failure_test() {
   |> should.equal(#(502, "store unavailable"))
   web.node_insert_failure(Error("disk full"), "proxmox-2")
   |> should.equal(#(502, "store unavailable"))
+}
+
+/// The pairing exchange (tui-pairing plan Phase A): a TUI host redeems
+/// a code for a node credential + the grant's pinned thread — with NO
+/// UI token (the whole point). Grants are seeded through the mock
+/// seam because there is deliberately no HTTP mint route (the web UI
+/// mints through the server component). Revocation needs no separate
+/// arm here: a revoked row is simply absent from the list, the exact
+/// state the unknown-code arm exercises.
+pub fn node_grant_exchange_round_trip_test() {
+  let now = timing.wall_now_s()
+  // One live grant (the pairing URL) and one already expired.
+  let #(live_code, live) = node.mint_grant(Some("t-pinned"), now)
+  let #(_expired_code, expired) =
+    node.mint_grant(Some("t-old"), now - node.grant_ttl_s - 1)
+  let #(_registry, port) =
+    start_server_with_grants(fn(store) {
+      store.insert_node_grant(live) |> should.be_ok
+      store.insert_node_grant(expired) |> should.be_ok
+    })
+
+  let pair = fn(code: String, name: String) {
+    hackney.send(req(
+      port,
+      Post,
+      "/nodes/pair",
+      "{\"code\":\"" <> code <> "\",\"name\":\"" <> name <> "\"}",
+    ))
+  }
+
+  // PUBLIC: a plain send, no Authorization header — a TUI host holds
+  // no UI token. The answer carries the one-time node token, the
+  // pinned thread, and never any hash.
+  let assert Ok(first) = pair(live_code, "laptop-a")
+  should.equal(first.status, 201)
+  should.be_true(string.contains(first.body, "\"name\":\"laptop-a\""))
+  should.be_true(string.contains(first.body, "\"token\":\""))
+  should.be_false(string.contains(first.body, "token_hash"))
+  should.be_false(string.contains(first.body, "code_hash"))
+  let assert Ok(thread_id) =
+    json.parse(first.body, decode.at(["thread_id"], decode.string))
+  should.equal(thread_id, "t-pinned")
+  let assert Ok(first_id) =
+    json.parse(first.body, decode.at(["id"], decode.string))
+
+  // MULTI-USE: the same code pairs a second host (the multi-host
+  // story) — a NEW node row, never a takeover.
+  let assert Ok(second) = pair(live_code, "laptop-b")
+  should.equal(second.status, 201)
+  let assert Ok(second_id) =
+    json.parse(second.body, decode.at(["id"], decode.string))
+  should.be_false(first_id == second_id)
+
+  // A name already paired is the same friendly 409 — a code must
+  // never authorize a takeover.
+  let assert Ok(dup) = pair(live_code, "laptop-a")
+  should.equal(dup.status, 409)
+  // And the admin route's row collides the same way (the ONE mint
+  // path's shared name space).
+  let #(admin, _) =
+    send_authorized(req(port, Post, "/nodes", "{\"name\":\"laptop-b\"}"))
+  should.equal(admin, 409)
+
+  // Expired and unknown codes answer the IDENTICAL merged 404 — the
+  // route must not become a code oracle.
+  let assert Ok(unknown) = pair("not-a-real-code-at-all", "laptop-c")
+  should.equal(unknown.status, 404)
+  should.be_true(string.contains(unknown.body, "unknown or expired"))
+
+  // An invalid name against a VALID code still refuses (the env
+  // target-name gate — workspace is reserved).
+  let assert Ok(reserved) = pair(live_code, "workspace")
+  should.equal(reserved.status, 400)
+
+  // Unreadable body: 400, like the admin route.
+  let assert Ok(bad) = hackney.send(req(port, Post, "/nodes/pair", "not json"))
+  should.equal(bad.status, 400)
+
+  // The nodes list (admin surface) shows both minted rows — the
+  // exchange really went through the ONE mint path.
+  let #(list_status, listed) = send_authorized(req(port, Get, "/nodes", ""))
+  should.equal(list_status, 200)
+  should.be_true(string.contains(listed, "laptop-a"))
+  should.be_true(string.contains(listed, "laptop-b"))
 }

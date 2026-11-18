@@ -213,7 +213,8 @@ env overrides: NEXUS_NODE, NEXUS_ROLE, NEXUS_THREAD (still wins over the grant's
 
 ## Phases
 
-### Phase A — grant seam + public exchange (server, offline-provable)
+### Phase A — grant seam + public exchange (server, offline-provable) —
+IMPLEMENTED
 
 - `sql/schema.sql` + `gleam run -m nexus/store/migrate`; squirrel
   queries (`insert_node_grant`, `list_node_grants`, `delete_node_grant`,
