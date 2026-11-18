@@ -697,7 +697,8 @@ fn timestamps_js() -> String {
 /// - The Copy button writes the same rebuilt URL to the clipboard.
 ///   Clipboard needs a secure context (https or localhost), so a
 ///   plain-http LAN origin falls back to the deprecated execCommand
-///   path. Button feedback is a text swap the next re-render resets.
+///   path (return-checked — some browsers return false rather than
+///   throw). Button feedback is a text swap the next re-render resets.
 ///
 /// Nothing is built from data: the URL is two concatenated strings
 /// (the origin is browser state; the code is server-minted base64url
@@ -729,7 +730,7 @@ fn pairing_js() -> String {
   <> "    ta.style.opacity = '0';\n"
   <> "    document.body.appendChild(ta);\n"
   <> "    ta.select();\n"
-  <> "    try { document.execCommand('copy'); flash(button); } catch (e) {}\n"
+  <> "    try { if (document.execCommand('copy')) flash(button); } catch (e) {}\n"
   <> "    document.body.removeChild(ta);\n"
   <> "  };\n"
   <> "  var copy = function (button) {\n"
