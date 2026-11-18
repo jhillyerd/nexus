@@ -5257,10 +5257,6 @@ pub fn pane_rows_escape_hostile_labels_test() {
   should_contain(html, "&lt;script&gt;alert(1)&lt;/script&gt;")
 }
 
-/// The deleted-bot fallback is the frozen creation title (the as-built
-/// amended the plan's "falls back to the id" — `create_dm` titled the
-/// channel with the bot's name, so the fallback still reads as a name).
-/// The row and the header label both use it.
 // ---- Environments section (tui-pairing plan Phase C) ----
 
 fn env_node(name: String, last_seen: Option(Int)) -> node.Node {
@@ -5493,6 +5489,10 @@ pub fn expires_in_label_test() {
   ui.expires_in_label(1000, 999) |> should.equal("expired")
 }
 
+/// The deleted-bot fallback is the frozen creation title (the as-built
+/// amended the plan's "falls back to the id" — `create_dm` titled the
+/// channel with the bot's name, so the fallback still reads as a name).
+/// The row and the header label both use it.
 pub fn deleted_bot_label_falls_back_to_title_test() {
   let model =
     new_model()
