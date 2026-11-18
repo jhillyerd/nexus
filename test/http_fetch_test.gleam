@@ -118,6 +118,68 @@ pub fn adapter_roundtrips_test() {
 }
 
 // ---------------------------------------------------------------------------
+// Hard deadline (the wedged-TLS-handshake regression)
+// ---------------------------------------------------------------------------
+
+const silent_tls_port = 18_043
+
+@external(erlang, "net_test_ffi", "start_silent_listener")
+fn start_silent_listener(port: Int) -> Result(Nil, String)
+
+@external(erlang, "net_test_ffi", "now_ms")
+fn now_ms() -> Int
+
+/// Found live (thread s2 on plastic.home.arpa, 2026-11-17): a server that
+/// completes the TCP connect but never speaks TLS stalls the TLS handshake
+/// forever — hackney 1.25 performs it with `ssl:connect(Sock, Opts)`, the
+/// no-timeout two-argument form; its `connect_timeout` covers only the TCP
+/// stage and `recv_timeout` only starts after the request is sent. The
+/// fetch worker used to hang past every configured bound, wedging the
+/// turn. nexus_net_ffi now runs each hop under a hard total deadline and
+/// kills the fetch at it: the call must RETURN (an error — tool data, not
+/// a loop error) within roughly 2×timeout + slack, instead of never.
+pub fn stalled_tls_handshake_is_deadline_bounded_test() {
+  let assert Ok(_) = start_silent_listener(silent_tls_port)
+  // The fetch runs in a worker that reports back through a subject: if
+  // the deadline itself regresses (the bug this test guards), the
+  // receive below times out and the suite FAILS loudly instead of
+  // hanging forever inside net.fetch.
+  let reporter = process.new_subject()
+  process.spawn(fn() {
+    let started = now_ms()
+    let result =
+      net.fetch(
+        "https://127.0.0.1:" <> int.to_string(silent_tls_port) <> "/",
+        [],
+        20_000,
+        // 1s budget → 4s hard deadline: fast enough to keep the suite
+        // snappy, long enough that the deadline (not a fast TLS refusal)
+        // is what ends the call.
+        1000,
+        True,
+        3,
+      )
+    process.send(reporter, #(now_ms() - started, result))
+  })
+  // The deadline is 4s; 20s of receive slack before declaring it dead.
+  case process.receive(reporter, 20_000) {
+    Ok(#(elapsed, result)) -> {
+      // The deadline floor proves the stall really happened and was
+      // waited out (a fast failure would mean the listener answered TLS
+      // somehow); the ceiling proves the deadline fired — pre-fix this
+      // call NEVER returned and hung the whole suite.
+      should.be_true(elapsed >= 3500)
+      should.be_true(elapsed < 15_000)
+      // net.fetch surfaces the FFI error verbatim; the "fetch failed: "
+      // prefix is added by the http_fetch tool adapter above it.
+      let assert Error("timeout (hard deadline)") = result
+    }
+    Error(Nil) ->
+      panic as "stalled-TLS fetch never returned: the hard deadline did not fire"
+  }
+}
+
+// ---------------------------------------------------------------------------
 // SSRF guard (pure)
 // ---------------------------------------------------------------------------
 

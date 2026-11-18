@@ -35,6 +35,9 @@ fn set_all(pairs: List(#(String, String))) -> Nil {
   envoy.unset("NEXUS_WORKSPACE_ROOT")
   envoy.unset("NEXUS_ENV_TIMEOUT_MS")
   envoy.unset("NEXUS_ENV_MAX_OUTPUT_BYTES")
+  envoy.unset("NEXUS_HTTP_FETCH_MAX_BYTES")
+  envoy.unset("NEXUS_HTTP_FETCH_TIMEOUT_MS")
+  envoy.unset("NEXUS_HTTP_FETCH_ALLOW_PRIVATE")
   list.each(pairs, fn(pair) { envoy.set(pair.0, pair.1) })
 }
 
@@ -190,6 +193,18 @@ pub fn load_rejects_negative_utility_delay_test() {
   message
   |> should.equal(
     "environment variable NEXUS_UTILITY_DELAY_MS must be >= 0: -1",
+  )
+}
+
+pub fn load_rejects_negative_http_fetch_timeout_test() {
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_HTTP_FETCH_TIMEOUT_MS", "-1"),
+  ])
+  let assert Error(message) = config.load()
+  message
+  |> should.equal(
+    "environment variable NEXUS_HTTP_FETCH_TIMEOUT_MS must be >= 0: -1",
   )
 }
 

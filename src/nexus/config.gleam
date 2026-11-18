@@ -210,7 +210,7 @@ pub fn from_env(
     "NEXUS_HTTP_FETCH_MAX_BYTES",
     20_000,
   ))
-  use http_fetch_timeout_ms <- result.try(optional_int(
+  use http_fetch_timeout_ms <- result.try(optional_non_negative_int(
     get,
     "NEXUS_HTTP_FETCH_TIMEOUT_MS",
     15_000,
