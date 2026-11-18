@@ -1504,12 +1504,19 @@ fn node_pair_response(
   case read_node_pair(req) {
     Error(_) -> json_response(400, err_json("unreadable body"))
     Ok(fields) ->
-      case find_live_grant(store, fields.code, timing.wall_now_s()) {
-        Error(resp) -> resp
-        Ok(grant) ->
-          case node.valid_name(fields.name) {
-            Error(reason) -> json_response(400, err_json(reason))
-            Ok(name) ->
+      // The name gate runs BEFORE the code check — the ordering is
+      // load-bearing (smart-loop R1, S1): with the code first, an
+      // invalid-name probe distinguishes a live code (400, name check
+      // reached) from a bogus one (404, short-circuit) — exactly the
+      // oracle the merged 404 exists to prevent. Name-first, an
+      // invalid name answers 400 unconditionally and code state is
+      // observable only through an otherwise-valid redemption.
+      case node.valid_name(fields.name) {
+        Error(reason) -> json_response(400, err_json(reason))
+        Ok(name) ->
+          case find_live_grant(store, fields.code, timing.wall_now_s()) {
+            Error(resp) -> resp
+            Ok(grant) ->
               case node_name_free(store, name) {
                 Error(resp) -> resp
                 Ok(Nil) ->
