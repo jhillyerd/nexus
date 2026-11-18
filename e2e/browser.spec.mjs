@@ -2557,14 +2557,6 @@ async function main() {
         });
         assert(at(t1.id), `back lands on t1's url: ${page.url()}`);
         await page.goForward();
-        await page.waitForTimeout(3500);
-        const dbg = await page.evaluate(() => ({
-          url: location.href,
-          selected: document.querySelector("#layout")?.getAttribute("data-selected"),
-          state: JSON.stringify(history.state),
-          hist: window.__hist ?? [],
-        }));
-        console.log("FWD-DBG", JSON.stringify(dbg));
         await poll(async () => (await selectedId(page)) === t2.id, {
           timeout: 15_000,
           message: "forward re-opened t2",

@@ -725,6 +725,13 @@ pub fn m3_page_thread_url_script_test() {
   ))
   should.be_true(string.contains(html, "if (Date.now() > deadline) {"))
   should.be_true(string.contains(html, "location.assign(location.href);"))
+  // The TIMER runs the same guards as the observer (a quiet shadow
+  // root must not skip the expiry): pinned as one contiguous fragment
+  // so the assertion matches the timer's block, not the observer's.
+  should.be_true(string.contains(
+    html,
+    "if (epoch !== navEpoch) { stopRetry(); return; }\n      if (current !== null && current !== armedId) { stopRetry(); return; }\n      giveUpOrReload();\n    }, 2050);",
+  ))
   should.be_true(string.contains(
     html,
     "      if (epoch !== navEpoch) { stopRetry(); return; }",

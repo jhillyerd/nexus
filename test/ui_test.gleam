@@ -5447,9 +5447,9 @@ pub fn replacement_auto_select_resets_vanished_channel_test() {
     |> step(ui.ChannelRowSelected(info))
     // The viewed channel's transcript has content.
     |> step(ui.UserEcho("channel line", None, None))
-  // The channel is gone (its parent was deleted): the resolution
-  // refuses, and the next refresh drops the selection, auto-selecting
-  // the parent as the replacement.
+  // The channel is gone (deleted directly — its resolution refuses),
+  // while the parent remains listed: the next refresh drops the
+  // selection and auto-selects the parent as the replacement.
   let model = step(model, ui.ChannelResolved("s-channel", Error(Nil)))
   let model = step(model, ui.ThreadsLoaded([summary("s-parent", False)]))
   model.selected |> should.equal(Some("s-parent"))
