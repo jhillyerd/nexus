@@ -163,9 +163,6 @@ async function relayRig(prefix, note) {
     made.bots.push(id);
     return id;
   };
-  const alphaId = await mkBot(`${prefix}Alpha`);
-  const betaId = await mkBot(`${prefix}Beta`);
-
   const cleanup = async () => {
     // CHILDREN FIRST (the reversed list): a parent delete would cascade
     // its channel silently — this way the channel's own 204 is asserted.
@@ -185,11 +182,13 @@ async function relayRig(prefix, note) {
     }
   };
 
-  // The rig owns its own failure cleanup: a failed receipt or settle
-  // poll must not leak the bots or the parent thread into the shared
-  // world of later tests (the caller's try/finally covers only the
-  // caller's own body).
+  // The rig owns its own failure cleanup, and BOTH bot creations live
+  // inside the protected block: a failed Beta create must not leak the
+  // already-created Alpha bot into the shared world of later tests
+  // (the caller's try/finally covers only the caller's own body).
   try {
+    const alphaId = await mkBot(`${prefix}Alpha`);
+    const betaId = await mkBot(`${prefix}Beta`);
     // A thread FROM Alpha (the shared orchestration re-validates the
     // alias against the fake gateway's live list).
     const created = await page.request.post(`${base}/threads`, {
@@ -2383,6 +2382,44 @@ async function main() {
               : null,
           { timeout: 15_000, interval: 250, message: "crumb re-selects the parent" },
         );
+
+        // Back/forward across a CHANNEL entry: the channel's url owns a
+        // history entry (selection-without-listing pushes real urls),
+        // but no sidebar row exists for it — the popstate click cannot
+        // serve it, so the retry's expiry falls back to a full load of
+        // the entry's url, which Flags.thread resolves (the pane path
+        // re-marks breadcrumb + highlight). Forward to the channel and
+        // land back in it.
+        // Back from the parent lands on the CHANNEL entry — but no
+        // sidebar row exists for it, so the popstate click cannot serve
+        // it: the retry's expiry falls back to a full load of the
+        // entry's url, which Flags.thread resolves (crumb + parent
+        // highlight restored through the pane path).
+        await page.goBack();
+        await poll(
+          async () =>
+            (await page.locator("#layout").getAttribute("data-selected")) ===
+            betaThread
+              ? true
+              : null,
+          {
+            timeout: 20_000,
+            interval: 500,
+            message: "back to the channel entry loads the channel (reload fallback)",
+          },
+        );
+        await page.locator("#crumb").waitFor({ timeout: 15_000 });
+        // Forward returns to the parent entry — an ordinary row, served
+        // by the popstate click.
+        await page.goForward();
+        await poll(
+          async () =>
+            (await page.locator("#layout").getAttribute("data-selected")) ===
+            alphaThread
+              ? true
+              : null,
+          { timeout: 15_000, interval: 250, message: "forward returns to the parent" },
+        );
       } finally {
         await cleanup();
       }
@@ -2520,6 +2557,14 @@ async function main() {
         });
         assert(at(t1.id), `back lands on t1's url: ${page.url()}`);
         await page.goForward();
+        await page.waitForTimeout(3500);
+        const dbg = await page.evaluate(() => ({
+          url: location.href,
+          selected: document.querySelector("#layout")?.getAttribute("data-selected"),
+          state: JSON.stringify(history.state),
+          hist: window.__hist ?? [],
+        }));
+        console.log("FWD-DBG", JSON.stringify(dbg));
         await poll(async () => (await selectedId(page)) === t2.id, {
           timeout: 15_000,
           message: "forward re-opened t2",

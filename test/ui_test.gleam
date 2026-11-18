@@ -5430,6 +5430,36 @@ pub fn pane_details_render_from_summary_and_ctx_test() {
   should_not_contain(html, "Provider / model")
 }
 
+/// A replaced selection (a dropped thread auto-replaced by the first
+/// active one — e.g. a viewed channel whose parent was deleted: the
+/// CASCADE takes the channel) resets the TRANSCRIPT state too, not
+/// just the pane fields: the replacement's Join replay appends to the
+/// log, so the vanished thread's lines would bleed into it. Ended
+/// alone covers only the no-replacement drop; `switched` covers this
+/// path (the CodeRabbit review finding).
+pub fn replacement_auto_select_resets_vanished_channel_test() {
+  let info = channel_info("s-channel", Some("RelayBeta"), False, False)
+  let model =
+    new_model()
+    |> step(ui.ThreadsLoaded([summary("s-parent", False)]))
+    |> step(ui.Select("s-parent"))
+    |> step(ui.ChannelsLoaded("s-parent", [info]))
+    |> step(ui.ChannelRowSelected(info))
+    // The viewed channel's transcript has content.
+    |> step(ui.UserEcho("channel line", None, None))
+  // The channel is gone (its parent was deleted): the resolution
+  // refuses, and the next refresh drops the selection, auto-selecting
+  // the parent as the replacement.
+  let model = step(model, ui.ChannelResolved("s-channel", Error(Nil)))
+  let model = step(model, ui.ThreadsLoaded([summary("s-parent", False)]))
+  model.selected |> should.equal(Some("s-parent"))
+  // The vanished channel's transcript did not survive the switch.
+  model.log |> should.equal([])
+  model.streaming |> should.be_false
+  model.channel_ctx |> should.equal(None)
+  model.channels |> should.equal([])
+}
+
 /// Toggling the pane open re-asks for fresh rows (the effect carries
 /// the ask; here we pin the update half: opening on a selection with
 /// rows keeps them, and the badge's aria state follows).

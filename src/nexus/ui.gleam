@@ -2092,18 +2092,27 @@ fn after_threads(model: Model, summaries: List(thread.ThreadSummary)) -> Model {
       [], _ -> True
       _, _ -> False
     },
-    log: case ended {
+    // Per-selection transcript state resets when the selection is gone
+    // (ended) OR swapped for a replacement (switched: a dropped thread
+    // auto-replaced by the first active one). The replacement's Join
+    // replay appends to the log — without the switch reset, a vanished
+    // channel's (or externally deleted thread's) transcript bled into
+    // the replacement's (the CodeRabbit review finding; routine for
+    // channels, whose CASCADE delete drops a viewed channel while the
+    // user watches). A changed label role: ended says "thread ended",
+    // a switch says "connecting…" for its fresh replay.
+    log: case ended || switched {
       True -> []
       False -> model.log
     },
     // The pending flushes belong to the ended thread's log; a stale
     // entry must never stamp another thread's (possibly unstamped)
     // line that happens to carry the same text.
-    flushed: case ended {
+    flushed: case ended || switched {
       True -> []
       False -> model.flushed
     },
-    bubble: case ended {
+    bubble: case ended || switched {
       True -> None
       False -> model.bubble
     },
@@ -2111,41 +2120,42 @@ fn after_threads(model: Model, summaries: List(thread.ThreadSummary)) -> Model {
     // ended thread's bubble was visible) would let the NEXT thread's
     // first streamed token — even whitespace-only — render, bypassing the
     // render-empty rule the Token arm applies.
-    bubble_hidden: case ended {
+    bubble_hidden: case ended || switched {
       True -> True
       False -> model.bubble_hidden
     },
-    thinking: case ended {
+    thinking: case ended || switched {
       True -> None
       False -> model.thinking
     },
-    streaming: case ended {
+    streaming: case ended || switched {
       True -> False
       False -> model.streaming
     },
-    pending: case ended {
+    pending: case ended || switched {
       True -> []
       False -> model.pending
     },
-    loop: case ended {
+    loop: case ended || switched {
       True -> None
       False -> model.loop
     },
-    guard: case ended {
+    guard: case ended || switched {
       True -> False
       False -> model.guard
     },
-    turn_base: case ended {
+    turn_base: case ended || switched {
       True -> 0
       False -> model.turn_base
     },
-    model_label: case ended {
-      True -> "thread ended"
-      False -> model.model_label
+    model_label: case ended, switched {
+      True, _ -> "thread ended"
+      False, True -> "connecting…"
+      False, False -> model.model_label
     },
     // The popup belongs to the ended thread's log — same rule as the
     // pending flushes above it.
-    pop: case ended {
+    pop: case ended || switched {
       True -> None
       False -> model.pop
     },
