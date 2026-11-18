@@ -112,6 +112,12 @@ pub type Msg {
   InsertNode(node: store.StoredNode, reply: Subject(Result(Nil, String)))
   TouchNode(id: String, reply: Subject(Result(Nil, String)))
   DeleteNode(id: String, reply: Subject(Result(Nil, String)))
+  // ---- node pairing grants (docs/plans/tui-pairing.md, Phase A) ----
+  ListNodeGrants(reply: Subject(Result(List(store.StoredGrant), String)))
+  InsertNodeGrant(grant: store.StoredGrant, reply: Subject(Result(Nil, String)))
+  TouchNodeGrant(id: String, reply: Subject(Result(Nil, String)))
+  DeleteNodeGrant(id: String, reply: Subject(Result(Nil, String)))
+  DeleteExpiredNodeGrants(reply: Subject(Result(Nil, String)))
 }
 
 type State {
@@ -327,6 +333,27 @@ pub fn seam(store_actor: Subject(Msg)) -> store.Store {
       actor.call(store_actor, call_timeout_ms, fn(reply) {
         DeleteNode(id, reply)
       })
+    },
+    list_node_grants: fn() {
+      actor.call(store_actor, call_timeout_ms, ListNodeGrants)
+    },
+    insert_node_grant: fn(grant) {
+      actor.call(store_actor, call_timeout_ms, fn(reply) {
+        InsertNodeGrant(grant, reply)
+      })
+    },
+    touch_node_grant: fn(id) {
+      actor.call(store_actor, call_timeout_ms, fn(reply) {
+        TouchNodeGrant(id, reply)
+      })
+    },
+    delete_node_grant: fn(id) {
+      actor.call(store_actor, call_timeout_ms, fn(reply) {
+        DeleteNodeGrant(id, reply)
+      })
+    },
+    delete_expired_node_grants: fn() {
+      actor.call(store_actor, call_timeout_ms, DeleteExpiredNodeGrants)
     },
   )
 }
@@ -887,6 +914,50 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       process.send(reply, update(sql.delete_node(state.db, id)))
       actor.continue(state)
     }
+
+    ListNodeGrants(reply) -> {
+      let result =
+        sql.list_node_grants(state.db)
+        |> result.map(fn(returned) { returned.rows |> list.map(grant_from_row) })
+        |> result.map_error(query_error)
+      process.send(reply, result)
+      actor.continue(state)
+    }
+
+    InsertNodeGrant(grant, reply) -> {
+      let result =
+        sql.insert_node_grant(
+          state.db,
+          grant.id,
+          grant.code_hash,
+          // insert_node_grant.sql for the ''-sentinel rationale.
+          option.unwrap(grant.thread_id, ""),
+          int.to_float(grant.created_at),
+          int.to_float(grant.expires_at),
+          grant.use_count,
+          // The 0 sentinel: a fresh grant has never been exchanged.
+          option.unwrap(grant.last_used_at, 0),
+        )
+        |> result.map(fn(_) { Nil })
+        |> result.map_error(query_error)
+      process.send(reply, result)
+      actor.continue(state)
+    }
+
+    TouchNodeGrant(id, reply) -> {
+      process.send(reply, update(sql.touch_node_grant(state.db, id)))
+      actor.continue(state)
+    }
+
+    DeleteNodeGrant(id, reply) -> {
+      process.send(reply, update(sql.delete_node_grant(state.db, id)))
+      actor.continue(state)
+    }
+
+    DeleteExpiredNodeGrants(reply) -> {
+      process.send(reply, update(sql.delete_expired_node_grants(state.db)))
+      actor.continue(state)
+    }
   }
 }
 
@@ -1164,6 +1235,25 @@ fn node_from_row(
     token_hash: token_hash,
     created_at: created_s,
     last_seen_at: case last_seen_s {
+      0 -> option.None
+      stamp -> option.Some(stamp)
+    },
+  )
+}
+
+/// A stored grant row from the list select. `last_used_s = 0` is the
+/// same NULL sentinel as `node_from_row` (never exchanged) → `None`;
+/// `thread_id` is squirrel-decoded nullable text, passed through
+/// verbatim (NULL = the reserved future unpinned shape).
+fn grant_from_row(row: sql.ListNodeGrantsRow) -> store.StoredGrant {
+  node.Grant(
+    id: row.id,
+    code_hash: row.code_hash,
+    thread_id: row.thread_id,
+    created_at: row.created_s,
+    expires_at: row.expires_s,
+    use_count: row.use_count,
+    last_used_at: case row.last_used_s {
       0 -> option.None
       stamp -> option.Some(stamp)
     },

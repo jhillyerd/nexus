@@ -4,6 +4,12 @@
 //// and serves its machine as an environment target under a stable
 //// user-assigned name.
 ////
+//// The same module owns the PAIRING GRANT domain (docs/plans/
+//// tui-pairing.md): the short-lived, multi-use invite the web UI mints
+//// so a TUI host can exchange a code for a node credential WITHOUT the
+//// UI token. Same rules, same shapes — the code is hashed exactly like
+//// a token and answers exactly once, at mint.
+////
 //// Like `nexus/bot` this module never touches the network, the store,
 //// or an actor. The stored row carries NO secret material — only the
 //// token HASH — so the stored row and the public shape are ONE type
@@ -68,4 +74,68 @@ pub fn verify_token(token: String, stored_hash: String) -> Bool {
     }
     Error(_) -> False
   }
+}
+
+// ---------------------------------------------------------------------------
+// Pairing grants (docs/plans/tui-pairing.md)
+// ---------------------------------------------------------------------------
+
+/// A pairing grant's whole life: one hour, multi-use. Short enough that
+/// a leaked URL dies quickly; long enough to launch several TUIs from
+/// one mint (the review-locked decision — the code's ONLY job is
+/// minting node credentials, so the window is the exposure).
+pub const grant_ttl_s = 3600
+
+/// A stored pairing grant row — the whole entity, no secrets (the code
+/// HASH is public by nature, the plaintext never rests). `thread_id`
+/// pins the grant to the issuing thread (v1 mints always pin); NULL is
+/// the reserved future unpinned shape — door open, no extra work (the
+/// review-locked decision). `use_count` / `last_used_at` are info-pane
+/// diagnostics; there is no max_uses in v1.
+pub type Grant {
+  Grant(
+    id: String,
+    code_hash: String,
+    thread_id: Option(String),
+    created_at: Int,
+    expires_at: Int,
+    use_count: Int,
+    last_used_at: Option(Int),
+  )
+}
+
+/// Mint a fresh grant: the plaintext code (answered ONCE, at mint, to
+/// the web UI that displays the pairing URL — never stored) and its
+/// row (hash only). `now_s` is injected so the mint needs no clock of
+/// its own — offline-testable; callers pass `timing.wall_now_s()`.
+pub fn mint_grant(thread_id: Option(String), now_s: Int) -> #(String, Grant) {
+  // The code is a bearer credential equivalent (for one hour) to the
+  // UI token's minting authority: full 32 random bytes, URL-safe
+  // base64 — copy-paste carries it, nobody types it.
+  let code =
+    crypto.strong_random_bytes(32) |> bit_array.base64_url_encode(False)
+  let id =
+    crypto.strong_random_bytes(8)
+    |> bit_array.base16_encode
+    |> string.lowercase
+    |> fn(hex) { "g" <> hex }
+  #(
+    code,
+    Grant(
+      id: id,
+      code_hash: hash_token(code),
+      thread_id: thread_id,
+      created_at: now_s,
+      expires_at: now_s + grant_ttl_s,
+      use_count: 0,
+      last_used_at: option.None,
+    ),
+  )
+}
+
+/// Is this grant's window still open at `now_s`? The exchange's
+/// expiry arm — checked beside the constant-time code verify so
+/// expired and unknown codes answer identically (no oracle).
+pub fn grant_live(grant: Grant, now_s: Int) -> Bool {
+  now_s < grant.expires_at
 }

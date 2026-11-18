@@ -549,6 +549,10 @@ pub fn protected_route_matrix_test() {
   // /node/ws is NOT UI-token-guarded: it authenticates with its own
   // node token against the node table (pre-upgrade, plain statuses).
   web.requires_auth(Get, ["node", "ws"]) |> should.be_false
+  // The pairing exchange (tui-pairing plan) is likewise UNGUARDED: its
+  // auth is the pairing code — an unauthenticated mint of a node
+  // credential, answered as plain statuses (the /node/ws precedent).
+  web.requires_auth(Post, ["nodes", "pair"]) |> should.be_false
 }
 
 pub fn m3_page_hosts_server_component_test() {

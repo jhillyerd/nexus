@@ -6,10 +6,12 @@
 //// constraint. The pog-backed implementation is drift-gated in CI by
 //// `squirrel check`; these pin the seam's SEMANTICS, not the SQL.
 
+import gleam/list
 import gleam/option.{None, Some}
 import gleeunit/should
 import nexus/node
 import nexus/store
+import nexus/timing
 import store_mock
 
 fn row(id: String, name: String) -> store.StoredNode {
@@ -78,4 +80,103 @@ pub fn node_touch_and_revoke_test() {
   seam.delete_node("n1") |> should.be_ok
   seam.get_node_by_name("proxmox-2") |> should.be_error
   seam.list_nodes() |> should.equal(Ok([]))
+}
+
+// ---------------------------------------------------------------------------
+// Pairing grants (docs/plans/tui-pairing.md, Phase A)
+// ---------------------------------------------------------------------------
+
+pub fn grant_crud_roundtrip_test() {
+  let seam = store_mock.seam(store_mock.start())
+  // Unpinned: this test exercises row/touch/delete semantics, not the
+  // thread pin (the FK makes a pinned seed need a REAL thread — that
+  // round-trip is web_routes_test's, against a created thread; the
+  // refusal itself is grant_thread_fk_refused_test).
+  let #(code, grant) = node.mint_grant(None, 1_000_000)
+  seam.insert_node_grant(grant) |> should.be_ok
+
+  // Duplicate id errors (the pkey); codes are 256-bit random, so no
+  // unique hash index exists to model.
+  seam.insert_node_grant(grant) |> should.be_error
+
+  // The list round-trips the whole row — including the Option shapes
+  // (reserved unpinned thread, never-exchanged sentinel).
+  let assert Ok([row]) = seam.list_node_grants()
+  should.equal(row.id, grant.id)
+  should.equal(row.code_hash, node.hash_token(code))
+  should.equal(row.thread_id, None)
+  should.equal(row.use_count, 0)
+  should.equal(row.last_used_at, None)
+
+  // Touch: use_count is a server-side increment (never lost counts),
+  // last_used stamps; a MISSING id is a silent no-op (the SQL update
+  // shape — best-effort diagnostics, never an error).
+  seam.touch_node_grant("ghost") |> should.be_ok
+  let before = timing.wall_now_s()
+  seam.touch_node_grant(grant.id) |> should.be_ok
+  seam.touch_node_grant(grant.id) |> should.be_ok
+  let after = timing.wall_now_s()
+  let assert Ok([stamped]) = seam.list_node_grants()
+  should.equal(stamped.use_count, 2)
+  // The stamp is the CURRENT time, not any post-1970 value (cubic
+  // review): bounded by samples taken either side of the touches.
+  case stamped.last_used_at {
+    Some(at) -> {
+      should.be_true(at >= before)
+      should.be_true(at <= after)
+    }
+    None -> should.fail()
+  }
+
+  // Revoke: idempotent row delete, the node posture.
+  seam.delete_node_grant(grant.id) |> should.be_ok
+  seam.delete_node_grant(grant.id) |> should.be_ok
+  seam.list_node_grants() |> should.equal(Ok([]))
+}
+
+/// The boot sweep's semantics: `expires_at < now()` deletes. No
+/// exactly-at-boundary row here — the sweep samples the wall clock
+/// itself (inside the mock), so a boundary row would race the test's
+/// own `now` sample (cubic review); the exact window edge is pinned
+/// by the PURE grant_live_window_test in node_test instead.
+pub fn grant_expiry_sweep_test() {
+  let seam = store_mock.seam(store_mock.start())
+  let now = timing.wall_now_s()
+  let grant_at = fn(id: String, expires_at: Int) {
+    let #(_, grant) = node.mint_grant(None, expires_at - node.grant_ttl_s)
+    node.Grant(..grant, id: id, expires_at: expires_at)
+  }
+  seam.insert_node_grant(grant_at("g-old", now - 60)) |> should.be_ok
+  seam.insert_node_grant(grant_at("g-live", now + 60)) |> should.be_ok
+
+  seam.delete_expired_node_grants() |> should.be_ok
+
+  let assert Ok(rows) = seam.list_node_grants()
+  rows
+  |> list.map(fn(row) { row.id })
+  |> should.equal(["g-live"])
+}
+
+/// node_grant_thread_id_fkey (cubic review): the mock models it like
+/// the provider/bot FK checks above it — a pinned grant must reference
+/// a stored thread, so the offline seam agrees with production
+/// Postgres, which would refuse the same insert.
+pub fn grant_thread_fk_refused_test() {
+  let seam = store_mock.seam(store_mock.start())
+  let #(_, pinned) = node.mint_grant(Some("t-ghost"), 1_000_000)
+  seam.insert_node_grant(pinned) |> should.be_error
+  // The reserved unpinned shape stays insertable.
+  let #(_, unpinned) = node.mint_grant(None, 1_000_000)
+  seam.insert_node_grant(unpinned) |> should.be_ok
+}
+
+/// The ''-sentinel contract for the reserved unpinned shape: a NULL
+/// thread grant round-trips as None (squirrel decodes nullable text;
+/// the mock agrees — no drift between the two seams).
+pub fn grant_unpinned_thread_roundtrip_test() {
+  let seam = store_mock.seam(store_mock.start())
+  let #(_, grant) = node.mint_grant(None, 1_000_000)
+  seam.insert_node_grant(grant) |> should.be_ok
+  let assert Ok([row]) = seam.list_node_grants()
+  should.equal(row.thread_id, None)
 }

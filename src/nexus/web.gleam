@@ -153,6 +153,11 @@ pub fn handler(
       Get, ["nodes"] -> protected(cfg, req, fn() { nodes_response(store) })
       Post, ["nodes"] ->
         protected(cfg, req, fn() { create_node_response(req, store) })
+      // The pairing exchange (tui-pairing plan Phase A): PUBLIC — its
+      // auth is the pairing code itself (the /node/ws precedent: a
+      // TUI host is not a browser and holds no UI token). It mints a
+      // node credential and answers the grant's pinned thread.
+      Post, ["nodes", "pair"] -> node_pair_response(req, store)
       Delete, ["nodes", id] ->
         protected(cfg, req, fn() { delete_node_response(store, id) })
       _, _ -> json_response(404, err_json("not found"))
@@ -1301,6 +1306,23 @@ pub fn parse_node_create_json(body: String) -> Result(NodeCreateFields, Nil) {
   |> result.map_error(fn(_) { Nil })
 }
 
+/// The POST /nodes/pair body: `{"code": …, "name": …}` — a TUI host
+/// redeeming a pairing code for its node credential.
+pub type NodePairFields {
+  NodePairFields(code: String, name: String)
+}
+
+pub fn node_pair_fields_decoder() -> decode.Decoder(NodePairFields) {
+  use code <- decode.field("code", decode.string)
+  use name <- decode.field("name", decode.string)
+  decode.success(NodePairFields(code:, name:))
+}
+
+pub fn parse_node_pair_json(body: String) -> Result(NodePairFields, Nil) {
+  json.parse(body, using: node_pair_fields_decoder())
+  |> result.map_error(fn(_) { Nil })
+}
+
 fn read_node_create(
   req: Request(mist.Connection),
 ) -> Result(NodeCreateFields, Nil) {
@@ -1310,6 +1332,23 @@ fn read_node_create(
       case bit_array.to_string(read.body) {
         Error(_) -> Error(Nil)
         Ok(body) -> parse_node_create_json(body)
+      }
+  }
+}
+
+fn read_node_pair(
+  req: Request(mist.Connection),
+) -> Result(NodePairFields, Nil) {
+  // A redemption body is ~100 bytes (43-char code + name). The admin
+  // route's 1 MB headroom buys nothing on a PUBLIC route — cap tight
+  // so an unauthenticated caller cannot make the server buffer (then
+  // per-grant hash) megabytes of junk code (cubic review).
+  case mist.read_body(req, max_body_limit: 4096) {
+    Error(_) -> Error(Nil)
+    Ok(read) ->
+      case bit_array.to_string(read.body) {
+        Error(_) -> Error(Nil)
+        Ok(body) -> parse_node_pair_json(body)
       }
   }
 }
@@ -1351,28 +1390,58 @@ fn create_node_response(
       case node.valid_name(fields.name) {
         Error(reason) -> json_response(400, err_json(reason))
         Ok(name) ->
-          // Uniqueness pre-check against the loaded rows (the bot
-          // registry's pattern): the seam's single-error type cannot
-          // distinguish "missing" from "store down", but `list_nodes`
-          // answers unambiguously — the schema's UNIQUE is the
-          // cross-instance backstop either way.
-          case store.list_nodes() {
-            Error(_) -> json_response(502, err_json("store unavailable"))
-            Ok(rows) ->
-              case list.find(rows, fn(row) { row.name == name }) {
-                Ok(_) ->
-                  json_response(409, err_json("node name is already paired"))
-                Error(_) -> create_node_row(store, name)
+          case node_name_free(store, name) {
+            Error(resp) -> resp
+            Ok(Nil) ->
+              case mint_node(store, name) {
+                Error(resp) -> resp
+                Ok(#(token, row)) ->
+                  json_response(
+                    201,
+                    json.object([
+                      #("id", json.string(row.id)),
+                      #("name", json.string(row.name)),
+                      // The plaintext answers ONCE, here — the stored
+                      // row carries only the hash, and no later route
+                      // can recover it.
+                      #("token", json.string(token)),
+                      #("created_at", json.int(row.created_at)),
+                    ]),
+                  )
               }
           }
       }
   }
 }
 
-fn create_node_row(
+/// The friendly duplicate-name pre-check shared by both mint routes
+/// (the bot registry's pattern): the seam's single-error type cannot
+/// distinguish "missing" from "store down", but `list_nodes` answers
+/// unambiguously — the schema's UNIQUE is the cross-instance backstop
+/// either way.
+fn node_name_free(
   store: store.Store,
   name: String,
-) -> Response(mist.ResponseData) {
+) -> Result(Nil, Response(mist.ResponseData)) {
+  case store.list_nodes() {
+    Error(_) -> Error(json_response(502, err_json("store unavailable")))
+    Ok(rows) ->
+      case list.find(rows, fn(row) { row.name == name }) {
+        Ok(_) ->
+          Error(json_response(409, err_json("node name is already paired")))
+        Error(_) -> Ok(Nil)
+      }
+  }
+}
+
+/// Mint a node row + its one-time plaintext token — the ONE mint path,
+/// shared by the UI-token `POST /nodes` and the public pairing
+/// exchange, so the two can never drift. Errors are the ready-made
+/// responses the routes answer verbatim.
+fn mint_node(
+  store: store.Store,
+  name: String,
+) -> Result(#(String, store.StoredNode), Response(mist.ResponseData)) {
   let token =
     crypto.strong_random_bytes(32)
     |> bit_array.base64_url_encode(False)
@@ -1390,22 +1459,99 @@ fn create_node_row(
       last_seen_at: option.None,
     )
   case store.insert_node(row) {
-    Ok(Nil) ->
-      json_response(
-        201,
-        json.object([
-          #("id", json.string(row.id)),
-          #("name", json.string(row.name)),
-          // The plaintext answers ONCE, here — the stored row carries
-          // only the hash, and no later route can recover it.
-          #("token", json.string(token)),
-          #("created_at", json.int(row.created_at)),
-        ]),
-      )
+    Ok(Nil) -> Ok(#(token, row))
     Error(_) -> {
       let #(status, message) = node_insert_failure(store.list_nodes(), name)
-      json_response(status, err_json(message))
+      Error(json_response(status, err_json(message)))
     }
+  }
+}
+
+/// Find the live grant a presented code redeems: constant-time verify
+/// per row (the node-token discipline — grants are few, one-hour
+/// rows), with the expiry check beside it so EXPIRED, REVOKED, and
+/// UNKNOWN codes answer one merged 404: the exchange must not become
+/// a code oracle.
+fn find_live_grant(
+  store: store.Store,
+  code: String,
+  now_s: Int,
+) -> Result(store.StoredGrant, Response(mist.ResponseData)) {
+  case store.list_node_grants() {
+    Error(_) -> Error(json_response(502, err_json("store unavailable")))
+    Ok(rows) ->
+      case
+        list.find(rows, fn(grant) {
+          node.grant_live(grant, now_s)
+          && node.verify_token(code, grant.code_hash)
+        })
+      {
+        Ok(grant) -> Ok(grant)
+        Error(_) ->
+          Error(json_response(404, err_json("unknown or expired pairing code")))
+      }
+  }
+}
+
+/// The PUBLIC exchange (tui-pairing plan Phase A): a TUI host redeems
+/// a pairing code for a node credential plus the grant's pinned
+/// thread_id — the host needs no UI token and no thread knowledge.
+/// Multi-use by design: every exchange mints a NEW node row (several
+/// hosts from one URL) and bumps the grant's diagnostics. A code must
+/// NEVER authorize taking over an existing name — a grant mints new
+/// nodes, nothing else — so the name pre-check/409 path is the same as
+/// the admin route's.
+fn node_pair_response(
+  req: Request(mist.Connection),
+  store: store.Store,
+) -> Response(mist.ResponseData) {
+  case read_node_pair(req) {
+    Error(_) -> json_response(400, err_json("unreadable body"))
+    Ok(fields) ->
+      // The name gate runs BEFORE the code check — the ordering is
+      // load-bearing: with the code first, an invalid-name probe
+      // distinguishes a live code (400, name check reached) from a
+      // bogus one (404, short-circuit) — exactly the oracle the
+      // merged 404 exists to prevent. Name-first, an invalid name
+      // answers 400 unconditionally, and code state shows only through
+      // an otherwise-valid redemption: free name → 201/404, taken name
+      // → 409. The collision check deliberately stays AFTER the code
+      // check — the reverse order would let an anonymous caller
+      // enumerate node names with a garbage code (409 taken vs 404
+      // free).
+      case node.valid_name(fields.name) {
+        Error(reason) -> json_response(400, err_json(reason))
+        Ok(name) ->
+          case find_live_grant(store, fields.code, timing.wall_now_s()) {
+            Error(resp) -> resp
+            Ok(grant) ->
+              case node_name_free(store, name) {
+                Error(resp) -> resp
+                Ok(Nil) ->
+                  case mint_node(store, name) {
+                    Error(resp) -> resp
+                    Ok(#(token, row)) -> {
+                      // Best-effort diagnostics (the touch_node rule):
+                      // use_count + last_used_at for the info pane.
+                      let _ = store.touch_node_grant(grant.id)
+                      json_response(
+                        201,
+                        json.object([
+                          #("id", json.string(row.id)),
+                          #("name", json.string(row.name)),
+                          #("token", json.string(token)),
+                          #("thread_id", case grant.thread_id {
+                            Some(id) -> json.string(id)
+                            None -> json.null()
+                          }),
+                          #("created_at", json.int(row.created_at)),
+                        ]),
+                      )
+                    }
+                  }
+              }
+          }
+      }
   }
 }
 
@@ -1862,6 +2008,9 @@ pub fn requires_auth(method: Method, segments: List(String)) -> Bool {
     // `GET /node/ws` is deliberately ABSENT: it carries its own
     // NODE-token auth against the `node` table (a node is not a
     // browser), answered pre-upgrade as plain HTTP statuses.
+    // `POST /nodes/pair` is likewise ABSENT (tui-pairing plan): its
+    // auth is the pairing CODE — an unauthenticated mint of a node
+    // credential, answered as plain statuses.
     _, _ -> False
   }
 }
