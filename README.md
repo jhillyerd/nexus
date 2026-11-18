@@ -405,20 +405,40 @@ by executing the four env tools LOCALLY, in its own workspace
 directory, through the same code the server runs for its own workspace
 (kill-tree, byte caps while reading, path confinement included).
 
-Pair a node and launch the TUI against one env-toolset thread with the
-bundled launcher — it derives the node name from the machine's
-hostname, replaces any stale row under that name, pairs fresh (the
-minted token lives only in the launcher's memory), and execs the TUI:
+Pair a node and launch the TUI with the bundled launcher: mint a
+pairing URL in the web UI (open the thread's info pane → Environments
+→ "Pair a TUI…"), then run the launcher with it once — it exchanges
+the code for a node credential pinned to that thread (no UI token, no
+thread id needed), persists the credential in a `0600` state file
+under `${XDG_STATE_HOME:-$HOME/.local/state}/nexus/`, and launches
+the TUI:
 
 ```sh
-NEXUS_URL=http://127.0.0.1:8080 \
-NEXUS_UI_TOKEN="$NEXUS_UI_TOKEN" \
-NEXUS_THREAD='<thread id>' \
-bin/nexus-tui
+bin/nexus-tui http://127.0.0.1:8080/pair/<code>   # first launch on a host
+bin/nexus-tui                                     # relaunch — stored credential
+bin/nexus-tui --reset                             # forget the stored credential
 ```
 
-Manually, the same dance is (delete the stale row first — a re-pair
-mints a fresh token, and rerunning without the delete is a 409):
+Relaunches reconnect with the stored token — no re-pairing — so a
+crash or closed terminal no longer loses the pairing, and the same
+node row (and its identity) survives. If the stored credential is
+ever rejected (the node row was revoked, or swept by idle expiry),
+the TUI exits 4: with a pairing URL the launcher re-pairs and tries
+once more; without one it exits 4 with "credential rejected — pair
+again". The pairing code never rests anywhere: the launcher does not
+persist the URL (the state file stores only the server base, node
+name, token, and thread), the server stores the code only as a hash,
+and the grant itself stays redeemable — by anyone holding the URL —
+until it expires or is revoked. Two hosts can pair from one URL
+(grants are multi-use for their one-hour life) — each under its own
+`NEXUS_NODE` name, since names are unique and a second exchange under
+a taken name 409s (hosts sharing a short hostname must override the
+default). Two threads on one host work the same way: distinct
+`NEXUS_NODE` names, each with its own state file.
+
+Manually, the analogous dance through the raw API (UI-token pairing
+stays available to scripts — delete the stale row first, since a
+re-pair over a live name is a 409):
 
 ```sh
 UI="Authorization: Bearer $NEXUS_UI_TOKEN"
@@ -441,9 +461,13 @@ gleam run -m nexus/tui
 Optional: `NEXUS_ROLE=viewer` (events + send, no tool plane; default
 `env`), `NEXUS_NODE_WORKSPACE=<dir>` (default `./node-workspace`), and
 the shared knobs `NEXUS_ENV_TIMEOUT_MS` / `NEXUS_ENV_MAX_OUTPUT_BYTES`
-(same floors as the server). Type a line to send it; `/quit` (or stdin
-EOF) leaves cleanly. It is a REPL: output arriving while you type
-interleaves with the half-typed line, and there is no input history.
+(same floors as the server). The launcher honors `NEXUS_NODE` (node
+name), `NEXUS_THREAD` (join a different thread than the grant's), and
+`NEXUS_PAIR_URL` (the env form of the pairing URL); `NEXUS_URL` only
+disambiguates when several servers hold stored credentials under the
+same node name. Type a line to send it; `/quit` (or stdin EOF) leaves
+cleanly. It is a REPL: output arriving while you type interleaves
+with the half-typed line, and there is no input history.
 
 ## Audit tool
 

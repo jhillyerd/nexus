@@ -2,40 +2,76 @@
 #
 # nexus-tui — pair THIS machine as a nexus node and launch the node TUI.
 #
-# The (short) hostname is the node name. Any existing row under that
-# name is deleted first: a re-pair mints a fresh token, and old tokens
-# stop working the moment their row is gone (revocation is a row
-# delete — a live connection survives until it disconnects, but
-# reconnects fail). The minted token lives only in this process's
-# memory: never echoed, never written to disk.
+# The caller hands the launcher a web-minted PAIRING URL (thread info
+# pane → "Pair a TUI…") instead of the UI token and a thread id; the
+# exchanged node token is persisted in a 0600 state file, so relaunches
+# reconnect without re-pairing and a crash or closed terminal no longer
+# loses the pairing (tui-pairing plan Phase B — the old
+# delete-stale-row-then-re-pair-every-launch behavior is gone).
 #
-# Required env:
-#   NEXUS_URL       server base URL, e.g. http://boss.home.arpa:8080
-#   NEXUS_THREAD    thread id to join (an env-toolset thread for role=env)
-# Optional env:
-#   NEXUS_UI_TOKEN  the server's UI token — OMIT it entirely when the
-#                   server itself runs without auth (its NEXUS_UI_TOKEN
-#                   unset): the pairing API then needs no header
-#   NEXUS_NODE      node name override (default: short hostname)
+# Usage:
+#   nexus-tui <pair-url>        first launch on a host — exchange the
+#                               code, persist the credential, connect
+#   nexus-tui                   relaunch — stored credential, no pairing
+#   nexus-tui --reset           forget the stored credential(s)
+#   NEXUS_PAIR_URL=<url>        env form of the pair-url argument
+#
+# Overrides (win over the grant's / stored values):
+#   NEXUS_NODE      node name (default: short hostname)
 #   NEXUS_ROLE      env (default) | viewer
+#   NEXUS_THREAD    join a different thread than the grant's
+#   NEXUS_URL       disambiguator when several servers hold stored
+#                   credentials under the same node name
+#
+# State: ${XDG_STATE_HOME:-$HOME/.local/state}/nexus/tui-<server>-<node>.json
+# (mode 0600), {server, node, token, thread}. `server` is the BASE URL —
+# the pairing code never rests anywhere (it dies at the exchange).
+#
+# Launch logic: stored credential first (a pairing URL stays unused
+# unless the stored credential is rejected — reconnecting keeps the
+# same node row). The TUI's WS upgrade answering 401 (row revoked or
+# swept) exits 4: with a pair-url the launcher re-pairs and tries once
+# more; without one it surfaces "credential rejected — pair again".
+#
+# Exit codes: 0 ok, 1 exchange/error, 2 usage/config, 4 credential
+# rejected (the TUI's own signal; also the bare-relaunch answer).
 #
 # Requires curl, jq, and gleam. Run from anywhere inside the repo
 # (the script cds to the repo root for `gleam run`).
 
 set -euo pipefail
 
-: "${NEXUS_URL:?NEXUS_URL is required, e.g. http://boss.home.arpa:8080}"
-: "${NEXUS_THREAD:?NEXUS_THREAD is required — a thread id, env-toolset for role=env}"
+STATE_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/nexus"
 
-# The UI token is OPTIONAL: the server explicitly supports running
-# without auth (its own NEXUS_UI_TOKEN unset), and then the pairing
-# API answers without any Authorization header (cubic PR review).
-AUTH=()
-if [ -n "${NEXUS_UI_TOKEN:-}" ]; then
-  AUTH=(-H "Authorization: Bearer $NEXUS_UI_TOKEN")
-fi
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
 
-BASE="${NEXUS_URL%/}"
+usage() {
+  cat <<'EOF'
+usage: nexus-tui <pair-url>   # first launch: exchange + persist + connect
+       nexus-tui              # relaunch with the stored credential
+       nexus-tui --reset      # forget the stored credential(s)
+
+A pairing URL is minted in the web UI: open a thread's info pane →
+Environments → "Pair a TUI…", and copy the http://…/pair/<code> link.
+Without a stored credential and without a pairing URL there is nothing
+to connect with.
+
+Overrides: NEXUS_NODE, NEXUS_ROLE, NEXUS_THREAD, NEXUS_PAIR_URL
+(and NEXUS_URL to disambiguate several stored servers).
+EOF
+}
+
+for tool in curl jq gleam; do
+  command -v "$tool" >/dev/null || { echo "error: $tool is required" >&2; exit 1; }
+done
+
+# ---------------------------------------------------------------------------
+# Node name (the roster target): NEXUS_NODE or the short hostname
+# ---------------------------------------------------------------------------
+
 NODE="${NEXUS_NODE:-$(hostname -s 2>/dev/null || hostname | cut -d. -f1)}"
 NODE=$(printf '%s' "$NODE" | tr '[:upper:]' '[:lower:]')
 
@@ -50,43 +86,273 @@ case "$NODE" in
     ;;
 esac
 
-for tool in curl jq gleam; do
-  command -v "$tool" >/dev/null || { echo "error: $tool is required" >&2; exit 1; }
+# ---------------------------------------------------------------------------
+# Pairing URL → base URL + code (the code is the LAST path segment; the
+# base is everything before /pair/)
+# ---------------------------------------------------------------------------
+
+BASE=""
+CODE=""
+resolve_pair_url() {
+  local url="$1"
+  case "$url" in
+    http://* | https://*) ;;
+    *) die "pairing url must start with http:// or https://: $url" ;;
+  esac
+  CODE=$(printf '%s' "$url" | sed -E 's#.*/pair/([^/?#]*).*#\1#')
+  BASE=$(printf '%s' "$url" | sed -E 's#^(https?://[^/]+).*/pair/.*#\1#')
+  case "$CODE" in
+    "" | */*) die "pairing url must carry a /pair/<code> path: $url" ;;
+  esac
+  case "$BASE" in
+    http://* | https://*) ;;
+    *) die "pairing url must include the server origin: $url" ;;
+  esac
+  BASE="${BASE%/}"
+}
+
+# ---------------------------------------------------------------------------
+# State file: keyed per (server base, node name)
+# ---------------------------------------------------------------------------
+
+state_key() {  # <base-url> — the authority, filename-safe
+  printf '%s' "$1" | sed -E 's#^https?://##; s#/.*$##' | tr -c 'a-zA-Z0-9._-' '-' | sed 's#-$##'
+}
+
+state_path() {  # <base-url> <node>
+  printf '%s/tui-%s-%s.json' "$STATE_ROOT" "$(state_key "$1")" "$2"
+}
+
+load_state() {  # <file> → S_SERVER S_NODE S_TOKEN S_THREAD (non-empty)
+  local file="$1" line
+  [ -f "$file" ] || return 1
+  # A plain read loop, not mapfile: macOS's /bin/bash 3.2 has no
+  # mapfile (bash >= 4), and the old launcher ran there.
+  local -a fields=()
+  while IFS= read -r line; do
+    fields+=("$line")
+  done < <(jq -r '[(.server // ""), (.node // ""), (.token // ""), (.thread // "")][]' "$file" 2>/dev/null)
+  [ "${#fields[@]}" -eq 4 ] || return 1
+  S_SERVER="${fields[0]}"
+  S_NODE="${fields[1]}"
+  S_TOKEN="${fields[2]}"
+  S_THREAD="${fields[3]}"
+  [ -n "$S_SERVER" ] && [ -n "$S_TOKEN" ] && [ -n "$S_THREAD" ]
+}
+
+# Find this node's stored credential. With a base given, only the
+# matching server's file qualifies; without one, a single match is
+# taken and several are listed for the caller to disambiguate.
+pick_state() {  # <node> <base-or-empty>
+  local node="$1" base="${2:-}" f
+  local -a matches=()
+  for f in "$STATE_ROOT"/tui-*.json; do
+    [ -f "$f" ] || continue
+    [ "$(jq -r '.node // ""' "$f" 2>/dev/null)" = "$node" ] || continue
+    if [ -n "$base" ] && [ "$(jq -r '.server // ""' "$f" 2>/dev/null)" != "$base" ]; then
+      continue
+    fi
+    matches+=("$f")
+  done
+  case "${#matches[@]}" in
+    0) STATE_FILE="" ;;
+    1) STATE_FILE="${matches[0]}" ;;
+    *)
+      local m
+      echo "error: several stored credentials for node '$node':" >&2
+      for m in "${matches[@]}"; do
+        echo "  $m (server $(jq -r '.server // "?"' "$m" 2>/dev/null))" >&2
+      done
+      echo "relaunch with its pairing URL, or set NEXUS_URL to pick the server" >&2
+      exit 2
+      ;;
+  esac
+}
+
+save_state() {  # <base> <node> <token> <thread> <file>
+  local file="$5"
+  mkdir -p "$(dirname "$file")"
+  chmod 700 "$(dirname "$file")" 2>/dev/null || true
+  local tmp="$file.tmp"
+  # Tighten the umask ONLY for the write (the plaintext token must not
+  # rest world-readable even between create and chmod), then restore —
+  # the shell's umask is inherited by the TUI the launcher goes on to
+  # run, and its workspace files are ordinary files.
+  local old_umask
+  old_umask=$(umask)
+  umask 177
+  jq -n --arg server "$1" --arg node "$2" --arg token "$3" --arg thread "$4" \
+    '{server: $server, node: $node, token: $token, thread: $thread}' >"$tmp"
+  umask "$old_umask"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$file"
+}
+
+reset_state() {  # <node> — forget every stored credential under the name
+  local f removed=0
+  for f in "$STATE_ROOT"/tui-*.json; do
+    [ -f "$f" ] || continue
+    [ "$(jq -r '.node // ""' "$f" 2>/dev/null)" = "$1" ] || continue
+    rm -f "$f"
+    echo "forgot stored credential $f"
+    removed=1
+  done
+  [ "$removed" = 1 ] || echo "no stored credential for node '$1'"
+}
+
+# ---------------------------------------------------------------------------
+# The exchange: POST /nodes/pair (public — its auth is the code itself)
+# ---------------------------------------------------------------------------
+
+PAIRED_TOKEN=""
+PAIRED_THREAD=""
+
+exchange() {  # <base> <code> <node>
+  local base="$1" code="$2" node="$3"
+  local nl body status
+  nl=$'\n'
+  local payload
+  payload=$(jq -n --arg code "$code" --arg name "$node" '{code: $code, name: $name}')
+  if ! body=$(curl -s -w "$nl%{http_code}" -X POST \
+    -H 'content-type: application/json' \
+    -d "$payload" "$base/nodes/pair"); then
+    die "cannot reach $base"
+  fi
+  status=${body##*"$nl"}
+  body=${body%%"$nl"*}
+  case "$status" in
+    201)
+      PAIRED_TOKEN=$(printf '%s' "$body" | jq -r '.token // ""')
+      PAIRED_THREAD=$(printf '%s' "$body" | jq -r '.thread_id // ""')
+      [ -n "$PAIRED_TOKEN" ] || die "exchange response carried no token"
+      ;;
+    409)
+      # The name is taken by a LIVE row (a lost state file's usual
+      # face): revoke it in the thread info pane (Environments section)
+      # or via the /nodes API, then pair again.
+      echo "error: node name '$node' is already paired — revoke it in the thread info pane (Environments) or via DELETE /nodes, then retry" >&2
+      exit 1
+      ;;
+    404)
+      echo "error: pairing code rejected (unknown, expired, or revoked) — mint a fresh pairing URL in the web UI" >&2
+      exit 1
+      ;;
+    *)
+      die "exchange failed (HTTP $status): $body"
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Launch: the TUI reads its own env; the script stays wrapping so a 401
+# (exit 4) can trigger the re-pair path. Exit codes propagate.
+# ---------------------------------------------------------------------------
+
+launch_tui() {  # <base> <token> <thread>
+  cd "$(dirname "$0")/.."
+  local rc=0
+  env \
+    NEXUS_URL="$1" \
+    NEXUS_NODE="$NODE" \
+    NEXUS_NODE_TOKEN="$2" \
+    NEXUS_THREAD="$3" \
+    gleam run -m nexus/tui || rc=$?
+  return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+PAIR_URL="${NEXUS_PAIR_URL:-}"
+DO_RESET=0
+for arg in "$@"; do
+  case "$arg" in
+    --reset) DO_RESET=1 ;;
+    -h | --help) usage; exit 0 ;;
+    http://* | https://*) PAIR_URL="$arg" ;;
+    *)
+      echo "error: unknown argument: $arg (see --help)" >&2
+      exit 2
+      ;;
+  esac
 done
 
-# Replace any stale row under this name — the whole point of re-running
-# is a fresh pairing every launch.
-ids=$(curl -sf "${AUTH[@]}" "$BASE/nodes" \
-      | jq -r --arg n "$NODE" '.nodes[]? | select(.name == $n) | .id' || true)
-for id in $ids; do
-  curl -sf -X DELETE "${AUTH[@]}" "$BASE/nodes/$id" >/dev/null
-  echo "replaced stale node row '$NODE' ($id)"
-done
-
-# Pair fresh: the plaintext token answers exactly once (201).
-nl=$'\n'
-response=$(curl -s -w "$nl%{http_code}" -X POST "${AUTH[@]}" \
-                -H 'content-type: application/json' \
-                -d "{\"name\":\"$NODE\"}" "$BASE/nodes")
-code=${response##*"$nl"}
-body=${response%%"$nl"*}
-if [ "$code" != "201" ]; then
-  echo "error: pairing failed (HTTP $code): $body" >&2
-  exit 1
+if [ "$DO_RESET" = 1 ]; then
+  reset_state "$NODE"
+  exit 0
 fi
-token=$(printf '%s' "$body" | jq -r '.token')
-if [ -z "$token" ] || [ "$token" = "null" ]; then
-  echo "error: pairing response carried no token" >&2
-  exit 1
-fi
-echo "paired as '$NODE'"
 
-# The TUI reads its own env; exec replaces the shell (Ctrl-C handling
-# stays with the TUI) and NEXUS_ROLE etc. pass through untouched.
-cd "$(dirname "$0")/.."
-exec env \
-  NEXUS_URL="$BASE" \
-  NEXUS_NODE="$NODE" \
-  NEXUS_NODE_TOKEN="$token" \
-  NEXUS_THREAD="$NEXUS_THREAD" \
-  gleam run -m nexus/tui
+if [ -n "$PAIR_URL" ]; then
+  resolve_pair_url "$PAIR_URL"
+elif [ -n "${NEXUS_URL:-}" ]; then
+  # No pairing URL: NEXUS_URL narrows the state lookup to one server
+  # (the disambiguator the several-matches error names). It never
+  # mints anything — without a code there is nothing to exchange.
+  BASE="${NEXUS_URL%/}"
+  case "$BASE" in
+    http://* | https://*) ;;
+    *) die "NEXUS_URL must start with http:// or https://: $BASE" ;;
+  esac
+fi
+
+# ---------------------------------------------------------------------------
+# The flows
+# ---------------------------------------------------------------------------
+
+# Locate the stored credential (if any) and load it.
+STATE_FILE=""
+if [ -n "$BASE" ]; then
+  pick_state "$NODE" "$BASE"
+else
+  pick_state "$NODE" ""
+fi
+HAVE_STATE=0
+if [ -n "$STATE_FILE" ] && load_state "$STATE_FILE"; then
+  HAVE_STATE=1
+fi
+
+if [ "$HAVE_STATE" = 1 ]; then
+  # Stored credential first; a handed-over pairing URL stays unused
+  # unless the credential is rejected — reconnecting keeps the same
+  # node row (replace-on-reconnect under the same name).
+  rc=0
+  launch_tui "$S_SERVER" "$S_TOKEN" "${NEXUS_THREAD:-$S_THREAD}" || rc=$?
+  if [ "$rc" != 4 ]; then
+    exit "$rc"
+  fi
+  if [ -z "$CODE" ]; then
+    echo "credential rejected — pair again (mint a pairing URL in the thread info pane: Environments → Pair a TUI…)" >&2
+    exit 4
+  fi
+  echo "stored credential rejected — re-pairing from the pairing URL"
+  exchange "$BASE" "$CODE" "$NODE"
+  THREAD="${NEXUS_THREAD:-$PAIRED_THREAD}"
+  if [ -z "$THREAD" ]; then
+    die "the grant carries no thread id — mint pairing URLs from a thread's info pane (Environments section)"
+  fi
+  STATE_FILE="$(state_path "$BASE" "$NODE")"
+  save_state "$BASE" "$NODE" "$PAIRED_TOKEN" "$THREAD" "$STATE_FILE"
+  echo "paired as '$NODE' (state: $STATE_FILE)"
+  launch_tui "$BASE" "$PAIRED_TOKEN" "$THREAD"
+  exit $?
+fi
+
+# No stored credential.
+if [ -z "$CODE" ]; then
+  echo "no stored credential for node '$NODE' and no pairing URL given" >&2
+  echo >&2
+  usage
+  exit 2
+fi
+
+exchange "$BASE" "$CODE" "$NODE"
+THREAD="${NEXUS_THREAD:-$PAIRED_THREAD}"
+if [ -z "$THREAD" ]; then
+  die "the grant carries no thread id — mint pairing URLs from a thread's info pane (Environments section)"
+fi
+STATE_FILE="$(state_path "$BASE" "$NODE")"
+save_state "$BASE" "$NODE" "$PAIRED_TOKEN" "$THREAD" "$STATE_FILE"
+echo "paired as '$NODE' (state: $STATE_FILE)"
+launch_tui "$BASE" "$PAIRED_TOKEN" "$THREAD"
+exit $?

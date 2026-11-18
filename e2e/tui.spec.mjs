@@ -15,6 +15,13 @@
 //   3. stdin EOF is a graceful /quit: the process exits 0 and the
 //      queued detach line lands behind the turn.
 //
+// Plus (tui-pairing plan Phase B) the bin/nexus-tui LAUNCHER: grants
+// seeded straight into the store (there is deliberately no HTTP mint
+// route — the web UI mints them, Phase C), then the whole credential
+// life against a second node name — exchange → 0600 state file →
+// stored-credential relaunch (same node row, replay) → revoked
+// credential refuses with exit 4 → a fresh pairing URL re-pairs.
+//
 // Same loopback posture as node.spec.mjs: fake OpenAI SSE provider
 // scripting the env-tool turn (`case:nodebash`), Postgres on loopback,
 // no Playwright, no network beyond loopback.
@@ -26,7 +33,8 @@
 // Writes e2e/tui-report.json; exits non-zero on any failure.
 
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:http";
@@ -34,6 +42,7 @@ import { createServer } from "node:http";
 const ROOT = new URL("..", import.meta.url).pathname;
 const TOKEN = "smoke-token-tui-" + Date.now();
 const NODE_NAME = "tui-node";
+const PAIR_NODE = "tui-pair-node";
 const PORT = 18091;
 const BASE = `http://127.0.0.1:${PORT}`;
 const ENC_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
@@ -339,11 +348,129 @@ function startTui(thread, nodeToken, workspace) {
 }
 
 // ---------------------------------------------------------------------------
+// Phase B under test: the bin/nexus-tui launcher (pairing URL → 0600
+// state file → stored-credential relaunch → re-pair), tui-pairing plan.
+// ---------------------------------------------------------------------------
+
+function sha256hex(text) {
+  return createHash("sha256").update(text).digest("hex");
+}
+
+/// Grants enter the store directly (psql): the exchange's own auth is
+/// the code, and no HTTP mint route exists by design — the web UI
+/// mints through the server component (Phase C). The hash is the
+/// node.hash_token discipline: hex SHA-256 of the plaintext code.
+function seedGrant(code, threadId) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      "psql",
+      [
+        "-q",
+        DATABASE_URL,
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-c",
+        `insert into node_grant (id, code_hash, thread_id, created_at, expires_at) ` +
+          `values ('g-e2e-${sha256hex(code).slice(0, 8)}', '${sha256hex(code)}', ` +
+          `'${threadId}', now(), now() + interval '1 hour');`,
+      ],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let out = "";
+    child.stdout.on("data", (d) => (out += d));
+    child.stderr.on("data", (d) => (out += d));
+    child.on("error", (err) => reject(new Error(`psql not found (${err.message})`)));
+    child.on("exit", (code_) =>
+      code_ === 0 ? resolve() : reject(new Error(`grant seed failed (${code_}):\n${out}`)),
+    );
+  });
+}
+
+/// The launcher's own keying: authority (host:port), filename-safe,
+/// inside <XDG_STATE_HOME>/nexus — mirrored from bin/nexus-tui.
+function stateFileFor(stateHome, base, node) {
+  const authority = base.replace(/^https?:\/\//, "").split("/")[0];
+  const key = authority.replace(/[^a-zA-Z0-9._-]/g, "-");
+  return join(stateHome, "nexus", `tui-${key}-${node}.json`);
+}
+
+function startLauncher({ stateHome, args = [], pairUrlEnv = null }) {
+  // The point of Phase B: NO NEXUS_URL, NEXUS_UI_TOKEN, or NEXUS_THREAD —
+  // the pairing URL (arg or NEXUS_PAIR_URL) and then the state file
+  // carry the server, token, and thread.
+  const env = {
+    ...process.env,
+    NEXUS_NODE: PAIR_NODE,
+    XDG_STATE_HOME: stateHome,
+    NEXUS_NODE_WORKSPACE: pairWorkspace,
+  };
+  if (pairUrlEnv) env.NEXUS_PAIR_URL = pairUrlEnv;
+  const child = spawn(join(ROOT, "bin", "nexus-tui"), args, {
+    cwd: ROOT,
+    env,
+    stdio: ["pipe", "pipe", "pipe"],
+    detached: true,
+  });
+  const out = [];
+  const errOut = [];
+  child.stdout.on("data", (d) => out.push(d.toString()));
+  child.stderr.on("data", (d) => errOut.push(d.toString()));
+  return {
+    child,
+    stdout: () => out.join(""),
+    stderr: () => errOut.join(""),
+    quit: () => {
+      child.stdin.write("/quit\n");
+      child.stdin.end();
+    },
+    waitExit: () =>
+      new Promise((resolve, reject) => {
+        const timer = setTimeout(
+          () =>
+            reject(
+              new Error(
+                `launcher did not exit (stdout: ${out.join("")} stderr: ${errOut.join("")})`,
+              ),
+            ),
+          60_000,
+        );
+        child.on("exit", (code) => {
+          clearTimeout(timer);
+          resolve(code);
+        });
+      }),
+    /// Simulate a crash / closed terminal: SIGKILL the whole group
+    /// (bash + gleam + BEAM). The stored credential must survive it.
+    killTree: () => {
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          /* already gone */
+        }
+      }
+    },
+  };
+}
+
+async function pairNodeRows() {
+  const { status, body } = await api("GET", "/nodes");
+  if (status !== 200) throw new Error(`nodes fetch failed: ${status}`);
+  return body.nodes.filter((n) => n.name === PAIR_NODE);
+}
+
+// ---------------------------------------------------------------------------
 // The suite
 // ---------------------------------------------------------------------------
 
 let nexus = null;
 let provider = null;
+let pairWorkspace = null;
+let pairLauncher = null;
+let pairNodeId = null;
+let pairStateToken = null;
 
 async function main() {
   await resetDatabase();
@@ -457,6 +584,143 @@ async function main() {
     }, { message: "detach line after the TUI left" });
   });
 
+  // --- 4. Phase B: the pairing-grant launcher (tui-pairing plan) ----------
+  // Two live grants seeded straight into the store (no HTTP mint route
+  // exists by design — the web UI mints them, Phase C), pinned to this
+  // thread; then the launcher's whole credential life under a second
+  // node name: exchange → 0600 state → crash + stored-credential
+  // relaunch (same row, replay) → revoked credential refuses → a fresh
+  // URL re-pairs.
+  pairWorkspace = mkdtempSync(join(tmpdir(), "nexus-tui-e2e-pair-"));
+  const stateHome = mkdtempSync(join(tmpdir(), "nexus-tui-e2e-state-"));
+  const pairCodeA = randomBytes(18).toString("base64url");
+  const pairCodeB = randomBytes(18).toString("base64url");
+  await seedGrant(pairCodeA, envThread);
+  await seedGrant(pairCodeB, envThread);
+
+  await check("launcher without state or pair-url exits 2 with usage", async () => {
+    const l = startLauncher({ stateHome });
+    const code = await l.waitExit();
+    if (code !== 2) throw new Error(`expected exit 2, got ${code} (stdout: ${l.stdout()})`);
+    if (!/pairing URL/i.test(l.stdout() + l.stderr())) {
+      throw new Error(`no usage pointer: ${l.stdout()} ${l.stderr()}`);
+    }
+  });
+
+  await check("pair via url: exchange, 0600 state file, tui joins", async () => {
+    const l = startLauncher({ stateHome, args: [`${BASE}/pair/${pairCodeA}`] });
+    pairLauncher = l;
+    await poll(() => (l.stdout().includes("-- joined thread — model smart") ? l.stdout() : null), {
+      message: "paired tui never joined",
+      timeout: 45_000,
+    });
+    const file = stateFileFor(stateHome, BASE, PAIR_NODE);
+    if (!existsSync(file)) throw new Error(`state file missing: ${file}`);
+    const mode = statSync(file).mode & 0o777;
+    if (mode !== 0o600) throw new Error(`state file mode ${mode.toString(8)}, want 600`);
+    const state = JSON.parse(readFileSync(file, "utf8"));
+    if (state.server !== BASE) throw new Error(`state server carries ${state.server}`);
+    if (state.node !== PAIR_NODE) throw new Error(`state node: ${state.node}`);
+    if (state.thread !== envThread) throw new Error(`state thread: ${state.thread} (grant's thread must ride along)`);
+    if (typeof state.token !== "string" || state.token.length < 20) throw new Error("state token missing");
+    if (JSON.stringify(state).includes("/pair/")) throw new Error("state file must never carry the pairing url");
+    pairStateToken = state.token;
+    const rows = await pairNodeRows();
+    if (rows.length !== 1) throw new Error(`expected 1 ${PAIR_NODE} row, got ${rows.length}`);
+    pairNodeId = rows[0].id;
+    // The attach landed the growing roster line server-side.
+    await poll(async () => {
+      const s = await threadState(envThread);
+      const lines = s.messages.filter(
+        (m) => m.role === "user" && m.origin?.author === "system",
+      );
+      return lines[lines.length - 1]?.content === "attached targets: workspace, tui-pair-node."
+        ? s
+        : null;
+    }, { message: "pair-node attach roster line" });
+  });
+
+  await check("kill the client; stored-credential relaunch keeps the node row", async () => {
+    // Crash / closed terminal: the whole group dies with SIGKILL — no
+    // graceful exit, no re-pair. The state file must carry the launch.
+    pairLauncher.killTree();
+    await sleep(500);
+    const l = startLauncher({ stateHome });
+    pairLauncher = l;
+    // Joined AND replayed in one poll: the roster line arrives in
+    // frames after the hello — asserting it outside a poll races the
+    // replay (cubic).
+    await poll(
+      () => {
+        const out = l.stdout();
+        return out.includes("-- joined thread — model smart") &&
+          out.includes("system: attached targets: workspace, tui-pair-node.")
+          ? out
+          : null;
+      },
+      { message: "relaunch never joined with the replayed roster", timeout: 45_000 },
+    );
+    // Still the SAME node row — connecting with the stored token never
+    // re-pairs (no second row, no fresh token).
+    const rows = await pairNodeRows();
+    if (rows.length !== 1 || rows[0].id !== pairNodeId) {
+      throw new Error(`node row changed after relaunch: ${JSON.stringify(rows)}`);
+    }
+  });
+
+  await check("revoked credential: bare relaunch refuses with exit 4", async () => {
+    pairLauncher.killTree();
+    await sleep(500);
+    const del = await api("DELETE", `/nodes/${pairNodeId}`);
+    if (del.status !== 204) throw new Error(`revoke failed: ${del.status}`);
+    const l = startLauncher({ stateHome });
+    const code = await l.waitExit();
+    if (code !== 4) {
+      throw new Error(`expected exit 4, got ${code} (stdout: ${l.stdout()} stderr: ${l.stderr()})`);
+    }
+    if (!/pair again|credential rejected/i.test(l.stdout() + l.stderr())) {
+      throw new Error(`no pair-again pointer: ${l.stdout()} ${l.stderr()}`);
+    }
+  });
+
+  await check("fresh pairing url re-pairs over the dead credential", async () => {
+    // NEXUS_PAIR_URL (the env form) this time; the stored state exists,
+    // so the launcher connects first, eats the TUI's exit 4, exchanges
+    // against the fresh code, and relaunches — one re-pair, no loop.
+    const l = startLauncher({ stateHome, pairUrlEnv: `${BASE}/pair/${pairCodeB}` });
+    pairLauncher = l;
+    await poll(
+      () => {
+        const out = l.stdout();
+        return out.includes("stored credential rejected — re-pairing from the pairing URL") &&
+          out.includes("-- joined thread — model smart")
+          ? out
+          : null;
+      },
+      { message: "re-pair never completed", timeout: 60_000 },
+    );
+    const rows = await pairNodeRows();
+    if (rows.length !== 1) throw new Error(`expected 1 ${PAIR_NODE} row, got ${rows.length}`);
+    if (rows[0].id === pairNodeId) throw new Error("node row was not replaced by the re-pair");
+    pairNodeId = rows[0].id;
+    const state = JSON.parse(readFileSync(stateFileFor(stateHome, BASE, PAIR_NODE), "utf8"));
+    if (state.token === pairStateToken) throw new Error("state file kept the dead token");
+    pairStateToken = state.token;
+    // Graceful exit closes the loop; the queued detach line lands.
+    l.quit();
+    const code = await l.waitExit();
+    if (code !== 0) throw new Error(`exit ${code} (stderr: ${l.stderr()})`);
+    await poll(async () => {
+      const s = await threadState(envThread);
+      const lines = s.messages.filter(
+        (m) => m.role === "user" && m.origin?.author === "system",
+      );
+      return lines[lines.length - 1]?.content === "attached targets: workspace."
+        ? s
+        : null;
+    }, { message: "detach line after the re-paired tui left" });
+  });
+
   await nexus.stop();
   await provider.close();
   writeFileSync(
@@ -476,6 +740,7 @@ main().catch(async (err) => {
     join(ROOT, "e2e", "tui-report.json"),
     JSON.stringify({ results, ok: false, error: err.message }, null, 2),
   );
+  pairLauncher?.killTree();
   await nexus?.stop();
   await provider?.close();
   process.exit(1);

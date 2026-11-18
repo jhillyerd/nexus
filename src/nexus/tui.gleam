@@ -41,7 +41,8 @@ import gleam/erlang/process.{type Subject}
 import gleam/http/request
 import gleam/int
 import gleam/io
-import gleam/option.{None}
+import gleam/list
+import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/result
 import gleam/string
@@ -154,6 +155,27 @@ fn load_config() -> Result(Config, String) {
   ))
 }
 
+/// The HTTP status stratus named in a handshake-failure reason
+/// ("WebSocket handshake failed with status 401"), when there is one.
+/// Pure so the offline suite pins the parse; anything but "status "
+/// followed by digits (timeouts, transport errors, other reasons)
+/// answers None and keeps the plain connect-failure exit.
+pub fn handshake_status(detail: String) -> Option(Int) {
+  case string.split_once(detail, "status ") {
+    Error(_) -> None
+    Ok(#(_, rest)) ->
+      case
+        rest
+        |> string.split(" ")
+        |> list.first
+        |> result.try(int.parse)
+      {
+        Ok(status) -> Some(status)
+        Error(_) -> None
+      }
+  }
+}
+
 fn required(name: String) -> Result(String, String) {
   case envoy.get(name) {
     Ok(value) if value != "" -> Ok(value)
@@ -263,13 +285,31 @@ fn run(config: Config) -> Nil {
             actor.InitTimeout -> "handshake timed out"
             actor.InitExited(_) -> "connection exited during handshake"
           }
-          io.println(
-            "! nexus-tui: cannot connect to "
-            <> config.base_url
-            <> " — "
-            <> detail,
-          )
-          halt(2)
+          case handshake_status(detail) {
+            // Credential rejected pre-upgrade: the node row is gone
+            // (revoked, or swept by idle expiry) or the token hashes
+            // differently. Exit 4 is bin/nexus-tui's re-pair signal
+            // (tui-pairing plan Phase B): the launcher re-pairs when it
+            // holds a pairing URL and surfaces "pair again" otherwise.
+            // Every other connect failure keeps the plain 2.
+            Some(401) -> {
+              io.println(
+                "! nexus-tui: credential rejected by "
+                <> config.base_url
+                <> " — node unknown, or its token was revoked or expired (pair again)",
+              )
+              halt(4)
+            }
+            _ -> {
+              io.println(
+                "! nexus-tui: cannot connect to "
+                <> config.base_url
+                <> " — "
+                <> detail,
+              )
+              halt(2)
+            }
+          }
         }
         Ok(started) -> {
           let assert Ok(inbox) = process.receive(handoff, 5000)
