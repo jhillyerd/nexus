@@ -197,13 +197,16 @@ fn node_upgrade(
     // crashed socket, the replace-kill — because an actor's own normal
     // exit does not rupture links. Killing here is exit-reason-agnostic
     // for the thread actor's monitor (any exit spends it) and immediate.
-    // The last-seen bump rides the same clean close (tui-pairing plan,
-    // hygiene): a TUI connected right up to a server shutdown must
-    // carry a FRESH stamp into the next boot's idle-node sweep, or the
-    // sweep — which runs before any reconnect can re-stamp it — would
-    // take a still-in-use credential. Best-effort like the connect-time
-    // touch; an ABNORMAL death (crash, replace-kill) skips it, which is
-    // exactly the "crashed TUI" case the idle window exists for.
+    // The last-seen bump rides the same callback. Mist invokes on_close
+    // "for any reason, valid or otherwise" — clean client closes,
+    // replace-kill teardown, server shutdown, surfaced socket errors —
+    // so last_seen tracks the last OBSERVED disconnect, and the boot
+    // sweep's idle window runs from there. Only a hard VM kill skips
+    // it; the window then runs from the previous stamp (connect or an
+    // earlier close), still bounded — the plan's "a crashed TUI has a
+    // week". Best-effort like the connect-time touch. (Gating this on
+    // a "clean" flag would UNPROTECT the server-shutdown case — the
+    // disconnect the bump exists to cover.)
     on_close: fn(state) {
       process.kill(state.adapter_pid)
       let _ = store.touch_node(state.node_id)

@@ -422,6 +422,13 @@ pub type Model {
     /// render — labelled "expired", revoke-able — because the boot
     /// sweep only collects them at the next restart.
     env_grants: List(node.Grant),
+    /// Monotonic generation for the pane's environment replies: bumped
+    /// on every MUTATION (mint request, revoke request), captured by
+    /// every store read at spawn. A reply applies only when its
+    /// generation still matches — a slow pane-open read that lands
+    /// after a mint/revoke must not erase the mutation's fresher
+    /// result (the `visit`-generation rule, scoped to this section).
+    env_generation: Int,
     /// The ONE-TIME mint display: the plaintext code exists only in
     /// this client's memory (the server stores the hash), so the URL
     /// renders only while this session holds it. Cleared on selection
@@ -603,19 +610,22 @@ pub type Msg {
   )
   // ---- Thread info pane: Environments (tui-pairing plan Phase C) ----
   /// The pane's store reads landed (nodes + grants, the `env_load_effect`
-  /// / `env_revoke_effect` workers), stamped with the selection they
-  /// were asked FOR: a selection change between effect start and
-  /// dispatch drops the stale reply (the `ChannelsLoaded` rule). Also
-  /// the self-refresh of a completed revoke (delete, then re-read).
+  /// / `env_revoke_effect` workers), stamped with the GENERATION they
+  /// were read at and the selection they were asked FOR: a mutation
+  /// between read and reply (or a selection change) drops the stale
+  /// reply. Also the self-refresh of a completed revoke (delete, then
+  /// re-read).
   EnvLoaded(
+    gen: Int,
     id: Option(String),
     nodes: List(node.Node),
     grants: List(node.Grant),
   )
   /// The pane's store reads failed (a store hiccup) or a worker crashed
   /// — every exit dispatches, so no pending state wedges (the `rescue`
-  /// contract). Surfaces as the section's muted note, never a log line.
-  EnvFailed(id: Option(String), reason: String)
+  /// contract). Stamped like `EnvLoaded`; surfaces as the section's
+  /// muted note, never a log line.
+  EnvFailed(gen: Int, id: Option(String), reason: String)
   /// The "Pair a TUI…" button: arms the single-mint guard and spawns
   /// the mint worker. One mint at a time (the `create_pending` rule).
   GrantMintRequested
@@ -625,8 +635,10 @@ pub type Msg {
   /// dropped (the guard releases regardless — it is section-level).
   GrantMinted(code: String, grant: node.Grant)
   /// The mint's insert failed or the worker crashed: the guard releases
-  /// and the section notes the reason.
-  GrantMintFailed(reason: String)
+  /// always; the section notes the reason only while the minting
+  /// thread is still selected (the same stamp the success path
+  /// carries — a late failure must not surface on another thread).
+  GrantMintFailed(id: Option(String), reason: String)
   /// A roster row's Revoke button: delete the NODE row (token revoke;
   /// a live connection survives until it disconnects — the shipped
   /// posture). The worker re-reads and dispatches `EnvLoaded`.
@@ -738,6 +750,7 @@ pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
       pane_open: False,
       env_nodes: [],
       env_grants: [],
+      env_generation: 0,
       grant_minted: None,
       grant_minting: False,
       env_error: None,
@@ -1778,12 +1791,12 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     // hit Postgres through the seam — the `models_effect` pattern, with
     // the `rescue` wrap: every worker exit dispatches, no wedged state).
     // Replies are stamped with the selection they were asked for.
-    EnvLoaded(id, nodes, grants) ->
-      case model.selected == id {
+    EnvLoaded(gen, id, nodes, grants) ->
+      case model.env_generation == gen, model.selected == id {
         // A self-refresh that no longer carries the displayed mint's
         // grant (it was revoked — or swept) drops the one-time URL
         // display with it: a revoked code must not linger.
-        True -> {
+        True, True -> {
           let grant_minted = case model.grant_minted {
             Some(#(code, g)) ->
               case list.any(grants, fn(other) { other.id == g.id }) {
@@ -1803,21 +1816,28 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             effect.none(),
           )
         }
-        False -> #(model, effect.none())
+        _, _ -> #(model, effect.none())
       }
 
-    EnvFailed(id, reason) ->
-      case model.selected == id {
-        True -> #(Model(..model, env_error: Some(reason)), effect.none())
-        False -> #(model, effect.none())
+    EnvFailed(gen, id, reason) ->
+      case model.env_generation == gen, model.selected == id {
+        True, True -> #(Model(..model, env_error: Some(reason)), effect.none())
+        _, _ -> #(model, effect.none())
       }
 
     GrantMintRequested ->
       case model.grant_minting, model.selected {
         // The single-mint guard (the `create_pending` rule): a mint
-        // already in flight cannot queue a second one behind it.
+        // already in flight cannot queue a second one behind it. The
+        // generation bumps here: a pane-open read still in flight
+        // becomes stale and cannot erase the mint that is about to
+        // land (the mint's own GrantMinted applies directly).
         False, Some(id) -> #(
-          Model(..model, grant_minting: True),
+          Model(
+            ..model,
+            grant_minting: True,
+            env_generation: model.env_generation + 1,
+          ),
           env_mint_effect(model, id),
         )
         _, _ -> #(model, effect.none())
@@ -1845,20 +1865,30 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       effect.none(),
     )
 
-    GrantMintFailed(reason) -> #(
-      Model(..model, grant_minting: False, env_error: Some(reason)),
-      effect.none(),
-    )
+    GrantMintFailed(id, reason) ->
+      // The guard releases ALWAYS (section-level, not per-thread); the
+      // note is stamped: a late failure must not surface as another
+      // thread's pane error.
+      case model.selected == id {
+        True -> #(
+          Model(..model, grant_minting: False, env_error: Some(reason)),
+          effect.none(),
+        )
+        False -> #(Model(..model, grant_minting: False), effect.none())
+      }
 
-    NodeRevokeRequested(id) -> #(
-      model,
-      env_revoke_effect(model, RevokeNode(id)),
-    )
+    NodeRevokeRequested(id) -> {
+      // A mutation: the generation bumps, so any read already in flight
+      // is stale; the revoke worker's own re-read spawns with the NEW
+      // generation and applies cleanly.
+      let next = Model(..model, env_generation: model.env_generation + 1)
+      #(next, env_revoke_effect(next, RevokeNode(id)))
+    }
 
-    GrantRevokeRequested(id) -> #(
-      model,
-      env_revoke_effect(model, RevokeGrant(id)),
-    )
+    GrantRevokeRequested(id) -> {
+      let next = Model(..model, env_generation: model.env_generation + 1)
+      #(next, env_revoke_effect(next, RevokeGrant(id)))
+    }
 
     ChannelRowSelected(info) ->
       case model.selected {
@@ -2808,13 +2838,15 @@ fn env_read(
 fn env_load_effect(model: Model) -> Effect(Msg) {
   let store = model.store
   let selected = model.selected
+  let gen = model.env_generation
   effect.from(fn(dispatch) {
     process.spawn_unlinked(fn() {
       let outcome = rescue.rescue(fn() { env_read(store) })
       case outcome {
-        Ok(Ok(#(nodes, grants))) -> dispatch(EnvLoaded(selected, nodes, grants))
-        Ok(Error(reason)) -> dispatch(EnvFailed(selected, reason))
-        Error(crash) -> dispatch(EnvFailed(selected, crash))
+        Ok(Ok(#(nodes, grants))) ->
+          dispatch(EnvLoaded(gen, selected, nodes, grants))
+        Ok(Error(reason)) -> dispatch(EnvFailed(gen, selected, reason))
+        Error(crash) -> dispatch(EnvFailed(gen, selected, crash))
       }
     })
     Nil
@@ -2844,8 +2876,8 @@ fn env_mint_effect(model: Model, thread_id: String) -> Effect(Msg) {
         })
       case outcome {
         Ok(Ok(#(code, grant))) -> dispatch(GrantMinted(code, grant))
-        Ok(Error(reason)) -> dispatch(GrantMintFailed(reason))
-        Error(crash) -> dispatch(GrantMintFailed(crash))
+        Ok(Error(reason)) -> dispatch(GrantMintFailed(Some(thread_id), reason))
+        Error(crash) -> dispatch(GrantMintFailed(Some(thread_id), crash))
       }
     })
     Nil
@@ -2860,6 +2892,10 @@ fn env_mint_effect(model: Model, thread_id: String) -> Effect(Msg) {
 fn env_revoke_effect(model: Model, revoke: EnvRevoke) -> Effect(Msg) {
   let store = model.store
   let selected = model.selected
+  // The caller bumped the generation BEFORE spawning: this worker's
+  // re-read is the NEWEST environment reply and applies over any
+  // earlier one (while an even newer mutation invalidates it in turn).
+  let gen = model.env_generation
   effect.from(fn(dispatch) {
     process.spawn_unlinked(fn() {
       let outcome =
@@ -2874,9 +2910,10 @@ fn env_revoke_effect(model: Model, revoke: EnvRevoke) -> Effect(Msg) {
           }
         })
       case outcome {
-        Ok(Ok(#(nodes, grants))) -> dispatch(EnvLoaded(selected, nodes, grants))
-        Ok(Error(reason)) -> dispatch(EnvFailed(selected, reason))
-        Error(crash) -> dispatch(EnvFailed(selected, crash))
+        Ok(Ok(#(nodes, grants))) ->
+          dispatch(EnvLoaded(gen, selected, nodes, grants))
+        Ok(Error(reason)) -> dispatch(EnvFailed(gen, selected, reason))
+        Error(crash) -> dispatch(EnvFailed(gen, selected, crash))
       }
     })
     Nil

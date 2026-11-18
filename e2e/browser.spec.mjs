@@ -357,8 +357,11 @@ function startNexus({ port, bifrostPort, searxPort, maxToolIterations, workspace
       "You are nexus under e2e test. Follow the case: markers exactly.",
     // Set only for the pairing-pane instance (tui-pairing Phase C): the
     // main instances deliberately have NO root, so their threads carry
-    // no env tools and the byte-prefix envelopes stay as captured.
-    ...(workspaceRoot ? { NEXUS_WORKSPACE_ROOT: workspaceRoot } : {}),
+    // no env tools and the byte-prefix envelopes stay as captured. The
+    // empty-string override matters: a caller's exported
+    // NEXUS_WORKSPACE_ROOT would survive the spread and silently env-up
+    // every instance (config treats "" as unset).
+    NEXUS_WORKSPACE_ROOT: workspaceRoot ?? "",
   };
   const child = spawn("gleam", ["run"], {
     cwd: ROOT,
@@ -2487,7 +2490,9 @@ async function main() {
           `roster row renders: "${roster}"`,
         );
 
-        // Mint: the one-time URL, origin-corrected by pairing_js to the
+        // Mint: the URL (the DISPLAY is one-time — the server stores
+        // only the hash; the grant itself stays multi-use until expiry
+        // or revocation), origin-corrected by pairing_js to the
         // BROWSING origin; code shape is 32 random bytes, URL-safe
         // base64 (43 chars, no padding).
         await mintBtn.click();
@@ -2545,8 +2550,9 @@ async function main() {
         );
 
         // Revoke: the worker deletes and re-reads — the grant row goes,
-        // and the one-time display drops with it (a revoked code must
-        // not linger).
+        // and the one-time display drops with it (a dead code must not
+        // linger; the grant was single-redeemable here only because the
+        // test revokes it, never because grants are single-use).
         await page.locator("[data-revoke-grant]").click();
         await poll(
           async () =>

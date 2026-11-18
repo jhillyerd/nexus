@@ -35,6 +35,10 @@ fn set_all(pairs: List(#(String, String))) -> Nil {
   envoy.unset("NEXUS_WORKSPACE_ROOT")
   envoy.unset("NEXUS_ENV_TIMEOUT_MS")
   envoy.unset("NEXUS_ENV_MAX_OUTPUT_BYTES")
+  // TUI pairing hygiene (tui-pairing plan): the default-7 assertion is
+  // only meaningful when the caller's shell has not exported an
+  // override (env leakage is real — see the seed-key foot-gun).
+  envoy.unset("NEXUS_NODE_IDLE_DAYS")
   envoy.unset("NEXUS_HTTP_FETCH_MAX_BYTES")
   envoy.unset("NEXUS_HTTP_FETCH_TIMEOUT_MS")
   envoy.unset("NEXUS_HTTP_FETCH_ALLOW_PRIVATE")

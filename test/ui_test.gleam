@@ -5295,7 +5295,7 @@ pub fn env_section_renders_roster_test() {
     |> step(ui.Select("s1"))
     |> step(ui.UserEcho(roster_text, Some(now), Some("system")))
     |> step(
-      ui.EnvLoaded(Some("s1"), [env_node("proxmox-2", Some(now - 120))], []),
+      ui.EnvLoaded(0, Some("s1"), [env_node("proxmox-2", Some(now - 120))], []),
     )
     |> step(ui.PaneToggled)
   let html = view_string(model)
@@ -5321,7 +5321,7 @@ pub fn env_section_unpaired_and_never_connected_test() {
       Some(now),
       Some("system"),
     ))
-    |> step(ui.EnvLoaded(Some("s1"), [env_node("fresh", None)], []))
+    |> step(ui.EnvLoaded(0, Some("s1"), [env_node("fresh", None)], []))
     |> step(ui.PaneToggled)
   let html = view_string(model)
   should_contain(html, "no credential")
@@ -5366,13 +5366,21 @@ pub fn env_mint_shows_url_once_test() {
   should_contain(html, "data-pair-url=\"CODE123\"")
   should_contain(html, "data-pair-copy=\"CODE123\"")
   should_contain(html, ">Copy</button>")
-  should_contain(html, "expires in 59m")
-  should_contain(html, "active · expires in 59m · paired 0 TUIs")
+  // Wall-clock live (fixture and renderer read the clock separately):
+  // pin the stable shape, not the exact minute — the exact labels are
+  // the pure fn's contract (expires_in_label_test).
+  should_contain(html, "expires in")
+  should_not_contain(html, "expired")
+  should_contain(html, "active")
+  should_contain(html, "paired 0 TUIs")
 }
 
 /// The mint display is stamped: a mint answering for a SUPERSEDED
 /// selection is dropped (the guard still releases).
 pub fn env_mint_stamps_to_selection_test() {
+  // The delayed-mint scenario: a mint STARTED on s1 lands after the
+  // user moved to s2 — the display must be dropped (stamped with the
+  // minting thread, not applied to whoever is selected now).
   let roster_text =
     env.roster_attach_text("proxmox-2", ["workspace", "proxmox-2"])
   let model =
@@ -5382,11 +5390,13 @@ pub fn env_mint_stamps_to_selection_test() {
     |> step(ui.UserEcho(roster_text, Some(0), Some("system")))
     |> step(ui.PaneToggled)
   let pending = step(model, ui.GrantMintRequested)
-  let minted_elsewhere =
-    step(pending, ui.GrantMinted("CODE123", env_grant("s-other", 0, 3540)))
-  minted_elsewhere.grant_minting |> should.be_false
-  minted_elsewhere.grant_minted |> should.equal(None)
-  let html = view_string(minted_elsewhere)
+  let switched = step(pending, ui.Select("s2"))
+  switched.selected |> should.equal(Some("s2"))
+  let minted_late =
+    step(switched, ui.GrantMinted("CODE123", env_grant("s1", 0, 3540)))
+  minted_late.grant_minting |> should.be_false
+  minted_late.grant_minted |> should.equal(None)
+  let html = view_string(minted_late)
   should_not_contain(html, "CODE123")
 }
 
@@ -5401,7 +5411,7 @@ pub fn env_grants_filter_and_expire_label_test() {
     |> step(ui.Select("s1"))
     |> step(ui.UserEcho(roster_text, Some(now), Some("system")))
     |> step(
-      ui.EnvLoaded(Some("s1"), [], [
+      ui.EnvLoaded(0, Some("s1"), [], [
         env_grant("s1", 2, 1800),
         env_grant("s2", 1, 1800),
         env_grant("s1", 0, -60),
@@ -5409,7 +5419,16 @@ pub fn env_grants_filter_and_expire_label_test() {
     )
     |> step(ui.PaneToggled)
   let html = view_string(model)
-  should_contain(html, "active · expires in 30m · paired 2 TUIs")
+  // The active row's minute count is wall-clock live (fixture and
+  // renderer read the clock separately), so pin the stable parts: the
+  // state word, the use-count diagnostic, and the fact it is NOT
+  // expired. The exact labels are the pure fn's contract
+  // (expires_in_label_test).
+  should_contain(html, "active")
+  should_contain(html, "paired 2 TUIs")
+  should_contain(html, "expires in")
+  // The past-due row is drift-safe: any wall time after the fixture
+  // reads expired.
   should_contain(html, "expired · expired · paired 0 TUIs")
   // The other thread's grant never renders here.
   should_not_contain(html, "paired 1 TUI")
@@ -5427,13 +5446,15 @@ pub fn env_revoke_reply_clears_display_test() {
     |> step(ui.ThreadsLoaded([summary("s1", False)]))
     |> step(ui.Select("s1"))
     |> step(ui.UserEcho(roster_text, Some(0), Some("system")))
-    |> step(ui.EnvLoaded(Some("s1"), [], [grant]))
+    |> step(ui.EnvLoaded(0, Some("s1"), [], [grant]))
     |> step(ui.PaneToggled)
     |> step(ui.GrantMintRequested)
     |> step(ui.GrantMinted("CODE123", grant))
   // A re-read lands WITHOUT the revoked grant: the display drops with
-  // it (a revoked URL must not linger).
-  let refreshed = step(model, ui.EnvLoaded(Some("s1"), [], []))
+  // it (a revoked URL must not linger). The re-read carries the mint
+  // request's generation (the bump proves the drop is CONTENT-based,
+  // not a generation mismatch).
+  let refreshed = step(model, ui.EnvLoaded(1, Some("s1"), [], []))
   refreshed.grant_minted |> should.equal(None)
   let html = view_string(refreshed)
   should_not_contain(html, "CODE123")
@@ -5450,7 +5471,7 @@ pub fn env_state_is_per_selection_test() {
     |> step(ui.ThreadsLoaded([summary("s1", False), summary("s2", False)]))
     |> step(ui.Select("s1"))
     |> step(ui.UserEcho(roster_text, Some(now), Some("system")))
-    |> step(ui.EnvLoaded(Some("s1"), [env_node("proxmox-2", Some(now))], []))
+    |> step(ui.EnvLoaded(0, Some("s1"), [env_node("proxmox-2", Some(now))], []))
     |> step(ui.PaneToggled)
     |> step(ui.GrantMinted("CODE123", env_grant("s1", 0, 3540)))
     |> step(ui.Select("s2"))
@@ -5471,7 +5492,7 @@ pub fn env_roster_row_is_hostile_text_test() {
     |> step(ui.ThreadsLoaded([summary("s1", False)]))
     |> step(ui.Select("s1"))
     |> step(ui.UserEcho(payload, Some(now), Some("system")))
-    |> step(ui.EnvLoaded(Some("s1"), [], []))
+    |> step(ui.EnvLoaded(0, Some("s1"), [], []))
     |> step(ui.PaneToggled)
   let html = view_string(model)
   should_not_contain(html, "<script>")

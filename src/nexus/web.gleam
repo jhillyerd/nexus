@@ -2029,6 +2029,15 @@ pub fn parse_text_json(body: String) -> Result(String, Nil) {
 /// shell's `pairing_js` rewrites the displayed URL to the BROWSING
 /// origin on mount (the operator copies the link for a TUI host that
 /// must reach the same origin they are using right now).
+/// The server's own origin as boot knows it: the base of a minted
+/// pairing URL (tui-pairing plan Phase C). Best effort only — the page
+/// shell's `pairing_js` rewrites the displayed URL to the BROWSING
+/// origin on mount. An IPv6 bind is bracketed so the fallback is at
+/// least a valid authority (`http://::1:8080` is not).
 fn pair_base(cfg: Config) -> String {
-  "http://" <> cfg.http_bind <> ":" <> int.to_string(cfg.http_port)
+  let host = case string.contains(cfg.http_bind, ":") {
+    True -> "[" <> cfg.http_bind <> "]"
+    False -> cfg.http_bind
+  }
+  "http://" <> host <> ":" <> int.to_string(cfg.http_port)
 }

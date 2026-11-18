@@ -197,9 +197,11 @@ env overrides: NEXUS_NODE, NEXUS_ROLE, NEXUS_THREAD (still wins over the grant's
   $1)`, driven by `NEXUS_NODE_IDLE_DAYS` (**default 7**, `0` = never
   sweep). A daily-driver TUI keeps its credential indefinitely; a
   crashed one has a week. `last_seen_at` is bumped on every
-  authenticated connect (shipped `touch_node`) **and on clean
-  disconnect** (the on_close bump — landed with Phase C's sweeps, see
-  the as-built deltas): without it, a TUI
+  authenticated connect (shipped `touch_node`) **and at every close
+  mist reports** (the on_close bump — landed with Phase C's sweeps;
+  mist fires on_close "for any reason, valid or otherwise", so the
+  stamp tracks the last OBSERVED disconnect — see the as-built
+  deltas): without it, a TUI
   connected right up to a server shutdown would carry a stale
   last-seen into the next boot, and the boot sweep — which runs before
   any reconnect can re-stamp it — could take a still-in-use
@@ -321,12 +323,16 @@ As-built deltas:
   depends on these rows being gone first. BOTH hygiene sweeps landed
   with Phase C (the grant sweep per the ordering constraint; the idle-
   node sweep rode along — Phase D is now stretch-only). The sweep's
-  freshness guard landed with it: the node route's clean-close
-  (`on_close`) now bumps `last_seen` best-effort (the abnormal-death
-  cases — crash, replace-kill — skip it, which is exactly the
-  "crashed TUI" case the idle window exists for), so the sweep that
-  runs before any reconnect can never take a credential that was
-  connected right up to the previous shutdown.
+  freshness guard landed with it: the node route's close (`on_close`)
+  bumps `last_seen` best-effort. Mist invokes `on_close` for ANY
+  shutdown reason ("valid or otherwise") — clean client closes,
+  replace-kill teardown, server shutdown, surfaced socket errors — so
+  `last_seen` tracks the last OBSERVED disconnect and the idle window
+  runs from there; only a hard VM kill skips it, in which case the
+  window runs from the previous stamp (connect or an earlier close),
+  still bounded — the plan's "a crashed TUI has a week". (Gating the
+  bump on a "clean" flag would unprotect the server-shutdown case, the
+  very disconnect the bump exists to cover — cubic PR review.)
 - **The roster the pane renders re-derives from the UI's OWN LOG** (the
   newest `system`-authored roster row, parsed with the same
   `env.roster_parse` the server's hydration uses) — no new registry

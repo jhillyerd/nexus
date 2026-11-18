@@ -287,9 +287,11 @@ pub fn main() -> Nil {
           // earlier runs while hydrating. The tool schema is still frozen
           // before any thread can exist: the registry built it from the
           // global config at its own start.
-          // Boot hygiene (tui-pairing plan): expired pairing grants and
-          // idle node credentials are pure garbage — logged-and-ignored
-          // through the seam (see persist.boot_sweeps).
+          // Boot hygiene (tui-pairing plan): expired pairing grants are
+          // pure garbage (the plaintext died at mint); idle node
+          // credentials are swept by policy after NEXUS_NODE_IDLE_DAYS
+          // — logged-and-ignored through the seam (see
+          // persist.boot_sweeps).
           persist.boot_sweeps(
             cfg,
             persist.seam(process.named_subject(store_name)),
