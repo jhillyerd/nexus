@@ -97,10 +97,13 @@ a deliberate absence in `requires_auth` with the same comment.
   `last_used_at` (best-effort, like `touch_node`), answer
   `201 {id, name, token, thread_id}`. The grant's thread rides along —
   the TUI host needs zero thread knowledge.
-- `409` name-already-paired keeps today's friendly path. **A code must
+- `409` name-already-paired keeps today's friendly path (the same
+  `node name is already paired` the admin route answers). **A code must
   never authorize taking over an existing name** — that would escalate a
-  grant beyond mint-new. A lost state file with the row still live
-  409s, and the error message points at the info pane's revoke.
+  grant beyond mint-new. A lost state file with the row still live 409s;
+  the SCRIPT's error output (Phase B) adds the pointer to the info
+  pane's revoke — the route's own message stays the plain collision
+  reason.
 
 **No `POST /nodes/grants`, no grant list/revoke HTTP routes.** The
 browser UI is a Lustre server component over `/ws`, and the standing
@@ -162,10 +165,12 @@ env overrides: NEXUS_NODE, NEXUS_ROLE, NEXUS_THREAD (still wins over the grant's
 ```
 
 - **State file** `${XDG_STATE_HOME:-$HOME/.local/state}/nexus/tui-<host>-<node>.json`,
-  mode `0600`, content `{url, node, token, thread}` — keyed per (server,
-  node name), so two threads on one host work via distinct `NEXUS_NODE`
-  names (one live TUI per name: the second connection replaces the
-  first — shipped replace-on-reconnect).
+  mode `0600`, content `{server, node, token, thread}` (`server` is
+  the server's BASE URL — never the pairing URL; the code dies at the
+  exchange) — keyed per (server, node name), so two threads on one
+  host work via distinct `NEXUS_NODE` names (one live TUI per name:
+  the second connection replaces the first — shipped
+  replace-on-reconnect).
 - Launch logic: state exists → connect with the stored token, no
   pairing at all. The WS upgrade answering `401` (the pre-upgrade plain
   status; row deleted or swept) → re-pair if a pair-url was given, else
@@ -186,8 +191,13 @@ env overrides: NEXUS_NODE, NEXUS_ROLE, NEXUS_THREAD (still wins over the grant's
   $1)`, driven by `NEXUS_NODE_IDLE_DAYS` (**default 7**, `0` = never
   sweep). A daily-driver TUI keeps its credential indefinitely; a
   crashed one has a week. `last_seen_at` is bumped on every
-  authenticated connect (shipped `touch_node`), and never-connected
-  rows expire from `created_at`.
+  authenticated connect (shipped `touch_node`) **and on clean
+  disconnect** (Phase D adds the on_close bump): without it, a TUI
+  connected right up to a server shutdown would carry a stale
+  last-seen into the next boot, and the boot sweep — which runs before
+  any reconnect can re-stamp it — could take a still-in-use
+  credential (cubic review). Never-connected rows expire from
+  `created_at`.
 - Sweeping does not rewrite roster history: roster rows are transcript
   text, not FKs. A swept node's target simply stops resolving — env
   routing to an unknown target fails as an ordinary tool error listing
@@ -243,6 +253,11 @@ IMPLEMENTED
 A + B together are the whole UX fix; they land first.
 
 ### Phase C — info pane Environments section (after the info pane merges)
+
+**Ordering constraint (cubic review): the grant boot sweep (Phase D's
+hygiene list) lands no later than this phase** — expired-grant
+accumulation only becomes real the moment a mint caller exists, and
+the exchange scans the live list.
 
 - `ui.Flags` store handle + boot→`web.gleam`→`ui_runtime` plumbing;
   `ui.Msg` variants; unlinked-worker effects (`models_effect` +

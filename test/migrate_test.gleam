@@ -187,9 +187,9 @@ pub fn uescape_string_test() {
 pub fn schema_is_the_entire_schema_test() {
   let assert Ok(schema) = read_file("sql/schema.sql") |> bit_array.to_string
   let statements = migrate.statements(schema)
-  // 17 = 15 (bot-channels era) + node_grant's table + expiry index
-  // (tui-pairing plan Phase A).
-  should.equal(list.length(statements), 17)
+  // 18 = 15 (bot-channels era) + node_grant's table + expiry index +
+  // the FK's thread_id lookup index (cubic review).
+  should.equal(list.length(statements), 18)
   // The one non-CREATE statement: the manifest swap (plugin-api
   // Phase 2) — a DO block that backfills the old plain-name column
   // into thread_toolset entries before dropping it, lossless for

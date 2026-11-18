@@ -1339,7 +1339,11 @@ fn read_node_create(
 fn read_node_pair(
   req: Request(mist.Connection),
 ) -> Result(NodePairFields, Nil) {
-  case mist.read_body(req, max_body_limit: 1_000_000) {
+  // A redemption body is ~100 bytes (43-char code + name). The admin
+  // route's 1 MB headroom buys nothing on a PUBLIC route — cap tight
+  // so an unauthenticated caller cannot make the server buffer (then
+  // per-grant hash) megabytes of junk code (cubic review).
+  case mist.read_body(req, max_body_limit: 4096) {
     Error(_) -> Error(Nil)
     Ok(read) ->
       case bit_array.to_string(read.body) {

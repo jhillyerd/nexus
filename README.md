@@ -201,9 +201,10 @@ request bodies.
 
 ### Routes
 
-All routes except `GET /healthz` and `GET /node/ws` require the
-configured UI token when `NEXUS_UI_TOKEN` is set; `/node/ws` carries its
-own NODE-token auth against the `node` table instead.
+All routes except `GET /healthz`, `GET /node/ws`, and `POST /nodes/pair`
+require the configured UI token when `NEXUS_UI_TOKEN` is set;
+`/node/ws` carries its own NODE-token auth against the `node` table, and
+`/nodes/pair`'s auth is the pairing code it redeems (tui-pairing plan).
 
 - `GET /` — authenticated chat page (Lustre server-component shell)
 - `GET /ws` — the server component's WebSocket transport
@@ -289,6 +290,12 @@ own NODE-token auth against the `node` table instead.
 - `POST /nodes` `{"name":"proxmox-2"}` — pair a node: 201 answering the
   minted plaintext token EXACTLY ONCE (store keeps only its SHA-256
   hash); duplicate name → `409`, reserved/invalid name → `400`
+- `POST /nodes/pair` `{"code":"…","name":"proxmox-2"}` — the PUBLIC
+  pairing exchange (tui-pairing plan): redeems a web-minted 1-hour,
+  multi-use pairing code for a node token plus the grant's pinned
+  `thread_id` — no UI token, the code is the auth. Expired/revoked/
+  unknown codes answer one merged `404`; a taken name answers the same
+  friendly `409` as `POST /nodes`
 - `DELETE /nodes/<id>` — revoke the node's token (204, idempotent;
   future connections fail, a live one is not retroactively killed)
 - `GET /node/ws?node=<name>&token=<token>&thread=<id>&role=env|viewer`

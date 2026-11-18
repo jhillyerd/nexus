@@ -2,6 +2,7 @@
 //// hashing/verification (one-way, constant-time, revocable) and the
 //// name gate. Offline: no store, no actor — pure functions only.
 
+import gleam/list
 import gleam/option.{None, Some}
 import gleam/string
 import gleeunit/should
@@ -68,8 +69,17 @@ pub fn verify_token_rejects_tampered_or_malformed_hash_test() {
 pub fn mint_grant_shape_test() {
   let #(code, grant) = node.mint_grant(Some("t-1"), 1_700_000_000)
   // The code is a full 256-bit URL-safe base64 token (43 chars, no
-  // padding): copy-paste carries it, nobody types it.
+  // padding): copy-paste carries it, nobody types it. The FULL
+  // alphabet is checked per character (cubic review), not just the
+  // absence of the three forbidden separators.
   should.equal(string.length(code), 43)
+  let alphabet =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+  should.be_true(
+    code
+    |> string.to_graphemes
+    |> list.all(fn(ch) { string.contains(alphabet, ch) }),
+  )
   should.be_false(string.contains(code, "+"))
   should.be_false(string.contains(code, "/"))
   should.be_false(string.contains(code, "="))

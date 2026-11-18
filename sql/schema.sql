@@ -213,14 +213,14 @@ CREATE INDEX IF NOT EXISTS node_recency ON node (last_seen_at DESC);
 -- short-lived, MULTI-USE invite authorizing the minting of node
 -- credentials without the UI token — the pairing UX deferred from
 -- environments Phase 2b. `code_hash` is the SHA-256 digest of the
--- pairing code (nexus/node.gleam), NEVER the plaintext: the code
--- answers exactly once, at mint, exactly like a node token. thread_id
--- pins the grant to the issuing thread (v1 mints always pin; NULL is
--- reserved for a future unpinned shape — no extra work now, just no
--- migration later) and CASCADEs with it: a pairing URL for a deleted
--- thread is meaningless. use_count / last_used_at are diagnostics for
--- the info pane; no max_uses in v1 — pairing several hosts from one
--- URL is the feature.
+-- pairing code (nexus/node.gleam), NEVER the plaintext: the PLAINTEXT
+-- code is returned exactly once, at mint, like a node token — the
+-- grant itself is multi-use (several hosts may redeem it within its
+-- window). thread_id pins the grant to the issuing thread (v1 mints
+-- always pin; NULL is reserved for a future unpinned shape — no
+-- extra work now, just no migration later) and CASCADEs with it: a
+-- pairing URL for a deleted thread is meaningless. use_count /
+-- last_used_at are diagnostics for the info pane; no max_uses in v1.
 CREATE TABLE IF NOT EXISTS node_grant (
   id           text PRIMARY KEY,
   code_hash    text NOT NULL,                  -- hex digest of the pairing code, never plaintext
@@ -232,6 +232,10 @@ CREATE TABLE IF NOT EXISTS node_grant (
 );
 
 CREATE INDEX IF NOT EXISTS node_grant_expiry ON node_grant (expires_at);
+-- The FK's lookup index (the thread_bot precedent): Postgres does not
+-- auto-index FK columns, so without this every thread DELETE seq-scans
+-- node_grant to find grants to cascade.
+CREATE INDEX IF NOT EXISTS node_grant_thread ON node_grant (thread_id);
 
 CREATE TABLE IF NOT EXISTS thread_message (
   id           bigserial PRIMARY KEY,

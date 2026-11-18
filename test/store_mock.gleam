@@ -799,15 +799,24 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
     DeleteThread(id, reply) -> {
       // Mirrors delete_thread.sql + the FK's ON DELETE CASCADE
       // (bot-channels plan, #123): deleting a parent removes its whole
-      // channel subtree (hop chains make channels of channels).
+      // channel subtree (hop chains make channels of channels). A
+      // subtree's pairing grants go with it — node_grant_thread_id_fkey
+      // CASCADEs the same way (tui-pairing plan).
       let subtree = channel_subtree(state.threads, id)
       let threads =
         list.fold(subtree, state.threads, fn(threads, sid) {
           dict.delete(threads, sid)
         })
+      let grants =
+        dict.filter(state.grants, fn(_gid, grant) {
+          case grant.thread_id {
+            option.Some(tid) -> !list.contains(subtree, tid)
+            option.None -> True
+          }
+        })
       process.send(reply, Ok(Nil))
       actor.continue(
-        State(..state, threads: threads, events: [
+        State(..state, threads: threads, grants: grants, events: [
           EvDeleteThread(id),
           ..state.events
         ]),
@@ -1298,15 +1307,28 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
       actor.continue(state)
     }
 
-    InsertNodeGrant(grant, reply) ->
+    InsertNodeGrant(grant, reply) -> {
       // node_grant_pkey, like the schema's constraint. Codes are
       // 256-bit random — no unique hash index to model.
-      case dict.has_key(state.grants, grant.id) {
-        True -> {
+      // node_grant_thread_id_fkey: a pinned grant must reference a
+      // stored thread (the insert-time half; CASCADE is the
+      // delete-time half, mirrored by DeleteThread below — the
+      // thread_provider/bot/parent checks above are the precedent).
+      let thread_ok = case grant.thread_id {
+        option.None -> True
+        option.Some(tid) -> dict.has_key(state.threads, tid)
+      }
+      case dict.has_key(state.grants, grant.id), thread_ok {
+        True, _ -> {
           process.send(reply, Error("node grant " <> grant.id <> " exists"))
           actor.continue(state)
         }
-        False -> {
+        False, False -> {
+          let assert option.Some(tid) = grant.thread_id
+          process.send(reply, Error("unknown thread " <> tid))
+          actor.continue(state)
+        }
+        False, True -> {
           process.send(reply, Ok(Nil))
           actor.continue(
             State(
@@ -1317,6 +1339,7 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
           )
         }
       }
+    }
 
     TouchNodeGrant(id, reply) ->
       // Like the SQL `update ... where id = $1`: a missing row is a

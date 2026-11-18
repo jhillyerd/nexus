@@ -106,8 +106,8 @@ pub type Grant {
 
 /// Mint a fresh grant: the plaintext code (answered ONCE, at mint, to
 /// the web UI that displays the pairing URL — never stored) and its
-/// row (hash only). `now_s` is injected so the mint stays pure and
-/// offline-testable; callers pass `timing.wall_now_s()`.
+/// row (hash only). `now_s` is injected so the mint needs no clock of
+/// its own — offline-testable; callers pass `timing.wall_now_s()`.
 pub fn mint_grant(thread_id: Option(String), now_s: Int) -> #(String, Grant) {
   // The code is a bearer credential equivalent (for one hour) to the
   // UI token's minting authority: full 32 random bytes, URL-safe

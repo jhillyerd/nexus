@@ -118,17 +118,19 @@ fn start_server() -> #(process.Subject(thread_registry.Msg), Int) {
   #(registry, port)
 }
 
-/// A rig whose store is seeded before the server starts — the pairing
-/// exchange's grant rows (tui-pairing plan Phase A): there is
-/// deliberately NO HTTP mint route (the web UI mints through the
-/// server component), so offline tests seed the mock directly and
-/// exercise the exchange exactly as a TUI host would.
-fn start_server_with_grants(
-  seed: fn(store.Store) -> Nil,
-) -> #(process.Subject(thread_registry.Msg), Int) {
-  let #(registry, _providers, port) =
-    start_server_rig(fn(_providers) { Nil }, seed)
-  #(registry, port)
+/// A rig that hands back its store seam: the exchange tests create a
+/// REAL thread first (the mock enforces node_grant's thread FK exactly
+/// like production Postgres), then seed grants through the seam —
+/// there is deliberately no HTTP mint route (the web UI mints through
+/// the server component, Phase C).
+fn start_server_with_store() -> #(
+  process.Subject(thread_registry.Msg),
+  Int,
+  store.Store,
+) {
+  let #(registry, _providers, port, seam) =
+    start_server_rig(fn(_providers) { Nil }, fn(_store) { Nil })
+  #(registry, port, seam)
 }
 
 /// The full rig behind every start_server variant: factory + store mock
@@ -141,7 +143,9 @@ fn start_server_with(
   process.Subject(provider_registry.Msg),
   Int,
 ) {
-  start_server_rig(extra, fn(_store) { Nil })
+  let #(registry, providers, port, _seam) =
+    start_server_rig(extra, fn(_store) { Nil })
+  #(registry, providers, port)
 }
 
 /// `extra` runs against the fresh provider registry before the server
@@ -156,6 +160,7 @@ fn start_server_rig(
   process.Subject(thread_registry.Msg),
   process.Subject(provider_registry.Msg),
   Int,
+  store.Store,
 ) {
   let cfg = test_config()
   let factory_name = process.new_name("nexus_routes_factory")
@@ -230,7 +235,7 @@ fn start_server_rig(
     |> mist.after_start(fn(port, _scheme, _ip) { process.send(bound, port) })
     |> mist.start
   let assert Ok(port) = process.receive(bound, 5000)
-  #(started.data, providers, port)
+  #(started.data, providers, port, persistence)
 }
 
 /// Create a keyless provider through the real registry (ids are minted
@@ -1412,16 +1417,31 @@ pub fn node_insert_failure_test() {
 /// arm here: a revoked row is simply absent from the list, the exact
 /// state the unknown-code arm exercises.
 pub fn node_grant_exchange_round_trip_test() {
-  let now = timing.wall_now_s()
+  let #(_registry, port, seam) = start_server_with_store()
+
+  // A REAL thread: the mock enforces node_grant's thread FK like
+  // production Postgres (cubic review), so grants pin to ids that
+  // exist.
+  let #(thread_status, thread_body) =
+    send_authorized(req(
+      port,
+      Post,
+      "/threads",
+      "{\"provider\":\""
+        <> store_mock.fixture_provider_id
+        <> "\",\"model\":\"alias-a\"}",
+    ))
+  should.equal(thread_status, 201)
+  let assert Ok(thread_id) =
+    json.parse(thread_body, decode.at(["id"], decode.string))
+
   // One live grant (the pairing URL) and one already expired.
-  let #(live_code, live) = node.mint_grant(Some("t-pinned"), now)
-  let #(_expired_code, expired) =
-    node.mint_grant(Some("t-old"), now - node.grant_ttl_s - 1)
-  let #(_registry, port) =
-    start_server_with_grants(fn(store) {
-      store.insert_node_grant(live) |> should.be_ok
-      store.insert_node_grant(expired) |> should.be_ok
-    })
+  let now = timing.wall_now_s()
+  let #(live_code, live) = node.mint_grant(Some(thread_id), now)
+  let #(expired_code, expired) =
+    node.mint_grant(Some(thread_id), now - node.grant_ttl_s - 1)
+  seam.insert_node_grant(live) |> should.be_ok
+  seam.insert_node_grant(expired) |> should.be_ok
 
   let pair = fn(code: String, name: String) {
     hackney.send(req(
@@ -1441,9 +1461,9 @@ pub fn node_grant_exchange_round_trip_test() {
   should.be_true(string.contains(first.body, "\"token\":\""))
   should.be_false(string.contains(first.body, "token_hash"))
   should.be_false(string.contains(first.body, "code_hash"))
-  let assert Ok(thread_id) =
+  let assert Ok(thread_id_resp) =
     json.parse(first.body, decode.at(["thread_id"], decode.string))
-  should.equal(thread_id, "t-pinned")
+  should.equal(thread_id_resp, thread_id)
   let assert Ok(first_id) =
     json.parse(first.body, decode.at(["id"], decode.string))
 
@@ -1466,10 +1486,15 @@ pub fn node_grant_exchange_round_trip_test() {
   should.equal(admin, 409)
 
   // Expired and unknown codes answer the IDENTICAL merged 404 — the
-  // route must not become a code oracle.
+  // route must not become a code oracle. The EXPIRED plaintext is
+  // actually redeemed here too (cubic review — it was seeded but
+  // never exercised): byte-identical body, not just the same status.
   let assert Ok(unknown) = pair("not-a-real-code-at-all", "laptop-c")
   should.equal(unknown.status, 404)
   should.be_true(string.contains(unknown.body, "unknown or expired"))
+  let assert Ok(expired_resp) = pair(expired_code, "laptop-d")
+  should.equal(expired_resp.status, 404)
+  should.equal(expired_resp.body, unknown.body)
 
   // An invalid name against a VALID code still refuses (the env
   // target-name gate — workspace is reserved).
