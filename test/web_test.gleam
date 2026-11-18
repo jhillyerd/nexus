@@ -729,10 +729,7 @@ pub fn m3_page_thread_url_script_test() {
     html,
     "      if (epoch !== navEpoch) { stopRetry(); return; }",
   ))
-  should.be_true(string.contains(
-    html,
-    "      giveUpOrReload();\n",
-  ))
+  should.be_true(string.contains(html, "      giveUpOrReload();\n"))
   // popstate drives the server's Select path through a synthetic click
   // on the row, never by touching the rendered tree's content.
   should.be_true(string.contains(html, "window.addEventListener('popstate'"))
