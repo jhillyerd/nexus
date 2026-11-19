@@ -707,17 +707,20 @@ fn boot_sweep(persistence: Store) -> List(String) {
 fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
   case msg {
     Create(requested, reply) ->
-      // The bot-default toolset transform (bots P3c, #97): a thread
-      // created FROM a bot with the default sentinel (`toolset: None`)
-      // snapshots the human default set PLUS `bot_message` — bots are the
-      // only senders, so an ordinary bot gets the delivery tool without
-      // listing it, while the HUMAN default set never carries it (a plain
-      // thread has no bot identity to send from). A bot that wants it
-      // gone names an explicit list without it; a chat-only `'{}'` bot
-      // already excludes it. Everything resolves through the same bundle
-      // cache as any other snapshot (the default+bot_message entry list
-      // is its own cache entry, built once). `None` (the plain default)
-      // skips the freeze entirely: the boot-seeded bundle IS the answer.
+      // The bot-default toolset transform (bots P3c, #97; #127 added
+      // the discovery half): a thread created FROM a bot with the
+      // default sentinel (`toolset: None`) snapshots the human default
+      // set PLUS `bot_message` and `list_bots` — bots are the only
+      // senders, so an ordinary bot gets the delivery tool (and its
+      // roster) without listing them, while the HUMAN default set never
+      // carries either (a plain thread has no bot identity to send
+      // from, and nobody to list for). A bot that wants them gone names
+      // an explicit list without them; a chat-only `'{}'` bot already
+      // excludes them. Everything resolves through the same bundle
+      // cache as any other snapshot (the default+delivery-tools entry
+      // list is its own cache entry, built once). `None` (the plain
+      // default) skips the freeze entirely: the boot-seeded bundle IS
+      // the answer.
       case effective_toolset(state, requested) {
         None -> {
           let toolset = default_toolset(state)
@@ -812,7 +815,10 @@ fn effective_toolset(
   case requested.bot_id, requested.toolset {
     Some(_), None ->
       Some(
-        list.append(tools.default_names(state.cfg), ["bot_message", "list_bots"]),
+        list.append(tools.default_names(state.cfg), [
+          "bot_message",
+          "list_bots",
+        ]),
       )
     _, _ -> requested.toolset
   }
@@ -3045,7 +3051,7 @@ fn refused_unknown_target(to: String, names: List(String)) -> delivery.Reply {
         "unknown target \""
         <> to
         <> "\" — available bots: "
-        <> string.join(names, ", "),
+        <> string.join(list.map(names, tools.flatten_bot_name), ", "),
       )
   }
 }

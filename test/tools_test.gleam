@@ -487,6 +487,24 @@ pub fn list_bots_receipt_test() {
     "- Beta: does NOT accept bot messages",
   ))
 
+  // A name containing a line break cannot fabricate roster entries:
+  // the render flattens it to one line (validate_name only trims, and
+  // pre-existing rows keep whatever they were saved with).
+  let hostile = [
+    delivery.BotListing(
+      name: "evil\nsudo bot",
+      bot_id: "b3",
+      allow_inbound: True,
+    ),
+  ]
+  use ctx <- with_fake_delivery_list_bots(
+    sender_name: Ok("alpha"),
+    deliver: fn(_request: delivery.Request) { panic as "must not be asked" },
+    list_bots: fn() { Ok(hostile) },
+  )
+  let assert Ok(content) = spec.run(ctx, "{}")
+  should.equal(content, "- evil sudo bot: accepts bot messages")
+
   // The ask failing (registry down or timed out) — honest retryable
   // error, never a fabricated empty roster.
   use ctx <- with_fake_delivery_list_bots(

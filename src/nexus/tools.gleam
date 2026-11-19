@@ -571,9 +571,9 @@ fn bot_message_spec() -> ToolSpec {
     tool: function_tool(
       name: "bot_message",
       description: "Send an async message to another bot. `to` is the bot's"
-        <> " name (case-insensitive; call list_bots to see who exists), or"
-        <> " a thread id from a previous bot_message receipt (precise"
-        <> " addressing). Returns a receipt naming the thread the"
+        <> " name (matching is case-insensitive), or a thread id from a"
+        <> " previous bot_message receipt (precise addressing). Returns a"
+        <> " receipt naming the thread the"
         <> " message landed in; the target bot answers on its own next turn"
         <> " — replies arrive as user messages prefixed `From <bot> (thread"
         <> " <id>):`. Refused when the target is unknown, archived, has"
@@ -727,14 +727,34 @@ fn render_bot_list(
           True -> " (you)"
           False -> ""
         }
-        let inbound = case bot.allow_inbound {
-          True -> "accepts bot messages"
-          False -> "does NOT accept bot messages"
-        }
-        "- " <> bot.name <> you <> ": " <> inbound
+        "- "
+        <> flatten_bot_name(bot.name)
+        <> you
+        <> ": "
+        <> inbound_label(bot.allow_inbound)
       })
       |> string.join("\n")
   }
+}
+
+fn inbound_label(allow_inbound: Bool) -> String {
+  case allow_inbound {
+    True -> "accepts bot messages"
+    False -> "does NOT accept bot messages"
+  }
+}
+
+/// Bot names ride display surfaces that are one ENTRY per line (the
+/// roster above) or one LINE (the delivery path's unknown-target
+/// refusal): a name containing a line break would fabricate entries in
+/// what the model reads as a list, so it flattens to spaces here, at
+/// the render sites. `validate_name` only trims, and pre-existing rows
+/// keep whatever they were saved with — naming validation is a wider
+/// question than either surface, deliberately out of scope here.
+pub fn flatten_bot_name(name: String) -> String {
+  name
+  |> string.replace("\n", " ")
+  |> string.replace("\r", " ")
 }
 
 /// The environment tools' spec assembly (environments plan Phase 1):

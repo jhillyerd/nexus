@@ -1772,7 +1772,10 @@ pub fn create_from_bot_toolset_snapshot_test() {
   let assert Ok(stored) = seam.get_thread(from_default_bot.id)
   should.equal(
     entry_names(stored.summary.toolset),
-    list.append(tools.default_names(test_config()), ["bot_message", "list_bots"]),
+    list.append(tools.default_names(test_config()), [
+      "bot_message",
+      "list_bots",
+    ]),
   )
 
   // And the human default stays bare: a plain create never gains the

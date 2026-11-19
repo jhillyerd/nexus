@@ -235,6 +235,21 @@ pub fn schema_is_the_entire_schema_test() {
   let bot_index_lower = string.lowercase(bot_name_index)
   should.be_true(string.contains(bot_index_lower, "unique"))
   should.be_true(string.contains(bot_index_lower, "on bot (lower(name))"))
+  // And the DROP precedes the CREATE — the schema depends on the order:
+  // swapped, the plain (name) CREATE would claim the bot_name slot and
+  // the DROP would then delete it, landing on NO unique index at all.
+  let indexed = list.index_map(statements, fn(stmt, i) { #(i, stmt) })
+  let assert Ok(#(drop_at, _)) =
+    indexed
+    |> list.find(fn(p) {
+      string.contains(string.lowercase(p.1), "drop index if exists bot_name")
+    })
+  let assert Ok(#(create_at, _)) =
+    indexed
+    |> list.find(fn(p) {
+      string.contains(string.lowercase(p.1), "index if not exists bot_name")
+    })
+  should.be_true(drop_at < create_at)
   let assert [node_scoping] =
     list.filter(non_create, fn(stmt) {
       let lower = string.lowercase(stmt)
