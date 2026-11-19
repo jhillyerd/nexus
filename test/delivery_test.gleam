@@ -410,16 +410,65 @@ fn last_user_depth(
 // ---------------------------------------------------------------------------
 
 /// Unknown targets refuse: neither a thread id nor a bot name resolves.
+/// The refusal names the available bots (#127) — the sender corrects
+/// itself without a discovery round trip. The roster here is ["alpha"]
+/// (the sender itself counts: it exists).
 pub fn deliver_unknown_target_test() {
   let booted = boot()
   let alpha = create_bot(booted, "alpha", allow_inbound: True)
   let parent = create_parent_thread(booted, alpha.id)
 
   deliver(booted.registry, alpha.id, "alpha", parent.id, 1, "s4242", "hi")
-  |> should.equal(delivery.Refused("unknown target"))
+  |> should.equal(delivery.Refused(
+    "unknown target \"s4242\" — available bots: alpha",
+  ))
 
   deliver(booted.registry, alpha.id, "alpha", parent.id, 1, "nobody", "hi")
-  |> should.equal(delivery.Refused("unknown target"))
+  |> should.equal(delivery.Refused(
+    "unknown target \"nobody\" — available bots: alpha",
+  ))
+}
+
+/// Name addressing is case-INSENSITIVE (#127): "BETA" reaches the bot
+/// named "beta". Names are case-insensitively unique, so the fallback
+/// match is unambiguous by construction, and the wrong-cased send opens
+/// the SAME per-(parent, beta) channel a correctly-cased one would.
+pub fn deliver_name_lookup_case_insensitive_test() {
+  let booted = boot()
+  let alpha = create_bot(booted, "alpha", allow_inbound: True)
+  let beta = create_bot(booted, "beta", allow_inbound: True)
+  let alpha_parent = create_parent_thread(booted, alpha.id)
+
+  let assert delivery.Delivered(dm_id) =
+    deliver(
+      booted.registry,
+      alpha.id,
+      "alpha",
+      alpha_parent.id,
+      1,
+      "BETA",
+      "hello beta",
+    )
+
+  // The channel is the (parent, beta) identity — the target bot's own
+  // deterministic title, not a phantom new bot row.
+  let stored = stored_channel(booted, alpha_parent.id, beta.id)
+  should.equal(stored.id, dm_id)
+  should.equal(stored.meta.title, "beta")
+
+  // A correctly-cased send reuses the SAME channel.
+  wait_idle(booted.registry, dm_id)
+  let assert delivery.Delivered(dm_id2) =
+    deliver(
+      booted.registry,
+      alpha.id,
+      "alpha",
+      alpha_parent.id,
+      1,
+      "beta",
+      "again",
+    )
+  should.equal(dm_id2, dm_id)
 }
 
 /// Self-addressing refuses BEFORE routing in BOTH shapes: by name (a

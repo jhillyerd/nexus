@@ -98,7 +98,7 @@ pub fn describe(error: RegistryError) -> String {
     InvalidName -> bot.describe(bot.InvalidName)
     ReservedName -> bot.describe(bot.ReservedName)
     InvalidModel -> bot.describe(bot.InvalidModel)
-    DuplicateName -> "bot name already exists"
+    DuplicateName -> "bot name already exists (names are case-insensitive)"
     InvalidTools(reason) -> reason
     StoreFailed(reason) -> reason
   }
@@ -418,13 +418,19 @@ fn update_row(
   }
 }
 
-/// True when some OTHER loaded bot already owns `name`.
+/// True when some OTHER loaded bot already owns `name` — compared
+/// case-insensitively (#127): delivery resolves names case-insensitively, so
+/// "alice" and "Alice" must be ONE bot, or the lookup below could not tell
+/// them apart. Display case is preserved verbatim.
 fn name_taken(
   rows: Dict(String, StoredBot),
   own_id: String,
   name: String,
 ) -> Bool {
-  list.any(dict.values(rows), fn(row) { row.id != own_id && row.name == name })
+  let name = string.lowercase(name)
+  list.any(dict.values(rows), fn(row) {
+    row.id != own_id && string.lowercase(row.name) == name
+  })
 }
 
 /// One toolset rule for create and patch alike: structural

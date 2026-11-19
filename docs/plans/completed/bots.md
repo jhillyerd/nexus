@@ -518,6 +518,34 @@ bot-authored lines with payload-laden text; loop interaction — a bot
 message arriving mid-turn is rejected, not queued, and the UI's
 rollback rules are untouched.
 
+#### As-built deltas (issue #127 — naming/discoverability)
+
+- **Bot names are case-insensitively unique** — the `bot_name` index
+  became functional, `ON bot (lower(name))` (pre-deployment: a
+  `DROP INDEX IF EXISTS` + `CREATE`, no migration), the registry's
+  `name_taken` pre-check and the mock seam's constraints compare
+  lowercased, and display case is preserved verbatim. This is what
+  makes the delivery lookup's case-insensitive fallback UNAMBIGUOUS:
+  at most one bot can match.
+- **`bot_message` addressing is exact-first, case-insensitive on the
+  fallback** (`find_bot_by_name`) — a sender that mistypes the casing
+  still reaches its target. Thread ids still win in
+  `classify_target`; the dm map stays bot-ID keyed; the `From` prefix
+  keeps the display name.
+- **`list_bots` joins `bot_message` in the bot-default sentinel** —
+  the discovery half, injected where the delivery tool is, never in
+  the human default set. The executor rides a THIRD `Delivery`
+  closure (`list_bots`) over the same bounded `try_send_named` ask
+  pattern as `sender_name`, answered from the bot registry's
+  boot-loaded rows as plain `BotListing`s (name, id, allow_inbound) —
+  never raw `StoredBot`s, so prompts stay out of tool receipts.
+- **The unknown-target refusal carries the roster** —
+  `"unknown target \"<to>\" — available bots: …"` built from the same
+  table scan the lookup already performs (empty table gets its own
+  honest line); a store failure stays the retryable
+  `"target lookup failed; try again"`. `bot_message`'s description
+  points at `list_bots` and states that casing doesn't matter.
+
 ## Non-goals (recorded, not planned)
 
 - **Shared chat rooms** (one transcript, multiple assistant

@@ -1013,7 +1013,10 @@ pub fn bots_crud_routes_test() {
       "/bots",
       "{\"name\":\"Writer\",\"provider\":\"p-test\",\"model\":\"alias-a\"}",
     )),
-    #(409, "{\"error\":\"bot name already exists\"}"),
+    #(
+      409,
+      "{\"error\":\"bot name already exists (names are case-insensitive)\"}",
+    ),
   )
 
   // PATCH: rename + clear the prompt back to the default.

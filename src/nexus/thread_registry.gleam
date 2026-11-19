@@ -707,17 +707,20 @@ fn boot_sweep(persistence: Store) -> List(String) {
 fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
   case msg {
     Create(requested, reply) ->
-      // The bot-default toolset transform (bots P3c, #97): a thread
-      // created FROM a bot with the default sentinel (`toolset: None`)
-      // snapshots the human default set PLUS `bot_message` — bots are the
-      // only senders, so an ordinary bot gets the delivery tool without
-      // listing it, while the HUMAN default set never carries it (a plain
-      // thread has no bot identity to send from). A bot that wants it
-      // gone names an explicit list without it; a chat-only `'{}'` bot
-      // already excludes it. Everything resolves through the same bundle
-      // cache as any other snapshot (the default+bot_message entry list
-      // is its own cache entry, built once). `None` (the plain default)
-      // skips the freeze entirely: the boot-seeded bundle IS the answer.
+      // The bot-default toolset transform (bots P3c, #97; #127 added
+      // the discovery half): a thread created FROM a bot with the
+      // default sentinel (`toolset: None`) snapshots the human default
+      // set PLUS `bot_message` and `list_bots` — bots are the only
+      // senders, so an ordinary bot gets the delivery tool (and its
+      // roster) without listing them, while the HUMAN default set never
+      // carries either (a plain thread has no bot identity to send
+      // from, and nobody to list for). A bot that wants them gone names
+      // an explicit list without them; a chat-only `'{}'` bot already
+      // excludes them. Everything resolves through the same bundle
+      // cache as any other snapshot (the default+delivery-tools entry
+      // list is its own cache entry, built once). `None` (the plain
+      // default) skips the freeze entirely: the boot-seeded bundle IS
+      // the answer.
       case effective_toolset(state, requested) {
         None -> {
           let toolset = default_toolset(state)
@@ -803,14 +806,20 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
 
 /// The effective toolset NAMES a create request resolves through: the
 /// requested explicit list, or — for a bot-sourced create with the
-/// default sentinel — the default set plus `bot_message` (see `handle`).
+/// default sentinel — the default set plus `bot_message` and `list_bots`
+/// (see `handle`; #127 adds the discovery half).
 fn effective_toolset(
   state: State,
   requested: NewThread,
 ) -> Option(List(String)) {
   case requested.bot_id, requested.toolset {
     Some(_), None ->
-      Some(list.append(tools.default_names(state.cfg), ["bot_message"]))
+      Some(
+        list.append(tools.default_names(state.cfg), [
+          "bot_message",
+          "list_bots",
+        ]),
+      )
     _, _ -> requested.toolset
   }
 }
@@ -2858,7 +2867,10 @@ fn deliver_message(
         True -> #(state, delivery.Refused("sender thread is archived"))
         False ->
           case classify_target(state, request.to) {
-            MissingTarget -> #(state, delivery.Refused("unknown target"))
+            MissingTarget(names) -> #(
+              state,
+              refused_unknown_target(request.to, names),
+            )
             // A store outage during the bot-name lookup is not an "unknown
             // target" — the honest verdict names the failure so the sender can
             // retry instead of giving up on a target that may well exist
@@ -2917,8 +2929,11 @@ fn deliver_message(
 /// What `to` resolved to. Thread ids win over bot names (the precise
 /// channel); a bot literally named like a thread id is reachable by name
 /// only while no thread owns that id — acceptable at personal scale.
+/// `MissingTarget` carries the names the same table scan saw (#127) —
+/// the refusal can name the available bots, so a mistyped or miscased
+/// address self-corrects in one round trip.
 type Target {
-  MissingTarget
+  MissingTarget(names: List(String))
   LookupUnavailable
   FoundBot(bot: store.StoredBot)
   FoundThread(state: State, record: Record)
@@ -2930,7 +2945,7 @@ fn classify_target(state: State, to: String) -> Target {
     Error(_) ->
       case find_bot_by_name(state, to) {
         BotFound(bot) -> FoundBot(bot)
-        NoSuchBot -> MissingTarget
+        NoSuchBot(names) -> MissingTarget(names)
         LookupFailed -> LookupUnavailable
       }
   }
@@ -2984,23 +2999,60 @@ fn resolve_thread(state: State, id: String) -> Result(#(State, Record), Nil) {
 /// a bot-registry call (§8 no-cross-registry-edges). A store failure is
 /// distinct from "no such bot": the caller must be able to tell a
 /// transient outage from a genuinely unknown target.
+///
+/// Matching is exact-first, then case-insensitive (#127): names are
+/// case-insensitively unique (`bot_name` on `lower(name)`), so at most
+/// one bot can match the fallback — unambiguous by construction — and a
+/// sender that mistypes the casing still reaches its target. A miss
+/// carries the table's names (sorted, for a stable refusal roster).
 type BotLookup {
   BotFound(bot: store.StoredBot)
-  NoSuchBot
+  NoSuchBot(names: List(String))
   LookupFailed
 }
 
 fn find_bot_by_name(state: State, name: String) -> BotLookup {
   case state.store.list_bots() {
-    Ok(bots) ->
-      case list.find(bots, fn(bot) { bot.name == name }) {
-        Ok(bot) -> BotFound(bot)
-        Error(Nil) -> NoSuchBot
+    Ok(bots) -> {
+      let found = case list.find(bots, fn(bot) { bot.name == name }) {
+        Ok(bot) -> Ok(bot)
+        Error(_) -> {
+          let lowered = string.lowercase(name)
+          list.find(bots, fn(bot) { string.lowercase(bot.name) == lowered })
+        }
       }
+      case found {
+        Ok(bot) -> BotFound(bot)
+        Error(_) ->
+          NoSuchBot(
+            bots
+            |> list.map(fn(bot) { bot.name })
+            |> list.sort(string.compare),
+          )
+      }
+    }
     Error(error) -> {
       log_store_error("deliver target lookup", error)
       LookupFailed
     }
+  }
+}
+
+/// The unknown-target verdict (#127): the refusal names the bots the
+/// lookup's table scan saw, so the sender can correct itself without a
+/// discovery round trip. An empty table gets its own honest line (the
+/// roster is empty because nobody exists, not because the target is
+/// mistyped).
+fn refused_unknown_target(to: String, names: List(String)) -> delivery.Reply {
+  case names {
+    [] -> delivery.Refused("unknown target: no bots exist yet")
+    _ ->
+      delivery.Refused(
+        "unknown target \""
+        <> to
+        <> "\" — available bots: "
+        <> string.join(list.map(names, tools.flatten_bot_name), ", "),
+      )
   }
 }
 
@@ -3483,6 +3535,7 @@ fn delivery_toolset(
           depth: initiating_depth(tr) + 1,
           deliver: fn(request) { deliver_ask(state.self, request) },
           sender_name: fn() { sender_name_ask(state.bots_name, bot_id) },
+          list_bots: fn() { list_bots_ask(state.bots_name) },
         )
       base(endpoint, tr, cancel, Some(ctx), environment, on_event)
     },
@@ -3558,6 +3611,36 @@ fn sender_name_ask(
     True ->
       case process.receive(reply, delivery_ask_timeout_ms) {
         Ok(Ok(bot)) -> Ok(bot.name)
+        _ -> Error(Nil)
+      }
+  }
+}
+
+/// The bot table for the `list_bots` tool (#127), asked from the bot
+/// registry (same manual ask pattern as `sender_name_ask`; the registry
+/// answers from boot-loaded state, name-sorted by its `List` arm).
+/// `Error` = the registry is down or the ask timed out — an honest tool
+/// error either way. Rows render as plain listings (the leaf
+/// `delivery.BotListing`), never raw `StoredBot`s — prompts and system
+/// texts stay OUT of the tool receipt.
+fn list_bots_ask(
+  bots_name: process.Name(bot_registry.Msg),
+) -> Result(List(delivery.BotListing), Nil) {
+  let reply = process.new_subject()
+  case try_send_named(bots_name, bot_registry.List(reply)) {
+    False -> Error(Nil)
+    True ->
+      case process.receive(reply, delivery_ask_timeout_ms) {
+        Ok(Ok(rows)) ->
+          Ok(
+            list.map(rows, fn(row) {
+              delivery.BotListing(
+                name: row.name,
+                bot_id: row.id,
+                allow_inbound: row.allow_inbound,
+              )
+            }),
+          )
         _ -> Error(Nil)
       }
   }

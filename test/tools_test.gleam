@@ -207,6 +207,7 @@ pub fn catalog_enumerates_compiled_plugin_and_foreign_test() {
     "bot_message",
     "codemode",
     "http_fetch",
+    "list_bots",
     "list_dir",
     "mcpsrv__echo",
     "mcpsrv__ping",
@@ -433,6 +434,97 @@ pub fn bot_message_sender_gone_and_bad_args_test() {
   should.be_true(string.contains(reason, "non-empty"))
 }
 
+// ---- list_bots: the discovery tool (#127) ---------------------------------
+
+/// The catalog carries list_bots, but the HUMAN default toolset never
+/// selects it — the registry injects it into bot-default threads itself,
+/// exactly like `bot_message`.
+pub fn list_bots_in_catalog_not_in_default_test() {
+  should.be_true(tools.is_compiled_name("list_bots"))
+  let assert Ok([spec]) = tools.by_names(plain(), ["list_bots"])
+  should.equal(tools.tool_name(spec), "list_bots")
+  tools.default_names(plain())
+  |> list.contains("list_bots")
+  |> should.be_false
+}
+
+/// Without a delivery context the executor errors honestly — same
+/// reachable-only-through-a-hand-built-toolset shape as `bot_message`.
+pub fn list_bots_without_delivery_ctx_errors_test() {
+  let assert Ok([spec]) = tools.by_names(plain(), ["list_bots"])
+  let assert Error(reason) =
+    spec.run(
+      tools.ToolCtx(
+        cancel: process.new_subject(),
+        delivery: option.None,
+        environment: option.None,
+      ),
+      "{}",
+    )
+  should.equal(reason, "list_bots: this thread has no bot identity to list for")
+}
+
+/// The receipt names every bot with its exact display name, marks the
+/// sender, and carries the inbound gate in the delivery guard's own
+/// vocabulary. A failed registry ask is an honest tool error; an empty
+/// registry says so plainly.
+pub fn list_bots_receipt_test() {
+  let assert Ok([spec]) = tools.by_names(plain(), ["list_bots"])
+
+  let roster = [
+    delivery.BotListing(name: "alpha", bot_id: "b1", allow_inbound: True),
+    delivery.BotListing(name: "Beta", bot_id: "b2", allow_inbound: False),
+  ]
+  use ctx <- with_fake_delivery_list_bots(
+    sender_name: Ok("alpha"),
+    deliver: fn(_request: delivery.Request) { panic as "must not be asked" },
+    list_bots: fn() { Ok(roster) },
+  )
+  let assert Ok(content) = spec.run(ctx, "{}")
+  should.be_true(string.contains(content, "- alpha (you): accepts bot messages"))
+  should.be_true(string.contains(
+    content,
+    "- Beta: does NOT accept bot messages",
+  ))
+
+  // A name containing a line break cannot fabricate roster entries:
+  // the render flattens it to one line (validate_name only trims, and
+  // pre-existing rows keep whatever they were saved with).
+  let hostile = [
+    delivery.BotListing(
+      name: "evil\nsudo bot",
+      bot_id: "b3",
+      allow_inbound: True,
+    ),
+  ]
+  use ctx <- with_fake_delivery_list_bots(
+    sender_name: Ok("alpha"),
+    deliver: fn(_request: delivery.Request) { panic as "must not be asked" },
+    list_bots: fn() { Ok(hostile) },
+  )
+  let assert Ok(content) = spec.run(ctx, "{}")
+  should.equal(content, "- evil sudo bot: accepts bot messages")
+
+  // The ask failing (registry down or timed out) — honest retryable
+  // error, never a fabricated empty roster.
+  use ctx <- with_fake_delivery_list_bots(
+    sender_name: Ok("alpha"),
+    deliver: fn(_request: delivery.Request) { panic as "must not be asked" },
+    list_bots: fn() { Error(Nil) },
+  )
+  let assert Error(reason) = spec.run(ctx, "{}")
+  should.be_true(string.contains(reason, "registry is unavailable"))
+
+  // An empty registry: nobody to message, not a tool failure.
+  use ctx <- with_fake_delivery_list_bots(
+    sender_name: Ok("alpha"),
+    deliver: fn(_request: delivery.Request) { panic as "must not be asked" },
+    list_bots: fn() { Ok([]) },
+  )
+  let assert Ok(content) = spec.run(ctx, "{}")
+  should.be_true(string.contains(content, "no bots exist yet"))
+}
+
 // ---- fixtures -------------------------------------------------------------
 
 /// A ToolCtx whose delivery closures are the given fakes.
@@ -441,19 +533,33 @@ fn with_fake_delivery(
   deliver deliver: fn(delivery.Request) -> Result(delivery.Reply, String),
   next next: fn(tools.ToolCtx) -> a,
 ) -> a {
+  with_fake_delivery_list_bots(
+    sender_name: sender_name,
+    deliver: deliver,
+    list_bots: fn() { Error(Nil) },
+    next: next,
+  )
+}
+
+/// The same rig with a fake bot roster (the `list_bots` tool's ask).
+fn with_fake_delivery_list_bots(
+  sender_name sender_name: Result(String, Nil),
+  deliver deliver: fn(delivery.Request) -> Result(delivery.Reply, String),
+  list_bots list_bots: fn() -> Result(List(delivery.BotListing), Nil),
+  next next: fn(tools.ToolCtx) -> a,
+) -> a {
   let ctx =
     tools.ToolCtx(
       cancel: process.new_subject(),
       environment: option.None,
-      delivery: option.Some(
-        delivery.Delivery(
-          thread_id: "s9",
-          bot_id: "b1",
-          depth: 2,
-          deliver: deliver,
-          sender_name: fn() { sender_name },
-        ),
-      ),
+      delivery: option.Some(delivery.Delivery(
+        thread_id: "s9",
+        bot_id: "b1",
+        depth: 2,
+        deliver: deliver,
+        sender_name: fn() { sender_name },
+        list_bots: list_bots,
+      )),
     )
   next(ctx)
 }

@@ -109,6 +109,12 @@ pub fn duplicate_bot_id_and_name_rejected_test() {
   seam.insert_bot(row("b1", "other")) |> should.be_error
   // bot_name
   seam.insert_bot(row("b2", "one")) |> should.be_error
+  // bot_name is the functional lower(name) index (#127): differing case
+  // is the SAME name — the seam mirrors the store's CI-unique index.
+  seam.insert_bot(row("b2", "ONE")) |> should.be_error
+  // A rename onto another bot's name in a different case refuses too.
+  let assert Ok(Nil) = seam.insert_bot(row("b2", "two"))
+  seam.update_bot(row("b2", "One")) |> should.be_error
 }
 
 pub fn bot_provider_fk_restrict_test() {

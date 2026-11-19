@@ -1104,12 +1104,13 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
       }
 
     InsertBot(bot, reply) ->
-      // bot_pkey + bot_name, like the schema's constraints; and the
-      // provider FK (RESTRICT — a bot cannot outlive its provider).
+      // bot_pkey + bot_name, like the schema's constraints (bot_name is the
+      // functional lower(name) index — CI-unique, #127); and the provider
+      // FK (RESTRICT — a bot cannot outlive its provider).
       case
         dict.has_key(state.bots, bot.id),
         list.any(dict.values(state.bots), fn(existing) {
-          existing.name == bot.name
+          string.lowercase(existing.name) == string.lowercase(bot.name)
         }),
         dict.has_key(state.providers, bot.provider_id)
       {
@@ -1146,11 +1147,13 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
         }
         Ok(_) ->
           // bot_name: renaming onto another bot's name is refused, like
-          // the schema's UNIQUE constraint — no state change, no event.
+          // the schema's lower(name) UNIQUE index (#127) — case-
+          // insensitive, no state change, no event.
           // The provider FK applies to the moved provider too.
           case
             list.any(dict.values(state.bots), fn(existing) {
-              existing.id != bot.id && existing.name == bot.name
+              existing.id != bot.id
+              && string.lowercase(existing.name) == string.lowercase(bot.name)
             }),
             dict.has_key(state.providers, bot.provider_id)
           {

@@ -69,6 +69,14 @@ pub type Reply {
 ///   was deleted OR the ask timed out — the caller cannot distinguish
 ///   the two, and its error text must claim neither exclusively
 ///   (cubic PR review).
+/// - `list_bots` — the bot registry `List` for the `list_bots` tool
+///   (#127): the discoverability half of bot-to-bot messaging, so a
+///   model learns WHO it can address without guessing names. The rows
+///   are plain data (name, id, allow_inbound) — the executor renders
+///   them; the registry is never imported here (this module stays a
+///   leaf; the ask closes over the registry's process name in the
+///   thread registry, exactly like `sender_name`). `Error` = the ask
+///   failed (registry down or timed out) — an honest tool error.
 pub type Delivery {
   Delivery(
     /// The sending thread's id (rides the `From` prefix, so the target
@@ -80,5 +88,15 @@ pub type Delivery {
     depth: Int,
     deliver: fn(Request) -> Result(Reply, String),
     sender_name: fn() -> Result(String, Nil),
+    list_bots: fn() -> Result(List(BotListing), Nil),
   )
+}
+
+/// One row of the `list_bots` receipt: the fields a sender model needs
+/// to address a peer — the EXACT display name (lookups are
+/// case-insensitive, so casing need not be copied), whether the peer
+/// accepts inbound bot messages, and the id (debugging). Kept a plain
+/// record so this leaf module stays import-free.
+pub type BotListing {
+  BotListing(name: String, bot_id: String, allow_inbound: Bool)
 }

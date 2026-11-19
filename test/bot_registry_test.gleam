@@ -315,7 +315,12 @@ pub fn duplicate_name_pre_check_test() {
   bot_registry.create_bot(registry, params("taken"))
   |> should.equal(Error(bot_registry.DuplicateName))
 
-  // Renaming ANOTHER bot onto it refuses too.
+  // Case is not a distinguishing feature (#127): delivery resolves
+  // names case-insensitively, so "TAKEN" is the SAME name.
+  bot_registry.create_bot(registry, params("TAKEN"))
+  |> should.equal(Error(bot_registry.DuplicateName))
+
+  // Renaming ANOTHER bot onto it refuses too — case-insensitively.
   let assert Ok(other) = bot_registry.create_bot(registry, params("other"))
   bot_registry.update_bot(
     registry,
@@ -331,6 +336,37 @@ pub fn duplicate_name_pre_check_test() {
     ),
   )
   |> should.equal(Error(bot_registry.DuplicateName))
+  bot_registry.update_bot(
+    registry,
+    other.id,
+    bot.BotUpdate(
+      name: Some("TAKEN"),
+      description: None,
+      provider_id: None,
+      model: None,
+      system_prompt: None,
+      tools: None,
+      allow_inbound: None,
+    ),
+  )
+  |> should.equal(Error(bot_registry.DuplicateName))
+
+  // Renaming a bot to its OWN name in a different case is allowed —
+  // a display-case change, not a collision (own id is excluded).
+  let assert Ok(_) =
+    bot_registry.update_bot(
+      registry,
+      other.id,
+      bot.BotUpdate(
+        name: Some("OTHER"),
+        description: None,
+        provider_id: None,
+        model: None,
+        system_prompt: None,
+        tools: None,
+        allow_inbound: None,
+      ),
+    )
 }
 
 pub fn unknown_id_update_delete_refused_test() {
