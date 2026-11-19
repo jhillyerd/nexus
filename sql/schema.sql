@@ -198,15 +198,53 @@ CREATE UNIQUE INDEX IF NOT EXISTS thread_channel ON thread (parent_thread_id, bo
 -- token and compares in constant time, so a stolen DB dump cannot mint a
 -- node connection. Tokens are distinct from the UI token and revocable by
 -- deleting the row (a revoke + re-pair mints a fresh hash).
+--
+-- thread_id binds the credential to its thread (per-thread node names,
+-- the environments plan's own 2b-2 rule: names are unique per ROSTER,
+-- not per instance — two threads can host same-named nodes, and the
+-- per-thread execution maps/rosters already route them independently).
+-- The auth lookup is (thread_id, name), so a row joins ONLY its thread.
+-- CASCADE matches the grant reasoning: a credential for a deleted
+-- thread is meaningless and must die with it.
 CREATE TABLE IF NOT EXISTS node (
   id            text PRIMARY KEY,
-  name          text NOT NULL,                  -- stable user-assigned target name (unique)
+  thread_id     text NOT NULL REFERENCES thread(id) ON DELETE CASCADE,
+  name          text NOT NULL,                  -- stable user-assigned target name (unique per thread)
   token_hash    text NOT NULL,                  -- hex digest of the bearer token, never plaintext
   created_at    timestamptz NOT NULL,
   last_seen_at  timestamptz                     -- bumped on each authenticated connect (NULL = never connected)
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS node_name ON node (name);
+-- Per-thread name scoping (the environments 2b-2 rule the store now
+-- enforces): (thread_id, name) is the node identity — the same name
+-- under a different thread is a DIFFERENT node. The leading column
+-- serves the scoped auth lookup, so no separate thread_id index. The
+-- old instance-global `node_name` index is dropped on databases that
+-- carry it.
+DROP INDEX IF EXISTS node_name;
+
+-- Migration for databases predating per-thread node names: the base
+-- CREATE above skips an existing table, so the column lands here, and
+-- pre-scoping rows have no backfillable thread (nothing in the row
+-- records it) — a node credential is re-mintable by re-pairing, so
+-- they are deleted, then the column is pinned NOT NULL. MUST run
+-- before the (thread_id, name) index below (the column must exist).
+-- One statement so the gate stays atomic; idempotent under the EXISTS
+-- guard (the thread.toolset migration precedent above).
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'node' AND column_name = 'thread_id'
+  ) THEN
+    ALTER TABLE node ADD COLUMN thread_id text;
+    DELETE FROM node WHERE thread_id IS NULL;
+    ALTER TABLE node ALTER COLUMN thread_id SET NOT NULL;
+    ALTER TABLE node ADD FOREIGN KEY (thread_id) REFERENCES thread(id) ON DELETE CASCADE;
+  END IF;
+END $$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS node_thread_name ON node (thread_id, name);
 CREATE INDEX IF NOT EXISTS node_recency ON node (last_seen_at DESC);
 
 -- TUI pairing grants (docs/plans/tui-pairing.md, Phase A): a web-minted,

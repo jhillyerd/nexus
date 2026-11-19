@@ -5259,9 +5259,10 @@ pub fn pane_rows_escape_hostile_labels_test() {
 
 // ---- Environments section (tui-pairing plan Phase C) ----
 
-fn env_node(name: String, last_seen: Option(Int)) -> node.Node {
+fn env_node(thread: String, name: String, last_seen: Option(Int)) -> node.Node {
   node.Node(
     id: "n-" <> name,
+    thread_id: thread,
     name: name,
     token_hash: "aabbcc",
     created_at: timing.wall_now_s() - 3600,
@@ -5295,7 +5296,12 @@ pub fn env_section_renders_roster_test() {
     |> step(ui.Select("s1"))
     |> step(ui.UserEcho(roster_text, Some(now), Some("system")))
     |> step(
-      ui.EnvLoaded(0, Some("s1"), [env_node("proxmox-2", Some(now - 120))], []),
+      ui.EnvLoaded(
+        0,
+        Some("s1"),
+        [env_node("s1", "proxmox-2", Some(now - 120))],
+        [],
+      ),
     )
     |> step(ui.PaneToggled)
   let html = view_string(model)
@@ -5305,6 +5311,8 @@ pub fn env_section_renders_roster_test() {
   should_contain(html, "last seen 2m ago")
   should_contain(html, "data-revoke-node=\"n-proxmox-2\"")
   should_contain(html, "Pair a TUI")
+  // Every stored row is rostered here: no unattached group.
+  should_not_contain(html, "not attached:")
 }
 
 /// A rostered target with NO stored row renders without revoke (no
@@ -5321,13 +5329,55 @@ pub fn env_section_unpaired_and_never_connected_test() {
       Some(now),
       Some("system"),
     ))
-    |> step(ui.EnvLoaded(0, Some("s1"), [env_node("fresh", None)], []))
+    |> step(ui.EnvLoaded(0, Some("s1"), [env_node("s1", "fresh", None)], []))
     |> step(ui.PaneToggled)
   let html = view_string(model)
   should_contain(html, "no credential")
   should_not_contain(html, "data-revoke-node=\"n-ghost\"")
   should_contain(html, "never connected")
   should_contain(html, "data-revoke-node=\"n-fresh\"")
+}
+
+/// A stored node row NOT on this thread's roster — a disconnected TUI's
+/// row awaiting the idle sweep — renders as a "not attached" group with
+/// a Revoke button: the pairing exchange's 409 advice ("revoke it in
+/// the thread info pane") must stay reachable for exactly the ghost row
+/// it names. A rostered row is NOT duplicated into the group, and a
+/// row of ANOTHER thread never renders here at all (names are
+/// per-thread; cross-thread rows are different nodes).
+pub fn env_section_unattached_ghost_rows_test() {
+  let now = timing.wall_now_s()
+  let model =
+    new_model()
+    |> step(ui.ThreadsLoaded([summary("s1", False)]))
+    |> step(ui.Select("s1"))
+    |> step(ui.UserEcho(
+      env.roster_attach_text("proxmox-2", ["workspace", "proxmox-2"]),
+      Some(now),
+      Some("system"),
+    ))
+    |> step(ui.EnvLoaded(
+      0,
+      Some("s1"),
+      [
+        env_node("s1", "proxmox-2", Some(now - 120)),
+        env_node("s1", "plastic", Some(now - 60)),
+        // Another thread's 'laptop' row: a DIFFERENT node (per-thread
+        // names) — invisible here, revocable from its own thread's pane.
+        env_node("s-other", "laptop", Some(now)),
+      ],
+      [],
+    ))
+    |> step(ui.PaneToggled)
+  let html = view_string(model)
+  should_contain(html, "not attached:")
+  should_contain(html, "data-revoke-node=\"n-plastic\"")
+  should_contain(html, "last seen 1m ago")
+  should_not_contain(html, "data-revoke-node=\"n-laptop\"")
+  // Exactly one row for the rostered node (split-and-count idiom).
+  string.split(html, "data-revoke-node=\"n-proxmox-2\"")
+  |> list.length
+  |> should.equal(2)
 }
 
 /// A thread created without a workspace has NO roster row: the section
@@ -5471,7 +5521,9 @@ pub fn env_state_is_per_selection_test() {
     |> step(ui.ThreadsLoaded([summary("s1", False), summary("s2", False)]))
     |> step(ui.Select("s1"))
     |> step(ui.UserEcho(roster_text, Some(now), Some("system")))
-    |> step(ui.EnvLoaded(0, Some("s1"), [env_node("proxmox-2", Some(now))], []))
+    |> step(
+      ui.EnvLoaded(0, Some("s1"), [env_node("s1", "proxmox-2", Some(now))], []),
+    )
     |> step(ui.PaneToggled)
     |> step(ui.GrantMinted("CODE123", env_grant("s1", 0, 3540)))
     |> step(ui.Select("s2"))

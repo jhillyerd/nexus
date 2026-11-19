@@ -115,7 +115,11 @@ pub type MockMsg {
   CountBotsForProvider(id: String, reply: Subject(Result(Int, String)))
   // ---- node rows (docs/plans/environments.md, Phase 2b) ----
   ListNodes(reply: Subject(Result(List(store.StoredNode), String)))
-  GetNodeByName(name: String, reply: Subject(Result(store.StoredNode, String)))
+  GetThreadNode(
+    thread_id: String,
+    name: String,
+    reply: Subject(Result(store.StoredNode, String)),
+  )
   InsertNode(node: store.StoredNode, reply: Subject(Result(Nil, String)))
   TouchNode(id: String, reply: Subject(Result(Nil, String)))
   DeleteNode(id: String, reply: Subject(Result(Nil, String)))
@@ -284,8 +288,8 @@ pub fn seam(mock: Subject(MockMsg)) -> Store {
       call(mock, 5000, fn(r) { CountBotsForProvider(id, r) })
     },
     list_nodes: fn() { call(mock, 5000, ListNodes) },
-    get_node_by_name: fn(name) {
-      call(mock, 5000, fn(r) { GetNodeByName(name, r) })
+    get_thread_node: fn(thread_id, name) {
+      call(mock, 5000, fn(r) { GetThreadNode(thread_id, name, r) })
     },
     insert_node: fn(row) { call(mock, 5000, fn(r) { InsertNode(row, r) }) },
     touch_node: fn(id) { call(mock, 5000, fn(r) { TouchNode(id, r) }) },
@@ -806,7 +810,9 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
       // (bot-channels plan, #123): deleting a parent removes its whole
       // channel subtree (hop chains make channels of channels). A
       // subtree's pairing grants go with it — node_grant_thread_id_fkey
-      // CASCADEs the same way (tui-pairing plan).
+      // CASCADEs the same way (tui-pairing plan) — and so do its NODE
+      // rows: node_thread_id_fkey (per-thread node names, a node
+      // credential is bound to its thread).
       let subtree = channel_subtree(state.threads, id)
       let threads =
         list.fold(subtree, state.threads, fn(threads, sid) {
@@ -819,9 +825,13 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
             option.None -> True
           }
         })
+      let nodes =
+        dict.filter(state.nodes, fn(_nid, node) {
+          !list.contains(subtree, node.thread_id)
+        })
       process.send(reply, Ok(Nil))
       actor.continue(
-        State(..state, threads: threads, grants: grants, events: [
+        State(..state, threads: threads, grants: grants, nodes: nodes, events: [
           EvDeleteThread(id),
           ..state.events
         ]),
@@ -1208,40 +1218,54 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
       actor.continue(state)
     }
 
-    GetNodeByName(name, reply) -> {
+    GetThreadNode(thread_id, name, reply) -> {
       let found =
         state.nodes
         |> dict.values
-        |> list.find(fn(node) { node.name == name })
+        |> list.find(fn(node) {
+          node.name == name && node.thread_id == thread_id
+        })
       case found {
         Ok(node) -> {
           process.send(reply, Ok(node))
           actor.continue(state)
         }
         Error(_) -> {
-          process.send(reply, Error("no stored node named " <> name))
+          process.send(
+            reply,
+            Error("no stored node " <> name <> " in thread " <> thread_id),
+          )
           actor.continue(state)
         }
       }
     }
 
     InsertNode(node, reply) ->
-      // node_pkey + node_name, like the schema's constraints.
+      // node_pkey + node_thread_name, like the schema's constraints.
+      // Names are unique PER THREAD (environments 2b-2): the same name
+      // under a different thread is a DIFFERENT node.
+      // node_thread_id_fkey: a node must reference a stored thread
+      // (the insert-time half; CASCADE is the delete-time half).
       case
         dict.has_key(state.nodes, node.id),
         list.any(dict.values(state.nodes), fn(existing) {
-          existing.name == node.name
-        })
+          existing.name == node.name && existing.thread_id == node.thread_id
+        }),
+        dict.has_key(state.threads, node.thread_id)
       {
-        True, _ -> {
+        True, _, _ -> {
           process.send(reply, Error("node " <> node.id <> " exists"))
           actor.continue(state)
         }
-        False, True -> {
+        False, True, _ -> {
           process.send(reply, Error("node name " <> node.name <> " exists"))
           actor.continue(state)
         }
-        False, False -> {
+        False, False, False -> {
+          process.send(reply, Error("unknown thread " <> node.thread_id))
+          actor.continue(state)
+        }
+        False, False, True -> {
           process.send(reply, Ok(Nil))
           actor.continue(
             State(

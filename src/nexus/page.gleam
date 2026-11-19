@@ -1458,9 +1458,12 @@ details.turn.reasoning.live > summary { color: color-mix(in srgb, currentColor 8
    rule loses the #app button reset's cascade; AGENTS.md cascade trap
    2). */
 #app .env-list, #app .grant-list { display: flex; flex-direction: column; gap: .15rem; }
+#app .env-unattached { margin-top: .3rem; }
+#app .env-unattached p { margin: 0; }
 #app .env-row { display: flex; align-items: baseline; gap: .5rem; width: 100%; }
 #app .env-row .nm { flex: 1; overflow-wrap: anywhere; text-align: left; }
 #app .env-row .age { font-size: .74rem; opacity: .6; }
+#app .env-row.unattached .nm { opacity: .7; }
 #app .env-row button.mini, #app .pair-url-row button.pair-copy {
   padding: .05rem .5rem; margin: 0; font-size: .68rem; width: auto; }
 #app .pair-area { display: flex; flex-direction: column; gap: .3rem; margin-top: .4rem; }

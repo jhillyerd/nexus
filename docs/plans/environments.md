@@ -260,6 +260,29 @@ not a Postgres keyword; FK/index naming per AGENTS.md):
   printed `nexus-node pair` bootstrap); the table lands first so tokens
   are verifiable statelessly per connection.
 
+> **As-built delta (2026-11-19, per-thread node names).** 2b-1 shipped
+> `node.name` as instance-global (`node_name` UNIQUE) while 2b-2's
+> runtime already assumed the opposite — this section's own Identity
+> bullet says names are "enforced unique across the live roster", and
+> the 2b-2 fork note reasons that "node names are unique per ROSTER,
+> not per instance". The store has caught up to the runtime: `node`
+> gained `thread_id` (NOT NULL, FK → thread ON DELETE CASCADE — a
+> credential is meaningless outside its thread, the grant's own
+> reasoning), the unique index is `node_thread_name (thread_id, name)`,
+> the `/node/ws` auth lookup is the (thread, name) PAIR (a row joins
+> ONLY its own thread; wrong thread/wrong name/wrong token all answer
+> the same merged 401 — still no oracle), `POST /nodes` requires
+> `thread`, and the pairing exchange binds the minted row to the
+> request's `thread` override (the launcher's `NEXUS_THREAD`), else the
+> grant's pin. The viewer bullet's "allowed on any thread" narrows to
+> the row's own thread (role still decides only the plane). The
+> migration has no backfill source (nothing in a pre-scoping row
+> records its thread) and node credentials are re-mintable, so it
+> deletes them and pins NOT NULL — the operator re-pairs. The UI token
+> authority wording above is otherwise unchanged: the token's OTHER
+> authority stays instance-wide v1; the thread binding scopes the
+> IDENTITY, not the token's whole reach.
+
 ### General MCP (future, owned by the plugin-api plan)
 
 Third-party MCP servers mount **at thread creation only**, never

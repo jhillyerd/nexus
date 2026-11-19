@@ -17,9 +17,11 @@
 #   NEXUS_PAIR_URL=<url>        env form of the pair-url argument
 #
 # Overrides (win over the grant's / stored values):
-#   NEXUS_NODE      node name (default: short hostname)
+#   NEXUS_NODE      node name (default: short hostname; unique per thread)
 #   NEXUS_ROLE      env (default) | viewer
-#   NEXUS_THREAD    join a different thread than the grant's
+#   NEXUS_THREAD    join a different thread than the grant's (also
+#                   disambiguates several stored credentials for one
+#                   node name)
 #   NEXUS_URL       disambiguator when several servers hold stored
 #                   credentials under the same node name
 #
@@ -60,7 +62,8 @@ Without a stored credential and without a pairing URL there is nothing
 to connect with.
 
 Overrides: NEXUS_NODE, NEXUS_ROLE, NEXUS_THREAD, NEXUS_PAIR_URL
-(and NEXUS_URL to disambiguate several stored servers).
+(and NEXUS_URL / NEXUS_THREAD to disambiguate several stored
+credentials for one node name).
 EOF
 }
 
@@ -112,15 +115,23 @@ resolve_pair_url() {
 }
 
 # ---------------------------------------------------------------------------
-# State file: keyed per (server base, node name)
+# State file: keyed per (server base, node name, thread) — node names
+# are unique PER THREAD, so the thread is part of the identity
 # ---------------------------------------------------------------------------
 
-state_key() {  # <base-url> — the authority, filename-safe
-  printf '%s' "$1" | sed -E 's#^https?://##; s#/.*$##' | tr -c 'a-zA-Z0-9._-' '-' | sed 's#-$##'
+name_key() {  # <string> — filename-safe
+  printf '%s' "$1" | tr -c 'a-zA-Z0-9._-' '-' | sed 's/-$//'
 }
 
-state_path() {  # <base-url> <node>
-  printf '%s/tui-%s-%s.json' "$STATE_ROOT" "$(state_key "$1")" "$2"
+state_key() {  # <base-url> — the authority, filename-safe
+  local authority
+  authority=$(printf '%s' "$1" | sed -E 's#^https?://##; s#/.*$##')
+  name_key "$authority"
+}
+
+state_path() {  # <base-url> <node> <thread>
+  printf '%s/tui-%s-%s-%s.json' \
+    "$STATE_ROOT" "$(state_key "$1")" "$(name_key "$2")" "$(name_key "$3")"
 }
 
 load_state() {  # <file> → S_SERVER S_NODE S_TOKEN S_THREAD (non-empty)
@@ -141,15 +152,19 @@ load_state() {  # <file> → S_SERVER S_NODE S_TOKEN S_THREAD (non-empty)
 }
 
 # Find this node's stored credential. With a base given, only the
-# matching server's file qualifies; without one, a single match is
-# taken and several are listed for the caller to disambiguate.
-pick_state() {  # <node> <base-or-empty>
-  local node="$1" base="${2:-}" f
+# matching server's file qualifies; with a thread given (NEXUS_THREAD),
+# only the matching thread's. Without one, a single match is taken and
+# several are listed for the caller to disambiguate.
+pick_state() {  # <node> <base-or-empty> <thread-or-empty>
+  local node="$1" base="${2:-}" thread="${3:-}" f
   local -a matches=()
   for f in "$STATE_ROOT"/tui-*.json; do
     [ -f "$f" ] || continue
     [ "$(jq -r '.node // ""' "$f" 2>/dev/null)" = "$node" ] || continue
     if [ -n "$base" ] && [ "$(jq -r '.server // ""' "$f" 2>/dev/null)" != "$base" ]; then
+      continue
+    fi
+    if [ -n "$thread" ] && [ "$(jq -r '.thread // ""' "$f" 2>/dev/null)" != "$thread" ]; then
       continue
     fi
     matches+=("$f")
@@ -161,9 +176,9 @@ pick_state() {  # <node> <base-or-empty>
       local m
       echo "error: several stored credentials for node '$node':" >&2
       for m in "${matches[@]}"; do
-        echo "  $m (server $(jq -r '.server // "?"' "$m" 2>/dev/null))" >&2
+        echo "  $m (server $(jq -r '.server // "?"' "$m" 2>/dev/null), thread $(jq -r '.thread // "?"' "$m" 2>/dev/null))" >&2
       done
-      echo "relaunch with its pairing URL, or set NEXUS_URL to pick the server" >&2
+      echo "relaunch with its pairing URL, or set NEXUS_URL / NEXUS_THREAD to pick one" >&2
       exit 2
       ;;
   esac
@@ -212,7 +227,15 @@ exchange() {  # <base> <code> <node>
   local nl body status
   nl=$'\n'
   local payload
-  payload=$(jq -n --arg code "$code" --arg name "$node" '{code: $code, name: $name}')
+  # NEXUS_THREAD overrides the grant's pinned thread AT PAIR TIME: the
+  # exchange binds the minted row to the thread the TUI will join
+  # (names are per-thread, so the row's thread is its identity).
+  if [ -n "${NEXUS_THREAD:-}" ]; then
+    payload=$(jq -n --arg code "$code" --arg name "$node" \
+      --arg thread "$NEXUS_THREAD" '{code: $code, name: $name, thread: $thread}')
+  else
+    payload=$(jq -n --arg code "$code" --arg name "$node" '{code: $code, name: $name}')
+  fi
   if ! body=$(curl -s -w "$nl%{http_code}" -X POST \
     -H 'content-type: application/json' \
     -d "$payload" "$base/nodes/pair"); then
@@ -227,10 +250,12 @@ exchange() {  # <base> <code> <node>
       [ -n "$PAIRED_TOKEN" ] || die "exchange response carried no token"
       ;;
     409)
-      # The name is taken by a LIVE row (a lost state file's usual
-      # face): revoke it in the thread info pane (Environments section)
-      # or via the /nodes API, then pair again.
-      echo "error: node name '$node' is already paired — revoke it in the thread info pane (Environments) or via DELETE /nodes, then retry" >&2
+      # The name is taken by a LIVE row of THIS thread (per-thread
+      # names; a lost state file's usual face): revoke it in the thread
+      # info pane (Environments section — the row shows under "not
+      # attached" once its TUI has disconnected) or via the /nodes API,
+      # then pair again.
+      echo "error: node name '$node' is already paired on this thread — revoke it in the thread info pane (Environments) or via DELETE /nodes, then retry" >&2
       exit 1
       ;;
     404)
@@ -300,12 +325,14 @@ fi
 # The flows
 # ---------------------------------------------------------------------------
 
-# Locate the stored credential (if any) and load it.
+# Locate the stored credential (if any) and load it. NEXUS_THREAD
+# narrows the lookup to one thread (names are per-thread, so several
+# files can legitimately carry the same node name).
 STATE_FILE=""
 if [ -n "$BASE" ]; then
-  pick_state "$NODE" "$BASE"
+  pick_state "$NODE" "$BASE" "${NEXUS_THREAD:-}"
 else
-  pick_state "$NODE" ""
+  pick_state "$NODE" "" "${NEXUS_THREAD:-}"
 fi
 HAVE_STATE=0
 if [ -n "$STATE_FILE" ] && load_state "$STATE_FILE"; then
@@ -331,7 +358,7 @@ if [ "$HAVE_STATE" = 1 ]; then
   if [ -z "$THREAD" ]; then
     die "the grant carries no thread id — mint pairing URLs from a thread's info pane (Environments section)"
   fi
-  STATE_FILE="$(state_path "$BASE" "$NODE")"
+  STATE_FILE="$(state_path "$BASE" "$NODE" "$THREAD")"
   save_state "$BASE" "$NODE" "$PAIRED_TOKEN" "$THREAD" "$STATE_FILE"
   echo "paired as '$NODE' (state: $STATE_FILE)"
   launch_tui "$BASE" "$PAIRED_TOKEN" "$THREAD"
@@ -351,7 +378,7 @@ THREAD="${NEXUS_THREAD:-$PAIRED_THREAD}"
 if [ -z "$THREAD" ]; then
   die "the grant carries no thread id — mint pairing URLs from a thread's info pane (Environments section)"
 fi
-STATE_FILE="$(state_path "$BASE" "$NODE")"
+STATE_FILE="$(state_path "$BASE" "$NODE" "$THREAD")"
 save_state "$BASE" "$NODE" "$PAIRED_TOKEN" "$THREAD" "$STATE_FILE"
 echo "paired as '$NODE' (state: $STATE_FILE)"
 launch_tui "$BASE" "$PAIRED_TOKEN" "$THREAD"

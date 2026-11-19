@@ -155,12 +155,12 @@ pub fn handler(
       // still plan-deferred; these routes are the curl/e2e path.
       Get, ["nodes"] -> protected(cfg, req, fn() { nodes_response(store) })
       Post, ["nodes"] ->
-        protected(cfg, req, fn() { create_node_response(req, store) })
+        protected(cfg, req, fn() { create_node_response(req, store, registry) })
       // The pairing exchange (tui-pairing plan Phase A): PUBLIC — its
       // auth is the pairing code itself (the /node/ws precedent: a
       // TUI host is not a browser and holds no UI token). It mints a
-      // node credential and answers the grant's pinned thread.
-      Post, ["nodes", "pair"] -> node_pair_response(req, store)
+      // node credential and answers its effective thread.
+      Post, ["nodes", "pair"] -> node_pair_response(req, store, registry)
       Delete, ["nodes", id] ->
         protected(cfg, req, fn() { delete_node_response(store, id) })
       _, _ -> json_response(404, err_json("not found"))
@@ -1293,15 +1293,18 @@ fn stop_response(
 // Node routes (environments plan Phase 2b-3)
 // ---------------------------------------------------------------------------
 
-/// The POST /nodes body: `{"name": …}` — everything else (id, token,
-/// hashes, stamps) is minted server-side.
+/// The POST /nodes body: `{"name": …, "thread": …}` — the node row is
+/// bound to its thread (per-thread node names), so the credential's
+/// thread is REQUIRED; everything else (id, token, hashes, stamps) is
+/// minted server-side.
 pub type NodeCreateFields {
-  NodeCreateFields(name: String)
+  NodeCreateFields(name: String, thread: String)
 }
 
 pub fn node_create_fields_decoder() -> decode.Decoder(NodeCreateFields) {
   use name <- decode.field("name", decode.string)
-  decode.success(NodeCreateFields(name:))
+  use thread <- decode.field("thread", decode.string)
+  decode.success(NodeCreateFields(name:, thread:))
 }
 
 pub fn parse_node_create_json(body: String) -> Result(NodeCreateFields, Nil) {
@@ -1309,16 +1312,24 @@ pub fn parse_node_create_json(body: String) -> Result(NodeCreateFields, Nil) {
   |> result.map_error(fn(_) { Nil })
 }
 
-/// The POST /nodes/pair body: `{"code": …, "name": …}` — a TUI host
-/// redeeming a pairing code for its node credential.
+/// The POST /nodes/pair body: `{"code": …, "name": …, "thread": …}` —
+/// a TUI host redeeming a pairing code for its node credential.
+/// `thread` is OPTIONAL: the grant's pinned thread by default; the
+/// launcher's NEXUS_THREAD override rides here so the row is bound to
+/// the thread the TUI will actually join.
 pub type NodePairFields {
-  NodePairFields(code: String, name: String)
+  NodePairFields(code: String, name: String, thread: Option(String))
 }
 
 pub fn node_pair_fields_decoder() -> decode.Decoder(NodePairFields) {
   use code <- decode.field("code", decode.string)
   use name <- decode.field("name", decode.string)
-  decode.success(NodePairFields(code:, name:))
+  use thread <- decode.optional_field(
+    "thread",
+    option.None,
+    decode.optional(decode.string),
+  )
+  decode.success(NodePairFields(code:, name:, thread:))
 }
 
 pub fn parse_node_pair_json(body: String) -> Result(NodePairFields, Nil) {
@@ -1361,6 +1372,7 @@ fn read_node_pair(
 fn node_json(row: store.StoredNode) -> Json {
   json.object([
     #("id", json.string(row.id)),
+    #("thread_id", json.string(row.thread_id)),
     #("name", json.string(row.name)),
     #("created_at", json.int(row.created_at)),
     #("created_at_rfc3339", json.string(timing.wall_to_rfc3339(row.created_at))),
@@ -1379,13 +1391,16 @@ fn nodes_response(store: store.Store) -> Response(mist.ResponseData) {
   }
 }
 
-/// Pair: validate the name, mint the token (32 random bytes, URL-safe
-/// base64 — query-string safe for `/node/ws?token=`), store only the
-/// hash, answer the plaintext EXACTLY ONCE. Collision with a live name
-/// is the friendly 409 (the schema's UNIQUE is the backstop).
+/// Pair: validate the name + thread, mint the token (32 random bytes,
+/// URL-safe base64 — query-string safe for `/node/ws?token=`), store
+/// only the hash, answer the plaintext EXACTLY ONCE. The row is bound
+/// to its thread (per-thread node names); collision with a live name
+/// IN THAT THREAD is the friendly 409 (the schema's UNIQUE is the
+/// backstop).
 fn create_node_response(
   req: Request(mist.Connection),
   store: store.Store,
+  registry: process.Subject(thread_registry.Msg),
 ) -> Response(mist.ResponseData) {
   case read_node_create(req) {
     Error(_) -> json_response(400, err_json("unreadable body"))
@@ -1393,24 +1408,32 @@ fn create_node_response(
       case node.valid_name(fields.name) {
         Error(reason) -> json_response(400, err_json(reason))
         Ok(name) ->
-          case node_name_free(store, name) {
-            Error(resp) -> resp
-            Ok(Nil) ->
-              case mint_node(store, name) {
+          // The row binds to its thread, so the thread must exist —
+          // the same ask the /node/ws upgrade uses (a dormant thread
+          // lazy-starts; harmless, the join would wake it anyway).
+          case thread_registry.get(registry, fields.thread) {
+            Error(_) -> json_response(404, err_json("thread not found"))
+            Ok(_) ->
+              case node_name_free(store, fields.thread, name) {
                 Error(resp) -> resp
-                Ok(#(token, row)) ->
-                  json_response(
-                    201,
-                    json.object([
-                      #("id", json.string(row.id)),
-                      #("name", json.string(row.name)),
-                      // The plaintext answers ONCE, here — the stored
-                      // row carries only the hash, and no later route
-                      // can recover it.
-                      #("token", json.string(token)),
-                      #("created_at", json.int(row.created_at)),
-                    ]),
-                  )
+                Ok(Nil) ->
+                  case mint_node(store, fields.thread, name) {
+                    Error(resp) -> resp
+                    Ok(#(token, row)) ->
+                      json_response(
+                        201,
+                        json.object([
+                          #("id", json.string(row.id)),
+                          #("name", json.string(row.name)),
+                          #("thread_id", json.string(row.thread_id)),
+                          // The plaintext answers ONCE, here — the stored
+                          // row carries only the hash, and no later route
+                          // can recover it.
+                          #("token", json.string(token)),
+                          #("created_at", json.int(row.created_at)),
+                        ]),
+                      )
+                  }
               }
           }
       }
@@ -1418,18 +1441,23 @@ fn create_node_response(
 }
 
 /// The friendly duplicate-name pre-check shared by both mint routes
-/// (the bot registry's pattern): the seam's single-error type cannot
-/// distinguish "missing" from "store down", but `list_nodes` answers
-/// unambiguously — the schema's UNIQUE is the cross-instance backstop
-/// either way.
+/// (the bot registry's pattern), scoped to the THREAD (per-thread node
+/// names): the seam's single-error type cannot distinguish "missing"
+/// from "store down", but `list_nodes` answers unambiguously — the
+/// schema's UNIQUE is the cross-instance backstop either way.
 fn node_name_free(
   store: store.Store,
+  thread_id: String,
   name: String,
 ) -> Result(Nil, Response(mist.ResponseData)) {
   case store.list_nodes() {
     Error(_) -> Error(json_response(502, err_json("store unavailable")))
     Ok(rows) ->
-      case list.find(rows, fn(row) { row.name == name }) {
+      case
+        list.find(rows, fn(row) {
+          row.name == name && row.thread_id == thread_id
+        })
+      {
         Ok(_) ->
           Error(json_response(409, err_json("node name is already paired")))
         Error(_) -> Ok(Nil)
@@ -1439,10 +1467,12 @@ fn node_name_free(
 
 /// Mint a node row + its one-time plaintext token — the ONE mint path,
 /// shared by the UI-token `POST /nodes` and the public pairing
-/// exchange, so the two can never drift. Errors are the ready-made
-/// responses the routes answer verbatim.
+/// exchange, so the two can never drift. The row binds to its thread
+/// (per-thread node names). Errors are the ready-made responses the
+/// routes answer verbatim.
 fn mint_node(
   store: store.Store,
+  thread_id: String,
   name: String,
 ) -> Result(#(String, store.StoredNode), Response(mist.ResponseData)) {
   let token =
@@ -1456,6 +1486,7 @@ fn mint_node(
   let row =
     node.Node(
       id: id,
+      thread_id: thread_id,
       name: name,
       token_hash: node.hash_token(token),
       created_at: timing.wall_now_s(),
@@ -1464,7 +1495,8 @@ fn mint_node(
   case store.insert_node(row) {
     Ok(Nil) -> Ok(#(token, row))
     Error(_) -> {
-      let #(status, message) = node_insert_failure(store.list_nodes(), name)
+      let #(status, message) =
+        node_insert_failure(store.list_nodes(), thread_id, name)
       Error(json_response(status, err_json(message)))
     }
   }
@@ -1497,16 +1529,19 @@ fn find_live_grant(
 }
 
 /// The PUBLIC exchange (tui-pairing plan Phase A): a TUI host redeems
-/// a pairing code for a node credential plus the grant's pinned
-/// thread_id — the host needs no UI token and no thread knowledge.
-/// Multi-use by design: every exchange mints a NEW node row (several
-/// hosts from one URL) and bumps the grant's diagnostics. A code must
-/// NEVER authorize taking over an existing name — a grant mints new
-/// nodes, nothing else — so the name pre-check/409 path is the same as
-/// the admin route's.
+/// a pairing code for a node credential plus its thread — the host
+/// needs no UI token and no thread knowledge. Multi-use by design:
+/// every exchange mints a NEW node row (several hosts from one URL)
+/// and bumps the grant's diagnostics. A code must NEVER authorize
+/// taking over an existing name — a grant mints new nodes, nothing
+/// else — so the name pre-check/409 path is the same as the admin
+/// route's, scoped to the thread the row will bind to (per-thread
+/// node names): the request's `thread` override, else the grant's
+/// pin.
 fn node_pair_response(
   req: Request(mist.Connection),
   store: store.Store,
+  registry: process.Subject(thread_registry.Msg),
 ) -> Response(mist.ResponseData) {
   case read_node_pair(req) {
     Error(_) -> json_response(400, err_json("unreadable body"))
@@ -1528,29 +1563,47 @@ fn node_pair_response(
           case find_live_grant(store, fields.code, timing.wall_now_s()) {
             Error(resp) -> resp
             Ok(grant) ->
-              case node_name_free(store, name) {
-                Error(resp) -> resp
-                Ok(Nil) ->
-                  case mint_node(store, name) {
-                    Error(resp) -> resp
-                    Ok(#(token, row)) -> {
-                      // Best-effort diagnostics (the touch_node rule):
-                      // use_count + last_used_at for the info pane.
-                      let _ = store.touch_node_grant(grant.id)
-                      json_response(
-                        201,
-                        json.object([
-                          #("id", json.string(row.id)),
-                          #("name", json.string(row.name)),
-                          #("token", json.string(token)),
-                          #("thread_id", case grant.thread_id {
-                            Some(id) -> json.string(id)
-                            None -> json.null()
-                          }),
-                          #("created_at", json.int(row.created_at)),
-                        ]),
-                      )
-                    }
+              // The EFFECTIVE thread: the request's override (the
+              // launcher's NEXUS_THREAD), else the grant's pin. v1
+              // grants always pin, so only a future unpinned grant
+              // shape without an override lands here — refuse rather
+              // than mint an unjoinable row.
+              case effective_thread(fields.thread, grant.thread_id) {
+                Error(_) ->
+                  json_response(
+                    400,
+                    err_json("grant is not pinned to a thread; pass \"thread\""),
+                  )
+                Ok(thread_id) ->
+                  // The row binds to its thread (per-thread names), so
+                  // the effective thread must EXIST — the admin route's
+                  // ask (a stolen code already carries instance-wide
+                  // authority v1, so the wake is not an escalation).
+                  case thread_registry.get(registry, thread_id) {
+                    Error(_) -> json_response(404, err_json("thread not found"))
+                    Ok(_) ->
+                      case node_name_free(store, thread_id, name) {
+                        Error(resp) -> resp
+                        Ok(Nil) ->
+                          case mint_node(store, thread_id, name) {
+                            Error(resp) -> resp
+                            Ok(#(token, row)) -> {
+                              // Best-effort diagnostics (the touch_node rule):
+                              // use_count + last_used_at for the info pane.
+                              let _ = store.touch_node_grant(grant.id)
+                              json_response(
+                                201,
+                                json.object([
+                                  #("id", json.string(row.id)),
+                                  #("name", json.string(row.name)),
+                                  #("token", json.string(token)),
+                                  #("thread_id", json.string(thread_id)),
+                                  #("created_at", json.int(row.created_at)),
+                                ]),
+                              )
+                            }
+                          }
+                      }
                   }
               }
           }
@@ -1558,20 +1611,41 @@ fn node_pair_response(
   }
 }
 
+/// The exchange's effective thread: the request's `thread` override,
+/// else the grant's pinned thread (the option.or precedence). Pure,
+/// offline-testable.
+pub fn effective_thread(
+  override: Option(String),
+  pinned: Option(String),
+) -> Result(String, Nil) {
+  case override {
+    Some(thread) -> Ok(thread)
+    None ->
+      case pinned {
+        Some(thread) -> Ok(thread)
+        None -> Error(Nil)
+      }
+  }
+}
+
 /// The insert's failure mapping (cubic review): a concurrent pair of
-/// the same name can lose the pre-check race and hit the unique index —
-/// re-check before calling it a store failure, so the loser gets the
-/// same friendly 409. Pure over the re-listed rows (the race itself
-/// cannot be staged through the seam: the mock rejects against the
-/// same state the pre-check reads), hence offline-testable directly.
+/// the same (thread, name) can lose the pre-check race and hit the
+/// unique index — re-check before calling it a store failure, so the
+/// loser gets the same friendly 409. Pure over the re-listed rows (the
+/// race itself cannot be staged through the seam: the mock rejects
+/// against the same state the pre-check reads), hence offline-testable
+/// directly.
 pub fn node_insert_failure(
   listing: Result(List(store.StoredNode), store.StoreError),
+  thread_id: String,
   name: String,
 ) -> #(Int, String) {
   case listing {
     Error(_) -> #(502, "store unavailable")
     Ok(rows) ->
-      case list.find(rows, fn(r) { r.name == name }) {
+      case
+        list.find(rows, fn(r) { r.name == name && r.thread_id == thread_id })
+      {
         Ok(_) -> #(409, "node name is already paired")
         Error(_) -> #(502, "store unavailable")
       }

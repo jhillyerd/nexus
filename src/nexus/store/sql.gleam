@@ -701,62 +701,6 @@ where id = $1
   |> pog.execute(db)
 }
 
-/// A row you get from running the `get_node_by_name` query
-/// defined in `./src/nexus/store/sql/get_node_by_name.sql`.
-///
-/// > 🐿️ This type definition was generated automatically using v4.7.0 of the
-/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
-///
-pub type GetNodeByNameRow {
-  GetNodeByNameRow(
-    id: String,
-    name: String,
-    token_hash: String,
-    created_s: Int,
-    last_seen_s: Int,
-  )
-}
-
-/// One node row by NAME (the stateless token-verification lookup key).
-///
-/// > 🐿️ This function was generated automatically using v4.7.0 of
-/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
-///
-pub fn get_node_by_name(
-  db: pog.Connection,
-  name: String,
-) -> Result(pog.Returned(GetNodeByNameRow), pog.QueryError) {
-  let decoder = {
-    use id <- decode.field(0, decode.string)
-    use name <- decode.field(1, decode.string)
-    use token_hash <- decode.field(2, decode.string)
-    use created_s <- decode.field(3, decode.int)
-    use last_seen_s <- decode.field(4, decode.int)
-    decode.success(GetNodeByNameRow(
-      id:,
-      name:,
-      token_hash:,
-      created_s:,
-      last_seen_s:,
-    ))
-  }
-
-  "-- One node row by NAME (the stateless token-verification lookup key).
-select
-  id,
-  name,
-  token_hash,
-  extract(epoch from created_at)::int8 as created_s,
-  coalesce(extract(epoch from last_seen_at)::int8, 0) as last_seen_s
-from node
-where name = $1
-"
-  |> pog.query
-  |> pog.parameter(pog.text(name))
-  |> pog.returning(decoder)
-  |> pog.execute(db)
-}
-
 /// A row you get from running the `get_provider` query
 /// defined in `./src/nexus/store/sql/get_provider.sql`.
 ///
@@ -959,6 +903,76 @@ where id = $1
   |> pog.execute(db)
 }
 
+/// A row you get from running the `get_thread_node` query
+/// defined in `./src/nexus/store/sql/get_thread_node.sql`.
+///
+/// > 🐿️ This type definition was generated automatically using v4.7.0 of the
+/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub type GetThreadNodeRow {
+  GetThreadNodeRow(
+    id: String,
+    thread_id: String,
+    name: String,
+    token_hash: String,
+    created_s: Int,
+    last_seen_s: Int,
+  )
+}
+
+/// One node row by (thread, NAME) — the stateless token-verification
+/// lookup key (environments 2b-2's per-thread rule): the /node/ws
+/// upgrade authenticates the (thread, name) pair, so a row joins ONLY
+/// its own thread and the same name under another thread is a
+/// DIFFERENT node (node_thread_name UNIQUE).
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn get_thread_node(
+  db: pog.Connection,
+  thread_id: String,
+  name: String,
+) -> Result(pog.Returned(GetThreadNodeRow), pog.QueryError) {
+  let decoder = {
+    use id <- decode.field(0, decode.string)
+    use thread_id <- decode.field(1, decode.string)
+    use name <- decode.field(2, decode.string)
+    use token_hash <- decode.field(3, decode.string)
+    use created_s <- decode.field(4, decode.int)
+    use last_seen_s <- decode.field(5, decode.int)
+    decode.success(GetThreadNodeRow(
+      id:,
+      thread_id:,
+      name:,
+      token_hash:,
+      created_s:,
+      last_seen_s:,
+    ))
+  }
+
+  "-- One node row by (thread, NAME) — the stateless token-verification
+-- lookup key (environments 2b-2's per-thread rule): the /node/ws
+-- upgrade authenticates the (thread, name) pair, so a row joins ONLY
+-- its own thread and the same name under another thread is a
+-- DIFFERENT node (node_thread_name UNIQUE).
+select
+  id,
+  thread_id,
+  name,
+  token_hash,
+  extract(epoch from created_at)::int8 as created_s,
+  coalesce(extract(epoch from last_seen_at)::int8, 0) as last_seen_s
+from node
+where thread_id = $1 and name = $2
+"
+  |> pog.query
+  |> pog.parameter(pog.text(thread_id))
+  |> pog.parameter(pog.text(name))
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
 /// A new bot row. `system_prompt` is NULL = global default (resolved at
 /// thread creation, never at request time); the '' sentinel inserts NULL —
 /// Postgres exposes no parameter nullability, so squirrel parameters cannot
@@ -1023,10 +1037,12 @@ values ($1, $2, $3, $4, $5, nullif($6, ''), case when $8::boolean then null else
 }
 
 /// A new node row (environments plan Phase 2b): the remote paired-TUI
-/// node entity. `token_hash` is the SHA-256 digest of the bearer token
-/// (nexus/node.gleam) — NEVER the plaintext. `last_seen_at` is
-/// to_timestamp(nullif($5, 0)): the 0 sentinel — a fresh pair has never
-/// connected, so the column is NULL.
+/// node entity. Per-thread names (environments 2b-2): the row is bound
+/// to its thread — the roster it serves — and (thread_id, name) is the
+/// node identity (node_thread_name UNIQUE). `token_hash` is the SHA-256
+/// digest of the bearer token (nexus/node.gleam) — NEVER the plaintext.
+/// `last_seen_at` is to_timestamp(nullif($5, 0)): the 0 sentinel — a
+/// fresh pair has never connected, so the column is NULL.
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
@@ -1036,25 +1052,29 @@ pub fn insert_node(
   arg_1: String,
   arg_2: String,
   arg_3: String,
-  arg_4: Float,
-  arg_5: Int,
+  arg_4: String,
+  arg_5: Float,
+  arg_6: Int,
 ) -> Result(pog.Returned(Nil), pog.QueryError) {
   let decoder = decode.map(decode.dynamic, fn(_) { Nil })
 
   "-- A new node row (environments plan Phase 2b): the remote paired-TUI
--- node entity. `token_hash` is the SHA-256 digest of the bearer token
--- (nexus/node.gleam) — NEVER the plaintext. `last_seen_at` is
--- to_timestamp(nullif($5, 0)): the 0 sentinel — a fresh pair has never
--- connected, so the column is NULL.
-insert into node (id, name, token_hash, created_at, last_seen_at)
-values ($1, $2, $3, to_timestamp($4), to_timestamp(nullif($5, 0::bigint)))
+-- node entity. Per-thread names (environments 2b-2): the row is bound
+-- to its thread — the roster it serves — and (thread_id, name) is the
+-- node identity (node_thread_name UNIQUE). `token_hash` is the SHA-256
+-- digest of the bearer token (nexus/node.gleam) — NEVER the plaintext.
+-- `last_seen_at` is to_timestamp(nullif($5, 0)): the 0 sentinel — a
+-- fresh pair has never connected, so the column is NULL.
+insert into node (id, thread_id, name, token_hash, created_at, last_seen_at)
+values ($1, $2, $3, $4, to_timestamp($5), to_timestamp(nullif($6, 0::bigint)))
 "
   |> pog.query
   |> pog.parameter(pog.text(arg_1))
   |> pog.parameter(pog.text(arg_2))
   |> pog.parameter(pog.text(arg_3))
-  |> pog.parameter(pog.float(arg_4))
-  |> pog.parameter(pog.int(arg_5))
+  |> pog.parameter(pog.text(arg_4))
+  |> pog.parameter(pog.float(arg_5))
+  |> pog.parameter(pog.int(arg_6))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }
@@ -1423,6 +1443,7 @@ order by id
 pub type ListNodesRow {
   ListNodesRow(
     id: String,
+    thread_id: String,
     name: String,
     token_hash: String,
     created_s: Int,
@@ -1430,7 +1451,10 @@ pub type ListNodesRow {
   )
 }
 
-/// All node rows (registry boot load), ordered by id.
+/// All node rows (the pane's store read + GET /nodes), ordered by id.
+/// Rows carry their thread: a node credential is bound to ONE thread
+/// (per-thread node names, environments 2b-2) — consumers scope by it
+/// (the info pane renders only the selected thread's rows).
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
@@ -1440,12 +1464,14 @@ pub fn list_nodes(
 ) -> Result(pog.Returned(ListNodesRow), pog.QueryError) {
   let decoder = {
     use id <- decode.field(0, decode.string)
-    use name <- decode.field(1, decode.string)
-    use token_hash <- decode.field(2, decode.string)
-    use created_s <- decode.field(3, decode.int)
-    use last_seen_s <- decode.field(4, decode.int)
+    use thread_id <- decode.field(1, decode.string)
+    use name <- decode.field(2, decode.string)
+    use token_hash <- decode.field(3, decode.string)
+    use created_s <- decode.field(4, decode.int)
+    use last_seen_s <- decode.field(5, decode.int)
     decode.success(ListNodesRow(
       id:,
+      thread_id:,
       name:,
       token_hash:,
       created_s:,
@@ -1453,9 +1479,13 @@ pub fn list_nodes(
     ))
   }
 
-  "-- All node rows (registry boot load), ordered by id.
+  "-- All node rows (the pane's store read + GET /nodes), ordered by id.
+-- Rows carry their thread: a node credential is bound to ONE thread
+-- (per-thread node names, environments 2b-2) — consumers scope by it
+-- (the info pane renders only the selected thread's rows).
 select
   id,
+  thread_id,
   name,
   token_hash,
   extract(epoch from created_at)::int8 as created_s,

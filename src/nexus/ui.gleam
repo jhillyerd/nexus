@@ -1797,6 +1797,11 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         // grant (it was revoked — or swept) drops the one-time URL
         // display with it: a revoked code must not linger.
         True, True -> {
+          // Node rows are scoped to THIS thread: names are per-thread
+          // (environments 2b-2), so another thread's rows are different
+          // nodes entirely and never render here — not rostered, not in
+          // the "not attached" group.
+          let nodes = list.filter(nodes, fn(n) { Some(n.thread_id) == id })
           let grant_minted = case model.grant_minted {
             Some(#(code, g)) ->
               case list.any(grants, fn(other) { other.id == g.id }) {
@@ -3173,11 +3178,14 @@ fn info_pane(model: Model) -> Element(Msg) {
 /// The pane's Environments section (tui-pairing plan Phase C): the
 /// thread's environment roster (the newest roster row in the log — the
 /// server's own hydration rule — joined with the store's node rows for
-/// last-seen ages and revokes), the "Pair a TUI…" mint with its ONE-TIME
-/// URL display, and the selected thread's pairing grants. Everything
-/// rendered is a Lustre text node — roster target names are transcript
-/// text (hostile-text rule), codes and node names are server-minted but
-/// still rendered inert.
+/// last-seen ages and revokes), THIS thread's stored rows that are not
+/// on that roster (detached TUIs awaiting the idle sweep — the
+/// EnvLoaded handler already filtered out every other thread's rows),
+/// the "Pair a TUI…" mint with its ONE-TIME URL display, and the
+/// selected thread's pairing grants. Everything rendered is a Lustre
+/// text node — roster target names are transcript text (hostile-text
+/// rule), codes and node names are server-minted but still rendered
+/// inert.
 fn env_section(model: Model) -> Element(Msg) {
   html.section([attr.class("sec")], [
     html.h3([], [html.text("Environments")]),
@@ -3191,6 +3199,7 @@ fn env_section(model: Model) -> Element(Msg) {
           [attr.class("env-list")],
           list.flatten([
             list.map(targets, fn(target) { env_row(model, target) }),
+            [env_unattached_area(model, targets)],
             [mint_area(model)],
             [grants_area(model)],
           ]),
@@ -3264,6 +3273,45 @@ fn env_row(model: Model, target: String) -> Element(Msg) {
           ])
       }
   }
+}
+
+/// THIS thread's stored node rows whose name is not on its roster:
+/// paired-but-unattached credentials — a disconnect detaches the TUI
+/// from the roster while its row lives on (idle sweep, default 7
+/// days), and a paired-never-connected row lands here too. These are
+/// exactly the ghost rows the pairing exchange's 409 ("already paired
+/// on this thread — revoke it in the thread info pane") names; this
+/// group is their reachable Revoke.
+fn env_unattached_area(model: Model, targets: List(String)) -> Element(Msg) {
+  let unattached =
+    list.filter(model.env_nodes, fn(n) { !list.contains(targets, n.name) })
+  case unattached {
+    [] -> element.none()
+    rows ->
+      html.div(
+        [attr.class("env-unattached")],
+        list.flatten([
+          [html.p([attr.class("sec-none")], [html.text("not attached:")])],
+          list.map(rows, env_unattached_row),
+        ]),
+      )
+  }
+}
+
+fn env_unattached_row(n: node.Node) -> Element(Msg) {
+  html.div([attr.class("env-row unattached")], [
+    html.span([attr.class("nm")], [html.text(n.name)]),
+    html.span([attr.class("age")], [html.text(last_seen_label(n))]),
+    html.button(
+      [
+        attr.type_("button"),
+        attr.class("mini"),
+        attr.attribute("data-revoke-node", n.id),
+        event.on_click(NodeRevokeRequested(n.id)),
+      ],
+      [html.text("Revoke")],
+    ),
+  ])
 }
 
 /// A node's last-seen age (`age_label` handles the "just now" case).

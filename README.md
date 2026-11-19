@@ -285,26 +285,32 @@ require the configured UI token when `NEXUS_UI_TOKEN` is set;
   `status` by an instant. A future abridged print/PDF view
   (`/threads/<id>/transcript`) is tracked in issue #117
 - `GET /healthz` — unauthenticated liveness probe
-- `GET /nodes` — paired remote nodes (id, name, stamps; the token
-  hash is never on the wire)
-- `POST /nodes` `{"name":"proxmox-2"}` — pair a node: 201 answering the
-  minted plaintext token EXACTLY ONCE (store keeps only its SHA-256
-  hash); duplicate name → `409`, reserved/invalid name → `400`
+- `GET /nodes` — paired remote nodes (id, thread_id, name, stamps; the
+  token hash is never on the wire)
+- `POST /nodes` `{"name":"proxmox-2","thread":"<id>"}` — pair a node
+  (names are unique PER THREAD; the row binds to its thread): 201
+  answering the minted plaintext token EXACTLY ONCE (store keeps only
+  its SHA-256 hash); duplicate name in that thread → `409`,
+  reserved/invalid name → `400`, unknown thread → `404`
 - `POST /nodes/pair` `{"code":"…","name":"proxmox-2"}` — the PUBLIC
   pairing exchange (tui-pairing plan): redeems a web-minted 1-hour,
-  multi-use pairing code for a node token plus the grant's pinned
-  `thread_id` — no UI token, the code is the auth. Expired/revoked/
-  unknown codes answer one merged `404`, checked before the
-  name-collision test, so a dead code looks identical whatever the
-  name; with a live code, a taken name answers the same friendly `409`
-  as `POST /nodes` (that order also keeps anonymous callers from
-  enumerating node names with a garbage code)
+  multi-use pairing code for a node token plus its thread — the
+  grant's pinned `thread_id`, or the request's optional `"thread"`
+  override (the launcher's `NEXUS_THREAD`) — no UI token, the code is
+  the auth. Expired/revoked/unknown codes answer one merged `404`,
+  checked before the name-collision test, so a dead code looks
+  identical whatever the name; with a live code, a name taken IN THAT
+  THREAD answers the same friendly `409` as `POST /nodes` (that order
+  also keeps anonymous callers from enumerating node names with a
+  garbage code)
 - `DELETE /nodes/<id>` — revoke the node's token (204, idempotent;
   future connections fail, a live one is not retroactively killed)
 - `GET /node/ws?node=<name>&token=<token>&thread=<id>&role=env|viewer`
   — the remote-node WebSocket (environments plan): NODE-token auth
-  (distinct from the UI token; also accepted as `Authorization:
-  Bearer`), one thread per connection. The versioned, additive-only
+  against the (thread, name) PAIR — names are per-thread, so a row
+  joins only its own thread (distinct from the UI token; also accepted
+  as `Authorization: Bearer`), one thread per connection. The
+  versioned, additive-only
   JSON client protocol (`"v":1`) serves an event plane (the thread's
   fan-out projected as frames), an MCP-shaped tool plane (`tools/call`
   down with the arguments verbatim, results up, `notifications/
@@ -439,7 +445,7 @@ default). Two threads on one host work the same way: distinct
 
 Manually, the analogous dance through the raw API (UI-token pairing
 stays available to scripts — delete the stale row first, since a
-re-pair over a live name is a 409):
+re-pair over a name live in the SAME thread is a 409):
 
 ```sh
 UI="Authorization: Bearer $NEXUS_UI_TOKEN"
@@ -450,7 +456,7 @@ LAPTOP_ID=$(curl -s -H "$UI" \
   "http://127.0.0.1:8080/nodes/$LAPTOP_ID"
 
 token=$(curl -s -X POST -H "$UI" -H 'content-type: application/json' \
-  -d '{"name":"laptop"}' http://127.0.0.1:8080/nodes | jq -r .token)  # shown exactly once
+  -d '{"name":"laptop","thread":"<thread id>"}' http://127.0.0.1:8080/nodes | jq -r .token)  # shown exactly once
 
 NEXUS_URL=http://127.0.0.1:8080 \
 NEXUS_NODE=laptop \

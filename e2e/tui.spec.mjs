@@ -389,12 +389,18 @@ function seedGrant(code, threadId) {
   });
 }
 
-/// The launcher's own keying: authority (host:port), filename-safe,
-/// inside <XDG_STATE_HOME>/nexus — mirrored from bin/nexus-tui.
-function stateFileFor(stateHome, base, node) {
+/// The launcher's own keying: authority (host:port), node, AND thread
+/// — names are per-thread, so the state file is keyed by the whole
+/// (server, node, thread) identity, filename-safe, inside
+/// <XDG_STATE_HOME>/nexus — mirrored from bin/nexus-tui.
+function stateFileFor(stateHome, base, node, thread) {
+  // Mirrors bin/nexus-tui exactly: name_key over the authority, the
+  // node, AND the thread (node/thread are charset-safe in practice —
+  // the server validates the node charset and mints the thread id —
+  // but the mirror must not silently diverge if that ever changes).
+  const nameKey = (s) => s.replace(/[^a-zA-Z0-9._-]/g, "-").replace(/-$/, "");
   const authority = base.replace(/^https?:\/\//, "").split("/")[0];
-  const key = authority.replace(/[^a-zA-Z0-9._-]/g, "-");
-  return join(stateHome, "nexus", `tui-${key}-${node}.json`);
+  return join(stateHome, "nexus", `tui-${nameKey(authority)}-${nameKey(node)}-${nameKey(thread)}.json`);
 }
 
 function startLauncher({ stateHome, args = [], pairUrlEnv = null }) {
@@ -484,15 +490,8 @@ async function main() {
   nexus = startNexus(provider.port, serverWorkspace);
   await waitHealthy();
 
-  const pair = await check("pair the TUI's node through POST /nodes", async () => {
-    const res = await api("POST", "/nodes", { name: NODE_NAME });
-    if (res.status !== 201) throw new Error(`expected 201, got ${res.status}: ${JSON.stringify(res.body)}`);
-    if (typeof res.body.token !== "string" || res.body.token.length < 20) {
-      throw new Error("no plaintext token in the create answer");
-    }
-    return res.body;
-  });
-
+  // The thread comes first: a node row binds to its thread (per-thread
+  // node names), so POST /nodes requires the thread id.
   const envThread = await check("create env-toolset thread", async () => {
     const res = await api("POST", "/threads", {
       provider: "faketui",
@@ -501,6 +500,15 @@ async function main() {
     });
     if (res.status !== 201) throw new Error(`expected 201, got ${res.status}: ${JSON.stringify(res.body)}`);
     return res.body.id;
+  });
+
+  const pair = await check("pair the TUI's node through POST /nodes", async () => {
+    const res = await api("POST", "/nodes", { name: NODE_NAME, thread: envThread });
+    if (res.status !== 201) throw new Error(`expected 201, got ${res.status}: ${JSON.stringify(res.body)}`);
+    if (typeof res.body.token !== "string" || res.body.token.length < 20) {
+      throw new Error("no plaintext token in the create answer");
+    }
+    return res.body;
   });
 
   const tui = startTui(envThread, pair.token, tuiWorkspace);
@@ -617,7 +625,7 @@ async function main() {
       message: "paired tui never joined",
       timeout: 45_000,
     });
-    const file = stateFileFor(stateHome, BASE, PAIR_NODE);
+    const file = stateFileFor(stateHome, BASE, PAIR_NODE, envThread);
     if (!existsSync(file)) throw new Error(`state file missing: ${file}`);
     const mode = statSync(file).mode & 0o777;
     if (mode !== 0o600) throw new Error(`state file mode ${mode.toString(8)}, want 600`);
@@ -706,7 +714,7 @@ async function main() {
     if (rows.length !== 1) throw new Error(`expected 1 ${PAIR_NODE} row, got ${rows.length}`);
     if (rows[0].id === pairNodeId) throw new Error("node row was not replaced by the re-pair");
     pairNodeId = rows[0].id;
-    const state = JSON.parse(readFileSync(stateFileFor(stateHome, BASE, PAIR_NODE), "utf8"));
+    const state = JSON.parse(readFileSync(stateFileFor(stateHome, BASE, PAIR_NODE, envThread), "utf8"));
     if (state.token === pairStateToken) throw new Error("state file kept the dead token");
     pairStateToken = state.token;
     // Graceful exit closes the loop; the queued detach line lands.

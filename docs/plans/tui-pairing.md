@@ -375,6 +375,28 @@ deliberately).
   run also surfaced (and the spec now strips) a foot-gun: a
   `NEXUS_SEED_PROVIDER_API_KEY` in the caller's shell keyed the seeded
   provider and broke the suite's keyless pins.
+- **Ghost-row revoke gap, then the ROOT CAUSE (2026-11-19, per-thread
+  node names).** The pane originally rendered only the current
+  thread's ROSTERED targets, while names were instance-global
+  (`node_name` UNIQUE) — a disconnected TUI's row blocked its name
+  everywhere yet no pane could show it, so the 409's advice was
+  unreachable. The first fix rendered unrostered rows as a "not
+  attached:" group; the REAL fix aligned the store with the
+  environments plan's own 2b-2 rule (names unique per THREAD): rows
+  gained `thread_id`, the unique index and the 409 checks scoped to
+  (thread, name), `/node/ws` auth became the (thread, name) pair
+  lookup, and the exchange grew an optional `thread` override (the
+  launcher's `NEXUS_THREAD` rides it) binding the row to the thread it
+  will join — a lost state file on thread A never blocks pairing the
+  same host name into thread B again. The "not attached:" group stays,
+  now scoped by thread (the pane filters rows to the selected
+  thread): it is the Revoke surface for THIS thread's paired-but-
+  disconnected rows (the lost-state-file case). The launcher's state
+  file key grew the thread too — `tui-<server>-<node>-<thread>.json` —
+  since one host can now hold credentials for the same name in
+  several threads (`NEXUS_THREAD` disambiguates a bare relaunch).
+  Pre-change state files (`tui-<server>-<node>.json`) are orphaned by
+  the new key — one re-pair per host, same as the row migration.
 
 ### Phase D — stretch
 
