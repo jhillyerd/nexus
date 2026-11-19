@@ -297,12 +297,13 @@ require the configured UI token when `NEXUS_UI_TOKEN` is set;
   multi-use pairing code for a node token plus its thread — the
   grant's pinned `thread_id`, or the request's optional `"thread"`
   override (the launcher's `NEXUS_THREAD`) — no UI token, the code is
-  the auth. Expired/revoked/unknown codes answer one merged `404`,
-  checked before the name-collision test, so a dead code looks
-  identical whatever the name; with a live code, a name taken IN THAT
-  THREAD answers the same friendly `409` as `POST /nodes` (that order
-  also keeps anonymous callers from enumerating node names with a
-  garbage code)
+  the auth. The name VALIDITY gate runs before the code check (an
+  invalid or reserved name answers `400` unconditionally — otherwise a
+  garbage-code probe could tell live codes from dead ones); past it,
+  expired/revoked/unknown codes answer one merged `404` so a dead code
+  looks identical whatever the valid name; with a live code, a name
+  taken IN THAT THREAD answers the same friendly `409` as
+  `POST /nodes`
 - `DELETE /nodes/<id>` — revoke the node's token (204, idempotent;
   future connections fail, a live one is not retroactively killed)
 - `GET /node/ws?node=<name>&token=<token>&thread=<id>&role=env|viewer`
@@ -438,10 +439,11 @@ name, token, and thread), the server stores the code only as a hash,
 and the grant itself stays redeemable — by anyone holding the URL —
 until it expires or is revoked. Two hosts can pair from one URL
 (grants are multi-use for their one-hour life) — each under its own
-`NEXUS_NODE` name, since names are unique and a second exchange under
-a taken name 409s (hosts sharing a short hostname must override the
-default). Two threads on one host work the same way: distinct
-`NEXUS_NODE` names, each with its own state file.
+`NEXUS_NODE` name (hosts sharing a short hostname must override the
+default). One host can also hold the SAME name in several threads:
+names are unique per thread, so pairing the same `NEXUS_NODE` into
+two threads mints two independent credentials, each with its own
+state file; `NEXUS_THREAD` disambiguates a bare relaunch.
 
 Manually, the analogous dance through the raw API (UI-token pairing
 stays available to scripts — delete the stale row first, since a
@@ -451,7 +453,10 @@ re-pair over a name live in the SAME thread is a 409):
 UI="Authorization: Bearer $NEXUS_UI_TOKEN"
 
 LAPTOP_ID=$(curl -s -H "$UI" \
-  http://127.0.0.1:8080/nodes | jq -r '.nodes[] | select(.name == "laptop") | .id')
+  http://127.0.0.1:8080/nodes | jq -r --arg t '<thread id>' \
+  '.nodes[] | select(.name == "laptop" and .thread_id == $t) | .id')
+# Names are unique per THREAD: filter by both, or a same-named node of
+# another thread would match.
 [ -n "$LAPTOP_ID" ] && curl -s -X DELETE -H "$UI" \
   "http://127.0.0.1:8080/nodes/$LAPTOP_ID"
 

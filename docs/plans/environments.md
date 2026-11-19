@@ -236,6 +236,9 @@ committed; nothing new rolls back.
   toolset has no env tools ("thread has no workspace toolset" — the
   `UnknownToolset` loud-refusal philosophy). Viewer-role join (no tool
   plane) is allowed on any thread, matching the web UI's read model.
+  *(As-built delta 2026-11-19: joins authenticate the `(thread_id,
+  name)` pair, so a row joins ONLY its own thread — viewer included;
+  a host watching another thread mints a row for it.)*
 - **Approvals: none.** The Pi model — the agent has free rein on attached
   targets; the human at the terminal watching commands run *is* the
   control surface; users who want gating sandbox the TUI/node itself.
@@ -278,10 +281,10 @@ not a Postgres keyword; FK/index naming per AGENTS.md):
 > the row's own thread (role still decides only the plane). The
 > migration has no backfill source (nothing in a pre-scoping row
 > records its thread) and node credentials are re-mintable, so it
-> deletes them and pins NOT NULL — the operator re-pairs. The UI token
-> authority wording above is otherwise unchanged: the token's OTHER
-> authority stays instance-wide v1; the thread binding scopes the
-> IDENTITY, not the token's whole reach.
+> deletes them and pins NOT NULL — the operator re-pairs. Token reach
+> is exactly the row's: everything a connection could do on its own
+> thread (Send, the viewer/event plane, env calls) is unchanged; the
+> cross-thread join the v1 wording described is gone.
 
 ### General MCP (future, owned by the plugin-api plan)
 

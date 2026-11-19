@@ -868,6 +868,19 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
         list.fold(ids, state.threads, fn(threads, id) {
           dict.delete(threads, id)
         })
+      // The DELETE's FK CASCADEs take a pruned thread's pairing grants
+      // and NODE rows with it — the same halves DeleteThread mirrors.
+      let grants =
+        dict.filter(state.grants, fn(_gid, grant) {
+          case grant.thread_id {
+            option.Some(tid) -> !list.contains(ids, tid)
+            option.None -> True
+          }
+        })
+      let nodes =
+        dict.filter(state.nodes, fn(_nid, node) {
+          !list.contains(ids, node.thread_id)
+        })
       process.send(reply, Ok(ids))
       // An empty sweep is a no-op — not an observable store event (the
       // metadata tests assert the exact event stream).
@@ -875,7 +888,15 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
         [] -> state.events
         _ -> [EvPruneNeverUsed(ids), ..state.events]
       }
-      actor.continue(State(..state, threads: threads, events: events))
+      actor.continue(
+        State(
+          ..state,
+          threads: threads,
+          grants: grants,
+          nodes: nodes,
+          events: events,
+        ),
+      )
     }
 
     Events(reply) -> {

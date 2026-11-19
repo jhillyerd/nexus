@@ -230,12 +230,15 @@ pub fn schema_is_the_entire_schema_test() {
     string.lowercase(node_scoping),
     "on delete cascade",
   ))
-  // The scoped index replaced the global one.
-  should.be_true(
-    list.any(statements, fn(stmt) {
+  // The scoped index replaced the global one — match the DEFINITION,
+  // not just the name, so a regression to node(name) fails here.
+  let assert [node_index] =
+    list.filter(statements, fn(stmt) {
       string.contains(string.lowercase(stmt), "node_thread_name")
-    }),
-  )
+    })
+  let index_lower = string.lowercase(node_index)
+  should.be_true(string.contains(index_lower, "unique"))
+  should.be_true(string.contains(index_lower, "on node (thread_id, name)"))
   let assert [thread_create] =
     list.filter(statements, fn(stmt) { string.contains(stmt, "tags_manual") })
   should.be_true(string.contains(thread_create, "tags_source"))

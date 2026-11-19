@@ -3191,9 +3191,17 @@ fn env_section(model: Model) -> Element(Msg) {
     html.h3([], [html.text("Environments")]),
     case env_roster(model) {
       // No roster row anywhere: the thread was created without a
-      // workspace — no env tools, so no TUI could serve it. The mint
-      // button does not render (an unpinnable TUI is not mintable).
-      None -> html.p([attr.class("sec-none")], [html.text("no environment")])
+      // workspace — no env tools, so no TUI could SERVE it (env-role
+      // joins 403) and the mint button does not render (an unpinnable
+      // TUI is not mintable). A node ROW can still exist here (POST
+      // /nodes only asks that the thread exist), so the unattached
+      // group renders regardless — the 409's revoke advice stays
+      // reachable from the row's own thread.
+      None ->
+        html.div([], [
+          html.p([attr.class("sec-none")], [html.text("no environment")]),
+          env_unattached_area(model, []),
+        ])
       Some(targets) ->
         html.div(
           [attr.class("env-list")],

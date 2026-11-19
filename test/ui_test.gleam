@@ -5382,16 +5382,32 @@ pub fn env_section_unattached_ghost_rows_test() {
 
 /// A thread created without a workspace has NO roster row: the section
 /// reads "no environment" and the mint button does not render (a TUI
-/// could not serve it).
+/// could not serve it). A node row can still be bound to it (POST
+/// /nodes only asks that the thread exist), and it renders as an
+/// unattached row with its Revoke.
 pub fn env_plain_thread_has_no_mint_test() {
+  let now = timing.wall_now_s()
   let model =
     new_model()
     |> step(ui.ThreadsLoaded([summary("s1", False)]))
     |> step(ui.Select("s1"))
+    |> step(
+      ui.EnvLoaded(
+        0,
+        Some("s1"),
+        [env_node("s1", "ghost-pair", Some(now - 30))],
+        [],
+      ),
+    )
     |> step(ui.PaneToggled)
   let html = view_string(model)
   should_contain(html, "no environment")
   should_not_contain(html, "id=\"pair-tui\"")
+  // No roster → every stored row of the thread is unattached, and its
+  // revoke stays reachable (the 409's advice holds on roster-less
+  // threads too).
+  should_contain(html, "not attached:")
+  should_contain(html, "data-revoke-node=\"n-ghost-pair\"")
 }
 
 /// The mint flow: the guard arms on request, the ONE-TIME URL display

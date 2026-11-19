@@ -688,7 +688,10 @@ async function main() {
     if (plain.status !== 201) {
       throw new Error(`plain thread creation returned ${plain.status}`);
     }
-    const bad = new FakeNode(nodeUrl(plain.body.id));
+    const bad = new FakeNode(nodeUrlFor("node-plain", await pairInto(plain.body.id, "node-plain"), plain.body.id));
+    // node-plain is bound to THIS thread: auth passes, so the refusal
+    // below is the 403 env-capability gate, not the scoped 401 auth
+    // lookup a foreign thread's row would hit.
     const opened = await bad.connect();
     if (opened !== null) {
       throw new Error("env-role socket unexpectedly connected to a plain thread");

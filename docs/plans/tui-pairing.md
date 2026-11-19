@@ -173,10 +173,11 @@ env overrides: NEXUS_NODE, NEXUS_ROLE, NEXUS_THREAD (still wins over the grant's
   the server's BASE URL — the launcher never persists the pairing
   URL; the code is stored only as a hash, and the grant itself stays
   redeemable until expiry or revocation) — keyed per (server, node
-  name), so two threads on one
-  host work via distinct `NEXUS_NODE` names (one live TUI per name:
-  the second connection replaces the first — shipped
-  replace-on-reconnect).
+  name, thread) as of the 2026-11-19 per-thread-names delta (the
+  original key was (server, node name), with two threads on one host
+  working via distinct `NEXUS_NODE` names — now the SAME name works
+  per thread; one live connection per row, the second connection to a
+  row replaces the first — shipped replace-on-reconnect).
 - Launch logic: state exists → connect with the stored token, no
   pairing at all. The WS upgrade answering `401` (the pre-upgrade plain
   status; row deleted or swept) → re-pair if a pair-url was given, else
@@ -221,7 +222,12 @@ env overrides: NEXUS_NODE, NEXUS_ROLE, NEXUS_THREAD (still wins over the grant's
    TUI of the future may want to switch/create threads, but that is the
    high-fidelity-TUI initiative, not this PoC. `thread_id` stays
    nullable so an unpinned grant shape needs no migration — door open,
-   zero extra work now.
+   zero extra work now. *(Partially superseded by the 2026-11-19
+   per-thread-names delta: the exchange now accepts an explicit
+   `thread` override — the launcher's `NEXUS_THREAD` — which binds the
+   minted row to that thread instead of the grant's pin; the default
+   remains the grant's pin, and an unpinned grant without an override
+   still refuses.)*
 2. **7-day idle expiry** (since last seen; `created_at` for
    never-connected), `NEXUS_NODE_IDLE_DAYS`, default 7, `0` disables.
 3. **Mint surface = the thread info pane's Environments section** (the

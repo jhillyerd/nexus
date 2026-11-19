@@ -1393,15 +1393,28 @@ pub fn node_ws_pre_upgrade_refusals_test() {
     ))
   should.equal(bad_token.status, 401)
 
-  // Right credentials, ANOTHER thread: 401 — the (thread, name) pair
-  // has no row there (per-thread names scope the credential; the
-  // 401-vs-404 order is auth first, so an unknown thread cannot probe
-  // token validity on a row from a different thread).
+  // Right credentials, ANOTHER (real, existing) thread: 401 — the
+  // (thread, name) pair has no row there (per-thread names scope the
+  // credential). A REAL second thread, not a ghost id: the point is
+  // that a VALID token is rejected wherever its row is not, so global
+  // node authentication cannot sneak back in.
+  let #(t2_status, t2_body) =
+    send_authorized(req(
+      port,
+      Post,
+      "/threads",
+      "{\"provider\":\""
+        <> store_mock.fixture_provider_id
+        <> "\",\"model\":\"alias-a\"}",
+    ))
+  should.equal(t2_status, 201)
+  let assert Ok(thread_2) =
+    json.parse(t2_body, decode.at(["id"], decode.string))
   let assert Ok(other_thread) =
     hackney.send(req(
       port,
       Get,
-      "/node/ws?node=node-a&token=" <> node_token <> "&thread=t-ghost",
+      "/node/ws?node=node-a&token=" <> node_token <> "&thread=" <> thread_2,
       "",
     ))
   should.equal(other_thread.status, 401)
