@@ -168,7 +168,8 @@ nexus-tui --reset                                  # forget the stored credentia
 env overrides: NEXUS_NODE, NEXUS_ROLE, NEXUS_THREAD (still wins over the grant's)
 ```
 
-- **State file** `${XDG_STATE_HOME:-$HOME/.local/state}/nexus/tui-<host>-<node>.json`,
+- **State file**
+  `${XDG_STATE_HOME:-$HOME/.local/state}/nexus/tui-<host>-<node>-<thread>.json`,
   mode `0600`, content `{server, node, token, thread}` (`server` is
   the server's BASE URL — the launcher never persists the pairing
   URL; the code is stored only as a hash, and the grant itself stays
