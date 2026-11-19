@@ -83,8 +83,8 @@ case "$NODE" in
     echo "error: 'workspace' is a reserved node name" >&2
     exit 1
     ;;
-  "" | *[^a-zA-Z0-9_-]*)
-    echo "error: node name '$NODE' must be non-empty [a-zA-Z0-9_-]+" >&2
+  "" | *[^a-zA-Z0-9_@-]*)
+    echo "error: node name '$NODE' must be non-empty [a-zA-Z0-9_@-]+" >&2
     exit 1
     ;;
 esac
@@ -119,8 +119,22 @@ resolve_pair_url() {
 # are unique PER THREAD, so the thread is part of the identity
 # ---------------------------------------------------------------------------
 
-name_key() {  # <string> — filename-safe
+name_key() {  # <string> — filename-safe (authority and thread segments;
+              # legacy collapse, kept byte-identical so stored files
+              # under those keys keep resolving)
   printf '%s' "$1" | tr -c 'a-zA-Z0-9._-' '-' | sed 's/-$//'
+}
+
+# Node-key mapping — INJECTIVE over the server's name charset
+# ([a-zA-Z0-9_@-]): '@' is the only character a valid name can carry
+# that the old collapse-to-dash mapping destroyed, and '%40' cannot
+# collide with a plain name because '%' is never a name character.
+# A non-injective key let pairing 'user@host' overwrite the stored
+# credential of 'user-host' (same file). The trailing-dash strip is
+# gone for the same reason ('node-' would share 'node''s key).
+node_key() {  # <node name> — filename-safe AND injective
+  local k="${1//@/%40}"
+  printf '%s' "$k" | tr -c 'a-zA-Z0-9._%~-' '-'
 }
 
 state_key() {  # <base-url> — the authority, filename-safe
@@ -131,7 +145,7 @@ state_key() {  # <base-url> — the authority, filename-safe
 
 state_path() {  # <base-url> <node> <thread>
   printf '%s/tui-%s-%s-%s.json' \
-    "$STATE_ROOT" "$(state_key "$1")" "$(name_key "$2")" "$(name_key "$3")"
+    "$STATE_ROOT" "$(state_key "$1")" "$(node_key "$2")" "$(name_key "$3")"
 }
 
 load_state() {  # <file> → S_SERVER S_NODE S_TOKEN S_THREAD (non-empty)

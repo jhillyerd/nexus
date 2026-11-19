@@ -394,13 +394,16 @@ function seedGrant(code, threadId) {
 /// (server, node, thread) identity, filename-safe, inside
 /// <XDG_STATE_HOME>/nexus — mirrored from bin/nexus-tui.
 function stateFileFor(stateHome, base, node, thread) {
-  // Mirrors bin/nexus-tui exactly: name_key over the authority, the
-  // node, AND the thread (node/thread are charset-safe in practice —
-  // the server validates the node charset and mints the thread id —
-  // but the mirror must not silently diverge if that ever changes).
+  // Mirrors bin/nexus-tui exactly: the authority and thread segments
+  // use the legacy collapse (name_key); the NODE segment uses the
+  // launcher's injective node_key ('@' → '%40', then the collapse with
+  // '%' filename-safe) so 'user@host' and 'user-host' cannot share a
+  // state file. The mirror must not silently diverge from the launcher.
   const nameKey = (s) => s.replace(/[^a-zA-Z0-9._-]/g, "-").replace(/-$/, "");
+  const nodeKey = (s) =>
+    s.replace(/@/g, "%40").replace(/[^a-zA-Z0-9._%~'-]/g, "-");
   const authority = base.replace(/^https?:\/\//, "").split("/")[0];
-  return join(stateHome, "nexus", `tui-${nameKey(authority)}-${nameKey(node)}-${nameKey(thread)}.json`);
+  return join(stateHome, "nexus", `tui-${nameKey(authority)}-${nodeKey(node)}-${nameKey(thread)}.json`);
 }
 
 function startLauncher({ stateHome, args = [], pairUrlEnv = null }) {
