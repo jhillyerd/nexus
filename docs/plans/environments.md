@@ -428,7 +428,8 @@ tail line is deliberately separate from the click-to-reveal pane.
 2. **Attach / detach actor messages** — `AttachTarget(name)` /
    `DetachTarget(name)` mutate `roster`, fan out a roster event, and
    append the tail roster line (below). `name` charset
-   `^[a-zA-Z0-9_-]+$`, `workspace` reserved (refused on attach), no
+   `^[a-zA-Z0-9_@-]+$` (`@` so a node can register as `user@host`),
+   `workspace` reserved (refused on attach), no
    duplicate-live attach, no detach of an absent target, and `workspace`
    is never detachable. (Reconnect-replace and the `target → execution
    subject` map arrive with the node adapter in 2b; here the roster is

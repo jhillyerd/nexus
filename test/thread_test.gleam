@@ -2175,7 +2175,7 @@ pub fn attach_refuses_bad_charset_test() {
   let reply = process.new_subject()
   process.send(sess, thread.AttachTarget("bad name", None, reply))
   let assert Ok(Error(reason)) = process.receive(reply, 2000)
-  should.be_true(string.contains(reason, "must match ^[a-zA-Z0-9_-]+$"))
+  should.be_true(string.contains(reason, "must match ^[a-zA-Z0-9_@-]+$"))
 }
 
 pub fn attach_mid_turn_queues_until_worker_done_test() {

@@ -11,6 +11,9 @@ import nexus/node
 pub fn valid_name_charset_test() {
   let assert Ok("proxmox-2") = node.valid_name("proxmox-2")
   let assert Ok("node_a_1") = node.valid_name("  node_a_1  ")
+  // `@` is allowed: a node can register as user@host.
+  let assert Ok("james@vps") = node.valid_name("james@vps")
+  let assert Ok("root@host-2") = node.valid_name("  root@host-2  ")
   // Reserved: workspace is the thread's own environment.
   let assert Error(_) = node.valid_name("workspace")
   // Empty and charset violations refuse loudly.

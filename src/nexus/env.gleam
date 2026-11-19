@@ -255,11 +255,12 @@ fn strip_trailing_dot(s: String) -> String {
 }
 
 /// Validate a proposed node/roster target name before it enters the
-/// live roster (environments plan Phase 2a): the charset rule shared
-/// with plugin tool half-names, `workspace` reserved (it is the
-/// thread's own environment and never attaches/detaches), no empty
-/// name. Refusal is loud and honest — no name enters the roster that
-/// would be ambiguous in `route`'s error or a roster line.
+/// live roster (environments plan Phase 2a): the plugin tool-name
+/// charset plus `@` (so a node can register as `user@host`),
+/// `workspace` reserved (it is the thread's own environment and never
+/// attaches/detaches), no empty name. Refusal is loud and honest — no
+/// name enters the roster that would be ambiguous in `route`'s error
+/// or a roster line.
 pub fn valid_target_name(name: String) -> Result(Nil, String) {
   case name {
     "" -> Error("target name must not be empty")
@@ -269,7 +270,7 @@ pub fn valid_target_name(name: String) -> Result(Nil, String) {
         True -> Ok(Nil)
         False ->
           Error(
-            "target name must match ^[a-zA-Z0-9_-]+$ (got \"" <> name <> "\")",
+            "target name must match ^[a-zA-Z0-9_@-]+$ (got \"" <> name <> "\")",
           )
       }
   }
@@ -277,7 +278,7 @@ pub fn valid_target_name(name: String) -> Result(Nil, String) {
 
 fn is_name_char(c: String) -> Bool {
   string.contains(
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-",
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_@-",
     c,
   )
 }
