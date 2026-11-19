@@ -140,6 +140,12 @@ pub type Config {
     /// and file reads (accumulation-bounded — post-hoc truncation does
     /// not bound memory).
     env_max_output_bytes: Int,
+    /// TUI pairing hygiene (tui-pairing plan): a node whose credential
+    /// has gone idle this many days (since last seen; `created_at` for
+    /// never-connected rows) is deleted by the boot sweep. `0` disables
+    /// the sweep entirely — a daily-driver TUI keeps its credential
+    /// indefinitely; a crashed one has a week by default.
+    node_idle_days: Int,
   )
 }
 
@@ -322,6 +328,13 @@ pub fn from_env(
     262_144,
     min: 1024,
   ))
+  // TUI pairing hygiene: 0 legitimately disables the sweep, so the
+  // floor is 0 (non-negative), not a positive minimum.
+  use node_idle_days <- result.try(optional_non_negative_int(
+    get,
+    "NEXUS_NODE_IDLE_DAYS",
+    7,
+  ))
   // The ASCII note rides the DEFAULT prompt only, and only while
   // codemode is enabled: an explicitly set NEXUS_SYSTEM_PROMPT is the
   // operator's own text and is never amended (enable codemode with a
@@ -368,6 +381,7 @@ pub fn from_env(
     workspace_root: workspace_root,
     env_timeout_ms: env_timeout_ms,
     env_max_output_bytes: env_max_output_bytes,
+    node_idle_days: node_idle_days,
   ))
 }
 

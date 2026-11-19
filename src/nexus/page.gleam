@@ -76,6 +76,8 @@ pub fn html(token: Option(String)) -> String {
     timestamps_js(),
     "\n",
     combobox_js(),
+    "\n",
+    pairing_js(),
     "\n</script>\n</body>\n</html>\n",
   ])
 }
@@ -643,6 +645,19 @@ fn timestamps_js() -> String {
   <> "      var title = new Date(epoch).toLocaleString();\n"
   <> "      if (el.getAttribute('title') !== title) el.setAttribute('title', title);\n"
   <> "    }\n"
+  <> "    // Pairing-grant expiry countdowns (tui-pairing Phase C): same\n"
+  <> "    // tick, same change-guarded writes — the server rendered the\n"
+  <> "    // initial label (nexus/ui's expires_in_label, same thresholds).\n"
+  <> "    var expiries = root.querySelectorAll('[data-expires]');\n"
+  <> "    for (var j = 0; j < expiries.length; j++) {\n"
+  <> "      var exp = expiries[j];\n"
+  <> "      var left = parseInt(exp.getAttribute('data-expires'), 10) * 1000 - now;\n"
+  <> "      var text =\n"
+  <> "        left <= 0 ? 'expired'\n"
+  <> "        : left < 60000 ? 'expires <1m'\n"
+  <> "        : 'expires in ' + Math.floor(left / 60000) + 'm';\n"
+  <> "      if (exp.textContent !== text) exp.textContent = text;\n"
+  <> "    }\n"
   <> "  };\n"
   <> "  var attached = false;\n"
   <> "  var attach = function () {\n"
@@ -661,6 +676,92 @@ fn timestamps_js() -> String {
   <> "  host.addEventListener('lustre:connect', attach);\n"
   <> "  attach();\n"
   <> "  setInterval(refresh, AGE_MS);\n"
+  <> "  refresh();\n"
+  <> "})();"
+}
+
+/// The pairing URL + copy button (tui-pairing plan Phase C): the info
+/// pane's one-time mint display. Two jobs, both static-scripted (the
+/// combobox_js delegated-event precedent — the app lives in the open
+/// shadow root, so real targets ride composedPath):
+///
+/// - The displayed URL's base follows the BROWSING origin, not the
+///   server's configured bind (a 0.0.0.0 bind or a LAN hostname must
+///   not leak into the link the operator copies for a TUI host — the
+///   TUI host must reach the same origin the operator is using). The
+///   server renders the URL from the boot config as an initial
+///   fallback; this script rewrites every `[data-pair-url]` element to
+///   location.origin + '/pair/' + code on every mutation, reading the
+///   code from the attribute — the URL is never carried as server text
+///   beyond that fallback.
+/// - The Copy button writes the same rebuilt URL to the clipboard.
+///   Clipboard needs a secure context (https or localhost), so a
+///   plain-http LAN origin falls back to the deprecated execCommand
+///   path (return-checked — some browsers return false rather than
+///   throw). Button feedback is a text swap the next re-render resets.
+///
+/// Nothing is built from data: the URL is two concatenated strings
+/// (the origin is browser state; the code is server-minted base64url
+/// set through a Lustre-escaped attribute). Static and token-free — a
+/// pairing URL deliberately carries NO token (the code IS the auth).
+fn pairing_js() -> String {
+  "(function () {\n"
+  <> "  'use strict';\n"
+  <> "  var host = document.querySelector('lustre-server-component');\n"
+  <> "  if (!host) return;\n"
+  <> "  var url = function (code) { return location.origin + '/pair/' + code; };\n"
+  <> "  var refresh = function () {\n"
+  <> "    var root = host.shadowRoot;\n"
+  <> "    if (!root) return;\n"
+  <> "    var els = root.querySelectorAll('[data-pair-url]');\n"
+  <> "    for (var i = 0; i < els.length; i++) {\n"
+  <> "      var full = url(els[i].getAttribute('data-pair-url'));\n"
+  <> "      if (els[i].textContent !== full) els[i].textContent = full;\n"
+  <> "    }\n"
+  <> "  };\n"
+  <> "  var flash = function (button) {\n"
+  <> "    button.textContent = 'Copied ✓';\n"
+  <> "    setTimeout(function () { button.textContent = 'Copy'; }, 1500);\n"
+  <> "  };\n"
+  <> "  var fallback = function (text, button) {\n"
+  <> "    var ta = document.createElement('textarea');\n"
+  <> "    ta.value = text;\n"
+  <> "    ta.style.position = 'fixed';\n"
+  <> "    ta.style.opacity = '0';\n"
+  <> "    document.body.appendChild(ta);\n"
+  <> "    ta.select();\n"
+  <> "    try { if (document.execCommand('copy')) flash(button); } catch (e) {}\n"
+  <> "    document.body.removeChild(ta);\n"
+  <> "  };\n"
+  <> "  var copy = function (button) {\n"
+  <> "    var text = url(button.getAttribute('data-pair-copy'));\n"
+  <> "    if (navigator.clipboard && navigator.clipboard.writeText) {\n"
+  <> "      navigator.clipboard.writeText(text).then(\n"
+  <> "        function () { flash(button); },\n"
+  <> "        function () { fallback(text, button); }\n"
+  <> "      );\n"
+  <> "    } else { fallback(text, button); }\n"
+  <> "  };\n"
+  <> "  document.addEventListener('click', function (e) {\n"
+  <> "    var el = e.composedPath()[0];\n"
+  <> "    var button = el && el.closest ? el.closest('[data-pair-copy]') : null;\n"
+  <> "    if (button) copy(button);\n"
+  <> "  });\n"
+  <> "  var attached = false;\n"
+  <> "  var attach = function () {\n"
+  <> "    var root = host.shadowRoot;\n"
+  <> "    if (!root || attached) return;\n"
+  <> "    attached = true;\n"
+  <> "    new MutationObserver(function () { refresh(); }).observe(root,\n"
+  <> "      { childList: true, subtree: true });\n"
+  <> "  };\n"
+  <> "  // The shadow root does not exist until the client runtime mounts;\n"
+  <> "  // the mount/connect hooks are the same re-entry points the sibling\n"
+  <> "  // scripts use (a crash costs one socket and the browser reconnects\n"
+  <> "  // into a fresh runtime — re-attach there too).\n"
+  <> "  host.addEventListener('lustre:mount', attach);\n"
+  <> "  host.addEventListener('lustre:connect', attach);\n"
+  <> "  attach();\n"
   <> "  refresh();\n"
   <> "})();"
 }
@@ -1350,6 +1451,25 @@ details.turn.reasoning.live > summary { color: color-mix(in srgb, currentColor 8
 /* Archived rows dim but keep their chevron: still navigable (reading is
    allowed), never hidden (the plan). */
 #app .ch.archived .nm, #app .ch.archived .age { opacity: .55; }
+/* Environments section (tui-pairing Phase C): roster rows, grant rows,
+   and the mint area share the channel row's baseline flex. The mini
+   buttons need #app prefixes like the .close rule (Pico matches
+   button twice — element and [type=…] at 0,1,0 — so an unprefixed
+   rule loses the #app button reset's cascade; AGENTS.md cascade trap
+   2). */
+#app .env-list, #app .grant-list { display: flex; flex-direction: column; gap: .15rem; }
+#app .env-row { display: flex; align-items: baseline; gap: .5rem; width: 100%; }
+#app .env-row .nm { flex: 1; overflow-wrap: anywhere; text-align: left; }
+#app .env-row .age { font-size: .74rem; opacity: .6; }
+#app .env-row button.mini, #app .pair-url-row button.pair-copy {
+  padding: .05rem .5rem; margin: 0; font-size: .68rem; width: auto; }
+#app .pair-area { display: flex; flex-direction: column; gap: .3rem; margin-top: .4rem; }
+#app .pair-area p { margin: 0; }
+#app .pair-note { font-size: .74rem; opacity: .6; }
+#app .pair-url-row { display: flex; align-items: center; gap: .4rem; }
+#app .pair-url-row code { flex: 1; overflow-wrap: anywhere; font-size: .72rem;
+  padding: .25rem .45rem; margin: 0; }
+#app .env-err { color: #c0392b; }
 #app .ch-dot { font-size: .7rem; }
 #app .ch-dot.idle { opacity: .35; }
 #app .ch-dot.run { color: #3b82f6; }

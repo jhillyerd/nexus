@@ -339,6 +339,11 @@ pub type Store {
     /// Boot sweep (Phase D wires the call): expired grants are pure
     /// garbage — the plaintext died at mint.
     delete_expired_node_grants: fn() -> Result(Nil, StoreError),
+    /// Boot sweep (the hygiene half): delete nodes whose credential has
+    /// gone idle past `idle_days` (since last seen; created_at for
+    /// never-connected). Returns the swept NAMES (logged at boot); `0`
+    /// idle days never reaches this call (the caller checks the config).
+    delete_idle_nodes: fn(Int) -> Result(List(String), StoreError),
   )
 }
 

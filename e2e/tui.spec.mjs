@@ -205,6 +205,9 @@ function seedProvider(port) {
     NEXUS_ENCRYPTION_KEY: ENC_KEY,
     NEXUS_SEED_PROVIDER_NAME: "faketui",
     NEXUS_SEED_PROVIDER_BASE_URL: `http://127.0.0.1:${port}/v1`,
+    // A NEXUS_SEED_PROVIDER_API_KEY in the CALLER's shell would key
+    // the seeded provider and break the suite's keyless pins — strip it.
+    NEXUS_SEED_PROVIDER_API_KEY: "",
   };
   return new Promise((resolve, reject) => {
     const child = spawn("gleam", ["run", "-m", "nexus/dev_seed"], {

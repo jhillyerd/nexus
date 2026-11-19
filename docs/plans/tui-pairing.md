@@ -197,8 +197,11 @@ env overrides: NEXUS_NODE, NEXUS_ROLE, NEXUS_THREAD (still wins over the grant's
   $1)`, driven by `NEXUS_NODE_IDLE_DAYS` (**default 7**, `0` = never
   sweep). A daily-driver TUI keeps its credential indefinitely; a
   crashed one has a week. `last_seen_at` is bumped on every
-  authenticated connect (shipped `touch_node`) **and on clean
-  disconnect** (Phase D adds the on_close bump): without it, a TUI
+  authenticated connect (shipped `touch_node`) **and at every close
+  mist reports** (the on_close bump — landed with Phase C's sweeps;
+  mist fires on_close "for any reason, valid or otherwise", so the
+  stamp tracks the last OBSERVED disconnect — see the as-built
+  deltas): without it, a TUI
   connected right up to a server shutdown would carry a stale
   last-seen into the next boot, and the boot sweep — which runs before
   any reconnect can re-stamp it — could take a still-in-use
@@ -293,6 +296,7 @@ As-built deltas:
 A + B together are the whole UX fix; they land first.
 
 ### Phase C — info pane Environments section (after the info pane merges)
+— IMPLEMENTED (2026-11-18), hygiene sweeps landed with it
 
 **Ordering constraint (cubic review): the grant boot sweep (Phase D's
 hygiene list) lands no later than this phase** — expired-grant
@@ -308,9 +312,73 @@ the exchange scans the live list.
 - Browser e2e: mint → URL visible in DOM → revoke; hostile-text
   payloads pinned; existing selectors untouched.
 
-### Phase D — hygiene + stretch
+As-built deltas:
 
-- Boot sweeps (expired grants; idle nodes per `NEXUS_NODE_IDLE_DAYS`).
+- **The boot sweeps run from `main`, through the seam — not inside the
+  store actor's initialiser.** `persist.boot_sweeps(cfg, db)` is called
+  once the supervision tree is up (an `actor.call` to self inside the
+  store actor's own initialiser would block it on the actor it is
+  still building) and is unit-tested offline over the mock seam.
+  Ordering is unconstrained — unlike the thread prune, no hydration
+  depends on these rows being gone first. BOTH hygiene sweeps landed
+  with Phase C (the grant sweep per the ordering constraint; the idle-
+  node sweep rode along — Phase D is now stretch-only). The sweep's
+  freshness guard landed with it: the node route's close (`on_close`)
+  bumps `last_seen` best-effort. Mist invokes `on_close` for ANY
+  shutdown reason ("valid or otherwise") — clean client closes,
+  replace-kill teardown, server shutdown, surfaced socket errors — so
+  `last_seen` tracks the last OBSERVED disconnect and the idle window
+  runs from there; only a hard VM kill skips it, in which case the
+  window runs from the previous stamp (connect or an earlier close),
+  still bounded — the plan's "a crashed TUI has a week". (Gating the
+  bump on a "clean" flag would unprotect the server-shutdown case, the
+  very disconnect the bump exists to cover — cubic PR review.)
+- **The roster the pane renders re-derives from the UI's OWN LOG** (the
+  newest `system`-authored roster row, parsed with the same
+  `env.roster_parse` the server's hydration uses) — no new registry
+  ask, and a live attach/detach echo updates the section with no extra
+  load. A thread with NO roster row reads "no environment" and the
+  mint button does not render (a TUI could not serve a thread without
+  env tools).
+- **The pane's store reads do NOT ride the every-refresh cascade** the
+  channels ask rides (that would put a Postgres read behind every
+  commit bump); the section loads on pane OPEN and self-refreshes
+  after each of its own mutations (revoke = delete + re-read in one
+  worker round trip; a successful mint appends the persisted row
+  directly).
+- **The info badge renders for EVERY selected thread** (Phase 2
+  amendment): the pane is the mint surface, so it must be reachable on
+  a channel-less thread — the count chip still hides at zero and the
+  dot stays gray there (the ambient signal exists only where channels
+  exist; `badge_counts_running_channels_test` was updated
+deliberately).
+- **The mint URL's origin is the BROWSING origin**: the server renders
+  the boot-config base (`pair_base` in Flags) as a no-JS fallback, and
+  the page shell's `pairing_js` rewrites every `[data-pair-url]`
+  element to `location.origin + "/pair/" + code` on mount — a `0.0.0.0`
+  bind or a LAN hostname must not leak into the link the operator
+  copies for a TUI host. The Copy button rebuilds the same URL at
+  click time (clipboard with an execCommand fallback for plain-http
+  LAN origins); the expiry ticks via a `[data-expires]` span the
+  timestamps script re-renders on its 30s pass (the rel_time twin
+  rule).
+- **A minted grant lands in the grants list immediately** (the
+  write-through succeeded — the msg only lands then), and a re-read
+  that no longer carries the displayed mint's grant (revoked, or
+  swept) drops the one-time URL display with it.
+- Browser e2e (`browser.spec.mjs`, its own workspace-rooted instance
+  on :18083 — the main instances keep their env-less default toolsets
+  for the byte-prefix pins): pane → mint → URL shape → REAL public
+  exchange redeeming the DOM's code (no auth) → pane reopen shows the
+  paired count → revoke kills row + display → revoked code answers the
+  merged 404. Hostile roster rows are pinned offline (ui_test). The
+  run also surfaced (and the spec now strips) a foot-gun: a
+  `NEXUS_SEED_PROVIDER_API_KEY` in the caller's shell keyed the seeded
+  provider and broke the suite's keyless pins.
+
+### Phase D — stretch
+
+- ~~Boot sweeps~~ — landed with Phase C (see above).
 - Stretch: human-friendly `GET /pair/<code>` landing page (shows the
   launch command + expiry — the visitor already holds the code);
   in-process reconnect-with-backoff in the TUI so a *server* restart

@@ -17,7 +17,9 @@ import lustre/server_component
 import nexus/bot
 import nexus/bot_registry
 import nexus/config
+import nexus/env
 import nexus/loop
+import nexus/node
 import nexus/openai
 import nexus/provider
 import nexus/provider_registry
@@ -40,6 +42,8 @@ fn new_model() -> ui.Model {
       bots: process.new_subject(),
       models_timeout_ms: 60_000,
       thread: None,
+      store: store_mock.seam(store_mock.start()),
+      pair_base: "http://127.0.0.1:8080",
     ))
   model
 }
@@ -54,6 +58,8 @@ fn new_model_with_thread(id: Option(String)) -> ui.Model {
       bots: process.new_subject(),
       models_timeout_ms: 60_000,
       thread: id,
+      store: store_mock.seam(store_mock.start()),
+      pair_base: "http://127.0.0.1:8080",
     ))
   model
 }
@@ -3197,6 +3203,8 @@ pub fn meta_updated_refreshes_sidebar_test() {
         bots: bots,
         models_timeout_ms: 60_000,
         thread: None,
+        store: seam,
+        pair_base: "http://127.0.0.1:8080",
       ),
     )
   let client = process.new_subject()
@@ -3339,6 +3347,8 @@ pub fn send_moves_previous_day_row_into_today_immediately_test() {
         bots: bots,
         models_timeout_ms: 60_000,
         thread: Some("s-old"),
+        store: seam,
+        pair_base: "http://127.0.0.1:8080",
       ),
     )
   let client = process.new_subject()
@@ -3444,6 +3454,8 @@ pub fn connect_with_configured_provider_never_notes_no_provider_test() {
         bots: bots,
         models_timeout_ms: 60_000,
         thread: None,
+        store: seam,
+        pair_base: "http://127.0.0.1:8080",
       ),
     )
   let client = process.new_subject()
@@ -3609,6 +3621,8 @@ pub fn thread_switch_drops_left_thread_stream_test() {
         bots: bots,
         models_timeout_ms: 60_000,
         thread: Some(a.id),
+        store: seam,
+        pair_base: "http://127.0.0.1:8080",
       ),
     )
   let client = process.new_subject()
@@ -3698,6 +3712,8 @@ pub fn meta_updated_from_other_thread_refreshes_sidebar_test() {
         bots: bots,
         models_timeout_ms: 60_000,
         thread: Some(a.id),
+        store: seam,
+        pair_base: "http://127.0.0.1:8080",
       ),
     )
   let client = process.new_subject()
@@ -3807,6 +3823,7 @@ fn test_config() -> config.Config {
     workspace_root: None,
     env_timeout_ms: 60_000,
     env_max_output_bytes: 100_000,
+    node_idle_days: 7,
     // Bots P3c: the delivery hop guard; 4 = the shipped default.
     max_bot_hops: 4,
   )
@@ -4233,6 +4250,8 @@ pub fn bot_picker_submit_roundtrip_test() {
         bots: bots,
         models_timeout_ms: 60_000,
         thread: None,
+        store: seam,
+        pair_base: "http://127.0.0.1:8080",
       ),
     )
   let client = process.new_subject()
@@ -4766,6 +4785,8 @@ fn boot_create_runtime(
         bots: bots,
         models_timeout_ms: 60_000,
         thread: None,
+        store: store_mock.seam(store_mock.start()),
+        pair_base: "http://127.0.0.1:8080",
       ),
     )
   let client = process.new_subject()
@@ -5134,28 +5155,33 @@ pub fn pane_renders_channel_rows_test() {
   should_contain(html, "data-thread-id=\"s-ch-2\"")
 }
 
-/// The header badge counts RUNNING channels and renders nothing when
-/// the thread has none (the ambient signal exists only where channels
-/// exist). Idle rows keep the button (the pane is still the way in) but
-/// hide the count chip and the pulse.
+/// The header badge counts RUNNING channels. Since Phase C (tui-pairing)
+/// the button renders for EVERY selected thread — the pane is the
+/// Environments/mint surface and must be reachable on a channel-less
+/// thread — but the count chip hides at zero and the dot stays gray
+/// there (the ambient signal still exists only where channels exist).
 pub fn badge_counts_running_channels_test() {
   let model =
     new_model()
     |> step(ui.ThreadsLoaded([summary("s-parent", False)]))
     |> step(ui.Select("s-parent"))
-  // No channels: no badge at all.
-  view_string(model) |> should_not_contain("id=\"info-btn\"")
-  let idle =
+  // No channels: the button renders (reachability), but carries no
+  // count chip and no live dot.
+  let idle_html = view_string(model)
+  should_contain(idle_html, "id=\"info-btn\"")
+  should_not_contain(idle_html, "class=\"n\"")
+  should_not_contain(idle_html, "info-dot live")
+  let with_idle =
     model
     |> step(
       ui.ChannelsLoaded("s-parent", [
         channel_info("s-ch-1", Some("RelayBeta"), False, False),
       ]),
     )
-  let idle_html = view_string(idle)
-  should_contain(idle_html, "id=\"info-btn\"")
-  should_not_contain(idle_html, "class=\"n\"")
-  should_not_contain(idle_html, "info-dot live")
+  let idle_rows_html = view_string(with_idle)
+  should_contain(idle_rows_html, "id=\"info-btn\"")
+  should_not_contain(idle_rows_html, "class=\"n\"")
+  should_not_contain(idle_rows_html, "info-dot live")
   let running =
     model
     |> step(
@@ -5229,6 +5255,259 @@ pub fn pane_rows_escape_hostile_labels_test() {
   let html = view_string(model)
   should_not_contain(html, "<script>")
   should_contain(html, "&lt;script&gt;alert(1)&lt;/script&gt;")
+}
+
+// ---- Environments section (tui-pairing plan Phase C) ----
+
+fn env_node(name: String, last_seen: Option(Int)) -> node.Node {
+  node.Node(
+    id: "n-" <> name,
+    name: name,
+    token_hash: "aabbcc",
+    created_at: timing.wall_now_s() - 3600,
+    last_seen_at: last_seen,
+  )
+}
+
+fn env_grant(thread_id: String, use_count: Int, expires_in: Int) -> node.Grant {
+  let now = timing.wall_now_s()
+  node.Grant(
+    id: "g-" <> thread_id,
+    code_hash: node.hash_token("unused"),
+    thread_id: Some(thread_id),
+    created_at: now,
+    expires_at: now + expires_in,
+    use_count: use_count,
+    last_used_at: None,
+  )
+}
+
+/// An env-carrying thread (a roster row in the log) renders the roster
+/// with the joined node rows: last-seen ages and revokes. Everything is
+/// a text node — target names are transcript text.
+pub fn env_section_renders_roster_test() {
+  let now = timing.wall_now_s()
+  let roster_text =
+    env.roster_attach_text("proxmox-2", ["workspace", "proxmox-2"])
+  let model =
+    new_model()
+    |> step(ui.ThreadsLoaded([summary("s1", False)]))
+    |> step(ui.Select("s1"))
+    |> step(ui.UserEcho(roster_text, Some(now), Some("system")))
+    |> step(
+      ui.EnvLoaded(0, Some("s1"), [env_node("proxmox-2", Some(now - 120))], []),
+    )
+    |> step(ui.PaneToggled)
+  let html = view_string(model)
+  should_contain(html, "workspace")
+  should_contain(html, "local workspace")
+  should_contain(html, "proxmox-2")
+  should_contain(html, "last seen 2m ago")
+  should_contain(html, "data-revoke-node=\"n-proxmox-2\"")
+  should_contain(html, "Pair a TUI")
+}
+
+/// A rostered target with NO stored row renders without revoke (no
+/// credential to revoke); a never-connected node reads "never
+/// connected".
+pub fn env_section_unpaired_and_never_connected_test() {
+  let now = timing.wall_now_s()
+  let model =
+    new_model()
+    |> step(ui.ThreadsLoaded([summary("s1", False)]))
+    |> step(ui.Select("s1"))
+    |> step(ui.UserEcho(
+      env.roster_attach_text("ghost", ["workspace", "ghost", "fresh"]),
+      Some(now),
+      Some("system"),
+    ))
+    |> step(ui.EnvLoaded(0, Some("s1"), [env_node("fresh", None)], []))
+    |> step(ui.PaneToggled)
+  let html = view_string(model)
+  should_contain(html, "no credential")
+  should_not_contain(html, "data-revoke-node=\"n-ghost\"")
+  should_contain(html, "never connected")
+  should_contain(html, "data-revoke-node=\"n-fresh\"")
+}
+
+/// A thread created without a workspace has NO roster row: the section
+/// reads "no environment" and the mint button does not render (a TUI
+/// could not serve it).
+pub fn env_plain_thread_has_no_mint_test() {
+  let model =
+    new_model()
+    |> step(ui.ThreadsLoaded([summary("s1", False)]))
+    |> step(ui.Select("s1"))
+    |> step(ui.PaneToggled)
+  let html = view_string(model)
+  should_contain(html, "no environment")
+  should_not_contain(html, "id=\"pair-tui\"")
+}
+
+/// The mint flow: the guard arms on request, the ONE-TIME URL display
+/// takes the plaintext code (server-side only the hash is stored), and
+/// the grant list renders the new row's state line.
+pub fn env_mint_shows_url_once_test() {
+  let roster_text =
+    env.roster_attach_text("proxmox-2", ["workspace", "proxmox-2"])
+  let model =
+    new_model()
+    |> step(ui.ThreadsLoaded([summary("s1", False)]))
+    |> step(ui.Select("s1"))
+    |> step(ui.UserEcho(roster_text, Some(0), Some("system")))
+    |> step(ui.PaneToggled)
+  let pending = step(model, ui.GrantMintRequested)
+  pending.grant_minting |> should.be_true
+  let grant = env_grant("s1", 0, 3540)
+  let minted = step(pending, ui.GrantMinted("CODE123", grant))
+  minted.grant_minting |> should.be_false
+  let html = view_string(minted)
+  should_contain(html, "http://127.0.0.1:8080/pair/CODE123")
+  should_contain(html, "data-pair-url=\"CODE123\"")
+  should_contain(html, "data-pair-copy=\"CODE123\"")
+  should_contain(html, ">Copy</button>")
+  // Wall-clock live (fixture and renderer read the clock separately):
+  // pin the stable shape, not the exact minute — the exact labels are
+  // the pure fn's contract (expires_in_label_test).
+  should_contain(html, "expires in")
+  should_not_contain(html, "expired")
+  should_contain(html, "active")
+  should_contain(html, "paired 0 TUIs")
+}
+
+/// The mint display is stamped: a mint answering for a SUPERSEDED
+/// selection is dropped (the guard still releases).
+pub fn env_mint_stamps_to_selection_test() {
+  // The delayed-mint scenario: a mint STARTED on s1 lands after the
+  // user moved to s2 — the display must be dropped (stamped with the
+  // minting thread, not applied to whoever is selected now).
+  let roster_text =
+    env.roster_attach_text("proxmox-2", ["workspace", "proxmox-2"])
+  let model =
+    new_model()
+    |> step(ui.ThreadsLoaded([summary("s1", False), summary("s2", False)]))
+    |> step(ui.Select("s1"))
+    |> step(ui.UserEcho(roster_text, Some(0), Some("system")))
+    |> step(ui.PaneToggled)
+  let pending = step(model, ui.GrantMintRequested)
+  let switched = step(pending, ui.Select("s2"))
+  switched.selected |> should.equal(Some("s2"))
+  let minted_late =
+    step(switched, ui.GrantMinted("CODE123", env_grant("s1", 0, 3540)))
+  minted_late.grant_minting |> should.be_false
+  minted_late.grant_minted |> should.equal(None)
+  let html = view_string(minted_late)
+  should_not_contain(html, "CODE123")
+}
+
+/// The grants list filters to the SELECTED thread's rows; expired-
+/// but-unswept rows stay listed, labelled.
+pub fn env_grants_filter_and_expire_label_test() {
+  let roster_text = env.roster_attach_text("proxmox-2", ["workspace"])
+  let now = timing.wall_now_s()
+  let model =
+    new_model()
+    |> step(ui.ThreadsLoaded([summary("s1", False), summary("s2", False)]))
+    |> step(ui.Select("s1"))
+    |> step(ui.UserEcho(roster_text, Some(now), Some("system")))
+    |> step(
+      ui.EnvLoaded(0, Some("s1"), [], [
+        env_grant("s1", 2, 1800),
+        env_grant("s2", 1, 1800),
+        env_grant("s1", 0, -60),
+      ]),
+    )
+    |> step(ui.PaneToggled)
+  let html = view_string(model)
+  // The active row's minute count is wall-clock live (fixture and
+  // renderer read the clock separately), so pin the stable parts: the
+  // state word, the use-count diagnostic, and the fact it is NOT
+  // expired. The exact labels are the pure fn's contract
+  // (expires_in_label_test).
+  should_contain(html, "active")
+  should_contain(html, "paired 2 TUIs")
+  should_contain(html, "expires in")
+  // The past-due row is drift-safe: any wall time after the fixture
+  // reads expired.
+  should_contain(html, "expired · expired · paired 0 TUIs")
+  // The other thread's grant never renders here.
+  should_not_contain(html, "paired 1 TUI")
+}
+
+/// A revoke self-refreshes: the revoke worker re-reads and dispatches
+/// the stamped EnvLoaded; here, the reply path — the revoked grant's
+/// row is gone from the list, and the one-time display drops when ITS
+/// grant is the one revoked.
+pub fn env_revoke_reply_clears_display_test() {
+  let roster_text = env.roster_attach_text("proxmox-2", ["workspace"])
+  let grant = env_grant("s1", 0, 3540)
+  let model =
+    new_model()
+    |> step(ui.ThreadsLoaded([summary("s1", False)]))
+    |> step(ui.Select("s1"))
+    |> step(ui.UserEcho(roster_text, Some(0), Some("system")))
+    |> step(ui.EnvLoaded(0, Some("s1"), [], [grant]))
+    |> step(ui.PaneToggled)
+    |> step(ui.GrantMintRequested)
+    |> step(ui.GrantMinted("CODE123", grant))
+  // A re-read lands WITHOUT the revoked grant: the display drops with
+  // it (a revoked URL must not linger). The re-read carries the mint
+  // request's generation (the bump proves the drop is CONTENT-based,
+  // not a generation mismatch).
+  let refreshed = step(model, ui.EnvLoaded(1, Some("s1"), [], []))
+  refreshed.grant_minted |> should.equal(None)
+  let html = view_string(refreshed)
+  should_not_contain(html, "CODE123")
+  should_not_contain(html, "data-revoke-grant")
+}
+
+/// Selection change clears the section's per-selection state (the pane
+/// rule the channel rows already follow).
+pub fn env_state_is_per_selection_test() {
+  let roster_text = env.roster_attach_text("proxmox-2", ["workspace"])
+  let now = timing.wall_now_s()
+  let model =
+    new_model()
+    |> step(ui.ThreadsLoaded([summary("s1", False), summary("s2", False)]))
+    |> step(ui.Select("s1"))
+    |> step(ui.UserEcho(roster_text, Some(now), Some("system")))
+    |> step(ui.EnvLoaded(0, Some("s1"), [env_node("proxmox-2", Some(now))], []))
+    |> step(ui.PaneToggled)
+    |> step(ui.GrantMinted("CODE123", env_grant("s1", 0, 3540)))
+    |> step(ui.Select("s2"))
+  model.env_nodes |> should.equal([])
+  model.env_grants |> should.equal([])
+  model.grant_minted |> should.equal(None)
+  model.env_error |> should.equal(None)
+}
+
+/// Hostile text: a crafted roster row (transcript text — a hostile
+/// payload can ride a persisted roster line) renders inert; the parsed
+/// "target" is a text node like any other.
+pub fn env_roster_row_is_hostile_text_test() {
+  let payload = env.roster_prefix <> "workspace, <script>alert(1)</script>img."
+  let now = timing.wall_now_s()
+  let model =
+    new_model()
+    |> step(ui.ThreadsLoaded([summary("s1", False)]))
+    |> step(ui.Select("s1"))
+    |> step(ui.UserEcho(payload, Some(now), Some("system")))
+    |> step(ui.EnvLoaded(0, Some("s1"), [], []))
+    |> step(ui.PaneToggled)
+  let html = view_string(model)
+  should_not_contain(html, "<script>")
+  should_contain(html, "&lt;script&gt;alert(1)&lt;/script&gt;")
+}
+
+/// The pure expiry label: minute granularity, sub-minute and past-due
+/// arms (the timestamps script's ticking twin uses the same
+/// thresholds).
+pub fn expires_in_label_test() {
+  ui.expires_in_label(1000, 1600) |> should.equal("expires in 10m")
+  ui.expires_in_label(1000, 1060) |> should.equal("expires in 1m")
+  ui.expires_in_label(1000, 1059) |> should.equal("expires <1m")
+  ui.expires_in_label(1000, 1000) |> should.equal("expired")
+  ui.expires_in_label(1000, 999) |> should.equal("expired")
 }
 
 /// The deleted-bot fallback is the frozen creation title (the as-built

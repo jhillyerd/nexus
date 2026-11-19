@@ -35,6 +35,10 @@ fn set_all(pairs: List(#(String, String))) -> Nil {
   envoy.unset("NEXUS_WORKSPACE_ROOT")
   envoy.unset("NEXUS_ENV_TIMEOUT_MS")
   envoy.unset("NEXUS_ENV_MAX_OUTPUT_BYTES")
+  // TUI pairing hygiene (tui-pairing plan): the default-7 assertion is
+  // only meaningful when the caller's shell has not exported an
+  // override (env leakage is real — see the seed-key foot-gun).
+  envoy.unset("NEXUS_NODE_IDLE_DAYS")
   envoy.unset("NEXUS_HTTP_FETCH_MAX_BYTES")
   envoy.unset("NEXUS_HTTP_FETCH_TIMEOUT_MS")
   envoy.unset("NEXUS_HTTP_FETCH_ALLOW_PRIVATE")
@@ -472,4 +476,39 @@ pub fn mcp_servers_rejects_nul_in_command_test() {
   ])
   let assert Error(message) = config.load()
   should.be_true(string.contains(message, "NUL"))
+}
+
+// ---------------------------------------------------------------------------
+// TUI pairing hygiene (tui-pairing plan)
+// ---------------------------------------------------------------------------
+
+/// The idle-node sweep ships enabled at 7 days.
+pub fn node_idle_days_defaults_and_overrides_test() {
+  set_all([#("NEXUS_ENCRYPTION_KEY", key_b64)])
+  let assert Ok(cfg) = config.load()
+  cfg.node_idle_days |> should.equal(7)
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_NODE_IDLE_DAYS", "0"),
+  ])
+  let assert Ok(cfg) = config.load()
+  // 0 legitimately DISABLES the sweep (a credential lives until
+  // revoked) — the floor is non-negative, not positive.
+  cfg.node_idle_days |> should.equal(0)
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_NODE_IDLE_DAYS", "30"),
+  ])
+  let assert Ok(cfg) = config.load()
+  cfg.node_idle_days |> should.equal(30)
+}
+
+pub fn node_idle_days_rejects_negative_test() {
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_NODE_IDLE_DAYS", "-1"),
+  ])
+  let assert Error(message) = config.load()
+  message
+  |> should.equal("environment variable NEXUS_NODE_IDLE_DAYS must be >= 0: -1")
 }
