@@ -77,7 +77,7 @@ CREATE INDEX IF NOT EXISTS provider_enabled ON provider (enabled);
 
 CREATE TABLE IF NOT EXISTS bot (
   id            text PRIMARY KEY,
-  name          text NOT NULL,                   -- display + lookup key (unique)
+  name          text NOT NULL,                   -- display name; lookup + uniqueness are case-INSENSITIVE (index below), display case preserved
   description   text NOT NULL DEFAULT '',
   provider_id   text NOT NULL REFERENCES provider(id) ON DELETE RESTRICT,
                                                 -- RESTRICT like thread.provider_id: a bot cannot outlive its provider;
@@ -90,7 +90,13 @@ CREATE TABLE IF NOT EXISTS bot (
   updated_at    timestamptz NOT NULL
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS bot_name ON bot (name);
+-- Bot names are case-insensitively unique (#127): addressing a bot by the
+-- wrong casing must resolve to it, which requires "alice" and "Alice" to
+-- be ONE bot. The index is functional (lower(name)); display case is kept
+-- verbatim. Pre-deployment schema: the DROP replaces the plain (name)
+-- index in place (IF NOT EXISTS would never rewrite an existing index).
+DROP INDEX IF EXISTS bot_name;
+CREATE UNIQUE INDEX IF NOT EXISTS bot_name ON bot (lower(name));
 
 CREATE TABLE IF NOT EXISTS thread (
   id             text PRIMARY KEY,             -- existing user-visible thread id

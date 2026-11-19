@@ -187,10 +187,12 @@ pub fn uescape_string_test() {
 pub fn schema_is_the_entire_schema_test() {
   let assert Ok(schema) = read_file("sql/schema.sql") |> bit_array.to_string
   let statements = migrate.statements(schema)
-  // 20 = 18 (the node_grant era) + per-thread node names: the
+  // 21 = 18 (the node_grant era) + per-thread node names: the
   // node_thread_name index replacing node_name, plus the deployed-db
-  // column migration (the DROP INDEX + the DO block).
-  should.equal(list.length(statements), 20)
+  // column migration (the DROP INDEX + the DO block), plus the bot
+  // name CI re-index (#127): the DROP of the plain (name) index before
+  // the functional lower(name) UNIQUE replaces it.
+  should.equal(list.length(statements), 21)
   // The non-CREATE statements: the manifest swap (plugin-api Phase 2)
   // — a DO block that backfills the old plain-name column into
   // thread_toolset entries before dropping it, lossless for existing
@@ -205,7 +207,7 @@ pub fn schema_is_the_entire_schema_test() {
     list.filter(statements, fn(stmt) {
       !string.starts_with(string.trim(string.lowercase(stmt)), "create")
     })
-  should.equal(list.length(non_create), 3)
+  should.equal(list.length(non_create), 4)
   let assert [swap] =
     list.filter(non_create, fn(stmt) {
       string.contains(string.lowercase(stmt), "drop column toolset")
@@ -219,6 +221,20 @@ pub fn schema_is_the_entire_schema_test() {
     list.filter(non_create, fn(stmt) {
       string.contains(string.lowercase(stmt), "drop index if exists node_name")
     })
+  // The bot-name CI re-index (#127): drop the plain (name) index, then
+  // the functional lower(name) UNIQUE replaces it — and match the
+  // DEFINITION, so a regression to a plain (name) index fails here.
+  let assert [_drop_bot_name] =
+    list.filter(non_create, fn(stmt) {
+      string.contains(string.lowercase(stmt), "drop index if exists bot_name")
+    })
+  let assert [bot_name_index] =
+    list.filter(statements, fn(stmt) {
+      string.contains(string.lowercase(stmt), "index if not exists bot_name")
+    })
+  let bot_index_lower = string.lowercase(bot_name_index)
+  should.be_true(string.contains(bot_index_lower, "unique"))
+  should.be_true(string.contains(bot_index_lower, "on bot (lower(name))"))
   let assert [node_scoping] =
     list.filter(non_create, fn(stmt) {
       let lower = string.lowercase(stmt)
