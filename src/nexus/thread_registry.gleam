@@ -2858,7 +2858,10 @@ fn deliver_message(
         True -> #(state, delivery.Refused("sender thread is archived"))
         False ->
           case classify_target(state, request.to) {
-            MissingTarget -> #(state, delivery.Refused("unknown target"))
+            MissingTarget(names) -> #(
+              state,
+              refused_unknown_target(request.to, names),
+            )
             // A store outage during the bot-name lookup is not an "unknown
             // target" — the honest verdict names the failure so the sender can
             // retry instead of giving up on a target that may well exist
@@ -2917,8 +2920,11 @@ fn deliver_message(
 /// What `to` resolved to. Thread ids win over bot names (the precise
 /// channel); a bot literally named like a thread id is reachable by name
 /// only while no thread owns that id — acceptable at personal scale.
+/// `MissingTarget` carries the names the same table scan saw (#127) —
+/// the refusal can name the available bots, so a mistyped or miscased
+/// address self-corrects in one round trip.
 type Target {
-  MissingTarget
+  MissingTarget(names: List(String))
   LookupUnavailable
   FoundBot(bot: store.StoredBot)
   FoundThread(state: State, record: Record)
@@ -2930,7 +2936,7 @@ fn classify_target(state: State, to: String) -> Target {
     Error(_) ->
       case find_bot_by_name(state, to) {
         BotFound(bot) -> FoundBot(bot)
-        NoSuchBot -> MissingTarget
+        NoSuchBot(names) -> MissingTarget(names)
         LookupFailed -> LookupUnavailable
       }
   }
@@ -2984,23 +2990,60 @@ fn resolve_thread(state: State, id: String) -> Result(#(State, Record), Nil) {
 /// a bot-registry call (§8 no-cross-registry-edges). A store failure is
 /// distinct from "no such bot": the caller must be able to tell a
 /// transient outage from a genuinely unknown target.
+///
+/// Matching is exact-first, then case-insensitive (#127): names are
+/// case-insensitively unique (`bot_name` on `lower(name)`), so at most
+/// one bot can match the fallback — unambiguous by construction — and a
+/// sender that mistypes the casing still reaches its target. A miss
+/// carries the table's names (sorted, for a stable refusal roster).
 type BotLookup {
   BotFound(bot: store.StoredBot)
-  NoSuchBot
+  NoSuchBot(names: List(String))
   LookupFailed
 }
 
 fn find_bot_by_name(state: State, name: String) -> BotLookup {
   case state.store.list_bots() {
-    Ok(bots) ->
-      case list.find(bots, fn(bot) { bot.name == name }) {
-        Ok(bot) -> BotFound(bot)
-        Error(Nil) -> NoSuchBot
+    Ok(bots) -> {
+      let found = case list.find(bots, fn(bot) { bot.name == name }) {
+        Ok(bot) -> Ok(bot)
+        Error(_) -> {
+          let lowered = string.lowercase(name)
+          list.find(bots, fn(bot) { string.lowercase(bot.name) == lowered })
+        }
       }
+      case found {
+        Ok(bot) -> BotFound(bot)
+        Error(_) ->
+          NoSuchBot(
+            bots
+            |> list.map(fn(bot) { bot.name })
+            |> list.sort(string.compare),
+          )
+      }
+    }
     Error(error) -> {
       log_store_error("deliver target lookup", error)
       LookupFailed
     }
+  }
+}
+
+/// The unknown-target verdict (#127): the refusal names the bots the
+/// lookup's table scan saw, so the sender can correct itself without a
+/// discovery round trip. An empty table gets its own honest line (the
+/// roster is empty because nobody exists, not because the target is
+/// mistyped).
+fn refused_unknown_target(to: String, names: List(String)) -> delivery.Reply {
+  case names {
+    [] -> delivery.Refused("unknown target: no bots exist yet")
+    _ ->
+      delivery.Refused(
+        "unknown target \""
+        <> to
+        <> "\" — available bots: "
+        <> string.join(names, ", "),
+      )
   }
 }
 
