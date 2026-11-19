@@ -437,16 +437,8 @@ async function main() {
   await waitHealthy();
 
   // --- Pairing + thread setup -------------------------------------------
-  const pair = await check("pair node through POST /nodes", async () => {
-    const res = await api("POST", "/nodes", { name: "node-a" });
-    if (res.status !== 201) throw new Error(`expected 201, got ${res.status}: ${JSON.stringify(res.body)}`);
-    if (typeof res.body.token !== "string" || res.body.token.length < 20) {
-      throw new Error("no plaintext token in the create answer");
-    }
-    return res.body;
-  });
-  const nodeToken = pair.token;
-
+  // The thread comes first: a node row binds to its thread (per-thread
+  // node names), so POST /nodes requires the thread id.
   const envThread = await check("create env-toolset thread", async () => {
     const res = await api("POST", "/threads", {
       provider: "fakenode",
@@ -457,8 +449,29 @@ async function main() {
     return res.body.id;
   });
 
+  const pair = await check("pair node through POST /nodes", async () => {
+    const res = await api("POST", "/nodes", { name: "node-a", thread: envThread });
+    if (res.status !== 201) throw new Error(`expected 201, got ${res.status}: ${JSON.stringify(res.body)}`);
+    if (typeof res.body.token !== "string" || res.body.token.length < 20) {
+      throw new Error("no plaintext token in the create answer");
+    }
+    if (res.body.thread_id !== envThread) throw new Error(`row bound to ${res.body.thread_id}, want ${envThread}`);
+    return res.body;
+  });
+  const nodeToken = pair.token;
+
   const nodeUrl = (thread, extra = "") =>
     `ws://127.0.0.1:${PORT}/node/ws?node=node-a&token=${encodeURIComponent(nodeToken)}&thread=${thread}${extra}`;
+
+  // Names are PER-THREAD: a row joins only its own thread, so a test
+  // hitting another thread pairs its own node name into it first.
+  const pairInto = async (thread, name) => {
+    const res = await api("POST", "/nodes", { name, thread });
+    if (res.status !== 201) throw new Error(`pair ${name} → ${thread}: ${res.status} ${JSON.stringify(res.body)}`);
+    return res.body.token;
+  };
+  const nodeUrlFor = (name, token, thread, extra = "") =>
+    `ws://127.0.0.1:${PORT}/node/ws?node=${name}&token=${encodeURIComponent(token)}&thread=${thread}${extra}`;
 
   // --- 1. Connect sequence + replay --------------------------------------
   const nodeA = new FakeNode(nodeUrl(envThread));
@@ -675,7 +688,10 @@ async function main() {
     if (plain.status !== 201) {
       throw new Error(`plain thread creation returned ${plain.status}`);
     }
-    const bad = new FakeNode(nodeUrl(plain.body.id));
+    const bad = new FakeNode(nodeUrlFor("node-plain", await pairInto(plain.body.id, "node-plain"), plain.body.id));
+    // node-plain is bound to THIS thread: auth passes, so the refusal
+    // below is the 403 env-capability gate, not the scoped 401 auth
+    // lookup a foreign thread's row would hit.
     const opened = await bad.connect();
     if (opened !== null) {
       throw new Error("env-role socket unexpectedly connected to a plain thread");
@@ -696,7 +712,8 @@ async function main() {
     if (def.status !== 201) {
       throw new Error(`default thread creation returned ${def.status}`);
     }
-    const node = new FakeNode(nodeUrl(def.body.id));
+    const defToken = await pairInto(def.body.id, "node-def");
+    const node = new FakeNode(nodeUrlFor("node-def", defToken, def.body.id));
     const opened = await node.connect();
     if (opened === null) {
       throw new Error("env socket closed at connect on a default thread");
@@ -715,7 +732,8 @@ async function main() {
       throw new Error(`plain thread creation returned ${plain.status}`);
     }
     const threadId = plain.body.id;
-    const viewer = new FakeNode(nodeUrl(threadId, "&role=viewer"));
+    const viewerToken = await pairInto(threadId, "node-view");
+    const viewer = new FakeNode(nodeUrlFor("node-view", viewerToken, threadId, "&role=viewer"));
     const opened = await viewer.connect();
     if (opened === null) throw new Error("viewer socket closed at connect");
     await viewer.waitFor((f) => f.type === "hello", "viewer hello");

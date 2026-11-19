@@ -21,9 +21,11 @@
 //// operator ONCE; only its digest is stored. Verification re-hashes the
 //// presented token and compares in constant time (`secure_compare`), so
 //// a stolen DB dump cannot mint a node connection, and a revoke is a
-//// row delete (a re-pair mints a fresh token + hash). Token authority
-//// is instance-wide by design (v1 single-user); per-thread grants grow
-//// on the join-authorization seam when multi-user accounts exist.
+//// row delete (a re-pair mints a fresh token + hash). Node NAMES are
+//// unique per thread (the row carries its `thread_id`); the token's
+//// OTHER authority stays instance-wide by design (v1 single-user),
+//// scoped to node operations — per-thread grants grow on the
+//// join-authorization seam when multi-user accounts exist.
 
 import gleam/bit_array
 import gleam/crypto
@@ -33,10 +35,17 @@ import gleam/string
 import nexus/env
 
 /// A stored node row — the whole entity (no secrets: the token HASH is
-/// public by nature, the plaintext token never rests).
+/// public by nature, the plaintext token never rests). `thread_id`
+/// binds the credential to its thread: node names are unique PER
+/// THREAD (the environments 2b-2 rule — two threads can host
+/// same-named nodes; the per-thread execution maps and rosters already
+/// route them independently), so (thread_id, name) is the node
+/// identity, and the /node/ws auth lookup is scoped by it — a row
+/// joins ONLY its own thread.
 pub type Node {
   Node(
     id: String,
+    thread_id: String,
     name: String,
     token_hash: String,
     created_at: Int,

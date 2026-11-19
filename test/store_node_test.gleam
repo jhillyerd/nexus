@@ -13,12 +13,47 @@ import nexus/config
 import nexus/node
 import nexus/store
 import nexus/store/persist
+import nexus/thread
 import nexus/timing
 import store_mock
 
-fn row(id: String, name: String) -> store.StoredNode {
+fn seed_thread(seam: store.Store, id: String) -> Nil {
+  store_mock.ensure_fixture_provider(seam)
+  let assert Ok(Nil) =
+    seam.insert_thread(
+      store.StoredSummary(
+        id: id,
+        // The mock enforces thread_provider_id_fkey: the fixture
+        // provider the mock boots with.
+        provider_id: store_mock.fixture_provider_id,
+        model: "alias-1",
+        meta: thread.ThreadMeta(
+          title: "",
+          title_source: thread.AutoTitle,
+          pinned: False,
+          tags: [],
+          tags_manual: [],
+          tags_source: thread.AutoTags,
+          archived: False,
+          bot_id: None,
+          parent_thread_id: None,
+          created_at: 1_700_000_000,
+        ),
+        last_active_at: 1_700_000_000,
+        toolset: [],
+        workspace_root: None,
+        roster: None,
+        message_count: 1,
+      ),
+      "sys",
+    )
+  Nil
+}
+
+fn row(id: String, thread_id: String, name: String) -> store.StoredNode {
   node.Node(
     id: id,
+    thread_id: thread_id,
     name: name,
     token_hash: node.hash_token("token-" <> name),
     created_at: 1_700_000_000,
@@ -28,17 +63,24 @@ fn row(id: String, name: String) -> store.StoredNode {
 
 pub fn node_pair_and_verify_roundtrip_test() {
   let seam = store_mock.seam(store_mock.start())
-  let n = row("n1", "proxmox-2")
+  seed_thread(seam, "t1")
+  let n = row("n1", "t1", "proxmox-2")
   seam.insert_node(n) |> should.be_ok
 
-  // Stateless verification: look up by NAME, check the token hash.
-  let assert Ok(stored) = seam.get_node_by_name("proxmox-2")
+  // Stateless verification: look up by (THREAD, name), check the
+  // token hash — per-thread node names, so the thread scopes it.
+  let assert Ok(stored) = seam.get_thread_node("t1", "proxmox-2")
   stored.id |> should.equal("n1")
+  stored.thread_id |> should.equal("t1")
   node.verify_token("token-proxmox-2", stored.token_hash) |> should.be_true
   node.verify_token("wrong", stored.token_hash) |> should.be_false
 
+  // The same name under ANOTHER thread does not resolve: a different
+  // node identity (the /node/ws auth is scoped by the pair).
+  seed_thread(seam, "t2")
+  seam.get_thread_node("t2", "proxmox-2") |> should.be_error
   // Unknown name refuses (no row to verify against).
-  seam.get_node_by_name("ghost") |> should.be_error
+  seam.get_thread_node("t1", "ghost") |> should.be_error
 }
 
 /// `list_nodes` returns nodes id-sorted, NOT insertion-sorted: insert a
@@ -47,31 +89,40 @@ pub fn node_pair_and_verify_roundtrip_test() {
 /// and fails.
 pub fn node_list_is_id_sorted_not_insertion_sorted_test() {
   let seam = store_mock.seam(store_mock.start())
+  seed_thread(seam, "t1")
   // Insertion order: n9, then n2. Lexical order: n2, then n9.
-  seam.insert_node(row("n9", "zeta")) |> should.be_ok
-  seam.insert_node(row("n2", "alpha")) |> should.be_ok
+  seam.insert_node(row("n9", "t1", "zeta")) |> should.be_ok
+  seam.insert_node(row("n2", "t1", "alpha")) |> should.be_ok
   let assert Ok(nodes) = seam.list_nodes()
   let assert [a, b] = nodes
   a.id |> should.equal("n2")
   b.id |> should.equal("n9")
 }
 
-pub fn node_name_is_unique_test() {
+pub fn node_name_is_unique_per_thread_test() {
   let seam = store_mock.seam(store_mock.start())
-  seam.insert_node(row("n1", "proxmox-2")) |> should.be_ok
-  // A second row with the same NAME refuses (node_name UNIQUE).
-  seam.insert_node(row("n2", "proxmox-2")) |> should.be_error
+  seed_thread(seam, "t1")
+  seed_thread(seam, "t2")
+  seam.insert_node(row("n1", "t1", "proxmox-2")) |> should.be_ok
+  // The same (thread, name) refuses (node_thread_name UNIQUE).
+  seam.insert_node(row("n2", "t1", "proxmox-2")) |> should.be_error
+  // The SAME NAME under a DIFFERENT thread is a different node —
+  // allowed (the environments 2b-2 rule the store now enforces).
+  seam.insert_node(row("n3", "t2", "proxmox-2")) |> should.be_ok
   // A second row with the same ID refuses too (node pkey).
-  seam.insert_node(row("n1", "other")) |> should.be_error
+  seam.insert_node(row("n1", "t2", "other")) |> should.be_error
+  // An unknown thread refuses (node_thread_id_fkey).
+  seam.insert_node(row("n4", "t-ghost", "other")) |> should.be_error
 }
 
 pub fn node_touch_and_revoke_test() {
   let seam = store_mock.seam(store_mock.start())
-  seam.insert_node(row("n1", "proxmox-2")) |> should.be_ok
+  seed_thread(seam, "t1")
+  seam.insert_node(row("n1", "t1", "proxmox-2")) |> should.be_ok
 
   // Touch bumps last_seen_at from None (never connected) to a stamp.
   seam.touch_node("n1") |> should.be_ok
-  let assert Ok(touched) = seam.get_node_by_name("proxmox-2")
+  let assert Ok(touched) = seam.get_thread_node("t1", "proxmox-2")
   should.be_true(case touched.last_seen_at {
     None -> False
     Some(_) -> True
@@ -80,7 +131,7 @@ pub fn node_touch_and_revoke_test() {
   // Revoke = hard delete: the name no longer resolves (token authority
   // gone).
   seam.delete_node("n1") |> should.be_ok
-  seam.get_node_by_name("proxmox-2") |> should.be_error
+  seam.get_thread_node("t1", "proxmox-2") |> should.be_error
   seam.list_nodes() |> should.equal(Ok([]))
 }
 
@@ -244,10 +295,13 @@ pub fn boot_sweeps_take_expired_grants_and_idle_nodes_test() {
   seam.insert_node_grant(expired) |> should.be_ok
   seam.insert_node_grant(live) |> should.be_ok
   // Old-node: never connected, created 8d ago; stale-node: connected,
-  // last seen 10d ago; fresh-node: connected 1h ago.
+  // last seen 10d ago; fresh-node: connected 1h ago. All bound to one
+  // seeded thread (the row's thread FK).
+  seed_thread(seam, "t1")
   let node_at = fn(id: String, name: String, created: Int, seen: Option(Int)) {
     node.Node(
       id: id,
+      thread_id: "t1",
       name: name,
       token_hash: "aabbcc",
       created_at: created,
@@ -292,9 +346,11 @@ pub fn boot_sweeps_zero_idle_days_disables_node_sweep_test() {
   }
   let expired = grant_at("g-expired", now - 60)
   seam.insert_node_grant(expired) |> should.be_ok
+  seed_thread(seam, "t1")
   let stale =
     node.Node(
       id: "n-ancient",
+      thread_id: "t1",
       name: "ancient-host",
       token_hash: "aabbcc",
       created_at: now - 400 * 86_400,

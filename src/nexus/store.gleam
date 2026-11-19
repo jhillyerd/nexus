@@ -309,12 +309,15 @@ pub type Store {
     /// guard's bot half (a store COUNT, never a bot-registry call).
     count_bots_for_provider: fn(String) -> Result(Int, StoreError),
     // ---- node rows (docs/plans/environments.md, Phase 2b) ----
-    /// Every stored node, ordered by id (registry boot load). No
-    /// plaintext secret: the row carries only the token hash.
+    /// Every stored node, ordered by id. Rows carry their thread_id —
+    /// consumers scope by it (the info pane renders one thread's rows).
     list_nodes: fn() -> Result(List(StoredNode), StoreError),
-    /// One stored node by its stable target NAME (the stateless
-    /// token-verification lookup key). `Error` for unknown names.
-    get_node_by_name: fn(String) -> Result(StoredNode, StoreError),
+    /// One stored node by (THREAD, NAME) — the stateless
+    /// token-verification lookup key: the /node/ws upgrade
+    /// authenticates the pair, so a row answers only for its own
+    /// thread (per-thread node names, environments 2b-2). `Error` for
+    /// unknown (thread, name) pairs.
+    get_thread_node: fn(String, String) -> Result(StoredNode, StoreError),
     /// Persist a new node row (write-through at pair). Errors on
     /// duplicate id or name, like the schema's constraints.
     insert_node: fn(StoredNode) -> Result(Nil, StoreError),

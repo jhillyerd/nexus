@@ -40,12 +40,15 @@
 //// ## Identity and replacement
 ////
 //// The connection's identity is the authenticated `node` row (the
-//// route verified the token pre-upgrade); the row's name IS the roster
-//// target. A fresh connection for a live name REPLACES the roster
-//// entry — the thread actor kills the old adapter (its linked socket
-//// dies with it), registers the new plane immediately, and appends NO
-//// roster line (the attached list is unchanged; the model already
-//// knows the target). Routing is not transcript state.
+//// route verified the token pre-upgrade, scoped to the (thread, name)
+//// pair — names are unique PER THREAD, so a row joins only its own
+//// thread and the same name elsewhere is a different node); the row's
+//// name IS the roster target. A fresh connection for a live name
+//// REPLACES the roster entry — the thread actor kills the old adapter
+//// (its linked socket dies with it), registers the new plane
+//// immediately, and appends NO roster line (the attached list is
+//// unchanged; the model already knows the target). Routing is not
+//// transcript state.
 
 import gleam/bytes_tree
 import gleam/dict.{type Dict}
@@ -105,23 +108,29 @@ pub fn websocket(
         json.object([#("error", json.string("node auth required"))]),
       )
     Ok(#(name, token)) ->
-      case authenticate(store, name, token) {
+      // The thread parameter comes BEFORE the auth lookup: names are
+      // per-thread (environments 2b-2), so the row is looked up by the
+      // (thread, name) PAIR — a row answers only for its own thread,
+      // and the same name under another thread is a different node.
+      case thread_id_from(req) {
         Error(_) ->
           json_response(
-            401,
-            json.object([#("error", json.string("unknown node or bad token"))]),
+            400,
+            json.object([
+              #("error", json.string("thread parameter required")),
+            ]),
           )
-        Ok(row) -> {
-          let _ = store.touch_node(row.id)
-          case thread_id_from(req) {
+        Ok(thread_id) ->
+          case authenticate(store, thread_id, name, token) {
             Error(_) ->
               json_response(
-                400,
+                401,
                 json.object([
-                  #("error", json.string("thread parameter required")),
+                  #("error", json.string("unknown node or bad token")),
                 ]),
               )
-            Ok(thread_id) ->
+            Ok(row) -> {
+              let _ = store.touch_node(row.id)
               case thread_registry.get(registry, thread_id) {
                 Error(_) ->
                   json_response(
@@ -170,8 +179,8 @@ pub fn websocket(
                   }
                 }
               }
+            }
           }
-        }
       }
   }
 }
@@ -261,18 +270,21 @@ fn env_capable(
   thread_registry.env_capable(registry, thread_id)
 }
 
-/// Stateless per-connection verify: the named row's stored hash against
-/// the presented token (`node.verify_token`, constant-time). A wrong
-/// name and a wrong token answer identically — the 401 carries no
-/// oracle. `touch_node` (last-seen) is best-effort at the route AND at
-/// the clean close (the idle-node sweep's freshness contract — see
-/// `node_upgrade`'s on_close).
+/// Stateless per-connection verify: the (thread, name) row's stored
+/// hash against the presented token (`node.verify_token`, constant-
+/// time). The lookup is SCOPED by the thread (per-thread node names):
+/// a credential answers only for its own thread, and a wrong name, a
+/// wrong thread, and a wrong token answer identically — the 401
+/// carries no oracle. `touch_node` (last-seen) is best-effort at the
+/// route AND at the clean close (the idle-node sweep's freshness
+/// contract — see `node_upgrade`'s on_close).
 fn authenticate(
   store: Store,
+  thread_id: String,
   name: String,
   token: String,
 ) -> Result(node.Node, Nil) {
-  case store.get_node_by_name(name) {
+  case store.get_thread_node(thread_id, name) {
     Ok(row) ->
       case node.verify_token(token, row.token_hash) {
         True -> Ok(row)

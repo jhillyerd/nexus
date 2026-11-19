@@ -108,7 +108,11 @@ pub type Msg {
   CountBotsForProvider(id: String, reply: Subject(Result(Int, String)))
   // ---- node rows (docs/plans/environments.md, Phase 2b) ----
   ListNodes(reply: Subject(Result(List(store.StoredNode), String)))
-  GetNodeByName(name: String, reply: Subject(Result(store.StoredNode, String)))
+  GetThreadNode(
+    thread_id: String,
+    name: String,
+    reply: Subject(Result(store.StoredNode, String)),
+  )
   InsertNode(node: store.StoredNode, reply: Subject(Result(Nil, String)))
   TouchNode(id: String, reply: Subject(Result(Nil, String)))
   DeleteNode(id: String, reply: Subject(Result(Nil, String)))
@@ -317,9 +321,9 @@ pub fn seam(store_actor: Subject(Msg)) -> store.Store {
       })
     },
     list_nodes: fn() { actor.call(store_actor, call_timeout_ms, ListNodes) },
-    get_node_by_name: fn(name) {
+    get_thread_node: fn(thread_id, name) {
       actor.call(store_actor, call_timeout_ms, fn(reply) {
-        GetNodeByName(name, reply)
+        GetThreadNode(thread_id, name, reply)
       })
     },
     insert_node: fn(node) {
@@ -861,6 +865,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           |> list.map(fn(row) {
             node_from_row(
               row.id,
+              row.thread_id,
               row.name,
               row.token_hash,
               row.created_s,
@@ -873,22 +878,24 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       actor.continue(state)
     }
 
-    GetNodeByName(name, reply) -> {
-      // Empty result = unknown name; the caller decides (the stateless
-      // verification path refuses a lookup that finds no row).
-      let result = case sql.get_node_by_name(state.db, name) {
+    GetThreadNode(thread_id, name, reply) -> {
+      // Empty result = unknown (thread, name); the caller decides (the
+      // stateless verification path refuses a lookup that finds no
+      // row). Scoped by BOTH: a row answers only for its own thread.
+      let result = case sql.get_thread_node(state.db, thread_id, name) {
         Error(error) -> Error(query_error(error))
         Ok(pog.Returned(_, rows)) ->
           case rows {
             [row] ->
               Ok(node_from_row(
                 row.id,
+                row.thread_id,
                 row.name,
                 row.token_hash,
                 row.created_s,
                 row.last_seen_s,
               ))
-            _ -> Error("no stored node named " <> name)
+            _ -> Error("no stored node " <> name <> " in thread " <> thread_id)
           }
       }
       process.send(reply, result)
@@ -900,6 +907,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
         sql.insert_node(
           state.db,
           node.id,
+          node.thread_id,
           node.name,
           node.token_hash,
           int.to_float(node.created_at),
@@ -1240,6 +1248,7 @@ fn bot_from_row(
 /// connected) → `None`, matching `node.Node`.
 fn node_from_row(
   id: String,
+  thread_id: String,
   name: String,
   token_hash: String,
   created_s: Int,
@@ -1247,6 +1256,7 @@ fn node_from_row(
 ) -> store.StoredNode {
   node.Node(
     id: id,
+    thread_id: thread_id,
     name: name,
     token_hash: token_hash,
     created_at: created_s,

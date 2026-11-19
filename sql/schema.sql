@@ -188,25 +188,67 @@ CREATE UNIQUE INDEX IF NOT EXISTS thread_channel ON thread (parent_thread_id, bo
 --
 -- Token authority is instance-wide by design (v1): nexus is single-user
 -- today (one NEXUS_UI_TOKEN guards the whole web surface), so a node token
--- grants exactly what a UI connection grants — join any thread as viewer,
--- join env-toolset threads as environment, Send — scoped to node
--- operations and revocable per node (DELETE the row). Per-thread grants
--- become REQUIRED the day multi-user accounts exist.
+-- grants exactly what a UI connection grants — as scoped by its ROW:
+-- join its own thread as viewer or environment (env-capable threads
+-- only), Send — revocable per node (DELETE the row). Per-thread grants
+-- and owner binding become REQUIRED the day multi-user accounts exist.
 --
 -- token_hash is the SHA-256 of the node's bearer token (nexus/node.gleam,
 -- gleam_crypto), NEVER the plaintext: verification re-hashes the presented
 -- token and compares in constant time, so a stolen DB dump cannot mint a
 -- node connection. Tokens are distinct from the UI token and revocable by
 -- deleting the row (a revoke + re-pair mints a fresh hash).
+--
+-- thread_id binds the credential to its thread (per-thread node names,
+-- the environments plan's own 2b-2 rule: names are unique per ROSTER,
+-- not per instance — two threads can host same-named nodes, and the
+-- per-thread execution maps/rosters already route them independently).
+-- The auth lookup is (thread_id, name), so a row joins ONLY its thread.
+-- CASCADE matches the grant reasoning: a credential for a deleted
+-- thread is meaningless and must die with it.
 CREATE TABLE IF NOT EXISTS node (
   id            text PRIMARY KEY,
-  name          text NOT NULL,                  -- stable user-assigned target name (unique)
+  thread_id     text NOT NULL REFERENCES thread(id) ON DELETE CASCADE,
+  name          text NOT NULL,                  -- stable user-assigned target name (unique per thread)
   token_hash    text NOT NULL,                  -- hex digest of the bearer token, never plaintext
   created_at    timestamptz NOT NULL,
   last_seen_at  timestamptz                     -- bumped on each authenticated connect (NULL = never connected)
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS node_name ON node (name);
+-- Per-thread name scoping (the environments plan's own 2b-2 rule,
+-- now enforced by the store): (thread_id, name) is the node identity —
+-- the same name under a different thread is a DIFFERENT node. The
+-- leading column serves the scoped auth lookup, so no separate
+-- thread_id index.
+--
+-- Migration for databases predating per-thread node names: the base
+-- CREATE above skips an existing table, so the column lands here, and
+-- pre-scoping rows have no backfillable thread (nothing in the row
+-- records it) — a node credential is re-mintable by re-pairing, so
+-- they are deleted, then the column is pinned NOT NULL. The replacement
+-- constraint is installed BEFORE the old one is dropped (the runner
+-- executes statements independently, so an interrupted run must never
+-- leave the name unguarded): the DO block first (the column must
+-- exist), then the new index, then the DROP. One statement so the gate
+-- stays atomic; idempotent under the EXISTS guard (the thread.toolset
+-- migration precedent above).
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'node' AND column_name = 'thread_id'
+  ) THEN
+    ALTER TABLE node ADD COLUMN thread_id text;
+    DELETE FROM node WHERE thread_id IS NULL;
+    ALTER TABLE node ALTER COLUMN thread_id SET NOT NULL;
+    ALTER TABLE node ADD FOREIGN KEY (thread_id) REFERENCES thread(id) ON DELETE CASCADE;
+  END IF;
+END $$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS node_thread_name ON node (thread_id, name);
+-- The old instance-global constraint goes LAST: the replacement above
+-- already guards (thread_id, name) when this runs.
+DROP INDEX IF EXISTS node_name;
 CREATE INDEX IF NOT EXISTS node_recency ON node (last_seen_at DESC);
 
 -- TUI pairing grants (docs/plans/tui-pairing.md, Phase A): a web-minted,

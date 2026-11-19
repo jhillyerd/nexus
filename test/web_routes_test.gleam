@@ -1274,62 +1274,14 @@ pub fn bots_allow_inbound_patch_round_trip_test() {
 // Node pairing routes + /node/ws pre-upgrade auth (environments 2b-3)
 // ---------------------------------------------------------------------------
 
-/// The minimal pairing surface: POST mints the row and answers the
-/// plaintext token ONCE (never the hash), duplicates refuse, the list
-/// carries no secrets, revoke is an idempotent row delete, and the
-/// UI token still guards the admin surface.
+/// The minimal pairing surface: POST mints the (thread-bound) row and
+/// answers the plaintext token ONCE (never the hash), duplicates
+/// refuse PER THREAD, the same name under another thread is a NEW row
+/// (per-thread node names), the list carries no secrets, revoke is an
+/// idempotent row delete, and the UI token still guards the admin
+/// surface.
 pub fn node_pairing_round_trip_test() {
   let #(_registry, port) = start_server()
-  let #(status, body) =
-    send_authorized(req(port, Post, "/nodes", "{\"name\":\"proxmox-2\"}"))
-  should.equal(status, 201)
-  should.be_true(string.contains(body, "\"name\":\"proxmox-2\""))
-  should.be_true(string.contains(body, "\"token\":\""))
-  should.be_false(string.contains(body, "token_hash"))
-  let assert Ok(node_id) = json.parse(body, decode.at(["id"], decode.string))
-
-  // A duplicate name is the friendly 409.
-  let #(dup, _dup_body) =
-    send_authorized(req(port, Post, "/nodes", "{\"name\":\"proxmox-2\"}"))
-  should.equal(dup, 409)
-
-  // The list carries the row, never the hash.
-  let #(list_status, listed) = send_authorized(req(port, Get, "/nodes", ""))
-  should.equal(list_status, 200)
-  should.be_true(string.contains(listed, "proxmox-2"))
-  should.be_false(string.contains(listed, "token_hash"))
-
-  // A reserved/invalid name refuses.
-  let #(reserved, _) =
-    send_authorized(req(port, Post, "/nodes", "{\"name\":\"workspace\"}"))
-  should.equal(reserved, 400)
-
-  // Revoke: 204, idempotent.
-  let #(del, _) = send_authorized(req(port, Delete, "/nodes/" <> node_id, ""))
-  should.equal(del, 204)
-  let #(del2, _) = send_authorized(req(port, Delete, "/nodes/" <> node_id, ""))
-  should.equal(del2, 204)
-  // The row is really gone, not just 204'd: the list no longer names it.
-  let #(_, after_revoke) = send_authorized(req(port, Get, "/nodes", ""))
-  should.be_false(string.contains(after_revoke, "proxmox-2"))
-
-  // The admin surface stays behind the UI token.
-  let assert Ok(unauth) =
-    hackney.send(req(port, Post, "/nodes", "{\"name\":\"x2\"}"))
-  should.equal(unauth.status, 401)
-}
-
-/// The pre-upgrade gates on /node/ws answer as ordinary HTTP statuses
-/// (a reconnecting client can tell bad token from bad path). The
-/// upgrade itself is the e2e fake node's to prove.
-pub fn node_ws_pre_upgrade_refusals_test() {
-  let #(_registry, port) = start_server()
-  let #(_, body) =
-    send_authorized(req(port, Post, "/nodes", "{\"name\":\"node-a\"}"))
-  let assert Ok(node_token) =
-    json.parse(body, decode.at(["token"], decode.string))
-
-  // A plain (non-env) thread for the role gate.
   let #(thread_status, thread_body) =
     send_authorized(req(
       port,
@@ -1342,6 +1294,89 @@ pub fn node_ws_pre_upgrade_refusals_test() {
   should.equal(thread_status, 201)
   let assert Ok(thread_id) =
     json.parse(thread_body, decode.at(["id"], decode.string))
+  let create = fn(thread: String, name: String) {
+    send_authorized(req(
+      port,
+      Post,
+      "/nodes",
+      "{\"thread\":\"" <> thread <> "\",\"name\":\"" <> name <> "\"}",
+    ))
+  }
+  let #(status, body) = create(thread_id, "proxmox-2")
+  should.equal(status, 201)
+  should.be_true(string.contains(body, "\"name\":\"proxmox-2\""))
+  should.be_true(string.contains(body, "\"token\":\""))
+  should.be_true(string.contains(body, "\"thread_id\":\"" <> thread_id))
+  should.be_false(string.contains(body, "token_hash"))
+  let assert Ok(node_id) = json.parse(body, decode.at(["id"], decode.string))
+
+  // A duplicate name IN ITS THREAD is the friendly 409.
+  let #(dup, _dup_body) = create(thread_id, "proxmox-2")
+  should.equal(dup, 409)
+
+  // The list carries the row (with its thread), never the hash.
+  let #(list_status, listed) = send_authorized(req(port, Get, "/nodes", ""))
+  should.equal(list_status, 200)
+  should.be_true(string.contains(listed, "proxmox-2"))
+  should.be_true(string.contains(listed, thread_id))
+  should.be_false(string.contains(listed, "token_hash"))
+
+  // A reserved/invalid name refuses.
+  let #(reserved, _) = create(thread_id, "workspace")
+  should.equal(reserved, 400)
+
+  // An unknown thread refuses (the row binds to its thread).
+  let #(ghost, _) = create("t-ghost", "x3")
+  should.equal(ghost, 404)
+
+  // Revoke: 204, idempotent.
+  let #(del, _) = send_authorized(req(port, Delete, "/nodes/" <> node_id, ""))
+  should.equal(del, 204)
+  let #(del2, _) = send_authorized(req(port, Delete, "/nodes/" <> node_id, ""))
+  should.equal(del2, 204)
+  // The row is really gone, not just 204'd: the list no longer names it.
+  let #(_, after_revoke) = send_authorized(req(port, Get, "/nodes", ""))
+  should.be_false(string.contains(after_revoke, "proxmox-2"))
+
+  // The admin surface stays behind the UI token.
+  let assert Ok(unauth) =
+    hackney.send(req(
+      port,
+      Post,
+      "/nodes",
+      "{\"thread\":\"" <> thread_id <> "\",\"name\":\"x2\"}",
+    ))
+  should.equal(unauth.status, 401)
+}
+
+/// The pre-upgrade gates on /node/ws answer as ordinary HTTP statuses
+/// (a reconnecting client can tell bad token from bad path). The
+/// upgrade itself is the e2e fake node's to prove.
+pub fn node_ws_pre_upgrade_refusals_test() {
+  let #(_registry, port) = start_server()
+  // The node's OWN (plain) thread: names are per-thread, so the row
+  // binds to it, and the auth lookup is scoped by the pair.
+  let #(thread_status, thread_body) =
+    send_authorized(req(
+      port,
+      Post,
+      "/threads",
+      "{\"provider\":\""
+        <> store_mock.fixture_provider_id
+        <> "\",\"model\":\"alias-a\"}",
+    ))
+  should.equal(thread_status, 201)
+  let assert Ok(thread_id) =
+    json.parse(thread_body, decode.at(["id"], decode.string))
+  let #(_, node_body) =
+    send_authorized(req(
+      port,
+      Post,
+      "/nodes",
+      "{\"thread\":\"" <> thread_id <> "\",\"name\":\"node-a\"}",
+    ))
+  let assert Ok(node_token) =
+    json.parse(node_body, decode.at(["token"], decode.string))
 
   // No credentials: 401.
   let assert Ok(no_creds) =
@@ -1358,22 +1393,40 @@ pub fn node_ws_pre_upgrade_refusals_test() {
     ))
   should.equal(bad_token.status, 401)
 
-  // Right credentials, unknown thread: 404.
-  let assert Ok(no_thread) =
+  // Right credentials, ANOTHER (real, existing) thread: 401 — the
+  // (thread, name) pair has no row there (per-thread names scope the
+  // credential). A REAL second thread, not a ghost id: the point is
+  // that a VALID token is rejected wherever its row is not, so global
+  // node authentication cannot sneak back in.
+  let #(t2_status, t2_body) =
+    send_authorized(req(
+      port,
+      Post,
+      "/threads",
+      "{\"provider\":\""
+        <> store_mock.fixture_provider_id
+        <> "\",\"model\":\"alias-a\"}",
+    ))
+  should.equal(t2_status, 201)
+  let assert Ok(thread_2) =
+    json.parse(t2_body, decode.at(["id"], decode.string))
+  let assert Ok(other_thread) =
     hackney.send(req(
       port,
       Get,
-      "/node/ws?node=node-a&token=" <> node_token <> "&thread=t-ghost",
+      "/node/ws?node=node-a&token=" <> node_token <> "&thread=" <> thread_2,
       "",
     ))
-  should.equal(no_thread.status, 404)
+  should.equal(other_thread.status, 401)
 
-  // Missing thread parameter: 400.
+  // Missing thread parameter: 400 (the thread scopes the lookup, so
+  // the parameter is read before auth).
   let assert Ok(no_thread_param) =
     hackney.send(req(port, Get, "/node/ws?node=node-a&token=" <> node_token, ""))
   should.equal(no_thread_param.status, 400)
 
-  // Env role on a plain thread: 403, the UnknownToolset philosophy.
+  // Env role on the plain thread: 403, the UnknownToolset philosophy
+  // (auth passed — the row's own thread — the toolset gate refuses).
   let assert Ok(no_env) =
     hackney.send(req(
       port,
@@ -1397,16 +1450,21 @@ pub fn node_insert_failure_test() {
   let row =
     node.Node(
       id: "n-race",
+      thread_id: "t1",
       name: "proxmox-2",
       token_hash: node.hash_token("tok"),
       created_at: 1_700_000_000,
       last_seen_at: None,
     )
-  web.node_insert_failure(Ok([row]), "proxmox-2")
+  web.node_insert_failure(Ok([row]), "t1", "proxmox-2")
   |> should.equal(#(409, "node name is already paired"))
-  web.node_insert_failure(Ok([row]), "other-name")
+  // The same name under ANOTHER thread did not lose the race — a
+  // genuinely unexpected failure stays 502.
+  web.node_insert_failure(Ok([row]), "t2", "proxmox-2")
   |> should.equal(#(502, "store unavailable"))
-  web.node_insert_failure(Error("disk full"), "proxmox-2")
+  web.node_insert_failure(Ok([row]), "t1", "other-name")
+  |> should.equal(#(502, "store unavailable"))
+  web.node_insert_failure(Error("disk full"), "t1", "proxmox-2")
   |> should.equal(#(502, "store unavailable"))
 }
 
@@ -1436,13 +1494,17 @@ pub fn node_grant_exchange_round_trip_test() {
   let assert Ok(thread_id) =
     json.parse(thread_body, decode.at(["id"], decode.string))
 
-  // One live grant (the pairing URL) and one already expired.
+  // One live grant (the pairing URL), one already expired, one
+  // UNPINNED (the reserved shape) for the no-thread refusal.
   let now = timing.wall_now_s()
   let #(live_code, live) = node.mint_grant(Some(thread_id), now)
   let #(expired_code, expired) =
     node.mint_grant(Some(thread_id), now - node.grant_ttl_s - 1)
+  let #(free_code, free_grant) = node.mint_grant(None, now)
   seam.insert_node_grant(live) |> should.be_ok
   seam.insert_node_grant(expired) |> should.be_ok
+  seam.insert_node_grant(node.Grant(..free_grant, id: "g-free"))
+  |> should.be_ok
 
   let pair = fn(code: String, name: String) {
     hackney.send(req(
@@ -1450,6 +1512,22 @@ pub fn node_grant_exchange_round_trip_test() {
       Post,
       "/nodes/pair",
       "{\"code\":\"" <> code <> "\",\"name\":\"" <> name <> "\"}",
+    ))
+  }
+  // The override form: the launcher's NEXUS_THREAD rides the request
+  // and binds the minted row to the given thread.
+  let pair_into = fn(code: String, name: String, thread: String) {
+    hackney.send(req(
+      port,
+      Post,
+      "/nodes/pair",
+      "{\"code\":\""
+        <> code
+        <> "\",\"name\":\""
+        <> name
+        <> "\",\"thread\":\""
+        <> thread
+        <> "\"}",
     ))
   }
 
@@ -1477,14 +1555,50 @@ pub fn node_grant_exchange_round_trip_test() {
   should.be_false(first_id == second_id)
 
   // A name already paired is the same friendly 409 — a code must
-  // never authorize a takeover.
+  // never authorize a takeover (scoped to the thread, like the
+  // schema's UNIQUE).
   let assert Ok(dup) = pair(live_code, "laptop-a")
   should.equal(dup.status, 409)
   // And the admin route's row collides the same way (the ONE mint
-  // path's shared name space).
+  // path's shared per-thread name space).
   let #(admin, _) =
-    send_authorized(req(port, Post, "/nodes", "{\"name\":\"laptop-b\"}"))
+    send_authorized(req(
+      port,
+      Post,
+      "/nodes",
+      "{\"thread\":\"" <> thread_id <> "\",\"name\":\"laptop-b\"}",
+    ))
   should.equal(admin, 409)
+
+  // PER-THREAD NAMES: the SAME name pairs fine into ANOTHER thread —
+  // the ghost-row bug this scoping removes (a disconnected TUI's row
+  // on thread A never blocks thread B). A second thread, the override
+  // form, and the answer carries the OVERRIDE thread.
+  let #(t2_status, t2_body) =
+    send_authorized(req(
+      port,
+      Post,
+      "/threads",
+      "{\"provider\":\""
+        <> store_mock.fixture_provider_id
+        <> "\",\"model\":\"alias-a\"}",
+    ))
+  should.equal(t2_status, 201)
+  let assert Ok(thread_2) =
+    json.parse(t2_body, decode.at(["id"], decode.string))
+  let assert Ok(cross) = pair_into(live_code, "laptop-a", thread_2)
+  should.equal(cross.status, 201)
+  let assert Ok(cross_thread) =
+    json.parse(cross.body, decode.at(["thread_id"], decode.string))
+  should.equal(cross_thread, thread_2)
+  // An override naming an UNKNOWN thread refuses (the row binds to
+  // its thread) — 404, same as the admin route's thread check.
+  let assert Ok(ghost_override) = pair_into(live_code, "laptop-e", "t-ghost")
+  should.equal(ghost_override.status, 404)
+  // An UNPINNED grant with no override has no thread to bind — 400,
+  // never an unjoinable row.
+  let assert Ok(unpinned) = pair(free_code, "laptop-f")
+  should.equal(unpinned.status, 400)
 
   // Expired and unknown codes answer the IDENTICAL merged 404 — the
   // route must not become a code oracle. The EXPIRED plaintext is

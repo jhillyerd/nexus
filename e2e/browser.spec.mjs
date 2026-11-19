@@ -2515,9 +2515,10 @@ async function main() {
 
         // The REAL exchange with the DOM's code: no auth header — the
         // code is the auth — and the answer carries the pinned thread.
-        // The node name is unique PER RUN: a node row outlives its
-        // thread (the cleanup only cascades the grant), so a static
-        // name would 409 the next run's exchange.
+        // The node name is unique PER RUN: rows now CASCADE with their
+        // thread (per-thread node names), so a static name would be
+        // fine too — the Date.now() suffix just keeps runs independent
+        // if a cleanup ever skips.
         const nodeName = `browser-pair-${Date.now()}`;
         const exchange = await page.request.post(`${pairBase}/nodes/pair`, {
           data: { code, name: nodeName },
@@ -2568,8 +2569,8 @@ async function main() {
         });
         eq(after.status(), 404, "revoked code answers the merged 404");
       } finally {
-        // The thread delete cascades its grant; the node row is
-        // unique-named per run, so the next run cannot 409 on the name.
+        // The thread delete cascades its grant AND the node row (a
+        // credential is bound to its thread — node_thread_id_fkey).
         await page.request.delete(`${pairBase}/threads/${thread.id}`, {
           headers: { authorization: `Bearer ${TOKEN}` },
         });
