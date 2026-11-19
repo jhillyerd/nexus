@@ -1753,7 +1753,8 @@ pub fn create_from_bot_toolset_snapshot_test() {
   // the current default at each create — and, since bots P3c (#97), the
   // bot-default form carries `bot_message` on top: bots are the only
   // senders, so an ordinary bot gets the delivery tool without listing
-  // it. A PLAIN thread (no bot) still snapshots the bare default set.
+  // it — plus its discovery half `list_bots` (#127). A PLAIN thread (no
+  // bot) still snapshots the bare default set.
   let assert Ok(Nil) = seed_bot_with_tools(seam, "b-default", None, None)
   let assert Ok(from_default_bot) =
     thread_registry.create(
@@ -1771,7 +1772,7 @@ pub fn create_from_bot_toolset_snapshot_test() {
   let assert Ok(stored) = seam.get_thread(from_default_bot.id)
   should.equal(
     entry_names(stored.summary.toolset),
-    list.append(tools.default_names(test_config()), ["bot_message"]),
+    list.append(tools.default_names(test_config()), ["bot_message", "list_bots"]),
   )
 
   // And the human default stays bare: a plain create never gains the

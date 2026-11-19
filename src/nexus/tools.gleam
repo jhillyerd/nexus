@@ -131,7 +131,14 @@ pub const freeze_ask_ms = 4000
 /// the default set in one edit (unless it needs its own gate line
 /// there).
 pub fn catalog_names() -> List(String) {
-  ["http_fetch", "web_search", "bot_message", "codemode", ..env.tool_names()]
+  [
+    "http_fetch",
+    "web_search",
+    "bot_message",
+    "list_bots",
+    "codemode",
+    ..env.tool_names()
+  ]
   |> list.sort(string.compare)
 }
 
@@ -149,8 +156,9 @@ pub fn is_compiled_name(name: String) -> Bool {
 /// added to nexus later joining automatically (the catalog is the
 /// source; the live-template NULL bots and plain threads track it). The
 /// filter drops exactly the tools that would error or refuse here:
-/// `bot_message` (the registry injects it into bot-default threads
-/// itself — a plain thread has no delivery identity to send from),
+/// `bot_message` and `list_bots` (the registry injects both into
+/// bot-default threads itself — a plain thread has no delivery identity
+/// to send from, and nobody to list for),
 /// `web_search` without a SearxNG base URL and `codemode` with the flag
 /// off (the existing gates; with the flag off the codemode schema stays
 /// out — KV-cache contract rule 4), and the environment tools without a
@@ -167,7 +175,7 @@ pub fn default_names(cfg: Config) -> List(String) {
   catalog_names()
   |> list.filter(fn(name) {
     case name {
-      "bot_message" -> False
+      "bot_message" | "list_bots" -> False
       "web_search" -> option.is_some(cfg.searxng_base_url)
       "codemode" -> cfg.codemode
       name -> !env.is_env_name(name) || option.is_some(cfg.workspace_root)
@@ -212,6 +220,7 @@ pub fn by_names_with(
         "http_fetch" -> Ok([fetch_spec(cfg)])
         "web_search" -> Ok([web_search_spec(cfg)])
         "bot_message" -> Ok([bot_message_spec()])
+        "list_bots" -> Ok([list_bots_spec()])
         // Codemode is built last below, over the full sibling list.
         "codemode" -> Ok([])
         // The environment tools (environments plan Phase 1): compiled
@@ -434,6 +443,7 @@ fn dispatch_entry(
     ToolsetEntry("http_fetch", _, _) -> Ok([fetch_spec(cfg)])
     ToolsetEntry("web_search", _, _) -> Ok([web_search_spec(cfg)])
     ToolsetEntry("bot_message", _, _) -> Ok([bot_message_spec()])
+    ToolsetEntry("list_bots", _, _) -> Ok([list_bots_spec()])
     // Codemode is built last below, over the full sibling list.
     ToolsetEntry("codemode", _, _) -> Ok([])
     ToolsetEntry("bash", _, _) ->
@@ -561,8 +571,9 @@ fn bot_message_spec() -> ToolSpec {
     tool: function_tool(
       name: "bot_message",
       description: "Send an async message to another bot. `to` is the bot's"
-        <> " name, or a thread id from a previous bot_message receipt"
-        <> " (precise addressing). Returns a receipt naming the thread the"
+        <> " name (case-insensitive; call list_bots to see who exists), or"
+        <> " a thread id from a previous bot_message receipt (precise"
+        <> " addressing). Returns a receipt naming the thread the"
         <> " message landed in; the target bot answers on its own next turn"
         <> " — replies arrive as user messages prefixed `From <bot> (thread"
         <> " <id>):`. Refused when the target is unknown, archived, has"
@@ -661,6 +672,68 @@ fn parse_bot_message_args(arguments: String) -> Result(BotMessageArgs, String) {
         _, False -> Ok(args)
       }
     Error(_) -> Error("invalid bot_message arguments: {\"to\", \"text\"}")
+  }
+}
+
+/// Bot discoverability (#127): the list half of bot-to-bot messaging.
+/// Injected wherever `bot_message` is — the registry's bot-default
+/// sentinel — never in the human default set (nobody to list for on a
+/// plain thread). Lookups on the delivery path are case-insensitive, so
+/// the receipt hands the model the exact DISPLAY names but does not
+/// demand they be copied verbatim.
+fn list_bots_spec() -> ToolSpec {
+  ToolSpec(
+    tool: function_tool(
+      name: "list_bots",
+      description: "List the bots available to message. Returns each bot's"
+        <> " exact name and whether it accepts inbound bot messages."
+        <> " Addressing in bot_message is case-insensitive, so casing"
+        <> " need not be copied.",
+      parameters_json: "{\"type\":\"object\",\"properties\":{},"
+        <> "\"additionalProperties\":false}",
+    ),
+    run: fn(ctx, _arguments) { list_bots_run(ctx.delivery) },
+  )
+}
+
+fn list_bots_run(delivery: Option(Delivery)) -> Result(String, String) {
+  case delivery {
+    // Only reachable through a hand-built toolset naming the tool on a
+    // plain thread (snapshots persist what they were created with): the
+    // thread has no bot identity — and no peer bots to list.
+    None -> Error("list_bots: this thread has no bot identity to list for")
+    Some(d) ->
+      case d.list_bots() {
+        Error(Nil) ->
+          Error("list_bots: the bot registry is unavailable; try again")
+        Ok(bots) -> Ok(render_bot_list(d.bot_id, bots))
+      }
+  }
+}
+
+/// One line per bot: exact display name, a `(you)` marker for the
+/// sender, and the inbound gate (the delivery guard's own vocabulary,
+/// so the model can predict a refusal before spending the round trip).
+fn render_bot_list(
+  own_bot_id: String,
+  bots: List(delivery.BotListing),
+) -> String {
+  case bots {
+    [] -> "no bots exist yet — ask the operator to create one"
+    _ ->
+      bots
+      |> list.map(fn(bot) {
+        let you = case bot.bot_id == own_bot_id {
+          True -> " (you)"
+          False -> ""
+        }
+        let inbound = case bot.allow_inbound {
+          True -> "accepts bot messages"
+          False -> "does NOT accept bot messages"
+        }
+        "- " <> bot.name <> you <> ": " <> inbound
+      })
+      |> string.join("\n")
   }
 }
 

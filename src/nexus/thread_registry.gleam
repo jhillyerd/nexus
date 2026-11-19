@@ -803,14 +803,17 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
 
 /// The effective toolset NAMES a create request resolves through: the
 /// requested explicit list, or — for a bot-sourced create with the
-/// default sentinel — the default set plus `bot_message` (see `handle`).
+/// default sentinel — the default set plus `bot_message` and `list_bots`
+/// (see `handle`; #127 adds the discovery half).
 fn effective_toolset(
   state: State,
   requested: NewThread,
 ) -> Option(List(String)) {
   case requested.bot_id, requested.toolset {
     Some(_), None ->
-      Some(list.append(tools.default_names(state.cfg), ["bot_message"]))
+      Some(
+        list.append(tools.default_names(state.cfg), ["bot_message", "list_bots"]),
+      )
     _, _ -> requested.toolset
   }
 }
@@ -3526,6 +3529,7 @@ fn delivery_toolset(
           depth: initiating_depth(tr) + 1,
           deliver: fn(request) { deliver_ask(state.self, request) },
           sender_name: fn() { sender_name_ask(state.bots_name, bot_id) },
+          list_bots: fn() { list_bots_ask(state.bots_name) },
         )
       base(endpoint, tr, cancel, Some(ctx), environment, on_event)
     },
@@ -3601,6 +3605,36 @@ fn sender_name_ask(
     True ->
       case process.receive(reply, delivery_ask_timeout_ms) {
         Ok(Ok(bot)) -> Ok(bot.name)
+        _ -> Error(Nil)
+      }
+  }
+}
+
+/// The bot table for the `list_bots` tool (#127), asked from the bot
+/// registry (same manual ask pattern as `sender_name_ask`; the registry
+/// answers from boot-loaded state, name-sorted by its `List` arm).
+/// `Error` = the registry is down or the ask timed out — an honest tool
+/// error either way. Rows render as plain listings (the leaf
+/// `delivery.BotListing`), never raw `StoredBot`s — prompts and system
+/// texts stay OUT of the tool receipt.
+fn list_bots_ask(
+  bots_name: process.Name(bot_registry.Msg),
+) -> Result(List(delivery.BotListing), Nil) {
+  let reply = process.new_subject()
+  case try_send_named(bots_name, bot_registry.List(reply)) {
+    False -> Error(Nil)
+    True ->
+      case process.receive(reply, delivery_ask_timeout_ms) {
+        Ok(Ok(rows)) ->
+          Ok(
+            list.map(rows, fn(row) {
+              delivery.BotListing(
+                name: row.name,
+                bot_id: row.id,
+                allow_inbound: row.allow_inbound,
+              )
+            }),
+          )
         _ -> Error(Nil)
       }
   }
