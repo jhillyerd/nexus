@@ -545,6 +545,19 @@ rollback rules are untouched.
   honest line); a store failure stays the retryable
   `"target lookup failed; try again"`. `bot_message`'s description
   points at `list_bots` and states that casing doesn't matter.
+- **Multi-instance id drift (follow-up, found by the browser rig)** —
+  the `b<N>` counter is seeded past the stored table at BOOT only, but
+  several nexus processes can share one database (the e2e rig runs
+  three), and rows minted by another instance never reach this
+  actor's memory: the first bot created on a secondary instance
+  collided with the primary's `b1` (bot_pkey) and answered 502. Every
+  create now re-reads the table and heals BOTH halves from it — the
+  counter re-seeds past every stored id, and the rows dict absorbs
+  the externally-minted rows (List and the duplicate-name pre-check
+  stop serving a stale view). One rare-path read; the store's
+  pkey/name constraints stay the last-resort backstop. The provider
+  registry's `p<N>` minting carries the same fix (same scheme, same
+  drift).
 
 ## Non-goals (recorded, not planned)
 

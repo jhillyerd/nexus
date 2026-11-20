@@ -439,10 +439,15 @@ pub type Model {
     /// result (the `visit`-generation rule, scoped to this section).
     env_generation: Int,
     /// The ONE-TIME mint display: the plaintext code exists only in
-    /// this client's memory (the server stores the hash), so the URL
-    /// renders only while this session holds it. Cleared on selection
-    /// change, a newer mint, or revoking that grant; a lost URL is
-    /// re-minted — cheap by design (the token-answers-once precedent).
+    /// this connection's server-side runtime (one per /ws — the server
+    /// stores only the hash; the browser holds nothing), so the URL
+    /// renders only while this model holds it. Cleared when the pane
+    /// CLOSES (toggle or Settings — "shown once" is literal: this model
+    /// outlives the pane and would re-render the live credential on
+    /// every reopen), on selection change, a newer mint, or revoking
+    /// that grant; a mint landing on an already-closed pane is dropped.
+    /// A lost URL is re-minted — cheap by design (the
+    /// token-answers-once precedent).
     grant_minted: Option(#(String, node.Grant)),
     /// The single mint in flight (the `create_pending` rule): the mint
     /// button disables, the guard releases on `GrantMinted` /
@@ -645,7 +650,9 @@ pub type Msg {
   /// A mint landed: the row is persisted (write-through at mint) and
   /// the ONE-TIME URL display takes the plaintext code. Stamped with
   /// the grant's thread: a mint answering for a superseded selection is
-  /// dropped (the guard releases regardless — it is section-level).
+  /// dropped, as is one landing after the pane closed (the display
+  /// exists only while the pane is open — the "shown once" rule; the
+  /// guard releases regardless — it is section-level).
   GrantMinted(code: String, grant: node.Grant)
   /// The mint's insert failed or the worker crashed: the guard releases
   /// always; the section notes the reason only while the minting
@@ -940,6 +947,9 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         },
         settings_manual: True,
         pane_open: False,
+        // Settings closes the pane: the mint display retires with it
+        // (the same "shown once" rule the toggle close carries).
+        grant_minted: None,
       ),
       effect.none(),
     )
@@ -1679,33 +1689,49 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     )
 
     // ---- Thread info pane (bot-channels plan Phase 2, #123) ----
-    PaneToggled -> #(Model(..model, pane_open: !model.pane_open), {
-      // Opening re-asks: the badge refreshes on the usual events, but
-      // the moment the user opens the pane is when freshness matters —
-      // a channel that finished while the thread sat idle must not
-      // show a stale dot (the ask is state-only, so it is cheap).
-      // Phase C: the Environments section loads on the same open —
-      // but through the unlinked-worker path, because its reads hit
-      // Postgres through the seam instead of registry memory. It does
-      // NOT ride the every-refresh cascade the channels ask rides
-      // (that would put a store read behind every commit bump); it
-      // refreshes on open and after each mint/revoke instead — the
-      // same freshness contract, scoped to when the section is used.
-      let registry = model.registry
-      case model.pane_open, model.selected {
-        False, Some(id) ->
-          effect.batch([
-            effect.from(fn(dispatch) {
-              dispatch(ChannelsLoaded(
-                id,
-                thread_registry.channels(registry, id),
-              ))
-            }),
-            env_load_effect(model),
-          ])
-        _, _ -> effect.none()
-      }
-    })
+    PaneToggled -> #(
+      Model(
+        ..model,
+        pane_open: !model.pane_open,
+        // Closing retires the one-time mint display (the "shown once"
+        // promise): the URL is a LIVE credential, and this server-
+        // component model outlives the pane — without the clear, the
+        // plaintext would re-render on every reopen for the whole /ws
+        // connection. Reopening answers with the mint button; a lost
+        // URL is re-minted.
+        grant_minted: case model.pane_open {
+          True -> None
+          False -> model.grant_minted
+        },
+      ),
+      {
+        // Opening re-asks: the badge refreshes on the usual events, but
+        // the moment the user opens the pane is when freshness matters —
+        // a channel that finished while the thread sat idle must not
+        // show a stale dot (the ask is state-only, so it is cheap).
+        // Phase C: the Environments section loads on the same open —
+        // but through the unlinked-worker path, because its reads hit
+        // Postgres through the seam instead of registry memory. It does
+        // NOT ride the every-refresh cascade the channels ask rides
+        // (that would put a store read behind every commit bump); it
+        // refreshes on open and after each mint/revoke instead — the
+        // same freshness contract, scoped to when the section is used.
+        let registry = model.registry
+        case model.pane_open, model.selected {
+          False, Some(id) ->
+            effect.batch([
+              effect.from(fn(dispatch) {
+                dispatch(ChannelsLoaded(
+                  id,
+                  thread_registry.channels(registry, id),
+                ))
+              }),
+              env_load_effect(model),
+            ])
+          _, _ -> effect.none()
+        }
+      },
+    )
 
     ChannelsLoaded(parent_id, rows) ->
       case model.selected {
@@ -1804,9 +1830,9 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         // only the one-time display is stamped: a mint answering for a
         // superseded selection is dropped.
         grant_minting: False,
-        grant_minted: case model.selected == grant.thread_id {
-          True -> Some(#(code, grant))
-          False -> model.grant_minted
+        grant_minted: case model.selected == grant.thread_id, model.pane_open {
+          True, True -> Some(#(code, grant))
+          _, _ -> model.grant_minted
         },
         // The row IS persisted (the write-through succeeded — this msg
         // only lands then), so the grants list reflects it immediately
@@ -3163,7 +3189,8 @@ fn last_seen_label(n: node.Node) -> String {
 
 /// The mint area: the "Pair a TUI…" button while nothing is displayed;
 /// once a mint lands, the ONE-TIME pairing URL (the code exists only in
-/// this client's memory — the server stores the hash), a copy button
+/// the connection's server-side runtime — the server stores the hash —
+/// and the display retires when the pane closes), a copy button
 /// (the page shell's `pairing_js` writes the clipboard), and the
 /// expiry, ticking via the timestamps script's `[data-expires]` span.
 fn mint_area(model: Model) -> Element(Msg) {

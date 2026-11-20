@@ -11,6 +11,7 @@ import gleam/dict
 import gleam/erlang/process
 import gleam/list
 import gleam/option.{None, Some}
+import gleam/string
 import gleeunit/should
 import nexus/boot
 import nexus/bot
@@ -146,6 +147,50 @@ pub fn boot_loads_and_mints_past_stored_ids_test() {
   // The next mint is past b7, not b1 (no collision with stored rows).
   let assert Ok(created) = bot_registry.create_bot(registry, params("fresh"))
   should.equal(created.id, "b8")
+}
+
+/// The counter DRIFT case: another nexus over the SAME store mints
+/// ids with its own counter, and its rows land after this registry's
+/// boot (empty here — counter 0). A mint re-seeds past the whole stored
+/// table first, so `b1` is never re-minted under a row minted elsewhere
+/// — the multi-instance 502 the browser rig hit: a secondary instance's
+/// first bot collided with the main instance's `b1` (bot_pkey).
+pub fn mint_reseeds_past_rows_minted_elsewhere_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  store_mock.ensure_fixture_provider(seam)
+  let registry = start_registry(seam)
+  let assert Ok(all) = bot_registry.list_bots(registry)
+  should.equal(all, [])
+  // Another instance's mint lands after this registry's boot.
+  let assert Ok(Nil) =
+    seam.insert_bot(bot.Bot(
+      id: "b3",
+      name: "minted-elsewhere",
+      description: "",
+      provider_id: store_mock.fixture_provider_id,
+      model: "alias-1",
+      system_prompt: None,
+      tools: None,
+      allow_inbound: True,
+      created_at: 1_700_000_000,
+      updated_at: 1_700_000_000,
+    ))
+  // The mint re-seeds past it instead of colliding on b1.
+  let assert Ok(created) = bot_registry.create_bot(registry, params("fresh"))
+  should.equal(created.id, "b4")
+  // The healed rows also serve the duplicate-name pre-check: a name
+  // minted elsewhere answers the friendly 409, not the store's
+  // unique-name backstop via StoreFailed.
+  bot_registry.create_bot(registry, params("minted-elsewhere"))
+  |> should.equal(Error(bot_registry.DuplicateName))
+  // The store holds both rows — no lost update (List sorts by name,
+  // so assert on the id set).
+  let assert Ok(all) = bot_registry.list_bots(registry)
+  should.equal(
+    all |> list.map(fn(b) { b.id }) |> list.sort(by: string.compare),
+    ["b3", "b4"],
+  )
 }
 
 pub fn crud_round_trip_test() {
@@ -502,6 +547,59 @@ pub fn provider_shape_test() {
       updated_at: fixture.updated_at,
     ),
   )
+}
+
+/// The provider twin of `mint_reseeds_past_rows_minted_elsewhere_test`:
+/// the same boot-only counter, the same multi-instance drift (p<N>
+/// ids minted by another nexus on the same store), the same re-seed at
+/// mint time. `p-test` (non-numeric) deliberately leaves the counter
+/// alone — only `p<N>`-shaped ids count.
+pub fn provider_mint_reseeds_past_rows_minted_elsewhere_test() {
+  let seam = store_mock.seam(store_mock.start())
+  let assert Ok(started_providers) =
+    provider_registry.start_with_model_fetcher(
+      test_config(),
+      seam,
+      process.new_name("nexus_bots_providers_drift_test"),
+      fn(_endpoint) { Ok(["alias-1"]) },
+    )
+  let providers = started_providers.data
+  let assert Ok([]) = provider_registry.list_providers(providers)
+  // Another instance's mint lands after this registry's boot.
+  let now = 1_700_000_000
+  let assert Ok(Nil) =
+    seam.insert_provider(store.StoredProvider(
+      id: "p9",
+      name: "minted-elsewhere",
+      base_url: "http://elsewhere.test/v1",
+      api_key_encrypted: None,
+      key_version: 1,
+      dialect: "openai",
+      enabled: True,
+      created_at: now,
+      updated_at: now,
+    ))
+  // The mint re-seeds past it instead of colliding on p1.
+  let assert Ok(created) =
+    provider_registry.create(
+      providers,
+      provider.ProviderParams(
+        name: "fresh",
+        base_url: "http://fresh.test/v1",
+        api_key: None,
+      ),
+    )
+  should.equal(created.id, "p10")
+  // The healed rows serve the duplicate-name pre-check too.
+  provider_registry.create(
+    providers,
+    provider.ProviderParams(
+      name: "minted-elsewhere",
+      base_url: "http://elsewhere.test/v1",
+      api_key: None,
+    ),
+  )
+  |> should.equal(Error(provider_registry.DuplicateName))
 }
 
 // ---------------------------------------------------------------------------

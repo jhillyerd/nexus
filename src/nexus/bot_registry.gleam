@@ -248,9 +248,32 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       }
 
     Create(params, reply) -> {
-      let counter = state.counter + 1
+      // The counter is seeded past the stored table at BOOT only, but
+      // another nexus over the SAME store (the e2e rig runs three
+      // instances on one database) mints with its own counter, and its
+      // rows never reach this actor's memory — minting from the boot
+      // seed alone collides on bot_pkey and answers StoreFailed. Every
+      // create therefore re-reads the table and heals BOTH halves from
+      // it: the counter re-seeds past every stored id (no id minted
+      // elsewhere is minted again here) and the rows dict absorbs the
+      // externally-minted rows (List and the duplicate-name pre-check
+      // stop serving a stale view). One rare-path read; the store's
+      // pkey/name constraints stay the last-resort backstop.
+      let #(rows, counter) = case state.store.list_bots() {
+        Ok(fresh) -> #(
+          list.fold(fresh, state.rows, fn(rows, row) {
+            dict.insert(rows, row.id, row)
+          }),
+          int.max(state.counter, max_bot_counter(fresh)),
+        )
+        Error(_) -> #(state.rows, state.counter)
+      }
+      let counter = counter + 1
       let id = "b" <> int.to_string(counter)
-      case create_row(state, id, params) {
+      // The pre-check reads the HEALED rows: a name minted by another
+      // instance answers DuplicateName (409), not the store's
+      // unique-name backstop via StoreFailed (502).
+      case create_row(State(..state, rows: rows), id, params) {
         Error(error) -> {
           process.send(reply, Error(error))
           actor.continue(state)
@@ -268,7 +291,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
               actor.continue(
                 State(
                   ..state,
-                  rows: dict.insert(state.rows, id, row),
+                  rows: dict.insert(rows, id, row),
                   counter: counter,
                 ),
               )

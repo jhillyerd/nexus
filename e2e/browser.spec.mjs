@@ -326,7 +326,11 @@ async function createBot(model, nameHint = "e2e-bot", origin = base) {
     },
     headers,
   });
-  eq(res.status(), 201, "bot created");
+  // The body names the refused registry ("provider/bot registry
+  // unavailable") — a bare status code can't tell a wedged bot registry
+  // from a provider lookup failure.
+  const body = res.status() === 201 ? "" : ` — ${(await res.text()).slice(0, 300)}`;
+  eq(res.status(), 201, `bot created (POST ${origin}/bots)${body}`);
   return (await res.json()).id;
 }
 
@@ -2528,9 +2532,13 @@ async function main() {
     // offline (ui_test); existing selectors are untouched by the badge
     // reachability change (the pane renders for every selection now).
     await test("pairing: the info pane mints a pairing URL, exchanges, revokes", async () => {
+      // Threads are bot-only (the create shape is {"bot": id}); the bot
+      // must exist on the PAIR instance (registries never sync), so this
+      // one can't ride the shared createBotThread helper.
+      const pairBot = await createBot("smart", "pair-bot", pairBase);
       const created = await page.request.post(`${pairBase}/threads`, {
         headers: { authorization: `Bearer ${TOKEN}` },
-        data: { provider: "fake", model: "smart" },
+        data: { bot: pairBot },
       });
       eq(created.status(), 201, "env thread created on the workspace instance");
       const thread = await created.json();
@@ -2615,6 +2623,12 @@ async function main() {
             message: "grant row shows the exchange's paired count",
           },
         );
+        // "Shown once" is literal: the pane CLOSE retired the one-time
+        // URL display — the server-component model outlives the pane,
+        // and without the clear the live credential would re-render on
+        // every reopen for the whole /ws connection.
+        eq(await page.locator("#pair-url").count(), 0, "pane close retired the URL");
+        eq(await page.locator("#pair-tui").count(), 1, "mint button is back");
 
         // Revoke: the worker deletes and re-reads — the grant row goes,
         // and the one-time display drops with it (a dead code must not

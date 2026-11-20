@@ -326,9 +326,24 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       }
 
     Create(params, reply) -> {
-      let counter = state.counter + 1
+      // Same re-seed-and-heal rule as the bot registry: the counter is
+      // seeded at BOOT only, and an instance sharing the store mints
+      // p<N> ids this actor never sees — one rare-path read re-seeds
+      // the counter and absorbs the externally-minted rows.
+      let #(rows, counter) = case state.store.list_providers() {
+        Ok(fresh) -> #(
+          list.fold(fresh, state.rows, fn(rows, row) {
+            dict.insert(rows, row.id, row)
+          }),
+          int.max(state.counter, max_provider_counter(fresh)),
+        )
+        Error(_) -> #(state.rows, state.counter)
+      }
+      let counter = counter + 1
       let id = "p" <> int.to_string(counter)
-      case create_row(state, id, params) {
+      // The pre-check reads the HEALED rows (the bot registry's rule):
+      // a name minted elsewhere answers DuplicateName, not StoreFailed.
+      case create_row(State(..state, rows: rows), id, params) {
         Error(error) -> {
           process.send(reply, Error(error))
           actor.continue(state)
@@ -346,7 +361,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
               actor.continue(
                 State(
                   ..state,
-                  rows: dict.insert(state.rows, id, row),
+                  rows: dict.insert(rows, id, row),
                   counter: counter,
                 ),
               )

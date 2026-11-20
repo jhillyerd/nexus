@@ -5480,6 +5480,60 @@ pub fn env_mint_shows_url_once_test() {
   should_contain(html, "paired 0 TUIs")
 }
 
+/// "Shown once" is literal: the server-component model outlives the
+/// pane, so CLOSING it retires the mint display — otherwise the live
+/// credential would re-render on every reopen for the whole /ws
+/// connection (Settings entering closes the pane with the same rule),
+/// and a mint landing on an already-closed pane is dropped — the row
+/// still lands (the write-through succeeded), the plaintext does not.
+pub fn env_mint_url_retired_when_pane_closes_test() {
+  let roster_text =
+    env.roster_attach_text("proxmox-2", ["workspace", "proxmox-2"])
+  let minted =
+    new_model()
+    |> step(ui.ThreadsLoaded([summary("s1", False)]))
+    |> step(ui.Select("s1"))
+    |> step(ui.UserEcho(roster_text, Some(0), Some("system")))
+    |> step(ui.PaneToggled)
+    |> step(ui.GrantMintRequested)
+    |> step(ui.GrantMinted("CODE123", env_grant("s1", 0, 3540)))
+  view_string(minted) |> should_contain("CODE123")
+  // The toggle close (× button, click-outside, the badge — all ride
+  // PaneToggled): the display is gone and reopening answers with the
+  // mint button, never the stale URL.
+  let closed = step(minted, ui.PaneToggled)
+  closed.grant_minted |> should.equal(None)
+  let reopened = step(closed, ui.PaneToggled)
+  reopened.grant_minted |> should.equal(None)
+  let html = view_string(reopened)
+  should_not_contain(html, "CODE123")
+  should_contain(html, "id=\"pair-tui\"")
+  // Entering Settings closes the pane: the same retirement.
+  let again =
+    reopened
+    |> step(ui.GrantMintRequested)
+    |> step(ui.GrantMinted("CODE456", env_grant("s1", 0, 3540)))
+  view_string(again) |> should_contain("CODE456")
+  let settings = step(again, ui.SettingsToggled)
+  settings.grant_minted |> should.equal(None)
+  view_string(settings) |> should_not_contain("CODE456")
+  // A mint landing on a closed pane: the guard releases, the row
+  // lands, the code does not. (Back to the chat view first; the pane
+  // stays closed — no toggle.)
+  let pending =
+    settings
+    |> step(ui.SettingsToggled)
+    |> step(ui.GrantMintRequested)
+  let landed =
+    step(pending, ui.GrantMinted("CODE999", env_grant("s1", 0, 3540)))
+  landed.grant_minting |> should.be_false
+  landed.grant_minted |> should.equal(None)
+  landed.env_grants
+  |> list.any(fn(g) { g.thread_id == Some("s1") })
+  |> should.be_true
+  view_string(landed) |> should_not_contain("CODE999")
+}
+
 /// The mint display is stamped: a mint answering for a SUPERSEDED
 /// selection is dropped (the guard still releases).
 pub fn env_mint_stamps_to_selection_test() {
