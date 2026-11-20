@@ -79,6 +79,18 @@ The persistence layer lives in `sql/schema.sql` + `src/nexus/store/sql/`.
   `thread_channel` on `(parent_thread_id, bot_id)` IS the channel
   identity: one DM thread per (parent, target bot), and the guarantee
   `find_channel` re-derivation matches unambiguously against.
+- **Every thread is created FROM a bot (threads are bot-only).**
+  The provider+model create shape is gone: the UI's compose-new flow
+  creates on first send from the composer's bot picker, HTTP
+  `POST /threads` accepts only `{"bot": id}` (a provider/model body is
+  a 400), and `thread_registry.NewThread.bot_id` is a required `String`
+  (blank → `CreateError.BotRequired`). The bot is a creation-time
+  template — the frozen columns are still the thread's truth — and the
+  column stays nullable (`ON DELETE SET NULL` keeps a deleted bot from
+  orphaning anything); the invariant lives at CREATION, not in the
+  schema. Consequence: the default toolset sentinel resolves to the
+  default set PLUS `bot_message` + `list_bots` for every create (each
+  thread carries a bot identity).
 
 ## Bot channel invariants (Phase 1 shipped)
 
@@ -213,12 +225,15 @@ Pinned by the e2e browser suite (`docs/plans/completed/m3-verification.md`);
   (`AssistantFull` / `commit_bubble` in `src/nexus/ui.gleam`) — one
   skipped shape per path, or a reload resurrects the empty pill.
 - **One frozen toolset per thread** (amended by bots plan P2;
-  `docs/plans/completed/bots.md`). The toolset is persisted at creation as
-  resolved tool names (`thread.toolset` — the default set's, or the
-  creating bot's; never NULL-for-default) and resolved against the
-  config-independent catalog (`tools.by_names`) into runner bundles
-  cached by the name tuple, so the default snapshot shares the
-  boot-built bundle and each distinct toolset builds exactly once.
+  `docs/plans/completed/bots.md`; amended again — threads are bot-only).
+  The toolset is persisted at creation as resolved manifest entries
+  (the default set's, or the creating bot's; never NULL-for-default)
+  and resolved against the config-independent catalog (`tools.by_names`)
+  into runner bundles cached by the name tuple, so each distinct
+  toolset builds exactly once — the default-create tuple is now the
+  default set PLUS `bot_message`/`list_bots` (a different cache entry
+  than the boot-seeded human default, which only boot-time hydration
+  of pre-bot-only rows still hits).
   `tools` / `tool_choice` never vary mid-thread — that is the part the
   KV-cache byte contract needs. Divergent heads across DIFFERENT
   toolsets are fine (they simply don't share cache spans); a chat-only
@@ -290,11 +305,13 @@ deltas; the rules that bite silently:
   tools stay explicit-only (explicit toolset or bot template) — so the
   default envelope stays a pure function of the boot config — the
   config-stability property the original never-in-default rule
-  protected. `bot_message` is never in the human default: the registry
-  injects it into bot-default threads itself, and a plain thread has no
-  delivery identity to send from. The RESOLVED root freezes per thread
-  onto `thread.workspace_root`; hydration rebuilds the handle from the
-  ROW, never the config.
+  protected. There is no HUMAN default anymore: every thread is
+  bot-sourced (threads are bot-only — the provider+model create shape
+  is gone), and the registry resolves the default sentinel to the
+  default set PLUS `bot_message` and `list_bots` for EVERY create, so
+  each thread carries its bot's delivery identity. The RESOLVED root
+  freezes per thread onto `thread.workspace_root`; hydration rebuilds
+  the handle from the ROW, never the config.
 - **Every env tool takes `target` as a free string** — the schema is
   byte-identical however many environments are attached; only
   execution routing is dynamic. `workspace` runs the local Phase 1

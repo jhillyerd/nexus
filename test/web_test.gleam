@@ -847,17 +847,11 @@ pub fn m3_layout_column_and_mobile_cap_css_test() {
     string.split_once(css, "@media (max-width: 900px) {")
   should.be_false(string.contains(desktop, "max-height: 40dvh"))
   should.be_true(string.contains(mobile, "aside { max-height: 40dvh; }"))
-  // F4: the create panel now sits ABOVE the list, so its separator flipped
-  // from a top rule to a bottom one. A stale `margin-top`/`border-top` here
-  // would leave a dead gap between "New" and the panel.
-  should.be_false(string.contains(
-    css,
-    "#create-panel { margin-top: 1rem; padding-top: .8rem; border-top",
-  ))
-  should.be_true(string.contains(
-    css,
-    "#create-panel { margin-bottom: 1rem; padding-bottom: .8rem; border-bottom",
-  ))
+  // COMPOSE-NEW (the create panel is gone): the bot picker bar sits
+  // directly above the entry field — its layout rules are the
+  // replacement for the old panel separator pins.
+  should.be_false(string.contains(css, "#create-panel"))
+  should.be_true(string.contains(css, "#composer-bot { display: flex;"))
 }
 
 /// Settings restyle contract (ui-polish P4 / F7): the page renders as one

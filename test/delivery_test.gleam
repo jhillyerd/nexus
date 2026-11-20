@@ -200,7 +200,7 @@ fn create_bot_thread(
         model: "alpha",
         system_prompt: None,
         toolset: None,
-        bot_id: Some(bot_id),
+        bot_id: bot_id,
         parent_thread_id: None,
         title: "",
       ),
@@ -301,7 +301,7 @@ fn create_parent_thread(
         model: "alpha",
         system_prompt: None,
         toolset: None,
-        bot_id: Some(bot_id),
+        bot_id: bot_id,
         parent_thread_id: None,
         title: "",
       ),
@@ -672,7 +672,7 @@ pub fn deliver_hint_only_when_tool_present_test() {
         model: "alpha",
         system_prompt: None,
         toolset: None,
-        bot_id: Some(quiet.id),
+        bot_id: quiet.id,
         parent_thread_id: None,
         title: "",
       ),
@@ -796,6 +796,10 @@ pub fn deliver_by_name_creates_dm_test() {
 pub fn deliver_by_thread_id_direct_test() {
   let booted = boot()
   let alpha = create_bot(booted, "alpha", allow_inbound: True)
+  // Threads are bot-only now: the direct-address target still carries a
+  // bot (allow_inbound open — the gate reads the STORE row, and the
+  // delivery here is by thread id, not bot name).
+  let target_bot = create_bot(booted, "target", allow_inbound: True)
   let alpha_parent = create_parent_thread(booted, alpha.id)
   let specs = tools.by_names(test_config(), []) |> result.unwrap([])
   let assert Ok(human) =
@@ -806,7 +810,7 @@ pub fn deliver_by_thread_id_direct_test() {
         model: "alpha",
         system_prompt: None,
         toolset: None,
-        bot_id: None,
+        bot_id: target_bot.id,
         parent_thread_id: None,
         title: "",
       ),

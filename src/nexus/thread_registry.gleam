@@ -76,24 +76,30 @@ pub type ChildArgument {
 /// at birth. `system_prompt: None` means the global default, resolved HERE
 /// at creation — the one NULL/default resolution point, and the value the
 /// same insert persists, so hydration rebuilds a byte-identical prefix.
-/// `bot_id` is the bots plan's provenance pointer (P1): the bot a
-/// create-from-bot sourced these values from, persisted onto the row and
-/// projected into summaries. Display-only — the frozen columns are the
-/// thread's truth; the bot row is never read back.
+///
+/// `bot_id` is REQUIRED: every thread is created from a bot (the bots
+/// plan, amended — the provider+model create shape is gone). The bot
+/// supplies the frozen provider/model/prompt/toolset template, and the id
+/// rides along as provenance; the bot-default toolset transform keys off
+/// it. Channels pass the TARGET bot's id; ordinary creates pass the
+/// creating bot's. A blank id refuses (`BotRequired`) — the registry's
+/// backstop behind the surfaces' own refusals. Display-only after that —
+/// the frozen columns are the thread's truth; the bot row is never read
+/// back, and deleting the bot NULLs the stored column (SET NULL).
 pub type NewThread {
   NewThread(
     provider_id: String,
     model: String,
     system_prompt: Option(String),
-    bot_id: Option(String),
+    bot_id: String,
     /// The toolset the new thread snapshots (bots plan P2): `None` = the
-    /// default set for a plain thread — or, when `bot_id` is `Some` (bots
-    /// P3c), the default set PLUS `bot_message`, so an ordinary bot gets
-    /// the delivery tool without listing it; `Some(names)` = an explicit
-    /// list, resolved against the config-independent catalog ∪ mounted
-    /// MCP servers (unknown name or unmounted server → `UnknownToolset`
-    /// — a stale bot is refused, never silently narrowed). The FREEZE
-    /// step (plugin-api plan Phase 2) turns these names into the
+    /// default set PLUS `bot_message` and `list_bots` — every thread is
+    /// bot-sourced now, so every default-toolset thread carries the
+    /// delivery tool and its roster plus the discovery half; `Some(names)`
+    /// = an explicit list, resolved against the config-independent catalog
+    /// ∪ mounted MCP servers (unknown name or unmounted server →
+    /// `UnknownToolset` — a stale bot is refused, never silently narrowed).
+    /// The FREEZE step (plugin-api plan Phase 2) turns these names into the
     /// manifest entries — plain names pass through; foreign names ask
     /// their server LIVE and persist the frozen (description, schema)
     /// into `thread_toolset`.
@@ -117,6 +123,10 @@ pub type NewThread {
 /// status code. Success carries the fresh `ThreadSummary` directly, so
 /// neither surface (HTTP, UI) ever hand-builds one (#73).
 pub type CreateError {
+  /// The create named no bot (blank id): every thread is born from one.
+  /// The surfaces refuse earlier — this is the registry's own backstop.
+  /// A 400-class client error.
+  BotRequired
   EmptyModel
   /// The pinned provider could not be resolved into a streaming
   /// endpoint (unknown / disabled / key unavailable). Carries the typed
@@ -708,48 +718,32 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
   case msg {
     Create(requested, reply) ->
       // The bot-default toolset transform (bots P3c, #97; #127 added
-      // the discovery half): a thread created FROM a bot with the
-      // default sentinel (`toolset: None`) snapshots the human default
-      // set PLUS `bot_message` and `list_bots` — bots are the only
-      // senders, so an ordinary bot gets the delivery tool (and its
-      // roster) without listing them, while the HUMAN default set never
-      // carries either (a plain thread has no bot identity to send
-      // from, and nobody to list for). A bot that wants them gone names
-      // an explicit list without them; a chat-only `'{}'` bot already
+      // the discovery half; amended — botless threads are gone): EVERY
+      // thread is created from a bot, so the default sentinel now
+      // resolves for ALL creates to the default set PLUS `bot_message`
+      // and `list_bots` — every thread carries a bot identity, so every
+      // default-toolset thread gets the delivery tool (and its roster)
+      // and the discovery half. A bot that wants them gone names an
+      // explicit list without them; a chat-only `'{}'` bot already
       // excludes them. Everything resolves through the same bundle
       // cache as any other snapshot (the default+delivery-tools entry
-      // list is its own cache entry, built once). `None` (the plain
-      // default) skips the freeze entirely: the boot-seeded bundle IS
-      // the answer.
-      case effective_toolset(state, requested) {
-        None -> {
-          let toolset = default_toolset(state)
-          handle_create(
-            state,
-            requested,
-            toolset,
-            plain_entries(state.default_names),
-            reply,
-          )
+      // list is its own cache entry, built once). The create-time
+      // freeze (plugin-api plan Phase 2) turns names → manifest
+      // entries, asking mounted MCP servers LIVE — then the entries
+      // resolve through the bundle cache.
+      case freeze_entries(state, effective_toolset(state, requested)) {
+        Error(reason) -> {
+          process.send(reply, Error(UnknownToolset(reason)))
+          actor.continue(state)
         }
-        Some(names) ->
-          // The create-time freeze (plugin-api plan Phase 2): names →
-          // manifest entries, asking mounted MCP servers LIVE — then
-          // resolve the entries through the bundle cache.
-          case freeze_entries(state, names) {
+        Ok(entries) ->
+          case resolve_entries(state, entries) {
             Error(reason) -> {
               process.send(reply, Error(UnknownToolset(reason)))
               actor.continue(state)
             }
-            Ok(entries) ->
-              case resolve_entries(state, entries) {
-                Error(reason) -> {
-                  process.send(reply, Error(UnknownToolset(reason)))
-                  actor.continue(state)
-                }
-                Ok(#(state, toolset)) ->
-                  handle_create(state, requested, toolset, entries, reply)
-              }
+            Ok(#(state, toolset)) ->
+              handle_create(state, requested, toolset, entries, reply)
           }
       }
 
@@ -805,32 +799,19 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
 }
 
 /// The effective toolset NAMES a create request resolves through: the
-/// requested explicit list, or — for a bot-sourced create with the
-/// default sentinel — the default set plus `bot_message` and `list_bots`
-/// (see `handle`; #127 adds the discovery half).
-fn effective_toolset(
-  state: State,
-  requested: NewThread,
-) -> Option(List(String)) {
-  case requested.bot_id, requested.toolset {
-    Some(_), None ->
-      Some(
-        list.append(tools.default_names(state.cfg), [
-          "bot_message",
-          "list_bots",
-        ]),
-      )
-    _, _ -> requested.toolset
+/// requested explicit list, or — with the default sentinel — the default
+/// set plus `bot_message` and `list_bots` (see `handle`; #127 adds the
+/// discovery half). Total now: every create is bot-sourced, so there is
+/// no plain-default branch left.
+fn effective_toolset(state: State, requested: NewThread) -> List(String) {
+  case requested.toolset {
+    None ->
+      list.append(tools.default_names(state.cfg), [
+        "bot_message",
+        "list_bots",
+      ])
+    Some(names) -> names
   }
-}
-
-/// The registry's default toolset bundle: resolved through the boot-seeded
-/// cache, so the default snapshot IS the boot-built bundle (#76). A miss
-/// would mean the seed was dropped — a programmer error, crashed loudly.
-fn default_toolset(state: State) -> thread.Toolset {
-  let assert Ok(toolset) =
-    dict.get(state.toolsets, plain_entries(state.default_names))
-  toolset
 }
 
 /// Plain manifest entries for a name list — no frozen schema, no
@@ -1057,6 +1038,22 @@ fn start_new_thread(
   toolset: thread.Toolset,
   entries: List(tools.ToolsetEntry),
 ) -> #(State, Result(Record, CreateError)) {
+  case string.trim(requested.bot_id) {
+    // Every thread is born from a bot (the NewThread contract): a blank
+    // id refuses before anything freezes. The surfaces refuse earlier
+    // (they resolve the bot first); this is the registry's backstop.
+    "" -> #(state, Error(BotRequired))
+    _ -> start_new_thread_bot(state, requested, toolset, entries)
+  }
+}
+
+/// The body of `start_new_thread`, past the bot-id guard.
+fn start_new_thread_bot(
+  state: State,
+  requested: NewThread,
+  toolset: thread.Toolset,
+  entries: List(tools.ToolsetEntry),
+) -> #(State, Result(Record, CreateError)) {
   case string.trim(requested.model) {
     "" -> #(state, Error(EmptyModel))
     alias ->
@@ -1129,7 +1126,7 @@ fn start_new_thread(
               archived: False,
               // Provenance only (bots plan P1): never read back — the
               // frozen columns above are the thread's truth.
-              bot_id: requested.bot_id,
+              bot_id: Some(requested.bot_id),
               // The parent link (bot-channels plan, #123): routing/
               // display only — never a request byte.
               parent_thread_id: requested.parent_thread_id,
@@ -1259,16 +1256,24 @@ fn start_new_thread(
               )
             None -> spec
           }
-          let spec = case requested.bot_id, persisted {
-            Some(bot_id), True ->
+          let spec = case persisted {
+            // Every thread is bot-sourced now: a PERSISTED one wraps (the
+            // unpersisted scrub below presents human and must behave
+            // human — see the meta scrub above).
+            True ->
               thread.ThreadSpec(
                 ..spec,
                 // `spec.toolset`, not the base bundle: it may already
                 // carry the environment wrapper above, and a wrap of
                 // the base would silently drop it.
-                toolset: delivery_toolset(state, spec.toolset, id, bot_id),
+                toolset: delivery_toolset(
+                  state,
+                  spec.toolset,
+                  id,
+                  requested.bot_id,
+                ),
               )
-            _, _ -> spec
+            False -> spec
           }
           // The channel-persistence refusal (bot-channels plan, #123;
           // CodeRabbit PR review on #137): a channel create whose insert
@@ -3247,7 +3252,7 @@ fn create_dm(
       // gets: `None` (the live-template sentinel) resolves to the
       // default set plus `bot_message`.
       toolset: bot.tools,
-      bot_id: Some(bot.id),
+      bot_id: bot.id,
       // The channel identity (bot-channels plan, #123): hangs off the
       // ORIGINATING thread — the routing key this whole plan re-derives
       // — under the target bot's creation-time template, exactly as P3c
@@ -3259,12 +3264,7 @@ fn create_dm(
       // it.
       title: bot.name,
     )
-  case
-    freeze_entries(
-      state,
-      effective_toolset(state, requested) |> option.unwrap([]),
-    )
-  {
+  case freeze_entries(state, effective_toolset(state, requested)) {
     Error(reason) -> #(
       state,
       Error("target bot toolset unavailable: " <> reason),

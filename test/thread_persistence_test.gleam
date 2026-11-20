@@ -300,6 +300,7 @@ type Boot {
 fn boot(seam: store.Store) -> Boot {
   // Threads created through the registry pin the fixture provider.
   store_mock.ensure_fixture_provider(seam)
+  store_mock.ensure_fixture_bot(seam)
   let factory_name = process.new_name("nexus_persist_factory")
   let registry_name = process.new_name("nexus_persist_registry")
   let assert Ok(factory) =
@@ -387,7 +388,7 @@ fn new_thread(provider_id: String, model: String) -> thread_registry.NewThread {
     model: model,
     system_prompt: None,
     toolset: None,
-    bot_id: None,
+    bot_id: "b-fixture",
     parent_thread_id: None,
     title: "",
   )
@@ -448,6 +449,7 @@ pub fn channel_parent_link_round_trips_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
   store_mock.ensure_fixture_provider(seam)
+  store_mock.ensure_fixture_bot(seam)
   // The channel FKs both ways: store the bot the channel points at.
   let assert Ok(_) =
     seam.insert_bot(bot.Bot(
@@ -565,11 +567,14 @@ pub fn metadata_writes_through_test() {
     |> list.filter(fn(event) {
       case event {
         store_mock.EvCommit(_, _) -> False
-        // Fixture provider seeding (P1) is setup, not the sequence under
-        // test here.
+        // Fixture provider + bot seeding is setup, not the sequence
+        // under test here.
         store_mock.EvInsertProvider(_)
         | store_mock.EvUpdateProvider(_)
-        | store_mock.EvDeleteProvider(_) -> False
+        | store_mock.EvDeleteProvider(_)
+        | store_mock.EvInsertBot(_)
+        | store_mock.EvUpdateBot(_)
+        | store_mock.EvDeleteBot(_) -> False
         _ -> True
       }
     })
@@ -664,6 +669,7 @@ pub fn lazy_start_is_one_shot_and_continues_ids_test() {
   let seam = store_mock.seam(mock)
   // Pre-populate the "database" with two stored threads.
   store_mock.ensure_fixture_provider(seam)
+  store_mock.ensure_fixture_bot(seam)
   let assert Ok(_) = seam.insert_thread(stored("s1"), "sys-1")
   let assert Ok(_) = seam.insert_thread(stored("s2"), "sys-2")
 
@@ -781,6 +787,7 @@ pub fn delete_removes_stored_rows_and_dormant_test() {
   // (the store is single-writer: rows appear there only through this
   // registry's create path or a previous boot).
   store_mock.ensure_fixture_provider(seam)
+  store_mock.ensure_fixture_bot(seam)
   let assert Ok(_) = seam.insert_thread(stored("s99"), "sys")
   let booted = boot(seam)
   let live = create(booted.registry, "alias-1", happy_runner)
@@ -813,6 +820,7 @@ pub fn dormant_metadata_writes_through_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
   store_mock.ensure_fixture_provider(seam)
+  store_mock.ensure_fixture_bot(seam)
   let assert Ok(_) = seam.insert_thread(stored("s1"), "sys")
   let booted = boot(seam)
 
@@ -1094,6 +1102,7 @@ pub fn auto_meta_upgrade_replaces_auto_title_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
   store_mock.ensure_fixture_provider(seam)
+  store_mock.ensure_fixture_bot(seam)
   let assert Ok(_) = seam.insert_thread(auto_stored("s1", "heuristic"), "sys")
 
   should.equal(seam.auto_meta_upgrade("s1", "Model Title", []), Ok(True))
@@ -1114,6 +1123,7 @@ pub fn auto_meta_upgrade_refuses_manual_title_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
   store_mock.ensure_fixture_provider(seam)
+  store_mock.ensure_fixture_bot(seam)
   let assert Ok(_) = seam.insert_thread(auto_stored("s2", "heuristic"), "sys")
 
   should.equal(seam.set_title("s2", "renamed"), Ok(Nil))
@@ -1133,6 +1143,7 @@ pub fn auto_meta_upgrade_refuses_after_manual_tag_save_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
   store_mock.ensure_fixture_provider(seam)
+  store_mock.ensure_fixture_bot(seam)
   let assert Ok(_) = seam.insert_thread(auto_stored("s3", "heuristic"), "sys")
 
   should.equal(seam.set_tags("s3", ["mine"]), Ok(Nil))
@@ -1165,6 +1176,7 @@ pub fn auto_meta_upgrade_applies_and_records_tags_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
   store_mock.ensure_fixture_provider(seam)
+  store_mock.ensure_fixture_bot(seam)
   let assert Ok(_) = seam.insert_thread(auto_stored("s4", "heuristic"), "sys")
 
   should.equal(
@@ -1317,6 +1329,7 @@ pub fn upgrade_auto_title_on_dormant_thread_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
   store_mock.ensure_fixture_provider(seam)
+  store_mock.ensure_fixture_bot(seam)
   let assert Ok(_) = seam.insert_thread(auto_stored("s9", "heuristic"), "sys")
   let booted = boot(seam)
 

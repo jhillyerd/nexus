@@ -172,6 +172,7 @@ fn start_server_rig(
     factory_supervisor.start(thread_registry.factory_builder(factory_name))
   let persistence = store_mock.seam(store_mock.start())
   store_mock.ensure_fixture_provider(persistence)
+  store_mock.ensure_fixture_bot(persistence)
   seed(persistence)
   // The REAL provider registry over the same mock store, with the live
   // model fetch replaced by a fixed alias list — offline, like the rest
@@ -346,7 +347,7 @@ fn create(
         model: model,
         system_prompt: None,
         toolset: None,
-        bot_id: None,
+        bot_id: "b-fixture",
         parent_thread_id: None,
         title: "",
       ),
@@ -502,99 +503,48 @@ pub fn patch_delete_and_archive_routes_test() {
 }
 
 // ---------------------------------------------------------------------------
-// P3: POST /threads pins provider + model
+// P3: POST /threads is BOT-ONLY (threads require a bot)
 // ---------------------------------------------------------------------------
 
-/// The full create flow over the real (loopback) surface: provider
-/// resolved by id, model validated against the provider's list, thread
-/// created and persisted with the pin.
-pub fn create_thread_pins_provider_and_model_test() {
-  let #(registry, port) = start_server()
-  let #(status, body) =
-    send_authorized(req(
-      port,
-      Post,
-      "/threads",
-      "{\"provider\":\""
-        <> store_mock.fixture_provider_id
-        <> "\",\"model\":\"alias-a\"}",
-    ))
-  should.equal(status, 201)
-  should.be_true(string.contains(body, "\"model\":\"alias-a\""))
-  // The pin is in the stored row too.
-  let assert [summary] = thread_registry.list_threads(registry)
-  summary.model |> should.equal("alias-a")
-  let #(_, listed) = send_authorized(req(port, Get, "/threads", ""))
-  should.be_true(string.contains(listed, "\"model\":\"alias-a\""))
-}
-
-/// Provider lookup accepts the NAME as well as the id (plan §11).
-pub fn create_thread_resolves_provider_by_name_test() {
+/// The provider+model create shape is GONE: any provider/model/tools
+/// body answers the honest 400 naming the one live shape (the bot).
+pub fn create_thread_requires_bot_test() {
   let #(_registry, port) = start_server()
-  let #(status, _body) =
-    send_authorized(req(
-      port,
-      Post,
-      "/threads",
-      "{\"provider\":\"fixture\",\"model\":\"alias-b\"}",
-    ))
-  should.equal(status, 201)
-}
-
-pub fn create_thread_validation_test() {
-  let #(_registry, port) = start_server()
-  // Unknown provider -> 400 (plan §11 mapping).
+  let refused = fn(body) { send_authorized(req(port, Post, "/threads", body)) }
   should.equal(
-    send_authorized(req(
-      port,
-      Post,
-      "/threads",
-      "{\"provider\":\"nope\",\"model\":\"alias-a\"}",
-    )),
-    #(400, "{\"error\":\"unknown provider: nope\"}"),
+    refused(
+      "{\"provider\":\""
+      <> store_mock.fixture_provider_id
+      <> "\",\"model\":\"alias-a\"}",
+    ),
+    #(
+      400,
+      "{\"error\":\"threads require a bot: pass a bot id —"
+        <> " the provider/model create shape is gone\"}",
+    ),
   )
-  // An alias OFF the provider's live list is NOT a refusal — proxies
-  // like Bifrost accept aliases their /v1/models may not carry, so the
-  // create pins it as-is and the turn fails at stream time if dead
-  // (thread_create's module doc).
+  // Blank halves, tools lists — every non-bot shape refuses the same way.
+  should.equal(refused("{\"model\":\"alias-a\"}") |> fn(pair) { pair.0 }, 400)
   should.equal(
-    send_authorized(req(
-      port,
-      Post,
-      "/threads",
-      "{\"provider\":\""
-        <> store_mock.fixture_provider_id
-        <> "\",\"model\":\"nope\"}",
-    ))
+    refused("{\"provider\":\"\",\"model\":\"alias-a\"}")
       |> fn(pair) { pair.0 },
-    201,
+    400,
   )
-  // Missing provider field -> 400 (no default provider exists anymore;
-  // the decoder is total over the two body shapes, so the refusal is the
-  // route's "empty provider").
+  should.equal(refused("{\"tools\":[]}") |> fn(pair) { pair.0 }, 400)
+  // And nothing was created.
+  let #(_, listed) = send_authorized(req(port, Get, "/threads", ""))
+  should.be_false(string.contains(listed, "alias-a"))
+}
+
+/// The bot shape keeps its own validations: unknown bot -> 400; a bot
+/// pinned to an alias the provider no longer lists still creates (the
+/// pin freezes "dead-alias"; the first turn fails at stream time if
+/// dead). Full flow coverage lives in create_thread_from_bot_test below.
+pub fn create_thread_bot_shape_refusals_test() {
+  let #(_registry, port) = start_server()
   should.equal(
-    send_authorized(req(port, Post, "/threads", "{\"model\":\"alias-a\"}")),
-    #(400, "{\"error\":\"empty provider\"}"),
-  )
-  should.equal(
-    send_authorized(req(
-      port,
-      Post,
-      "/threads",
-      "{\"provider\":\"\",\"model\":\"alias-a\"}",
-    )),
-    #(400, "{\"error\":\"empty provider\"}"),
-  )
-  should.equal(
-    send_authorized(req(
-      port,
-      Post,
-      "/threads",
-      "{\"provider\":\""
-        <> store_mock.fixture_provider_id
-        <> "\",\"model\":\"   \"}",
-    )),
-    #(400, "{\"error\":\"empty model\"}"),
+    send_authorized(req(port, Post, "/threads", "{\"bot\":\"b-nope\"}")),
+    #(400, "{\"error\":\"unknown bot: b-nope\"}"),
   )
 }
 
@@ -630,31 +580,27 @@ pub fn thread_page_route_test() {
 }
 
 // A provider may be NAMED after another provider's id — the id is the
-// unambiguous key and must win: a request for "p1" pins the provider
-// WITH ID p1, never the provider merely named "p1" (review finding on
-// PR #12).
+// unambiguous key and must win (review finding on PR #12). The HTTP
+// create no longer carries a provider identifier at all (threads are
+// bot-only; the bot row stores the CANONICAL id), so the surface-level
+// test is gone; the resolution itself keeps the id-first rule in
+// thread_create.resolve_provider for the bot path.
 pub fn create_thread_provider_id_wins_over_name_test() {
   let #(_registry, _providers, port) =
     start_server_with(fn(providers) {
-      // Registry-minted ids: beta -> p1, the second -> p2, NAMED "p1".
       create_provider(providers, "beta", "https://beta.test/v1")
       create_provider(providers, "p1", "https://gamma.test/v1")
     })
-  // p1 (id) is beta; the provider NAMED p1 mints id p2. Ids are the
-  // unambiguous key and must win when the two disagree (review finding
-  // on PR #12). The summary pins WHICH provider row the create landed
-  // on — validation no longer distinguishes the two fetch lists, since
-  // aliases are not checked at create.
-  let assert #(201, id_wins) =
+  // The dead shape refuses like any other non-bot body.
+  let #(status, body) =
     send_authorized(req(
       port,
       Post,
       "/threads",
       "{\"provider\":\"p1\",\"model\":\"gamma-only\"}",
     ))
-  // Name-matching would have pinned p2 (the provider named p1).
-  should.be_true(string.contains(id_wins, "\"provider_id\":\"p1\""))
-  should.be_false(string.contains(id_wins, "\"provider_id\":\"p2\""))
+  should.equal(status, 400)
+  should.be_true(string.contains(body, "threads require a bot"))
 }
 
 // ---------------------------------------------------------------------------
@@ -867,13 +813,24 @@ pub fn provider_delete_guard_test() {
     ))
   let provider_id = first_id(created)
 
-  // A thread pins it (model list comes from gamma's own fetcher).
+  // Threads are bot-only: a BOT pins the provider, and the thread
+  // created from it pins the same row.
+  let assert #(201, bot) =
+    send_authorized(req(
+      port,
+      Post,
+      "/bots",
+      "{\"name\":\"gamma-bot\",\"provider\":\""
+        <> provider_id
+        <> "\",\"model\":\"gamma-only\"}",
+    ))
+  let bot_id = first_id(bot)
   let assert #(201, thread) =
     send_authorized(req(
       port,
       Post,
       "/threads",
-      "{\"provider\":\"" <> provider_id <> "\",\"model\":\"gamma-only\"}",
+      "{\"bot\":\"" <> bot_id <> "\"}",
     ))
   let thread_id = first_id(thread)
 
@@ -886,7 +843,7 @@ pub fn provider_delete_guard_test() {
     ),
   )
   // Disabling is allowed (the reversible path) but does NOT unpin —
-  // the threads still reference the row, so the guard holds.
+  // the bot and its thread still reference the row, so the guard holds.
   let assert #(200, _disabled) =
     send_authorized(req(
       port,
@@ -902,9 +859,21 @@ pub fn provider_delete_guard_test() {
     ),
   )
 
-  // Unpin (hard-delete the thread) and the provider deletes cleanly.
+  // Unpin: hard-delete the thread, then the bot (the thread's bot_id
+  // was already scrubbed by the delete — but the BOT row itself still
+  // RESTRICTs the provider until it is gone too).
   should.equal(
     send_authorized(req(port, Delete, "/threads/" <> thread_id, ""))
+      |> fn(pair) { #(pair.0, "") },
+    #(204, ""),
+  )
+  should.equal(
+    send_authorized(req(port, Delete, "/providers/" <> provider_id, ""))
+      |> fn(pair) { pair.0 },
+    409,
+  )
+  should.equal(
+    send_authorized(req(port, Delete, "/bots/" <> bot_id, ""))
       |> fn(pair) { #(pair.0, "") },
     #(204, ""),
   )
@@ -1283,17 +1252,31 @@ pub fn bots_allow_inbound_patch_round_trip_test() {
 /// (per-thread node names), the list carries no secrets, revoke is an
 /// idempotent row delete, and the UI token still guards the admin
 /// surface.
-pub fn node_pairing_round_trip_test() {
-  let #(_registry, port) = start_server()
-  let #(thread_status, thread_body) =
+/// The node/pairing tests' thread: bot-sourced (the only create shape —
+/// every thread names its bot). Returns (status, body) of POST /threads.
+fn create_thread_via_bot(port: Int) -> #(Int, String) {
+  // Bot names are case-insensitively unique, and a test may call this
+  // twice (the per-thread-names round trip) — the microsecond suffix
+  // keeps the rows distinct.
+  let name = "node-bot-" <> int.to_string(timing.now_us())
+  let #(_, bot_body) =
     send_authorized(req(
       port,
       Post,
-      "/threads",
-      "{\"provider\":\""
+      "/bots",
+      "{\"name\":\""
+        <> name
+        <> "\",\"provider\":\""
         <> store_mock.fixture_provider_id
         <> "\",\"model\":\"alias-a\"}",
     ))
+  let assert Ok(bot_id) = json.parse(bot_body, decode.at(["id"], decode.string))
+  send_authorized(req(port, Post, "/threads", "{\"bot\":\"" <> bot_id <> "\"}"))
+}
+
+pub fn node_pairing_round_trip_test() {
+  let #(_registry, port) = start_server()
+  let #(thread_status, thread_body) = create_thread_via_bot(port)
   should.equal(thread_status, 201)
   let assert Ok(thread_id) =
     json.parse(thread_body, decode.at(["id"], decode.string))
@@ -1359,15 +1342,7 @@ pub fn node_ws_pre_upgrade_refusals_test() {
   let #(_registry, port) = start_server()
   // The node's OWN (plain) thread: names are per-thread, so the row
   // binds to it, and the auth lookup is scoped by the pair.
-  let #(thread_status, thread_body) =
-    send_authorized(req(
-      port,
-      Post,
-      "/threads",
-      "{\"provider\":\""
-        <> store_mock.fixture_provider_id
-        <> "\",\"model\":\"alias-a\"}",
-    ))
+  let #(thread_status, thread_body) = create_thread_via_bot(port)
   should.equal(thread_status, 201)
   let assert Ok(thread_id) =
     json.parse(thread_body, decode.at(["id"], decode.string))
@@ -1401,15 +1376,7 @@ pub fn node_ws_pre_upgrade_refusals_test() {
   // credential). A REAL second thread, not a ghost id: the point is
   // that a VALID token is rejected wherever its row is not, so global
   // node authentication cannot sneak back in.
-  let #(t2_status, t2_body) =
-    send_authorized(req(
-      port,
-      Post,
-      "/threads",
-      "{\"provider\":\""
-        <> store_mock.fixture_provider_id
-        <> "\",\"model\":\"alias-a\"}",
-    ))
+  let #(t2_status, t2_body) = create_thread_via_bot(port)
   should.equal(t2_status, 201)
   let assert Ok(thread_2) =
     json.parse(t2_body, decode.at(["id"], decode.string))
@@ -1484,15 +1451,7 @@ pub fn node_grant_exchange_round_trip_test() {
   // A REAL thread: the mock enforces node_grant's thread FK like
   // production Postgres (cubic review), so grants pin to ids that
   // exist.
-  let #(thread_status, thread_body) =
-    send_authorized(req(
-      port,
-      Post,
-      "/threads",
-      "{\"provider\":\""
-        <> store_mock.fixture_provider_id
-        <> "\",\"model\":\"alias-a\"}",
-    ))
+  let #(thread_status, thread_body) = create_thread_via_bot(port)
   should.equal(thread_status, 201)
   let assert Ok(thread_id) =
     json.parse(thread_body, decode.at(["id"], decode.string))
@@ -1577,15 +1536,7 @@ pub fn node_grant_exchange_round_trip_test() {
   // the ghost-row bug this scoping removes (a disconnected TUI's row
   // on thread A never blocks thread B). A second thread, the override
   // form, and the answer carries the OVERRIDE thread.
-  let #(t2_status, t2_body) =
-    send_authorized(req(
-      port,
-      Post,
-      "/threads",
-      "{\"provider\":\""
-        <> store_mock.fixture_provider_id
-        <> "\",\"model\":\"alias-a\"}",
-    ))
+  let #(t2_status, t2_body) = create_thread_via_bot(port)
   should.equal(t2_status, 201)
   let assert Ok(thread_2) =
     json.parse(t2_body, decode.at(["id"], decode.string))

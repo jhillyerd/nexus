@@ -39,14 +39,18 @@
 -- - `ON DELETE RESTRICT` + the registry's `409` pre-check: deleting a
 --   referenced provider is refused; disabling is the reversible path.
 --
--- Bot design notes (docs/plans/completed/bots.md, Phase 1):
+-- Bot design notes (docs/plans/completed/bots.md, Phase 1; amended —
+-- threads are bot-only):
 -- - `bot` is a creation-time template, NOT a runtime dependency: creating
 --   a thread from a bot COPIES provider/model/system_prompt into the
---   thread's frozen-at-creation columns; editing or deleting a bot never
---   changes an existing thread. `thread.bot_id` is provenance/display
---   only, which is why it is `ON DELETE SET NULL` — deleting a bot
---   orphans nothing (`provider_id` stays RESTRICT: it is live at request
---   time, and `delete_provider`'s 409 pre-check counts bots too).
+--   thread's frozen-at-creation columns. Editing or deleting a bot never
+--   changes an existing thread. There is no provider+model create shape
+--   anymore — every thread is born from a bot (the registry refuses a
+--   blank bot_id) — but the column stays NULLABLE: `ON DELETE SET NULL`
+--   is what keeps a deleted bot from orphaning its threads. The
+--   bot-required invariant lives at CREATION (thread_registry.NewThread),
+--   not in the schema. (`provider_id` stays RESTRICT: it is live at
+--   request time, and `delete_provider`'s 409 pre-check counts bots too.)
 -- - `bot.system_prompt` NULL = the global default, resolved AT CREATION
 --   into the thread's frozen `system_prompt` (same rule as an explicit
 --   NEXUS_SYSTEM_PROMPT); never resolved at request time.
@@ -114,7 +118,8 @@ CREATE TABLE IF NOT EXISTS thread (
   created_at     timestamptz NOT NULL,
   last_active_at timestamptz NOT NULL,         -- bumped on turn commit; drives recency + buckets
   message_count  int NOT NULL DEFAULT 0,       -- denormalized for list queries
-  bot_id         text REFERENCES bot(id) ON DELETE SET NULL,   -- provenance/display only (bots plan P1): which bot the frozen
+  bot_id         text REFERENCES bot(id) ON DELETE SET NULL,   -- REQUIRED at creation (threads are bot-only — NewThread refuses a
+                                                -- blank id); provenance/display after that: which bot the frozen
                                                 -- columns were sourced from. Never joined at request-encoding time;
                                                 -- deleting the bot NULLs it — the thread is self-contained.
   parent_thread_id text REFERENCES thread(id) ON DELETE CASCADE, -- bot channels (docs/plans/bot-channels.md, #123): the parent thread a
