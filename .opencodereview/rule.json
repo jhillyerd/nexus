@@ -1,0 +1,20 @@
+{
+  "include": [
+    "**/*.gleam",
+    "**/*.md"
+  ],
+  "rules": [
+    {
+      "path": "docs/plans/**/*.md",
+      "rule": "Design/plan document for nexus (Gleam on BEAM). These docs pin hard invariants: KV-cache request-byte stability (single encode path in src/nexus/transcript, byte-deterministic re-encoding, suffix-only request growth, one frozen toolset per thread), thread_message schema semantics (singular tables, seq is the 0-based row index, tool_args is text never jsonb, timestamptz only, message_count includes the system prompt), bot-channel and environment invariants, and Pico-first UI rules (no innerHTML, Lustre text nodes only, self-hosted assets, no public CDNs). Review for: claims contradicting the actual code, stated file paths / function names that do not exist, instructions violating the repo AGENTS.md invariants, and steps that would break the offline-test guarantee (gleam test must stay network-free)."
+    },
+    {
+      "path": "**/*.md",
+      "rule": "Documentation for nexus (Gleam on BEAM). Verify referenced commands, file paths, module names, and config keys actually exist in the repo; keep setup steps reproducible offline; flag instructions that pull from public CDNs or external URLs (the UI and e2e suites are self-hosted/offline by policy)."
+    },
+    {
+      "path": "**/*.gleam",
+      "rule": "Gleam source for nexus. The pinned gleam_stdlib is 1.0.5 — do not assume APIs from newer training data: io.debug does not exist (use the echo keyword expression or io.println), string.find does not exist (use string.contains or string.split_once), and process.receive panics on a subject owned by another process (invert the protocol: the worker creates the subject and sends it back to the caller). nexus/env must stay a leaf module (imports no nexus actor module; the nexus/tools bridge breaks the cycle). Tests must stay offline and network-free: persistence tests go through the mockable store seam (src/nexus/store.gleam, test/store_mock.gleam), never a live database; env tests run real bash in temp dirs only. Schema/query changes require editing sql/schema.sql idempotently (IF NOT EXISTS) and regenerating sql.gleam via squirrel (the generated file is committed and CI runs squirrel check). Changes to the transcript/request-encoding path must keep byte-deterministic re-encoding and suffix-only request growth with an unchanged envelope (model, stream, tools, tool_choice never vary mid-thread) — test/m3_prefix_test.gleam is the offline golden. UI changes must render model and tool output as Lustre text nodes only (no innerHTML), keep the shadow root open, keep one Lustre runtime per /ws connection, and mirror the server's commit/rollback rules."
+    }
+  ]
+}
