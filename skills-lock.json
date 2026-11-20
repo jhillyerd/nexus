@@ -1,0 +1,12 @@
+{
+  "version": 2,
+  "skills": {
+    "open-code-review": {
+      "source": "alibaba/open-code-review",
+      "commit": "5a6f77ccd1540ed4e80c06490a696543e507d3e4",
+      "sourceType": "github",
+      "skillPath": "skills/open-code-review/SKILL.md",
+      "computedHash": "c863348ea930df89dcdb7e19250a7a07b639bc26445f5b5217829513a730b698"
+    }
+  }
+}
