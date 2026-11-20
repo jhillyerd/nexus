@@ -373,6 +373,13 @@ deliberately).
   write-through succeeded — the msg only lands then), and a re-read
   that no longer carries the displayed mint's grant (revoked, or
   swept) drops the one-time URL display with it.
+- **Pane close retires the one-time URL display** (follow-up): the
+  server-component model outlives the pane, so closing the info pane
+  (toggle or Settings) now clears the mint display — before the fix,
+  the plaintext re-rendered on every pane reopen for the whole /ws
+  connection and "shown once" was false. A mint landing on an
+  already-closed pane drops the code (the row still lands). A lost URL
+  is re-minted, as the pane's own note promises.
 - Browser e2e (`browser.spec.mjs`, its own workspace-rooted instance
   on :18083 — the main instances keep their env-less default toolsets
   for the byte-prefix pins): pane → mint → URL shape → REAL public
