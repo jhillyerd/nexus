@@ -71,10 +71,13 @@ Every thread **pins one `(provider, model)` pair at creation** — frozen
 like the system prompt for the thread's lifetime (KV-cache contract).
 Changing provider or model means creating a new thread.
 
+Every thread is also **born from a bot** — there is no provider+model
+create shape. A bot is a named creation-time template (provider, model,
+system prompt, toolset), and threads always arrive through it.
+
 A fresh database has zero providers, and the server boots fine that way
 (zero threads too — nothing auto-creates). Create the first provider
-in the chat UI's **Providers** panel (sidebar, below the create panel)
-or through the HTTP API:
+in the chat UI's **Settings → Providers** view or through the HTTP API:
 
 ```sh
 curl -s http://127.0.0.1:8080/providers \
@@ -101,9 +104,10 @@ gleam run -m nexus/dev_seed
 The seed tool is idempotent by name (re-running reports "nothing to
 do"), and the key never appears in its output. Seed **before** booting
 the server or restart it afterwards — the provider registry loads the
-table once at start (a bad envelope fails boot loudly). Either way, the
-chat UI's provider picker lists every enabled provider and reloads the
-model aliases whenever the selection changes.
+table once at start (a bad envelope fails boot loudly). With a provider
+in place, create a **bot** (Settings → Bots), and threads start from it:
+click **New**, pick the bot beside the composer, type a message, and
+send — the send creates the thread.
 
 ## The UI
 
@@ -240,21 +244,22 @@ require the configured UI token when `NEXUS_UI_TOKEN` is set;
   from a bot keep their frozen settings (`bot_id` provenance is
   `ON DELETE SET NULL`)
 - `GET /threads` — summaries (each carrying the pinned `provider_id`
-  and, when created from a bot, the `bot_id` provenance), pinned first
+  and the `bot_id` provenance — a deleted bot's is NULL), pinned first
   then most recently active (default: active only)
 - `GET /threads?archived=1` — archived summaries only
-- `POST /threads` `{"provider":"id-or-name","model":"alias"}` —
-  the provider is resolved by id or name (unknown/disabled → `400`),
-  the alias trimmed and pinned for the thread's lifetime (blank →
-  `400`) — NOT validated against the provider's live model list
-  (proxies like Bifrost accept aliases their `/v1/models` may not
-  carry; a dead alias fails the thread's first turn) — or `{"bot":"id"}`
-  alone, which sources the provider, model, and system prompt from the
-  bot at creation (unknown bot → `400`; mixing `bot` with
-  `provider`/`model` → `400`, even when
-  the provider/model values are blank). Editing a bot never changes an
-  existing thread — its provider/model/prompt were copied at creation —
-  and deleting one only clears the `bot_id` provenance.
+- `POST /threads` `{"bot":"id"}` — the ONLY create shape: every thread
+  is born from a bot, which sources the provider, model, system prompt,
+  and toolset at creation (unknown bot → `400`). The alias is NOT
+  validated against the provider's live model list (proxies like
+  Bifrost accept aliases their `/v1/models` may not carry; a dead alias
+  fails the thread's first turn). Any `provider`/`model` body or
+  non-null `tools` value answers `400 threads require a bot`; mixing
+  `bot` with those values is `400`, even when the provider/model values
+  are blank (an explicit `"tools": null` is NOT a conflict — it
+  flattens to the default-set sentinel like absence). Editing a bot
+  never changes an existing thread — its provider/model/prompt were
+  copied at creation — and deleting one only clears the `bot_id`
+  provenance.
   (There is no global `GET /models` — with N providers there is no
   default endpoint to answer it; use `GET /providers/<id>/models`.)
 - `PATCH /threads/<id>` `{"title?","pinned?","tags?","archived?"}` — update

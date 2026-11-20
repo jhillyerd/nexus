@@ -113,6 +113,7 @@ fn start_registry_with_workspace(
   let assert Ok(_factory) =
     factory_supervisor.start(thread_registry.factory_builder(factory_name))
   store_mock.ensure_fixture_provider(persistence)
+  store_mock.ensure_fixture_bot(persistence)
   let assert Ok(started) =
     thread_registry.start_with_toolset(
       config.Config(..test_config(), workspace_root: option.Some(root)),
@@ -201,15 +202,16 @@ fn create(
   Created(id: summary.id, model: summary.model, subject: subject, pid: pid)
 }
 
-/// The common creation request shape: pin provider + model,
-/// config-default prompt.
+/// The common creation request shape: a bot-sourced pin (every thread
+/// is bot-sourced now — the id is provenance only here), config-default
+/// prompt.
 fn new_thread(provider_id: String, model: String) -> thread_registry.NewThread {
   thread_registry.NewThread(
     provider_id: provider_id,
     model: model,
     system_prompt: None,
     toolset: None,
-    bot_id: None,
+    bot_id: "b-fixture",
     parent_thread_id: None,
     title: "",
   )
@@ -669,6 +671,7 @@ fn blocking_runner(
 /// exactly like a stored row this feature's era created.
 fn seed_with_tags(seam: store.Store, id: String, tags: List(String)) -> Nil {
   store_mock.ensure_fixture_provider(seam)
+  store_mock.ensure_fixture_bot(seam)
   let assert Ok(Nil) =
     seam.insert_thread(
       store.StoredSummary(
@@ -1021,6 +1024,7 @@ fn seed_at(
   // The seeded row pins the fixture provider; the FK (enforced by the
   // mock too) needs it in place before the insert.
   store_mock.ensure_fixture_provider(seam)
+  store_mock.ensure_fixture_bot(seam)
   let assert Ok(Nil) =
     seam.insert_thread(
       store.StoredSummary(
@@ -1056,6 +1060,7 @@ fn seed_at(
 /// the sweep's never-used ceiling for those is 2, system + roster).
 fn seed_env(seam: store.Store, id: String, message_count: Int) -> Nil {
   store_mock.ensure_fixture_provider(seam)
+  store_mock.ensure_fixture_bot(seam)
   let assert Ok(Nil) =
     seam.insert_thread(
       store.StoredSummary(
@@ -1078,6 +1083,7 @@ fn seed_env(seam: store.Store, id: String, message_count: Int) -> Nil {
 /// rig: committed history (message_count 3) behind the parent link.
 fn seed_channel(seam: store.Store, id: String, parent: String) -> Nil {
   store_mock.ensure_fixture_provider(seam)
+  store_mock.ensure_fixture_bot(seam)
   let assert Ok(Nil) =
     seam.insert_thread(
       store.StoredSummary(
@@ -1272,6 +1278,7 @@ pub fn create_rejects_disabled_provider_test() {
     factory_supervisor.start(thread_registry.factory_builder(factory_name))
   let persistence = store_mock.seam(store_mock.start())
   store_mock.ensure_fixture_provider(persistence)
+  store_mock.ensure_fixture_bot(persistence)
   let disabled: thread_registry.ResolveProvider = fn(id) {
     case id == store_mock.fixture_provider_id {
       True -> Error(thread_registry.ProviderDisabled)
@@ -1348,6 +1355,7 @@ fn start_registry_keeping_seam_with(
       child,
     ))
   store_mock.ensure_fixture_provider(persistence)
+  store_mock.ensure_fixture_bot(persistence)
   let assert Ok(started) =
     thread_registry.start(
       test_config(),
@@ -1487,7 +1495,7 @@ pub fn create_from_bot_freezes_columns_and_provenance_test() {
         model: "alpha",
         system_prompt: Some("be terse"),
         toolset: None,
-        bot_id: Some("b1"),
+        bot_id: "b1",
         parent_thread_id: None,
         title: "",
       ),
@@ -1500,16 +1508,18 @@ pub fn create_from_bot_freezes_columns_and_provenance_test() {
   should.equal(stored.summary.model, "alpha")
   should.equal(stored.summary.meta.bot_id, Some("b1"))
 
-  // A plain create stays unprovenanced.
+  // EVERY create is bot-sourced now: the fixture-helper request (a
+  // blank bot id refuses — see the snapshot test's tail) carries the
+  // seeded fixture bot as its required provenance.
   let assert Ok(plain) =
     thread_registry.create_with_toolset(
       registry,
       new_thread(store_mock.fixture_provider_id, "alpha"),
       toolset(happy_runner),
     )
-  should.equal(plain.bot_id, None)
+  should.equal(plain.bot_id, Some("b-fixture"))
   let assert Ok(plain_stored) = seam.get_thread(plain.id)
-  should.equal(plain_stored.summary.meta.bot_id, None)
+  should.equal(plain_stored.summary.meta.bot_id, Some("b-fixture"))
 }
 
 /// The bot's NULL prompt is the config default resolved AT CREATION
@@ -1528,7 +1538,7 @@ pub fn create_from_null_prompt_bot_freezes_config_default_test() {
         model: "alpha",
         system_prompt: None,
         toolset: None,
-        bot_id: Some("b2"),
+        bot_id: "b2",
         parent_thread_id: None,
         title: "",
       ),
@@ -1561,7 +1571,7 @@ pub fn toolset_snapshot_persisted_at_creation_test() {
         model: "alpha",
         system_prompt: None,
         toolset: Some(["http_fetch"]),
-        bot_id: None,
+        bot_id: "b-fixture",
         parent_thread_id: None,
         title: "",
       ),
@@ -1569,7 +1579,9 @@ pub fn toolset_snapshot_persisted_at_creation_test() {
   let assert Ok(stored) = seam.get_thread(explicit.id)
   should.equal(entry_names(stored.summary.toolset), ["http_fetch"])
 
-  // A plain create: the default set's names, persisted verbatim.
+  // A bot-default create: the default set PLUS the delivery and
+  // discovery tools (every thread is bot-sourced now), persisted
+  // verbatim as resolved names.
   let assert Ok(plain) =
     thread_registry.create(
       registry,
@@ -1578,7 +1590,10 @@ pub fn toolset_snapshot_persisted_at_creation_test() {
   let assert Ok(plain_stored) = seam.get_thread(plain.id)
   should.equal(
     entry_names(plain_stored.summary.toolset),
-    tools.default_names(test_config()),
+    list.append(tools.default_names(test_config()), [
+      "bot_message",
+      "list_bots",
+    ]),
   )
 }
 
@@ -1595,7 +1610,7 @@ pub fn chat_only_toolset_create_test() {
         model: "alpha",
         system_prompt: None,
         toolset: Some([]),
-        bot_id: None,
+        bot_id: "b-fixture",
         parent_thread_id: None,
         title: "",
       ),
@@ -1613,7 +1628,7 @@ pub fn chat_only_toolset_create_test() {
         model: "alpha",
         system_prompt: None,
         toolset: Some([]),
-        bot_id: None,
+        bot_id: "b-fixture",
         parent_thread_id: None,
         title: "",
       ),
@@ -1635,7 +1650,7 @@ pub fn unknown_toolset_create_refused_test() {
       model: "alpha",
       system_prompt: None,
       toolset: Some(["nope"]),
-      bot_id: None,
+      bot_id: "b-fixture",
       parent_thread_id: None,
       title: "",
     ),
@@ -1658,6 +1673,7 @@ pub fn plugin_toolset_create_resolves_through_provider_table_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
   store_mock.ensure_fixture_provider(seam)
+  store_mock.ensure_fixture_bot(seam)
   // The production boot path: config-listed plugin → supervised actor →
   // bounded ListTools → validated table.
   let assert Ok(providers) =
@@ -1690,7 +1706,7 @@ pub fn plugin_toolset_create_resolves_through_provider_table_test() {
         model: "alpha",
         system_prompt: None,
         toolset: Some(["http_fetch", "example__echo"]),
-        bot_id: None,
+        bot_id: "b-fixture",
         parent_thread_id: None,
         title: "",
       ),
@@ -1709,7 +1725,7 @@ pub fn plugin_toolset_create_resolves_through_provider_table_test() {
       model: "alpha",
       system_prompt: None,
       toolset: Some(["nosuch__thing"]),
-      bot_id: None,
+      bot_id: "b-fixture",
       parent_thread_id: None,
       title: "",
     ),
@@ -1740,7 +1756,7 @@ pub fn create_from_bot_toolset_snapshot_test() {
         model: "alpha",
         system_prompt: None,
         toolset: Some(["http_fetch"]),
-        bot_id: Some("b-tools"),
+        bot_id: "b-tools",
         parent_thread_id: None,
         title: "",
       ),
@@ -1764,7 +1780,7 @@ pub fn create_from_bot_toolset_snapshot_test() {
         model: "alpha",
         system_prompt: None,
         toolset: None,
-        bot_id: Some("b-default"),
+        bot_id: "b-default",
         parent_thread_id: None,
         title: "",
       ),
@@ -1778,30 +1794,25 @@ pub fn create_from_bot_toolset_snapshot_test() {
     ]),
   )
 
-  // And the human default stays bare: a plain create never gains the
-  // delivery tool (a plain thread has no bot identity to send from).
-  let assert Ok(plain) =
-    thread_registry.create(
-      registry,
-      thread_registry.NewThread(
-        provider_id: store_mock.fixture_provider_id,
-        model: "alpha",
-        system_prompt: None,
-        toolset: None,
-        bot_id: None,
-        parent_thread_id: None,
-        title: "",
-      ),
-    )
-  let assert Ok(stored) = seam.get_thread(plain.id)
-  should.equal(
-    entry_names(stored.summary.toolset),
-    tools.default_names(test_config()),
+  // Botless threads are GONE: a blank bot id refuses the create
+  // (`BotRequired`) before anything freezes or persists — the surfaces
+  // refuse earlier; this is the registry's backstop. The threads the
+  // test created above stay; the refusal adds nothing.
+  let before = thread_registry.list_threads(registry) |> list.length
+  thread_registry.create(
+    registry,
+    thread_registry.NewThread(
+      provider_id: store_mock.fixture_provider_id,
+      model: "alpha",
+      system_prompt: None,
+      toolset: None,
+      bot_id: "  ",
+      parent_thread_id: None,
+      title: "",
+    ),
   )
-  should.equal(
-    list.contains(entry_names(stored.summary.toolset), "bot_message"),
-    False,
-  )
+  |> should.equal(Error(thread_registry.BotRequired))
+  should.equal(list.length(thread_registry.list_threads(registry)), before)
 }
 
 /// THE shared orchestration (the gap the registry-level snapshot tests
@@ -1813,6 +1824,7 @@ pub fn create_from_bot_orchestration_carries_bot_toolset_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
   store_mock.ensure_fixture_provider(seam)
+  store_mock.ensure_fixture_bot(seam)
   let cfg = test_config()
   let assert Ok(started_bots) =
     bot_registry.start(
@@ -1897,6 +1909,7 @@ pub fn dormant_toolset_rehydrates_through_snapshot_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
   store_mock.ensure_fixture_provider(seam)
+  store_mock.ensure_fixture_bot(seam)
   // A row whose snapshot is a NON-default toolset (the test config's
   // default is ["http_fetch"]; this thread pinned chat-only).
   let assert Ok(Nil) =
@@ -1920,6 +1933,7 @@ pub fn absent_tool_name_hydration_fails_loud_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
   store_mock.ensure_fixture_provider(seam)
+  store_mock.ensure_fixture_bot(seam)
   let assert Ok(Nil) =
     seam.insert_thread(stored_with_toolset("s-gone", ["vanished"]), "sys")
 
@@ -1947,6 +1961,7 @@ pub fn toolset_snapshot_survives_changed_default_config_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
   store_mock.ensure_fixture_provider(seam)
+  store_mock.ensure_fixture_bot(seam)
   // Created under a default of ["http_fetch"], the thread pinned a
   // DIFFERENT explicit toolset.
   let assert Ok(Nil) =
@@ -1993,6 +2008,7 @@ pub fn create_with_toolset_carries_the_whole_bundle_test() {
     factory_supervisor.start(thread_registry.factory_builder(factory_name))
   let persistence = store_mock.seam(store_mock.start())
   store_mock.ensure_fixture_provider(persistence)
+  store_mock.ensure_fixture_bot(persistence)
   let assert Ok(started) =
     thread_registry.start(
       config.Config(..test_config(), utility_enabled: True),
@@ -2144,6 +2160,7 @@ pub fn bot_delete_scrubs_cached_provenance_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
   store_mock.ensure_fixture_provider(seam)
+  store_mock.ensure_fixture_bot(seam)
   let assert Ok(Nil) = seed_bot(seam, "b1", Some("p"))
   // The unrelated bot exists too — the mock enforces the insert-time FK.
   let assert Ok(Nil) = seed_bot(seam, "b9", Some("p"))
@@ -2198,7 +2215,7 @@ pub fn bot_delete_scrubs_cached_provenance_test() {
         model: "alpha",
         system_prompt: Some("p"),
         toolset: None,
-        bot_id: Some("b1"),
+        bot_id: "b1",
         parent_thread_id: None,
         title: "",
       ),
@@ -2243,6 +2260,7 @@ pub fn unpersisted_create_carries_no_provenance_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
   store_mock.ensure_fixture_provider(seam)
+  store_mock.ensure_fixture_bot(seam)
   let assert Ok(Nil) = seed_bot(seam, "b1", Some("p"))
 
   // A store whose thread inserts always fail (the store-down half of
@@ -2262,7 +2280,7 @@ pub fn unpersisted_create_carries_no_provenance_test() {
         model: "alpha",
         system_prompt: Some("p"),
         toolset: None,
-        bot_id: Some("b1"),
+        bot_id: "b1",
         parent_thread_id: None,
         title: "",
       ),
@@ -2309,12 +2327,16 @@ pub fn env_capable_ask_test() {
         title: "",
       ),
     )
+  // The non-env counterpart is an EXPLICIT chat-only toolset (there is
+  // no plain default anymore: a default-toolset thread under a
+  // workspace root carries the env four — `default_names` includes them
+  // exactly when the config has a root — so it would BE env-capable).
   let assert Ok(plain_thread) =
     thread_registry.create(
       registry,
       thread_registry.NewThread(
         ..new_thread(store_mock.fixture_provider_id, "plain-thread"),
-        toolset: None,
+        toolset: Some([]),
         parent_thread_id: None,
         title: "",
       ),
@@ -2333,6 +2355,7 @@ pub fn env_capable_ask_test() {
 pub fn env_capable_dormant_thread_test() {
   let seam = store_mock.seam(store_mock.start())
   store_mock.ensure_fixture_provider(seam)
+  store_mock.ensure_fixture_bot(seam)
   let assert Ok(Nil) =
     seam.insert_thread(
       store.StoredSummary(
@@ -2520,6 +2543,7 @@ pub fn env_toolset_hydrates_from_persisted_root_test() {
   let old_root = "/srv/old-root"
   let seam = store_mock.seam(store_mock.start())
   store_mock.ensure_fixture_provider(seam)
+  store_mock.ensure_fixture_bot(seam)
   // Seed BEFORE the boot: dormant rows hydrate at registry start (and
   // recent timestamps keep the row past the boot sweep's grace window).
   let assert Ok(Nil) =
@@ -2578,6 +2602,7 @@ pub fn env_roster_legacy_row_falls_back_to_workspace_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
   store_mock.ensure_fixture_provider(seam)
+  store_mock.ensure_fixture_bot(seam)
 
   // Seed a dormant env thread whose creation roster row carries the
   // LEGACY Phase 1 wording (no `attached targets: ` prefix).
@@ -2653,6 +2678,7 @@ pub fn env_roster_rehydrates_from_persisted_attach_row_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
   store_mock.ensure_fixture_provider(seam)
+  store_mock.ensure_fixture_bot(seam)
 
   // Seed a dormant env thread: the creation-time roster row (workspace)
   // rides the INSERT (as insert_thread persists it).

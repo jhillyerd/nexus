@@ -248,10 +248,24 @@ async function waitHealthyAt(port, timeoutMs = 60_000) {
 async function cacheThreadViaApi(port, alias, prompts) {
   const base = `http://127.0.0.1:${port}`;
   const headers = { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" };
+  // Threads are bot-only now: a per-alias bot carries the pin.
+  const botRes = await fetch(`${base}/bots`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      name: `cache-${alias}-${Date.now()}`,
+      provider: "bifrost",
+      model: alias,
+    }),
+  });
+  if (botRes.status !== 201) {
+    throw new Error(`bot create failed: ${botRes.status} ${await botRes.text()}`);
+  }
+  const botId = (await botRes.json()).id;
   const createRes = await fetch(`${base}/threads`, {
     method: "POST",
     headers,
-    body: JSON.stringify({ provider: "bifrost", model: alias }),
+    body: JSON.stringify({ bot: botId }),
   });
   if (createRes.status !== 201) {
     throw new Error(`create failed: ${createRes.status} ${await createRes.text()}`);
@@ -308,19 +322,40 @@ async function popInfo(page_, selector) {
 }
 
 async function createThread(alias) {
-  const panelOpen = () => page.locator("#create-panel").evaluate((el) => !el.hidden);
-  if (!(await panelOpen().catch(() => false))) await page.click("#new-thread");
-  await poll(panelOpen, { timeout: 15_000, message: "create panel open" });
-  await page.selectOption("#model-picker", alias);
-  await page.click("#create-thread");
+  // Threads are bot-only: make a bot carrying the alias pin, then
+  // compose-new — the draft send creates the thread and starts the
+  // first turn.
+  const headers = { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" };
+  const botRes = await page.request.post(`${BASE}/bots`, {
+    data: { name: `ui-${alias}-${Date.now()}`, provider: "bifrost", model: alias },
+    headers,
+  });
+  if (botRes.status() !== 201) throw new Error(`bot create failed: ${botRes.status()}`);
+  const botId = (await botRes.json()).id;
+  await page.click("#new-thread");
+  await poll(
+    async () => (await page.locator("#bot-picker option").count()) >= 1,
+    { timeout: 15_000, message: "compose picker lists bots" },
+  );
+  const beforeIds = new Set(
+    (await (await page.request.get(`${BASE}/threads`, { headers })).json()).threads.map((t) => t.id),
+  );
+  await page.selectOption("#bot-picker", botId);
+  await page.fill("#input", `case:hello ${alias}`);
+  await page.press("#input", "Enter");
+  // The send IS the create: the fresh thread lands (the compose flow
+  // selects it — Created replies with the summary), and the user bubble
+  // proves the draft became its first message.
   await poll(
     async () => {
-      const current = await page
-        .locator("#thread-list .thread-main[aria-current='true']")
-        .textContent();
-      return current?.includes(`${alias} ·`);
+      const threads = (await (await page.request.get(`${BASE}/threads`, { headers })).json()).threads;
+      return threads.some((t) => !beforeIds.has(t.id));
     },
-    { timeout: 30_000, message: `thread on ${alias} selected` },
+    { timeout: 60_000, message: `thread on ${alias} created` },
+  );
+  await poll(
+    async () => (await page.locator(".turn.user").count()) >= 1,
+    { timeout: 30_000, message: "draft is the first message" },
   );
 }
 
@@ -393,13 +428,21 @@ async function main() {
     await test("page: live alias list from real Bifrost", async () => {
       await page.goto(`${BASE}/?token=${TOKEN}`);
       await connected();
-      await poll(
-        async () => (await page.locator("#model-picker option").count()) >= 2,
-        { timeout: 60_000, message: "aliases from Bifrost" },
+      // The live alias list rides the provider route now (the create
+      // panel's picker is gone); the UI surface for it is Settings.
+      const headers = { authorization: `Bearer ${TOKEN}` };
+      const providersRes = await page.request.get(`${BASE}/providers`, { headers });
+      assert(providersRes.status() === 200, "providers listed");
+      const providersJson = await providersRes.json();
+      const aliasRes = await page.request.get(
+        `${BASE}/providers/${providersJson.providers[0].id}/models`,
+        { headers },
       );
-      const aliases = await page.$$eval("#model-picker option", (els) => els.map((e) => e.value));
+      assert(aliasRes.status() === 200, "models listed");
+      const aliases = (await aliasRes.json()).models;
       console.log(`  aliases: ${aliases.join(", ")}`);
       assert(aliases.length >= 2, "Bifrost alias list loaded");
+      globalThis.INTEGRATION_ALIASES = aliases;
       // Resolve one vLLM and one llama.cpp backend alias for the tool rounds.
       globalThis.VLLM_ALIAS = pickAlias(aliases, ["smart", "qwen3.8-flash"], "vLLM");
       // The gateway's second backend slot: fractal nodes now serve
@@ -509,7 +552,8 @@ async function main() {
       const THREADS = 3;
       const WARMS = 5;
       const cachePort = PORT + 1;
-      const options = await page.$$eval("#model-picker option", (els) => els.map((e) => e.value));
+      // The live alias list from Bifrost (resolved once above — reused).
+      const options = globalThis.INTEGRATION_ALIASES ?? [];
       const cacheAlias = pickAlias(options, [CACHE_ALIAS, "qwen3.6-35b"], "cache (fractal)");
       cacheCapture.alias = cacheAlias;
       console.log(`  cache alias: ${cacheAlias} (fresh VM per thread)`);

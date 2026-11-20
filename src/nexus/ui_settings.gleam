@@ -2251,8 +2251,8 @@ fn combobox_provider_name(
 }
 
 /// The add-bot form's provider select: switching providers re-scopes
-/// the model combobox's datalist (the create panel's ProviderPicked
-/// rule, carried into the bot forms).
+/// the model combobox's datalist (the picker-re-scope rule the old
+/// create panel carried; the bot forms are its surviving surface).
 fn bot_add_provider_change() -> attr.Attribute(Msg) {
   let decoder =
     decode.at(["target", "value"], decode.string)

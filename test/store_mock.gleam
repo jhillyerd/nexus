@@ -13,6 +13,7 @@ import gleam/list
 import gleam/option.{None, Some}
 import gleam/otp/actor
 import gleam/string
+import nexus/bot
 import nexus/node
 import nexus/store.{
   type Store, type StoredBot, type StoredProvider, type StoredSummary,
@@ -208,6 +209,45 @@ pub fn ensure_fixture_provider(seam: Store) -> Nil {
     Ok(_) -> Nil
     Error(_) -> {
       let assert Ok(Nil) = seam.insert_provider(fixture_provider())
+      Nil
+    }
+  }
+}
+
+/// The bot id the registry-level create requests name: `bot_id` is
+/// REQUIRED now (every thread is bot-sourced), and the mock's insert
+/// enforces the bot FK exactly like production Postgres — so tests that
+/// mint threads through the registry seed this row first via
+/// `ensure_fixture_bot`. Tests that assert EXACT bot lists never call
+/// it, and stay in full control of their rows.
+pub const fixture_bot_id = "b-fixture"
+
+/// The fixture bot row: a live-template bot over the fixture provider
+/// (default toolset sentinel, open inbound gate).
+pub fn fixture_bot() -> StoredBot {
+  bot.Bot(
+    id: fixture_bot_id,
+    name: "Fixture",
+    description: "",
+    provider_id: fixture_provider_id,
+    model: "alias-1",
+    system_prompt: None,
+    tools: None,
+    allow_inbound: True,
+    created_at: 0,
+    updated_at: 0,
+  )
+}
+
+/// Idempotently create the fixture bot through the seam (and its
+/// provider underneath it) — call beside `ensure_fixture_provider` in
+/// harnesses whose registry creates carry `fixture_bot_id`.
+pub fn ensure_fixture_bot(seam: Store) -> Nil {
+  ensure_fixture_provider(seam)
+  case seam.get_bot(fixture_bot_id) {
+    Ok(_) -> Nil
+    Error(_) -> {
+      let assert Ok(Nil) = seam.insert_bot(fixture_bot())
       Nil
     }
   }

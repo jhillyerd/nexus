@@ -1137,12 +1137,12 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
 #app .confirm-delete button { font-size: .72rem; padding: .2rem .55rem; }
 .thread-item { display: block; width: 100%; text-align: left; overflow-wrap: anywhere; }
 .thread-item[aria-current='true'] { border-color: #3b82f6; background: color-mix(in srgb, #3b82f6 16%, transparent); }
-/* ui-polish F4: the panel moved ABOVE the thread list in `sidebar()`, so
-   its separator is a bottom rule now (it used to sit below the whole list,
-   which is why 'New' opened it off-screen). */
-#create-panel { margin-bottom: 1rem; padding-bottom: .8rem; border-bottom: 1px solid
-  color-mix(in srgb, currentColor 15%, transparent); display: flex; flex-direction: column; gap: .45rem; }
-#create-panel[hidden] { display: none; }
+/* COMPOSE-NEW: the bot picker bar sits directly above the entry field
+   (the create panel is gone — the bot is picked beside the composer).
+   Pico styles the label and select; the bar only needs its layout. */
+#composer-bot { display: flex; align-items: center; gap: .6rem; padding: .55rem .75rem 0; }
+#composer-bot label { font-size: .78rem; opacity: .7; margin: 0; }
+#composer-bot select { max-width: 18rem; margin: 0; height: auto; padding: .3rem .6rem; }
 /* ui-polish F7, extended with the tab rail: the page is a narrow left
    rail (one button per settings category) beside a body column, and the
    active section keeps the centered 46rem column shape inside that body
@@ -1559,7 +1559,7 @@ textarea { flex: 1; resize: none; }
   /* Pico's button defaults are for full-width form CTAs; the shell's
      chrome buttons are inline-sized, self-spaced, and flat. */
   width: auto; margin: 0; }
-button#send, button#create-thread { background: var(--pico-primary-background);
+button#send { background: var(--pico-primary-background);
   border-color: var(--pico-primary-border); color: #fff; }
 #app button:disabled { opacity: .45; cursor: default; }
 @media (max-width: 900px) {

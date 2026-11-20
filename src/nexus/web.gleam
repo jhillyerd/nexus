@@ -271,10 +271,14 @@ fn create_thread_response(
   providers: process.Subject(provider_registry.Msg),
   bots: process.Subject(bot_registry.Msg),
 ) -> Response(mist.ResponseData) {
-  // Multi-provider §11 + bots plan P1: the body pins the thread's
-  // identity ONE of two ways — `{"provider":…, "model":…}` (both
-  // required) or `{"bot": id}` (provider/model/system prompt copied
-  // from the bot at creation). Specifying both shapes is a conflict.
+  // Bots plan P1, amended: the body pins the thread's identity the ONE
+  // remaining way — `{"bot": id}` (provider/model/system prompt copied
+  // from the bot at creation). The old provider+model shape is GONE: a
+  // thread is always born from a bot, so a provider/model (or tools)
+  // body answers the honest 400 instead of silently creating a botless
+  // thread. `bot` alongside `provider`, `model`, or a NON-NULL `tools`
+  // stays a conflict (an explicit `"tools": null` flattens to the
+  // default sentinel — no conflict, just a plain bot create).
   case read_create(req) {
     Error(_) -> json_response(400, err_json("unreadable body"))
     Ok(fields) ->
@@ -304,40 +308,14 @@ fn create_thread_response(
                 err_json(thread_create.describe(problem)),
               )
           }
-        PlainCreate(provider: "", model: _, tools: _) ->
-          json_response(400, err_json("empty provider"))
-        PlainCreate(provider: _, model: "", tools: _) ->
-          json_response(400, err_json("empty model"))
-        PlainCreate(provider: ident, model: trimmed_model, tools: tools) -> {
-          // The shared orchestration (#73): provider resolution outside
-          // the registry's loop, then the create. The model alias is NOT
-          // validated — proxies serve aliases their /v1/models may not
-          // list (see thread_create's module doc). The reply IS the
-          // summary — this layer never hand-builds one. `tools` is the
-          // explicit toolset vocabulary (absent/null = the default
-          // snapshot; a bot-sourced create arrives through the
-          // BotCreate arm above instead, bots plan P2) — the registry
-          // freezes env names' workspace root at this boundary
-          // (environments plan Phase 1).
-          let requested =
-            thread_registry.NewThread(
-              provider_id: ident,
-              model: trimmed_model,
-              system_prompt: None,
-              toolset: tools,
-              bot_id: None,
-              parent_thread_id: None,
-              title: "",
-            )
-          case thread_create.create_thread(providers, registry, requested) {
-            Ok(summary) -> json_response(201, thread_summary_json(summary))
-            Error(problem) ->
-              json_response(
-                create_problem_status(problem),
-                err_json(thread_create.describe(problem)),
-              )
-          }
-        }
+        PlainCreate(_, _, _) ->
+          json_response(
+            400,
+            err_json(
+              "threads require a bot: pass a bot id —"
+              <> " the provider/model create shape is gone",
+            ),
+          )
       }
   }
 }
@@ -353,13 +331,15 @@ fn create_problem_status(problem: thread_create.CreateProblem) -> Int {
     thread_create.ProviderDisabled(_) -> 400
     thread_create.BotsUnavailable -> 502
     thread_create.BotUnknown(_) -> 400
-    // Provider and start failures after resolution are races: the
-    // provider passed the resolve, then could not stream when the
-    // thread pinned it. (EmptyModel above is client data, not a race.)
+    // Blank bot id and empty model are client data, not races.
+    thread_create.CreateFailed(thread_registry.BotRequired) -> 400
     thread_create.CreateFailed(thread_registry.EmptyModel) -> 400
     // A stale bot's toolset named a tool outside the compiled catalog
     // (bots plan P2): a client-data problem, refused like a bad alias.
     thread_create.CreateFailed(thread_registry.UnknownToolset(_)) -> 400
+    // Provider and start failures after resolution are races: the
+    // provider passed the resolve, then could not stream when the
+    // thread pinned it.
     thread_create.CreateFailed(thread_registry.ProviderFailed(_)) -> 502
     thread_create.CreateFailed(thread_registry.StartFailed(_)) -> 503
     // A channel create whose row insert failed: the store side refused,
@@ -372,10 +352,11 @@ fn read_json(req: Request(mist.Connection)) -> Result(String, Nil) {
   read_body_json(req, text_decoder())
 }
 
-/// The POST /threads body, already split into its two shapes (bots plan
-/// P1): `PlainCreate(provider, model)` (both required — a thread always
-/// pins its provider explicitly) or `BotCreate(bot)` (provider/model/
-/// system prompt copied from the bot at creation). A present `bot` KEY
+/// The POST /threads body, already split into its shapes (bots plan
+/// P1, amended): `BotCreate(bot)` is the ONLY accepted shape
+/// (provider/model/system prompt copied from the bot at creation);
+/// `PlainCreate` survives as a parsed shape only so the route can
+/// answer it with the honest bot-required 400. A present `bot` KEY
 /// alongside a present `provider`/`model` KEY — blank or not — or a
 /// present non-null `tools` value is a conflict: the bot's frozen
 /// values (toolset included) must not be quietly overridden, and a
@@ -385,19 +366,20 @@ fn read_json(req: Request(mist.Connection)) -> Result(String, Nil) {
 /// default-set sentinel exactly like absence (the bots-plan `tools`
 /// vocabulary), so `{"bot": …}` stays a plain bot create. The
 /// provider/model halves stay raw-presence-aware (a trimmed-blank
-/// value is still a value the caller sent); trimming happens after, so
-/// the plain path's blank halves stay the empty-field 400s. Presence is
+/// value is still a value the caller sent) — but the halves no longer
+/// select a response: ANY non-bot body answers the single
+/// bot-required 400. Presence is
 /// read on the RAW JSON value: an explicit `null` fails the decode
 /// (400) instead of collapsing into the missing-key default —
 /// `decode.optional` would blur `{"bot": null}` into a plain create and
 /// `{"bot": "b1", "provider": null}` into a bot create (coderabbit
 /// review, PR #87).
 pub type CreateFields {
-  /// `tools` (environments plan Phase 1 follows the bots plan's create
-  /// vocabulary): absent/null is the default set, `[]` chat-only, a
-  /// non-empty array an explicit list the registry validates (env
-  /// names among them — refused while no workspace root can be
-  /// frozen).
+  /// NOT accepted anymore — parsed so the route can refuse it with the
+  /// bot-required 400 naming the one live shape. `tools` rides the
+  /// same vocabulary (absent/null = default, `[]` chat-only, explicit
+  /// list) and was the plain shape's toolset source (environments
+  /// plan Phase 1); today it only feeds the conflict detection.
   PlainCreate(provider: String, model: String, tools: Option(List(String)))
   BotCreate(bot: String)
   /// `bot` alongside `provider` and/or `model` — the shapes cannot both

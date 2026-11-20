@@ -18,21 +18,22 @@
 //      runtime (own selection, non-mirroring panels, reload restores its
 //      own thread) with no horizontal overflow with tool cards
 //  11. connection dot: red while the backend is down, green on reconnect
-//  12. provider management end-to-end (multi-provider P5, now in the
+//  12. provider management end-to-end (multi-provider P5, in the
 //      Settings view): create a provider in Settings, test its
-//      connection (live model aliases), pick it in the create panel
-//      (aliases reload per provider), pin a thread to it, stream a turn,
-//      and hit the delete/disable guard rails
+//      connection (live model aliases), pin a thread to it THROUGH A
+//      BOT (the only create shape), stream a turn, and hit the
+//      delete/disable guard rails
 //  13. utility branch (utility-titles §4.1 / utility-tags §3.1): the
 //      model's two-line reply (line 1 title, line 2 tags) lands through
 //      the auto path as sidebar chips — inert text nodes, <script>
 //      payloads included — while a manual tags save freezes the set so
 //      the racing model apply is refused by the both-provenance guard
 //  14. bots (bots plan P1): create a bot in Settings (provider +
-//      model + prompt template), start a thread FROM it in the create
-//      panel (the provider/model pickers stand down, the row subtitle
-//      leads with the bot name), and delete the bot — the thread keeps
-//      its frozen pin and the provenance name falls away
+//      model + prompt template), start a thread FROM it at the
+//      composer (type the draft, pick the bot, send — the send creates
+//      the thread; the row subtitle leads with the bot name), and
+//      delete the bot — the thread keeps its frozen pin and the
+//      provenance name falls away
 //
 // Usage: node e2e/browser.spec.mjs   (see e2e/README.md)
 
@@ -106,14 +107,14 @@ async function dumpPageState(name) {
       return {
         hosts,
         url: location.href,
-        pickerOptions: sr?.querySelectorAll("#model-picker option").length ?? -1,
+        pickerOptions: sr?.querySelectorAll("#bot-picker option").length ?? -1,
         userTurns: sr?.querySelectorAll(".turn.user").length ?? -1,
         toolCards: sr?.querySelectorAll(".turn.tool").length ?? -1,
       };
     })
     .catch((e) => ({ error: String(e).slice(0, 100) }));
   const locatorCounts = {
-    pickerOptions: await page.locator("#model-picker option").count(),
+    pickerOptions: await page.locator("#bot-picker option").count(),
     userTurns: await page.locator(".turn.user").count(),
     toolCards: await page.locator(".turn.tool").count(),
   };
@@ -307,6 +308,40 @@ function resetDatabase() {
         : reject(new Error(`database reset failed (${code}):\n${out}`)),
     );
   });
+}
+
+/// A bot over the API, uniquely named (bot names are case-insensitively
+/// unique). Keyless "fake" provider, the given model alias. Returns the
+/// bot id.
+// `origin` defaults to the main instance; pass another instance's base
+// (e.g. guardBase) when the bot must exist in THAT instance's in-memory
+// bot registry — registries are boot-loaded per server and never sync.
+async function createBot(model, nameHint = "e2e-bot", origin = base) {
+  const headers = { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" };
+  const res = await page.request.post(`${origin}/bots`, {
+    data: {
+      name: `${nameHint}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`,
+      provider: "fake",
+      model,
+    },
+    headers,
+  });
+  eq(res.status(), 201, "bot created");
+  return (await res.json()).id;
+}
+
+/// A thread born the only way threads are born now — from a bot. Makes
+/// the bot (see createBot), then POSTs the thread. Returns
+/// `{ botId, thread }` for cleanup and identity assertions.
+async function createBotThread(model, nameHint = "e2e-bot") {
+  const headers = { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" };
+  const botId = await createBot(model, nameHint);
+  const res = await page.request.post(`${base}/threads`, {
+    data: { bot: botId },
+    headers,
+  });
+  eq(res.status(), 201, "thread from bot created");
+  return { botId, thread: await res.json() };
 }
 
 /// Seed (or re-point) the suite's keyless provider. The provider table is
@@ -570,112 +605,100 @@ async function main() {
       eq(res.status(), 200, "authenticated status");
       assert((await res.text()).includes("lustre-server-component"), "component host element");
     });
-    await test("auth: thread create pins provider + model (no token → 401)", async () => {
+    await test("auth: thread create requires a bot (no token → 401)", async () => {
       // GET /models is gone (P3 hard cut: no default provider); the
-      // create route is the scripted surface now.
-      // The route is gone entirely: the router's catch-all answers 404
-      // before the auth gate is even consulted.
-      eq((await page.request.get(base + "/models")).status(), 404, "models gone (no token)");
-      eq(
-        (
-          await page.request.get(`${base}/models`, {
-            headers: { authorization: `Bearer ${TOKEN}` },
-          })
-        ).status(),
-        404,
-        "models gone (with token)",
+      // create shape is bot-only now, so a provider/model body answers
+      // the honest bot-required 400 — gated by the token like every
+      // route, and the bot shape still needs the token.
+      const noToken = await page.request.post(`${base}/threads`, {
+        data: { provider: "fake", model: "smart" },
+      });
+      eq(noToken.status(), 401, "no token → 401");
+      const denied = await page.request.post(`${base}/threads`, {
+        data: { provider: "fake", model: "smart" },
+        headers: { authorization: "Bearer wrong" },
+      });
+      eq(denied.status(), 401, "wrong token → 401");
+      const shape = await page.request.post(`${base}/threads`, {
+        data: { provider: "fake", model: "smart" },
+        headers: { authorization: `Bearer ${TOKEN}` },
+      });
+      eq(shape.status(), 400, "provider/model shape is gone");
+      const body = await shape.json();
+      assert(
+        body.error.includes("threads require a bot"),
+        `bot-required error: ${JSON.stringify(body)}`,
       );
-      const no = await page.request.post(`${base}/threads`, {
-        data: { provider: "fake", model: "smart" },
-      });
-      eq(no.status(), 401, "no-token create");
-      const res = await page.request.post(`${base}/threads`, {
+      // The live shape: {"bot": id} — and unknown bots still refuse.
+      const botId = await createBot("smart", "auth-bot");
+      const ok = await page.request.post(`${base}/threads`, {
+        data: { bot: botId },
         headers: { authorization: `Bearer ${TOKEN}` },
-        data: { provider: "fake", model: "smart" },
       });
-      eq(res.status(), 201, "bearer create pins fake/smart");
+      eq(ok.status(), 201, "bot shape creates");
+      const created = await ok.json();
       const unknown = await page.request.post(`${base}/threads`, {
+        data: { bot: "b-nope" },
         headers: { authorization: `Bearer ${TOKEN}` },
-        data: { provider: "nope", model: "smart" },
       });
-      eq(unknown.status(), 400, "unknown provider refused");
-      // Leave no row behind: the next test asserts an empty thread list.
-      const created = await res.json();
+      eq(unknown.status(), 400, "unknown bot refused");
+      // Leave no rows behind: the next test asserts an empty thread list.
       const gone = await page.request.delete(`${base}/threads/${created.id}`, {
         headers: { authorization: `Bearer ${TOKEN}` },
       });
       eq(gone.status(), 204, "created thread cleaned up");
+      const botGone = await page.request.delete(`${base}/bots/${botId}`, {
+        headers: { authorization: `Bearer ${TOKEN}` },
+      });
+      eq(botGone.status(), 204, "created bot cleaned up");
     });
 
-    // -- 2. page load: shell, websocket, aliases, empty thread list -------
-    await test("page: loads, connects websocket, opens the create panel", async () => {
+    // -- 2. page load: shell, websocket, empty thread list ----------------
+    await test("page: loads, connects websocket, composes against nothing", async () => {
       await page.goto(`${base}/?token=${TOKEN}`);
       await connected(page);
-      await poll(
-        async () => (await page.locator("#model-picker option").count()) >= 2,
-        { timeout: 15_000, message: "alias options" },
-      );
-      const options = await page.$$eval("#model-picker option", (els) => els.map((e) => e.value));
-      assert(options.includes("smart") && options.includes("fast"), `alias options: ${options}`);
-      // The provider picker (P5) targets the seeded keyless provider by
-      // default — the first enabled row — and the aliases above belong
-      // to it.
-      const providerOptions = await page.$$eval("#provider-picker option", (els) => els.map((e) => e.textContent));
-      assert(
-        providerOptions.length === 1 && providerOptions[0].includes("fake") && providerOptions[0].includes("keyless"),
-        `provider options: ${providerOptions}`,
-      );
-      // No thread is minted for the visitor: the list stays empty and the
-      // create panel auto-opens, so the model is the user's choice.
-      await poll(
-        async () => page.locator("#create-panel").evaluate((el) => !el.hidden),
-        { timeout: 15_000, message: "create panel auto-opened" },
-      );
+      // The create panel is GONE: threads are bot-only, and the bot is
+      // picked beside the composer in compose-new mode.
+      eq(await page.locator("#create-panel").count(), 0, "no create panel");
       eq(await page.locator("#thread-list .thread-main").count(), 0, "no threads yet");
+      // No bots exist yet: the composer stands down entirely and the
+      // muted hint points at Settings.
       assert(
         (await page.getAttribute("#input", "disabled")) !== null,
-        "composer disabled without a thread",
+        "composer disabled without bots",
       );
-      // ui-polish F5 + the #67 no-selection state: with nothing selected
-      // the composer is disabled, so the intentional muted hint points at
-      // the sidebar, not at a send that would fail. (A selected-but-empty
-      // thread gets the send-pointing variant instead — asserted nowhere
-      // here because this test deliberately mints nothing.)
+      assert(
+        (await page.getAttribute("#send", "disabled")) !== null,
+        "send disabled without bots",
+      );
       await poll(
         async () =>
           (await page.locator("#log .note").textContent()).includes(
-            "No thread selected",
+            "No bots yet",
           ),
-        { timeout: 15_000, message: "empty-state note" },
+        { timeout: 15_000, message: "botless empty-state note" },
       );
     });
 
-    // -- 3. create + switch threads ----------------------------------------
-    await test("threads: create on both aliases and switch back", async () => {
-      // The panel may be open (auto-opened on the empty list) or closed;
-      // make it open.
-      const panelOpen = () =>
-        page.locator("#create-panel").evaluate((el) => !el.hidden);
-      if (!(await panelOpen().catch(() => false))) {
-        await page.click("#new-thread");
-      }
-      await poll(panelOpen, { timeout: 10_000, message: "create panel open" });
-      await page.selectOption("#model-picker", "smart");
-      await page.click("#create-thread");
-      await poll(
-        async () => (await page.locator("#thread-list .thread-main").count()) === 1,
-        { timeout: 15_000, message: "first thread appears" },
-      );
-      // A second thread on the other alias.
-      if (!(await panelOpen().catch(() => false))) {
-        await page.click("#new-thread");
-      }
-      await poll(panelOpen, { timeout: 10_000, message: "create panel reopened" });
-      await page.selectOption("#model-picker", "fast");
-      await page.click("#create-thread");
+    // -- 3. bot-created threads + switch ------------------------------------
+    await test("threads: create from bots and switch back", async () => {
+      // Threads are born ONLY from bots now, and the UI's compose-new
+      // flow creates on first send — so this test drives the API shape
+      // (empty threads, no first message yet) to set up the rows the
+      // later organize/turn tests expect, and the compose-send flow
+      // itself is exercised end-to-end in the bots test below.
+      const headers = { authorization: `Bearer ${TOKEN}` };
+      const smartMade = await createBotThread("smart", "smart-bot");
+      const fastMade = await createBotThread("fast", "fast-bot");
+      const smart = smartMade.thread;
+      const fast = fastMade.thread;
+      // API creates broadcast nothing (empty threads carry no metadata
+      // events), so the sidebar learns them on the next connect.
+      await page.reload();
+      await connected(page);
       await poll(
         async () => (await page.locator("#thread-list .thread-main").count()) === 2,
-        { timeout: 15_000, message: "second thread appears" },
+        { timeout: 15_000, message: "both threads appear" },
       );
       const labels = await page.$$eval("#thread-list .thread-main", (els) => els.map((e) => e.textContent));
       // #107: untitled rows read "Untitled thread" — the alias fallback
@@ -688,13 +711,9 @@ async function main() {
         (els) => els.map((e) => e.textContent),
       );
       eq(currentLabels.length, 1, "exactly one current thread");
-      assert(currentLabels[0].includes("Untitled thread"), `current is the new thread: ${currentLabels}`);
-      // Switch back to the original smart thread (Created prepends, so
-      // match by thread id rather than DOM position).
-      const headers = { authorization: `Bearer ${TOKEN}` };
-      const smart = (await (
-        await page.request.get(`${base}/threads`, { headers })
-      ).json()).threads.find((s) => s.model === "smart");
+      assert(currentLabels[0].includes("Untitled thread"), `current is a new thread: ${currentLabels}`);
+      // Switch back to the smart thread (match by thread id rather than
+      // DOM position — the rows are otherwise identical).
       const smartMain = page.locator(
         `#thread-list .thread-row[data-thread-id="${smart.id}"] .thread-main`,
       );
@@ -714,6 +733,10 @@ async function main() {
         "Untitled thread",
         "header title placeholder",
       );
+      // The bots stay for the later compose-send tests (they are
+      // cleaned up with the whole world by resetDatabase).
+      void fastMade;
+      void headers;
     });
 
     // -- 3b. thread organization --------------------------------------------
@@ -1391,18 +1414,35 @@ async function main() {
     await test("guard: max-iteration turn renders terminal state", async () => {
       await page.goto(`${guardBase}/?token=${TOKEN}`);
       await connected(page);
-      // No thread is minted at boot (the model is the user's choice), so
-      // create one here — the panel auto-opens on the empty list.
+      // No thread is minted at boot, and threads are born from bots now:
+      // compose-new — pick a bot beside the composer and send; the send
+      // itself starts the thread AND the turn (the instances share the
+      // database, so a bot made here is visible; the reload lands its
+      // row in the picker).
+      // The bot registry is in-memory per instance and boot-loaded: the
+      // guard instance must learn the bot through its OWN API, or its
+      // compose picker (served by the guard's registry) never lists it.
+      const guardBotId = await createBot("smart", "guard-bot", guardBase);
+      await page.reload();
+      await connected(page);
+      await page.click("#new-thread");
       await poll(
-        async () => page.locator("#create-panel").evaluate((el) => !el.hidden),
-        { timeout: 15_000, message: "guard create panel open" },
+        async () => (await page.locator("#bot-picker option").count()) >= 1,
+        { timeout: 15_000, message: "guard picker lists the bot" },
       );
-      await page.click("#create-thread");
+      await page.selectOption("#bot-picker", guardBotId);
+      await page.fill("#input", "case:loop never stop calling tools");
+      await page.press("#input", "Enter");
       await poll(
         async () => (await page.locator("#thread-list .thread-main").count()) === 1,
         { timeout: 15_000, message: "guard thread appears" },
       );
-      await sendAndWaitIdle(page, "case:loop never stop calling tools");
+      // The turn IS the send; the Send button re-enabling proves it
+      // ended (failed at the guard — that is the state under test).
+      await poll(() => page.locator("#send").evaluate((el) => !el.disabled), {
+        timeout: 120_000,
+        message: "guard turn ended",
+      });
       // Guard terminal: chip reached guard phase, note rendered, send re-enabled.
       const note = page.locator(".note.err");
       await note.first().waitFor({ timeout: 90_000 });
@@ -1518,17 +1558,18 @@ async function main() {
         "fresh context auto-selects like any fresh model",
       );
 
-      // Panels are per-client: opening the create panel on mobile must
-      // not open it on the desktop context.
+      // Selection state is per-client: entering compose-new (the bot
+      // picker beside the composer) on mobile must not appear on the
+      // desktop context, whose selection stays put.
       await mpage.click("#new-thread");
       await poll(
-        async () => await mpage.locator("#create-panel").evaluate((el) => !el.hidden),
-        { timeout: 15_000, message: "mobile create panel open" },
+        async () => await mpage.locator("#composer-bot").isVisible(),
+        { timeout: 15_000, message: "mobile compose-new picker visible" },
       );
       eq(
-        await dpage.locator("#create-panel").evaluate((el) => el.hidden),
-        true,
-        "desktop create panel stays closed",
+        await dpage.locator("#composer-bot").count(),
+        0,
+        "desktop stays in its thread (no picker)",
       );
 
       const overflow = await mpage.evaluate(() => ({
@@ -1567,29 +1608,17 @@ async function main() {
         `transcript is crushed or the composer is off-screen: ${JSON.stringify(mobileBox)}`,
       );
 
-      // ui-polish F4: the create panel opens ABOVE the thread list, so it
-      // lands on screen — previously it opened below the fold, which is what
-      // made the create flow unusable on a phone. The panel is already open
-      // here (the per-client check above), so measure it as-is and only
-      // toggle it open if that changed.
-      const panelVisible = await mpage
-        .locator("#create-panel")
-        .evaluate((el) => !el.hidden)
-        .catch(() => false);
-      if (!panelVisible) {
-        await mpage.click("#new-thread");
-        await poll(
-          async () => await mpage.locator("#create-panel").evaluate((el) => !el.hidden),
-          { timeout: 15_000, message: "create panel open before measuring" },
-        );
-      }
-      const panelBox = await mpage.locator("#create-panel").evaluate((el) => {
+      // ui-polish F4's successor: the compose picker rides the composer
+      // at the BOTTOM of the viewport, so it lands on screen on a phone
+      // by construction — measure it as-is (compose-new is still armed
+      // from the per-client check above).
+      const pickBox = await mpage.locator("#composer-bot").evaluate((el) => {
         const r = el.getBoundingClientRect();
-        return { top: r.top, bottom: r.bottom, height: window.innerHeight };
+        return { top: r.top, bottom: r.bottom, inner: window.innerHeight };
       });
       assert(
-        panelBox.top >= 0 && panelBox.bottom <= panelBox.height,
-        `create panel opens off-screen: ${JSON.stringify(panelBox)}`,
+        pickBox.top >= 0 && pickBox.bottom <= pickBox.inner,
+        `compose picker off-screen: ${JSON.stringify(pickBox)}`,
       );
 
       // Desktop height clamp: a transcript must scroll inside #log, never
@@ -1672,12 +1701,25 @@ async function main() {
         `column became a containing block for the jump button: ${JSON.stringify(column)}`,
       );
 
-      // Diverge the contexts for real: create a second thread in the
-      // mobile context (its model learns it; the desktop context's model
-      // never does), so mobile holds the new thread while desktop keeps
-      // the original — two live connections, two different selections.
-      await mpage.selectOption("#model-picker", "fast");
-      await mpage.click("#create-thread");
+      // Diverge the contexts for real: start a second thread from the
+      // mobile context's composer — pick a bot, send the draft; the send
+      // creates the thread and selects it. The desktop context's model
+      // never learns of it (the draft's auto-title does broadcast a
+      // sidebar refresh — but the desktop REFRESH only relists what it
+      // asks for; the divergence is the selection, asserted below), so
+      // mobile holds the new thread while desktop keeps the original —
+      // two live connections, two different selections.
+      const divergeBotId = await createBot("smart", "diverge-bot");
+      await mpage.reload();
+      await connected(mpage);
+      await mpage.click("#new-thread");
+      await poll(
+        async () => (await mpage.locator("#bot-picker option").count()) >= 1,
+        { timeout: 15_000, message: "mobile compose picker lists bots" },
+      );
+      await mpage.selectOption("#bot-picker", divergeBotId);
+      await mpage.fill("#input", "case:mobile diverge draft");
+      await mpage.press("#input", "Enter");
       await poll(
         async () => (await mpage.locator("#thread-list .thread-main").count()) === 2,
         { timeout: 15_000, message: "second thread appears on mobile" },
@@ -1689,10 +1731,13 @@ async function main() {
         first,
         "desktop keeps its own selection while mobile diverges",
       );
-      eq(
-        await dpage.locator("#thread-list .thread-main").count(),
-        1,
-        "desktop model never sees the other context's thread",
+      // Sidebar metadata is GLOBAL (MetaUpdated passes the delivery
+      // filter): the draft's send-time auto-title refreshes every
+      // connected tab's list, so the desktop list learns the new row —
+      // but its SELECTION stays its own (that is the per-client half).
+      await poll(
+        async () => (await dpage.locator("#thread-list .thread-main").count()) === 2,
+        { timeout: 15_000, message: "desktop list refreshes globally" },
       );
 
       // Reload: the context's own last-selected thread (the second one —
@@ -1706,9 +1751,9 @@ async function main() {
         { timeout: 15_000, message: "reload restores the diverged selection" },
       );
       eq(
-        await mpage.locator("#create-panel").evaluate((el) => el.hidden),
-        true,
-        "panel state does not survive a reload",
+        await mpage.locator("#composer-bot").count(),
+        0,
+        "compose-new state does not survive a reload (the selection does)",
       );
       eq(
         await selectedId(dpage),
@@ -1827,15 +1872,15 @@ async function main() {
       await ctx.close();
     });
 
-    // -- 13. provider management + provider→model picker (P5) ---------------
-    // The P5 acceptance, end to end through the real UI — now inside the
+    // -- 13. provider management (P5) ----------------------------------------
+    // The P5 acceptance, end to end through the real UI — inside the
     // Settings view (the header button swaps the main area; provider
-    // management moved off the sidebar): create a provider in Settings,
-    // test the seeded provider's connection (live model aliases), pick
-    // it in the create panel (model aliases reload per provider), create
-    // a thread pinned to it, and stream a turn. Then the guard rails:
-    // the delete is refused while the new thread pins the provider, and
-    // disable/enable flip the picker.
+    // management lives there): create a provider in Settings, test the
+    // seeded provider's connection (live model aliases), then pin a
+    // thread to it THROUGH A BOT (threads are bot-only now) and stream
+    // a turn. Then the guard rails: the delete is refused while the
+    // thread's bot pins the provider, and disable/enable gate bot
+    // creates.
     await test("providers: create in UI, pick, pin a thread, stream a turn", async () => {
       // Back on the MAIN instance: test 10 navigated `page` to the guard
       // instance, and the indicator test used its own context.
@@ -1918,35 +1963,33 @@ async function main() {
       eq(made.has_key, false, "created provider keyless in API");
       eq(made.base_url, fakeUrl, "created provider url in API");
 
-      // Back to chat for the create-panel flow: pick it in the create
-      // panel, the model aliases reload scoped to the selection, and the
-      // thread pins (provider, model).
+      // Back to chat to start a thread on the new provider — the only
+      // way threads begin now: a BOT carrying the pin (provider
+      // ui-made, alias smart), composed in the UI. The provider pin is
+      // asserted through the API and the streamed turn below.
       await backToChat(page);
+      const headers13 = { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" };
+      const madeBotRes = await page.request.post(`${base}/bots`, {
+        data: { name: `ui-made-bot-${Date.now()}`, provider: madeId, model: "smart" },
+        headers: headers13,
+      });
+      eq(madeBotRes.status(), 201, "bot on the new provider created");
+      const madeBotId = (await madeBotRes.json()).id;
       const threadsBefore = await page.locator("#thread-list .thread-main").count();
-      const panelOpen = () =>
-        page.locator("#create-panel").evaluate((el) => !el.hidden);
-      if (!(await panelOpen().catch(() => false))) {
-        await page.click("#new-thread");
-      }
-      await poll(panelOpen, { timeout: 10_000, message: "create panel open" });
+      await page.click("#new-thread");
       await poll(
-        async () => (await page.locator("#provider-picker option").count()) === 2,
-        { timeout: 15_000, message: "both providers in picker" },
+        async () => await page.locator("#bot-picker").isVisible(),
+        { timeout: 10_000, message: "compose-new picker visible" },
       );
-      await page.selectOption("#provider-picker", madeId);
-      await poll(
-        async () => (await page.locator("#model-picker option").count()) >= 2,
-        { timeout: 15_000, message: "aliases reloaded for the picked provider" },
-      );
-      await page.selectOption("#model-picker", "smart");
-      await page.click("#create-thread");
+      await page.selectOption("#bot-picker", madeBotId);
+      await page.fill("#input", "case:text provider ui round");
+      await page.press("#input", "Enter");
       await poll(
         async () => (await page.locator("#thread-list .thread-main").count()) === threadsBefore + 1,
         { timeout: 15_000, message: "pinned thread appears" },
       );
-      // #107: the row subtitle no longer names the pinned provider —
-      // the chrome shows bot-or-nothing + age. The pin itself is
-      // asserted through the API and the streamed turn below.
+      // #107: the row subtitle leads with the bot name (provenance),
+      // never the provider/model — the chrome shows bot-or-nothing + age.
       eq(
         await page
           .locator("#thread-list .thread-main", { hasText: "ui-made/" })
@@ -1955,8 +1998,12 @@ async function main() {
         "row subtitle omits provider/model",
       );
 
-      // Stream a turn end-to-end through the new provider.
-      await sendAndWaitIdle(page, "case:text provider ui round");
+      // The send IS the create: the first message streams end-to-end
+      // through the new provider.
+      await poll(() => page.locator("#send").evaluate((el) => !el.disabled), {
+        timeout: 60_000,
+        message: "compose-send turn ended",
+      });
       const assistant = await page.$$eval(".turn.assistant", (els) => els.map((e) => e.textContent));
       assert(assistant.some((t) => t.includes("Plain answer")), `assistant turn via ui-made: ${assistant}`);
 
@@ -1986,32 +2033,36 @@ async function main() {
         { timeout: 15_000, message: "409 guard note after pinned delete" },
       );
 
-      // Disable: the row badges as disabled (in Settings) and the picker
-      // drops it (back in chat).
+      // Disable: the row badges as disabled (in Settings), and a bot
+      // create naming it refuses — bots are the only create shape, so
+      // the disabled provider cannot enter any new thread's pin.
       await openSettings(page);
       await madeRow.getByRole("button", { name: "Disable", exact: true }).click();
       await poll(
         async () => (await madeRow.locator(".badge.off").textContent()) === "disabled",
         { timeout: 15_000, message: "disabled badge" },
       );
-      await backToChat(page);
-      await poll(
-        async () => (await page.locator("#provider-picker option").count()) === 1,
-        { timeout: 15_000, message: "picker drops disabled provider" },
-      );
+      const disabledBot = await page.request.post(`${base}/bots`, {
+        data: { name: `disabled-pin-${Date.now()}`, provider: madeId, model: "smart" },
+        headers: headers13,
+      });
+      eq(disabledBot.status(), 400, "disabled provider refuses bot create");
       // Disabling blocks new resolutions, not the already-frozen thread
-      // endpoint — the pinned thread keeps streaming either way.
-      await openSettings(page);
+      // endpoint — the pinned thread keeps streaming either way (the
+      // compose-send turn above already ran while enabled; the frozen
+      // endpoint is what the next send would ride).
       await madeRow.getByRole("button", { name: "Enable", exact: true }).click();
       await poll(
         async () => (await madeRow.locator(".badge").count()) === 1,
         { timeout: 15_000, message: "re-enabled provider badge restored" },
       );
-      await backToChat(page);
-      await poll(
-        async () => (await page.locator("#provider-picker option").count()) === 2,
-        { timeout: 15_000, message: "re-enabled provider back in picker" },
-      );
+      const reBot = await page.request.post(`${base}/bots`, {
+        data: { name: `re-enabled-pin-${Date.now()}`, provider: madeId, model: "smart" },
+        headers: headers13,
+      });
+      eq(reBot.status(), 201, "re-enabled provider takes bot creates again");
+      const reEnabledBotId = (await reBot.json()).id;
+      void reEnabledBotId;
     });
 
     // -- 17b. bots: create in Settings, start-from-bot, delete keeps the
@@ -2053,36 +2104,39 @@ async function main() {
       eq(made.name, "Writer", "created bot in API");
       eq(made.system_prompt, "be terse", "bot prompt in API");
 
-      // Back to chat: the create panel gains the start-from-bot picker.
+      // Back to chat: the COMPOSER carries the bot picker (compose-new
+      // mode — no thread selected). Type the draft FIRST, then pick the
+      // bot — changing your mind about the bot never touches the text.
       await backToChat(page);
-      const panelOpen = () =>
-        page.locator("#create-panel").evaluate((el) => !el.hidden);
-      if (!(await panelOpen().catch(() => false))) {
-        await page.click("#new-thread");
-      }
-      await poll(panelOpen, { timeout: 10_000, message: "create panel open" });
+      await page.click("#new-thread");
       await poll(
-        async () => (await page.locator("#bot-picker option").count()) === 2,
-        { timeout: 15_000, message: "bot picker lists the bot + the none option" },
+        async () => await page.locator("#bot-picker").isVisible(),
+        { timeout: 10_000, message: "compose-new picker visible" },
       );
+      await page.fill("#input", "case:hello writer");
       await page.selectOption("#bot-picker", botId);
-      // The plain pickers stand down while a bot is selected.
-      await poll(
-        async () =>
-          await page.locator(".plain-create").evaluate((el) => el.hidden),
-        { timeout: 10_000, message: "provider/model pickers stood down" },
+      eq(
+        await page.inputValue("#input"),
+        "case:hello writer",
+        "the draft survives the bot change",
       );
       const threadsBefore = await page.locator("#thread-list .thread-main").count();
       const beforeIds = new Set(
         (await (await page.request.get(`${base}/threads`, { headers })).json()).threads.map((s) => s.id),
       );
-      await page.click("#create-thread");
+      // The send IS the create: the draft starts the thread and becomes
+      // its first message (the turn streams via the fake gateway).
+      await page.press("#input", "Enter");
       await poll(
         async () =>
           (await page.locator("#thread-list .thread-main").count())
             === threadsBefore + 1,
         { timeout: 15_000, message: "bot-sourced thread appears" },
       );
+      await poll(() => page.locator("#send").evaluate((el) => !el.disabled), {
+        timeout: 60_000,
+        message: "compose-send turn ended",
+      });
       // The API agrees: identify the created thread precisely (a diff
       // against the pre-create snapshot), so every later assertion — row
       // subtitle, provenance drop, frozen pin — is about THIS thread,
@@ -2105,6 +2159,11 @@ async function main() {
       assert(
         (await botThreadRow.innerText()).includes("Writer · "),
         "row subtitle leads with the bot name",
+      );
+      // The draft auto-titled the thread at the send boundary.
+      assert(
+        (await botThreadRow.innerText()).includes("case:hello writer"),
+        "row title is the first message",
       );
 
       // Delete the bot (two-step, unguarded): the thread keeps its
@@ -2137,17 +2196,24 @@ async function main() {
             !!kept
             && kept.provider_id === madeThread.provider_id
             && kept.model === madeThread.model
-            && rowText.includes("Untitled thread")
-            && !rowText.includes("Writer")
+            && rowText.includes("case:hello writer")
+            && !rowText.includes("Writer · ")
           );
         },
         { timeout: 15_000, message: "thread keeps pin, provenance name gone",
         },
       );
-      // A bot-less panel is today's panel again: no picker markup.
+      // The compose picker drops the deleted bot too (the picker re-aim
+      // rule, bot edition): its option is gone on the next load.
+      await page.click("#new-thread");
       await poll(
-        async () => (await page.locator("#bot-picker").count()) === 0,
-        { timeout: 15_000, message: "bot picker gone with the last bot" },
+        async () => {
+          const options = await page.$$eval("#bot-picker option", (els) =>
+            els.map((e) => e.value),
+          );
+          return !options.includes(botId);
+        },
+        { timeout: 15_000, message: "picker drops the deleted bot" },
       );
       // Leave the client freshly connected on the server's current
       // truth (the utility test below reads the sidebar this page

@@ -77,7 +77,7 @@ pub type Flags {
     registry: Subject(thread_registry.Msg),
     providers: Subject(provider_registry.Msg),
     /// The bot registry: the Settings Bots section's CRUD and the
-    /// create panel's start-from-bot both go through it.
+    /// composer's compose-new picker both go through it.
     bots: Subject(bot_registry.Msg),
     models_timeout_ms: Int,
     thread: Option(String),
@@ -242,29 +242,38 @@ pub type Model {
     // per-client break; a reload is a new subject, and the thread actor
     // de-duplicates re-Joins by subject).
     events: Option(Subject(ThreadEvent)),
-    /// The provider whose models fill the create panel's picker (P5): the
-    /// user's selection, defaulting to the first enabled provider. Aliases
-    /// reload whenever this changes.
-    provider: Option(String),
-    /// All providers as masked metadata (the Settings page, the picker's
-    /// options, and provider-name resolution for thread subtitles).
-    /// `has_key` only — key material never reaches this model.
+    /// All providers as masked metadata (the Settings page and
+    /// provider-name resolution for thread subtitles). `has_key` only —
+    /// key material never reaches this model.
     provider_list: List(Provider),
-    /// All bots (the Settings page's Bots section, the create panel's
-    /// start-from-bot picker, and bot-name resolution for thread
+    /// All bots (the Settings page's Bots section, the composer's
+    /// compose-new picker, and bot-name resolution for thread
     /// subtitles). Reloaded whenever a bot mutation lands.
     bot_list: List(Bot),
-    /// The bot selected in the create panel (start-from-bot): when set,
-    /// the provider/model pickers stand down — the bot sources both,
-    /// pinned as-is (no create-time alias validation).
+    /// The bot selected in the COMPOSER's picker (compose-new mode — no
+    /// thread selected): the bot the next send will start the thread
+    /// from, sourcing provider/model/prompt/toolset exactly like the
+    /// old create panel's start-from-bot. Defaults to the first bot so
+    /// a fresh compose state is one send away from live; changing it is
+    /// a pure model write that never touches the (uncontrolled) draft.
     create_bot: Option(String),
+    /// The draft held aside while its bot-sourced create is in flight
+    /// (compose-new send): `SendRequested` with no selection stashes the
+    /// trimmed text here and starts the create worker; `Created` sends
+    /// it into the fresh thread (the textarea is never re-keyed in
+    /// between, so the visible draft and this stash stay the same text);
+    /// `CreateFailed` clears it (the visible draft survives — the user
+    /// fixes the problem and sends again). Cleared nowhere else: the
+    /// `Created` reply selects the fresh thread itself, so a selection
+    /// change mid-create cannot strand the send.
+    pending_send: Option(String),
     /// The per-connection pending-creation guard (#88): True from the
-    /// moment a create request (plain OR bot-sourced) is handed to its
-    /// worker until that worker's reply lands. Both paths share ONE
-    /// slot — a duplicate request while one is pending is rejected, so
-    /// a slow (or hung) create worker cannot accumulate a queue of
-    /// creates behind it. Cleared by `Created`/`CreateFailed`, success
-    /// and failure alike, so a refused create never locks the panel.
+    /// moment a create request (the compose-new send's bot-sourced
+    /// create) is handed to its worker until that worker's reply lands.
+    /// A duplicate request while one is pending is rejected, so a slow
+    /// (or hung) create worker cannot accumulate a queue of creates
+    /// behind it. Cleared by `Created`/`CreateFailed`, success and
+    /// failure alike, so a refused create never locks the composer.
     create_pending: Bool,
     /// Which main view the shell renders (chat vs settings).
     view: UiView,
@@ -273,13 +282,19 @@ pub type Model {
     settings: ui_settings.State,
     /// True once the user has toggled the settings view BY HAND: the
     /// first-run auto-open rule (empty provider list → settings) then
-    /// stops firing — mirroring `create_auto`.
+    /// stops firing.
     settings_manual: Bool,
     /// True once any `ProvidersLoaded` has arrived on this connection:
     /// the auto-open rule fires only on the FIRST load, so a provider
     /// list that later becomes empty (e.g. external deletes + reconnect
     /// refresh) never hijacks a thread in progress back into settings.
     providers_seen: Bool,
+    /// Whether the PREVIOUS load saw an ENABLED provider: the "no
+    /// provider configured" note fires on the first empty load and on
+    /// the enabled-to-none TRANSITION — never per refresh. Tracking the
+    /// previous load (not "ever seen") is what keeps repeated empty
+    /// refreshes silent: the transition fires once, then the flag drops.
+    providers_enabled_last: Bool,
     /// Set by the deliberate no-selection entry points (archiving the
     /// open thread, the New-thread button): the loaded list must not
     /// auto-select a replacement — an empty selection is a real state,
@@ -287,7 +302,6 @@ pub type Model {
     /// lands (auto-select or `Select`), so the boot auto-selection and
     /// the vanished-selection reselect keep working unchanged.
     suppress_autoselect: Bool,
-    aliases: List(String),
     threads: List(thread.ThreadSummary),
     selected: Option(String),
     /// Monotonic per-connection visit generation, bumped on every thread
@@ -311,8 +325,6 @@ pub type Model {
     /// ends: a stale entry must never stamp another thread's (possibly
     /// unstamped) line that happens to carry the same text.
     flushed: List(String),
-    picker: String,
-    create_open: Bool,
     log: List(Line),
     bubble: Option(String),
     /// Whether the live bubble must not render: either there is no bubble
@@ -343,12 +355,9 @@ pub type Model {
     // Monotonic generation counter for the keyed composer textarea: bumping
     // it after an accepted send replaces the (uncontrolled) textarea, which
     // is the only way a server component can clear it — see `composer` below.
+    // NOTHING else bumps it: the compose-new bot picker must be able to
+    // change while a draft is typed, and a re-key would wipe the draft.
     composer: Int,
-    // True while the create panel is open *because the thread list was
-    // empty* (e.g. the component booted before the registry's first
-    // thread existed) — auto-opened, so it also auto-closes again once
-    // there is something to select.
-    create_auto: Bool,
     // Header fallback label (ui-polish F8): what the `#model` span shows
     // while NO thread is selected — "connecting…" at boot and on select,
     // "thread ended" after the selection drops. With a selection the
@@ -468,39 +477,43 @@ pub type Msg {
   /// `MetaUpdated` deliberately passes the filter: sidebar metadata is
   /// global.
   ThreadScoped(thread_id: String, visit: Int, event: Msg)
-  // ---- Providers (P5: management + provider-scoped picker) ----
-  /// Masked metadata for every provider (Settings page + picker).
+  // ---- Providers (P5: management; CRUD lives in ui_settings) ----
+  /// Masked metadata for every provider (the Settings page and thread
+  /// subtitles).
   ProvidersLoaded(List(Provider))
   ProvidersFailed(String)
   // ---- Bots (bots plan P1) ----
-  /// Every bot (Settings Bots section, start-from-bot picker, thread
-  /// subtitle provenance names).
+  /// Every bot (Settings Bots section, the composer's compose-new
+  /// picker, thread subtitle provenance names).
   BotsLoaded(List(Bot))
   BotsFailed(String)
-  /// The create panel's bot select changed: "" deselects (back to the
-  /// provider/model pickers), any other value starts-from-bot.
+  /// The composer's bot select changed (compose-new mode): the bot the
+  /// next send starts the thread from. A pure model write — the draft
+  /// in the uncontrolled textarea is untouched.
   CreateBotChanged(String)
-  /// The create panel's provider select changed: aliases reload scoped
-  /// to the new provider (multi-provider §12).
-  ProviderPicked(id: String)
   /// The header button toggled between the chat and Settings views.
   SettingsToggled
   /// A message for the Settings sub-component (`nexus/ui_settings`),
   /// lifted into this app: `update` delegates to `ui_settings.update`
   /// and folds the returned signals back into this model.
   Settings(ui_settings.Msg)
-  AliasesLoaded(provider: String, aliases: List(String))
-  AliasesFailed
   ThreadsLoaded(List(thread.ThreadSummary))
   ThreadsFailed(String)
   Select(String)
+  /// The sidebar's New button: enters compose-new mode (deselect — the
+  /// chat pane blanks and the composer grows its bot picker). There is
+  /// no separate panel anymore; the bot is picked beside the entry
+  /// field and the first send creates the thread.
   NewThreadToggled
-  PickerChanged(String)
-  CreateRequested
+  /// The create worker's success reply (#88): the fresh thread lands in
+  /// the list, is selected, and — compose-new — any stashed draft is
+  /// sent into it as the first message.
   Created(thread.ThreadSummary)
   CreateFailed(String)
   // The composer is uncontrolled: its text rides the event itself (the
   // keydown's `target.value` for Enter, `detail.formData` for submits).
+  // With NO thread selected the send starts one: the picked bot sources
+  // the create, the text becomes its first message.
   SendRequested(String)
   SendAccepted
   SendRejected(String)
@@ -690,17 +703,17 @@ pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
       models_timeout_ms: flags.models_timeout_ms,
       pair_base: flags.pair_base,
       events: None,
-      provider: None,
       provider_list: [],
       bot_list: [],
       create_bot: None,
+      pending_send: None,
       create_pending: False,
       view: ChatView,
       settings: ui_settings.init(),
       settings_manual: False,
       providers_seen: False,
+      providers_enabled_last: False,
       suppress_autoselect: False,
-      aliases: [],
       threads: [],
       // A reload re-opens the client's last-selected thread: the page
       // shell persists it and supplies it on the /ws route. If it has since
@@ -712,8 +725,6 @@ pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
       // (see the ToolCallDelta arm): its authoritative stamp arrives on
       // the round's ToolCallAssembled and restamps the line.
       flushed: [],
-      picker: "",
-      create_open: False,
       log: [],
       bubble: None,
       bubble_hidden: True,
@@ -724,7 +735,6 @@ pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
       guard: False,
       turn_base: 0,
       composer: 0,
-      create_auto: False,
       model_label: "connecting…",
       tag_filter: "",
       filter_gen: 0,
@@ -829,54 +839,31 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       #(model, eff)
     }
 
-    // ---- Providers: list + picker (P5; CRUD lives in ui_settings) ----
+    // ---- Providers: metadata only (P5; CRUD lives in ui_settings) ----
     ProvidersLoaded(providers) -> {
-      // Keep the picker aimed at a provider that still exists and is
-      // still enabled; fall back to the first enabled row otherwise.
-      let previous = model.provider
-      let selected = pick_provider(providers, previous)
-      let changed = selected != previous
-      let model =
-        Model(
-          ..model,
-          provider_list: providers,
-          provider: selected,
-          // The old provider's models must not survive a selection
-          // change (the ProviderPicked rule): Create stays disabled
-          // until the replacement provider's list lands, so a stale
-          // alias can never be pinned to a provider it did not come
-          // from — and no options render when none remains.
-          aliases: case changed {
-            True -> []
-            False -> model.aliases
-          },
-          picker: case changed {
-            True -> ""
-            False -> model.picker
-          },
-        )
-      let eff = case selected, changed {
-        Some(id), True -> aliases_for(model, id)
-        _, _ -> effect.none()
-      }
+      let model = Model(..model, provider_list: providers)
+      let enabled = list.any(providers, fn(p) { p.enabled })
       // A load that concludes there is no enabled provider notes the
-      // chat log — only here, where "none exist" is actually known
-      // (the picker placeholder carries the same message in the create
-      // panel, and the first-load auto-open rule puts the user on the
-      // Settings page). The note fires on the connection's first load
-      // and on the TRANSITION from an enabled provider to none — never
-      // per refresh, so ordinary Settings reloads while nothing is
-      // enabled cannot stack duplicates in the log (the auto-open
-      // rule's `providers_seen` idiom). The clearing the old
-      // `NoProviders` message did is already covered above: `selected`
-      // is None and a changed selection wiped `aliases`/`picker`.
-      let model = case selected, model.providers_seen, previous {
-        None, False, _ ->
+      // chat log — only here, where "none exist" is actually known (a
+      // bot needs a provider to exist, so this is first-run guidance
+      // too). The note fires on the connection's first load and on the
+      // TRANSITION from an enabled provider to none — never per refresh,
+      // so ordinary Settings reloads while nothing is enabled cannot
+      // stack duplicates in the log (`providers_enabled_seen` is the
+      // transition detector).
+      let model = case
+        enabled,
+        model.providers_enabled_last,
+        model.providers_seen
+      {
+        // The enabled-to-none transition is new information.
+        False, True, _ ->
           Model(..model, log: [
             NoteLine(True, "no provider configured — add one in Settings"),
             ..model.log
           ])
-        None, True, Some(_) ->
+        // The FIRST load concluding none is too; later empties are not.
+        False, False, False ->
           Model(..model, log: [
             NoteLine(True, "no provider configured — add one in Settings"),
             ..model.log
@@ -884,16 +871,16 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         _, _, _ -> model
       }
       // First run: the connection's FIRST provider load arriving empty
-      // auto-opens the Settings view (the guided path the always-visible
-      // sidebar panel used to provide) — unless the user toggled the
-      // view by hand. Later loads never re-open it (a list that becomes
-      // empty mid-thread must not hijack the chat view).
+      // auto-opens the Settings view (the guided path) — unless the user
+      // toggled the view by hand. Later loads never re-open it (a list
+      // that becomes empty mid-thread must not hijack the chat view).
       let model = case providers, model.providers_seen, model.settings_manual {
         [], False, False -> Model(..model, view: SettingsView)
         _, _, _ -> model
       }
-      let model = Model(..model, providers_seen: True)
-      #(model, eff)
+      let model =
+        Model(..model, providers_seen: True, providers_enabled_last: enabled)
+      #(model, effect.none())
     }
 
     ProvidersFailed(reason) -> #(
@@ -906,17 +893,18 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
 
     // ---- Bots (bots plan P1) ----
     BotsLoaded(bots) -> {
-      // A deleted bot must not stay selected in the create panel (its
-      // provider/model pickers stood down for it) — fall back to the
-      // plain flow, exactly like the picker re-aim on a vanished
-      // provider.
+      // The composer's picker re-aims (the pick_provider rule, bot
+      // edition): a bot deleted elsewhere must not stay selected, and a
+      // fresh or deselected picker falls to the FIRST bot — compose-new
+      // is always one send away from live, with the selection changeable
+      // until the send lands.
       let create_bot = case model.create_bot {
         Some(selected) ->
           case list.any(bots, fn(bot) { bot.id == selected }) {
             True -> model.create_bot
-            False -> None
+            False -> first_bot_id(bots)
           }
-        None -> None
+        None -> first_bot_id(bots)
       }
       #(Model(..model, bot_list: bots, create_bot: create_bot), effect.none())
     }
@@ -930,29 +918,18 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     )
 
     CreateBotChanged(id) ->
+      // The composer's bot picker (compose-new mode). A pure model
+      // write: the uncontrolled textarea keeps its draft — changing
+      // your mind about the bot must never cost you the typed text.
       case string.trim(id) {
         "" -> #(Model(..model, create_bot: None), effect.none())
         bot_id -> #(Model(..model, create_bot: Some(bot_id)), effect.none())
       }
 
-    ProviderPicked(id) ->
-      case model.provider {
-        Some(current) if current == id -> #(model, effect.none())
-        _ -> #(
-          // Stale aliases must not survive a provider switch: the picker
-          // empties until the new provider's list lands (Create is
-          // disabled while it is), and never offers another provider's
-          // models as the pin for a new thread.
-          Model(..model, provider: Some(id), aliases: [], picker: ""),
-          aliases_for(model, id),
-        )
-      }
-
     SettingsToggled -> #(
       // Manual toggle, both directions: it also latches `settings_manual`,
       // which stops the first-run auto-open rule from re-opening the
-      // settings page on every empty-list refresh (mirroring the
-      // `create_auto` latch for the create panel). The info pane closes:
+      // settings page on every empty-list refresh. The info pane closes:
       // it is chat-context display state (like `pop`), and re-opening is
       // one click away on the way back.
       Model(
@@ -986,26 +963,17 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           fn(acc, signal) {
             let #(model, effs) = acc
             case signal {
-              ui_settings.ProviderCreated(provider) -> {
-                // First-run flow: with nothing selected, the freshly
-                // created (enabled) provider becomes the picker's target
-                // at once — and creating the FIRST provider returns the
-                // view to chat (the auto-opened settings page has served
-                // its purpose; a deliberate settings visit stays put).
-                let model = case model.provider {
-                  None -> Model(..model, provider: Some(provider.id))
-                  Some(_) -> model
-                }
+              ui_settings.ProviderCreated(_) -> {
+                // First-run flow: creating the FIRST provider returns
+                // the view to chat (the auto-opened settings page has
+                // served its purpose; a deliberate settings visit stays
+                // put). No picker re-aim — the composer's bot picker
+                // has no provider selection of its own.
                 let model = case model.provider_list {
                   [] -> Model(..model, view: ChatView)
                   _ -> model
                 }
-                let eff = case model.provider, provider.id {
-                  Some(current), created if current == created ->
-                    aliases_for(model, provider.id)
-                  _, _ -> effect.none()
-                }
-                #(model, [eff, ..effs])
+                #(model, effs)
               }
               ui_settings.ProvidersChanged -> #(model, [
                 providers_effect(model),
@@ -1039,24 +1007,6 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         )
       #(model, effect.batch([effect.map(inner_eff, Settings), ..signal_effs]))
     }
-
-    AliasesLoaded(provider, aliases) -> #(
-      Model(
-        ..model,
-        provider: Some(provider),
-        aliases: aliases,
-        picker: first_alias(model, aliases),
-      ),
-      effect.none(),
-    )
-
-    AliasesFailed -> #(
-      Model(..model, log: [
-        NoteLine(True, "could not load model aliases"),
-        ..model.log
-      ]),
-      effect.none(),
-    )
 
     ThreadsLoaded(summaries) -> {
       let next = after_threads(model, summaries)
@@ -1228,85 +1178,61 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         }
       }
 
-    NewThreadToggled -> {
-      let model =
-        Model(..model, create_open: !model.create_open, create_auto: False)
-      // Opening the create panel enters the deliberate no-selection state:
-      // the chat pane goes blank so the user composes a new thread
-      // against nothing, and a later refresh must not auto-select a
-      // replacement (see `deselect`). Closing it just closes the panel —
-      // the no-selection state stays until a row is picked. The button can
-      // also be clicked BEFORE the first thread list arrives (the sidebar
-      // renders immediately on a fresh connection): the deliberate mark
-      // must land then too, or the arriving list auto-selects right over
-      // the open panel.
-      case model.create_open, model.selected {
-        True, Some(current) -> {
-          let next = deselect(model, "no thread selected")
+    NewThreadToggled ->
+      // The New button enters COMPOSE-NEW: deselect (the chat pane goes
+      // blank) and mark the no-selection state deliberate, so a later
+      // refresh must not auto-select a replacement (see `deselect`).
+      // There is no separate panel anymore — the bot picker rides the
+      // composer. The button can be clicked BEFORE the first thread list
+      // arrives (the sidebar renders immediately on a fresh connection):
+      // the deliberate mark must land then too, or the arriving list
+      // auto-selects right over the compose-new state.
+      case model.selected {
+        Some(current) -> {
+          let next = deselect(model, "new thread")
           #(next, leave_effect(model, current))
         }
-        True, None -> {
-          let next = Model(..model, suppress_autoselect: True)
-          #(next, effect.none())
-        }
-        _, _ -> #(model, effect.none())
-      }
-    }
-
-    PickerChanged(alias) -> #(Model(..model, picker: alias), effect.none())
-
-    CreateRequested ->
-      // The shared pending guard FIRST (#88): at most one create in
-      // flight per connection, across both paths — while a create worker
-      // is mid-flight, further clicks must not queue more creates.
-      // Rejection is a silent no-op, the same shape as the streaming
-      // guard on `SendRequested`; the worker's reply (Created /
-      // CreateFailed) clears the guard.
-      case model.create_pending {
-        True -> #(model, effect.none())
-        False ->
-          // Start-from-bot (bots plan P1): a selected bot sources the
-          // provider/model/system prompt; otherwise today's picker flow.
-          // Both paths share the one `thread_create` orchestration, and
-          // neither validates the alias against the provider's live
-          // model list — a dead alias lands and fails its first turn.
-          case model.create_bot {
-            Some(bot_id) -> #(
-              Model(..model, create_pending: True),
-              create_from_bot_effect(model, bot_id),
-            )
-            None ->
-              case model.picker {
-                "" -> #(model, effect.none())
-                alias -> #(
-                  Model(..model, create_pending: True),
-                  create_effect(model, alias),
-                )
-              }
-          }
+        // Already composing (or boot with an unloaded list): re-arm the
+        // deliberate mark so the arriving list cannot auto-select over
+        // the compose-new state.
+        None -> #(Model(..model, suppress_autoselect: True), effect.none())
       }
 
     Created(summary) -> {
       // The worker's success reply (#88): the guard opens again before
       // anything else — a later create must be able to proceed — then
-      // the pre-worker behaviour: add the row, close the panel, select
-      // the new thread.
+      // add the row and select the new thread.
       let model =
         Model(
           ..model,
           threads: [summary, ..model.threads],
-          create_open: False,
           create_pending: False,
         )
-      update(model, Select(summary.id))
+      let #(next, eff) = update(model, Select(summary.id))
+      // COMPOSE-NEW: the stashed draft is the fresh thread's first
+      // message. The selection is in place (the Select above), so the
+      // ordinary send path runs — its own guards apply, and `SendAccepted`
+      // re-keys the composer, clearing the draft only when the thread has
+      // ACCEPTED the message. A refused send keeps both the stash-free
+      // state and the visible draft (the note explains; the user retries
+      // by sending again — the thread already exists).
+      case model.pending_send {
+        Some(text) -> #(
+          Model(..next, pending_send: None),
+          effect.batch([eff, send_effect(next, text)]),
+        )
+        None -> #(next, eff)
+      }
     }
 
     CreateFailed(reason) ->
-      // The worker's failure reply (#88) clears the guard too: a
-      // refused create must not lock the create panel — the note is
-      // the user's cue to retry.
+      // The worker's failure reply (#88) clears the guard too: a refused
+      // create must not lock the composer — the note is the user's cue
+      // to retry. The stashed draft clears with it (the visible draft in
+      // the untouched textarea survives — no re-key happened — so the
+      // user can just send again once the problem is fixed).
       #(
-        Model(..model, create_pending: False, log: [
+        Model(..model, create_pending: False, pending_send: None, log: [
           NoteLine(True, "could not create thread: " <> reason),
           ..model.log
         ]),
@@ -1315,11 +1241,34 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
 
     SendRequested(text) -> {
       let text = string.trim(text)
-      case text, model.streaming, model.selected {
-        "", _, _ -> #(model, effect.none())
-        _, True, _ -> #(model, effect.none())
-        _, _, None -> #(model, effect.none())
-        text, False, Some(_) -> #(model, send_effect(model, text))
+      case text, model.streaming, model.selected, model.create_pending {
+        // Empty text: nothing to send in either mode.
+        "", _, _, _ -> #(model, effect.none())
+        // The streaming guard: a turn is already in flight.
+        _, True, _, _ -> #(model, effect.none())
+        // The create guard (compose-new): the bot-sourced create is in
+        // flight; its `Created` reply will send the stashed draft.
+        _, _, _, True -> #(model, effect.none())
+        // A selected thread: the ordinary send.
+        text, False, Some(_), False -> #(model, send_effect(model, text))
+        // COMPOSE-NEW: the text starts the thread. The picked bot sources
+        // the create (bots-required — there is no provider+model shape);
+        // the draft is stashed so `Created` can send it into the fresh
+        // thread. The textarea is NOT re-keyed here: the visible draft
+        // and the stash stay the same text, and changing the bot picker
+        // meanwhile is just a model write — the draft survives every
+        // change of mind (requirement: type first, pick the bot second).
+        text, False, None, False ->
+          case model.create_bot {
+            Some(bot_id) -> #(
+              Model(..model, create_pending: True, pending_send: Some(text)),
+              create_from_bot_effect(model, bot_id),
+            )
+            // No bot to source the thread from: the picker is empty
+            // (no bots exist yet) and the composer is disabled — the
+            // defensive arm stays a no-op.
+            None -> #(model, effect.none())
+          }
       }
     }
 
@@ -2265,11 +2214,11 @@ fn deselect(model: Model, label: String) -> Model {
 
 /// Apply the M2 refresh rules to the loaded thread list: drop a vanished
 /// selection, auto-select the first ACTIVE (non-archived) thread — unless
-/// the no-selection state is deliberate (`suppress_autoselect`) — and show
-/// the create panel only when there is nothing to select. An archived
-/// selection stays selected (the chat pane keeps showing what the user
-/// just archived, and a deliberately re-opened archived row survives a
-/// refresh) but never auto-selects.
+/// the no-selection state is deliberate (`suppress_autoselect`: compose-
+/// new has no panel anymore, the composer's bot picker is the surface).
+/// An archived selection stays selected (the chat pane keeps showing
+/// what the user just archived, and a deliberately re-opened archived
+/// row survives a refresh) but never auto-selects.
 fn after_threads(model: Model, summaries: List(thread.ThreadSummary)) -> Model {
   let active = list.filter(summaries, fn(summary) { !summary.archived })
   let selected = case model.selected {
@@ -2316,26 +2265,6 @@ fn after_threads(model: Model, summaries: List(thread.ThreadSummary)) -> Model {
     suppress_autoselect: case selected {
       Some(_) -> False
       None -> model.suppress_autoselect
-    },
-    create_open: case active, selected {
-      [], _ -> True
-      // No selection with threads available is now a real state (the
-      // deliberate no-selection mode), not a gap: keep the panel as the
-      // user left it — closed after an archive-deselect, open when the
-      // New-thread button opened it alongside the deselect.
-      _, None -> model.create_open
-      // A panel auto-opened by an (empty-at-boot) thread list closes
-      // again as soon as there is something to select; one the user opened
-      // by hand stays open.
-      _, Some(_) ->
-        case model.create_auto {
-          True -> False
-          False -> model.create_open
-        }
-    },
-    create_auto: case active, selected {
-      [], _ -> True
-      _, _ -> False
     },
     // Per-selection transcript state resets when the selection is gone
     // (ended) OR swapped for a replacement (switched: a dropped thread
@@ -2442,10 +2371,13 @@ fn after_threads(model: Model, summaries: List(thread.ThreadSummary)) -> Model {
   )
 }
 
-fn first_alias(model: Model, aliases: List(String)) -> String {
-  case model.picker, aliases {
-    "", [first, ..] -> first
-    picker, _ -> picker
+/// The composer picker's fallback: the FIRST bot's id, or None when no
+/// bots exist (compose-new then has nothing to start from — the chat
+/// hint points at Settings).
+fn first_bot_id(bots: List(Bot)) -> Option(String) {
+  case bots {
+    [first, ..] -> Some(first.id)
+    [] -> None
   }
 }
 
@@ -2453,24 +2385,8 @@ fn first_alias(model: Model, aliases: List(String)) -> String {
 // Effects (registry / thread / model API glue)
 // ---------------------------------------------------------------------------
 
-/// Fetch the selected provider's live model list (multi-provider §12:
-/// the picker is provider-scoped). Generous actor-call timeout: the
-/// fetch itself is bounded by the endpoint's first-response budget
-/// (server-global SSE policy), this only has to outlive it — and it
-/// runs off the registry's loop (see provider_registry `ListModels`).
-fn aliases_for(model: Model, provider_id: String) -> Effect(Msg) {
-  let providers = model.providers
-  let timeout = model.models_timeout_ms
-  effect.from(fn(dispatch) {
-    case provider_registry.list_models(providers, provider_id, timeout) {
-      Ok(aliases) -> dispatch(AliasesLoaded(provider_id, aliases))
-      Error(_) -> dispatch(AliasesFailed)
-    }
-  })
-}
-
-/// All providers as masked metadata: the Settings page, the picker's
-/// options, and subtitle name resolution all read this list.
+/// All providers as masked metadata: the Settings page and subtitle
+/// name resolution read this list.
 fn providers_effect(model: Model) -> Effect(Msg) {
   let providers = model.providers
   effect.from(fn(dispatch) {
@@ -2482,8 +2398,8 @@ fn providers_effect(model: Model) -> Effect(Msg) {
   })
 }
 
-/// All bots: the Settings Bots section, the start-from-bot picker, and
-/// subtitle provenance names read this list.
+/// All bots: the Settings Bots section, the composer's compose-new
+/// picker, and subtitle provenance names read this list.
 fn bots_effect(model: Model) -> Effect(Msg) {
   let bots = model.bots
   effect.from(fn(dispatch) {
@@ -2492,25 +2408,6 @@ fn bots_effect(model: Model) -> Effect(Msg) {
       Error(error) -> dispatch(BotsFailed(bot_registry.describe(error)))
     }
   })
-}
-
-/// The picker's target after a (re)load: the previous selection when it
-/// still exists and is enabled, else the first enabled provider.
-pub fn pick_provider(
-  providers: List(Provider),
-  previous: Option(String),
-) -> Option(String) {
-  let enabled = list.filter(providers, fn(p) { p.enabled })
-  case previous {
-    Some(id) ->
-      case list.any(enabled, fn(p) { p.id == id }) {
-        True -> Some(id)
-        False ->
-          list.map(enabled, fn(p) { p.id }) |> list.first |> option.from_result
-      }
-    None ->
-      list.map(enabled, fn(p) { p.id }) |> list.first |> option.from_result
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2697,71 +2594,7 @@ fn stop_effect(model: Model) -> Effect(Msg) {
   })
 }
 
-fn create_effect(model: Model, alias: String) -> Effect(Msg) {
-  let registry = model.registry
-  let providers = model.providers
-  let provider = model.provider
-  effect.from(fn(dispatch) {
-    // OFF the runtime loop (#88), per ui_settings' `models_effect`
-    // pattern: the create's registry asks block the worker, and a
-    // wedged registry must not freeze this connection's entire UI
-    // (navigation, thread events, everything). Spawn unlinked; the
-    // reply dispatches back (`Created` / `CreateFailed`). The pending
-    // guard in `update` keeps the single-slot honest: no second create
-    // can start before this one's reply lands.
-    process.spawn_unlinked(fn() {
-      // EVERY exit path dispatches (Created / CreateFailed): the create
-      // outcome routes through `rescue` so a worker crash — e.g. an
-      // `actor.call` panic when a registry dies mid-create — lands on
-      // the failure path too, instead of leaving `create_pending` stuck
-      // True and Create disabled for this connection (#90 review).
-      //
-      // The registry builds the M3 agent-loop runner itself, from the tool
-      // registry frozen at its boot — threads created here get the full
-      // toolset, pinned to the create panel's selected provider + model
-      // (multi-provider §8: the pin is explicit, never defaulted).
-      //
-      // The SHARED orchestration (#73): provider resolution outside the
-      // registry's loop. The alias is pinned as-is — NOT validated
-      // against the live list (proxies serve aliases their /v1/models
-      // may not list; see thread_create's module doc). The reply IS the
-      // summary; this component never hand-builds one.
-      let outcome =
-        rescue.rescue(fn() {
-          case provider {
-            None -> Error("no provider configured")
-            Some(provider_id) -> {
-              let requested =
-                thread_registry.NewThread(
-                  provider_id: provider_id,
-                  model: alias,
-                  // The create panel pins the config default toolset; a
-                  // bot-sourced create runs through create_from_bot_effect
-                  // instead (bots plan P2).
-                  system_prompt: None,
-                  toolset: None,
-                  bot_id: None,
-                  parent_thread_id: None,
-                  title: "",
-                )
-              case thread_create.create_thread(providers, registry, requested) {
-                Ok(summary) -> Ok(summary)
-                Error(problem) -> Error(thread_create.describe(problem))
-              }
-            }
-          }
-        })
-      case outcome {
-        Ok(Ok(summary)) -> dispatch(Created(summary))
-        Ok(Error(reason)) -> dispatch(CreateFailed(reason))
-        Error(crash) -> dispatch(CreateFailed(crash))
-      }
-    })
-    Nil
-  })
-}
-
-/// Start a thread FROM a bot (bots plan P1): the shared create-from-bot
+/// Start a thread FROM a bot (bots plan P1, amended: the ONLY create
 /// orchestration resolves the bot and copies its frozen values — the
 /// alias pinned as-is, like the plain flow. A deleted bot (the row
 /// vanished between the pick and the click) reads as a create failure
@@ -2771,13 +2604,11 @@ fn create_from_bot_effect(model: Model, bot_id: String) -> Effect(Msg) {
   let providers = model.providers
   let bots = model.bots
   effect.from(fn(dispatch) {
-    // OFF the runtime loop (#88), same `models_effect` shape as
-    // `create_effect` above: the worker's registry asks must never
-    // block this connection's UI.
+    // OFF the runtime loop (#88), the `models_effect` shape: the
+    // worker's registry asks must never block this connection's UI.
     process.spawn_unlinked(fn() {
-      // Same rescue contract as `create_effect` above: every exit
-      // dispatches, so a crashed worker releases the pending guard
-      // (#90 review).
+      // Every exit dispatches, so a crashed worker releases the pending
+      // guard (#90 review).
       let outcome =
         rescue.rescue(fn() {
           case
@@ -3554,76 +3385,11 @@ fn provider_name(model: Model, provider_id: String) -> String {
 }
 
 fn sidebar(model: Model) -> Element(Msg) {
+  // The create panel is GONE (threads are bot-only now, and the bot is
+  // picked beside the chat entry field): the sidebar is the thread list
+  // alone. The New button (`#new-thread`, same spot as ever) enters
+  // compose-new mode — deselect — and the composer grows its bot picker.
   html.aside([attr.id("sidebar")], [
-    // The create panel comes FIRST (ui-polish F4): it used to sit below the
-    // whole thread list, so pressing "New" (top-right of the list) usually
-    // opened it below the fold. Markup order is the fix — no new state, and
-    // the `#create-panel` / `#new-thread` selectors the browser suite drives
-    // are unchanged.
-    html.section(
-      [attr.id("create-panel"), attr.hidden(!model.create_open)],
-      list.append(bot_picker(model), [
-        // The provider/model pickers stand down while a bot is selected:
-        // the bot supplies both halves of the pin (and its prompt); the
-        // controls stay mounted-but-hidden so re-selecting "— pick
-        // provider & model —" restores the flow without a reload.
-        html.div(
-          [
-            attr.class("plain-create"),
-            attr.hidden(option.is_some(model.create_bot)),
-          ],
-          [
-            html.label([attr.for("provider-picker")], [
-              html.text("Provider"),
-            ]),
-            html.select(
-              [
-                attr.id("provider-picker"),
-                attr.aria("label", "Provider"),
-                provider_change(),
-              ],
-              provider_options(model),
-            ),
-            html.label([attr.for("model-picker")], [html.text("Model alias")]),
-            html.select(
-              [
-                attr.id("model-picker"),
-                attr.aria("label", "Model alias"),
-                picker_change(),
-              ],
-              list.map(model.aliases, fn(alias) {
-                html.option(
-                  [
-                    attr.value(alias),
-                    attr.selected(alias == model.picker || model.picker == ""),
-                  ],
-                  alias,
-                )
-              }),
-            ),
-          ],
-        ),
-        html.button(
-          [
-            attr.id("create-thread"),
-            attr.type_("button"),
-            // Disabled while a create is pending (#88): the update-level
-            // guard already rejects duplicates, and this keeps the button
-            // honest with it — no clickable Create behind an in-flight
-            // preflight, for either path.
-            attr.disabled(
-              model.create_pending
-              || case model.create_bot {
-                Some(_) -> False
-                None -> model.aliases == [] || model.provider == None
-              },
-            ),
-            event.on_click(CreateRequested),
-          ],
-          [html.text("Create thread")],
-        ),
-      ]),
-    ),
     html.section([], [
       html.div([attr.class("section-head")], [
         html.h2([], [html.text("Threads")]),
@@ -3631,6 +3397,7 @@ fn sidebar(model: Model) -> Element(Msg) {
           [
             attr.id("new-thread"),
             attr.type_("button"),
+            attr.title("Start a new thread — pick a bot beside the composer"),
             event.on_click(NewThreadToggled),
           ],
           [html.text("New")],
@@ -3669,25 +3436,33 @@ fn sidebar(model: Model) -> Element(Msg) {
   ])
 }
 
-/// The start-from-bot select (plus its label), or nothing when no bots
-/// exist — a bot-free install sees today's create panel unchanged.
-fn bot_picker(model: Model) -> List(Element(Msg)) {
-  case model.bot_list {
-    [] -> []
-    bots -> [
-      html.label([attr.for("bot-picker")], [html.text("Bot")]),
-      html.select(
-        [
-          attr.id("bot-picker"),
-          attr.aria("label", "Start from bot"),
-          create_bot_change(),
-        ],
-        [
+/// The composer's compose-new bot picker: a labelled select rendered
+/// directly ABOVE the entry field whenever no thread is selected. The
+/// bot the next send starts the thread from — type the message first,
+/// then pick (or change your mind about) the bot; the select is a pure
+/// model write and the uncontrolled textarea never moves, so the draft
+/// survives every change. Kept the `#bot-picker` id the browser suite
+/// drives. No empty "— pick —" placeholder option: the mode itself is
+/// the empty state, and `BotsLoaded` defaults the selection to the first
+/// bot — with bots present, a send is always one Enter away.
+fn bot_picker_bar(model: Model) -> Element(Msg) {
+  html.div([attr.id("composer-bot")], [
+    html.label([attr.for("bot-picker")], [html.text("Bot")]),
+    html.select(
+      [
+        attr.id("bot-picker"),
+        attr.aria("label", "Bot for the new thread"),
+        create_bot_change(),
+      ],
+      case model.bot_list {
+        [] -> [
           html.option(
-            [attr.value(""), attr.selected(option.is_none(model.create_bot))],
-            "— pick provider & model —",
+            [attr.value(""), attr.selected(True)],
+            "no bots yet — add one in Settings",
           ),
-          ..list.map(bots, fn(bot) {
+        ]
+        bots ->
+          list.map(bots, fn(bot) {
             html.option(
               [
                 attr.value(bot.id),
@@ -3696,38 +3471,9 @@ fn bot_picker(model: Model) -> List(Element(Msg)) {
               bot.name,
             )
           })
-        ],
-      ),
-    ]
-  }
-}
-
-/// Options for the create panel's provider select: enabled providers
-/// only (the plan's `enabled = true` picker filter), the selected one
-/// marked. With none, a disabled placeholder keeps the control legible.
-fn provider_options(model: Model) -> List(Element(Msg)) {
-  let enabled = list.filter(model.provider_list, fn(p) { p.enabled })
-  case enabled {
-    [] -> [
-      html.option(
-        [attr.value(""), attr.selected(True)],
-        "no providers — add one in Settings",
-      ),
-    ]
-    providers ->
-      list.map(providers, fn(p) {
-        html.option(
-          [
-            attr.value(p.id),
-            attr.selected(model.provider == Some(p.id)),
-          ],
-          case p.has_key {
-            True -> p.name
-            False -> p.name <> " (keyless)"
-          },
-        )
-      })
-  }
+      },
+    ),
+  ])
 }
 
 /// The selected thread's parent id when it is a channel (the pane's
@@ -4147,6 +3893,14 @@ fn chat(model: Model) -> Element(Msg) {
       jump_latest(),
     ]),
     loop_chip(model),
+    // COMPOSE-NEW (no thread selected): the bot picker sits directly
+    // above the entry field — pick (or change your mind about) the bot
+    // the first send will start the thread from. It is NOT keyed with
+    // the textarea and replacing it never touches the draft.
+    case has_thread {
+      True -> element.none()
+      False -> bot_picker_bar(model)
+    },
     composer(model, has_thread),
     // The composer hints (the mock): the channel view names the parent
     // it hangs off; a thread WITH channels points at the pane, so the
@@ -4248,6 +4002,18 @@ fn loop_chip(model: Model) -> Element(Msg) {
 ///   element wholesale — clearing it no `value` patch ever could — and its
 ///   `autofocus` attribute puts the caret right back for the next turn.
 fn composer(model: Model, has_thread: Bool) -> Element(Msg) {
+  // Where a send can go: a selected thread, or — compose-new — any bot
+  // to start one from. No bots and no thread means the composer stands
+  // down entirely (the empty-state hint points at Settings). While a
+  // compose-new create is in flight the Send button stands down too —
+  // the update-level guard rejects duplicates, and the button stays
+  // honest with it (the #88 rule, composer edition).
+  let can_send = has_thread || model.create_bot != None
+  // While a compose-new create is in flight BOTH controls stand down —
+  // even if the user selects some other thread in the meantime
+  // (`SendRequested` rejects every send until the create's reply lands,
+  // and that reply selects the fresh thread itself).
+  let send_disabled = model.streaming || !can_send || model.create_pending
   keyed.element(
     "form",
     [attr.id("composer"), attr.action("#"), submit_requested()],
@@ -4259,11 +4025,17 @@ fn composer(model: Model, has_thread: Bool) -> Element(Msg) {
             attr.id("input"),
             attr.name("text"),
             attr.rows(3),
-            attr.placeholder(
-              "Send a message… (Enter · Shift+Enter for a new line)",
-            ),
+            attr.placeholder(case has_thread {
+              True -> "Send a message… (Enter · Shift+Enter for a new line)"
+              False ->
+                "Describe your first message — it starts the thread with"
+                <> " the picked bot (Enter to send)"
+            }),
             attr.autofocus(True),
-            attr.disabled(!has_thread),
+            // A pending compose-new create also stands the textarea down:
+            // `Created` sends the STASHED draft and `SendAccepted` re-keys
+            // the element, so edits made meanwhile would be silently lost.
+            attr.disabled(!can_send || model.create_pending),
             enter_key(),
           ],
           "",
@@ -4290,7 +4062,7 @@ fn composer(model: Model, has_thread: Bool) -> Element(Msg) {
             [
               attr.id("send"),
               attr.type_("submit"),
-              attr.disabled(model.streaming || !has_thread),
+              attr.disabled(send_disabled),
             ],
             [html.text("Send")],
           ),
@@ -4331,18 +4103,24 @@ fn log_lines(model: Model) -> List(Element(Msg)) {
   }
   case lines {
     // ui-polish F5: an empty transcript used to render a blank void above
-    // the composer. Give the fresh-thread state an intentional muted
-    // hint — a Lustre text node, like every word this UI renders. With no
-    // thread selected (the deliberate no-selection state) the composer
-    // is disabled, so the hint points at the sidebar instead of a send
-    // that would fail.
+    // the composer. Give the fresh state an intentional muted hint — a
+    // Lustre text node, like every word this UI renders. With no thread
+    // selected (compose-new mode) the composer carries the bot picker;
+    // the hint points there — or at Settings when no bots exist yet.
     [] -> [
       html.div([attr.class("note")], [
         html.text(case model.selected {
           Some(_) ->
             "Send a message to start — tool calls and reasoning will render here"
           None ->
-            "No thread selected — pick one from the list or create a new one."
+            case model.bot_list {
+              [] ->
+                "No bots yet — add one in Settings (top right), then send a"
+                <> " message from the composer to start a thread."
+              _ ->
+                "Pick a bot beside the composer, type a message, and send —"
+                <> " that starts the thread."
+            }
         }),
       ]),
     ]
@@ -4845,26 +4623,9 @@ fn submit_requested() -> attr.Attribute(Msg) {
   |> server_component.include(["detail.formData"])
 }
 
-fn picker_change() -> attr.Attribute(Msg) {
-  let decoder =
-    decode.at(["target", "value"], decode.string)
-    |> decode.map(PickerChanged)
-  event.on("change", decoder)
-  |> server_component.include(["target.value"])
-}
-
-/// The create panel's provider select: switching providers re-scopes
-/// the model picker (multi-provider §12).
-fn provider_change() -> attr.Attribute(Msg) {
-  let decoder =
-    decode.at(["target", "value"], decode.string)
-    |> decode.map(ProviderPicked)
-  event.on("change", decoder)
-  |> server_component.include(["target.value"])
-}
-
-/// The create panel's bot select (start-from-bot): the change carries
-/// the picked bot id, "" deselecting back to the plain flow.
+/// The composer's compose-new bot select: the change carries the picked
+/// bot id. A pure model write — the draft in the uncontrolled textarea
+/// is untouched (change your mind about the bot, keep your text).
 fn create_bot_change() -> attr.Attribute(Msg) {
   let decoder =
     decode.at(["target", "value"], decode.string)

@@ -348,15 +348,16 @@ pub fn golden_metadata_never_alters_request_bytes_test() {
   should.be_true(extends(body_before, transcript.request_body(tr2, opts)))
 }
 
-/// The common creation request shape: pin provider + model, config-default
-/// prompt.
+/// The common creation request shape: a bot-sourced pin (every thread is
+/// bot-sourced now; the id is provenance only here) with the
+/// config-default prompt.
 fn new_thread(provider_id: String, model: String) -> thread_registry.NewThread {
   thread_registry.NewThread(
     provider_id: provider_id,
     model: model,
     system_prompt: None,
     toolset: None,
-    bot_id: None,
+    bot_id: "b-fixture",
     parent_thread_id: None,
     title: "",
   )
@@ -384,6 +385,7 @@ fn start_registry() -> process.Subject(thread_registry.Msg) {
     factory_supervisor.start(thread_registry.factory_builder(factory_name))
   let persistence = store_mock.seam(store_mock.start())
   store_mock.ensure_fixture_provider(persistence)
+  store_mock.ensure_fixture_bot(persistence)
   let assert Ok(started) =
     thread_registry.start(
       smoke_config(),

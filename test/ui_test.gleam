@@ -95,7 +95,7 @@ fn summary(id: String, streaming: Bool) -> thread.ThreadSummary {
 pub fn init_starts_empty_test() {
   let model = new_model()
   model.threads |> should.equal([])
-  model.aliases |> should.equal([])
+  model.provider_list |> should.equal([])
   model.selected |> should.equal(None)
   model.bubble |> should.equal(None)
   model.streaming |> should.be_false
@@ -110,7 +110,6 @@ pub fn init_starts_empty_test() {
 pub fn threads_auto_select_first_test() {
   let model = new_model() |> step(ui.ThreadsLoaded([summary("s-1", False)]))
   model.selected |> should.equal(Some("s-1"))
-  model.create_open |> should.be_false
 }
 
 /// The auto-selection fires a join carrying a NEW visit generation, and
@@ -163,18 +162,17 @@ pub fn archive_of_selection_clears_selection_test() {
 }
 
 /// The New button can be clicked BEFORE the first thread list arrives
-/// (the sidebar renders immediately on a fresh connection). The hand-opened
-/// panel must mark the no-selection state as deliberate, or the arriving
-/// list auto-selects right over the open panel.
+/// (the sidebar renders immediately on a fresh connection). The click
+/// must mark the no-selection state as deliberate, or the arriving list
+/// auto-selects right over the compose-new state.
 pub fn new_thread_before_first_load_suppresses_autoselect_test() {
   let model = new_model() |> step(ui.NewThreadToggled)
-  model.create_open |> should.be_true
   model.selected |> should.equal(None)
+  model.suppress_autoselect |> should.be_true
   // The first (or any later) list load must not auto-select over the
-  // hand-opened panel.
+  // compose-new state.
   let model = step(model, ui.ThreadsLoaded([summary("s-1", False)]))
   model.selected |> should.equal(None)
-  model.create_open |> should.be_true
   // A row pick recovers normally.
   let model = step(model, ui.Select("s-1"))
   model.selected |> should.equal(Some("s-1"))
@@ -192,11 +190,12 @@ pub fn archive_of_other_thread_keeps_selection_test() {
   model.log |> should.equal([])
 }
 
-/// The New-thread button enters the same deliberate no-selection state:
-/// the create panel opens AND the open thread's view clears, so the
-/// user composes the new thread against a blank pane. The panel toggle
-/// still works, and the state holds across refreshes until a row is
-/// picked.
+/// The New-thread button enters COMPOSE-NEW, the same deliberate
+/// no-selection state: the open thread's view clears, and the composer
+/// grows its bot picker (the bot the first send starts the thread from).
+/// The state holds across refreshes until a row is picked; pressing New
+/// again while already composing stays there (there is no panel to
+/// close — the composer is the compose surface).
 pub fn new_thread_button_clears_selection_test() {
   let model =
     new_model()
@@ -204,27 +203,27 @@ pub fn new_thread_button_clears_selection_test() {
     |> step(ui.Select("s-1"))
     |> step(ui.UserEcho("hi", None, None))
     |> step(ui.NewThreadToggled)
-  model.create_open |> should.be_true
   model.selected |> should.equal(None)
   model.log |> should.equal([])
-  model.model_label |> should.equal("no thread selected")
+  model.model_label |> should.equal("new thread")
   // A refresh (title upgrade from any thread) keeps the state: no
-  // auto-select, panel stays open.
+  // auto-select, still composing.
   let model = step(model, ui.ThreadsLoaded([summary("s-1", False)]))
   model.selected |> should.equal(None)
-  model.create_open |> should.be_true
-  // Closing the panel leaves the no-selection state; a row pick recovers.
-  let model = step(model, ui.NewThreadToggled)
-  model.create_open |> should.be_false
-  model.selected |> should.equal(None)
-  let model = step(model, ui.Select("s-1"))
+  // A second press while composing stays composing.
+  let again = step(model, ui.NewThreadToggled)
+  again.selected |> should.equal(None)
+  // A row pick recovers.
+  let model = step(again, ui.Select("s-1"))
   model.selected |> should.equal(Some("s-1"))
 }
 
-pub fn threads_empty_opens_create_panel_test() {
+pub fn threads_empty_leaves_compose_new_test() {
   let model = new_model() |> step(ui.ThreadsLoaded([]))
+  // Nothing to select: the composer sits in its compose-new shape (the
+  // bot picker is visible — see the view tests below).
   model.selected |> should.equal(None)
-  model.create_open |> should.be_true
+  model.suppress_autoselect |> should.be_false
 }
 
 pub fn select_resets_log_and_streams_test() {
@@ -330,7 +329,6 @@ pub fn vanished_selection_ends_thread_test() {
   model.bubble |> should.equal(None)
   model.streaming |> should.be_false
   model.model_label |> should.equal("thread ended")
-  model.create_open |> should.be_true
   // The hidden flag resets with the bubble it belonged to: a stale False
   // (the ended thread's bubble was visible) would let the NEXT thread's
   // first streamed token — even whitespace-only — render, bypassing the
@@ -1311,30 +1309,23 @@ fn view_string(model: ui.Model) -> String {
   element.to_string(ui.view(model))
 }
 
-pub fn view_create_panel_precedes_thread_list_test() {
-  // ui-polish F4: "New" used to open the create panel below the whole
-  // thread list, i.e. below the fold. Markup order is the fix, so the
-  // panel must come FIRST inside the sidebar — and it must still be the
-  // same `#create-panel` section with the same pickers, since the browser
-  // suite drives this flow by those ids.
+pub fn view_new_button_precedes_thread_list_test() {
+  // The New button keeps its spot (the section head above the list), and
+  // the browser suite still drives it by `#new-thread`. The create panel
+  // is gone — the bot picker lives beside the composer.
   let html =
     new_model()
-    |> step(ui.AliasesLoaded("p1", ["smart", "fast"]))
     |> step(ui.ThreadsLoaded([summary("s-1", False)]))
     |> view_string
-  // Everything rendered before the list's id must include the panel's id:
-  // that is the order assertion, without pinning a byte offset.
   let assert Ok(#(before_list, _)) =
     string.split_once(html, "id=\"thread-list\"")
-  should.be_true(string.contains(before_list, "id=\"create-panel\""))
-  should.be_true(string.contains(html, "id=\"provider-picker\""))
-  should.be_true(string.contains(html, "id=\"create-thread\""))
+  should.be_true(string.contains(before_list, "id=\"new-thread\""))
+  should.be_false(string.contains(html, "create-panel"))
 }
 
 pub fn view_renders_shell_and_sidebar_test() {
   let model =
     new_model()
-    |> step(ui.AliasesLoaded("p1", ["smart", "fast"]))
     |> step(ui.ThreadsLoaded([summary("s-1", False)]))
   let html = view_string(model)
   should.be_true(string.contains(html, "id=\"app\""))
@@ -1347,8 +1338,8 @@ pub fn view_renders_shell_and_sidebar_test() {
   should.be_false(string.contains(html, "smart · "))
   should.be_true(string.contains(html, "class=\"thread-sub\""))
   should.be_true(string.contains(html, "aria-current=\"true\""))
-  should.be_true(string.contains(html, "id=\"model-picker\""))
-  should.be_true(string.contains(html, "value=\"fast\""))
+  // With a thread selected the compose-new picker is not mounted at all.
+  should.be_false(string.contains(html, "bot-picker"))
   should.be_true(string.contains(html, "id=\"tag-filter\""))
   should.be_true(string.contains(html, "Show archived"))
   // No raw HTML injection: dynamic text is escaped by Lustre text nodes.
@@ -1364,13 +1355,22 @@ pub fn view_renders_empty_states_test() {
 // ui-polish F5: an empty transcript renders an intentional muted hint, not
 // a blank void; the hint disappears the moment there is anything to show.
 pub fn view_empty_transcript_note_test() {
-  // No thread selected (the deliberate no-selection state): the hint
-  // points at the sidebar — the composer is disabled, so a send hint
-  // would invite a failing submit.
+  // Compose-new with bots available: the hint names the flow — pick the
+  // bot beside the composer and send (the composer is live).
+  let html =
+    new_model()
+    |> step(ui.BotsLoaded([bot_row("b1", "Writer", "", None)]))
+    |> view_string
+  should.be_true(string.contains(
+    html,
+    "Pick a bot beside the composer, type a message, and send",
+  ))
+  // Compose-new with NO bots: the composer stands down; the hint points
+  // at Settings.
   let html = new_model() |> view_string
   should.be_true(string.contains(
     html,
-    "No thread selected — pick one from the list or create a new one.",
+    "No bots yet — add one in Settings (top right)",
   ))
   // With a selection and an empty transcript the hint invites a send.
   let html =
@@ -1686,7 +1686,6 @@ pub fn threads_auto_select_first_active_test() {
     |> step(ui.ThreadsLoaded([archived, active]))
   // The archived row is soft-hidden, so auto-selection skips it.
   model.selected |> should.equal(Some("s-2"))
-  model.create_open |> should.be_false
 }
 
 pub fn archived_selection_survives_refresh_test() {
@@ -1704,13 +1703,13 @@ pub fn archived_selection_survives_refresh_test() {
   model.model_label |> should.equal("connecting…")
 }
 
-pub fn all_archived_opens_create_panel_test() {
+pub fn all_archived_leaves_compose_new_test() {
   let archived = meta_summary("s-1", "Old", False, [], True, 0)
   let model = new_model() |> step(ui.ThreadsLoaded([archived]))
   model.selected |> should.equal(None)
-  // No active thread to select: the create panel opens so the sidebar is
-  // never a dead end.
-  model.create_open |> should.be_true
+  // No active thread to select: the composer sits in its compose-new
+  // shape (bot picker beside the entry field) so the sidebar is never a
+  // dead end.
 }
 
 pub fn delete_of_selection_reselects_first_active_test() {
@@ -1916,21 +1915,7 @@ fn prov(
   )
 }
 
-pub fn pick_provider_test() {
-  let providers = [
-    prov("p1", "bifrost", False, True),
-    prov("p2", "ollama", True, False),
-  ]
-  // No previous selection: the first ENABLED provider.
-  ui.pick_provider(providers, None) |> should.equal(Some("p2"))
-  ui.pick_provider([], None) |> should.equal(None)
-  // A live selection survives; a disabled or vanished one falls back.
-  ui.pick_provider(providers, Some("p2")) |> should.equal(Some("p2"))
-  ui.pick_provider(providers, Some("p1")) |> should.equal(Some("p2"))
-  ui.pick_provider(providers, Some("gone")) |> should.equal(Some("p2"))
-}
-
-pub fn providers_loaded_auto_picks_enabled_test() {
+pub fn providers_loaded_keeps_masked_metadata_test() {
   let model =
     new_model()
     |> step(
@@ -1939,16 +1924,10 @@ pub fn providers_loaded_auto_picks_enabled_test() {
         prov("p2", "ollama", True, False),
       ]),
     )
-  model.provider |> should.equal(Some("p2"))
   list.length(model.provider_list) |> should.equal(2)
-}
-
-pub fn providers_loaded_falls_back_when_disabled_test() {
-  let model =
-    new_model()
-    |> step(ui.ProvidersLoaded([prov("p2", "ollama", True, False)]))
-    |> step(ui.ProvidersLoaded([prov("p2", "ollama", False, False)]))
-  model.provider |> should.equal(None)
+  // has_key is the only key fact that reaches the UI model.
+  list.map(model.provider_list, fn(p) { p.has_key })
+  |> should.equal([True, False])
 }
 
 pub fn providers_loaded_notes_only_when_load_concludes_empty_test() {
@@ -1969,11 +1948,10 @@ pub fn providers_loaded_notes_only_when_load_concludes_empty_test() {
     |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
   offered.log |> should.equal([])
 
-  // All-disabled is "none exist" too: same note, plus the cleared picker.
+  // All-disabled is "none exist" too: same note.
   let disabled =
     new_model()
     |> step(ui.ProvidersLoaded([prov("p1", "bifrost", False, True)]))
-  disabled.provider |> should.equal(None)
   note_count(disabled.log) |> should.equal(1)
 
   // Repeated refreshes that STAY empty add nothing: the note fires on
@@ -2008,80 +1986,28 @@ fn note_count(log: List(ui.Line)) -> Int {
   |> list.length
 }
 
-pub fn providers_loaded_clears_stale_aliases_on_fallback_test() {
-  // The fallback (selection disabled or gone) must not leave the old
-  // provider's models offerable: Create stays disabled until the
-  // replacement list lands, and a stale alias can never be pinned to a
-  // provider it did not come from (the ProviderPicked rule, applied to
-  // programmatic selection changes).
-  let model =
-    new_model()
-    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
-    |> step(ui.AliasesLoaded("p1", ["gpt", "claude"]))
-    |> step(
-      ui.ProvidersLoaded([
-        prov("p1", "bifrost", False, True),
-        prov("p2", "ollama", True, False),
-      ]),
-    )
-  model.provider |> should.equal(Some("p2"))
-  model.aliases |> should.equal([])
-  model.picker |> should.equal("")
-  // No provider left at all: same clearing, nothing stale rendered.
-  let gone =
-    new_model()
-    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
-    |> step(ui.AliasesLoaded("p1", ["gpt"]))
-    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", False, True)]))
-  gone.provider |> should.equal(None)
-  gone.aliases |> should.equal([])
-  gone.picker |> should.equal("")
-  // An unchanged selection keeps its loaded aliases (no flicker on
-  // unrelated refreshes).
-  let kept =
-    new_model()
-    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
-    |> step(ui.AliasesLoaded("p1", ["gpt"]))
-    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
-  kept.provider |> should.equal(Some("p1"))
-  kept.aliases |> should.equal(["gpt"])
-}
-
-pub fn provider_picked_scopes_and_clears_aliases_test() {
-  let model =
-    new_model()
-    |> step(ui.ProvidersLoaded([prov("p2", "ollama", True, False)]))
-    |> step(ui.AliasesLoaded("p2", ["qwen", "llama"]))
-    |> step(ui.ProviderPicked("p2"))
-  // Re-picking the same provider changes nothing.
-  model.aliases |> should.equal(["qwen", "llama"])
-  let switched = step(model, ui.ProviderPicked("p9"))
-  // Another provider's models must never linger as pin options.
-  switched.aliases |> should.equal([])
-  switched.picker |> should.equal("")
-}
-
-pub fn provider_created_selects_first_provider_test() {
+pub fn provider_created_returns_to_chat_on_first_provider_test() {
   // The creation lands in the settings sub-component; the signal fold
-  // in ui.update re-aims the picker — and, with no provider before it,
-  // returns the view to chat (the auto-opened settings page has served
-  // its purpose). Start from the AUTO-OPENED settings view (first load
-  // empty) so the ChatView assertion is load-bearing, not the default.
+  // in ui.update returns the view to chat when the FIRST provider lands
+  // (the auto-opened settings page has served its purpose). There is no
+  // picker re-aim anymore — the composer's bot picker has no provider
+  // selection of its own. Start from the AUTO-OPENED settings view
+  // (first load empty) so the ChatView assertion is load-bearing.
   let opened = new_model() |> step(ui.ProvidersLoaded([]))
   opened.view |> should.equal(ui.SettingsView)
   let model =
     opened
     |> step(ui.Settings(ui_settings.Created(prov("p3", "new", True, True))))
-  model.provider |> should.equal(Some("p3"))
+  // The provider list itself reloads via the paired ProvidersChanged
+  // signal (the harness drops effects) — the fold's own verdict is the
+  // view flip.
   model.view |> should.equal(ui.ChatView)
-  // An existing selection is left alone — and a settings visit that was
-  // NOT the first-run auto-open stays in settings.
+  // A settings visit that was NOT the first-run auto-open stays put.
   let kept =
     new_model()
     |> step(ui.ProvidersLoaded([prov("p2", "ollama", True, False)]))
     |> step(ui.SettingsToggled)
     |> step(ui.Settings(ui_settings.Created(prov("p3", "new", True, True))))
-  kept.provider |> should.equal(Some("p2"))
   kept.view |> should.equal(ui.SettingsView)
 }
 
@@ -2216,33 +2142,6 @@ pub fn view_provider_forms_hidden_until_opened_test() {
   should.be_true(string.contains(editing, "API key (blank keeps existing)"))
   should.be_true(string.contains(editing, "value=\"bifrost\""))
   should.be_false(string.contains(editing, "value=\"sk-"))
-}
-
-pub fn view_provider_picker_lists_enabled_only_test() {
-  let html =
-    new_model()
-    |> step(
-      ui.ProvidersLoaded([
-        prov("p1", "bifrost", True, True),
-        prov("p2", "ollama", True, False),
-        prov("p3", "old", False, True),
-      ]),
-    )
-    |> view_string
-  should.be_true(string.contains(html, "provider-picker"))
-  should.be_true(string.contains(html, ">bifrost<"))
-  // Keyless providers are called out in the option label; disabled
-  // providers do not appear at all.
-  should.be_true(string.contains(html, ">ollama (keyless)<"))
-  // Disabled providers appear in the MANAGEMENT panel but never as a
-  // picker option (option values carry the id).
-  should.be_false(string.contains(html, "value=\"p3\""))
-  // Zero enabled providers: a legible placeholder, not an empty select.
-  let none =
-    new_model()
-    |> step(ui.ProvidersLoaded([prov("p3", "old", False, True)]))
-    |> view_string
-  should.be_true(string.contains(none, "no providers — add one in Settings"))
 }
 
 /// The rendered text of the first `.thread-sub` span in a view string —
@@ -3143,6 +3042,7 @@ pub fn meta_updated_refreshes_sidebar_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
   store_mock.ensure_fixture_provider(seam)
+  store_mock.ensure_fixture_bot(seam)
 
   // Real registries over the offline seams — the refresh effect calls
   // both, so a dead subject would crash the runtime's actor.
@@ -3242,6 +3142,7 @@ pub fn send_moves_previous_day_row_into_today_immediately_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
   store_mock.ensure_fixture_provider(seam)
+  store_mock.ensure_fixture_bot(seam)
 
   // Seed the previous-day conversation through the store seam: the row
   // first, then one committed user message — so the send below is NOT
@@ -3384,9 +3285,11 @@ pub fn send_moves_previous_day_row_into_today_immediately_test() {
   // text — so did the old middot anchor.
   let after = collect_until_quiet(client, 10, 10, "")
   should.be_true(string.contains(after, "hello again"))
+  // The today row's subtitle flipped to just-now — bot-sourced threads
+  // lead with the provenance name, so the whole subtitle text anchors.
   should.be_true(string.contains(
     after,
-    "\"just now\",\"kind\":2}],\"attributes\":[{\"value\":\"thread-sub\"",
+    "Fixture · just now\",\"kind\":2}],\"attributes\":[{\"value\":\"thread-sub\"",
   ))
 }
 
@@ -3404,6 +3307,7 @@ pub fn connect_with_configured_provider_never_notes_no_provider_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
   store_mock.ensure_fixture_provider(seam)
+  store_mock.ensure_fixture_bot(seam)
 
   let assert Ok(started_providers) =
     provider_registry.start_with_model_fetcher(
@@ -3462,16 +3366,19 @@ pub fn connect_with_configured_provider_never_notes_no_provider_test() {
   server_component.register_subject(client)
   |> lustre.send(to: runtime)
 
-  // The whole connect cascade (provider load, thread load, alias
-  // fetch) settles before anything is asserted. The create panel's
-  // provider select is rendered (hidden) in every chat view, so the
-  // fixture row in the SAME stream proves `ProvidersLoaded` landed —
-  // the note's absence is a verdict, not a stall.
+  // The whole connect cascade (provider load, thread load) settles
+  // before anything is asserted. The provider's masked metadata is
+  // rendered by the SETTINGS page only, so the view flip proves
+  // `ProvidersLoaded` landed: open Settings, collect again, and the
+  // fixture row in the SAME stream is the verdict anchor — the note's
+  // absence across the whole stream is a verdict, not a stall.
+  lustre.send(to: runtime, message: lustre.dispatch(ui.SettingsToggled))
   let seen = collect_until_quiet(client, 10, 10, "")
 
-  // The configured provider is offered…
-  // The configured provider is offered…
-  should.be_true(string.contains(seen, "fixture (keyless)"))
+  // The configured provider is offered (its row + the keyless badge;
+  // patches are element JSON, so plain substrings are the anchors)…
+  should.be_true(string.contains(seen, "fixture"))
+  should.be_true(string.contains(seen, "keyless"))
   // …and the bogus note never reached the client.
   should.be_false(string.contains(seen, "no provider configured"))
 }
@@ -3563,6 +3470,7 @@ pub fn thread_switch_drops_left_thread_stream_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
   store_mock.ensure_fixture_provider(seam)
+  store_mock.ensure_fixture_bot(seam)
 
   let assert Ok(started_providers) =
     provider_registry.start_with_model_fetcher(
@@ -3661,6 +3569,7 @@ pub fn meta_updated_from_other_thread_refreshes_sidebar_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
   store_mock.ensure_fixture_provider(seam)
+  store_mock.ensure_fixture_bot(seam)
 
   let assert Ok(started_providers) =
     provider_registry.start_with_model_fetcher(
@@ -3759,15 +3668,16 @@ fn fixture_resolver() -> thread_registry.ResolveProvider {
   }
 }
 
-/// The common creation request shape: pin provider + model,
-/// config-default prompt.
+/// The common creation request shape: a bot-sourced pin (every thread is
+/// bot-sourced now — the id is provenance only here), config-default
+/// prompt.
 fn new_thread(provider_id: String, model: String) -> thread_registry.NewThread {
   thread_registry.NewThread(
     provider_id: provider_id,
     model: model,
     system_prompt: None,
     toolset: None,
-    bot_id: None,
+    bot_id: "b-fixture",
     parent_thread_id: None,
     title: "",
   )
@@ -3972,6 +3882,32 @@ pub fn view_settings_bots_section_test() {
   should.be_true(string.contains(editing, ">Edit bot<"))
   should.be_true(string.contains(editing, "value=\"Writer\""))
   should.be_true(string.contains(editing, "be terse"))
+}
+
+/// The inbound gate toggle's two shapes (bots plan P3a's display): the
+/// open gate renders the "Block" affordance, the closed one the "Allow"
+/// affordance plus the "inbound off" badge, and the hostile name still
+/// escapes as text.
+pub fn view_settings_bots_inbound_toggle_test() {
+  let html =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(
+      ui.BotsLoaded([
+        bot_row("b1", "<script>alert(3)</script>", "", None),
+        bot_row_inbound("b2", "quiet", "", None, False),
+      ]),
+    )
+    |> step(ui.SettingsToggled)
+    |> view_string
+  // Both toggle shapes are in the list, one per row.
+  should.be_true(string.contains(html, ">Block inbound<"))
+  should.be_true(string.contains(html, ">Allow inbound<"))
+  // The blocked gate's badge, mirroring the provider row's "off".
+  should.be_true(string.contains(html, "inbound off"))
+  // The hostile name is escaped text, never markup.
+  should.be_true(string.contains(html, "&lt;script&gt;alert(3)&lt;/script&gt;"))
+  should_not_contain(html, "<script>alert(3)</script>")
 }
 
 /// The toolset display (bots plan P2): the three states read distinctly
@@ -4202,6 +4138,7 @@ pub fn bot_picker_submit_roundtrip_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
   store_mock.ensure_fixture_provider(seam)
+  store_mock.ensure_fixture_bot(seam)
 
   // Real registries over the offline seams — the add form's open
   // effect asks both (the alias fetch fails offline; the catalog
@@ -4353,64 +4290,20 @@ pub fn bot_picker_submit_roundtrip_test() {
   )
 
   let rows = poll_bots(bots, 40)
-  let assert [a, b, c] = rows
+  let assert [a, b, c] =
+    list.filter(rows, fn(b) { b.id != store_mock.fixture_bot_id })
   a.name |> should.equal("Picker A")
   a.tools |> should.equal(Some(["codemode", "http_fetch"]))
   b.tools |> should.equal(Some([]))
   c.tools |> should.equal(None)
 }
 
-/// Poll the bot registry until its rows appear (the runtime's effects
-/// cross process boundaries) or the attempts run out.
-fn poll_bots(
-  bots: process.Subject(bot_registry.Msg),
-  attempts: Int,
-) -> List(store.StoredBot) {
-  case bot_registry.list_bots(bots) {
-    Ok([]) if attempts > 0 -> {
-      process.sleep(25)
-      poll_bots(bots, attempts - 1)
-    }
-    Ok(rows) -> rows
-    Error(_) if attempts > 0 -> {
-      process.sleep(25)
-      poll_bots(bots, attempts - 1)
-    }
-    Error(_) -> []
-  }
-}
-
-/// The inbound gate toggle (bots plan P3a, issue #95): the row's control
-/// names the INVERSE action (an open gate offers to block, a blocked one
-/// offers to reopen), the blocked gate shows a badge, and a
-/// payload-laden bot name renders the toggle row as inert text — the
-/// toggle sits beside hostile text, never around it.
-pub fn view_settings_bots_inbound_toggle_test() {
-  let html =
-    new_model()
-    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
-    |> step(
-      ui.BotsLoaded([
-        bot_row("b1", "<script>alert(3)</script>", "", None),
-        bot_row_inbound("b2", "quiet", "", None, False),
-      ]),
-    )
-    |> step(ui.SettingsToggled)
-    |> view_string
-  // Both toggle shapes are in the list, one per row.
-  should.be_true(string.contains(html, ">Block inbound<"))
-  should.be_true(string.contains(html, ">Allow inbound<"))
-  // The blocked gate's badge, mirroring the provider row's "off".
-  should.be_true(string.contains(html, "inbound off"))
-  // The hostile name is escaped text, never markup.
-  should.be_true(string.contains(html, "&lt;script&gt;alert(3)&lt;/script&gt;"))
-  should_not_contain(html, "<script>alert(3)</script>")
-}
-
-/// The toggle's CLICK, against the REAL runtime over a REAL bot
-/// registry: the patch lands write-through in the registry (and the
-/// store mock behind it), the reload re-renders the row with the badge,
-/// and the hostile name stays inert text through the whole cascade.
+/// The inbound gate toggle, end to end over the real runtime (bots plan
+/// P3a, issue #95): the click patches the gate closed through the bot
+/// registry, and the mutation reply's reload re-renders the blocked
+/// badge with the name still escaped. The harness's fixture bot is
+/// filtered out of the exact-row assertions (seeding setup, not the row
+/// under test).
 pub fn settings_inbound_toggle_runtime_round_trip_test() {
   let #(registry, providers, bots) =
     start_offline_registries(
@@ -4453,8 +4346,16 @@ pub fn settings_inbound_toggle_runtime_round_trip_test() {
   // The mutation reply reloads the bot list; the re-render shows the
   // blocked badge with the name still escaped.
   wait_for_patch(client, "inbound off", 20)
-  let assert [stored] = bot_registry_rows(bots)
+  let assert [stored] =
+    bot_registry_rows(bots)
+    |> list.filter(fn(b) { b.id != store_mock.fixture_bot_id })
   should.equal(stored.name, "<script>alert(3)</script>")
+}
+
+/// The registry's current rows (its in-state mirror post-write-through).
+fn bot_registry_rows(bots: process.Subject(bot_registry.Msg)) -> List(bot.Bot) {
+  let assert Ok(all) = bot_registry.list_bots(bots)
+  all
 }
 
 /// Poll the registry until bot `id`'s gate reads `want` (the PATCH
@@ -4479,10 +4380,34 @@ fn wait_for_registry_gate(
   }
 }
 
-/// The registry's current rows (its in-state mirror post-write-through).
-fn bot_registry_rows(bots: process.Subject(bot_registry.Msg)) -> List(bot.Bot) {
-  let assert Ok(all) = bot_registry.list_bots(bots)
-  all
+/// Poll the bot registry until the THREE non-fixture bots this test's
+/// UI submissions create appear (the runtime's effects cross process
+/// boundaries) or the attempts run out. The count is the single
+/// caller's expectation, hardcoded here.
+fn poll_bots(
+  bots: process.Subject(bot_registry.Msg),
+  attempts: Int,
+) -> List(store.StoredBot) {
+  poll_bots_for(bots, 3, attempts)
+}
+
+fn poll_bots_for(
+  bots: process.Subject(bot_registry.Msg),
+  want: Int,
+  attempts: Int,
+) -> List(store.StoredBot) {
+  let rows = case bot_registry.list_bots(bots) {
+    Ok(rows) -> rows
+    Error(_) -> []
+  }
+  let relevant = list.filter(rows, fn(b) { b.id != store_mock.fixture_bot_id })
+  case list.length(relevant) >= want || attempts <= 0 {
+    True -> relevant
+    False -> {
+      process.sleep(25)
+      poll_bots_for(bots, want, attempts - 1)
+    }
+  }
 }
 
 /// Without bots the section says so; without PROVIDERS it explains the
@@ -4504,55 +4429,70 @@ pub fn view_settings_bots_empty_states_test() {
   ))
 }
 
-/// The create panel's start-from-bot picker: rendered only when bots
-/// exist, and selecting one stands the provider/model pickers down (the
-/// bot sources the pin); deselecting restores them.
-pub fn view_create_panel_bot_picker_test() {
-  let no_bots =
-    new_model()
-    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
-    |> step(ui.NewThreadToggled)
-    |> view_string
-  // A bot-free install sees today's panel: no picker markup at all.
-  should.be_false(string.contains(no_bots, "bot-picker"))
-
+/// The composer's compose-new bot picker: rendered (above the entry
+/// field) whenever no thread is selected, listing the bots with the
+/// DEFAULT selection on the first one — changing your mind is a select
+/// away, and the draft never moves.
+pub fn view_composer_bot_picker_test() {
+  // Compose-new with bots: the picker rides the composer, first bot
+  // pre-selected (a send is always one Enter away).
   let with_bots =
     new_model()
-    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
-    |> step(ui.BotsLoaded([bot_row("b1", "Writer", "", None)]))
-    |> step(ui.NewThreadToggled)
+    |> step(
+      ui.BotsLoaded([
+        bot_row("b1", "Writer", "", None),
+        bot_row("b2", "Coder", "", None),
+      ]),
+    )
     |> view_string
   should.be_true(string.contains(with_bots, "bot-picker"))
   should.be_true(string.contains(with_bots, ">Writer<"))
-  // The ampersand escapes in the option label (hostile-text rules apply
-  // to our own copy too).
-  should.be_true(string.contains(with_bots, "pick provider &amp; model"))
+  should.be_true(string.contains(with_bots, ">Coder<"))
+  should.be_true(string.contains(with_bots, "selected value=\"b1\""))
+  should.be_true(string.contains(with_bots, "id=\"composer-bot\""))
 
-  let from_bot =
+  // Changing the pick is a pure model write: the selection moves, the
+  // composer textarea is NOT re-keyed (same key = same element = the
+  // draft survives the change of mind).
+  let picked =
     new_model()
-    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
-    |> step(ui.BotsLoaded([bot_row("b1", "Writer", "", None)]))
-    |> step(ui.NewThreadToggled)
-    |> step(ui.CreateBotChanged("b1"))
+    |> step(
+      ui.BotsLoaded([
+        bot_row("b1", "Writer", "", None),
+        bot_row("b2", "Coder", "", None),
+      ]),
+    )
+    |> step(ui.CreateBotChanged("b2"))
     |> view_string
-  // The plain flow stands down: the plain-create block itself is hidden,
-  // not just some unrelated hidden attribute.
-  should.be_true(string.contains(from_bot, "plain-create\" hidden"))
-  // Deselect restores the plain flow.
-  let restored =
+  should.be_true(string.contains(picked, "selected value=\"b2\""))
+  should.be_false(string.contains(picked, "selected value=\"b1\""))
+
+  // With a thread selected the picker is not mounted at all (the
+  // thread's bot is frozen — there is nothing to pick).
+  let selected =
     new_model()
-    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
     |> step(ui.BotsLoaded([bot_row("b1", "Writer", "", None)]))
-    |> step(ui.NewThreadToggled)
-    |> step(ui.CreateBotChanged("b1"))
-    |> step(ui.CreateBotChanged(""))
+    |> step(ui.ThreadsLoaded([summary("s-1", False)]))
+    |> step(ui.Select("s-1"))
     |> view_string
-  should.be_false(string.contains(restored, "bot-picker\" hidden"))
-  // …and the plain-create block itself is visible again (hidden elements
-  // still render into the string, so provider-picker presence alone
-  // proves nothing).
-  should.be_false(string.contains(restored, "plain-create\" hidden"))
-  should.be_true(string.contains(restored, "provider-picker"))
+  should.be_false(string.contains(selected, "bot-picker"))
+
+  // Hostile bot names are escaped in the options (hostile-text rules).
+  let hostile =
+    new_model()
+    |> step(ui.BotsLoaded([bot_row("b1", "<i>x</i>", "", None)]))
+    |> view_string
+  should.be_true(string.contains(hostile, "&lt;i&gt;x&lt;/i&gt;"))
+  should_not_contain(hostile, "<i>x</i>")
+}
+
+/// No bots and no thread: the composer stands down entirely (textarea
+/// and Send disabled) — there is nothing to start a thread from.
+pub fn view_composer_disabled_without_bots_test() {
+  let html = new_model() |> view_string
+  should.be_true(string.contains(html, "disabled id=\"input\""))
+  should.be_true(string.contains(html, "disabled id=\"send\""))
+  should.be_true(string.contains(html, "no bots yet — add one in Settings"))
 }
 
 /// A bot-sourced thread's subtitle leads with the bot's name
@@ -4595,123 +4535,147 @@ pub fn view_thread_subtitle_shows_bot_provenance_test() {
   should.equal(first_thread_sub(gone), ui.rel_time(timing.wall_now_s(), 0))
 }
 
-/// A deleted bot falls out of the create panel's selection: the model
-/// drops `create_bot` on the next load (the picker re-aim rule's bot
-/// twin), so a vanished bot can never stay sourced.
-pub fn bots_load_drops_deleted_selection_test() {
-  let model =
-    new_model()
-    |> step(ui.BotsLoaded([bot_row("b1", "Writer", "", None)]))
-    |> step(ui.CreateBotChanged("b1"))
-  should.equal(model.create_bot, Some("b1"))
-  let reloaded = step(model, ui.BotsLoaded([]))
-  should.equal(reloaded.create_bot, None)
+/// The composer picker re-aims on load (the pick_provider rule, bot
+/// edition): a fresh picker falls to the FIRST bot, a selection whose
+/// bot was deleted falls back to the first survivor, and an empty bot
+/// list leaves nothing selected (the composer stands down).
+pub fn bots_load_defaults_and_reaims_selection_test() {
+  // No prior selection: the first bot.
+  let fresh =
+    new_model() |> step(ui.BotsLoaded([bot_row("b1", "Writer", "", None)]))
+  should.equal(fresh.create_bot, Some("b1"))
+
+  // A live selection survives a reload.
+  let picked =
+    fresh
+    |> step(ui.CreateBotChanged("b2"))
+    |> step(
+      ui.BotsLoaded([
+        bot_row("b1", "Writer", "", None),
+        bot_row("b2", "Coder", "", None),
+      ]),
+    )
+  should.equal(picked.create_bot, Some("b2"))
+
+  // A deleted selection falls to the first survivor — never stuck None
+  // while bots exist.
+  let reloaded =
+    step(picked, ui.BotsLoaded([bot_row("b1", "Writer", "", None)]))
+  should.equal(reloaded.create_bot, Some("b1"))
+
+  // Bots gone entirely: nothing selected.
+  let empty = step(reloaded, ui.BotsLoaded([]))
+  should.equal(empty.create_bot, None)
 }
 
 // ---------------------------------------------------------------------------
-// #88: creation moved to unlinked workers + the shared pending guard
+// #88: creation runs in unlinked workers behind the shared pending guard;
+// the compose-new send (no selection) IS the create trigger.
 // ---------------------------------------------------------------------------
 
-/// A model whose create panel is ready for a PLAIN create: a provider
-/// loaded and auto-aimed, aliases loaded (the first lands in the picker).
-fn plain_ready_model() -> ui.Model {
+/// A model ready to compose a new thread: bots loaded (the picker
+/// defaults to the first), nothing selected.
+fn compose_ready_model() -> ui.Model {
   new_model()
-  |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
-  |> step(ui.AliasesLoaded("p1", ["smart"]))
+  |> step(
+    ui.BotsLoaded([
+      bot_row("b1", "Writer", "", None),
+      bot_row("b2", "Coder", "", None),
+    ]),
+  )
 }
 
-/// The plain request latches the shared pending guard, and a duplicate
-/// click while one create is in flight is rejected wholesale.
-pub fn create_request_sets_pending_guard_test() {
-  let model = plain_ready_model()
+/// The compose-new send latches the shared pending guard AND stashes the
+/// draft; a duplicate send while the create is in flight is rejected
+/// wholesale. The textarea is untouched (the composer key holds), so the
+/// visible draft and the stash stay the same text.
+pub fn compose_send_stashes_draft_and_guards_test() {
+  let model = compose_ready_model()
   model.create_pending |> should.be_false
+  model.pending_send |> should.equal(None)
 
-  let pending = step(model, ui.CreateRequested)
+  let pending = step(model, ui.SendRequested("hello there"))
   pending.create_pending |> should.be_true
+  pending.pending_send |> should.equal(Some("hello there"))
+  // The draft survives in the untouched textarea: the key did not move.
+  pending.composer |> should.equal(model.composer)
 
-  // A duplicate request starts nothing: the guard rejects it and the
-  // model comes back untouched.
-  let rejected = step(pending, ui.CreateRequested)
+  // A duplicate send starts nothing: the guard rejects it wholesale.
+  let rejected = step(pending, ui.SendRequested("hello there"))
   rejected |> should.equal(pending)
 }
 
-/// ONE guard spans both paths: a pending plain create rejects a request
-/// that switched to start-from-bot, and a pending bot create rejects one
-/// that switched back to the plain picker.
-pub fn create_pending_guard_spans_both_paths_test() {
-  // Plain request pending; switch the panel to a bot mid-flight.
-  let switched =
-    plain_ready_model()
-    |> step(ui.CreateRequested)
-    |> step(ui.BotsLoaded([bot_row("b1", "Writer", "", None)]))
-    |> step(ui.CreateBotChanged("b1"))
-    |> step(ui.CreateRequested)
+/// Picking a different bot while a create is in flight is allowed (it is
+/// a pure model write); it does not start a second create.
+pub fn compose_send_pending_bot_change_is_harmless_test() {
+  let pending = compose_ready_model() |> step(ui.SendRequested("hi"))
+  let switched = step(pending, ui.CreateBotChanged("b2"))
   switched.create_pending |> should.be_true
-  switched.create_bot |> should.equal(Some("b1"))
-
-  // Mirror: bot-sourced request pending; switch back to the plain
-  // picker mid-flight and click again.
-  let bot_pending =
-    plain_ready_model()
-    |> step(ui.BotsLoaded([bot_row("b1", "Writer", "", None)]))
-    |> step(ui.CreateBotChanged("b1"))
-    |> step(ui.CreateRequested)
-  bot_pending.create_pending |> should.be_true
-  let back_to_plain = step(bot_pending, ui.CreateBotChanged(""))
-  let rejected = step(back_to_plain, ui.CreateRequested)
-  rejected |> should.equal(back_to_plain)
+  switched.create_bot |> should.equal(Some("b2"))
+  switched.pending_send |> should.equal(Some("hi"))
 }
 
-/// The worker's success reply clears the guard and keeps the pre-worker
-/// behaviour intact: row added, panel closed, new thread selected.
-pub fn created_clears_pending_guard_test() {
-  let pending = plain_ready_model() |> step(ui.CreateRequested)
+/// The worker's success reply clears the guard, selects the fresh
+/// thread, and dispatches the stashed draft as its first message (the
+/// send effect rides the same update — the harness drops effects, so
+/// the model-level contract is what's pinned here).
+pub fn created_selects_and_releases_draft_test() {
+  let pending = compose_ready_model() |> step(ui.SendRequested("hello"))
   let done = step(pending, ui.Created(summary("s-new", False)))
   done.create_pending |> should.be_false
-  done.create_open |> should.be_false
+  done.pending_send |> should.equal(None)
   done.selected |> should.equal(Some("s-new"))
   list.map(done.threads, fn(t) { t.id }) |> should.equal(["s-new"])
 }
 
-/// The worker's failure reply clears the guard too — a refused create
-/// must not lock the panel — and a later request can proceed.
+/// The worker's failure reply clears the guard and the stash — a
+/// refused create must not lock the composer — while the VISIBLE draft
+/// survives (no re-key happened) and a later send can proceed.
 pub fn create_failed_clears_guard_and_allows_retry_test() {
-  let pending = plain_ready_model() |> step(ui.CreateRequested)
+  let pending = compose_ready_model() |> step(ui.SendRequested("hello"))
   let failed = step(pending, ui.CreateFailed("provider became unusable"))
   failed.create_pending |> should.be_false
+  failed.pending_send |> should.equal(None)
+  failed.composer |> should.equal(pending.composer)
   let assert [
     ui.NoteLine(True, "could not create thread: provider became unusable"),
     ..
   ] = failed.log
 
-  let retried = step(failed, ui.CreateRequested)
+  let retried = step(failed, ui.SendRequested("hello"))
   retried.create_pending |> should.be_true
 }
 
-/// The Create button stays honest with the guard: disabled while any
-/// create is pending, on either path, and enabled when idle (with a
-/// provider + aliases present).
-pub fn view_create_button_disabled_while_pending_test() {
-  let ready =
-    plain_ready_model()
-    |> step(ui.NewThreadToggled)
-    |> view_string
-  should.be_false(string.contains(ready, "disabled id=\"create-thread\""))
+/// A send into a SELECTED thread never stashes or creates.
+pub fn selected_send_does_not_compose_test() {
+  let model =
+    compose_ready_model()
+    |> step(ui.ThreadsLoaded([summary("s-1", False)]))
+    |> step(ui.Select("s-1"))
+  let sent = step(model, ui.SendRequested("hi"))
+  sent.pending_send |> should.equal(None)
+  sent.create_pending |> should.be_false
+}
 
-  let pending =
-    plain_ready_model()
-    |> step(ui.CreateRequested)
-    |> step(ui.NewThreadToggled)
-    |> view_string
-  should.be_true(string.contains(pending, "disabled id=\"create-thread\""))
+/// Compose-new with NO bot picked: the send is a no-op (the composer is
+/// disabled in this state; the arm is the defensive twin).
+pub fn compose_send_without_bot_is_noop_test() {
+  let model = compose_ready_model() |> step(ui.BotsLoaded([]))
+  let sent = step(model, ui.SendRequested("hi"))
+  sent.pending_send |> should.equal(None)
+  sent.create_pending |> should.be_false
+}
 
-  let bot_pending =
-    plain_ready_model()
-    |> step(ui.BotsLoaded([bot_row("b1", "Writer", "", None)]))
-    |> step(ui.CreateBotChanged("b1"))
-    |> step(ui.CreateRequested)
-    |> view_string
-  should.be_true(string.contains(bot_pending, "disabled id=\"create-thread\""))
+/// The Send button stays honest with the guard: disabled while a
+/// compose-new create is in flight, and enabled when idle with a bot to
+/// start from.
+pub fn view_send_button_disabled_while_pending_test() {
+  let ready = compose_ready_model() |> view_string
+  should.be_false(string.contains(ready, "disabled id=\"send\""))
+
+  let pending = compose_ready_model() |> step(ui.SendRequested("hi"))
+  let html = pending |> view_string
+  should.be_true(string.contains(html, "disabled id=\"send\""))
 }
 
 // --- the worker harness: real runtime over real (offline) registries ---
@@ -4727,9 +4691,26 @@ fn start_offline_registries(
   process.Subject(provider_registry.Msg),
   process.Subject(bot_registry.Msg),
 ) {
+  start_offline_registries_with_resolver(seed, fetch, fixture_resolver())
+}
+
+/// The same harness with an explicit provider seam: the compose-send
+/// tests pass the DEAD loopback resolver so the draft's follow-up turn
+/// fails fast at stream time, fully offline (connection refused — no
+/// DNS, no TLS).
+fn start_offline_registries_with_resolver(
+  seed: fn(store.Store) -> Result(Nil, String),
+  fetch: fn(openai.Endpoint) -> Result(List(String), openai.StreamError),
+  resolve: thread_registry.ResolveProvider,
+) -> #(
+  process.Subject(thread_registry.Msg),
+  process.Subject(provider_registry.Msg),
+  process.Subject(bot_registry.Msg),
+) {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
   store_mock.ensure_fixture_provider(seam)
+  store_mock.ensure_fixture_bot(seam)
   let _ = seed(seam)
 
   let assert Ok(started_providers) =
@@ -4755,7 +4736,7 @@ fn start_offline_registries(
       seam,
       toolset(unused_turn_runner),
       fn() { [] },
-      fixture_resolver(),
+      resolve,
       // Bots P3c: the delivery wrapper's sender-name ask resolves this
       // name at ask time — the SAME name this harness started the bot
       // registry under.
@@ -4764,6 +4745,20 @@ fn start_offline_registries(
       dict.new(),
     )
   #(started_registry.data, started_providers.data, started_bots.data)
+}
+
+/// A resolver whose endpoint is a CLOSED LOOPBACK port: creates freeze
+/// it, and any turn that runs against it fails immediately at stream
+/// time — fully offline (connection refused; no DNS, no TLS).
+fn dead_resolver() -> thread_registry.ResolveProvider {
+  fn(_id) {
+    Ok(openai.Endpoint(
+      base_url: "http://127.0.0.1:1/v1",
+      api_key: None,
+      sse_first_response_timeout_ms: 100,
+      stream_idle_timeout_ms: 100,
+    ))
+  }
 }
 
 /// Start the runtime exactly like the /ws socket handler does, with a
@@ -4813,15 +4808,17 @@ fn wait_for_thread_count(
 }
 
 /// The create worker over the real runtime, pinning the no-preflight
-/// contract end to end: an alias OFF the provider's live list lands as a
-/// pinned thread (proxies like Bifrost accept aliases their /v1/models
-/// may not carry — see `nexus/thread_create`), and the create path
-/// fetches no model list at all. The view-patch check below only
-/// EXERCISES runtime liveness — with the preflight gone, nothing on the
-/// create path can block, so this test no longer proves it (that
+/// contract end to end: a bot pinned to an alias OFF the provider's live
+/// list lands as a thread (proxies like Bifrost accept aliases their
+/// /v1/models may not carry — see `nexus/thread_create`), and the create
+/// path fetches no model list at all. The compose-new send IS the create
+/// trigger; the view-patch check below only EXERCISES runtime liveness —
+/// with the preflight gone, nothing on the create path can block (that
 /// guarantee is structural: the worker is spawned unlinked;
 /// duplicates-while-pending stay pinned at the unit level,
-/// `create_pending_guard_spans_both_paths_test`).
+/// `compose_send_stashes_draft_and_guards_test`). The dead-loopback
+/// resolver keeps the draft's follow-up turn offline: the turn fails at
+/// stream time, exactly the dead-alias semantics.
 pub fn create_worker_lands_off_list_alias_and_runtime_stays_live_test() {
   // The gate protocol doubles as the settle barrier: the boot alias load
   // is the ONLY fetch this test answers — receiving its signal proves
@@ -4829,33 +4826,56 @@ pub fn create_worker_lands_off_list_alias_and_runtime_stays_live_test() {
   // before anything below is dispatched.
   let started = process.new_subject()
   let #(registry, providers, bots) =
-    start_offline_registries(fn(_seam) { Ok(Nil) }, fn(_endpoint) {
-      let gate = process.new_subject()
-      process.send(started, gate)
-      let assert Ok(answer) = process.receive(gate, 60_000)
-      answer
-    })
+    start_offline_registries_with_resolver(
+      fn(seam) {
+        seam.insert_bot(bot.Bot(
+          id: "b-off",
+          name: "Writer",
+          description: "",
+          provider_id: store_mock.fixture_provider_id,
+          model: "alias-gone",
+          system_prompt: None,
+          tools: None,
+          allow_inbound: True,
+          created_at: 0,
+          updated_at: 0,
+        ))
+      },
+      fn(_endpoint) {
+        let gate = process.new_subject()
+        process.send(started, gate)
+        let assert Ok(answer) = process.receive(gate, 60_000)
+        answer
+      },
+      dead_resolver(),
+    )
   let #(runtime, client) = boot_create_runtime(registry, providers, bots)
-  let assert Ok(gate_1) = process.receive(started, 10_000)
-  process.send(gate_1, Ok(["alias-1"]))
 
-  // Create with an alias the live list does not carry (PickerChanged is
-  // sticky across the alias load's auto-aim — a non-empty picker is
-  // kept), then immediately flip the view: the runtime must serve the
-  // patch while the create worker runs.
+  // The settle barrier is a VIEW PATCH now: the boot cascade no longer
+  // fetches a model list at all, so the old fetch-gate protocol has
+  // nothing to gate on. The compose-new hint flipping to "pick a bot"
+  // proves BotsLoaded landed — and the providers load (the batch's
+  // first effect) completed before it.
+  let _ = wait_for_patch(client, "Pick a bot beside the composer", 40)
+
+  // Compose a new thread from the bot (an explicit pick — no ordering
+  // dependency on the boot bots load) and immediately flip the view: the
+  // runtime must serve the patch while the create worker runs. The send
+  // carries the draft that becomes the fresh thread's first message.
   lustre.send(
     to: runtime,
-    message: lustre.dispatch(ui.PickerChanged("alias-gone")),
+    message: lustre.dispatch(ui.CreateBotChanged("b-off")),
   )
-  lustre.send(to: runtime, message: lustre.dispatch(ui.CreateRequested))
+  lustre.send(to: runtime, message: lustre.dispatch(ui.SendRequested("hello")))
   lustre.send(to: runtime, message: lustre.dispatch(ui.SettingsToggled))
   let _ = wait_for_patch(client, "Back to chat", 20)
 
-  // The thread LANDED — an off-list alias is a valid pin, not a refusal.
+  // The thread LANDED — an off-list alias is a valid pin, not a refusal,
+  // and the bot is its required provenance.
   let threads = wait_for_thread_count(registry, 1, 40)
   let assert [only] = threads
   only.model |> should.equal("alias-gone")
-  only.bot_id |> should.equal(None)
+  only.bot_id |> should.equal(Some("b-off"))
 
   // And the create path fetched NO model list: the boot load was the
   // only call (the old preflight is gone, not merely permissive).
@@ -4867,7 +4887,7 @@ pub fn create_worker_lands_off_list_alias_and_runtime_stays_live_test() {
 pub fn create_from_bot_worker_lands_provenance_test() {
   let started = process.new_subject()
   let #(registry, providers, bots) =
-    start_offline_registries(
+    start_offline_registries_with_resolver(
       fn(seam) {
         seam.insert_bot(bot.Bot(
           id: "b7",
@@ -4888,17 +4908,19 @@ pub fn create_from_bot_worker_lands_provenance_test() {
         let assert Ok(answer) = process.receive(gate, 60_000)
         answer
       },
+      dead_resolver(),
     )
   let #(runtime, _client) = boot_create_runtime(registry, providers, bots)
 
-  // The first fetch signal proves the boot provider load landed; then
-  // start-from-bot: the worker resolves the bot and creates directly —
-  // no live-list fetch on the create path (the boot load was the only
-  // one).
-  let assert Ok(gate_1) = process.receive(started, 10_000)
-  process.send(gate_1, Ok(["alias-1"]))
+  // Compose-from-bot: the worker resolves the bot and creates directly —
+  // no live-list fetch anywhere on the create path (the fetch closure
+  // below is never called; the final receive asserts that). The explicit
+  // CreateBotChanged pick carries no ordering dependency on the boot
+  // bots load, and the dead-loopback resolver keeps the draft's
+  // follow-up turn offline (it fails at stream time — the dead-alias
+  // semantics).
   lustre.send(to: runtime, message: lustre.dispatch(ui.CreateBotChanged("b7")))
-  lustre.send(to: runtime, message: lustre.dispatch(ui.CreateRequested))
+  lustre.send(to: runtime, message: lustre.dispatch(ui.SendRequested("hello")))
 
   let threads = wait_for_thread_count(registry, 1, 40)
   let assert [only] = threads
@@ -4915,18 +4937,35 @@ pub fn create_from_bot_worker_lands_provenance_test() {
 pub fn create_worker_crash_releases_guard_test() {
   let started = process.new_subject()
   let #(registry, providers, bots) =
-    start_offline_registries(fn(_seam) { Ok(Nil) }, fn(_endpoint) {
-      let gate = process.new_subject()
-      process.send(started, gate)
-      let assert Ok(answer) = process.receive(gate, 60_000)
-      answer
-    })
+    start_offline_registries(
+      fn(seam) {
+        seam.insert_bot(bot.Bot(
+          id: "b7",
+          name: "Writer",
+          description: "",
+          provider_id: store_mock.fixture_provider_id,
+          model: "alias-1",
+          system_prompt: None,
+          tools: None,
+          allow_inbound: True,
+          created_at: 0,
+          updated_at: 0,
+        ))
+      },
+      fn(_endpoint) {
+        let gate = process.new_subject()
+        process.send(started, gate)
+        let assert Ok(answer) = process.receive(gate, 60_000)
+        answer
+      },
+    )
   let #(runtime, client) = boot_create_runtime(registry, providers, bots)
 
-  // The first fetch signal proves the boot provider load landed; answer
-  // it so the cascade drains.
-  let assert Ok(gate_1) = process.receive(started, 10_000)
-  process.send(gate_1, Ok(["alias-1"]))
+  // Let the boot cascade drain BEFORE the kill (the connect effect asks
+  // the provider registry; a mid-cascade kill would crash the runtime
+  // instead of exercising the worker). The patch barrier is the same
+  // one the landing test uses.
+  let _ = wait_for_patch(client, "Pick a bot beside the composer", 40)
 
   // Kill the provider registry (unlinked first: it is linked to this
   // test process). The worker's very next registry call now panics.
@@ -4939,14 +4978,14 @@ pub fn create_worker_crash_releases_guard_test() {
   // this test would exercise the success path instead of the crash path.
   wait_until_dead(pid, 100)
 
-  lustre.send(
-    to: runtime,
-    message: lustre.dispatch(ui.PickerChanged("alias-1")),
-  )
-  lustre.send(to: runtime, message: lustre.dispatch(ui.CreateRequested))
+  // The compose-new send starts the create (the bot pick is explicit —
+  // no ordering dependency on the boot bots load). The crash surfaces
+  // as a create-failure note (the guard clears with it — pinned offline
+  // by create_failed_clears_guard_and_allows_retry); the draft never
+  // sends because nothing landed.
+  lustre.send(to: runtime, message: lustre.dispatch(ui.CreateBotChanged("b7")))
+  lustre.send(to: runtime, message: lustre.dispatch(ui.SendRequested("hello")))
 
-  // The crash surfaces as a create-failure note (the guard clears with
-  // it — pinned offline by create_failed_clears_guard_and_allows_retry).
   let _ = wait_for_patch_prefix(client, "could not create thread: ", 40)
   thread_registry.list_threads(registry) |> should.equal([])
 }

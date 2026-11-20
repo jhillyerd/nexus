@@ -679,6 +679,7 @@ pub fn create_freezes_live_schema_into_manifest_test() {
   complete_handshake(fake)
   let persistence = store_mock.seam(store_mock.start())
   store_mock.ensure_fixture_provider(persistence)
+  store_mock.ensure_fixture_bot(persistence)
   let factory_name = process.new_name("nexus_freeze_factory")
   let assert Ok(_factory) =
     factory_supervisor.start(thread_registry.factory_builder(factory_name))
@@ -705,7 +706,7 @@ pub fn create_freezes_live_schema_into_manifest_test() {
         model: "alpha",
         system_prompt: None,
         toolset: Some(["fakesrv__get_issue"]),
-        bot_id: None,
+        bot_id: "b-fixture",
         parent_thread_id: None,
         title: "",
       ),
@@ -735,6 +736,7 @@ pub fn create_freezes_live_schema_into_manifest_test() {
 pub fn unmounted_server_create_is_honest_400_test() {
   let persistence = store_mock.seam(store_mock.start())
   store_mock.ensure_fixture_provider(persistence)
+  store_mock.ensure_fixture_bot(persistence)
   let factory_name = process.new_name("nexus_unmount_factory")
   let assert Ok(_factory) =
     factory_supervisor.start(thread_registry.factory_builder(factory_name))
@@ -758,7 +760,7 @@ pub fn unmounted_server_create_is_honest_400_test() {
         model: "alpha",
         system_prompt: None,
         toolset: Some(["ghost__tool"]),
-        bot_id: None,
+        bot_id: "b-fixture",
         parent_thread_id: None,
         title: "",
       ),
@@ -779,6 +781,7 @@ pub fn hydration_replays_frozen_schema_without_server_contact_test() {
   complete_handshake(fake)
   let persistence = store_mock.seam(store_mock.start())
   store_mock.ensure_fixture_provider(persistence)
+  store_mock.ensure_fixture_bot(persistence)
   let factory_name = process.new_name("nexus_hydr_factory")
   let assert Ok(_factory) =
     factory_supervisor.start(thread_registry.factory_builder(factory_name))
@@ -804,7 +807,7 @@ pub fn hydration_replays_frozen_schema_without_server_contact_test() {
         model: "alpha",
         system_prompt: None,
         toolset: Some(["fakesrv__t"]),
-        bot_id: None,
+        bot_id: "b-fixture",
         parent_thread_id: None,
         title: "",
       ),
@@ -995,6 +998,7 @@ pub fn corrupt_row_ids_are_not_reminted_test() {
   // fresh create can never collide with the corrupt row on insert.
   let persistence = store_mock.seam(store_mock.start())
   store_mock.ensure_fixture_provider(persistence)
+  store_mock.ensure_fixture_bot(persistence)
   let factory_name = process.new_name("nexus_corrupt_factory")
   let assert Ok(_factory) =
     factory_supervisor.start(thread_registry.factory_builder(factory_name))
@@ -1020,7 +1024,7 @@ pub fn corrupt_row_ids_are_not_reminted_test() {
         model: "alpha",
         system_prompt: None,
         toolset: None,
-        bot_id: None,
+        bot_id: "b-fixture",
         parent_thread_id: None,
         title: "",
       ),
