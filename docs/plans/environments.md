@@ -190,10 +190,17 @@ committed; nothing new rolls back.
   `http_fetch`'s max-bytes pattern; post-hoc truncation does not bound
   memory) + canonical-path confinement for the fs tools
   (`read_file`/`write_file`/`list_dir` resolve against the workspace
-  root and refuse escapes). This contains accidents and bounded output,
-  not a hostile model: a `bash` command can still reach the host (`cd
-  /`, absolute paths, symlinks — cwd confines nothing by itself), so
-  until the escalation lands, prompt-injection → host access under the
+  root and refuse escapes) + an ALLOWLIST child environment
+  (`nexus_env_ffi.sandbox_env/1`: PATH passthrough, HOME rewritten to
+  the workspace dir, TZ and the non-secret CA-path vars
+  (`SSL_CERT_FILE`/`SSL_CERT_DIR`) when set — a workspace bash must
+  never inherit the BEAM's environment, where one `env` away from the
+  transcript sit `DATABASE_URL`, `NEXUS_PG_*`, and every other
+  secret the server holds). This contains accidents and bounded
+  output, not a hostile model: a `bash` command can still reach the
+  host (`cd /`, absolute paths, symlinks — cwd confines nothing by
+  itself) and dial out, so until the escalation lands,
+  prompt-injection → host access under the
   nexus user is an accepted, recorded risk of the Pi model on the
   operator's own server. The escalation is container-per-workspace —
   and the **external container workspace** (a

@@ -26,8 +26,12 @@
 //// enforced WHILE READING (port output and file reads capped at
 //// accumulation — post-hoc truncation does not bound memory) +
 //// LEXICAL canonical-path confinement for the fs tools (symlinks can
-//// still escape; `bash` can always reach the host — the recorded
-//// accepted risk of the Pi model on the operator's own server).
+//// still escape) + an ALLOWLIST child environment (PATH passthrough,
+//// HOME rewritten to the workspace, TZ and CA-path vars when set —
+//// the FFI's sandbox_env; `bash` never inherits the BEAM's secrets) (`bash`
+//// can still reach the host filesystem and network as this uid —
+//// the recorded accepted risk of the Pi model on the operator's own
+//// server, #126's remaining work).
 ////
 //// Process model: executors run inside the per-turn worker (the
 //// codemode pattern). `bash` spawns a port owned by the calling

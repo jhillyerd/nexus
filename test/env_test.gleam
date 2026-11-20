@@ -312,6 +312,71 @@ pub fn bash_runs_in_workspace_cwd_test() {
   let _ = simplifile.delete(root)
 }
 
+/// Plant a canary in the EMULATOR's environment (the test FFI
+/// converts binaries to the lists os:putenv demands). A plain port
+/// would hand that environment to the child — the scrubbed spawn
+/// must not carry it across.
+@external(erlang, "nexus_env_test_ffi", "put_env")
+fn put_env(name: String, value: String) -> Nil
+
+@external(erlang, "nexus_env_test_ffi", "unset_env")
+fn unset_env(name: String) -> Nil
+
+@external(erlang, "nexus_env_test_ffi", "get_env")
+fn get_env(name: String) -> Result(String, Nil)
+
+/// Restore a stomped variable to its ORIGINAL value — unset only when
+/// it was absent before the plant (OCR review: an unconditional unset
+/// destroys a machine's real CA config for the rest of the run).
+fn restore(name: String, original: Result(String, Nil)) -> Nil {
+  case original {
+    Ok(value) -> put_env(name, value)
+    Error(Nil) -> unset_env(name)
+  }
+}
+
+pub fn bash_environment_is_allowlisted_test() {
+  let root = fresh_root()
+  let original_cert = get_env("SSL_CERT_FILE")
+  let original_tz = get_env("TZ")
+  put_env("NEXUS_TEST_SECRET_CANARY", "hunter2-database-url")
+  put_env("SSL_CERT_FILE", root <> "/fake-ca.pem")
+  put_env("TZ", "UTC")
+  // Failure-safe cleanup (OCR review): bind WITHOUT asserting first, so
+  // a failing bash call cannot skip the restore and leave the plants in
+  // the emulator's process-global environment for the rest of the run.
+  let out = bash(env_for(root), 5000, "env")
+  unset_env("NEXUS_TEST_SECRET_CANARY")
+  restore("SSL_CERT_FILE", original_cert)
+  restore("TZ", original_tz)
+  let assert Ok(out) = out
+  // The BEAM's secrets do NOT ride into the child (#126): the canary
+  // planted in the emulator's own environment is absent…
+  let assert False = string.contains(out, "hunter2-database-url")
+  let assert False = string.contains(out, "NEXUS_TEST_SECRET_CANARY")
+  // …while the allowlist keeps the child working: PATH resolves bare
+  // names, HOME is REWRITTEN to the workspace dir (not the operator's
+  // home, which may well be this test's real HOME).
+  let assert True = string.contains(out, "PATH=")
+  let ws =
+    env.workspace_dir(env.Environment(
+      workspace_root: root,
+      thread_id: "t1",
+      roster: env.attached_targets(),
+      remote: None,
+    ))
+  let assert True = string.contains(out, "HOME=" <> ws)
+  // CA paths pass through (OCR review): non-secret, and dropping them
+  // breaks TLS on env-configured systems. TZ's "when set" half of the
+  // passthrough is pinned the same way.
+  let assert True = string.contains(out, "SSL_CERT_FILE=" <> root)
+  let assert True = string.contains(out, "TZ=UTC")
+  // Bare-name resolution really works through the passed PATH.
+  let assert Ok(tr) = bash(env_for(root), 5000, "command -v cat")
+  let assert True = string.contains(tr, "/cat")
+  let _ = simplifile.delete(root)
+}
+
 pub fn bash_exit_status_is_data_test() {
   let root = fresh_root()
   let assert Ok(out) = bash(env_for(root), 5000, "echo oops >&2; exit 3")

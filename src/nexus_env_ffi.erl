@@ -8,7 +8,8 @@
 %%   does NOT search PATH). First regular-file execute-bit hit wins.
 %% - open_port/3: spawn a child with its stdio wired to the port
 %%   (use_stdio, binary, exit_status, hide, stderr_to_stdout) with a
-%%   working directory ({cd, Dir}) — the workspace's cwd default.
+%%   working directory ({cd, Dir}) — the workspace's cwd default — and
+%%   a SCRUBBED environment ({env, sandbox_env/1}; see below).
 %% - kill_tree/1: best-effort kill of the child AND its process group.
 %%   The workspace bash prints its own pid (== its process-group id when
 %%   launched under setsid) as the first stdout line; the caller parses
@@ -28,6 +29,8 @@
 %% error, never a crash of the per-turn worker.
 -module(nexus_env_ffi).
 
+-define(DEFAULT_PATH, "/usr/local/bin:/usr/bin:/bin").
+
 -export([resolve/1, open_port/3, kill_tree/2, to_text_lossy/1, read_capped/2,
          split_line/1, kill_group_marker/1, kill_pid_marker/1]).
 
@@ -43,7 +46,7 @@ resolve(Name) ->
             true ->
                 {ok, Name};
             false ->
-                Path = os:getenv("PATH", "/usr/local/bin:/usr/bin:/bin"),
+                Path = os:getenv("PATH", ?DEFAULT_PATH),
                 Dirs = string:split(Path, ":", all),
                 Hit =
                     lists:search(
@@ -68,9 +71,21 @@ executable(F) ->
             false
     end.
 
-%% Spawn a child with cwd confinement. {cd, Dir} fails the spawn when
-%% the directory does not exist — the caller creates the workspace
-%% lazily first, so a failure here is an honest spawn error.
+%% Spawn a child with cwd confinement and an ALLOWLIST environment.
+%% {cd, Dir} fails the spawn when the directory does not exist — the
+%% caller creates the workspace lazily first, so a failure here is an
+%% honest spawn error. {env, …} is the scrub (jhillyerd/nexus#126): a
+%% plain port would inherit the BEAM's whole environment, and one
+%% `env` inside a workspace bash would print DATABASE_URL, NEXUS_PG_*,
+%% API keys — every secret the server holds — straight into the
+%% transcript. Note {env, …} MERGES into the inherited environment
+%% (verified against OTP 27: a canary planted via os:putenv rides
+%% straight through the tuple form; the old replace-all string-list
+%% form is removed), so sandbox_env/1 must explicitly UNSET everything
+%% not allowed, not just set the allowed. The allowlist keeps the
+%% child working without the secrets; it is NOT a sandbox (bash still
+%% runs as this uid and can read the filesystem and dial out — #126's
+%% real work).
 open_port(Command, Args, Cwd) ->
     try
         Port =
@@ -83,11 +98,74 @@ open_port(Command, Args, Cwd) ->
                               stderr_to_stdout,
                               {args,
                                [unicode:characters_to_list(A) || A <- Args]},
-                              {cd, unicode:characters_to_list(Cwd)}]),
+                              {cd, unicode:characters_to_list(Cwd)},
+                              {env, sandbox_env(Cwd)}]),
         {ok, Port}
     catch
         _:_ -> {error, <<"spawn failed">>}
     end.
+
+%% The workspace-child allowlist — the child's environment is EXACTLY
+%% these, nothing inherited. Three variables, each earning its place:
+%%
+%% - PATH passes through (default matches resolve/1) because bare
+%%   command names are the common shape of model-authored commands;
+%%   setsid/bash themselves are already PATH-resolved BEAM-side against
+%%   the same value, so the wrapper never needs it.
+%% - HOME is REWRITTEN to the workspace dir: unset makes common tools
+%%   (git, pip…) warn or misbehave, inherited points `~` at the
+%%   operator's home (exactly the direction an injected `cat ~/…`
+%%   wants); the workspace keeps `~` inside the confined tree and tool
+%%   caches/lockfiles land in the disposable per-thread dir.
+%% - TZ passes through when set: no secret, and it keeps `date`-style
+%%   output stable across the scrub.
+%% - SSL_CERT_FILE / SSL_CERT_DIR pass through when set (OCR review):
+%%   CA paths, not secrets — but dropping them breaks TLS in workspace
+%%   bash on env-configured systems (custom CAs, NixOS), which the
+%%   recorded "can still dial out" posture explicitly promises works.
+%%
+%% Locale (LANG/LC_*) stays deliberately dropped: the deterministic C
+%% locale is the right default for model-driven tooling (stable sort,
+%% stable messages), not an accident to paper over.
+%%
+%% Everything inherited and not on that list is {Name, false} — the
+%% unset that turns the MERGING {env, …} option into a replace (see
+%% open_port/3 above for the experiment that pinned this).
+%%
+%% Deliberately NOT a passthrough knob: operators needing vars inside
+%% the workspace is a sandbox-config question (#126), not an env one.
+sandbox_env(Cwd) ->
+    Allow =
+        maps:from_list(
+          [{"HOME", unicode:characters_to_list(Cwd)},
+           {"PATH", os:getenv("PATH", ?DEFAULT_PATH)}]
+          ++ pass_through(["TZ", "SSL_CERT_FILE", "SSL_CERT_DIR"])),
+    Unset =
+        [{Name, false}
+         || Name <- inherited_env_names(),
+            not maps:is_key(Name, Allow)],
+    maps:to_list(Allow) ++ Unset.
+
+%% The inherited environment's variable names (os:getenv/0 answers
+%% "NAME=VALUE" strings; a leading-= split is the whole parse).
+inherited_env_names() ->
+    [case string:split(Entry, "=", leading) of
+         [Name, _Value] -> Name;
+         [Name] -> Name
+     end
+     || Entry <- os:getenv()].
+
+%% {Name, Value} pairs for each listed variable that is actually set —
+%% passthrough helpers, unset names contribute nothing.
+pass_through(Names) ->
+    lists:filtermap(
+      fun(Name) ->
+          case os:getenv(Name) of
+              false -> false;
+              Value -> {true, {Name, Value}}
+          end
+      end,
+      Names).
 
 %% Kill the child's whole process group when the pgid is known (the
 %% first-line marker under setsid: the child IS the group leader), then
