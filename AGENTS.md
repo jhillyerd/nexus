@@ -347,7 +347,12 @@ deltas; the rules that bite silently:
   pgid marker + the PATH-resolved `kill` BINARY with argv
   `["-9", "--", "-<pgid>"]` — the `--` is load-bearing (procps-ng
   4.x silently no-ops without it), and the kill helper must wait for
-  the binary to act (see `nexus_env_ffi.kill_tree`).
+  the binary to act (see `nexus_env_ffi.kill_tree`). The port spawns
+  with an ALLOWLIST environment, never the BEAM's inherited one (the
+  FFI's internal `sandbox_env/1` helper: PATH passthrough, HOME
+  rewritten to the workspace dir, TZ and CA-path vars when set) — a
+  workspace `env` must not print `DATABASE_URL` and friends into the
+  transcript (#126).
 - **Caps are enforced WHILE READING** (bash output, `read_file` via
   the FFI's chunked read) — post-hoc truncation does not bound
   memory. Non-UTF-8 command output decodes lossily (latin-1
