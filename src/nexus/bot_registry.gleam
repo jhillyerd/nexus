@@ -270,7 +270,10 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       }
       let counter = counter + 1
       let id = "b" <> int.to_string(counter)
-      case create_row(state, id, params) {
+      // The pre-check reads the HEALED rows: a name minted by another
+      // instance answers DuplicateName (409), not the store's
+      // unique-name backstop via StoreFailed (502).
+      case create_row(State(..state, rows: rows), id, params) {
         Error(error) -> {
           process.send(reply, Error(error))
           actor.continue(state)

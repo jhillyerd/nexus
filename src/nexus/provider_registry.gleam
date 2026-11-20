@@ -341,7 +341,9 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       }
       let counter = counter + 1
       let id = "p" <> int.to_string(counter)
-      case create_row(state, id, params) {
+      // The pre-check reads the HEALED rows (the bot registry's rule):
+      // a name minted elsewhere answers DuplicateName, not StoreFailed.
+      case create_row(State(..state, rows: rows), id, params) {
         Error(error) -> {
           process.send(reply, Error(error))
           actor.continue(state)

@@ -179,6 +179,11 @@ pub fn mint_reseeds_past_rows_minted_elsewhere_test() {
   // The mint re-seeds past it instead of colliding on b1.
   let assert Ok(created) = bot_registry.create_bot(registry, params("fresh"))
   should.equal(created.id, "b4")
+  // The healed rows also serve the duplicate-name pre-check: a name
+  // minted elsewhere answers the friendly 409, not the store's
+  // unique-name backstop via StoreFailed.
+  bot_registry.create_bot(registry, params("minted-elsewhere"))
+  |> should.equal(Error(bot_registry.DuplicateName))
   // The store holds both rows — no lost update (List sorts by name,
   // so assert on the id set).
   let assert Ok(all) = bot_registry.list_bots(registry)
@@ -585,6 +590,16 @@ pub fn provider_mint_reseeds_past_rows_minted_elsewhere_test() {
       ),
     )
   should.equal(created.id, "p10")
+  // The healed rows serve the duplicate-name pre-check too.
+  provider_registry.create(
+    providers,
+    provider.ProviderParams(
+      name: "minted-elsewhere",
+      base_url: "http://elsewhere.test/v1",
+      api_key: None,
+    ),
+  )
+  |> should.equal(Error(provider_registry.DuplicateName))
 }
 
 // ---------------------------------------------------------------------------
