@@ -16,8 +16,11 @@
 //// the registry's bot-to-bot DM create always had. (This supersedes
 //// the old multi-provider §11 "400 unknown model" preflight.)
 ////
-//// Registry errors that can only be races surface as `CreateFailed`
-//// and stay server-side problems (502/503), not client errors.
+//// Registry errors surface as `CreateFailed`; most are client-data
+//// refusals (a blank bot id, an unknown toolset — 400s, the same
+//// vocabulary as a bad alias), while the true races (the provider
+//// vanished between resolve and create) stay server-side problems
+//// (502/503), not client errors.
 
 import gleam/erlang/process.{type Subject}
 import gleam/list
@@ -66,10 +69,11 @@ pub type CreateProblem {
   BotsUnavailable
   /// No bot with that id (the only create shape: `POST {"bot": id}`).
   BotUnknown(id: String)
-  /// The registry refused. After the bot + provider resolution, these
-  /// are races (the provider or a toolset source vanished mid-flight)
-  /// or start failures — the caller still maps them (400 empty
-  /// model/bot, 502 provider, 503 start).
+  /// The registry refused. A blank bot id or unknown toolset is client
+  /// data (400); provider and start failures after resolution are
+  /// races — the provider passed the resolve, then could not stream
+  /// when the thread pinned it (502/503). The caller still maps each
+  /// arm onto its status.
   CreateFailed(thread_registry.CreateError)
 }
 

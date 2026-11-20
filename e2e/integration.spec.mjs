@@ -554,6 +554,7 @@ async function main() {
       const cachePort = PORT + 1;
       // The live alias list from Bifrost (resolved once above — reused).
       const options = globalThis.INTEGRATION_ALIASES ?? [];
+      const cacheAlias = pickAlias(options, [CACHE_ALIAS, "qwen3.6-35b"], "cache (fractal)");
       cacheCapture.alias = cacheAlias;
       console.log(`  cache alias: ${cacheAlias} (fresh VM per thread)`);
 

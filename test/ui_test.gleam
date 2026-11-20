@@ -4887,7 +4887,7 @@ pub fn create_worker_lands_off_list_alias_and_runtime_stays_live_test() {
 pub fn create_from_bot_worker_lands_provenance_test() {
   let started = process.new_subject()
   let #(registry, providers, bots) =
-    start_offline_registries(
+    start_offline_registries_with_resolver(
       fn(seam) {
         seam.insert_bot(bot.Bot(
           id: "b7",
@@ -4908,6 +4908,7 @@ pub fn create_from_bot_worker_lands_provenance_test() {
         let assert Ok(answer) = process.receive(gate, 60_000)
         answer
       },
+      dead_resolver(),
     )
   let #(runtime, _client) = boot_create_runtime(registry, providers, bots)
 

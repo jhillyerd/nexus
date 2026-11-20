@@ -289,11 +289,12 @@ pub type Model {
     /// list that later becomes empty (e.g. external deletes + reconnect
     /// refresh) never hijacks a thread in progress back into settings.
     providers_seen: Bool,
-    /// True once any load has seen an ENABLED provider: the "no provider
-    /// configured" note fires on the first empty load and on the
-    /// TRANSITION from enabled to none — never per refresh (the same
-    /// non-stacking rule `providers_seen` gives the auto-open).
-    providers_enabled_seen: Bool,
+    /// Whether the PREVIOUS load saw an ENABLED provider: the "no
+    /// provider configured" note fires on the first empty load and on
+    /// the enabled-to-none TRANSITION — never per refresh. Tracking the
+    /// previous load (not "ever seen") is what keeps repeated empty
+    /// refreshes silent: the transition fires once, then the flag drops.
+    providers_enabled_last: Bool,
     /// Set by the deliberate no-selection entry points (archiving the
     /// open thread, the New-thread button): the loaded list must not
     /// auto-select a replacement — an empty selection is a real state,
@@ -711,7 +712,7 @@ pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
       settings: ui_settings.init(),
       settings_manual: False,
       providers_seen: False,
-      providers_enabled_seen: False,
+      providers_enabled_last: False,
       suppress_autoselect: False,
       threads: [],
       // A reload re-opens the client's last-selected thread: the page
@@ -852,15 +853,17 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       // transition detector).
       let model = case
         enabled,
-        model.providers_enabled_seen,
+        model.providers_enabled_last,
         model.providers_seen
       {
-        False, _, False ->
+        // The enabled-to-none transition is new information.
+        False, True, _ ->
           Model(..model, log: [
             NoteLine(True, "no provider configured — add one in Settings"),
             ..model.log
           ])
-        False, True, _ ->
+        // The FIRST load concluding none is too; later empties are not.
+        False, False, False ->
           Model(..model, log: [
             NoteLine(True, "no provider configured — add one in Settings"),
             ..model.log
@@ -876,11 +879,7 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         _, _, _ -> model
       }
       let model =
-        Model(
-          ..model,
-          providers_seen: True,
-          providers_enabled_seen: model.providers_enabled_seen || enabled,
-        )
+        Model(..model, providers_seen: True, providers_enabled_last: enabled)
       #(model, effect.none())
     }
 
@@ -4010,8 +4009,11 @@ fn composer(model: Model, has_thread: Bool) -> Element(Msg) {
   // the update-level guard rejects duplicates, and the button stays
   // honest with it (the #88 rule, composer edition).
   let can_send = has_thread || model.create_bot != None
-  let send_disabled =
-    model.streaming || !can_send || model.create_pending && !has_thread
+  // While a compose-new create is in flight BOTH controls stand down —
+  // even if the user selects some other thread in the meantime
+  // (`SendRequested` rejects every send until the create's reply lands,
+  // and that reply selects the fresh thread itself).
+  let send_disabled = model.streaming || !can_send || model.create_pending
   keyed.element(
     "form",
     [attr.id("composer"), attr.action("#"), submit_requested()],
@@ -4030,7 +4032,10 @@ fn composer(model: Model, has_thread: Bool) -> Element(Msg) {
                 <> " the picked bot (Enter to send)"
             }),
             attr.autofocus(True),
-            attr.disabled(!can_send),
+            // A pending compose-new create also stands the textarea down:
+            // `Created` sends the STASHED draft and `SendAccepted` re-keys
+            // the element, so edits made meanwhile would be silently lost.
+            attr.disabled(!can_send || model.create_pending),
             enter_key(),
           ],
           "",

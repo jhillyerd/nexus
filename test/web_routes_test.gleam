@@ -580,12 +580,13 @@ pub fn thread_page_route_test() {
 }
 
 // A provider may be NAMED after another provider's id — the id is the
-// unambiguous key and must win (review finding on PR #12). The HTTP
-// create no longer carries a provider identifier at all (threads are
-// bot-only; the bot row stores the CANONICAL id), so the surface-level
-// test is gone; the resolution itself keeps the id-first rule in
-// thread_create.resolve_provider for the bot path.
-pub fn create_thread_provider_id_wins_over_name_test() {
+// unambiguous key and must win (review finding on PR #12). With bot-only
+// creates the HTTP surface carries no provider identifier at all: the
+// bot row stores the CANONICAL id, so resolve_provider's id-first rule
+// is what the bot path always hits (the name fallback is defensive
+// only). What THIS surface can still pin is the dead-shape refusal that
+// replaced the old provider/model test.
+pub fn create_thread_dead_provider_model_shape_refused_test() {
   let #(_registry, _providers, port) =
     start_server_with(fn(providers) {
       create_provider(providers, "beta", "https://beta.test/v1")

@@ -172,7 +172,7 @@ fn create_bot(
 
 /// A thread of `bot` whose turn runner is the REAL loop over the REAL
 /// `bot_message` spec with a SCRIPTED stream (below) — the registry wraps
-/// it with the delivery identity because `bot_id` is `Some`.
+/// it with the delivery identity because the thread carries a bot id.
 fn create_bot_thread(
   booted: Booted,
   bot_id: String,
@@ -791,8 +791,9 @@ pub fn deliver_by_name_creates_dm_test() {
   )
 }
 
-/// Thread-id addressing goes direct (no DM map), including into a HUMAN
-/// thread (no bot on the target — no gate to read).
+/// Thread-id addressing goes direct (no DM map), including into a
+/// thread whose bot's inbound gate is OPEN (the gate reads the STORE
+/// row; the delivery here addresses the thread id, not the bot name).
 pub fn deliver_by_thread_id_direct_test() {
   let booted = boot()
   let alpha = create_bot(booted, "alpha", allow_inbound: True)

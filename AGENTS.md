@@ -228,8 +228,10 @@ Pinned by the e2e browser suite (`docs/plans/completed/m3-verification.md`);
   `docs/plans/completed/bots.md`; amended again — threads are bot-only).
   The toolset is persisted at creation as resolved manifest entries
   (the default set's, or the creating bot's; never NULL-for-default)
-  and resolved against the config-independent catalog (`tools.by_names`)
-  into runner bundles cached by the name tuple, so each distinct
+  and resolved through the registry's manifest path (`tools.by_names`
+  covers the compiled-in names; provider and MCP entries are frozen as
+  manifest entries at the create-time freeze) into runner bundles
+  cached by the name tuple, so each distinct
   toolset builds exactly once — the default-create tuple is now the
   default set PLUS `bot_message`/`list_bots` (a different cache entry
   than the boot-seeded human default, which only boot-time hydration
@@ -305,9 +307,11 @@ deltas; the rules that bite silently:
   tools stay explicit-only (explicit toolset or bot template) — so the
   default envelope stays a pure function of the boot config — the
   config-stability property the original never-in-default rule
-  protected. There is no HUMAN default anymore: every thread is
-  bot-sourced (threads are bot-only — the provider+model create shape
-  is gone), and the registry resolves the default sentinel to the
+  protected. There is no HUMAN-facing create default anymore (the
+  boot-seeded default bundle itself survives for hydration of pre-
+  bot-only rows): every thread is bot-sourced (threads are bot-only —
+  the provider+model create shape is gone), and the registry resolves
+  the default sentinel to the
   default set PLUS `bot_message` and `list_bots` for EVERY create, so
   each thread carries its bot's delivery identity. The RESOLVED root
   freezes per thread onto `thread.workspace_root`; hydration rebuilds

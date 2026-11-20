@@ -717,33 +717,48 @@ fn boot_sweep(persistence: Store) -> List(String) {
 fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
   case msg {
     Create(requested, reply) ->
-      // The bot-default toolset transform (bots P3c, #97; #127 added
-      // the discovery half; amended — botless threads are gone): EVERY
-      // thread is created from a bot, so the default sentinel now
-      // resolves for ALL creates to the default set PLUS `bot_message`
-      // and `list_bots` — every thread carries a bot identity, so every
-      // default-toolset thread gets the delivery tool (and its roster)
-      // and the discovery half. A bot that wants them gone names an
-      // explicit list without them; a chat-only `'{}'` bot already
-      // excludes them. Everything resolves through the same bundle
-      // cache as any other snapshot (the default+delivery-tools entry
-      // list is its own cache entry, built once). The create-time
-      // freeze (plugin-api plan Phase 2) turns names → manifest
-      // entries, asking mounted MCP servers LIVE — then the entries
-      // resolve through the bundle cache.
-      case freeze_entries(state, effective_toolset(state, requested)) {
-        Error(reason) -> {
-          process.send(reply, Error(UnknownToolset(reason)))
+      case string.trim(requested.bot_id) {
+        // Every thread is born from a bot (the NewThread contract): a
+        // blank id refuses BEFORE anything freezes — no live MCP asks,
+        // no bundle-cache population, no partial work. The surfaces
+        // refuse earlier; this is the registry's backstop, kept ahead
+        // of the freeze on purpose (a malformed botless create with an
+        // explicit foreign toolset would otherwise perform live tool
+        // discovery before refusing).
+        "" -> {
+          process.send(reply, Error(BotRequired))
           actor.continue(state)
         }
-        Ok(entries) ->
-          case resolve_entries(state, entries) {
+        _ ->
+          // The bot-default toolset transform (bots P3c, #97; #127
+          // added the discovery half; amended — botless threads are
+          // gone): EVERY thread is created from a bot, so the default
+          // sentinel now resolves for ALL creates to the default set
+          // PLUS `bot_message` and `list_bots` — every thread carries a
+          // bot identity, so every default-toolset thread gets the
+          // delivery tool (and its roster) and the discovery half. A
+          // bot that wants them gone names an explicit list without
+          // them; a chat-only `'{}'` bot already excludes them.
+          // Everything resolves through the same bundle cache as any
+          // other snapshot (the default+delivery-tools entry list is
+          // its own cache entry, built once). The create-time freeze
+          // (plugin-api plan Phase 2) turns names → manifest entries,
+          // asking mounted MCP servers LIVE — then the entries resolve
+          // through the bundle cache.
+          case freeze_entries(state, effective_toolset(state, requested)) {
             Error(reason) -> {
               process.send(reply, Error(UnknownToolset(reason)))
               actor.continue(state)
             }
-            Ok(#(state, toolset)) ->
-              handle_create(state, requested, toolset, entries, reply)
+            Ok(entries) ->
+              case resolve_entries(state, entries) {
+                Error(reason) -> {
+                  process.send(reply, Error(UnknownToolset(reason)))
+                  actor.continue(state)
+                }
+                Ok(#(state, toolset)) ->
+                  handle_create(state, requested, toolset, entries, reply)
+              }
           }
       }
 
@@ -1040,8 +1055,10 @@ fn start_new_thread(
 ) -> #(State, Result(Record, CreateError)) {
   case string.trim(requested.bot_id) {
     // Every thread is born from a bot (the NewThread contract): a blank
-    // id refuses before anything freezes. The surfaces refuse earlier
-    // (they resolve the bot first); this is the registry's backstop.
+    // id refuses before anything freezes. The Create arm refuses EARLIER
+    // (ahead of the freeze's live asks); this second guard is the
+    // backstop for the paths that skip that arm — the injected-bundle
+    // test seam and DM find-or-create.
     "" -> #(state, Error(BotRequired))
     _ -> start_new_thread_bot(state, requested, toolset, entries)
   }

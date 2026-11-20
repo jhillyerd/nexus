@@ -313,9 +313,12 @@ function resetDatabase() {
 /// A bot over the API, uniquely named (bot names are case-insensitively
 /// unique). Keyless "fake" provider, the given model alias. Returns the
 /// bot id.
-async function createBot(model, nameHint = "e2e-bot") {
+// `origin` defaults to the main instance; pass another instance's base
+// (e.g. guardBase) when the bot must exist in THAT instance's in-memory
+// bot registry — registries are boot-loaded per server and never sync.
+async function createBot(model, nameHint = "e2e-bot", origin = base) {
   const headers = { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" };
-  const res = await page.request.post(`${base}/bots`, {
+  const res = await page.request.post(`${origin}/bots`, {
     data: {
       name: `${nameHint}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`,
       provider: "fake",
@@ -1416,7 +1419,10 @@ async function main() {
       // itself starts the thread AND the turn (the instances share the
       // database, so a bot made here is visible; the reload lands its
       // row in the picker).
-      const guardBotId = await createBot("smart", "guard-bot");
+      // The bot registry is in-memory per instance and boot-loaded: the
+      // guard instance must learn the bot through its OWN API, or its
+      // compose picker (served by the guard's registry) never lists it.
+      const guardBotId = await createBot("smart", "guard-bot", guardBase);
       await page.reload();
       await connected(page);
       await page.click("#new-thread");

@@ -252,9 +252,11 @@ require the configured UI token when `NEXUS_UI_TOKEN` is set;
   and toolset at creation (unknown bot → `400`). The alias is NOT
   validated against the provider's live model list (proxies like
   Bifrost accept aliases their `/v1/models` may not carry; a dead alias
-  fails the thread's first turn). Any `provider`/`model`/`tools` body
-  answers `400 threads require a bot`; mixing `bot` with those keys is
-  `400`, even when the provider/model values are blank. Editing a bot
+  fails the thread's first turn). Any `provider`/`model` body or
+  non-null `tools` value answers `400 threads require a bot`; mixing
+  `bot` with those values is `400`, even when the provider/model values
+  are blank (an explicit `"tools": null` is NOT a conflict — it
+  flattens to the default-set sentinel like absence). Editing a bot
   never changes an existing thread — its provider/model/prompt were
   copied at creation — and deleting one only clears the `bot_id`
   provenance.

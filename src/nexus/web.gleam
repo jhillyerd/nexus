@@ -276,7 +276,9 @@ fn create_thread_response(
   // from the bot at creation). The old provider+model shape is GONE: a
   // thread is always born from a bot, so a provider/model (or tools)
   // body answers the honest 400 instead of silently creating a botless
-  // thread. `bot` alongside any other key stays a conflict.
+  // thread. `bot` alongside `provider`, `model`, or a NON-NULL `tools`
+  // stays a conflict (an explicit `"tools": null` flattens to the
+  // default sentinel — no conflict, just a plain bot create).
   case read_create(req) {
     Error(_) -> json_response(400, err_json("unreadable body"))
     Ok(fields) ->
@@ -329,14 +331,15 @@ fn create_problem_status(problem: thread_create.CreateProblem) -> Int {
     thread_create.ProviderDisabled(_) -> 400
     thread_create.BotsUnavailable -> 502
     thread_create.BotUnknown(_) -> 400
-    // Provider and start failures after resolution are races: the
-    // provider passed the resolve, then could not stream when the
-    // thread pinned it.
+    // Blank bot id and empty model are client data, not races.
     thread_create.CreateFailed(thread_registry.BotRequired) -> 400
     thread_create.CreateFailed(thread_registry.EmptyModel) -> 400
     // A stale bot's toolset named a tool outside the compiled catalog
     // (bots plan P2): a client-data problem, refused like a bad alias.
     thread_create.CreateFailed(thread_registry.UnknownToolset(_)) -> 400
+    // Provider and start failures after resolution are races: the
+    // provider passed the resolve, then could not stream when the
+    // thread pinned it.
     thread_create.CreateFailed(thread_registry.ProviderFailed(_)) -> 502
     thread_create.CreateFailed(thread_registry.StartFailed(_)) -> 503
     // A channel create whose row insert failed: the store side refused,
@@ -363,8 +366,9 @@ fn read_json(req: Request(mist.Connection)) -> Result(String, Nil) {
 /// default-set sentinel exactly like absence (the bots-plan `tools`
 /// vocabulary), so `{"bot": …}` stays a plain bot create. The
 /// provider/model halves stay raw-presence-aware (a trimmed-blank
-/// value is still a value the caller sent); trimming happens after, so
-/// the plain path's blank halves stay the empty-field 400s. Presence is
+/// value is still a value the caller sent) — but the halves no longer
+/// select a response: ANY non-bot body answers the single
+/// bot-required 400. Presence is
 /// read on the RAW JSON value: an explicit `null` fails the decode
 /// (400) instead of collapsing into the missing-key default —
 /// `decode.optional` would blur `{"bot": null}` into a plain create and
