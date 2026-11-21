@@ -1,32 +1,94 @@
-//// Schema migration runner: applies `sql/schema.sql` to the database in
-//// `DATABASE_URL` (the same convention squirrel uses).
+//// Sequential schema migration runner: applies pending numbered SQL files
+//// from `sql/migrations/` to the database in `DATABASE_URL` (the same
+//// convention squirrel uses) and records each applied migration in
+//// `schema_migration`.
 ////
 //// This runner is the only schema-apply path: the compose file has no
 //// schema bind mount (its config must stay identical from every
 //// checkout/worktree, so `up` never recreates the singleton db on a
-//// worktree switch). Apply after boot; re-apply after schema changes
+//// worktree switch). Apply after boot; re-apply after adding migrations
 //// and for the CI service container:
 ////
 ////     DATABASE_URL=postgres://nexus@127.0.0.1:5433/nexus \
 ////       gleam run -m nexus/store/migrate
 ////   # (bin/dev-server runs this on every dev boot)
 ////
-//// The schema is written idempotently (`create table if not exists`), so
-//// re-running is safe. Statements are split by a quote-aware scanner
+//// Migration files live in `sql/migrations/` and are named
+//// `NNNN_<short_name>.sql` (at least 4 digits, version > 0, lowercase
+//// snake_case slug, e.g. `0001_initial.sql`, `0002_workspace_sandbox.sql`).
+//// Already-applied migrations are immutable: the runner verifies each
+//// applied migration's filename and SHA-256 checksum against
+//// `schema_migration` before applying pending files. Each pending file runs
+//// inside its own PostgreSQL transaction alongside its `schema_migration`
+//// insert so a failed statement rolls back cleanly.
+////
+//// Statements within each file are split by a quote-aware scanner
 //// (`statements`), so `;` inside string literals, double-quoted
 //// identifiers, dollar-quoted bodies (`CREATE FUNCTION` / `DO`), and
 //// comments do not break a statement apart.
 
+import filepath
+import gleam/bit_array
+import gleam/crypto
+import gleam/dict
 import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/int
 import gleam/io
 import gleam/list
+import gleam/order
+import gleam/result
 import gleam/string
 import pog
+import simplifile
 
-@external(erlang, "nexus_store_ffi", "read_file")
-fn read_file(path: String) -> Result(String, String)
+/// Directory containing sequentially numbered `.sql` migration files,
+/// relative to the repository root.
+pub const migrations_dir = "sql/migrations"
+
+/// Fixed advisory-lock key ("nexus" in big-endian ASCII hex, 0x6E65787573)
+/// used inside transactions so concurrent migration runners serialize cleanly.
+const advisory_lock_key = 474_148_795_763
+
+/// Timeout while waiting for another runner to release the advisory lock (30s).
+const lock_wait_timeout_ms = 30_000
+
+/// Statement timeout for DDL/backfill statements inside a migration (60s).
+const statement_timeout_ms = 60_000
+
+/// One migration file loaded from disk.
+pub type Migration {
+  Migration(version: Int, name: String, sql: String, checksum: String)
+}
+
+/// One migration row already recorded in `schema_migration`.
+pub type AppliedMigration {
+  AppliedMigration(version: Int, name: String, checksum: String)
+}
+
+/// Validation or drift error found while planning a migration run.
+pub type PlanError {
+  InvalidFilename(filename: String)
+  DuplicateVersion(version: Int, first: String, second: String)
+  EmptyMigration(name: String)
+  NameMismatch(version: Int, applied: String, disk: String)
+  ChecksumMismatch(version: Int, name: String, applied: String, disk: String)
+}
+
+/// Pure result of comparing disk migrations against `schema_migration`.
+pub type MigrationPlan {
+  MigrationPlan(
+    pending: List(Migration),
+    already_applied: Int,
+    ahead_in_db: List(AppliedMigration),
+  )
+}
+
+type TxError {
+  StatementFailed(statement: String, error: pog.QueryError)
+  RecordFailed(error: pog.QueryError)
+  ConcurrentDrift(PlanError)
+}
 
 @external(erlang, "nexus_store_ffi", "database_url")
 fn database_url() -> Result(String, Nil)
@@ -35,56 +97,461 @@ fn database_url() -> Result(String, Nil)
 // VM must neither halt nor panic while the pool's boot is still in flight
 // (intermittent pgo_pool_sup shutdown_error report at teardown); see
 // nexus_store_ffi:with_pool_settled/2. pog.start hands back the pool's
-// queue gen_server. Panics before pog.start (schema file, DATABASE_URL,
+// queue gen_server. Panics before pog.start (migration files, DATABASE_URL,
 // URL parse) have no pool to race the halt with and stay unwrapped.
 @external(erlang, "nexus_store_ffi", "with_pool_settled")
 fn with_pool_settled(run: fn() -> Nil, queue: process.Pid) -> Nil
 
 pub fn main() -> Nil {
-  let schema =
-    or_panic(read_file("sql/schema.sql"), "cannot read sql/schema.sql")
+  let migrations =
+    or_panic(
+      load_migrations(migrations_dir),
+      "cannot load migrations from " <> migrations_dir,
+    )
   let url = or_panic(database_url(), "DATABASE_URL is not set")
   let config =
     or_panic(
       pog.url_config(process.new_name("nexus_migrate"), url),
       "invalid DATABASE_URL",
     )
+    |> pog.pool_size(1)
+    |> pog.connection_parameter("timezone", "UTC")
   let started =
-    or_panic(
-      pog.start(pog.connection_parameter(config, "timezone", "UTC")),
-      "could not connect — is the database up?",
-    )
-  with_pool_settled(fn() { apply_schema(schema, started.data) }, started.pid)
+    or_panic(pog.start(config), "could not connect — is the database up?")
+  with_pool_settled(
+    fn() { apply_migrations(migrations, started.data) },
+    started.pid,
+  )
 }
 
-fn apply_schema(schema: String, db: pog.Connection) -> Nil {
-  let stmts = statements(schema)
-  case stmts {
-    [] -> io.println("migrate: schema file contains no statements (?)")
-    _ ->
-      list.each(stmts, fn(statement) {
-        case
-          statement
-          |> pog.query
-          |> pog.returning(decode.dynamic)
-          |> pog.execute(db)
-        {
-          Ok(_) -> io.println("migrate: applied: " <> summarize(statement))
-          Error(error) -> {
-            io.println(
-              "migrate: FAILED: "
-              <> summarize(statement)
-              <> " — "
-              <> string.inspect(error),
+fn apply_migrations(migrations: List(Migration), db: pog.Connection) -> Nil {
+  or_panic(ensure_tracking_table(db), "failed to initialize schema_migration")
+  let applied =
+    or_panic(fetch_applied(db), "failed to read schema_migration rows")
+  let migration_plan = case plan(migrations, applied) {
+    Ok(p) -> p
+    Error(err) -> {
+      io.println("migrate: " <> format_plan_error(err))
+      panic as "migrate failed"
+    }
+  }
+  case migration_plan.ahead_in_db {
+    [] -> Nil
+    ahead -> {
+      let names = list.map(ahead, fn(m) { m.name }) |> string.join(", ")
+      io.println(
+        "migrate: note: database has migrations not in "
+        <> migrations_dir
+        <> " (ahead): "
+        <> names,
+      )
+    }
+  }
+  case migration_plan.pending {
+    [] ->
+      io.println(
+        "migrate: up to date ("
+        <> int.to_string(migration_plan.already_applied)
+        <> " applied, 0 pending)",
+      )
+    pending -> {
+      let applied_now =
+        list.fold(pending, 0, fn(applied_count, migration) {
+          case apply_one(db, migration) {
+            Ok(0) -> {
+              io.println(
+                "migrate: skipped "
+                <> migration.name
+                <> " (applied concurrently)",
+              )
+              applied_count
+            }
+            Ok(count) -> {
+              io.println(
+                "migrate: applied "
+                <> migration.name
+                <> " ("
+                <> int.to_string(count)
+                <> " statements)",
+              )
+              applied_count + 1
+            }
+            Error(pog.TransactionRolledBack(StatementFailed(stmt, err))) -> {
+              io.println(
+                "migrate: FAILED "
+                <> migration.name
+                <> " on: "
+                <> summarize(stmt)
+                <> " — "
+                <> string.inspect(err),
+              )
+              panic as "migrate: statement failed"
+            }
+            Error(pog.TransactionRolledBack(RecordFailed(err))) -> {
+              io.println(
+                "migrate: FAILED recording "
+                <> migration.name
+                <> " — "
+                <> string.inspect(err),
+              )
+              panic as "migrate: record failed"
+            }
+            Error(pog.TransactionRolledBack(ConcurrentDrift(err))) -> {
+              io.println("migrate: " <> format_plan_error(err))
+              panic as "migrate failed"
+            }
+            Error(pog.TransactionQueryError(err)) -> {
+              io.println(
+                "migrate: FAILED transaction for "
+                <> migration.name
+                <> " — "
+                <> string.inspect(err),
+              )
+              panic as "migrate: transaction failed"
+            }
+          }
+        })
+      let total = migration_plan.already_applied + list.length(pending)
+      io.println(
+        "migrate: done ("
+        <> int.to_string(applied_now)
+        <> " applied, "
+        <> int.to_string(total)
+        <> " total)",
+      )
+    }
+  }
+}
+
+fn ensure_tracking_table(
+  db: pog.Connection,
+) -> Result(Nil, pog.TransactionError(pog.QueryError)) {
+  pog.transaction(db, fn(tx) {
+    use _ <- result.try(acquire_lock(tx))
+    "CREATE TABLE IF NOT EXISTS schema_migration (
+      version    int PRIMARY KEY,
+      name       text NOT NULL,
+      checksum   text NOT NULL,
+      applied_at timestamptz NOT NULL DEFAULT now()
+    )"
+    |> pog.query
+    |> pog.returning(decode.dynamic)
+    |> pog.execute(tx)
+    |> result.replace(Nil)
+  })
+}
+
+fn acquire_lock(tx: pog.Connection) -> Result(Nil, pog.QueryError) {
+  // Wrap pg_advisory_xact_lock in a subquery returning int4 rather than
+  // Postgres `void` (OID 2278), which pgo's pg_types decoder does not map.
+  "SELECT 1 FROM (SELECT pg_advisory_xact_lock($1)) AS _lock"
+  |> pog.query
+  |> pog.timeout(lock_wait_timeout_ms)
+  |> pog.parameter(pog.int(advisory_lock_key))
+  |> pog.returning(decode.dynamic)
+  |> pog.execute(tx)
+  |> result.replace(Nil)
+}
+
+fn fetch_applied(
+  db: pog.Connection,
+) -> Result(List(AppliedMigration), pog.QueryError) {
+  let decoder = {
+    use version <- decode.field(0, decode.int)
+    use name <- decode.field(1, decode.string)
+    use checksum <- decode.field(2, decode.string)
+    decode.success(AppliedMigration(version:, name:, checksum:))
+  }
+  "SELECT version, name, checksum FROM schema_migration ORDER BY version ASC"
+  |> pog.query
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+  |> result.map(fn(returned) { returned.rows })
+}
+
+fn apply_one(
+  db: pog.Connection,
+  migration: Migration,
+) -> Result(Int, pog.TransactionError(TxError)) {
+  let stmts = statements(migration.sql)
+  pog.transaction(db, fn(tx) {
+    use _ <- result.try(acquire_lock(tx) |> result.map_error(RecordFailed))
+    use existing <- result.try(
+      fetch_one_applied(tx, migration.version)
+      |> result.map_error(RecordFailed),
+    )
+    case existing {
+      [AppliedMigration(version:, name:, checksum:)] ->
+        case name == migration.name, checksum == migration.checksum {
+          True, True -> Ok(0)
+          False, _ ->
+            Error(ConcurrentDrift(NameMismatch(version, name, migration.name)))
+          True, False ->
+            Error(
+              ConcurrentDrift(ChecksumMismatch(
+                version,
+                migration.name,
+                checksum,
+                migration.checksum,
+              )),
             )
-            panic as "migrate: statement failed"
+        }
+      _ -> {
+        use _ <- result.try(execute_statements(tx, stmts))
+        use _ <- result.try(
+          "INSERT INTO schema_migration (version, name, checksum) VALUES ($1, $2, $3)"
+          |> pog.query
+          |> pog.parameter(pog.int(migration.version))
+          |> pog.parameter(pog.text(migration.name))
+          |> pog.parameter(pog.text(migration.checksum))
+          |> pog.returning(decode.dynamic)
+          |> pog.execute(tx)
+          |> result.map_error(RecordFailed),
+        )
+        Ok(list.length(stmts))
+      }
+    }
+  })
+}
+
+fn fetch_one_applied(
+  tx: pog.Connection,
+  version: Int,
+) -> Result(List(AppliedMigration), pog.QueryError) {
+  let decoder = {
+    use v <- decode.field(0, decode.int)
+    use name <- decode.field(1, decode.string)
+    use checksum <- decode.field(2, decode.string)
+    decode.success(AppliedMigration(version: v, name:, checksum:))
+  }
+  "SELECT version, name, checksum FROM schema_migration WHERE version = $1"
+  |> pog.query
+  |> pog.parameter(pog.int(version))
+  |> pog.returning(decoder)
+  |> pog.execute(tx)
+  |> result.map(fn(returned) { returned.rows })
+}
+
+fn execute_statements(
+  tx: pog.Connection,
+  stmts: List(String),
+) -> Result(Nil, TxError) {
+  list.try_each(stmts, fn(stmt) {
+    stmt
+    |> pog.query
+    |> pog.timeout(statement_timeout_ms)
+    |> pog.returning(decode.dynamic)
+    |> pog.execute(tx)
+    |> result.replace(Nil)
+    |> result.map_error(fn(err) { StatementFailed(stmt, err) })
+  })
+}
+
+/// Load and validate all migration files in `dir`, sorted by ascending
+/// numeric version.
+pub fn load_migrations(dir: String) -> Result(List(Migration), String) {
+  use entries <- result.try(
+    simplifile.read_directory(dir)
+    |> result.map_error(fn(err) {
+      "cannot list " <> dir <> ": " <> simplifile.describe_error(err)
+    }),
+  )
+  let sorted_entries =
+    entries
+    |> list.filter(fn(entry) { string.ends_with(entry, ".sql") })
+    |> list.sort(string.compare)
+  use loaded <- result.try(
+    list.try_map(sorted_entries, fn(entry) {
+      use version <- result.try(
+        parse_filename(entry)
+        |> result.map_error(fn(_) { format_plan_error(InvalidFilename(entry)) }),
+      )
+      let full_path = filepath.join(dir, entry)
+      use sql <- result.try(
+        simplifile.read(full_path)
+        |> result.map_error(fn(err) {
+          "cannot read " <> full_path <> ": " <> simplifile.describe_error(err)
+        }),
+      )
+      Ok(Migration(version:, name: entry, sql:, checksum: checksum(sql)))
+    }),
+  )
+  use validated <- result.try(
+    validate_disk(loaded) |> result.map_error(format_plan_error),
+  )
+  Ok(validated)
+}
+
+/// Validate a migration filename and extract its numeric version.
+///
+/// Expected format: `NNNN_<slug>.sql` where `NNNN` is at least 4 ASCII
+/// digits representing an integer > 0 and `<slug>` is lowercase ASCII
+/// letters, digits, and underscores containing at least one alphanumeric
+/// character (e.g. `0001_initial.sql`, `0002_workspace_sandbox.sql`).
+pub fn parse_filename(filename: String) -> Result(Int, Nil) {
+  case string.ends_with(filename, ".sql") {
+    False -> Error(Nil)
+    True -> {
+      let stem = string.drop_end(filename, 4)
+      case string.split_once(stem, "_") {
+        Error(_) -> Error(Nil)
+        Ok(#(prefix, slug)) -> {
+          let prefix_codes = to_codepoints(prefix)
+          let slug_codes = to_codepoints(slug)
+          let valid_prefix =
+            list.length(prefix_codes) >= 4 && list.all(prefix_codes, is_digit)
+          let valid_slug =
+            slug != ""
+            && list.all(slug_codes, is_slug_char)
+            && list.any(slug_codes, is_slug_alnum)
+          case valid_prefix && valid_slug {
+            False -> Error(Nil)
+            True ->
+              case int.parse(prefix) {
+                Ok(version) if version > 0 -> Ok(version)
+                _ -> Error(Nil)
+              }
           }
         }
-      })
+      }
+    }
   }
-  io.println(
-    "migrate: done (" <> int.to_string(list.length(stmts)) <> " statements)",
+}
+
+/// Lowercase SHA-256 hex digest of a migration file's UTF-8 contents
+/// (matches `sha256sum`).
+pub fn checksum(sql: String) -> String {
+  crypto.hash(crypto.Sha256, <<sql:utf8>>)
+  |> bit_array.base16_encode
+  |> string.lowercase
+}
+
+/// Compare disk migrations against already-applied rows from
+/// `schema_migration` and compute the pending migrations to run.
+///
+/// - Rejects duplicate versions and empty (comment/whitespace-only) files.
+/// - Verifies that every applied migration present on disk still has the
+///   same filename and SHA-256 checksum (applied migrations are immutable).
+/// - Applied migrations absent from disk (e.g. an older branch running
+///   against a shared dev DB) are reported in `ahead_in_db` rather than
+///   blocking execution.
+/// - Pending migrations whose version is lower than already-applied ones
+///   (gaps from parallel branches) are applied out of order in ascending
+///   version order, so migrations should tolerate running after later
+///   independent migrations have already landed.
+/// - Returns `pending` sorted in ascending numeric version order.
+pub fn plan(
+  disk: List(Migration),
+  applied: List(AppliedMigration),
+) -> Result(MigrationPlan, PlanError) {
+  use sorted_disk <- result.try(validate_disk(disk))
+  let disk_by_version =
+    list.fold(sorted_disk, dict.new(), fn(acc, m) {
+      dict.insert(acc, m.version, m)
+    })
+  let sorted_applied =
+    list.sort(applied, fn(a, b) { int.compare(a.version, b.version) })
+  use #(verified, ahead_rev) <- result.try(
+    list.try_fold(sorted_applied, #(0, []), fn(acc, row) {
+      let #(verified, ahead) = acc
+      case dict.get(disk_by_version, row.version) {
+        Error(Nil) -> Ok(#(verified, [row, ..ahead]))
+        Ok(m) ->
+          case m.name == row.name, m.checksum == row.checksum {
+            True, True -> Ok(#(verified + 1, ahead))
+            False, _ -> Error(NameMismatch(row.version, row.name, m.name))
+            True, False ->
+              Error(ChecksumMismatch(
+                row.version,
+                m.name,
+                row.checksum,
+                m.checksum,
+              ))
+          }
+      }
+    }),
   )
+  let applied_by_version =
+    list.fold(sorted_applied, dict.new(), fn(acc, row) {
+      dict.insert(acc, row.version, row)
+    })
+  let pending =
+    list.filter(sorted_disk, fn(m) {
+      !dict.has_key(applied_by_version, m.version)
+    })
+  Ok(MigrationPlan(
+    pending:,
+    already_applied: verified,
+    ahead_in_db: list.reverse(ahead_rev),
+  ))
+}
+
+/// Human-readable description of a `PlanError`.
+pub fn format_plan_error(error: PlanError) -> String {
+  case error {
+    InvalidFilename(filename) ->
+      "invalid migration filename '"
+      <> filename
+      <> "' (expected NNNN_<snake_case>.sql, e.g. 0002_add_workspace.sql)"
+    DuplicateVersion(version, first, second) ->
+      "duplicate migration version "
+      <> int.to_string(version)
+      <> ": "
+      <> first
+      <> " and "
+      <> second
+    EmptyMigration(name) ->
+      "migration '" <> name <> "' contains no SQL statements"
+    NameMismatch(version, applied, disk) ->
+      "migration version "
+      <> int.to_string(version)
+      <> " was applied as '"
+      <> applied
+      <> "' but disk has '"
+      <> disk
+      <> "' (already-applied migrations are immutable; add a new numbered migration instead)"
+    ChecksumMismatch(version, name, applied, disk) ->
+      "checksum mismatch for migration "
+      <> int.to_string(version)
+      <> " ("
+      <> name
+      <> "): applied "
+      <> applied
+      <> ", disk "
+      <> disk
+      <> " (already-applied migrations are immutable; add a new numbered migration instead)"
+  }
+}
+
+fn validate_disk(disk: List(Migration)) -> Result(List(Migration), PlanError) {
+  let sorted =
+    list.sort(disk, fn(a, b) {
+      case int.compare(a.version, b.version) {
+        order.Eq -> string.compare(a.name, b.name)
+        other -> other
+      }
+    })
+  use _ <- result.try(
+    list.try_fold(sorted, dict.new(), fn(seen, m) {
+      case dict.get(seen, m.version) {
+        Ok(first) -> Error(DuplicateVersion(m.version, first, m.name))
+        Error(Nil) ->
+          case statements(m.sql) {
+            [] -> Error(EmptyMigration(m.name))
+            _ -> Ok(dict.insert(seen, m.version, m.name))
+          }
+      }
+    }),
+  )
+  Ok(sorted)
+}
+
+fn is_slug_alnum(code: Int) -> Bool {
+  { code >= 97 && code <= 122 } || is_digit(code)
+}
+
+fn is_slug_char(code: Int) -> Bool {
+  is_slug_alnum(code) || code == 95
 }
 
 fn or_panic(result: Result(a, e), message: String) -> a {

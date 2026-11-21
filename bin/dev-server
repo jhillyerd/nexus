@@ -16,7 +16,8 @@
 # while it already runs — from any checkout: the compose file carries no
 # worktree-relative paths (no bind mounts), so its config hash does not
 # vary per checkout. Schema applies via the migrate runner below
-# (idempotent DDL — cheap no-op when the volume is already current).
+# (sequential migrations tracked in schema_migration — cheap no-op when
+# the volume is already current).
 set -euo pipefail
 
 reset=0

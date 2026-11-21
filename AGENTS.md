@@ -6,7 +6,7 @@ KV-cache verification lives in `docs/plans/completed/m3-verification.md`.
 
 ## Database schema naming (decided, follow it)
 
-The persistence layer lives in `sql/schema.sql` + `src/nexus/store/sql/`.
+The persistence layer lives in `sql/migrations/` + `src/nexus/store/sql/`.
 
 - **Table names are singular** — `thread`, `thread_message`. Each row is
   one entity; this matches the Postgres system catalog's own convention
@@ -21,12 +21,11 @@ The persistence layer lives in `sql/schema.sql` + `src/nexus/store/sql/`.
 - **Indexes follow `<table>_<purpose>`** — `thread_recency`,
   `thread_tags`.
 - **Foreign keys are `<parent>_id`** (`thread_message.thread_id`).
-- Renaming after deployment requires a migration; renames while the schema
-  has no deployed data (pre-merge) are just edits — that is how the
-  `sessions`/`messages` → `session`/`session_message` rename landed, and
-  later the `session`/`session_message` → `thread`/`thread_message` rename
-  (vocabulary alignment ahead of the bots/profiles system: a thread is the
-  chat entity; "session" stays free for connection/auth scopes).
+- Schema changes (including renames) land as new sequential migrations
+  under `sql/migrations/` — never edit an already-applied migration.
+  (`0001_initial.sql` is the squashed baseline snapshot from the early
+  pre-deployment phase when `sessions`/`messages` → `session`/`session_message`
+  → `thread`/`thread_message` were edited in place.)
 
 ## Schema invariants (hard constraints — do not break)
 
@@ -177,13 +176,24 @@ the rules that bite silently:
 
 ## Changing the schema or queries
 
-1. Edit `sql/schema.sql` idempotently (`IF NOT EXISTS`).
-2. Re-apply: `gleam run -m nexus/store/migrate` (needs `DATABASE_URL`;
+1. Add a new sequential migration under `sql/migrations/` named
+   `NNNN_<snake_case>.sql` (next 4-digit version number, e.g.
+   `0002_workspace_sandbox.sql`). **Never edit an already-applied
+   migration** — the runner tracks applied versions and SHA-256 checksums
+   in `schema_migration` (singular, unquoted-safe, `timestamptz`) and
+   refuses modified files. Each pending migration runs once inside a
+   PostgreSQL transaction alongside its `schema_migration` insert, so
+   ordinary `ALTER TABLE` / `CREATE TABLE` / backfill DDL needs no
+   idempotency shims. Pending gaps from parallel branches (a lower
+   version merged after a higher one was applied locally) are applied in
+   ascending version order, so keep independent migrations order-tolerant.
+2. Apply: `gleam run -m nexus/store/migrate` (needs `DATABASE_URL`;
    `docker compose up -d` provides the local database on `127.0.0.1:5433`).
 3. Edit the queries in `src/nexus/store/sql/*.sql` (one query per file,
    file name = generated function name), then regenerate:
    `gleam run -m squirrel` — the generated `sql.gleam` is committed.
-4. CI runs `squirrel check` and fails on stale generated code.
+4. CI runs `gleam run -m nexus/store/migrate` and `squirrel check` (fails
+   on stale generated code).
 5. `gleam test` must stay offline/network-free: persistence tests go
    through the mockable seam (`src/nexus/store.gleam`,
    `test/store_mock.gleam`), never a live database.
@@ -192,7 +202,8 @@ The runner's statement splitter (`statements` in `migrate.gleam`) is
 quote-aware: single/double quotes, dollar quotes (`$$…$$`, `$tag$…$tag$`),
 `--` lines, and nested `/* */` comments are understood, so a `;` inside a
 `DO` block, `CREATE FUNCTION` body, or literal does not split a statement.
-Unit tests: `test/migrate_test.gleam`.
+Unit tests (splitter, filename/checksum validation, planner, and live
+`sql/migrations/` checks): `test/migrate_test.gleam`.
 
 ## UI and agent-loop invariants (hard constraints — do not break)
 

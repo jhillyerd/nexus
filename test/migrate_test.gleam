@@ -1,19 +1,17 @@
-//// Unit tests for the schema-script statement splitter in
-//// `nexus/store/migrate`. The splitter must only split on top-level `;`,
-//// ignoring semicolons inside quotes and comments — the trap for future
-//// `DO $$ ... $$` blocks, `CREATE FUNCTION` bodies, and literals.
+//// Unit tests for `nexus/store/migrate`:
+//// - the quote-aware SQL statement splitter (`statements`),
+//// - migration filename validation and SHA-256 checksums,
+//// - the pure migration planner (ordering, immutability checks, ahead-in-db),
+//// - live validation of the repository's `sql/migrations/` directory.
 
-import gleam/bit_array
 import gleam/list
 import gleam/string
 import gleeunit/should
-import nexus/store/migrate
-
-/// Same test-only file read the M3 golden prefix test uses (fixtures
-/// and repo files are read relative to the repo root, where `gleam
-/// test` runs).
-@external(erlang, "nexus_loop_test_ffi", "read_file")
-fn read_file(path: String) -> BitArray
+import nexus/store/migrate.{
+  type Migration, AppliedMigration, ChecksumMismatch, DuplicateVersion,
+  EmptyMigration, Migration, MigrationPlan, NameMismatch,
+}
+import simplifile
 
 pub fn splits_top_level_semicolons_test() {
   migrate.statements("create table a (x int); create table b (y int);")
@@ -171,119 +169,9 @@ pub fn uescape_string_test() {
   |> should.equal(["select U&'d\\0061t\\'s;ok'", "select 2"])
 }
 
-/// The squashed schema shape (pre-deploy squash): `sql/schema.sql` is
-/// the ENTIRE schema — plain idempotent CREATEs, no ALTER/DO migration
-/// shims (nothing is deployed anywhere, so a shape change is an edit to
-/// the CREATEs, not a new shim). The REAL file runs through the
-/// splitter — not a pasted copy, which could drift from the schema
-/// without failing this test. Every statement must LEAD with `create`
-/// (trimmed, lowercased — catches any `DO $$` block, tagged or not, and
-/// any `ALTER`, however spelled or wrapped), and the
-/// tags provenance columns (`tags_manual`, `tags_source`, utility-tags
-/// plan §3.4) must live INLINE in the `thread` CREATE TABLE — a
-/// reintroduced DO-block shim fails here. The splitter's dollar-quote
-/// handling (an inner `;` inside `$$` bodies) stays covered
-/// synthetically by `semicolon_in_literal_inside_dollar_quote_test`.
-pub fn schema_is_the_entire_schema_test() {
-  let assert Ok(schema) = read_file("sql/schema.sql") |> bit_array.to_string
-  let statements = migrate.statements(schema)
-  // 21 = 18 (the node_grant era) + per-thread node names: the
-  // node_thread_name index replacing node_name, plus the deployed-db
-  // column migration (the DROP INDEX + the DO block), plus the bot
-  // name CI re-index (#127): the DROP of the plain (name) index before
-  // the functional lower(name) UNIQUE replaces it.
-  should.equal(list.length(statements), 21)
-  // The non-CREATE statements: the manifest swap (plugin-api Phase 2)
-  // — a DO block that backfills the old plain-name column into
-  // thread_toolset entries before dropping it, lossless for existing
-  // rows, skipped entirely on a database already migrated — and the
-  // node scoping pair: the old global index's DROP and the DO block
-  // that adds node.thread_id (no backfillable thread: pre-scoping rows
-  // die, re-pair mints fresh). (The environments Phase 1 column landed
-  // as a CREATE-only edit, per the squash-migrations-into-the-base-
-  // CREATEs policy, cecd906 — the bot-channels plan's
-  // parent_thread_id + thread_channel index did too.)
-  let non_create =
-    list.filter(statements, fn(stmt) {
-      !string.starts_with(string.trim(string.lowercase(stmt)), "create")
-    })
-  should.equal(list.length(non_create), 4)
-  let assert [swap] =
-    list.filter(non_create, fn(stmt) {
-      string.contains(string.lowercase(stmt), "drop column toolset")
-    })
-  should.be_true(string.contains(string.lowercase(swap), "do $$"))
-  should.be_true(string.contains(
-    string.lowercase(swap),
-    "information_schema.columns",
-  ))
-  let assert [_drop_node_name] =
-    list.filter(non_create, fn(stmt) {
-      string.contains(string.lowercase(stmt), "drop index if exists node_name")
-    })
-  // The bot-name CI re-index (#127): drop the plain (name) index, then
-  // the functional lower(name) UNIQUE replaces it — and match the
-  // DEFINITION, so a regression to a plain (name) index fails here.
-  let assert [_drop_bot_name] =
-    list.filter(non_create, fn(stmt) {
-      string.contains(string.lowercase(stmt), "drop index if exists bot_name")
-    })
-  let assert [bot_name_index] =
-    list.filter(statements, fn(stmt) {
-      string.contains(string.lowercase(stmt), "index if not exists bot_name")
-    })
-  let bot_index_lower = string.lowercase(bot_name_index)
-  should.be_true(string.contains(bot_index_lower, "unique"))
-  should.be_true(string.contains(bot_index_lower, "on bot (lower(name))"))
-  // And the DROP precedes the CREATE — the schema depends on the order:
-  // swapped, the plain (name) CREATE would claim the bot_name slot and
-  // the DROP would then delete it, landing on NO unique index at all.
-  let indexed = list.index_map(statements, fn(stmt, i) { #(i, stmt) })
-  let assert Ok(#(drop_at, _)) =
-    indexed
-    |> list.find(fn(p) {
-      string.contains(string.lowercase(p.1), "drop index if exists bot_name")
-    })
-  let assert Ok(#(create_at, _)) =
-    indexed
-    |> list.find(fn(p) {
-      string.contains(string.lowercase(p.1), "index if not exists bot_name")
-    })
-  should.be_true(drop_at < create_at)
-  let assert [node_scoping] =
-    list.filter(non_create, fn(stmt) {
-      let lower = string.lowercase(stmt)
-      string.contains(lower, "do $$")
-      && string.contains(lower, "table_name = 'node'")
-      && string.contains(lower, "set not null")
-    })
-  should.be_true(string.contains(
-    string.lowercase(node_scoping),
-    "on delete cascade",
-  ))
-  // The scoped index replaced the global one — match the DEFINITION,
-  // not just the name, so a regression to node(name) fails here.
-  let assert [node_index] =
-    list.filter(statements, fn(stmt) {
-      string.contains(string.lowercase(stmt), "node_thread_name")
-    })
-  let index_lower = string.lowercase(node_index)
-  should.be_true(string.contains(index_lower, "unique"))
-  should.be_true(string.contains(index_lower, "on node (thread_id, name)"))
-  let assert [thread_create] =
-    list.filter(statements, fn(stmt) { string.contains(stmt, "tags_manual") })
-  should.be_true(string.contains(thread_create, "tags_source"))
-  should.be_true(string.contains(
-    string.lowercase(thread_create),
-    "create table",
-  ))
-}
-
-/// …and the one trap that shape adds beyond the existing `$$` coverage:
-/// a `;` inside a single-quoted literal INSIDE a dollar-quoted body (a
-/// future column default like `';'::text`, say) must stay inside the
-/// statement — quote tracking inside `$$` may not flip on the inner
-/// quotes.
+/// A `;` inside a single-quoted literal INSIDE a dollar-quoted body (a
+/// column default like `';'::text`, say) must stay inside the statement —
+/// quote tracking inside `$$` may not flip on the inner quotes.
 pub fn semicolon_in_literal_inside_dollar_quote_test() {
   migrate.statements(
     "do $$ begin alter table t add c text default 'a;b'; end $$;select 2;",
@@ -292,4 +180,179 @@ pub fn semicolon_in_literal_inside_dollar_quote_test() {
     "do $$ begin alter table t add c text default 'a;b'; end $$",
     "select 2",
   ])
+}
+
+// ---------------------------------------------------------------------------
+// Sequential migration naming, checksum, planner, and live directory checks
+// ---------------------------------------------------------------------------
+
+fn migration(version: Int, name: String, sql: String) -> Migration {
+  Migration(version:, name:, sql:, checksum: migrate.checksum(sql))
+}
+
+pub fn parse_filename_accepts_numbered_snake_case_test() {
+  migrate.parse_filename("0001_initial.sql") |> should.equal(Ok(1))
+  migrate.parse_filename("0002_workspace_sandbox.sql") |> should.equal(Ok(2))
+  migrate.parse_filename("0042_add_v2_index.sql") |> should.equal(Ok(42))
+  migrate.parse_filename("10000_large_number.sql") |> should.equal(Ok(10_000))
+}
+
+pub fn parse_filename_rejects_malformed_names_test() {
+  migrate.parse_filename("schema.sql") |> should.equal(Error(Nil))
+  migrate.parse_filename("001_too_short.sql") |> should.equal(Error(Nil))
+  migrate.parse_filename("0000_zero.sql") |> should.equal(Error(Nil))
+  migrate.parse_filename("0001_.sql") |> should.equal(Error(Nil))
+  migrate.parse_filename("0001____.sql") |> should.equal(Error(Nil))
+  migrate.parse_filename("0001_Upper.sql") |> should.equal(Error(Nil))
+  migrate.parse_filename("0001_with-dash.sql") |> should.equal(Error(Nil))
+  migrate.parse_filename("0001_missing_ext") |> should.equal(Error(Nil))
+  migrate.parse_filename("0001_wrong.txt") |> should.equal(Error(Nil))
+}
+
+pub fn checksum_matches_sha256_vector_test() {
+  migrate.checksum("")
+  |> should.equal(
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  )
+}
+
+pub fn plan_fresh_database_sorts_pending_ascending_test() {
+  let m1 = migration(1, "0001_initial.sql", "CREATE TABLE a (id int);")
+  let m2 = migration(2, "0002_second.sql", "ALTER TABLE a ADD COLUMN b text;")
+  let m3 = migration(3, "0003_third.sql", "CREATE INDEX a_b ON a (b);")
+
+  migrate.plan([m3, m1, m2], [])
+  |> should.equal(
+    Ok(
+      MigrationPlan(pending: [m1, m2, m3], already_applied: 0, ahead_in_db: []),
+    ),
+  )
+}
+
+pub fn plan_incremental_and_up_to_date_test() {
+  let m1 = migration(1, "0001_initial.sql", "CREATE TABLE a (id int);")
+  let m2 = migration(2, "0002_second.sql", "ALTER TABLE a ADD COLUMN b text;")
+  let applied1 = AppliedMigration(1, m1.name, m1.checksum)
+  let applied2 = AppliedMigration(2, m2.name, m2.checksum)
+
+  migrate.plan([m1, m2], [applied1])
+  |> should.equal(
+    Ok(MigrationPlan(pending: [m2], already_applied: 1, ahead_in_db: [])),
+  )
+
+  migrate.plan([m1, m2], [applied1, applied2])
+  |> should.equal(
+    Ok(MigrationPlan(pending: [], already_applied: 2, ahead_in_db: [])),
+  )
+}
+
+pub fn plan_rejects_modified_applied_migration_test() {
+  let original_sql = "CREATE TABLE a (id int);"
+  let edited_sql = "CREATE TABLE a (id bigint);"
+  let m1 = migration(1, "0001_initial.sql", edited_sql)
+  let applied =
+    AppliedMigration(1, "0001_initial.sql", migrate.checksum(original_sql))
+
+  migrate.plan([m1], [applied])
+  |> should.equal(
+    Error(ChecksumMismatch(
+      1,
+      "0001_initial.sql",
+      migrate.checksum(original_sql),
+      migrate.checksum(edited_sql),
+    )),
+  )
+}
+
+pub fn plan_rejects_renamed_applied_migration_test() {
+  let sql = "CREATE TABLE a (id int);"
+  let m1 = migration(1, "0001_renamed.sql", sql)
+  let applied = AppliedMigration(1, "0001_initial.sql", migrate.checksum(sql))
+
+  migrate.plan([m1], [applied])
+  |> should.equal(
+    Error(NameMismatch(1, "0001_initial.sql", "0001_renamed.sql")),
+  )
+}
+
+pub fn plan_rejects_duplicate_versions_on_disk_test() {
+  let m2a = migration(2, "0002_alpha.sql", "SELECT 1;")
+  let m2b = migration(2, "0002_beta.sql", "SELECT 2;")
+
+  migrate.plan([m2b, m2a], [])
+  |> should.equal(Error(DuplicateVersion(2, "0002_alpha.sql", "0002_beta.sql")))
+}
+
+pub fn plan_rejects_empty_migration_test() {
+  let empty = migration(2, "0002_empty.sql", "-- just a comment\n")
+
+  migrate.plan([empty], [])
+  |> should.equal(Error(EmptyMigration("0002_empty.sql")))
+}
+
+pub fn plan_tolerates_db_ahead_of_older_branch_test() {
+  let m1 = migration(1, "0001_initial.sql", "CREATE TABLE a (id int);")
+  let applied1 = AppliedMigration(1, m1.name, m1.checksum)
+  let applied2 = AppliedMigration(2, "0002_future.sql", "deadbeef")
+
+  migrate.plan([m1], [applied1, applied2])
+  |> should.equal(
+    Ok(MigrationPlan(pending: [], already_applied: 1, ahead_in_db: [applied2])),
+  )
+}
+
+pub fn plan_applies_out_of_order_pending_migration_test() {
+  let m1 = migration(1, "0001_initial.sql", "SELECT 1;")
+  let m2 = migration(2, "0002_merged_later.sql", "SELECT 2;")
+  let m3 = migration(3, "0003_feature.sql", "SELECT 3;")
+  let applied1 = AppliedMigration(1, m1.name, m1.checksum)
+  let applied3 = AppliedMigration(3, m3.name, m3.checksum)
+
+  migrate.plan([m1, m2, m3], [applied1, applied3])
+  |> should.equal(
+    Ok(MigrationPlan(pending: [m2], already_applied: 2, ahead_in_db: [])),
+  )
+}
+
+/// Validates the real `sql/migrations/` directory offline: every filename
+/// follows `NNNN_<snake_case>.sql`, versions are unique and strictly
+/// increasing starting at `0001_initial.sql`, every file contains at least
+/// one parseable SQL statement, and the fresh-DB plan succeeds.
+pub fn repo_migrations_are_valid_test() {
+  let assert Ok(migrations) = migrate.load_migrations(migrate.migrations_dir)
+  let assert [first, ..] = migrations
+  should.equal(first.version, 1)
+  should.equal(first.name, "0001_initial.sql")
+  should.be_true(string.length(first.checksum) == 64)
+  should.be_true(migrate.statements(first.sql) != [])
+  // `0001_initial.sql` is immutable (checksum-tracked): pin its SHA-256 so an
+  // accidental edit fails `gleam test` offline before any database sees it.
+  should.equal(
+    first.checksum,
+    "c8c74a64f2c048d119e9c7135d8fefab5bab575088c3e0396b0ef77194029de0",
+  )
+  let assert Ok(MigrationPlan(pending:, already_applied: 0, ahead_in_db: [])) =
+    migrate.plan(migrations, [])
+  should.equal(list.length(pending), list.length(migrations))
+}
+
+pub fn load_migrations_ignores_non_sql_entries_and_rejects_bad_sql_names_test() {
+  let dir = "/tmp/nexus_migrate_load_test"
+  let _ = simplifile.delete(dir)
+  let assert Ok(Nil) = simplifile.create_directory_all(dir)
+  let assert Ok(Nil) = simplifile.write(dir <> "/.DS_Store", "junk")
+  let assert Ok(Nil) = simplifile.write(dir <> "/README.md", "notes")
+  let assert Ok(Nil) =
+    simplifile.write(dir <> "/0001_init.sql", "CREATE TABLE t (id int);")
+
+  let assert Ok([loaded]) = migrate.load_migrations(dir)
+  should.equal(loaded.version, 1)
+  should.equal(loaded.name, "0001_init.sql")
+
+  let assert Ok(Nil) = simplifile.write(dir <> "/bad_name.sql", "SELECT 1;")
+  let assert Error(message) = migrate.load_migrations(dir)
+  should.be_true(string.contains(message, "bad_name.sql"))
+
+  let _ = simplifile.delete(dir)
+  Nil
 }

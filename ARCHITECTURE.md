@@ -528,7 +528,7 @@ utility-attempt bookkeeping.
 
 | System | Used by | Notes |
 |---|---|---|
-| Postgres | store actor | mandatory; idempotent schema applied by `nexus/store/migrate` |
+| Postgres | store actor | mandatory; sequential migrations in `sql/migrations/` applied by `nexus/store/migrate` |
 | OpenAI-compatible provider(s) | turn + utility workers, provider registry (`ListModels`) | N rows in the provider table; streaming SSE with cancel + timeouts (`nexus/openai`) |
 | SearxNG | `web_search` tool (turn worker) | optional; tool absent from the schema when unconfigured |
 | Any web host | `http_fetch` tool (turn worker) | SSRF-guarded, size- and time-bounded |
@@ -539,8 +539,8 @@ utility-attempt bookkeeping.
 Separate OS processes from the same codebase — none of them are actors:
 
 - `nexus/boot` (`main`) — the server described above.
-- `nexus/store/migrate` — applies `sql/schema.sql` idempotently; the only
-  schema-apply path.
+- `nexus/store/migrate` — applies pending `sql/migrations/*.sql` inside
+  transactions, tracked in `schema_migration`; the only schema-apply path.
 - `nexus/dev_seed` — out-of-band first-provider seeding (CI / compose
   bootstrap, before the server exists).
 - `nexus/tui` — the node TUI (environments plan 2b-5): a REPL-style

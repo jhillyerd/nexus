@@ -30,7 +30,7 @@ Some of my goals for this project:
 
 ```sh
 docker compose up -d --wait   # local Postgres 17 on 127.0.0.1:5433 (waits for health)
-gleam run -m nexus/store/migrate  # applies sql/schema.sql (idempotent; rerun after schema edits)
+gleam run -m nexus/store/migrate  # applies pending sql/migrations/*.sql (tracked in schema_migration)
 gleam run                   # web server (registry, threads, streaming, stop, auth, store)
 gleam test                  # offline unit tests (no network, no database — the store is a mockable seam)
 gleam format src test
@@ -54,9 +54,9 @@ above is enough locally).
 Query changes: edit `src/nexus/store/sql/*.sql`, then regenerate the
 typed Gleam (`gleam run -m squirrel` — needs the live DB above) and
 commit the result; `gleam run -m squirrel check` (CI does this) fails
-when the generated module is stale. Schema changes: edit
-`sql/schema.sql`, re-apply with
-`gleam run -m nexus/store/migrate` (idempotent).
+when the generated module is stale. Schema changes: add a new numbered
+file under `sql/migrations/` (never edit applied migrations), then apply
+with `gleam run -m nexus/store/migrate`.
 
 ## Providers
 
