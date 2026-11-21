@@ -14,6 +14,7 @@ import gleam/otp/actor
 import gleam/string
 import gleeunit/should
 import nexus/config
+import nexus/log
 import nexus/node_adapter
 import nexus/node_protocol
 import nexus/thread
@@ -163,6 +164,7 @@ fn test_config() -> config.Config {
     // (small so `adapter_caps_node_result_test` stays cheap).
     env_max_output_bytes: 1024,
     node_idle_days: 7,
+    log_level: log.Info,
     max_bot_hops: 4,
   )
 }

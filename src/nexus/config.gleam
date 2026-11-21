@@ -14,6 +14,7 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import nexus/crypto
+import nexus/log
 import nexus/tool_provider
 
 /// Default system prompt (NEXUS_SYSTEM_PROMPT unset).
@@ -146,6 +147,9 @@ pub type Config {
     /// the sweep entirely — a daily-driver TUI keeps its credential
     /// indefinitely; a crashed one has a week by default.
     node_idle_days: Int,
+    /// Minimum server log level (`NEXUS_LOG_LEVEL`: `debug`, `info`,
+    /// `warn`/`warning`, `error`; default `info`).
+    log_level: log.Level,
   )
 }
 
@@ -335,6 +339,7 @@ pub fn from_env(
     "NEXUS_NODE_IDLE_DAYS",
     7,
   ))
+  use log_level <- result.try(optional_log_level(get, "NEXUS_LOG_LEVEL"))
   // The ASCII note rides the DEFAULT prompt only, and only while
   // codemode is enabled: an explicitly set NEXUS_SYSTEM_PROMPT is the
   // operator's own text and is never amended (enable codemode with a
@@ -382,6 +387,7 @@ pub fn from_env(
     env_timeout_ms: env_timeout_ms,
     env_max_output_bytes: env_max_output_bytes,
     node_idle_days: node_idle_days,
+    log_level: log_level,
   ))
 }
 
@@ -667,6 +673,21 @@ fn optional_bool(
         "0" | "false" | "no" | "" -> Ok(False)
         _ ->
           Error("environment variable " <> name <> " is not a boolean: " <> raw)
+      }
+  }
+}
+
+fn optional_log_level(
+  get: fn(String) -> Result(String, Nil),
+  name: String,
+) -> Result(log.Level, String) {
+  case optional_string(get, name) {
+    None -> Ok(log.Info)
+    Some(raw) ->
+      case log.parse_level(raw) {
+        Ok(level) -> Ok(level)
+        Error(reason) ->
+          Error("environment variable " <> name <> " " <> reason <> ": " <> raw)
       }
   }
 }

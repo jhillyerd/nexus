@@ -10,6 +10,7 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleeunit/should
 import nexus/config
+import nexus/log
 import nexus/node
 import nexus/store
 import nexus/store/persist
@@ -273,6 +274,7 @@ fn sweep_config(node_idle_days: Int) -> config.Config {
     env_timeout_ms: 60_000,
     env_max_output_bytes: 262_144,
     node_idle_days: node_idle_days,
+    log_level: log.Info,
     max_bot_hops: 4,
   )
 }

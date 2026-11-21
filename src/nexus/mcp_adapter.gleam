@@ -39,7 +39,6 @@ import gleam/dynamic.{type Dynamic}
 import gleam/erlang/process.{type Name, type Subject}
 import gleam/erlang/reference
 import gleam/int
-import gleam/io
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
@@ -47,6 +46,7 @@ import gleam/otp/static_supervisor as supervisor
 import gleam/otp/supervision
 import gleam/result
 import nexus/config.{type Config}
+import nexus/log
 import nexus/mcp
 import nexus/tool_provider.{type ToolDef, type ToolReply}
 import nexus/tools
@@ -218,9 +218,10 @@ fn do_start(
           Ok(#(transport, out, init_id, phase)) -> {
             case phase {
               Down(reason) ->
-                io.println(
-                  "mcp server '" <> server.name <> "' degraded: " <> reason,
-                )
+                log.warn("mcp", "server degraded", [
+                  log.str("server", server.name),
+                  log.str("reason", reason),
+                ])
               _ -> Nil
             }
             Ok(initial(
@@ -356,18 +357,18 @@ fn step(state: State, msg: Msg) -> State {
 fn step_frame(state: State, frame: mcp.Frame) -> State {
   case frame {
     mcp.NotUtf8 -> {
-      log(state, "non-UTF-8 bytes dropped")
+      log_warn(state, "non-UTF-8 bytes dropped")
       state
     }
     mcp.TooBig -> {
-      log(state, "frame over the read cap refused")
+      log_warn(state, "frame over the read cap refused")
       state
     }
     mcp.Line("") -> state
     mcp.Line(line) ->
       case mcp.parse_incoming(line) {
         mcp.Garbage -> {
-          log(state, "unparseable frame dropped")
+          log_warn(state, "unparseable frame dropped")
           state
         }
         mcp.ServerNotification(_) -> state
@@ -691,7 +692,10 @@ fn degrade(state: State, reason: String) -> State {
   |> list.each(fn(pending) {
     process.send(pending.1.reply, tool_provider.ToolErr(unavailable_text))
   })
-  log(state, reason)
+  log.warn("mcp", "server degraded", [
+    log.str("server", state.server.name),
+    log.str("reason", reason),
+  ])
   State(
     ..state,
     phase: Down(reason),
@@ -710,8 +714,8 @@ fn unavailable(state: State, reason: String) -> String {
   "mcp server '" <> state.server.name <> "' is unavailable: " <> reason
 }
 
-fn log(state: State, text: String) -> Nil {
-  io.println("mcp server '" <> state.server.name <> "': " <> text)
+fn log_warn(state: State, text: String) -> Nil {
+  log.warn("mcp", text, [log.str("server", state.server.name)])
 }
 
 fn send_frame(state: State, frame: String) -> Result(Nil, String) {
@@ -819,16 +823,13 @@ pub fn boot(
               // Probe failed: LOUD, but the server stays mounted —
               // hydration of its frozen threads must not depend on it
               // being reachable at boot; the freeze re-asks live.
-              io.println(
-                "mcp server '"
-                <> s.name
-                <> "' degraded (catalog probe failed; frozen threads"
-                <> " still hydrate, creates re-ask live): "
-                <> case dict.get(outcomes, s.name) {
+              log.warn("mcp", "catalog probe failed", [
+                log.str("server", s.name),
+                log.str("reason", case dict.get(outcomes, s.name) {
                   Ok(Error(reason)) -> reason
                   _ -> "no probe reply within the boot budget"
-                },
-              )
+                }),
+              ])
           }
           #(
             s.name,

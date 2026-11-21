@@ -8,6 +8,7 @@ import gleam/otp/actor
 import gleam/string
 import gleeunit/should
 import nexus/config
+import nexus/log
 import nexus/loop
 import nexus/openai
 import nexus/thread
@@ -67,6 +68,7 @@ fn test_config() -> config.Config {
     env_timeout_ms: 60_000,
     env_max_output_bytes: 100_000,
     node_idle_days: 7,
+    log_level: log.Info,
     // Bots P3c: the delivery hop guard; 4 = the shipped default.
     max_bot_hops: 4,
   )

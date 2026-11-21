@@ -11,6 +11,9 @@ ensure_hackney_started() ->
     end.
 
 halt(Code) ->
+    %% Flush the default :logger handler before halting so fatal boot
+    %% diagnostics always reach stdout/stderr before VM exit.
+    try logger_std_h:filesync(default) catch _:_ -> ok end,
     erlang:halt(Code).
 
 

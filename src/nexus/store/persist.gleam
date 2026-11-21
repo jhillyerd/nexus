@@ -27,7 +27,6 @@
 import gleam/dict.{type Dict}
 import gleam/erlang/process.{type Subject}
 import gleam/int
-import gleam/io
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/otp/actor
@@ -35,6 +34,7 @@ import gleam/result
 import gleam/string
 import nexus/bot
 import nexus/config.{type Config}
+import nexus/log
 import nexus/node
 import nexus/store
 import nexus/store/sql
@@ -389,7 +389,10 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
             case stored_summary_from_row(row) {
               Ok(summary) -> #([summary, ..summaries], skipped)
               Error(e) -> {
-                io.println("store: skipping corrupt thread row: " <> e)
+                log.warn("store", "skipping corrupt thread row", [
+                  log.str("thread_id", row.id),
+                  log.str("error", e),
+                ])
                 #(summaries, [row.id, ..skipped])
               }
             }
@@ -1151,7 +1154,10 @@ fn update(
 }
 
 fn log_store_error(context: String, error: String) -> Nil {
-  io.println("nexus store: " <> context <> " failed: " <> error)
+  log.error("store", "store operation failed", [
+    log.str("context", context),
+    log.str("error", error),
+  ])
 }
 
 fn query_error(error: pog.QueryError) -> String {
@@ -1414,30 +1420,36 @@ fn tags_source(text: String) -> thread.TagsSource {
 /// latency-free garbage collection.
 pub fn boot_sweeps(cfg: Config, db: store.Store) -> Nil {
   case db.delete_expired_node_grants() {
-    Ok(_) -> io.println("boot sweep: expired node grants deleted")
+    Ok(_) -> log.info("store", "boot sweep deleted expired node grants", [])
     Error(error) ->
-      io.println("boot sweep: expired node grants NOT swept: " <> error)
+      log.error("store", "boot sweep failed", [
+        log.str("sweep", "expired_node_grants"),
+        log.str("error", error),
+      ])
   }
   case cfg.node_idle_days {
     0 ->
-      io.println(
-        "boot sweep: node idle sweep disabled (NEXUS_NODE_IDLE_DAYS=0)",
-      )
+      log.info("store", "boot sweep disabled", [
+        log.str("sweep", "idle_nodes"),
+        log.str("reason", "NEXUS_NODE_IDLE_DAYS=0"),
+      ])
     days ->
       case db.delete_idle_nodes(days) {
         Ok([]) ->
-          io.println(
-            "boot sweep: no node idle past " <> int.to_string(days) <> "d",
-          )
+          log.info("store", "boot sweep found no idle nodes", [
+            log.int("idle_days", days),
+          ])
         Ok(names) ->
-          io.println(
-            "boot sweep: deleted idle nodes (>"
-            <> int.to_string(days)
-            <> "d): "
-            <> string.join(names, ", "),
-          )
+          log.info("store", "boot sweep deleted idle nodes", [
+            log.int("idle_days", days),
+            log.int("count", list.length(names)),
+            log.str("nodes", string.join(names, ",")),
+          ])
         Error(error) ->
-          io.println("boot sweep: idle nodes NOT swept: " <> error)
+          log.error("store", "boot sweep failed", [
+            log.str("sweep", "idle_nodes"),
+            log.str("error", error),
+          ])
       }
   }
 }

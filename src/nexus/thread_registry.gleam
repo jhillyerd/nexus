@@ -42,7 +42,6 @@
 import gleam/dict.{type Dict}
 import gleam/erlang/process.{type Monitor, type Pid, type Subject}
 import gleam/int
-import gleam/io
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/order.{type Order, Eq, Gt, Lt}
@@ -56,6 +55,7 @@ import nexus/bot_registry
 import nexus/config.{type Config}
 import nexus/delivery
 import nexus/env
+import nexus/log
 import nexus/openai
 import nexus/rescue
 import nexus/store.{type Store, type StoredSummary}
@@ -699,12 +699,10 @@ fn boot_sweep(persistence: Store) -> List(String) {
   case persistence.prune_never_used() {
     Ok([]) -> []
     Ok(ids) -> {
-      io.println(
-        "boot sweep: deleted "
-        <> int.to_string(list.length(ids))
-        <> " never-used thread(s): "
-        <> string.join(ids, ", "),
-      )
+      log.info("registry", "boot sweep deleted never-used threads", [
+        log.int("count", list.length(ids)),
+        log.str("ids", string.join(ids, ",")),
+      ])
       ids
     }
     Error(error) -> {
@@ -1805,12 +1803,9 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
                         case process.receive(reply_subject, 5000) {
                           Ok(_) -> Nil
                           Error(_) ->
-                            io.println(
-                              "nexus registry: archive notify "
-                              <> sid
-                              <> " unreachable (actor down; rehydration will "
-                              <> "re-derive its archived state)",
-                            )
+                            log.warn("registry", "archive notify unreachable", [
+                              log.str("thread_id", sid),
+                            ])
                         }
                       False -> Nil
                     }
@@ -2298,19 +2293,15 @@ fn lazy_start(state: State, summary: StoredSummary) -> Resolved {
   // Get later (e.g. after re-enabling) retries it.
   case state.resolve_provider(summary.provider_id) {
     Error(reason) -> {
-      io.println(
-        "nexus registry: lazy_start "
-        <> summary.id
-        <> " failed: provider "
-        <> summary.provider_id
-        <> " cannot stream ("
-        <> case reason {
+      log.warn("registry", "lazy_start failed", [
+        log.str("thread_id", summary.id),
+        log.str("provider_id", summary.provider_id),
+        log.str("reason", case reason {
           ProviderUnknown -> "unknown"
           ProviderDisabled -> "disabled"
           ProviderKeyUnavailable -> "key unavailable"
-        }
-        <> "); thread stays dormant",
-      )
+        }),
+      ])
       Missing
     }
     Ok(endpoint) ->
@@ -2329,18 +2320,17 @@ fn lazy_start(state: State, summary: StoredSummary) -> Resolved {
       // provider-failure path above.
       case resolve_entries(state, summary.toolset) {
         Error(reason) -> {
-          io.println(
-            "nexus registry: lazy_start "
-            <> summary.id
-            <> " failed: toolset ["
-            <> string.join(
-              list.map(summary.toolset, fn(entry) { entry.name }),
-              ", ",
-            )
-            <> "] is not resolvable ("
-            <> reason
-            <> "); thread stays dormant",
-          )
+          log.warn("registry", "lazy_start failed", [
+            log.str("thread_id", summary.id),
+            log.str(
+              "toolset",
+              string.join(
+                list.map(summary.toolset, fn(entry) { entry.name }),
+                ",",
+              ),
+            ),
+            log.str("reason", reason),
+          ])
           Missing
         }
         Ok(#(state, resolved)) -> {
@@ -2599,7 +2589,10 @@ fn write_through_or_log(id: String, write: fn() -> Result(Nil, String)) -> Nil {
 }
 
 fn log_store_error(context: String, error: String) -> Nil {
-  io.println("nexus registry: store " <> context <> " failed: " <> error)
+  log.error("registry", "store operation failed", [
+    log.str("context", context),
+    log.str("error", error),
+  ])
 }
 
 /// Tags are normalized on write through the ONE shared rule
