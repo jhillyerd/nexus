@@ -188,20 +188,24 @@ CREATE INDEX IF NOT EXISTS workspace_pending_gc
   WHERE deleted_at IS NOT NULL;
 ```
 
-Links on `bot` and `thread` (additive `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`):
+Links on `bot` and `thread` (following `sql/schema.sql`'s
+squash-migrations-into-base-CREATEs policy — edit the base
+`CREATE TABLE bot` and `CREATE TABLE thread` definitions directly, adding
+an `EXISTS`-guarded `DO $$` upgrade block only where existing dev/deployed
+data needs backfill, per the `thread.toolset` and `node.thread_id`
+precedents):
 
 ```sql
-ALTER TABLE bot ADD COLUMN IF NOT EXISTS workspace_mode text NOT NULL DEFAULT 'thread';
-  -- 'thread' (default: fresh workspace per thread) | 'bot' (shared persistent workspace across this bot's threads)
+-- New columns on CREATE TABLE bot:
+  workspace_mode    text NOT NULL DEFAULT 'thread',   -- 'thread' (fresh per thread) | 'bot' (shared across this bot's threads)
+  workspace_net     text NOT NULL DEFAULT 'none',     -- 'none' (offline bash) | 'proxy' (egress proxy + optional allowlist) | 'host' (explicit opt-in)
+  workspace_domains text[] NOT NULL DEFAULT '{}'      -- domain allowlist for workspace_net = 'proxy' ('{}' = public internet via SSRF-checked proxy)
 
-ALTER TABLE bot ADD COLUMN IF NOT EXISTS workspace_net text NOT NULL DEFAULT 'none';
-  -- 'none' (offline bash) | 'proxy' (egress proxy + optional allowlist) | 'host' (explicit opt-in)
-
-ALTER TABLE bot ADD COLUMN IF NOT EXISTS workspace_domains text[] NOT NULL DEFAULT '{}';
-  -- domain allowlist for workspace_net = 'proxy' ('{}' = public internet via SSRF-checked proxy; non-empty = allowlist only)
-
-ALTER TABLE thread ADD COLUMN IF NOT EXISTS workspace_id text REFERENCES workspace(id) ON DELETE SET NULL;
-ALTER TABLE thread ADD COLUMN IF NOT EXISTS tmp_workspace_id text REFERENCES workspace(id) ON DELETE SET NULL;
+-- New columns on CREATE TABLE thread:
+  workspace_id      text REFERENCES workspace(id) ON DELETE SET NULL,
+  tmp_workspace_id  text REFERENCES workspace(id) ON DELETE SET NULL,
+  workspace_net     text NOT NULL DEFAULT 'none',     -- frozen from bot at thread creation
+  workspace_domains text[] NOT NULL DEFAULT '{}'      -- frozen from bot at thread creation
 ```
 
 **Why `workspace` is a separate table instead of relying on `thread.workspace_root`:**
@@ -236,9 +240,12 @@ ALTER TABLE thread ADD COLUMN IF NOT EXISTS tmp_workspace_id text REFERENCES wor
     `rel_path = "threads/" <> thread_id`, `thread_id = Some(thread_id)`).
   - If `bot.workspace_mode == 'bot'`: find-or-create the bot's live
     `kind = 'bot'` workspace row (`root = cfg.workspace_root`,
-    `rel_path = "bots/" <> bot_id`, `bot_id = Some(bot_id)` — unique
-    index `workspace_bot_live` prevents duplicate rows under concurrent
-    creates).
+    `rel_path = "bots/" <> bot_id`, `bot_id = Some(bot_id)`) via
+    `INSERT ... ON CONFLICT (bot_id) WHERE kind = 'bot' AND
+    deleted_at IS NULL DO NOTHING` followed by a re-select, so the loser
+    of a concurrent create reuses the winner's row instead of failing
+    thread creation (matching the store's `on conflict ... do nothing`
+    idiom).
 - **Per-thread temp dir (`thread.tmp_workspace_id`):**
   - Always create a `workspace` row (`kind = 'tmp'`,
     `root = cfg.workspace_root`, `rel_path = "tmp/" <> thread_id`,
@@ -335,8 +342,9 @@ to keep threads self-contained even after bot edits/deletes, freeze
     Unix socket for `bwrap`).
   - Proxy enforces **SSRF protection unconditionally** (reject loopback,
     link-local/metadata, RFC1918, and ULA/CGNAT/Tailscale ranges, reusing
-    the same private-IP rules as `nexus/http_fetch`), plus optional
-    per-bot `workspace_domains` allowlisting.
+    the same private-IP rules as `nexus/net.is_private_address` — the
+    guard `nexus/http_fetch` delegates to), plus optional per-bot
+    `workspace_domains` allowlisting.
   - Ideal for scheduled tasks and light research (`curl`, `python3`,
     `git`, `gh`, `uv`).
 - **`host` (explicit opt-in):**
@@ -400,8 +408,9 @@ to keep threads self-contained even after bot edits/deletes, freeze
   - allowlist env scrub (`sandbox_env/1`),
   - first-line PID marker / cancel / timeout / partial output,
   - byte-capped streaming read,
-  - offline `gleam test` (unsandboxed fallback + mockable/opt-in sandbox
-    integration tests when the binary is on PATH).
+  - offline `gleam test` (unsandboxed fallback + sandbox integration
+    tests gated on an explicit opt-in env var, never binary-on-PATH
+    detection, so the default suite stays deterministic and offline).
 - Bind-mount or wire per-thread `/tmp` per Phase 0 decision.
 
 ### Phase 3 — Per-bot policies: network tiers + Option B bot-shared workspace
