@@ -143,30 +143,43 @@ through), and supports paginated reading via `start_index` and `max_length`.
 ### 3. Transport (`nexus/net` + `nexus_net_ffi.erl`)
 
 Reuse `nexus/net`'s existing SSRF guard, manual per-hop redirect validation,
-streaming byte cap, and hard per-hop deadline, with two small extensions:
+streaming byte cap, and hard per-hop deadline, with four focused updates:
 
-1. **Return `final_url` on `net.FetchResponse`:** `do_fetch` already computes
-   `validated.url` on each redirect hop; threading it onto `FetchResponse`
-   lets `web_fetch` report the post-redirect URL and resolve relative HTML
-   links accurately.
-2. **Request headers for `web_fetch`:**
+1. **RFC 3986-correct relative redirect resolution (`nexus/net`):**
+   `net.gleam`'s current `relative_to` helper prepends `/` to relative
+   `Location` paths and discards the previous hop's directory path (so a
+   redirect from `/docs/v1/intro.html` to `guide.html` wrongly resolves to
+   `/guide.html`). Replace `resolve_location`/`relative_to` with `gleam/uri.merge`
+   against the parsed previous hop URL (handling nested relative paths,
+   `..` segments, query-only targets, and protocol-relative `//host/...`
+   URLs per RFC 3986, still re-validating every hop through `validate_url`).
+2. **Return `final_url` and `content_encoding` on `net.FetchResponse`:**
+   - `do_fetch` already computes `validated.url` on each redirect hop; threading
+     it onto `FetchResponse` lets `web_fetch` report the post-redirect URL and
+     resolve relative HTML links accurately.
+   - Read the `content-encoding` response header in `nexus_net_ffi.erl`
+     (normalized lowercase, empty when absent) onto `FetchResponse`.
+3. **Request headers and compression posture for `web_fetch`:**
    - Send `Accept: text/markdown, text/html;q=0.9, text/plain;q=0.8, */*;q=0.5`
      so Markdown-aware docs servers (Cloudflare Markdown for Agents, Mintlify,
      etc.) can serve clean Markdown directly without HTML parsing.
    - Send a clean, honest `User-Agent` (e.g. `nexus-web-fetch/1.0`) — some
      public docs/CDNs reject empty or default `hackney/...` user agents with
      403.
-   - **Compression posture:** Do *not* advertise `Accept-Encoding: gzip` on
-     `stream_body` requests in v1, so the FFI's `MaxBytes` cap bounds real
-     uncompressed bytes directly and structurally prevents gzip-bomb memory
-     amplification. (If a server returns `Content-Encoding: gzip` anyway, fail
-     cleanly with a clear message or add bounded streaming `zlib` gunzip later.)
-3. **Lossy UTF-8 decoding at the boundary:** Web pages occasionally emit
+   - **Compression posture (v1):** Send `Accept-Encoding: identity` (do *not*
+     advertise `gzip`/`deflate`/`br`), so the FFI's `MaxBytes` cap bounds real
+     uncompressed bytes directly and structurally prevents decompression-bomb
+     memory amplification. Because an origin may still ignore `Accept-Encoding`
+     and return compressed bytes anyway, **reject any non-empty `content_encoding`
+     other than `"identity"` before UTF-8 decoding or HTML parsing** with
+     `Error("unsupported content-encoding: <encoding>")`. Bounded streaming
+     decompression is deferred to a future phase if real-world origins require it.
+4. **Lossy UTF-8 decoding at the boundary:** Web pages occasionally emit
    non-UTF-8 bytes (Latin-1 / Windows-1252 / truncated multi-byte sequences at
-   `MaxBytes`). Decode response bytes lossily into valid UTF-8 (reusing the
-   same Erlang pattern as `nexus_env_ffi:to_text_lossy/1`) before handing the
-   body to the HTML parser or JSON encoder so malformed bytes never crash a
-   turn.
+   `MaxBytes`). After verifying identity encoding and non-binary `Content-Type`,
+   decode response bytes lossily into valid UTF-8 (reusing the same Erlang
+   pattern as `nexus_env_ffi:to_text_lossy/1`) before handing the body to the
+   HTML parser or JSON encoder so malformed bytes never crash a turn.
 
 ### 4. Content-Type dispatch & HTML-to-Markdown (`nexus/html_markdown.gleam`)
 
@@ -177,10 +190,13 @@ void elements, HTML entities, malformed attributes) cleanly, and streams tokens
 in a single pass without allocating a full DOM tree.
 
 > **Verification gate before implementation:** Run `gleam add htmgrrrl` and
-> confirm clean compilation under the repo's Gleam + OTP 28 toolchain. If
-> `htmgrrrl` lags behind OTP 28 or current Gleam stdlib, depend directly on
-> `htmerl` via a ~40-line `nexus_html_ffi.erl` wrapper — same pure-Erlang
-> parser, zero risk.
+> confirm both clean compilation under the repo's Gleam + OTP 28 toolchain
+> **and** that `htmgrrrl` exposes `htmerl`'s `{preserve_ws, true}` SAX option
+> (required so whitespace-only text nodes inside `<pre>` and between inline
+> tags are not dropped by `htmerl`'s default `preserve_ws: false`). If
+> `htmgrrrl` lags behind OTP 28/stdlib or does not expose `preserve_ws`,
+> depend directly on `htmerl` via a ~40-line `nexus_html_ffi.erl` wrapper
+> passing `[{preserve_ws, true}]` — same pure-Erlang parser, zero risk.
 
 **Content-Type handling** (strip parameters like `; charset=...`, lowercase):
 
@@ -215,7 +231,9 @@ in a single pass without allocating a full DOM tree.
   - `br` → newline; `hr` → `\n---\n`.
   - `pre` / `pre > code` → fenced code block (`` ```lang `` when
     `class="language-..."` or `lang-...` is present), preserving whitespace
-    verbatim inside `<pre>`.
+    verbatim inside `<pre>` (guaranteed by invoking the SAX parser with
+    `preserve_ws: true` and applying whitespace normalization only outside
+    `<pre>` in the converter state machine).
   - `ul` / `ol` / `li` → `- ` / `1. ` with nesting indentation.
   - `table` / `tr` / `th` / `td` → compact GFM Markdown tables (with graceful
     fallback for nested/irregular tables).
@@ -259,7 +277,10 @@ pub type CachedDoc {
 }
 ```
 
-- **Key:** Requested URL string (post-trim, exact match). Only 2xx converted
+- **Key:** Normalized requested URL with the URI fragment (`#...`) stripped
+  while retaining scheme, host (lowercased), port, path, and query parameters
+  (fragments are client-side only and never alter the HTTP response, so anchor
+  links to the same page hit the same cache entry). Only 2xx converted
   documents are stored; errors and non-2xx responses are never cached.
 - **Bounds & eviction:**
   - **TTL:** `cfg.web_fetch_cache_ttl_ms` (default `600_000` = 10 minutes).
@@ -313,24 +334,34 @@ stays one shared knob across both HTTP tools:
 ## Phased implementation plan
 
 ### Phase 1 — Transport prep + pure HTML-to-Markdown converter
-1. Add `htmgrrrl` (or `htmerl` + thin FFI if OTP 28 needs it) in `gleam.toml`
-   and verify `gleam build` + `gleam test`.
-2. Extend `net.FetchResponse` with `final_url: String` (and update
-   `nexus_net_ffi.erl` / `net.gleam` + lossy UTF-8 helper for response bodies).
+1. Add `htmgrrrl` (or `htmerl` + thin `nexus_html_ffi.erl` with
+   `[{preserve_ws, true}]` if OTP 28 or missing `preserve_ws` requires it) in
+   `gleam.toml` and verify `gleam build` + `gleam test`.
+2. Update `nexus/net` and `nexus_net_ffi.erl`:
+   - Fix relative redirect resolution using `gleam/uri.merge` (RFC 3986) and
+     add nested-path / `..` / query-only relative redirect tests in
+     `test/net_test.gleam`.
+   - Extend `net.FetchResponse` with `final_url: String` and
+     `content_encoding: String`, plus lossy UTF-8 decoding helper.
 3. Create `src/nexus/html_markdown.gleam`:
    - `pub type Converted { Converted(title: Option(String), markdown: String) }`
    - `pub fn convert(html: String, base_url: String) -> Converted`
+   - Always invoke `htmerl` with `preserve_ws: true` and normalize whitespace
+     only outside `<pre>`.
    - Unit tests in `test/html_markdown_test.gleam`: headings, paragraphs,
-     nested lists, `<pre><code>` whitespace preservation, links (absolute,
-     relative, fragment, `javascript:` stripped), tables, `<script>`/`<style>`/
-     `<svg>`/`<!-- comment -->` stripping, `<nav>`/`<footer>` drop + empty-body
+     nested lists, `<pre><code>` indentation & blank-line preservation, inline
+     tag boundary spacing (`<b>a</b> <i>b</i>`), links (absolute, relative,
+     fragment, `javascript:` stripped), tables, `<script>`/`<style>`/`<svg>`/
+     `<!-- comment -->` stripping, `<nav>`/`<footer>` drop + empty-body
      fallback, HTML entities, malformed/unclosed tags, non-UTF-8/Unicode.
 
 ### Phase 2 — Bounded TTL/LRU cache
 1. Create `src/nexus/web_fetch_cache.gleam`:
-   - Pure cache state + `Seam` + supervised OTP actor + rescued `named_seam`.
+   - Pure cache state + fragment-stripping key normalization + `Seam` +
+     supervised OTP actor + rescued `named_seam`.
 2. Unit tests in `test/web_fetch_cache_test.gleam` (offline, injected clock):
-   - Hit/miss, TTL expiry, LRU eviction on entry count, eviction on byte cap,
+   - Hit/miss, fragment-stripping key equivalence (`#a` vs `#b`, query params
+     preserved), TTL expiry, LRU eviction on entry count, eviction on byte cap,
      oversized doc skipped, dead/missing actor degrades to miss without
      crashing.
 
@@ -339,12 +370,13 @@ stays one shared knob across both HTTP tools:
    tests in `test/config_test.gleam` and `README.md`).
 2. Create `src/nexus/web_fetch.gleam`:
    - `schema()`, argument parsing/validation (`url`, `start_index`,
-     `max_length`), `Content-Type` dispatch, cache lookup/store, character
-     pagination, JSON output encoding.
+     `max_length`), non-identity `Content-Encoding` rejection, `Content-Type`
+     dispatch, cache lookup/store, character pagination, JSON output encoding.
    - Inject the fetch fn (`fn(url, headers) -> Result(FetchResponse, String)`)
      into an inner `run_with` so `test/web_fetch_test.gleam` covers every path
      completely offline (HTML conversion, native `text/markdown` passthrough,
-     JSON/plain passthrough, binary rejection, pagination across cached pages,
+     JSON/plain passthrough, unsolicited `Content-Encoding: gzip` rejection,
+     binary rejection, pagination across cached pages, fragment URL cache hit,
      `start_index` past end, `max_length` clamping, non-2xx not cached,
      SSRF/transport errors, `raw_truncated` propagation).
 3. Update `src/nexus/tools.gleam`:
