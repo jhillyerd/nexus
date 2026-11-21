@@ -71,6 +71,7 @@ pub type PlanError {
   InvalidFilename(filename: String)
   DuplicateVersion(version: Int, first: String, second: String)
   EmptyMigration(name: String)
+  TransactionControlNotAllowed(name: String, statement: String)
   NameMismatch(version: Int, applied: String, disk: String)
   ChecksumMismatch(version: Int, name: String, applied: String, disk: String)
 }
@@ -85,6 +86,7 @@ pub type MigrationPlan {
 }
 
 type TxError {
+  CheckoutFailed(reason: String)
   StatementFailed(statement: String, error: pog.QueryError)
   RecordFailed(error: pog.QueryError)
   ConcurrentDrift(PlanError)
@@ -102,6 +104,12 @@ fn database_url() -> Result(String, Nil)
 @external(erlang, "nexus_store_ffi", "with_pool_settled")
 fn with_pool_settled(run: fn() -> Nil, queue: process.Pid) -> Nil
 
+@external(erlang, "nexus_store_ffi", "with_checked_out")
+fn with_checked_out(
+  pool_name: process.Name(pog.Message),
+  run: fn() -> Result(a, e),
+) -> Result(Result(a, e), String)
+
 pub fn main() -> Nil {
   let migrations =
     or_panic(
@@ -109,23 +117,28 @@ pub fn main() -> Nil {
       "cannot load migrations from " <> migrations_dir,
     )
   let url = or_panic(database_url(), "DATABASE_URL is not set")
+  let pool_name = process.new_name("nexus_migrate")
   let config =
-    or_panic(
-      pog.url_config(process.new_name("nexus_migrate"), url),
-      "invalid DATABASE_URL",
-    )
+    or_panic(pog.url_config(pool_name, url), "invalid DATABASE_URL")
     |> pog.pool_size(1)
     |> pog.connection_parameter("timezone", "UTC")
   let started =
     or_panic(pog.start(config), "could not connect — is the database up?")
   with_pool_settled(
-    fn() { apply_migrations(migrations, started.data) },
+    fn() { apply_migrations(migrations, pool_name, started.data) },
     started.pid,
   )
 }
 
-fn apply_migrations(migrations: List(Migration), db: pog.Connection) -> Nil {
-  or_panic(ensure_tracking_table(db), "failed to initialize schema_migration")
+fn apply_migrations(
+  migrations: List(Migration),
+  pool_name: process.Name(pog.Message),
+  db: pog.Connection,
+) -> Nil {
+  or_panic(
+    ensure_tracking_table(pool_name, db),
+    "failed to initialize schema_migration",
+  )
   let applied =
     or_panic(fetch_applied(db), "failed to read schema_migration rows")
   let migration_plan = case plan(migrations, applied) {
@@ -157,7 +170,7 @@ fn apply_migrations(migrations: List(Migration), db: pog.Connection) -> Nil {
     pending -> {
       let applied_now =
         list.fold(pending, 0, fn(applied_count, migration) {
-          case apply_one(db, migration) {
+          case apply_one(pool_name, db, migration) {
             Ok(0) -> {
               io.println(
                 "migrate: skipped "
@@ -176,7 +189,16 @@ fn apply_migrations(migrations: List(Migration), db: pog.Connection) -> Nil {
               )
               applied_count + 1
             }
-            Error(pog.TransactionRolledBack(StatementFailed(stmt, err))) -> {
+            Error(CheckoutFailed(reason)) -> {
+              io.println(
+                "migrate: FAILED checking out connection for "
+                <> migration.name
+                <> " — "
+                <> reason,
+              )
+              panic as "migrate: checkout failed"
+            }
+            Error(StatementFailed(stmt, err)) -> {
               io.println(
                 "migrate: FAILED "
                 <> migration.name
@@ -187,7 +209,7 @@ fn apply_migrations(migrations: List(Migration), db: pog.Connection) -> Nil {
               )
               panic as "migrate: statement failed"
             }
-            Error(pog.TransactionRolledBack(RecordFailed(err))) -> {
+            Error(RecordFailed(err)) -> {
               io.println(
                 "migrate: FAILED recording "
                 <> migration.name
@@ -196,18 +218,9 @@ fn apply_migrations(migrations: List(Migration), db: pog.Connection) -> Nil {
               )
               panic as "migrate: record failed"
             }
-            Error(pog.TransactionRolledBack(ConcurrentDrift(err))) -> {
+            Error(ConcurrentDrift(err)) -> {
               io.println("migrate: " <> format_plan_error(err))
               panic as "migrate failed"
-            }
-            Error(pog.TransactionQueryError(err)) -> {
-              io.println(
-                "migrate: FAILED transaction for "
-                <> migration.name
-                <> " — "
-                <> string.inspect(err),
-              )
-              panic as "migrate: transaction failed"
             }
           }
         })
@@ -224,10 +237,11 @@ fn apply_migrations(migrations: List(Migration), db: pog.Connection) -> Nil {
 }
 
 fn ensure_tracking_table(
+  pool_name: process.Name(pog.Message),
   db: pog.Connection,
-) -> Result(Nil, pog.TransactionError(pog.QueryError)) {
-  pog.transaction(db, fn(tx) {
-    use _ <- result.try(acquire_lock(tx))
+) -> Result(Nil, TxError) {
+  run_transaction(pool_name, db, fn(tx) {
+    use _ <- result.try(acquire_lock(tx) |> result.map_error(RecordFailed))
     "CREATE TABLE IF NOT EXISTS schema_migration (
       version    int PRIMARY KEY,
       name       text NOT NULL,
@@ -238,15 +252,85 @@ fn ensure_tracking_table(
     |> pog.returning(decode.dynamic)
     |> pog.execute(tx)
     |> result.replace(Nil)
+    |> result.map_error(RecordFailed)
   })
+}
+
+/// Run `body` inside a PostgreSQL transaction whose pool checkout is NOT
+/// capped by pgo's 5-second default deadline. Transaction-local
+/// `lock_timeout` and `statement_timeout` enforce the configured lock and
+/// statement budgets server-side in PostgreSQL.
+fn run_transaction(
+  pool_name: process.Name(pog.Message),
+  db: pog.Connection,
+  body: fn(pog.Connection) -> Result(a, TxError),
+) -> Result(a, TxError) {
+  case
+    with_checked_out(pool_name, fn() {
+      use _ <- result.try(
+        exec_tx_control(db, "BEGIN") |> result.map_error(RecordFailed),
+      )
+      let outcome = {
+        use _ <- result.try(
+          set_local_timeout(db, "lock_timeout", lock_wait_timeout_ms)
+          |> result.map_error(RecordFailed),
+        )
+        use _ <- result.try(
+          set_local_timeout(db, "statement_timeout", statement_timeout_ms)
+          |> result.map_error(RecordFailed),
+        )
+        body(db)
+      }
+      case outcome {
+        Ok(value) -> {
+          use _ <- result.try(
+            exec_tx_control(db, "COMMIT") |> result.map_error(RecordFailed),
+          )
+          Ok(value)
+        }
+        Error(err) -> {
+          let _ = exec_tx_control(db, "ROLLBACK")
+          Error(err)
+        }
+      }
+    })
+  {
+    Ok(inner) -> inner
+    Error(reason) -> Error(CheckoutFailed(reason))
+  }
+}
+
+fn exec_tx_control(
+  db: pog.Connection,
+  sql: String,
+) -> Result(Nil, pog.QueryError) {
+  sql
+  |> pog.query
+  |> pog.returning(decode.dynamic)
+  |> pog.execute(db)
+  |> result.replace(Nil)
+}
+
+fn set_local_timeout(
+  db: pog.Connection,
+  setting: String,
+  ms: Int,
+) -> Result(Nil, pog.QueryError) {
+  "SELECT set_config($1, $2, true)"
+  |> pog.query
+  |> pog.parameter(pog.text(setting))
+  |> pog.parameter(pog.text(int.to_string(ms) <> "ms"))
+  |> pog.returning(decode.dynamic)
+  |> pog.execute(db)
+  |> result.replace(Nil)
 }
 
 fn acquire_lock(tx: pog.Connection) -> Result(Nil, pog.QueryError) {
   // Wrap pg_advisory_xact_lock in a subquery returning int4 rather than
   // Postgres `void` (OID 2278), which pgo's pg_types decoder does not map.
+  // Bound server-side by `lock_timeout` set at transaction start.
   "SELECT 1 FROM (SELECT pg_advisory_xact_lock($1)) AS _lock"
   |> pog.query
-  |> pog.timeout(lock_wait_timeout_ms)
   |> pog.parameter(pog.int(advisory_lock_key))
   |> pog.returning(decode.dynamic)
   |> pog.execute(tx)
@@ -264,17 +348,19 @@ fn fetch_applied(
   }
   "SELECT version, name, checksum FROM schema_migration ORDER BY version ASC"
   |> pog.query
+  |> pog.timeout(statement_timeout_ms)
   |> pog.returning(decoder)
   |> pog.execute(db)
   |> result.map(fn(returned) { returned.rows })
 }
 
 fn apply_one(
+  pool_name: process.Name(pog.Message),
   db: pog.Connection,
   migration: Migration,
-) -> Result(Int, pog.TransactionError(TxError)) {
+) -> Result(Int, TxError) {
   let stmts = statements(migration.sql)
-  pog.transaction(db, fn(tx) {
+  run_transaction(pool_name, db, fn(tx) {
     use _ <- result.try(acquire_lock(tx) |> result.map_error(RecordFailed))
     use existing <- result.try(
       fetch_one_applied(tx, migration.version)
@@ -339,7 +425,6 @@ fn execute_statements(
   list.try_each(stmts, fn(stmt) {
     stmt
     |> pog.query
-    |> pog.timeout(statement_timeout_ms)
     |> pog.returning(decode.dynamic)
     |> pog.execute(tx)
     |> result.replace(Nil)
@@ -502,6 +587,12 @@ pub fn format_plan_error(error: PlanError) -> String {
       <> second
     EmptyMigration(name) ->
       "migration '" <> name <> "' contains no SQL statements"
+    TransactionControlNotAllowed(name, statement) ->
+      "migration '"
+      <> name
+      <> "' contains a top-level transaction-control statement ('"
+      <> statement
+      <> "'); the runner already wraps each migration in a transaction"
     NameMismatch(version, applied, disk) ->
       "migration version "
       <> int.to_string(version)
@@ -538,12 +629,64 @@ fn validate_disk(disk: List(Migration)) -> Result(List(Migration), PlanError) {
         Error(Nil) ->
           case statements(m.sql) {
             [] -> Error(EmptyMigration(m.name))
-            _ -> Ok(dict.insert(seen, m.version, m.name))
+            stmts ->
+              case list.find(stmts, is_transaction_control) {
+                Ok(stmt) ->
+                  Error(TransactionControlNotAllowed(m.name, summarize(stmt)))
+                Error(Nil) -> Ok(dict.insert(seen, m.version, m.name))
+              }
           }
       }
     }),
   )
   Ok(sorted)
+}
+
+/// True when a top-level SQL statement (already split and stripped of
+/// comments by `statements`) begins with a transaction-control command
+/// (`BEGIN`, `START TRANSACTION`, `COMMIT`, `END`, `ROLLBACK`, `ABORT`).
+///
+/// Transaction-control keywords inside dollar-quoted `DO` or function bodies
+/// are unaffected because those statements start with `DO` or `CREATE`.
+pub fn is_transaction_control(statement: String) -> Bool {
+  let #(first, rest) = take_leading_word(to_codepoints(statement))
+  case first {
+    "begin" | "commit" | "end" | "rollback" | "abort" -> True
+    "start" -> {
+      let #(second, _) = take_leading_word(rest)
+      second == "transaction"
+    }
+    _ -> False
+  }
+}
+
+fn take_leading_word(chars: List(Int)) -> #(String, List(Int)) {
+  let trimmed = skip_whitespace(chars)
+  let #(word, rest) = take_ident_chars(trimmed, [])
+  #(string.lowercase(codepoints_to_string(list.reverse(word))), rest)
+}
+
+fn skip_whitespace(chars: List(Int)) -> List(Int) {
+  case chars {
+    [c, ..rest]
+      if c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12
+    -> skip_whitespace(rest)
+    _ -> chars
+  }
+}
+
+fn take_ident_chars(
+  chars: List(Int),
+  acc: List(Int),
+) -> #(List(Int), List(Int)) {
+  case chars {
+    [c, ..rest] ->
+      case is_ident_continue(c) {
+        True -> take_ident_chars(rest, [c, ..acc])
+        False -> #(acc, chars)
+      }
+    [] -> #(acc, [])
+  }
 }
 
 fn is_slug_alnum(code: Int) -> Bool {

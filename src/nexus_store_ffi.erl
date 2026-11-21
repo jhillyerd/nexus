@@ -1,11 +1,37 @@
 -module(nexus_store_ffi).
 
--export([database_url/0, with_pool_settled/2]).
+-export([database_url/0, with_pool_settled/2, with_checked_out/2]).
 
 database_url() ->
     case os:getenv("DATABASE_URL") of
         false -> {error, nil};
         Value -> {ok, unicode:characters_to_binary(Value)}
+    end.
+
+%% Check out a connection from PoolName with `{timeout, infinity}` so long
+%% migration transactions are not killed by pgo's 5-second default checkout
+%% deadline (`pog.transaction` calls `pgo:checkout/1` with no timeout option).
+%% Binds the connection via `pgo:with_conn/2` so normal `pog.execute(..., db)`
+%% calls run on that exact connection, rolls back on unexpected crash, and
+%% always checks the connection back into the pool.
+with_checked_out(PoolName, Fun) ->
+    case pgo:checkout(PoolName, [{timeout, infinity}]) of
+        {ok, Ref, Conn} ->
+            try
+                {ok, pgo:with_conn(Conn, Fun)}
+            catch
+                Class:Reason:Stack ->
+                    catch pgo_handler:extended_query(
+                        Conn, <<"ROLLBACK">>, [], #{queue_time => undefined}
+                    ),
+                    erlang:raise(Class, Reason, Stack)
+            after
+                pgo:checkin(Ref, Conn)
+            end;
+        {error, Reason} ->
+            {error, unicode:characters_to_binary(
+                io_lib:format("~p", [Reason])
+            )}
     end.
 
 %% Run Fun to completion, then hold the VM until the pog pool's type server

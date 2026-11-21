@@ -4,12 +4,15 @@
 //// - the pure migration planner (ordering, immutability checks, ahead-in-db),
 //// - live validation of the repository's `sql/migrations/` directory.
 
+import gleam/bit_array
+import gleam/crypto
 import gleam/list
 import gleam/string
 import gleeunit/should
 import nexus/store/migrate.{
   type Migration, AppliedMigration, ChecksumMismatch, DuplicateVersion,
   EmptyMigration, Migration, MigrationPlan, NameMismatch,
+  TransactionControlNotAllowed,
 }
 import simplifile
 
@@ -290,6 +293,38 @@ pub fn plan_rejects_empty_migration_test() {
   |> should.equal(Error(EmptyMigration("0002_empty.sql")))
 }
 
+pub fn plan_rejects_top_level_transaction_control_test() {
+  let cases = [
+    "BEGIN; CREATE TABLE t (id int);",
+    "CREATE TABLE t (id int); COMMIT;",
+    "CREATE TABLE t (id int); ROLLBACK;",
+    "START TRANSACTION ISOLATION LEVEL SERIALIZABLE; SELECT 1;",
+    "CREATE TABLE t (id int); END WORK;",
+    "CREATE TABLE t (id int); ABORT;",
+    "/* comment */ commit and chain;",
+  ]
+  list.each(cases, fn(sql) {
+    let m = migration(2, "0002_tx.sql", sql)
+    let assert Error(TransactionControlNotAllowed(name: "0002_tx.sql", ..)) =
+      migrate.plan([m], [])
+  })
+}
+
+pub fn plan_allows_transaction_keywords_in_do_and_function_bodies_and_ddl_test() {
+  let m =
+    migration(
+      2,
+      "0002_safe_keywords.sql",
+      "DO $$ BEGIN PERFORM 1; END; $$;
+       CREATE FUNCTION f() RETURNS void AS $$ BEGIN NULL; END; $$ LANGUAGE plpgsql;
+       CREATE TABLE commit_log (id int, rollback_reason text, begin_at timestamptz);
+       CREATE TABLE start_events (id int);",
+    )
+  let assert Ok(MigrationPlan(pending: [planned], already_applied: 0, ..)) =
+    migrate.plan([m], [])
+  should.equal(planned.version, 2)
+}
+
 pub fn plan_tolerates_db_ahead_of_older_branch_test() {
   let m1 = migration(1, "0001_initial.sql", "CREATE TABLE a (id int);")
   let applied1 = AppliedMigration(1, m1.name, m1.checksum)
@@ -337,8 +372,9 @@ pub fn repo_migrations_are_valid_test() {
 }
 
 pub fn load_migrations_ignores_non_sql_entries_and_rejects_bad_sql_names_test() {
-  let dir = "/tmp/nexus_migrate_load_test"
-  let _ = simplifile.delete(dir)
+  let suffix =
+    crypto.strong_random_bytes(8) |> bit_array.base16_encode |> string.lowercase
+  let dir = "/tmp/nexus_migrate_load_test_" <> suffix
   let assert Ok(Nil) = simplifile.create_directory_all(dir)
   let assert Ok(Nil) = simplifile.write(dir <> "/.DS_Store", "junk")
   let assert Ok(Nil) = simplifile.write(dir <> "/README.md", "notes")
