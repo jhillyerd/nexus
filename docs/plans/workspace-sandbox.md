@@ -144,8 +144,40 @@ Landlock ABI):
    current `nixpkgs-unstable` without fragile native build hacks.
 
 **Spike deliverable:** record measurements and the backend decision
-(`nono`, `bwrap`, or `bwrap` + proxy / pluggable backend) in an "As-built
-spike results" section appended to this doc before starting Phase 2.
+(`nono`, `bwrap`, or `bwrap` + proxy / pluggable backend) in a spike
+results research doc referenced from this plan before starting Phase 2.
+
+### Phase 0 outcome (spike complete, 2026-11-21)
+
+Full measurements, per-check evidence, and reproduction shapes live in
+`docs/research/workspace-sandbox-backend-spike.md` (run on `boss`,
+NixOS 26.05, kernel 6.18.59, Landlock ABI 7; every check against
+nexus's exact `bash_workspace` spawn shape). The decision and its
+load-bearing consequences:
+
+- **Primary backend: `bwrap`** (`--tmpfs /` + `--unshare-net`
+  `--unshare-pid` `--die-with-parent` + workspace/tmp binds), kept
+  pluggable behind the planned `Sandbox` config enum
+  (`bwrap` | `nono` | `none`). It is the only offline posture with no
+  residual DNS channel, gives true per-thread `/tmp` at `/tmp`, and
+  adds ~2 ms per call (p95 4.6 ms).
+- **Kill-tree amendment for pid-namespace backends:** the first-line
+  marker pid is IN-NAMESPACE, so the host-side group kill must be
+  suppressed (`kill_group` = False); `port_close` (kills bwrap) +
+  `--die-with-parent` is the entire, verified kill path.
+- **Egress tier runs nono:** `nono wrap --block-net
+  --allow-connect-port <P>` + a shared long-lived `nono proxy`
+  (SSRF-guarded domain allowlists) measured 6.6 ms p95; per-call proxy
+  boot (~240 ms) is disqualified. Open question 1 is answered: no
+  bwrap-around-nono nesting — per-tier backend selection instead.
+- **nono embedding contract** (if/where nono is configured): the
+  wrapper chain's `HOME`/`XDG_*` must point outside every grant
+  (nono refuses grants containing its state roots; the bash prelude
+  re-exports `HOME`/`TMPDIR` as its first silent statement — spawn
+  shape only, zero request bytes), plus `--read /nix/store`,
+  `--allow-cwd`, a profile excluding `system_write_linux`, and
+  exit-code-based failure surfacing (`-s` hides even fatal errors).
+  Details and exact argv in the research doc.
 
 ---
 
