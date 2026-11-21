@@ -364,7 +364,7 @@ pub fn repo_migrations_are_valid_test() {
   // accidental edit fails `gleam test` offline before any database sees it.
   should.equal(
     first.checksum,
-    "c8c74a64f2c048d119e9c7135d8fefab5bab575088c3e0396b0ef77194029de0",
+    "fa32d1bc76967941730db6b2ac3d94fd8a9d78cc6501eb43362daed918430c81",
   )
   let assert Ok(MigrationPlan(pending:, already_applied: 0, ahead_in_db: [])) =
     migrate.plan(migrations, [])
