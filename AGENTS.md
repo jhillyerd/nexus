@@ -516,6 +516,41 @@ resolves no local install, fetches latest, and drops a second, unpinned
 browser revision into the shared cache. Postgres/migrate preconditions:
 `e2e/README.md`.
 
+## Logging
+
+Server logging lives in `src/nexus/log.gleam` + `src/nexus_log_ffi.erl`
+and emits single-line `logfmt` through Erlang's built-in `:logger`
+(human-readable in terminal / container logs and directly parseable by
+Grafana Loki's `| logfmt` stage):
+
+```gleam
+import gleam/list
+import gleam/string
+import nexus/log
+
+log.info("store", "boot sweep deleted idle nodes", [
+  log.int("count", list.length(names)),
+  log.str("nodes", string.join(list.take(names, 100), ",")),
+])
+```
+
+- **Use `nexus/log` for all server logging** (`log.debug`, `log.info`,
+  `log.warn`, `log.error` with a short `component`, short `msg`, and
+  typed fields via `log.str`, `log.int`, `log.float`, `log.bool`) —
+  never `io.println` in server modules. Keep `io.println` only for
+  deliberate stdout output in standalone CLI tools (`tui`, `migrate`,
+  `dev_seed`, `audit/ttft`).
+- **Configured once at boot** (`log.configure` / `log.set_level` in
+  `src/nexus/boot.gleam`, driven by `NEXUS_LOG_LEVEL`, default `info`).
+  Because `mist`, `glisten`, `stratus`, and OTP supervisors all log
+  through `:logger`, their output and crash reports share the same level
+  filter and single-line `logfmt` formatter.
+- **`nexus/log` is a leaf module** (imports `gleam_stdlib` only) so any
+  module, including `nexus/config`, can import it without cycles.
+- **Never log secrets** — `NEXUS_ENCRYPTION_KEY`, provider API keys,
+  `NEXUS_UI_TOKEN`, `NEXUS_SEARXNG_TOKEN`, `NEXUS_PG_PASSWORD`, node
+  tokens, and pairing codes must never appear in messages or fields.
+
 ## Gleam API pitfalls (training data lags the pinned toolchain)
 
 A flash model hit all three of these repeatedly during the issue #88
@@ -527,8 +562,8 @@ pinned gleam_stdlib is 1.0.5 (`manifest.toml`) — confirm API existence in
   `print`/`println` (plus `_error` variants); debug printing moved to the
   `echo` keyword expression (Gleam v1.9:
   https://gleam.run/news/hello-echo-hello-git/) — `echo some_expression`
-  prints the value with file:line to stderr. Use `io.println` for
-  deliberate output.
+  prints the value with file:line to stderr. Use `nexus/log` for server
+  logging and `io.println` only for deliberate CLI stdout output.
 - **`string.find` does not exist.** Use `string.contains` (Bool) or
   `string.split_once` instead. (The `string.find` text in
   `src/nexus/codemode.gleam` is Lua inside generated codemode scripts,

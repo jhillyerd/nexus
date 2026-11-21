@@ -33,8 +33,6 @@
 
 import gleam/dict
 import gleam/erlang/process
-import gleam/int
-import gleam/io
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/otp/factory_supervisor
@@ -45,6 +43,7 @@ import mist
 import nexus/bot_registry
 import nexus/config
 import nexus/env
+import nexus/log
 import nexus/mcp_adapter
 import nexus/plugin
 import nexus/provider_registry
@@ -105,17 +104,21 @@ pub fn bot_validate_tools(
 }
 
 pub fn main() -> Nil {
-  io.println("nexus — M3 server-component UI")
+  log.configure(log.Info)
   case config.load() {
     Error(message) -> {
-      io.println("config error: " <> message)
-      io.println(
-        "required: NEXUS_ENCRYPTION_KEY (base64 of 32 bytes); "
-        <> "see the README env table",
-      )
+      log.error("boot", "config error", [
+        log.str("error", message),
+        log.str(
+          "hint",
+          "required: NEXUS_ENCRYPTION_KEY (base64 of 32 bytes); see the README env table",
+        ),
+      ])
       halt(2)
     }
     Ok(cfg) -> {
+      log.set_level(cfg.log_level)
+      log.info("boot", "starting", [])
       // Plugins FIRST (plugin-api plan Phase 1): the provider table must
       // exist before the root tree's closures capture it. Loud on every
       // failure — an unknown name, a provider that will not start or
@@ -125,7 +128,7 @@ pub fn main() -> Nil {
       let providers = case plugin.boot(cfg) {
         Ok(table) -> table
         Error(reason) -> {
-          io.println("plugin boot error: " <> reason)
+          log.error("boot", "plugin boot error", [log.str("error", reason)])
           halt(2)
         }
       }
@@ -140,7 +143,7 @@ pub fn main() -> Nil {
       let foreign = case mcp_adapter.boot(cfg) {
         Ok(mounts) -> dict.from_list(mounts)
         Error(reason) -> {
-          io.println("mcp boot error: " <> reason)
+          log.error("boot", "mcp boot error", [log.str("error", reason)])
           halt(2)
         }
       }
@@ -275,6 +278,13 @@ pub fn main() -> Nil {
             ))
             |> mist.bind(cfg.http_bind)
             |> mist.port(cfg.http_port)
+            |> mist.after_start(fn(port, _scheme, _interface) {
+              log.info("boot", "listening", [
+                log.str("bind", cfg.http_bind),
+                log.int("port", port),
+                log.str("log_level", log.level_to_string(cfg.log_level)),
+              ])
+            })
             |> mist.start
           }),
         )
@@ -296,22 +306,19 @@ pub fn main() -> Nil {
             cfg,
             persist.seam(process.named_subject(store_name)),
           )
-          io.println(
-            "listening on http://"
-            <> cfg.http_bind
-            <> ":"
-            <> int.to_string(cfg.http_port),
-          )
           case cfg.ui_token {
-            Some(_) -> io.println("auth: token required")
-            None -> io.println("auth: disabled (NEXUS_UI_TOKEN unset)")
+            Some(_) -> log.info("boot", "auth enabled", [])
+            None ->
+              log.warn("boot", "auth disabled", [
+                log.str("reason", "NEXUS_UI_TOKEN unset"),
+              ])
           }
           process.sleep_forever()
         }
         Error(reason) -> {
-          io.println(
-            "failed to start supervision tree: " <> string.inspect(reason),
-          )
+          log.error("boot", "failed to start supervision tree", [
+            log.str("reason", string.inspect(reason)),
+          ])
           halt(1)
         }
       }

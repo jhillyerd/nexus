@@ -392,6 +392,7 @@ Bifrost/SearxNG, and the production cache check whose golden fixture is
 | `NEXUS_ENV_TIMEOUT_MS` | `60000` | environments: per-call wall-clock deadline for `bash` in ms (>= 1000; at the deadline the command's whole process tree is killed on Linux (setsid + process-group kill; without setsid — e.g. macOS dev machines — only the direct child dies and descendants may survive), partial output kept) |
 | `NEXUS_ENV_MAX_OUTPUT_BYTES` | `262144` | environments: byte cap on bash output and file reads, enforced at accumulation (>= 1024; buffering is bounded at the cap plus one chunk and a small slack, omission noted) |
 | `NEXUS_NODE_IDLE_DAYS` | `7` | node credentials unattended this many days (since last connect; creation for never-connected) are deleted by the boot sweep — a daily-driver TUI keeps its credential indefinitely, a crashed one has a week; `0` disables the sweep |
+| `NEXUS_LOG_LEVEL` | `info` | minimum server log level (`debug`, `info`, `warn`/`warning`, `error`); logs are emitted as single-line `logfmt` via Erlang `:logger` |
 
 The single-provider env trio (`BIFROST_BASE_URL`, `BIFROST_API_KEY`,
 `NEXUS_MODEL_DEFAULT`) is gone: the `provider` table in Postgres is the

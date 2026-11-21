@@ -23,6 +23,7 @@ import nexus/bot
 import nexus/bot_registry
 import nexus/config.{type Config}
 import nexus/delivery
+import nexus/log
 import nexus/loop
 import nexus/openai
 import nexus/store
@@ -71,6 +72,7 @@ fn test_config() -> Config {
     env_timeout_ms: 60_000,
     env_max_output_bytes: 100_000,
     node_idle_days: 7,
+    log_level: log.Info,
     max_bot_hops: 4,
   )
 }

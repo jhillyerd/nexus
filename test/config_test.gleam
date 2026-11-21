@@ -4,6 +4,7 @@ import gleam/option.{None, Some}
 import gleam/string
 import gleeunit/should
 import nexus/config
+import nexus/log
 
 /// Valid base64 of exactly 32 bytes — the shared test fixture value
 /// (same convention as the other suites' `encryption_key` field).
@@ -39,6 +40,7 @@ fn set_all(pairs: List(#(String, String))) -> Nil {
   // only meaningful when the caller's shell has not exported an
   // override (env leakage is real — see the seed-key foot-gun).
   envoy.unset("NEXUS_NODE_IDLE_DAYS")
+  envoy.unset("NEXUS_LOG_LEVEL")
   envoy.unset("NEXUS_HTTP_FETCH_MAX_BYTES")
   envoy.unset("NEXUS_HTTP_FETCH_TIMEOUT_MS")
   envoy.unset("NEXUS_HTTP_FETCH_ALLOW_PRIVATE")
@@ -511,4 +513,43 @@ pub fn node_idle_days_rejects_negative_test() {
   let assert Error(message) = config.load()
   message
   |> should.equal("environment variable NEXUS_NODE_IDLE_DAYS must be >= 0: -1")
+}
+
+pub fn log_level_defaults_and_overrides_test() {
+  set_all([#("NEXUS_ENCRYPTION_KEY", key_b64)])
+  let assert Ok(cfg) = config.load()
+  cfg.log_level |> should.equal(log.Info)
+
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_LOG_LEVEL", "debug"),
+  ])
+  let assert Ok(cfg) = config.load()
+  cfg.log_level |> should.equal(log.Debug)
+
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_LOG_LEVEL", "WARNING"),
+  ])
+  let assert Ok(cfg) = config.load()
+  cfg.log_level |> should.equal(log.Warn)
+
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_LOG_LEVEL", "error"),
+  ])
+  let assert Ok(cfg) = config.load()
+  cfg.log_level |> should.equal(log.Error)
+}
+
+pub fn log_level_rejects_invalid_value_test() {
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_LOG_LEVEL", "verbose"),
+  ])
+  let assert Error(message) = config.load()
+  message
+  |> should.equal(
+    "environment variable NEXUS_LOG_LEVEL must be one of: debug, info, warn, error: verbose",
+  )
 }

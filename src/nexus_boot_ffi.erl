@@ -11,7 +11,24 @@ ensure_hackney_started() ->
     end.
 
 halt(Code) ->
+    %% Flush the default :logger handler before halting so fatal boot
+    %% diagnostics always reach stdout/stderr before VM exit. Retry once on
+    %% a transient non-ok result; never block indefinitely on a dead handler.
+    flush_default_logger(2),
     erlang:halt(Code).
+
+flush_default_logger(0) ->
+    ok;
+flush_default_logger(Attempts) ->
+    case (try logger_std_h:filesync(default) catch _:_ -> {error, failed} end) of
+        ok ->
+            ok;
+        _ when Attempts > 1 ->
+            timer:sleep(25),
+            flush_default_logger(Attempts - 1);
+        _ ->
+            ok
+    end.
 
 
 
