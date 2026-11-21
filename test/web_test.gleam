@@ -898,6 +898,41 @@ pub fn m3_settings_page_restyle_css_test() {
   ))
 }
 
+/// Bot message chip formatting contract: `details.turn.bot` stands
+/// outside `.chip-row`, so it must carry the same collapsed chip
+/// padding (`.1rem .5rem`) and `[open]` expansion padding
+/// (`.35rem .7rem`) directly, and keep `summary` in Pico's native
+/// block/list-item flow (never `display: flex`, which breaks Pico's
+/// `summary::after` float, doubles the chevron gap, and shifts the
+/// chevron onto the text baseline) with `time.ts` inline beside the
+/// sender name.
+pub fn m3_bot_chip_css_test() {
+  let css = nexus_page.html(None)
+  should.be_true(string.contains(
+    css,
+    "details.turn.bot { margin: 0; align-self: flex-start; max-width: 46rem; padding: .1rem .5rem; border-radius: 10px;",
+  ))
+  should.be_true(string.contains(
+    css,
+    "details.turn.bot[open] { padding: .35rem .7rem; }",
+  ))
+  should.be_true(string.contains(
+    css,
+    "details.turn.bot > summary { cursor: pointer; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;\n  font-size: .72rem; opacity: .75; margin: 0; white-space: normal; }",
+  ))
+  should.be_true(string.contains(
+    css,
+    "#app details.turn.bot > summary time.ts { display: inline; margin-top: 0; margin-left: .45rem; }",
+  ))
+  // Tool chips share the same .72rem / 1rem line box and .1rem .5rem
+  // padding as the <details> chip summaries, so all three chip kinds
+  // render at the exact same height.
+  should.be_true(string.contains(
+    css,
+    "font-size: .72rem; line-height: 1rem; padding: .1rem .5rem; margin: 0; border-radius: 10px;",
+  ))
+}
+
 /// No-CDN guard: the UI must render fully offline, so the shell may not
 /// reference any absolute or protocol-relative external URL — every asset
 /// it loads is vendored in-repo and served by nexus itself (runtime.mjs,

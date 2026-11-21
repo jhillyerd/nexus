@@ -1285,20 +1285,24 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
    sender beside the message's age; expanded, the body renders the
    sender's text through the same security-safe markdown renderer as
    assistant turns. Same dashed chip look as reasoning, same left lane:
-   it is inbound traffic, not the user's own line. The margin resets
-   kill Pico's accordion spacing — bare `details` carries a 1rem bottom
-   margin and `details[open]>summary` another 1rem under the label —
-   which would double the conversation gap and pad the expanded body
-   (the summary override is #app-free: class count already beats
-   Pico's `details[open]>summary` at equal element count). */
-details.turn.bot { margin: 0; align-self: flex-start; max-width: 46rem; padding: .35rem .7rem; border-radius: 10px;
+   it is inbound traffic, not the user's own line. Collapsed padding
+   matches `.chip-row > details.turn.reasoning` and `.turn.tool`
+   (`.1rem .5rem`) so it reads as the same compact pill even outside a
+   `.chip-row`; `[open]` restores the roomy block padding (`.35rem .7rem`).
+   The summary stays in Pico's native flow (NOT `display: flex`, which
+   disables `::after`'s `float: right`, adds flex `gap` on top of Pico's
+   `::after` margin, and baseline-shifts the chevron); `time.ts` flips to
+   `display: inline` to sit beside the sender name. The margin resets kill
+   Pico's accordion spacing — bare `details` carries a 1rem bottom margin
+   and `details[open]>summary` another 1rem under the label (class count
+   on `details.turn.bot > summary` beats Pico's `details[open]>summary`). */
+details.turn.bot { margin: 0; align-self: flex-start; max-width: 46rem; padding: .1rem .5rem; border-radius: 10px;
   font-size: .8rem; border: 1px dashed color-mix(in srgb, currentColor 22%, transparent);
   background: color-mix(in srgb, currentColor 4%, transparent); }
+details.turn.bot[open] { padding: .35rem .7rem; }
 details.turn.bot > summary { cursor: pointer; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: .72rem; opacity: .75; display: flex; align-items: baseline; gap: .5rem;
-  white-space: normal; }
-details.turn.bot[open] > summary { margin-bottom: 0; }
-#app details.turn.bot > summary time.ts { margin-top: 0; }
+  font-size: .72rem; opacity: .75; margin: 0; white-space: normal; }
+#app details.turn.bot > summary time.ts { display: inline; margin-top: 0; margin-left: .45rem; }
 details.turn.bot .bot-body { padding: .3rem 0 .1rem; }
 /* Per-message timestamp (nexus/ui time_stamp): a small muted line under
    the bubble text. #app-prefix per the cascade traps above (bare `time`
@@ -1345,7 +1349,7 @@ details.turn.reasoning.live > summary { color: color-mix(in srgb, currentColor 8
    reset). Chip look matches the old collapsed card: transparent
    background, hairline tinted border, mono face, shrink-wrapped. */
 #app .turn.tool { display: inline-block; align-self: flex-start; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: .78rem; line-height: 1.45; padding: .1rem .5rem; margin: 0; border-radius: 10px;
+  font-size: .72rem; line-height: 1rem; padding: .1rem .5rem; margin: 0; border-radius: 10px;
   border: 1px solid color-mix(in srgb, currentColor 15%, transparent); background: transparent;
   color: inherit; text-align: left; }
 /* Hover/focus affordance is a box-shadow ring, NOT a border-color
