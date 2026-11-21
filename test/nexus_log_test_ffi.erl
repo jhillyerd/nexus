@@ -6,6 +6,7 @@
     format_io_event/3,
     format_report_event/3,
     format_large_fallback_event/1,
+    format_large_report_cb_event/1,
     capture_with_level/2,
     log/2
 ]).
@@ -59,6 +60,21 @@ format_large_fallback_event(TimeUs) ->
         level => error,
         msg => {report, Big},
         meta => #{time => TimeUs, domain => [otp]}
+    },
+    unicode:characters_to_binary(nexus_log_ffi:format(Event, #{})).
+
+format_large_report_cb_event(TimeUs) ->
+    Event = #{
+        level => error,
+        msg => {report, #{}},
+        meta => #{
+            time => TimeUs,
+            domain => [otp],
+            %% Ignores chars_limit in Config on purpose.
+            report_cb => fun(_Report, _Cfg) ->
+                lists:duplicate(10000, $z)
+            end
+        }
     },
     unicode:characters_to_binary(nexus_log_ffi:format(Event, #{})).
 

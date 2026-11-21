@@ -278,7 +278,13 @@ pub fn main() -> Nil {
             ))
             |> mist.bind(cfg.http_bind)
             |> mist.port(cfg.http_port)
-            |> mist.after_start(fn(_, _, _) { Nil })
+            |> mist.after_start(fn(port, _scheme, _interface) {
+              log.info("boot", "listening", [
+                log.str("bind", cfg.http_bind),
+                log.int("port", port),
+                log.str("log_level", log.level_to_string(cfg.log_level)),
+              ])
+            })
             |> mist.start
           }),
         )
@@ -300,11 +306,6 @@ pub fn main() -> Nil {
             cfg,
             persist.seam(process.named_subject(store_name)),
           )
-          log.info("boot", "listening", [
-            log.str("bind", cfg.http_bind),
-            log.int("port", cfg.http_port),
-            log.str("log_level", log.level_to_string(cfg.log_level)),
-          ])
           case cfg.ui_token {
             Some(_) -> log.info("boot", "auth enabled", [])
             None ->

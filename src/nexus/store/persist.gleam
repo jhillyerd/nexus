@@ -1443,7 +1443,7 @@ pub fn boot_sweeps(cfg: Config, db: store.Store) -> Nil {
           log.info("store", "boot sweep deleted idle nodes", [
             log.int("idle_days", days),
             log.int("count", list.length(names)),
-            log.str("nodes", string.join(names, ",")),
+            log.str("nodes", string.join(list.take(names, 100), ",")),
           ])
         Error(error) ->
           log.error("store", "boot sweep failed", [

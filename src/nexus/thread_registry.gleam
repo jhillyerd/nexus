@@ -701,7 +701,7 @@ fn boot_sweep(persistence: Store) -> List(String) {
     Ok(ids) -> {
       log.info("registry", "boot sweep deleted never-used threads", [
         log.int("count", list.length(ids)),
-        log.str("ids", string.join(ids, ",")),
+        log.str("ids", string.join(list.take(ids, 100), ",")),
       ])
       ids
     }

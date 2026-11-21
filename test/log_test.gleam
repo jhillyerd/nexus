@@ -24,6 +24,9 @@ fn format_report_event(time_us: Int, level: log.Level, reason: String) -> String
 @external(erlang, "nexus_log_test_ffi", "format_large_fallback_event")
 fn format_large_fallback_event(time_us: Int) -> String
 
+@external(erlang, "nexus_log_test_ffi", "format_large_report_cb_event")
+fn format_large_report_cb_event(time_us: Int) -> String
+
 @external(erlang, "nexus_log_test_ffi", "capture_with_level")
 fn capture_with_level(level: log.Level, run: fn() -> Nil) -> List(String)
 
@@ -125,6 +128,19 @@ pub fn format_line_dedupes_colliding_field_keys_test() {
   )
 }
 
+pub fn format_value_caps_oversized_values_preserving_logfmt_test() {
+  let huge_bare = string.repeat("a", 5000)
+  let formatted_bare = log.format_value(huge_bare)
+  string.length(formatted_bare) |> should.equal(log.max_value_chars + 3)
+  should.be_true(string.ends_with(formatted_bare, "..."))
+
+  // Oversized string with quotes/spaces stays validly quoted & escaped.
+  let huge_quoted = "hello \"" <> string.repeat("b", 5000) <> "\""
+  let formatted_quoted = log.format_value(huge_quoted)
+  should.be_true(string.starts_with(formatted_quoted, "\"hello \\\""))
+  should.be_true(string.ends_with(formatted_quoted, "...\""))
+}
+
 pub fn format_line_is_strictly_single_line_test() {
   let line =
     log.format_line("2026-11-21T21:18:02.123Z", "error", "mcp", "line1\nline2", [
@@ -178,6 +194,11 @@ pub fn erl_formatter_handles_nexus_and_otp_events_test() {
     large_line,
     "time=2026-11-21T21:18:02.123Z level=error component=otp msg=",
   ))
+
+  // An arity-2 report_cb that ignores chars_limit is still capped.
+  let large_cb_line = format_large_report_cb_event(fixed_time_us)
+  should.be_true(string.byte_size(large_cb_line) < 4250)
+  should.be_true(string.ends_with(large_cb_line, "...\n"))
 }
 
 pub fn logger_pipeline_respects_level_filter_test() {

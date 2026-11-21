@@ -524,11 +524,13 @@ and emits single-line `logfmt` through Erlang's built-in `:logger`
 Grafana Loki's `| logfmt` stage):
 
 ```gleam
+import gleam/list
+import gleam/string
 import nexus/log
 
 log.info("store", "boot sweep deleted idle nodes", [
-  log.int("count", count),
-  log.str("nodes", names),
+  log.int("count", list.length(names)),
+  log.str("nodes", string.join(list.take(names, 100), ",")),
 ])
 ```
 

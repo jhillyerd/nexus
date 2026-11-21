@@ -66,7 +66,7 @@ format(#{level := Level, msg := Msg, meta := Meta}, _Config) ->
 extract({report, #{nexus_log := true, component := Component, msg := Text, fields := Fields}}, _Meta) ->
     {Component, Text, Fields};
 extract({string, Chardata}, Meta) ->
-    {external_component(Meta), to_binary(Chardata), []};
+    {external_component(Meta), cap_binary(to_binary(Chardata)), []};
 extract({Format, Args}, Meta) when is_list(Format); is_binary(Format) ->
     {external_component(Meta), format_io(Format, Args), []};
 extract({report, Report}, Meta) ->
@@ -85,7 +85,9 @@ format_report(Report, Meta) ->
     case maps:get(report_cb, Meta, undefined) of
         Fun when is_function(Fun, 2) ->
             try
-                to_binary(Fun(Report, #{depth => 20, chars_limit => 4096, single_line => true}))
+                cap_binary(
+                    to_binary(Fun(Report, #{depth => 20, chars_limit => 4096, single_line => true}))
+                )
             catch
                 _:_ -> fallback_term(Report)
             end;
@@ -98,6 +100,16 @@ format_report(Report, Meta) ->
             end;
         _ ->
             fallback_term(Report)
+    end.
+
+cap_binary(Bin) when byte_size(Bin) =< 4096 ->
+    Bin;
+cap_binary(Bin) ->
+    case string:length(Bin) > 4096 of
+        true ->
+            to_binary([string:slice(Bin, 0, 4096), <<"...">>]);
+        false ->
+            Bin
     end.
 
 format_io(Format, Args) ->

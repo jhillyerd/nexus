@@ -186,19 +186,56 @@ pub fn sanitize_key(key: String) -> String {
   }
 }
 
+/// Maximum number of Unicode codepoints kept per `msg` or field value before
+/// truncating with `"..."` (bounded prior to quoting/escaping so logfmt output
+/// always stays valid and single-line).
+pub const max_value_chars = 4096
+
 /// Encode one logfmt value. Bare when safe; double-quoted with standard
-/// escapes when empty or containing whitespace, quotes, `=`, `\`, or ASCII
-/// control characters. Output is strictly single-line.
+/// escapes when empty or containing whitespace, quotes, `=`, `\`, or control /
+/// line-separator characters. Values longer than `max_value_chars` codepoints
+/// are truncated with `"..."` before escaping. Output is strictly single-line.
 pub fn format_value(value: String) -> String {
   case value {
     "" -> "\"\""
     _ -> {
-      let cps = string.to_utf_codepoints(value)
+      let #(bounded, cps) = bound_codepoints(value)
       case list.any(cps, needs_quoting) {
-        False -> value
+        False -> bounded
         True -> "\"" <> string.concat(list.map(cps, escape_codepoint)) <> "\""
       }
     }
+  }
+}
+
+fn bound_codepoints(value: String) -> #(String, List(UtfCodepoint)) {
+  // Fast path: every UTF-8 codepoint is >= 1 byte, so <= max_value_chars bytes
+  // guarantees <= max_value_chars codepoints with no truncation needed.
+  case string.byte_size(value) <= max_value_chars {
+    True -> #(value, string.to_utf_codepoints(value))
+    False -> {
+      let cps = string.to_utf_codepoints(value)
+      case take_if_over(cps, max_value_chars, []) {
+        Ok(kept) -> {
+          let truncated = string.from_utf_codepoints(kept) <> "..."
+          #(truncated, string.to_utf_codepoints(truncated))
+        }
+        gleam.Error(Nil) -> #(value, cps)
+      }
+    }
+  }
+}
+
+fn take_if_over(
+  cps: List(UtfCodepoint),
+  remaining: Int,
+  acc: List(UtfCodepoint),
+) -> Result(List(UtfCodepoint), Nil) {
+  case remaining, cps {
+    0, [] -> gleam.Error(Nil)
+    0, [_, ..] -> Ok(list.reverse(acc))
+    _, [] -> gleam.Error(Nil)
+    _, [head, ..tail] -> take_if_over(tail, remaining - 1, [head, ..acc])
   }
 }
 
