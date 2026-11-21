@@ -188,24 +188,22 @@ CREATE INDEX IF NOT EXISTS workspace_pending_gc
   WHERE deleted_at IS NOT NULL;
 ```
 
-Links on `bot` and `thread` (following `sql/schema.sql`'s
-squash-migrations-into-base-CREATEs policy — edit the base
-`CREATE TABLE bot` and `CREATE TABLE thread` definitions directly, adding
-an `EXISTS`-guarded `DO $$` upgrade block only where existing dev/deployed
-data needs backfill, per the `thread.toolset` and `node.thread_id`
-precedents):
+Links on `bot` and `thread` (land as a new sequential migration under
+`sql/migrations/` — e.g. `0002_workspace_sandbox.sql` — with `CREATE TABLE
+workspace` and `ALTER TABLE bot` / `ALTER TABLE thread` plus the backfill
+for existing `thread.workspace_root` rows):
 
 ```sql
--- New columns on CREATE TABLE bot:
-  workspace_mode    text NOT NULL DEFAULT 'thread',   -- 'thread' (fresh per thread) | 'bot' (shared across this bot's threads)
-  workspace_net     text NOT NULL DEFAULT 'none',     -- 'none' (offline bash) | 'proxy' (egress proxy + optional allowlist) | 'host' (explicit opt-in)
-  workspace_domains text[] NOT NULL DEFAULT '{}'      -- domain allowlist for workspace_net = 'proxy' ('{}' = public internet via SSRF-checked proxy)
+ALTER TABLE bot
+  ADD COLUMN workspace_mode    text NOT NULL DEFAULT 'thread',   -- 'thread' (fresh per thread) | 'bot' (shared across this bot's threads)
+  ADD COLUMN workspace_net     text NOT NULL DEFAULT 'none',     -- 'none' (offline bash) | 'proxy' (egress proxy + optional allowlist) | 'host' (explicit opt-in)
+  ADD COLUMN workspace_domains text[] NOT NULL DEFAULT '{}';     -- domain allowlist for workspace_net = 'proxy' ('{}' = public internet via SSRF-checked proxy)
 
--- New columns on CREATE TABLE thread:
-  workspace_id      text REFERENCES workspace(id) ON DELETE SET NULL,
-  tmp_workspace_id  text REFERENCES workspace(id) ON DELETE SET NULL,
-  workspace_net     text NOT NULL DEFAULT 'none',     -- frozen from bot at thread creation
-  workspace_domains text[] NOT NULL DEFAULT '{}'      -- frozen from bot at thread creation
+ALTER TABLE thread
+  ADD COLUMN workspace_id      text REFERENCES workspace(id) ON DELETE SET NULL,
+  ADD COLUMN tmp_workspace_id  text REFERENCES workspace(id) ON DELETE SET NULL,
+  ADD COLUMN workspace_net     text NOT NULL DEFAULT 'none',     -- frozen from bot at thread creation
+  ADD COLUMN workspace_domains text[] NOT NULL DEFAULT '{}';     -- frozen from bot at thread creation
 ```
 
 **Why `workspace` is a separate table instead of relying on `thread.workspace_root`:**

@@ -6,8 +6,9 @@
 # .env (untracked, loaded by .envrc):
 #   DATABASE_URL=postgres://nexus@127.0.0.1:5433/nexus
 #
-# Schema is applied by the migrate runner, not this file (idempotent —
-# the DDL uses IF NOT EXISTS; safe on every boot):
+# Schema is applied by the migrate runner, not this file (sequential
+# migrations in sql/migrations/, tracked in schema_migration; safe on
+# every boot):
 #
 #   DATABASE_URL=postgres://nexus@127.0.0.1:5433/nexus \
 #     gleam run -m nexus/store/migrate

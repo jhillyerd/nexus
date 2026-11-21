@@ -14,7 +14,7 @@
 //// path anywhere — so a hydrated thread re-encodes byte-identically
 //// (guarded by the golden restart tests).
 ////
-//// Row model (messages table, `sql/schema.sql`):
+//// Row model (messages table, `sql/migrations/`):
 //// - `role` is one of the transcript roles 'user' | 'assistant' | 'tool'.
 //// - A plain user or assistant message is one row.
 //// - An assistant message carrying N tool calls is N consecutive
