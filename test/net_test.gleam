@@ -4,7 +4,7 @@
 import gleam/bit_array
 import gleam/bytes_tree
 import gleam/erlang/process
-import gleam/http.{Get, Post}
+import gleam/http.{Get}
 import gleam/http/request.{type Request}
 import gleam/http/response.{type Response}
 import gleam/int

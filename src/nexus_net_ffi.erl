@@ -296,8 +296,8 @@ run_inflate(Body, MaxOut, Wbits) ->
                 %% The authoritative completeness verdict: inflateEnd
                 %% succeeds only when end-of-stream was reached (its
                 %% data_error here is expected for an incomplete stream,
-                %% caught by `case catch`, never leaked as a crash).
-                case catch zlib:inflateEnd(Z) of
+                %% caught below, never leaked as a crash).
+                case (try zlib:inflateEnd(Z) catch _:_ -> not_ok end) of
                     ok -> {ok, {Acc, false}};
                     _ -> {ok, {Acc, true}}
                 end
@@ -308,7 +308,7 @@ run_inflate(Body, MaxOut, Wbits) ->
     after
         %% close/1 frees the stream even when inflateInit or inflate failed;
         %% guarded so a close fault cannot mask the outcome above.
-        catch zlib:close(Z)
+        try zlib:close(Z) catch _:_ -> ok end
     end.
 
 %% Drains the enqueued body through fixed-size output chunks until the
