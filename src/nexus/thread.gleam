@@ -575,6 +575,10 @@ pub type Msg {
   )
   /// Cancel the in-flight turn, if any.
   Stop
+  /// Cancel the in-flight turn (if any) and reply with the active turn
+  /// worker's PID so thread deletion can wait for worker exit before
+  /// removing workspace directories and dropping tombstone rows.
+  CancelTurn(reply: Subject(Option(Pid)))
   /// The registry's archive cascade flagged this thread (bot-channels
   /// plan, #123): update the live `archived` flag so an archived channel
   /// refuses human Sends from now on. A bounded ask — the actor answers
@@ -1142,6 +1146,25 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           )
         Streaming(_, _, cancel, _, _, _, _) -> {
           process.send(cancel, Nil)
+          actor.continue(state)
+        }
+      }
+
+    CancelTurn(reply) ->
+      case state.turn {
+        Idle -> {
+          process.send(reply, None)
+          actor.continue(state)
+        }
+        Starting(worker, monitor, _stop_requested, started_us) -> {
+          process.send(reply, Some(worker))
+          actor.continue(
+            State(..state, turn: Starting(worker, monitor, True, started_us)),
+          )
+        }
+        Streaming(worker, _, cancel, _, _, _, _) -> {
+          process.send(cancel, Nil)
+          process.send(reply, Some(worker))
           actor.continue(state)
         }
       }

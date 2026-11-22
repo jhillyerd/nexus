@@ -66,6 +66,18 @@ pub fn workspace_root_must_be_absolute_test() {
   ])
   let assert Ok(cfg) = config.load()
   should.equal(cfg.workspace_root, Some("/srv/ws"))
+
+  // Reject '/' and '..' segments so config agrees with workspace_gc.
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="),
+    #("NEXUS_WORKSPACE_ROOT", "/"),
+  ])
+  should.be_error(config.load())
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="),
+    #("NEXUS_WORKSPACE_ROOT", "/srv/ws/../etc"),
+  ])
+  should.be_error(config.load())
 }
 
 pub fn env_knob_bounds_test() {

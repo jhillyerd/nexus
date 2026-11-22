@@ -1,6 +1,7 @@
--- Insert a managed workspace row directly (used for crash-recovery testing
--- and Phase 3 shared bot workspaces). Empty-string sentinels for thread_id
--- / bot_id insert NULL; 0 sentinels for last_used_at / deleted_at insert NULL.
+-- Insert a managed workspace row directly (used for standalone/shared
+-- workspaces and crash-recovery fixtures). Empty-string sentinels for
+-- thread_id / bot_id insert NULL; 0 sentinels for last_used_at / deleted_at
+-- insert NULL.
 insert into workspace (id, kind, root, rel_path, thread_id, bot_id, created_at, last_used_at, deleted_at)
 values (
   $1,

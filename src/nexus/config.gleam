@@ -349,20 +349,11 @@ pub fn from_env(
   // philosophy, the codemode/plugin precedent).
   use workspace_root <- result.try(
     case optional_string(get, "NEXUS_WORKSPACE_ROOT") {
-      // Absolute only: a relative root would silently resolve against
-      // the BEAM process's cwd, scattering workspaces wherever nexus
-      // happened to start (smart-loop S6) — the loud-boot philosophy.
+      // Absolute only, never `/` or containing `..` / NUL bytes: matches
+      // `workspace_gc.safe_target_path` so every configured root can be
+      // tracked and garbage-collected cleanly (loud-boot philosophy).
       None -> Ok(None)
-      Some(root) ->
-        case string.starts_with(root, "/") {
-          True -> Ok(Some(root))
-          False ->
-            Error(
-              "environment variable NEXUS_WORKSPACE_ROOT must be an"
-              <> " absolute path: "
-              <> root,
-            )
-        }
+      Some(root) -> validate_workspace_root(root) |> result.map(Some)
     },
   )
   use env_timeout_ms <- result.try(optional_min_int(
@@ -751,5 +742,48 @@ fn required_encryption_key(
   case crypto.decode_key(raw) {
     Ok(_) -> Ok(raw)
     Error(error) -> Error("NEXUS_ENCRYPTION_KEY: " <> crypto.describe(error))
+  }
+}
+
+/// Validate `NEXUS_WORKSPACE_ROOT` at boot so every configured root satisfies
+/// `workspace_gc.safe_target_path`: absolute, no NUL bytes, no `..` segments,
+/// and never collapsing to `/`.
+fn validate_workspace_root(root: String) -> Result(String, String) {
+  case string.starts_with(root, "/") {
+    False ->
+      Error(
+        "environment variable NEXUS_WORKSPACE_ROOT must be an"
+        <> " absolute path: "
+        <> root,
+      )
+    True ->
+      case string.contains(root, "\u{0}") {
+        True ->
+          Error(
+            "environment variable NEXUS_WORKSPACE_ROOT must not contain NUL bytes",
+          )
+        False -> {
+          let raw_segments = string.split(root, "/")
+          case list.any(raw_segments, fn(seg) { seg == ".." }) {
+            True ->
+              Error(
+                "environment variable NEXUS_WORKSPACE_ROOT must not contain '..': "
+                <> root,
+              )
+            False -> {
+              let clean =
+                list.filter(raw_segments, fn(seg) { seg != "" && seg != "." })
+              case clean {
+                [] ->
+                  Error(
+                    "environment variable NEXUS_WORKSPACE_ROOT cannot be '/': "
+                    <> root,
+                  )
+                _ -> Ok("/" <> string.join(clean, "/"))
+              }
+            }
+          }
+        }
+      }
   }
 }

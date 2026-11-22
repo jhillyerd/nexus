@@ -99,7 +99,7 @@ pub fn bot_crud_round_trips_test() {
     #("b1", True),
   ])
 
-  let assert Ok(Nil) = seam.delete_bot("b1")
+  let assert Ok(_) = seam.delete_bot("b1")
   seam.get_bot("b1") |> should.be_error
 }
 
@@ -140,7 +140,7 @@ pub fn count_and_provider_delete_guard_test() {
   // RESTRICT: the pinned provider refuses to delete while a bot points\n  // at it (the registry's 409 pre-check is the friendly copy).
   seam.delete_provider(store_mock.fixture_provider_id) |> should.be_error
 
-  let assert Ok(Nil) = seam.delete_bot("b1")
+  let assert Ok(_) = seam.delete_bot("b1")
   let assert Ok(Nil) = seam.delete_provider(store_mock.fixture_provider_id)
 }
 
@@ -153,7 +153,7 @@ pub fn deleting_bot_nulls_thread_provenance_test() {
     seam.insert_thread(summary("s1", Some("b1")), "bot prompt")
   let assert Ok(Nil) = seam.insert_thread(summary("s2", None), "default")
 
-  let assert Ok(Nil) = seam.delete_bot("b1")
+  let assert Ok(_) = seam.delete_bot("b1")
 
   // SET NULL: both threads survive with their frozen columns intact;
   // only the provenance pointer disappeared.

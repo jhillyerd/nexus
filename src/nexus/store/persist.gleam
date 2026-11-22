@@ -117,7 +117,10 @@ pub type Msg {
   GetBot(id: String, reply: Subject(Result(store.StoredBot, String)))
   InsertBot(bot: store.StoredBot, reply: Subject(Result(Nil, String)))
   UpdateBot(bot: store.StoredBot, reply: Subject(Result(Nil, String)))
-  DeleteBot(id: String, reply: Subject(Result(Nil, String)))
+  DeleteBot(
+    id: String,
+    reply: Subject(Result(List(store.TombstonedWorkspace), String)),
+  )
   CountBotsForProvider(id: String, reply: Subject(Result(Int, String)))
   // ---- node rows (docs/plans/environments.md, Phase 2b) ----
   ListNodes(reply: Subject(Result(List(store.StoredNode), String)))
@@ -672,34 +675,90 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
     }
 
     DeleteThread(id, reply) -> {
-      let result = case sql.delete_thread(state.db, id) {
-        Ok(returned) ->
-          Ok(
-            list.map(returned.rows, fn(row) {
-              store.TombstonedWorkspace(
-                id: row.id,
-                root: row.root,
-                rel_path: row.rel_path,
-              )
-            }),
+      // Two sequential statements in ONE transaction: tombstoning owned
+      // workspaces FIRST clears workspace.thread_id = NULL before DELETE FROM
+      // thread runs, so ON DELETE SET NULL never overlaps with setting
+      // deleted_at. Returning the full deleted subtree also lets us evict
+      // every cascaded channel descendant from state.persisted.
+      let outcome =
+        pog.transaction(state.db, fn(tx) {
+          use subtree_rows <- result.try(
+            sql.select_thread_subtree(tx, id) |> result.map_error(query_error),
           )
-        Error(error) -> Error(query_error(error))
+          let subtree_ids = list.map(subtree_rows.rows, fn(row) { row.id })
+          case subtree_ids {
+            [] -> Ok(#([], []))
+            _ -> {
+              use ws_rows <- result.try(
+                sql.tombstone_workspaces_for_threads(tx, subtree_ids)
+                |> result.map_error(query_error),
+              )
+              use _ <- result.try(
+                sql.delete_thread(tx, id) |> result.map_error(query_error),
+              )
+              let tombstoned =
+                ws_rows.rows
+                |> list.map(fn(row) {
+                  store.TombstonedWorkspace(
+                    id: row.id,
+                    root: row.root,
+                    rel_path: row.rel_path,
+                  )
+                })
+                |> list.sort(fn(a, b) { string.compare(a.id, b.id) })
+              Ok(#(tombstoned, subtree_ids))
+            }
+          }
+        })
+        |> result.map_error(transaction_error)
+      case outcome {
+        Ok(#(tombstoned, subtree_ids)) -> {
+          let persisted =
+            list.fold([id, ..subtree_ids], state.persisted, fn(acc, sid) {
+              dict.delete(acc, sid)
+            })
+          process.send(reply, Ok(tombstoned))
+          actor.continue(State(..state, persisted: persisted))
+        }
+        Error(error) -> {
+          process.send(reply, Error(error))
+          actor.continue(state)
+        }
       }
-      process.send(reply, result)
-      let persisted = case result {
-        Ok(_) -> dict.delete(state.persisted, id)
-        Error(_) -> state.persisted
-      }
-      actor.continue(State(..state, persisted: persisted))
     }
 
     PruneNeverUsed(reply) -> {
-      case sql.prune_never_used(state.db) {
-        Ok(returned) -> {
-          let ids =
-            returned.rows
-            |> list.map(fn(row) { row.id })
-            |> list.sort(string.compare)
+      // Lock candidates FOR UPDATE, tombstone their workspaces, then delete
+      // the locked threads — sequential statements in ONE transaction so
+      // ON DELETE SET NULL never races setting deleted_at.
+      let outcome =
+        pog.transaction(state.db, fn(tx) {
+          use candidates <- result.try(
+            sql.select_never_used_threads(tx) |> result.map_error(query_error),
+          )
+          let candidate_ids = list.map(candidates.rows, fn(row) { row.id })
+          case candidate_ids {
+            [] -> Ok([])
+            _ -> {
+              use _ <- result.try(
+                sql.tombstone_workspaces_for_threads(tx, candidate_ids)
+                |> result.map_error(query_error),
+              )
+              use deleted <- result.try(
+                sql.prune_never_used(tx, candidate_ids)
+                |> result.map_error(query_error),
+              )
+              Ok(
+                deleted.rows
+                |> list.map(fn(row) { row.id })
+                |> list.sort(string.compare),
+              )
+            }
+          }
+        })
+        |> result.map_error(transaction_error)
+      case outcome {
+        Ok(ids) -> {
           // Same bookkeeping as DeleteThread: a pruned row is gone, so
           // its persisted-length watermark must not survive it.
           let persisted =
@@ -710,7 +769,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           actor.continue(State(..state, persisted: persisted))
         }
         Error(error) -> {
-          process.send(reply, Error(query_error(error)))
+          process.send(reply, Error(error))
           actor.continue(state)
         }
       }
@@ -906,7 +965,29 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
     }
 
     DeleteBot(id, reply) -> {
-      process.send(reply, update(sql.delete_bot(state.db, id)))
+      let outcome =
+        pog.transaction(state.db, fn(tx) {
+          use ws_rows <- result.try(
+            sql.tombstone_bot_workspaces(tx, id)
+            |> result.map_error(query_error),
+          )
+          use _ <- result.try(
+            sql.delete_bot(tx, id) |> result.map_error(query_error),
+          )
+          Ok(
+            ws_rows.rows
+            |> list.map(fn(row) {
+              store.TombstonedWorkspace(
+                id: row.id,
+                root: row.root,
+                rel_path: row.rel_path,
+              )
+            })
+            |> list.sort(fn(a, b) { string.compare(a.id, b.id) }),
+          )
+        })
+        |> result.map_error(transaction_error)
+      process.send(reply, outcome)
       actor.continue(state)
     }
 
@@ -1508,6 +1589,13 @@ fn thread_workspaces_from_row(
         ),
       )
     _, _ -> None
+  }
+}
+
+fn transaction_error(error: pog.TransactionError(String)) -> String {
+  case error {
+    pog.TransactionQueryError(query_err) -> query_error(query_err)
+    pog.TransactionRolledBack(message) -> message
   }
 }
 

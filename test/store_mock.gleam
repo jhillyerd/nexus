@@ -126,7 +126,10 @@ pub type MockMsg {
   GetBot(id: String, reply: Subject(Result(StoredBot, String)))
   InsertBot(bot: StoredBot, reply: Subject(Result(Nil, String)))
   UpdateBot(bot: StoredBot, reply: Subject(Result(Nil, String)))
-  DeleteBot(id: String, reply: Subject(Result(Nil, String)))
+  DeleteBot(
+    id: String,
+    reply: Subject(Result(List(store.TombstonedWorkspace), String)),
+  )
   CountBotsForProvider(id: String, reply: Subject(Result(Int, String)))
   // ---- node rows (docs/plans/environments.md, Phase 2b) ----
   ListNodes(reply: Subject(Result(List(store.StoredNode), String)))
@@ -1092,15 +1095,37 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
     }
 
     InsertWorkspace(ws, reply) -> {
-      case insert_workspace_checked(state.workspaces, ws) {
-        Error(err) -> {
-          process.send(reply, Error(err))
+      // Mirror workspace.thread_id and workspace.bot_id FKs.
+      let thread_ok = case ws.thread_id {
+        None -> True
+        Some(tid) -> dict.has_key(state.threads, tid)
+      }
+      let bot_ok = case ws.bot_id {
+        None -> True
+        Some(bid) -> dict.has_key(state.bots, bid)
+      }
+      case thread_ok, bot_ok {
+        False, _ -> {
+          let assert Some(tid) = ws.thread_id
+          process.send(reply, Error("unknown thread " <> tid))
           actor.continue(state)
         }
-        Ok(workspaces) -> {
-          process.send(reply, Ok(Nil))
-          actor.continue(State(..state, workspaces: workspaces))
+        _, False -> {
+          let assert Some(bid) = ws.bot_id
+          process.send(reply, Error("unknown bot " <> bid))
+          actor.continue(state)
         }
+        True, True ->
+          case insert_workspace_checked(state.workspaces, ws) {
+            Error(err) -> {
+              process.send(reply, Error(err))
+              actor.continue(state)
+            }
+            Ok(workspaces) -> {
+              process.send(reply, Ok(Nil))
+              actor.continue(State(..state, workspaces: workspaces))
+            }
+          }
       }
     }
 
@@ -1387,15 +1412,18 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
       // ON DELETE SET NULL on thread.bot_id: provenance disappears, the
       // threads keep their frozen columns — mirrored as a metadata
       // scrub over the stored summaries.
+      // Matches tombstone_bot_workspaces.sql + delete_bot.sql: any live
+      // shared bot workspace owned by this bot with zero referencing threads
+      // is tombstoned (bot_id = NULL, deleted_at = now()); any still-referenced
+      // bot workspace stays live with bot_id = NULL so the last referencing
+      // thread's delete tombstones it.
       case dict.has_key(state.bots, id) {
         False -> {
-          process.send(reply, Ok(Nil))
+          process.send(reply, Ok([]))
           actor.continue(state)
         }
         True -> {
-          // ON DELETE SET NULL, mirrored: every stored summary that
-          // carried this bot as provenance loses the pointer (the
-          // threads keep their frozen columns).
+          let now = timing.wall_now_s()
           let threads =
             dict.fold(state.threads, dict.new(), fn(acc, thread_id, stored) {
               let updated = case stored.summary.meta.bot_id {
@@ -1414,15 +1442,60 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
               }
               dict.insert(acc, thread_id, updated)
             })
-          let workspaces =
-            dict.map_values(state.workspaces, fn(_wid, ws) {
+          let #(workspaces, tombstoned) =
+            dict.fold(state.workspaces, #(dict.new(), []), fn(acc, wid, ws) {
+              let #(map, list_acc) = acc
               case ws.bot_id {
-                Some(bot_id) if bot_id == id ->
-                  store.StoredWorkspace(..ws, bot_id: None)
-                _ -> ws
+                Some(bot_id) if bot_id == id -> {
+                  let referenced =
+                    state.threads
+                    |> dict.values
+                    |> list.any(fn(stored) {
+                      case stored.summary.workspaces {
+                        Some(tw) -> tw.workspace_id == wid
+                        None -> False
+                      }
+                    })
+                  case
+                    ws.kind == store.BotWorkspace
+                    && ws.deleted_at == None
+                    && !referenced
+                  {
+                    True -> #(
+                      dict.insert(
+                        map,
+                        wid,
+                        store.StoredWorkspace(
+                          ..ws,
+                          bot_id: None,
+                          deleted_at: Some(now),
+                        ),
+                      ),
+                      [
+                        store.TombstonedWorkspace(
+                          id: ws.id,
+                          root: ws.root,
+                          rel_path: ws.rel_path,
+                        ),
+                        ..list_acc
+                      ],
+                    )
+                    False -> #(
+                      dict.insert(
+                        map,
+                        wid,
+                        store.StoredWorkspace(..ws, bot_id: None),
+                      ),
+                      list_acc,
+                    )
+                  }
+                }
+                _ -> #(dict.insert(map, wid, ws), list_acc)
               }
             })
-          process.send(reply, Ok(Nil))
+          let sorted =
+            list.sort(tombstoned, fn(a, b) { string.compare(a.id, b.id) })
+          process.send(reply, Ok(sorted))
           actor.continue(
             State(
               ..state,

@@ -38,6 +38,7 @@ import gleam/string
 import nexus/bot
 import nexus/store.{type Store, type StoredBot}
 import nexus/timing
+import nexus/workspace_gc
 
 /// The tool-catalog seam (bots plan P2): a submitted name list → the
 /// normalized list, or a reason string when some name is not in the
@@ -344,9 +345,11 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
               process.send(reply, Error(StoreFailed(error)))
               actor.continue(state)
             }
-            Ok(Nil) -> {
+            Ok(tombstoned) -> {
               // No re-check race to bridge: threads carry ON DELETE SET
-              // NULL provenance, so nothing can pin a bot.
+              // NULL provenance, so nothing can pin a bot. Clean up any
+              // unreferenced bot workspaces tombstoned with the delete.
+              workspace_gc.cleanup_async(state.store, tombstoned)
               process.send(reply, Ok(Nil))
               actor.continue(State(..state, rows: dict.delete(state.rows, id)))
             }

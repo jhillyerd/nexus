@@ -2135,7 +2135,7 @@ pub fn dormant_summary_carries_bot_provenance_test() {
 
   // Deleting the bot NULLs the stored provenance (the mock mirrors SET
   // NULL): a later boot lists the thread unprovenanced.
-  let assert Ok(Nil) = seam.delete_bot("b1")
+  let assert Ok(_) = seam.delete_bot("b1")
   let factory2 = process.new_name("nexus_test_factory_boot2")
   let assert Ok(_factory2) =
     factory_supervisor.start(thread_registry.factory_builder_with_child(
@@ -2254,7 +2254,7 @@ pub fn bot_delete_scrubs_cached_provenance_test() {
 
   // The delete orchestration's order: the store NULLs the rows (SET
   // NULL) inside the bot delete, then the registry mirror is scrubbed.
-  let assert Ok(Nil) = seam.delete_bot("b1")
+  let assert Ok(_) = seam.delete_bot("b1")
   thread_registry.bot_deleted(registry, "b1")
 
   // Both halves scrubbed; the unrelated pointer preserved.

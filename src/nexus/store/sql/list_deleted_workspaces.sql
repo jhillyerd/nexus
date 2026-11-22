@@ -1,6 +1,5 @@
--- Pending disk GC rows (docs/plans/workspace-sandbox.md, Phase 1): every
--- tombstoned workspace awaiting guarded recursive removal on disk, oldest
--- tombstone first.
+-- Pending disk GC rows: every tombstoned workspace awaiting guarded recursive
+-- removal on disk, oldest tombstone first.
 select
   id,
   root,

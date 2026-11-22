@@ -31,6 +31,11 @@ CREATE INDEX workspace_thread
   ON workspace (thread_id)
   WHERE thread_id IS NOT NULL;
 
+-- Non-partial FK lookup index (matching thread_bot) so DELETE FROM bot does
+-- not seq-scan workspace to apply ON DELETE SET NULL.
+CREATE INDEX workspace_bot
+  ON workspace (bot_id);
+
 CREATE UNIQUE INDEX workspace_bot_live
   ON workspace (bot_id)
   WHERE kind = 'bot' AND deleted_at IS NULL;

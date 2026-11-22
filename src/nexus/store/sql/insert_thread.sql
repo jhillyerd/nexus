@@ -21,8 +21,8 @@
 -- an open auto path.
 -- workspace_id ($17), tmp_workspace_id ($18), workspace_rel_path ($19),
 -- and tmp_rel_path ($20) persist the thread's managed workspace rows
--- atomically with the thread row (workspace-sandbox plan Phase 1; ''
--- sentinels insert NULL / skip workspace rows).
+-- atomically with the thread row ('' sentinels insert NULL / skip workspace
+-- rows).
 with new_thread as (
   insert into thread (id, provider_id, title, title_source, model, system_prompt, pinned, tags, tags_manual, created_at, last_active_at, message_count, bot_id, workspace_root, parent_thread_id, workspace_id, tmp_workspace_id)
   values ($1, $2, $3, $4, $5, $6, $7, $8, '{}', to_timestamp($9), to_timestamp($9), $10, nullif($11, ''), nullif($13, ''), nullif($16, ''), nullif($17, ''), nullif($18, ''))

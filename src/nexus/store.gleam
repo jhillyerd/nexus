@@ -369,9 +369,10 @@ pub type Store {
     /// Full-metadata update (the registry merges the PATCH first; the
     /// statement is a plain replace).
     update_bot: fn(StoredBot) -> Result(Nil, StoreError),
-    /// Hard delete. No guard: `thread.bot_id` is ON DELETE SET NULL
-    /// (provenance only), so deleting a bot orphans nothing.
-    delete_bot: fn(String) -> Result(Nil, StoreError),
+    /// Hard delete. Tombstones any unreferenced shared bot workspace in the
+    /// same transaction and returns those tombstones; workspaces still
+    /// referenced by live threads stay live with `bot_id = NULL`.
+    delete_bot: fn(String) -> Result(List(TombstonedWorkspace), StoreError),
     /// Bots pointing at this provider — the provider registry's delete
     /// guard's bot half (a store COUNT, never a bot-registry call).
     count_bots_for_provider: fn(String) -> Result(Int, StoreError),

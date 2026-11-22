@@ -10,6 +10,7 @@ import gleam/option.{None, Some}
 import gleam/otp/factory_supervisor
 import gleam/string
 import gleeunit/should
+import nexus/bot
 import nexus/config
 import nexus/env
 import nexus/log
@@ -537,4 +538,124 @@ pub fn env_workspace_dir_uses_rel_path_when_present_test() {
       env.workspace_dir(bad_env) |> should.equal("/srv/ws/s5")
     },
   )
+}
+
+pub fn delete_bot_tombstones_unreferenced_workspace_and_preserves_referenced_test() {
+  let root = fresh_root("botdel")
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  store_mock.ensure_fixture_provider(seam)
+  let now = timing.wall_now_s()
+
+  let mk_bot = fn(id, name) {
+    bot.Bot(
+      id: id,
+      name: name,
+      description: "",
+      provider_id: store_mock.fixture_provider_id,
+      model: "alpha",
+      system_prompt: None,
+      tools: None,
+      allow_inbound: True,
+      created_at: now,
+      updated_at: now,
+    )
+  }
+  let assert Ok(Nil) = seam.insert_bot(mk_bot("b-free", "FreeBot"))
+  let assert Ok(Nil) = seam.insert_bot(mk_bot("b-used", "UsedBot"))
+
+  // Direct insert_workspace enforces thread_id and bot_id FKs.
+  seam.insert_workspace(store.StoredWorkspace(
+    id: "ws-bad-thread",
+    kind: store.ThreadWorkspace,
+    root: root,
+    rel_path: "threads/ghost",
+    thread_id: Some("ghost"),
+    bot_id: None,
+    created_at: now,
+    last_used_at: None,
+    deleted_at: None,
+  ))
+  |> should.be_error
+  seam.insert_workspace(store.StoredWorkspace(
+    id: "ws-bad-bot",
+    kind: store.BotWorkspace,
+    root: root,
+    rel_path: "bots/ghost",
+    thread_id: None,
+    bot_id: Some("ghost"),
+    created_at: now,
+    last_used_at: None,
+    deleted_at: None,
+  ))
+  |> should.be_error
+
+  // Seed one unreferenced bot workspace (b-free) and one referenced by s1 (b-used).
+  let assert Ok(Nil) =
+    seam.insert_workspace(store.StoredWorkspace(
+      id: "ws-bot-free",
+      kind: store.BotWorkspace,
+      root: root,
+      rel_path: "bots/b-free",
+      thread_id: None,
+      bot_id: Some("b-free"),
+      created_at: now,
+      last_used_at: None,
+      deleted_at: None,
+    ))
+  let assert Ok(Nil) =
+    seam.insert_workspace(store.StoredWorkspace(
+      id: "ws-bot-used",
+      kind: store.BotWorkspace,
+      root: root,
+      rel_path: "bots/b-used",
+      thread_id: None,
+      bot_id: Some("b-used"),
+      created_at: now,
+      last_used_at: None,
+      deleted_at: None,
+    ))
+  let assert Ok(Nil) =
+    seam.insert_thread(
+      store.StoredSummary(
+        ..env_summary("s1", root, None, now, 3),
+        meta: thread.ThreadMeta(..fresh_meta(None, now), bot_id: Some("b-used")),
+        workspaces: Some(store.ThreadWorkspaces(
+          workspace_id: "ws-bot-used",
+          rel_path: "bots/b-used",
+          tmp_id: None,
+          tmp_rel_path: None,
+        )),
+      ),
+      "sys",
+    )
+
+  // Deleting b-free tombstones ws-bot-free immediately.
+  let assert Ok([tomb]) = seam.delete_bot("b-free")
+  should.equal(tomb.id, "ws-bot-free")
+
+  // Deleting b-used keeps ws-bot-used live (bot_id = None) until s1 dies.
+  let assert Ok([]) = seam.delete_bot("b-used")
+  let assert Ok(live_used) =
+    store_mock.workspaces(mock)
+    |> list.find(fn(w) { w.id == "ws-bot-used" })
+  should.equal(live_used.bot_id, None)
+  should.equal(live_used.deleted_at, None)
+
+  // Now deleting s1 tombstones the orphaned ws-bot-used.
+  let assert Ok([tomb2]) = seam.delete_thread("s1")
+  should.equal(tomb2.id, "ws-bot-used")
+}
+
+pub fn await_workers_exit_waits_for_exiting_and_times_out_on_live_worker_test() {
+  // Fast-exiting worker drains cleanly.
+  let fast = process.spawn_unlinked(fn() { process.sleep(20) })
+  workspace_gc.await_workers_exit([fast], 1000) |> should.be_true
+  // Already-dead worker drains immediately.
+  workspace_gc.await_workers_exit([fast], 100) |> should.be_true
+
+  // Hung worker hits the deadline so caller retains tombstones.
+  let stuck = process.spawn_unlinked(fn() { process.sleep(5000) })
+  workspace_gc.await_workers_exit([stuck], 40) |> should.be_false
+  process.kill(stuck)
 }

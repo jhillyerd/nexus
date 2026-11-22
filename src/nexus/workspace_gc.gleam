@@ -22,13 +22,15 @@
 ////   errors.
 
 import filepath
-import gleam/erlang/process
+import gleam/erlang/process.{type Monitor, type Pid}
+import gleam/int
 import gleam/list
 import gleam/result
 import gleam/string
 import nexus/env
 import nexus/log
 import nexus/store
+import nexus/timing
 import simplifile
 
 /// Validate `(root, rel_path)` and return the normalized target path
@@ -183,21 +185,101 @@ pub fn cleanup(
   })
 }
 
+/// Maximum time the async cleanup task waits for cancelled turn workers to
+/// exit before deferring tombstones to the next boot sweep.
+const worker_drain_timeout_ms = 5000
+
 /// Spawn an unlinked background cleanup task for a batch of tombstoned
 /// workspaces. No-op when `workspaces` is empty.
 pub fn cleanup_async(
   db: store.Store,
   workspaces: List(store.TombstonedWorkspace),
 ) -> Nil {
+  cleanup_async_after(db, workspaces, [])
+}
+
+/// Spawn an unlinked background cleanup task that first waits (bounded) for
+/// every cancelled worker in `workers` to exit before removing directories
+/// and dropping tombstone rows. If any worker is still alive at the deadline,
+/// the tombstones are retained untouched so the next boot sweep cleans up
+/// safely instead of hard-deleting rows while a straggler could still write.
+pub fn cleanup_async_after(
+  db: store.Store,
+  workspaces: List(store.TombstonedWorkspace),
+  workers: List(Pid),
+) -> Nil {
   case workspaces {
     [] -> Nil
     _ -> {
       let _ =
         process.spawn_unlinked(fn() {
-          let _ = cleanup(db, workspaces)
-          Nil
+          case await_workers_exit(workers, worker_drain_timeout_ms) {
+            True -> {
+              let _ = cleanup(db, workspaces)
+              Nil
+            }
+            False ->
+              log.warn(
+                "workspace_gc",
+                "deferring cleanup to boot sweep: cancelled worker still alive",
+                [log.int("pending", list.length(workspaces))],
+              )
+          }
         })
       Nil
+    }
+  }
+}
+
+/// Monitor every pid in `workers` and wait up to `timeout_ms` total for all
+/// of them to exit. Already-dead pids deliver `ProcessDown` immediately.
+/// Returns `True` when every worker exited, `False` on timeout.
+pub fn await_workers_exit(workers: List(Pid), timeout_ms: Int) -> Bool {
+  case workers {
+    [] -> True
+    _ -> {
+      let monitors = list.map(workers, fn(pid) { #(process.monitor(pid), pid) })
+      let selector =
+        process.new_selector()
+        |> process.select_monitors(fn(down) {
+          case down {
+            process.ProcessDown(monitor, _pid, _reason) -> Ok(monitor)
+            process.PortDown(_, _, _) -> Error(Nil)
+          }
+        })
+      let deadline_ms = timing.now_us() / 1000 + timeout_ms
+      let drained = drain_monitors(selector, monitors, deadline_ms)
+      case drained {
+        True -> True
+        False -> {
+          list.each(monitors, fn(pair) {
+            let _ = process.demonitor_process(pair.0)
+            Nil
+          })
+          False
+        }
+      }
+    }
+  }
+}
+
+fn drain_monitors(
+  selector: process.Selector(Result(Monitor, Nil)),
+  remaining: List(#(Monitor, Pid)),
+  deadline_ms: Int,
+) -> Bool {
+  case remaining {
+    [] -> True
+    _ -> {
+      let left_ms = int.max(deadline_ms - timing.now_us() / 1000, 0)
+      case process.selector_receive(selector, left_ms) {
+        Error(Nil) -> False
+        Ok(Error(Nil)) -> drain_monitors(selector, remaining, deadline_ms)
+        Ok(Ok(mon)) -> {
+          let next = list.filter(remaining, fn(pair) { pair.0 != mon })
+          drain_monitors(selector, next, deadline_ms)
+        }
+      }
     }
   }
 }
