@@ -1509,18 +1509,17 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           // pass cap the model may reply PASS; after it the forced
           // instruction applies and a PASS reply comes back as a failure.
           let allow_pass = state.utility_passes < max_utility_passes
+          let self = state.self
+          let endpoint = state.endpoint
+          let utility_runner = state.utility_runner
+          let utility_apply = state.utility_apply
           let worker =
             process.spawn_unlinked(fn() {
               let cancel = process.new_subject()
               let pid = process.self()
-              process.send(state.self, UtilityStarted(pid, cancel))
+              process.send(self, UtilityStarted(pid, cancel))
               let result = case
-                state.utility_runner(
-                  state.endpoint,
-                  snapshot,
-                  cancel,
-                  allow_pass,
-                )
+                utility_runner(endpoint, snapshot, cancel, allow_pass)
               {
                 // A PASS counts only on an attempt that offered it: under
                 // the forced instruction the attempt cannot defer again,
@@ -1535,13 +1534,13 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
                     False -> UtilityFailed
                   }
                 Ok(utility.Title(title, tags)) ->
-                  case state.utility_apply(title, tags) {
+                  case utility_apply(title, tags) {
                     Ok(meta) -> UtilityApplied(meta.title, meta.tags)
                     Error(Nil) -> UtilityFailed
                   }
                 Error(_) -> UtilityFailed
               }
-              process.send(state.self, UtilityDone(pid, result))
+              process.send(self, UtilityDone(pid, result))
             })
           let monitor = process.monitor(worker)
           actor.continue(
@@ -1743,13 +1742,16 @@ fn start_send_turn(
             |> option.map(fn(origin) { origin.author }),
         ),
       )
+      let self = state.self
+      let runner = state.runner
+      let endpoint = state.endpoint
       let worker =
         process.spawn_unlinked(fn() {
           let cancel = process.new_subject()
           let pid = process.self()
-          process.send(state.self, TurnStarted(pid, cancel))
+          process.send(self, TurnStarted(pid, cancel))
           let on_event = fn(event) {
-            process.send(state.self, WorkerEvent(pid, event))
+            process.send(self, WorkerEvent(pid, event))
           }
           // The runner is the registry-built bundle's turn fn —
           // wrapped per thread with the delivery identity on bot
@@ -1757,9 +1759,8 @@ fn start_send_turn(
           // env-carrying threads (environments Phase 1), both of
           // which ignore these arguments and build their own
           // contexts from the thread's frozen values.
-          let outcome =
-            state.runner(state.endpoint, tr, cancel, None, None, on_event)
-          process.send(state.self, WorkerDone(pid, outcome))
+          let outcome = runner(endpoint, tr, cancel, None, None, on_event)
+          process.send(self, WorkerDone(pid, outcome))
         })
       let monitor = process.monitor(worker)
       process.send(reply, Sent)

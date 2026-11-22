@@ -829,7 +829,7 @@ fn build_tools_table(
       glua.new_index(
         table: tools_tbl,
         key: glua.string(host.name),
-        value: glua.function(task_start_fn(hosts, host.name, deadline_us)),
+        value: glua.function(task_start_fn(host, deadline_us)),
       )
     })
     |> list.fold(glua.success(Nil), fn(acc, action) {
@@ -848,10 +848,11 @@ fn build_tools_table(
 /// or not the script ever awaits it (the counter cell and the handle
 /// registry are engine-process-local, like the budget always was).
 fn task_start_fn(
-  hosts: List(HostTool),
-  name: String,
+  host: HostTool,
   deadline_us: Int,
 ) -> fn(List(glua.Value)) -> glua.Action(List(glua.Value), glua.Never) {
+  let name = host.name
+  let call = host.call
   fn(args) {
     // Budget before the deadline short-circuit: a near-deadline script
     // must not mint uncounted handles (the call_all rule carried over —
@@ -878,10 +879,12 @@ fn task_start_fn(
               // Eager start: linked to this engine so worker kill,
               // deadline kill, cancel, and the max-heap reaper all reap
               // the child; the engine owns the subject, so `await`'s
-              // receive (also engine-side) is legal.
+              // receive (also engine-side) is legal. Only this single
+              // host's `call` closure is copied into the child, never the
+              // full sibling host list.
               let results = process.new_subject()
               let pid =
-                process.spawn(fn() { task_child(hosts, name, encoded, results) })
+                process.spawn(fn() { task_child(call, encoded, results) })
               task_put_pending(id, results, pid)
               handle_action(id, name)
             }
@@ -901,17 +904,6 @@ fn handle_action(id: String, name: String) -> glua.Action(List(glua.Value), e) {
     ]),
   )
   glua.success([handle])
-}
-
-fn execute_host(
-  hosts: List(HostTool),
-  name: String,
-  arguments: String,
-) -> Result(String, String) {
-  case list.find(hosts, fn(host) { host.name == name }) {
-    Error(Nil) -> Error("unknown tool: " <> name)
-    Ok(host) -> host.call(arguments)
-  }
 }
 
 fn budget_error() -> String {
@@ -940,8 +932,7 @@ type TaskMsg {
 /// becomes an error value — nothing a tool can do takes the engine
 /// down), report, exit. The child always exits normally.
 fn task_child(
-  hosts: List(HostTool),
-  name: String,
+  call: fn(String) -> Result(String, String),
   arguments: String,
   results: Subject(TaskMsg),
 ) -> Nil {
@@ -951,7 +942,7 @@ fn task_child(
   // allocating uncapped in a child the engine's own flag never covers
   // (review on #105 -- children used to inherit no ceiling at all).
   let _ = set_max_heap_size(max_heap_words)
-  let outcome = case safe_call(fn() { execute_host(hosts, name, arguments) }) {
+  let outcome = case safe_call(fn() { call(arguments) }) {
     Ok(Ok(content)) -> TaskOk(content)
     Ok(Error(reason)) -> TaskErr(reason)
     Error(crash) -> TaskErr(crash)

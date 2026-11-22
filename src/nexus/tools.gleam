@@ -570,6 +570,9 @@ pub fn foreign_spec(
   server server: ForeignServer,
   schema_json schema_json: String,
 ) -> ToolSpec {
+  let provider = server.name
+  let timeout_ms = server.timeout_ms
+  let max_output_chars = cfg.plugin_max_output_chars
   ToolSpec(
     tool: function_tool(
       name: qualified,
@@ -578,10 +581,10 @@ pub fn foreign_spec(
     ),
     run: fn(ctx, arguments) {
       tool_provider.run(
-        provider: server.name,
+        provider: provider,
         tool: tool,
-        timeout_ms: server.timeout_ms,
-        max_output_chars: cfg.plugin_max_output_chars,
+        timeout_ms: timeout_ms,
+        max_output_chars: max_output_chars,
         cancel: ctx.cancel,
         arguments: arguments,
       )
@@ -859,28 +862,24 @@ fn env_list_run(
 }
 
 fn env_spec(cfg: Config, schema: ChatCompletionTool, run: EnvRun) -> ToolSpec {
+  let timeout_ms = cfg.env_timeout_ms
+  let max_output_bytes = cfg.env_max_output_bytes
   ToolSpec(tool: schema, run: fn(ctx, arguments) {
-    run(
-      cfg.env_timeout_ms,
-      cfg.env_max_output_bytes,
-      ctx.environment,
-      ctx.cancel,
-      arguments,
-    )
+    run(timeout_ms, max_output_bytes, ctx.environment, ctx.cancel, arguments)
   })
 }
 
 fn fetch_spec(cfg: Config) -> ToolSpec {
+  let exec =
+    http_fetch.run(
+      cfg.http_fetch_max_bytes,
+      cfg.http_fetch_timeout_ms,
+      cfg.http_fetch_allow_private,
+    )
   ToolSpec(
     tool: http_fetch.schema(),
     // ctx-ignoring adapter: http_fetch itself stays a pure fn(String).
-    run: fn(_ctx, arguments) {
-      http_fetch.run(
-        cfg.http_fetch_max_bytes,
-        cfg.http_fetch_timeout_ms,
-        cfg.http_fetch_allow_private,
-      )(arguments)
-    },
+    run: fn(_ctx, arguments) { exec(arguments) },
   )
 }
 
@@ -904,16 +903,15 @@ fn web_fetch_spec(
 }
 
 fn web_search_spec(cfg: Config) -> ToolSpec {
+  let searxng_base_url = cfg.searxng_base_url
+  let searxng_token = cfg.searxng_token
+  let timeout_ms = cfg.http_fetch_timeout_ms
   ToolSpec(tool: web_search.schema(), run: fn(_ctx, arguments) {
     // A snapshot can pin web_search past losing the SearxNG config
     // (the freeze overrides the gate); the call then fails loudly at
     // run time — the executor error renders as tool content.
-    case cfg.searxng_base_url {
-      Some(base) -> {
-        web_search.run(base, cfg.searxng_token, cfg.http_fetch_timeout_ms)(
-          arguments,
-        )
-      }
+    case searxng_base_url {
+      Some(base) -> web_search.run(base, searxng_token, timeout_ms)(arguments)
       None -> Error("web_search: SearxNG is not configured")
     }
   })
@@ -922,22 +920,21 @@ fn web_search_spec(cfg: Config) -> ToolSpec {
 /// The codemode spec over the already-built sibling list. codemode.gleam
 /// is a leaf module (no import of this one — Gleam forbids the cycle), so
 /// the bridge lives here: hosts are the siblings, and each host call
-/// reuses this turn's ToolCtx.
+/// reuses this turn's ToolCtx. Only `(name, spec.run)` pairs and the two
+/// codemode scalars are captured, keeping `Config` and wire schemas out
+/// of the codemode engine child's copied heap.
 fn codemode_spec(siblings: List(ToolSpec), cfg: Config) -> ToolSpec {
+  let timeout_ms = cfg.codemode_timeout_ms
+  let max_output_chars = cfg.codemode_max_output_chars
+  let sibling_runners =
+    list.map(siblings, fn(spec) { #(tool_name(spec), spec.run) })
   ToolSpec(tool: codemode.schema(), run: fn(ctx, arguments) {
     let hosts =
-      list.map(siblings, fn(spec) {
-        codemode.HostTool(name: tool_name(spec), call: fn(args) {
-          spec.run(ctx, args)
-        })
+      list.map(sibling_runners, fn(pair) {
+        let #(name, run) = pair
+        codemode.HostTool(name: name, call: fn(args) { run(ctx, args) })
       })
-    codemode.run(
-      hosts,
-      cfg.codemode_timeout_ms,
-      cfg.codemode_max_output_chars,
-      ctx.cancel,
-      arguments,
-    )
+    codemode.run(hosts, timeout_ms, max_output_chars, ctx.cancel, arguments)
   })
 }
 
