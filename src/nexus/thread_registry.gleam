@@ -66,6 +66,7 @@ import nexus/tools
 import nexus/transcript.{type Transcript}
 import nexus/utility
 import nexus/web_fetch_cache
+import nexus/workspace_gc
 
 /// The factory's child-start argument: everything needed to (re)start one
 /// thread actor identically.
@@ -691,6 +692,7 @@ fn stored_summary_with_id(id: String) -> StoredSummary {
     ),
     toolset: [],
     workspace_root: None,
+    workspaces: None,
     roster: None,
     last_active_at: 0,
     message_count: 0,
@@ -1140,6 +1142,20 @@ fn start_new_thread_bot(
             True -> state.cfg.workspace_root
             False -> None
           }
+          // Workspace-sandbox plan Phase 1: new env threads get managed
+          // `thread` (`threads/<id>`) and `tmp` (`tmp/<id>`) workspace rows
+          // persisted atomically with the thread row; directories on disk
+          // stay lazy until the first env tool call (`ensure_workspace`).
+          let workspaces = case workspace_root {
+            Some(_) ->
+              Some(store.ThreadWorkspaces(
+                workspace_id: "ws-thread-" <> id,
+                rel_path: "threads/" <> id,
+                tmp_id: Some("ws-tmp-" <> id),
+                tmp_rel_path: Some("tmp/" <> id),
+              ))
+            None -> None
+          }
           let transcript = transcript.new(alias, prompt)
           // The creation-time roster message (environments plan):
           // roster changes ride MESSAGES, never the envelope — a
@@ -1206,6 +1222,7 @@ fn start_new_thread_bot(
                 // Environments plan Phase 1: the frozen root (None =
                 // no env tools).
                 workspace_root: workspace_root,
+                workspaces: workspaces,
                 // The roster row rides the INSERT (persisted
                 // atomically — see StoredSummary.roster) so the
                 // write-behind watermark matches the stored rows.
@@ -1304,7 +1321,14 @@ fn start_new_thread_bot(
             Some(root) ->
               thread.ThreadSpec(
                 ..spec,
-                toolset: env_toolset(toolset, id, root, state.self, state.cfg),
+                toolset: env_toolset(
+                  toolset,
+                  id,
+                  root,
+                  option.map(workspaces, fn(ws) { ws.rel_path }),
+                  state.self,
+                  state.cfg,
+                ),
               )
             None -> spec
           }
@@ -1391,7 +1415,10 @@ fn start_new_thread_bot(
               let state = case persisted {
                 True ->
                   case state.store.delete_thread(id) {
-                    Ok(_) -> state
+                    Ok(tombstoned) -> {
+                      workspace_gc.cleanup_async(state.store, tombstoned)
+                      state
+                    }
                     Error(error) -> {
                       log_store_error("delete ghost thread " <> id, error)
                       state
@@ -1889,7 +1916,7 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
               process.send(reply, False)
               actor.continue(state)
             }
-            Ok(_) -> {
+            Ok(tombstoned) -> {
               // Stop + kill every LIVE member (the parent's existing
               // treatment, applied to each descendant: demonitor first
               // so no DOWN can trigger a replacement — factory children
@@ -1914,6 +1941,12 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
                   Error(_) -> Nil
                 }
               })
+              // Spawn guarded disk GC after signalling live actors in the
+              // subtree to stop/exit. `process.kill` is asynchronous, so
+              // `workspace_gc.remove_dir` verifies absence after removal and
+              // keeps the tombstone for the next boot sweep if anything
+              // remains (workspace-sandbox plan Phase 1).
+              workspace_gc.cleanup_async(state.store, tombstoned)
               process.send(reply, True)
               actor.continue(
                 State(
@@ -2378,7 +2411,14 @@ fn lazy_start(state: State, summary: StoredSummary) -> Resolved {
           // changed or was removed (its files stay where they were).
           let resolved = case summary.workspace_root {
             Some(root) ->
-              env_toolset(resolved, summary.id, root, state.self, state.cfg)
+              env_toolset(
+                resolved,
+                summary.id,
+                root,
+                option.map(summary.workspaces, fn(ws) { ws.rel_path }),
+                state.self,
+                state.cfg,
+              )
             None -> resolved
           }
           // The delivery wrapper rides hydration too (bots P3c, #97): a
@@ -3477,6 +3517,7 @@ fn env_toolset(
   toolset: thread.Toolset,
   thread_id: String,
   workspace_root: String,
+  workspace_rel_path: Option(String),
   registry: Subject(Msg),
   cfg: Config,
 ) -> thread.Toolset {
@@ -3507,6 +3548,7 @@ fn env_toolset(
         Some(env.Environment(
           workspace_root: workspace_root,
           thread_id: thread_id,
+          workspace_rel_path: workspace_rel_path,
           roster: env.attached_targets(),
           remote: Some(router),
         )),

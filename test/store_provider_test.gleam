@@ -53,6 +53,7 @@ fn summary(id: String, provider_id: String) -> store.StoredSummary {
     last_active_at: 1_700_000_000,
     toolset: [],
     workspace_root: None,
+    workspaces: None,
     roster: None,
     message_count: 1,
   )
@@ -241,7 +242,7 @@ pub fn thread_pin_and_delete_guard_test() {
   seam.delete_provider("p1") |> should.be_error
 
   // Unreferenced after the thread's own delete: the delete lands.
-  let assert Ok(Nil) = seam.delete_thread("s1")
+  let assert Ok(_) = seam.delete_thread("s1")
   let assert Ok(0) = seam.count_threads_for_provider("p1")
   let assert Ok(Nil) = seam.delete_provider("p1")
   seam.get_provider("p1") |> should.be_error

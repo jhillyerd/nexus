@@ -24,12 +24,51 @@
 -- state where an old parent row still hangs a channel with durable
 -- transcripts. The child check reads the same table CASCADE would
 -- delete from.
-delete from thread
-where (message_count <= 1 or (workspace_root is not null and message_count <= 2))
-  and title_source = 'auto'
-  and pinned = false
-  and last_active_at < now() - interval '15 minutes'
-  and not exists (
-    select 1 from thread c where c.parent_thread_id = thread.id
-  )
-returning id
+-- Workspace tombstoning (docs/plans/workspace-sandbox.md, Phase 1): any
+-- pruned thread's owned workspaces (and any orphaned bot workspace whose
+-- last referencing thread is pruned) are tombstoned in the SAME statement
+-- so the boot GC sweep removes their directories on disk.
+with candidates as (
+  select id, workspace_id, tmp_workspace_id
+  from thread
+  where (message_count <= 1 or (workspace_root is not null and message_count <= 2))
+    and title_source = 'auto'
+    and pinned = false
+    and last_active_at < now() - interval '15 minutes'
+    and not exists (
+      select 1 from thread c where c.parent_thread_id = thread.id
+    )
+),
+tombstoned as (
+  update workspace w
+  set deleted_at = now(),
+      thread_id = case when w.kind in ('thread', 'tmp') then null else w.thread_id end
+  where w.deleted_at is null
+    and (
+      (
+        w.kind in ('thread', 'tmp')
+        and (
+          w.thread_id in (select id from candidates)
+          or w.id in (select workspace_id from candidates where workspace_id is not null)
+          or w.id in (select tmp_workspace_id from candidates where tmp_workspace_id is not null)
+        )
+      )
+      or (
+        w.kind = 'bot'
+        and w.bot_id is null
+        and w.id in (select workspace_id from candidates where workspace_id is not null)
+        and not exists (
+          select 1 from thread t
+          where t.workspace_id = w.id
+            and t.id not in (select id from candidates)
+        )
+      )
+    )
+  returning w.id
+),
+deleted as (
+  delete from thread
+  where id in (select id from candidates)
+  returning id
+)
+select id from deleted

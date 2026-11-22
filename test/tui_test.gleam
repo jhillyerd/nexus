@@ -181,6 +181,7 @@ fn node_handle(root: String) -> env.Environment {
   env.Environment(
     workspace_root: root,
     thread_id: "srv-thread",
+    workspace_rel_path: None,
     roster: env.attached_targets(),
     remote: None,
   )

@@ -9,8 +9,10 @@
 
 import gleam/dict.{type Dict}
 import gleam/erlang/process.{type Subject}
+import gleam/int
 import gleam/list
 import gleam/option.{None, Some}
+import gleam/order
 import gleam/otp/actor
 import gleam/string
 import nexus/bot
@@ -92,10 +94,22 @@ pub type MockMsg {
   SetPinned(id: String, pinned: Bool, reply: Subject(Result(Nil, String)))
   Archive(id: String, reply: Subject(Result(Nil, String)))
   Unarchive(id: String, reply: Subject(Result(Nil, String)))
-  DeleteThread(id: String, reply: Subject(Result(Nil, String)))
+  DeleteThread(
+    id: String,
+    reply: Subject(Result(List(store.TombstonedWorkspace), String)),
+  )
   /// Mirrors `prune_never_used.sql` (see the seam's docs in
   /// `nexus/store`): bulk boot sweep, replying with the deleted ids.
   PruneNeverUsed(reply: Subject(Result(List(String), String)))
+  // ---- workspace rows (docs/plans/workspace-sandbox.md, Phase 1) ----
+  ListDeletedWorkspaces(
+    reply: Subject(Result(List(store.TombstonedWorkspace), String)),
+  )
+  DeleteWorkspace(id: String, reply: Subject(Result(Nil, String)))
+  InsertWorkspace(
+    workspace: store.StoredWorkspace,
+    reply: Subject(Result(Nil, String)),
+  )
   // ---- provider rows (docs/plans/multi-provider.md §5.3) ----
   ListProviders(reply: Subject(Result(List(StoredProvider), String)))
   GetProvider(id: String, reply: Subject(Result(store.StoredProvider, String)))
@@ -142,6 +156,9 @@ pub type MockMsg {
   Nodes(reply: Subject(List(store.StoredNode)))
   /// Every stored grant, id-sorted — for direct row assertions.
   Grants(reply: Subject(List(store.StoredGrant)))
+  /// Every stored workspace (live + tombstoned), id-sorted — for direct
+  /// row assertions.
+  Workspaces(reply: Subject(List(store.StoredWorkspace)))
   /// Test-only: truncate a thread's stored rows back to `keep_rows` and
   /// its persisted message count to `messages` to model a crash between
   /// commits — the next Commit re-emits the delta, which is exactly the
@@ -175,6 +192,7 @@ type State {
     bots: Dict(String, StoredBot),
     nodes: Dict(String, store.StoredNode),
     grants: Dict(String, store.StoredGrant),
+    workspaces: Dict(String, store.StoredWorkspace),
     events: List(Event),
   )
 }
@@ -264,6 +282,7 @@ pub fn start() -> Subject(MockMsg) {
           bots: dict.new(),
           nodes: dict.new(),
           grants: dict.new(),
+          workspaces: dict.new(),
           events: [],
         ),
       )
@@ -305,6 +324,13 @@ pub fn seam(mock: Subject(MockMsg)) -> Store {
     unarchive: fn(id) { call(mock, 5000, fn(r) { Unarchive(id, r) }) },
     delete_thread: fn(id) { call(mock, 5000, fn(r) { DeleteThread(id, r) }) },
     prune_never_used: fn() { call(mock, 5000, PruneNeverUsed) },
+    list_deleted_workspaces: fn() { call(mock, 5000, ListDeletedWorkspaces) },
+    delete_workspace: fn(id) {
+      call(mock, 5000, fn(r) { DeleteWorkspace(id, r) })
+    },
+    insert_workspace: fn(ws) {
+      call(mock, 5000, fn(r) { InsertWorkspace(ws, r) })
+    },
     list_providers: fn() { call(mock, 5000, ListProviders) },
     get_provider: fn(id) { call(mock, 5000, fn(r) { GetProvider(id, r) }) },
     insert_provider: fn(provider) {
@@ -386,6 +412,12 @@ pub fn nodes(mock: Subject(MockMsg)) -> List(store.StoredNode) {
 /// Every stored grant, id-sorted — for direct row assertions.
 pub fn grants(mock: Subject(MockMsg)) -> List(store.StoredGrant) {
   call(mock, 5000, Grants)
+}
+
+/// Every stored workspace (live + tombstoned), id-sorted — for direct
+/// row assertions.
+pub fn workspaces(mock: Subject(MockMsg)) -> List(store.StoredWorkspace) {
+  call(mock, 5000, Workspaces)
 }
 
 /// Truncate a thread's stored rows (models a crash between commits so
@@ -545,48 +577,113 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
               actor.continue(state)
             }
             True, True, True -> {
-              process.send(reply, Ok(Nil))
-              actor.continue(
-                State(
-                  ..state,
-                  threads: dict.insert(
-                    state.threads,
-                    summary.id,
-                    // insert_thread.sql: tags_manual '{}' literally and
-                    // tags_source DEFAULT 'auto' — a new row's auto path is
-                    // open, regardless of what the passed summary carried
-                    // (a fresh insert never inherits provenance).
-                    Stored(
-                      store.StoredSummary(
-                        ..summary,
-                        meta: thread.ThreadMeta(
-                          ..summary.meta,
-                          tags_manual: [],
-                          tags_source: thread.AutoTags,
+              // Workspace-sandbox plan Phase 1: insert_thread creates the
+              // thread's managed `thread` and `tmp` workspace rows in the
+              // same atomic statement when summary.workspaces is Some.
+              let next_workspaces = case
+                summary.workspace_root,
+                summary.workspaces
+              {
+                Some(root), Some(ws) -> {
+                  let after_main = case
+                    dict.get(state.workspaces, ws.workspace_id)
+                  {
+                    Ok(existing)
+                      if existing.kind == store.BotWorkspace
+                      && existing.deleted_at == None
+                    -> Ok(state.workspaces)
+                    _ ->
+                      insert_workspace_checked(
+                        state.workspaces,
+                        store.StoredWorkspace(
+                          id: ws.workspace_id,
+                          kind: store.ThreadWorkspace,
+                          root: root,
+                          rel_path: ws.rel_path,
+                          thread_id: Some(summary.id),
+                          bot_id: None,
+                          created_at: summary.meta.created_at,
+                          last_used_at: None,
+                          deleted_at: None,
+                        ),
+                      )
+                  }
+                  case after_main {
+                    Error(err) -> Error(err)
+                    Ok(after_main) ->
+                      case ws.tmp_id, ws.tmp_rel_path {
+                        Some(tid), Some(trel) ->
+                          insert_workspace_checked(
+                            after_main,
+                            store.StoredWorkspace(
+                              id: tid,
+                              kind: store.TmpWorkspace,
+                              root: root,
+                              rel_path: trel,
+                              thread_id: Some(summary.id),
+                              bot_id: None,
+                              created_at: summary.meta.created_at,
+                              last_used_at: None,
+                              deleted_at: None,
+                            ),
+                          )
+                        _, _ -> Ok(after_main)
+                      }
+                  }
+                }
+                _, _ -> Ok(state.workspaces)
+              }
+              case next_workspaces {
+                Error(err) -> {
+                  process.send(reply, Error(err))
+                  actor.continue(state)
+                }
+                Ok(workspaces) -> {
+                  process.send(reply, Ok(Nil))
+                  actor.continue(
+                    State(
+                      ..state,
+                      workspaces: workspaces,
+                      threads: dict.insert(
+                        state.threads,
+                        summary.id,
+                        // insert_thread.sql: tags_manual '{}' literally and
+                        // tags_source DEFAULT 'auto' — a new row's auto path is
+                        // open, regardless of what the passed summary carried
+                        // (a fresh insert never inherits provenance).
+                        Stored(
+                          store.StoredSummary(
+                            ..summary,
+                            meta: thread.ThreadMeta(
+                              ..summary.meta,
+                              tags_manual: [],
+                              tags_source: thread.AutoTags,
+                            ),
+                          ),
+                          system_prompt,
+                          // insert_thread's roster CTE: the creation-time
+                          // roster row is stored WITH the thread (seq 0,
+                          // system-authored) — the watermark (messages)
+                          // already counts it.
+                          case summary.roster {
+                            option.Some(#(text, stamp)) -> [
+                              store.UserRow(
+                                content: text,
+                                author: option.Some("system"),
+                                hop_depth: 0,
+                                at: option.Some(stamp),
+                              ),
+                            ]
+                            option.None -> []
+                          },
+                          summary.message_count,
                         ),
                       ),
-                      system_prompt,
-                      // insert_thread's roster CTE: the creation-time
-                      // roster row is stored WITH the thread (seq 0,
-                      // system-authored) — the watermark (messages)
-                      // already counts it.
-                      case summary.roster {
-                        option.Some(#(text, stamp)) -> [
-                          store.UserRow(
-                            content: text,
-                            author: option.Some("system"),
-                            hop_depth: 0,
-                            at: option.Some(stamp),
-                          ),
-                        ]
-                        option.None -> []
-                      },
-                      summary.message_count,
+                      events: [EvInsertThread(summary.id), ..state.events],
                     ),
-                  ),
-                  events: [EvInsertThread(summary.id), ..state.events],
-                ),
-              )
+                  )
+                }
+              }
             }
           }
         }
@@ -852,8 +949,13 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
       // subtree's pairing grants go with it — node_grant_thread_id_fkey
       // CASCADEs the same way (tui-pairing plan) — and so do its NODE
       // rows: node_thread_id_fkey (per-thread node names, a node
-      // credential is bound to its thread).
+      // credential is bound to its thread). Owned workspaces (and any
+      // orphaned bot workspace whose last referencing thread dies here)
+      // are tombstoned atomically in the same step (workspace-sandbox
+      // plan Phase 1).
       let subtree = channel_subtree(state.threads, id)
+      let #(workspaces, tombstoned) =
+        tombstone_for_threads(state.workspaces, state.threads, subtree)
       let threads =
         list.fold(subtree, state.threads, fn(threads, sid) {
           dict.delete(threads, sid)
@@ -869,12 +971,16 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
         dict.filter(state.nodes, fn(_nid, node) {
           !list.contains(subtree, node.thread_id)
         })
-      process.send(reply, Ok(Nil))
+      process.send(reply, Ok(tombstoned))
       actor.continue(
-        State(..state, threads: threads, grants: grants, nodes: nodes, events: [
-          EvDeleteThread(id),
-          ..state.events
-        ]),
+        State(
+          ..state,
+          threads: threads,
+          grants: grants,
+          nodes: nodes,
+          workspaces: workspaces,
+          events: [EvDeleteThread(id), ..state.events],
+        ),
       )
     }
 
@@ -904,6 +1010,8 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
         })
         |> list.map(fn(stored) { stored.summary.id })
         |> list.sort(string.compare)
+      let #(workspaces, _tombstoned) =
+        tombstone_for_threads(state.workspaces, state.threads, ids)
       let threads =
         list.fold(ids, state.threads, fn(threads, id) {
           dict.delete(threads, id)
@@ -934,9 +1042,66 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
           threads: threads,
           grants: grants,
           nodes: nodes,
+          workspaces: workspaces,
           events: events,
         ),
       )
+    }
+
+    ListDeletedWorkspaces(reply) -> {
+      let deleted =
+        state.workspaces
+        |> dict.values
+        |> list.filter_map(fn(ws) {
+          case ws.deleted_at {
+            Some(at) -> Ok(#(at, ws))
+            None -> Error(Nil)
+          }
+        })
+        |> list.sort(fn(a, b) {
+          case int.compare(a.0, b.0) {
+            order.Eq -> string.compare({ a.1 }.id, { b.1 }.id)
+            other -> other
+          }
+        })
+        |> list.map(fn(pair) {
+          let ws = pair.1
+          store.TombstonedWorkspace(
+            id: ws.id,
+            root: ws.root,
+            rel_path: ws.rel_path,
+          )
+        })
+      process.send(reply, Ok(deleted))
+      actor.continue(state)
+    }
+
+    DeleteWorkspace(id, reply) -> {
+      // Mirrors delete_workspace.sql: only tombstoned rows can be
+      // hard-deleted by GC (a live row is untouched).
+      let workspaces = case dict.get(state.workspaces, id) {
+        Ok(ws) ->
+          case ws.deleted_at {
+            Some(_) -> dict.delete(state.workspaces, id)
+            None -> state.workspaces
+          }
+        Error(_) -> state.workspaces
+      }
+      process.send(reply, Ok(Nil))
+      actor.continue(State(..state, workspaces: workspaces))
+    }
+
+    InsertWorkspace(ws, reply) -> {
+      case insert_workspace_checked(state.workspaces, ws) {
+        Error(err) -> {
+          process.send(reply, Error(err))
+          actor.continue(state)
+        }
+        Ok(workspaces) -> {
+          process.send(reply, Ok(Nil))
+          actor.continue(State(..state, workspaces: workspaces))
+        }
+      }
     }
 
     Events(reply) -> {
@@ -1249,11 +1414,20 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
               }
               dict.insert(acc, thread_id, updated)
             })
+          let workspaces =
+            dict.map_values(state.workspaces, fn(_wid, ws) {
+              case ws.bot_id {
+                Some(bot_id) if bot_id == id ->
+                  store.StoredWorkspace(..ws, bot_id: None)
+                _ -> ws
+              }
+            })
           process.send(reply, Ok(Nil))
           actor.continue(
             State(
               ..state,
               threads: threads,
+              workspaces: workspaces,
               bots: dict.delete(state.bots, id),
               events: [EvDeleteBot(id), ..state.events],
             ),
@@ -1537,6 +1711,15 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
       actor.continue(state)
     }
 
+    Workspaces(reply) -> {
+      let workspaces =
+        state.workspaces
+        |> dict.values
+        |> list.sort(fn(a, b) { string.compare(a.id, b.id) })
+      process.send(reply, workspaces)
+      actor.continue(state)
+    }
+
     Bots(reply) -> {
       let bots =
         state.bots
@@ -1648,4 +1831,118 @@ fn never_used(summary: StoredSummary, cutoff_s: Int) -> Bool {
   && summary.meta.title_source == thread.AutoTitle
   && !summary.meta.pinned
   && summary.last_active_at < cutoff_s
+}
+
+/// Insert a workspace row enforcing the `workspace_pkey` and `workspace_path`
+/// (`UNIQUE (root, rel_path)`) constraints.
+fn insert_workspace_checked(
+  workspaces: Dict(String, store.StoredWorkspace),
+  ws: store.StoredWorkspace,
+) -> Result(Dict(String, store.StoredWorkspace), String) {
+  case dict.has_key(workspaces, ws.id) {
+    True -> Error("duplicate workspace id " <> ws.id)
+    False -> {
+      let path_taken =
+        workspaces
+        |> dict.values
+        |> list.any(fn(existing) {
+          existing.root == ws.root && existing.rel_path == ws.rel_path
+        })
+      case path_taken {
+        True ->
+          Error("duplicate workspace_path " <> ws.root <> "/" <> ws.rel_path)
+        False -> Ok(dict.insert(workspaces, ws.id, ws))
+      }
+    }
+  }
+}
+
+/// Mirror the atomic tombstone logic in `delete_thread.sql` and
+/// `prune_never_used.sql` for a set of doomed thread ids.
+fn tombstone_for_threads(
+  workspaces: Dict(String, store.StoredWorkspace),
+  threads: Dict(String, Stored),
+  doomed_ids: List(String),
+) -> #(Dict(String, store.StoredWorkspace), List(store.TombstonedWorkspace)) {
+  let now = timing.wall_now_s()
+  let doomed_ws_ids =
+    doomed_ids
+    |> list.filter_map(fn(tid) {
+      case dict.get(threads, tid) {
+        Ok(stored) ->
+          case stored.summary.workspaces {
+            Some(ws) -> Ok(ws.workspace_id)
+            None -> Error(Nil)
+          }
+        Error(_) -> Error(Nil)
+      }
+    })
+  let doomed_tmp_ids =
+    doomed_ids
+    |> list.filter_map(fn(tid) {
+      case dict.get(threads, tid) {
+        Ok(stored) ->
+          case stored.summary.workspaces {
+            Some(store.ThreadWorkspaces(tmp_id: Some(tmp_ws_id), ..)) ->
+              Ok(tmp_ws_id)
+            _ -> Error(Nil)
+          }
+        Error(_) -> Error(Nil)
+      }
+    })
+  let surviving_threads =
+    threads
+    |> dict.values
+    |> list.filter(fn(stored) { !list.contains(doomed_ids, stored.summary.id) })
+  let #(updated, tombstoned) =
+    dict.fold(workspaces, #(dict.new(), []), fn(acc, wid, ws) {
+      let #(map, list_acc) = acc
+      let should_tombstone = case ws.deleted_at, ws.kind {
+        Some(_), _ -> False
+        None, store.ThreadWorkspace | None, store.TmpWorkspace -> {
+          let owned_by_thread = case ws.thread_id {
+            Some(tid) -> list.contains(doomed_ids, tid)
+            None -> False
+          }
+          owned_by_thread
+          || list.contains(doomed_ws_ids, wid)
+          || list.contains(doomed_tmp_ids, wid)
+        }
+        None, store.BotWorkspace -> {
+          ws.bot_id == None
+          && list.contains(doomed_ws_ids, wid)
+          && !list.any(surviving_threads, fn(stored) {
+            case stored.summary.workspaces {
+              Some(tw) -> tw.workspace_id == wid
+              None -> False
+            }
+          })
+        }
+      }
+      case should_tombstone {
+        False -> #(dict.insert(map, wid, ws), list_acc)
+        True -> {
+          let next_thread_id = case ws.kind {
+            store.ThreadWorkspace | store.TmpWorkspace -> None
+            store.BotWorkspace -> ws.thread_id
+          }
+          let marked =
+            store.StoredWorkspace(
+              ..ws,
+              deleted_at: Some(now),
+              thread_id: next_thread_id,
+            )
+          #(dict.insert(map, wid, marked), [
+            store.TombstonedWorkspace(
+              id: ws.id,
+              root: ws.root,
+              rel_path: ws.rel_path,
+            ),
+            ..list_acc
+          ])
+        }
+      }
+    })
+  let sorted = list.sort(tombstoned, fn(a, b) { string.compare(a.id, b.id) })
+  #(updated, sorted)
 }

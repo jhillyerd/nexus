@@ -47,6 +47,7 @@ fn summary(id: String, bot_id: option.Option(String)) -> store.StoredSummary {
     last_active_at: 1_700_000_000,
     toolset: [],
     workspace_root: None,
+    workspaces: None,
     roster: None,
     message_count: 1,
   )

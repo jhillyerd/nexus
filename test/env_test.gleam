@@ -25,6 +25,7 @@ fn env_for(root: String) -> Option(env.Environment) {
   Some(env.Environment(
     workspace_root: root,
     thread_id: "t1",
+    workspace_rel_path: None,
     roster: env.attached_targets(),
     remote: None,
   ))
@@ -139,6 +140,7 @@ fn node_for(root: String) -> env.Environment {
   env.Environment(
     workspace_root: root,
     thread_id: "srv-thread",
+    workspace_rel_path: None,
     roster: env.attached_targets(),
     remote: None,
   )
@@ -267,6 +269,7 @@ pub fn route_names_live_roster_test() {
     env.Environment(
       workspace_root: "/srv/nexus",
       thread_id: "s12",
+      workspace_rel_path: None,
       roster: [
         "workspace",
         "proxmox-2",
@@ -305,6 +308,7 @@ pub fn bash_runs_in_workspace_cwd_test() {
       env.workspace_dir(env.Environment(
         workspace_root: root,
         thread_id: "t1",
+        workspace_rel_path: None,
         roster: env.attached_targets(),
         remote: None,
       )),
@@ -362,6 +366,7 @@ pub fn bash_environment_is_allowlisted_test() {
     env.workspace_dir(env.Environment(
       workspace_root: root,
       thread_id: "t1",
+      workspace_rel_path: None,
       roster: env.attached_targets(),
       remote: None,
     ))
@@ -901,6 +906,7 @@ pub fn confinement_normalization_test() {
     env.Environment(
       workspace_root: "/srv/nexus",
       thread_id: "s12",
+      workspace_rel_path: None,
       roster: env.attached_targets(),
       remote: None,
     )
@@ -920,6 +926,7 @@ pub fn workspace_dir_derivation_test() {
   env.workspace_dir(env.Environment(
     workspace_root: "/srv/nx",
     thread_id: "s3",
+    workspace_rel_path: None,
     roster: env.attached_targets(),
     remote: None,
   ))
@@ -961,6 +968,7 @@ pub fn remote_dispatch_routes_all_four_tools_test() {
     Some(env.Environment(
       workspace_root: "/srv/nx",
       thread_id: "t1",
+      workspace_rel_path: None,
       roster: ["workspace", "node-a"],
       remote: Some(capture_router(seen)),
     ))
@@ -1023,6 +1031,7 @@ pub fn remote_errors_pass_through_test() {
     Some(env.Environment(
       workspace_root: "/srv/nx",
       thread_id: "t1",
+      workspace_rel_path: None,
       roster: ["workspace", "node-a"],
       remote: Some(fn(_t, _tool, _args, _c) {
         Error("target \"node-a\" is not attached. attached targets: workspace")
@@ -1049,6 +1058,7 @@ pub fn remote_none_falls_back_to_local_route_test() {
     Some(env.Environment(
       workspace_root: "/srv/nx",
       thread_id: "t1",
+      workspace_rel_path: None,
       roster: ["workspace", "node-a"],
       remote: None,
     ))
@@ -1076,6 +1086,7 @@ pub fn workspace_target_never_dispatches_remotely_test() {
     Some(env.Environment(
       workspace_root: root,
       thread_id: "t1",
+      workspace_rel_path: None,
       roster: ["workspace"],
       remote: Some(capture_router(seen)),
     ))

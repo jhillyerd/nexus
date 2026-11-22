@@ -220,6 +220,7 @@ fn run(config: Config) -> Nil {
     env.Environment(
       workspace_root: config.workspace,
       thread_id: config.thread_id,
+      workspace_rel_path: None,
       roster: env.attached_targets(),
       remote: None,
     )

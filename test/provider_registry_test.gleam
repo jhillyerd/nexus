@@ -128,6 +128,7 @@ fn pinned_thread(id: String, provider_id: String) -> store.StoredSummary {
     last_active_at: 1_700_000_000,
     toolset: [],
     workspace_root: None,
+    workspaces: None,
     roster: None,
     message_count: 1,
   )
@@ -511,7 +512,7 @@ pub fn delete_guarded_while_pinned_test() {
   let assert Ok(_) = call(registry, fn(r) { provider_registry.Get("p1", r) })
 
   // Unpinned: delete goes through, and every path forgets the provider.
-  let assert Ok(Nil) = seam.delete_thread("s1")
+  let assert Ok(_) = seam.delete_thread("s1")
   call(registry, fn(r) { provider_registry.Delete("p1", r) })
   |> should.equal(Ok(Nil))
   store_mock.providers(mock) |> should.equal([])

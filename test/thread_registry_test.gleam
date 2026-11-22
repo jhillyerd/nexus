@@ -701,6 +701,7 @@ fn seed_with_tags(seam: store.Store, id: String, tags: List(String)) -> Nil {
           tools.default_names(test_config()),
         ),
         workspace_root: None,
+        workspaces: None,
         roster: None,
         message_count: 3,
       ),
@@ -1054,6 +1055,7 @@ fn seed_at(
           tools.default_names(test_config()),
         ),
         workspace_root: None,
+        workspaces: None,
         roster: None,
         message_count: message_count,
       ),
@@ -1076,6 +1078,7 @@ fn seed_env(seam: store.Store, id: String, message_count: Int) -> Nil {
         meta: fresh_meta(),
         toolset: thread_registry.plain_entries(["bash"]),
         workspace_root: Some("/srv/old-root"),
+        workspaces: None,
         roster: None,
         last_active_at: 1_700_000_000,
         message_count: message_count,
@@ -1112,6 +1115,7 @@ fn seed_channel(seam: store.Store, id: String, parent: String) -> Nil {
           tools.default_names(test_config()),
         ),
         workspace_root: None,
+        workspaces: None,
         roster: None,
         last_active_at: 1_700_000_060,
         message_count: 3,
@@ -1431,6 +1435,7 @@ fn stored_with_toolset(id: String, names: List(String)) -> store.StoredSummary {
     ),
     toolset: thread_registry.plain_entries(names),
     workspace_root: None,
+    workspaces: None,
     roster: None,
     last_active_at: timing.wall_now_s(),
     message_count: 1,
@@ -2093,6 +2098,7 @@ pub fn dormant_summary_carries_bot_provenance_test() {
           tools.default_names(test_config()),
         ),
         workspace_root: None,
+        workspaces: None,
         roster: None,
         message_count: 3,
       ),
@@ -2205,6 +2211,7 @@ pub fn bot_delete_scrubs_cached_provenance_test() {
             tools.default_names(test_config()),
           ),
           workspace_root: None,
+          workspaces: None,
           roster: None,
           message_count: 3,
         ),
@@ -2379,6 +2386,7 @@ pub fn env_capable_dormant_thread_test() {
         meta: fresh_meta(),
         toolset: thread_registry.plain_entries(["bash"]),
         workspace_root: Some("/srv/dormant"),
+        workspaces: None,
         roster: Some(#(
           env.roster_attach_text("workspace", env.attached_targets()),
           1_700_000_000,
@@ -2397,6 +2405,7 @@ pub fn env_capable_dormant_thread_test() {
         meta: fresh_meta(),
         toolset: thread_registry.plain_entries(["http_fetch"]),
         workspace_root: None,
+        workspaces: None,
         roster: None,
         last_active_at: timing.wall_now_s(),
         message_count: 1,
@@ -2496,10 +2505,11 @@ pub fn env_toolset_runner_receives_environment_handle_test() {
     )
   let assert Ok(sess) = thread_registry.get(registry, summary.id)
   let assert thread.Sent = thread.send_message(sess, "run something")
-  let assert Ok(Some(env.Environment(got_root, id, roster, _remote))) =
+  let assert Ok(Some(env.Environment(got_root, id, rel_path, roster, _remote))) =
     process.receive(seen, 5000)
   should.equal(got_root, root)
   should.equal(id, summary.id)
+  should.equal(rel_path, Some("threads/" <> summary.id))
   should.equal(roster, ["workspace"])
 }
 
@@ -2569,6 +2579,7 @@ pub fn env_toolset_hydrates_from_persisted_root_test() {
         meta: fresh_meta(),
         toolset: thread_registry.plain_entries(["bash"]),
         workspace_root: Some(old_root),
+        workspaces: None,
         // The creation-time roster row, as insert_thread persists it.
         roster: Some(#(
           env.roster_attach_text("workspace", env.attached_targets()),
@@ -2631,6 +2642,7 @@ pub fn env_roster_legacy_row_falls_back_to_workspace_test() {
         meta: fresh_meta(),
         toolset: thread_registry.plain_entries(["bash"]),
         workspace_root: Some("/srv/old-root"),
+        workspaces: None,
         roster: Some(#(legacy_text, 1_700_000_000)),
         last_active_at: timing.wall_now_s(),
         message_count: 1,
@@ -2705,6 +2717,7 @@ pub fn env_roster_rehydrates_from_persisted_attach_row_test() {
         meta: fresh_meta(),
         toolset: thread_registry.plain_entries(["bash"]),
         workspace_root: Some("/srv/old-root"),
+        workspaces: None,
         roster: Some(#(
           env.roster_attach_text("workspace", env.attached_targets()),
           1_700_000_000,

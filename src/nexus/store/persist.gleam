@@ -40,6 +40,7 @@ import nexus/store
 import nexus/store/sql
 import nexus/thread
 import nexus/transcript.{type Transcript}
+import nexus/workspace_gc
 import pog
 
 pub type Msg {
@@ -79,10 +80,22 @@ pub type Msg {
   SetPinned(id: String, pinned: Bool, reply: Subject(Result(Nil, String)))
   Archive(id: String, reply: Subject(Result(Nil, String)))
   Unarchive(id: String, reply: Subject(Result(Nil, String)))
-  DeleteThread(id: String, reply: Subject(Result(Nil, String)))
+  DeleteThread(
+    id: String,
+    reply: Subject(Result(List(store.TombstonedWorkspace), String)),
+  )
   /// Boot sweep (see `prune_never_used.sql`): bulk delete of stale
   /// never-used threads, replying with the deleted ids.
   PruneNeverUsed(reply: Subject(Result(List(String), String)))
+  // ---- workspace rows (docs/plans/workspace-sandbox.md, Phase 1) ----
+  ListDeletedWorkspaces(
+    reply: Subject(Result(List(store.TombstonedWorkspace), String)),
+  )
+  DeleteWorkspace(id: String, reply: Subject(Result(Nil, String)))
+  InsertWorkspace(
+    workspace: store.StoredWorkspace,
+    reply: Subject(Result(Nil, String)),
+  )
   // ---- provider rows (docs/plans/multi-provider.md §5.3) ----
   ListProviders(reply: Subject(Result(List(store.StoredProvider), String)))
   GetProvider(id: String, reply: Subject(Result(store.StoredProvider, String)))
@@ -268,6 +281,19 @@ pub fn seam(store_actor: Subject(Msg)) -> store.Store {
     prune_never_used: fn() {
       actor.call(store_actor, call_timeout_ms, PruneNeverUsed)
     },
+    list_deleted_workspaces: fn() {
+      actor.call(store_actor, call_timeout_ms, ListDeletedWorkspaces)
+    },
+    delete_workspace: fn(id) {
+      actor.call(store_actor, call_timeout_ms, fn(reply) {
+        DeleteWorkspace(id, reply)
+      })
+    },
+    insert_workspace: fn(workspace) {
+      actor.call(store_actor, call_timeout_ms, fn(reply) {
+        InsertWorkspace(workspace, reply)
+      })
+    },
     list_providers: fn() {
       actor.call(store_actor, call_timeout_ms, ListProviders)
     },
@@ -439,6 +465,12 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
                       ),
                       toolset: entries,
                       workspace_root: row.workspace_root,
+                      workspaces: thread_workspaces_from_row(
+                        row.workspace_id,
+                        row.workspace_rel_path,
+                        row.tmp_workspace_id,
+                        row.tmp_rel_path,
+                      ),
                       roster: option.None,
                       last_active_at: row.last_active_s,
                       // The column already counts the system prompt
@@ -526,6 +558,24 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           // sentinel inserts NULL (ordinary threads) — the same nullif
           // pattern as bot_id/workspace_root above.
           option.unwrap(summary.meta.parent_thread_id, ""),
+          // Workspace rows (workspace-sandbox plan Phase 1, $17..$20):
+          // '' sentinels insert NULL / skip workspace row creation.
+          case summary.workspaces {
+            Some(ws) -> ws.workspace_id
+            None -> ""
+          },
+          case summary.workspaces {
+            Some(ws) -> option.unwrap(ws.tmp_id, "")
+            None -> ""
+          },
+          case summary.workspaces {
+            Some(ws) -> ws.rel_path
+            None -> ""
+          },
+          case summary.workspaces {
+            Some(ws) -> option.unwrap(ws.tmp_rel_path, "")
+            None -> ""
+          },
         )
         |> result.map(fn(_) { Nil })
         |> result.map_error(query_error)
@@ -622,10 +672,25 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
     }
 
     DeleteThread(id, reply) -> {
-      process.send(reply, update(sql.delete_thread(state.db, id)))
-      actor.continue(
-        State(..state, persisted: dict.delete(state.persisted, id)),
-      )
+      let result = case sql.delete_thread(state.db, id) {
+        Ok(returned) ->
+          Ok(
+            list.map(returned.rows, fn(row) {
+              store.TombstonedWorkspace(
+                id: row.id,
+                root: row.root,
+                rel_path: row.rel_path,
+              )
+            }),
+          )
+        Error(error) -> Error(query_error(error))
+      }
+      process.send(reply, result)
+      let persisted = case result {
+        Ok(_) -> dict.delete(state.persisted, id)
+        Error(_) -> state.persisted
+      }
+      actor.continue(State(..state, persisted: persisted))
     }
 
     PruneNeverUsed(reply) -> {
@@ -985,6 +1050,49 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       process.send(reply, deleted)
       actor.continue(state)
     }
+
+    ListDeletedWorkspaces(reply) -> {
+      let result = case sql.list_deleted_workspaces(state.db) {
+        Ok(returned) ->
+          Ok(
+            list.map(returned.rows, fn(row) {
+              store.TombstonedWorkspace(
+                id: row.id,
+                root: row.root,
+                rel_path: row.rel_path,
+              )
+            }),
+          )
+        Error(error) -> Error(query_error(error))
+      }
+      process.send(reply, result)
+      actor.continue(state)
+    }
+
+    DeleteWorkspace(id, reply) -> {
+      process.send(reply, update(sql.delete_workspace(state.db, id)))
+      actor.continue(state)
+    }
+
+    InsertWorkspace(workspace, reply) -> {
+      let result =
+        sql.insert_workspace(
+          state.db,
+          workspace.id,
+          store.workspace_kind_to_string(workspace.kind),
+          workspace.root,
+          workspace.rel_path,
+          option.unwrap(workspace.thread_id, ""),
+          option.unwrap(workspace.bot_id, ""),
+          int.to_float(workspace.created_at),
+          option.unwrap(workspace.last_used_at, 0),
+          option.unwrap(workspace.deleted_at, 0),
+        )
+        |> result.map(fn(_) { Nil })
+        |> result.map_error(query_error)
+      process.send(reply, result)
+      actor.continue(state)
+    }
   }
 }
 
@@ -1208,6 +1316,12 @@ fn stored_summary_from_row(
         // entries.
         toolset: entries,
         workspace_root: row.workspace_root,
+        workspaces: thread_workspaces_from_row(
+          row.workspace_id,
+          row.workspace_rel_path,
+          row.tmp_workspace_id,
+          row.tmp_rel_path,
+        ),
         roster: option.None,
         last_active_at: row.last_active_s,
         // The column already counts the system prompt (Phase 1
@@ -1371,6 +1485,32 @@ fn message_row_from_row(row: sql.LoadMessagesRow) -> store.MessageRow {
   }
 }
 
+fn thread_workspaces_from_row(
+  workspace_id: option.Option(String),
+  workspace_rel_path: String,
+  tmp_workspace_id: option.Option(String),
+  tmp_rel_path: String,
+) -> option.Option(store.ThreadWorkspaces) {
+  case workspace_id, workspace_rel_path {
+    Some(id), rel if rel != "" ->
+      Some(
+        store.ThreadWorkspaces(
+          workspace_id: id,
+          rel_path: rel,
+          tmp_id: case tmp_workspace_id, tmp_rel_path {
+            Some(tid), trel if trel != "" -> Some(tid)
+            _, _ -> None
+          },
+          tmp_rel_path: case tmp_workspace_id, tmp_rel_path {
+            Some(_), trel if trel != "" -> Some(trel)
+            _, _ -> None
+          },
+        ),
+      )
+    _, _ -> None
+  }
+}
+
 fn title_source(text: String) -> thread.TitleSource {
   case text {
     "manual" -> thread.ManualTitle
@@ -1452,4 +1592,5 @@ pub fn boot_sweeps(cfg: Config, db: store.Store) -> Nil {
           ])
       }
   }
+  workspace_gc.sweep(db)
 }

@@ -114,6 +114,11 @@ pub type Environment {
   Environment(
     workspace_root: String,
     thread_id: String,
+    /// Relative path beneath `workspace_root` (workspace-sandbox plan
+    /// Phase 1): `"threads/<id>"` for new thread workspaces, `"bots/<id>"`
+    /// for shared bot workspaces, or `<id>` for legacy Phase 1 rows.
+    /// `None` falls back to `thread_id` (legacy fixtures and TUI nodes).
+    workspace_rel_path: Option(String),
     roster: List(String),
     remote: Option(RemoteRouter),
   )
@@ -175,11 +180,45 @@ pub fn is_env_name(name: String) -> Bool {
   list.contains(tool_names(), name)
 }
 
-/// The thread's workspace directory: `<root>/<thread id>`. Lazy —
-/// nothing creates it until the first environment tool call
-/// (`ensure_workspace`).
+/// The thread's workspace directory: `<root>/<rel_path>` (falling back to
+/// `<root>/<thread_id>` when `workspace_rel_path` is `None` or fails lexical
+/// validation). Mirrors `workspace_gc.safe_target_path`'s guard on `rel_path`
+/// so use-time and GC-time invariants agree. Lazy — nothing creates it until
+/// the first environment tool call (`ensure_workspace`).
 pub fn workspace_dir(env: Environment) -> String {
-  filepath.join(env.workspace_root, env.thread_id)
+  let rel = case env.workspace_rel_path {
+    Some(candidate) ->
+      case safe_rel_path(candidate) {
+        Ok(valid) -> valid
+        Error(Nil) -> env.thread_id
+      }
+    None -> env.thread_id
+  }
+  filepath.join(env.workspace_root, rel)
+}
+
+/// Lexical check for a `workspace.rel_path` value: non-empty, no NUL bytes,
+/// relative (no leading `/`), no `..` segments, and does not collapse to `.`.
+pub fn safe_rel_path(rel_path: String) -> Result(String, Nil) {
+  let trimmed = string.trim(rel_path)
+  case
+    trimmed == ""
+    || string.contains(rel_path, "\u{0}")
+    || string.starts_with(rel_path, "/")
+    || filepath.is_absolute(rel_path)
+    || {
+      rel_path
+      |> string.split("/")
+      |> list.any(fn(segment) { segment == ".." })
+    }
+  {
+    True -> Error(Nil)
+    False ->
+      case normalize(rel_path) {
+        "" -> Error(Nil)
+        normalized -> Ok(normalized)
+      }
+  }
 }
 
 /// The roster message appended to the transcript when a target

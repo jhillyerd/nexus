@@ -50,6 +50,58 @@ import nexus/thread
 import nexus/tools.{type ToolsetEntry, ToolsetEntry}
 import nexus/transcript.{type Transcript}
 
+/// Managed workspace kind (`workspace.kind`, workspace-sandbox plan Phase 1).
+pub type WorkspaceKind {
+  ThreadWorkspace
+  BotWorkspace
+  TmpWorkspace
+}
+
+/// Encode a `WorkspaceKind` to its SQL `workspace.kind` value.
+pub fn workspace_kind_to_string(kind: WorkspaceKind) -> String {
+  case kind {
+    ThreadWorkspace -> "thread"
+    BotWorkspace -> "bot"
+    TmpWorkspace -> "tmp"
+  }
+}
+
+/// A managed workspace directory tracked in `workspace`
+/// (`docs/plans/workspace-sandbox.md`, Phase 1). `deleted_at` is `None` while
+/// live and `Some(epoch_s)` once tombstoned awaiting disk removal.
+pub type StoredWorkspace {
+  StoredWorkspace(
+    id: String,
+    kind: WorkspaceKind,
+    root: String,
+    rel_path: String,
+    thread_id: Option(String),
+    bot_id: Option(String),
+    created_at: Int,
+    last_used_at: Option(Int),
+    deleted_at: Option(Int),
+  )
+}
+
+/// Minimal identity of a tombstoned workspace awaiting guarded disk GC.
+pub type TombstonedWorkspace {
+  TombstonedWorkspace(id: String, root: String, rel_path: String)
+}
+
+/// Managed workspace links attached to a stored thread (workspace-sandbox
+/// plan Phase 1). `workspace_id` + `rel_path` identify the main workspace
+/// (`threads/<id>`, `bots/<id>`, or legacy `<id>`); `tmp_id` + `tmp_rel_path`
+/// identify its per-thread scratch temp dir (`tmp/<id>`, `None` on legacy
+/// backfilled threads).
+pub type ThreadWorkspaces {
+  ThreadWorkspaces(
+    workspace_id: String,
+    rel_path: String,
+    tmp_id: Option(String),
+    tmp_rel_path: Option(String),
+  )
+}
+
 /// A stored thread's organizational metadata — exactly the Phase 1
 /// `ThreadSummary` field set minus live state (streaming, metrics).
 pub type StoredSummary {
@@ -77,6 +129,9 @@ pub type StoredSummary {
     /// `NEXUS_WORKSPACE_ROOT` change can never re-aim an existing
     /// thread's files.
     workspace_root: Option(String),
+    /// Managed workspace rows linked to this thread (workspace-sandbox
+    /// plan Phase 1): `None` on plain threads or legacy test fixtures.
+    workspaces: Option(ThreadWorkspaces),
     /// The creation-time roster row (environments plan Phase 1):
     /// `Some(#(text, stamp))` on env threads — persisted ATOMICALLY
     /// with the thread row (insert_thread's roster CTE) so the
@@ -260,16 +315,28 @@ pub type Store {
     /// Archiving clears the pin (Phase 1 invariant, enforced in SQL too).
     archive: fn(String) -> Result(Nil, StoreError),
     unarchive: fn(String) -> Result(Nil, StoreError),
-    /// Hard delete; cascades to the thread's message rows.
-    delete_thread: fn(String) -> Result(Nil, StoreError),
+    /// Hard delete; cascades to the thread's channels and message rows, and
+    /// tombstones owned workspaces in the same statement. Returns the
+    /// tombstoned workspaces awaiting guarded disk removal.
+    delete_thread: fn(String) -> Result(List(TombstonedWorkspace), StoreError),
     /// Boot sweep: delete every never-used stored thread older than the
     /// grace window — one statement, so the work is bounded wherever it
     /// runs (the registry calls it inside its actor-initialiser
-    /// deadline). The grace window keeps an empty thread another
-    /// concurrently-running server just created (still empty until its
-    /// first commit) from being deleted under its live actor. Returns
-    /// the deleted ids; an error leaves the store untouched.
+    /// deadline). Also tombstones pruned threads' workspaces atomically.
+    /// Returns the deleted ids; an error leaves the store untouched.
     prune_never_used: fn() -> Result(List(String), StoreError),
+    // ---- workspace rows (docs/plans/workspace-sandbox.md, Phase 1) ----
+    /// Every tombstoned workspace (`deleted_at IS NOT NULL`), oldest
+    /// tombstone first — read by the boot GC sweep.
+    list_deleted_workspaces: fn() ->
+      Result(List(TombstonedWorkspace), StoreError),
+    /// Hard-delete one tombstoned workspace row after its directory has
+    /// been removed on disk (or confirmed absent). Scoped to tombstoned
+    /// rows so GC can never drop a live workspace.
+    delete_workspace: fn(String) -> Result(Nil, StoreError),
+    /// Insert a standalone workspace row (crash-recovery tests and
+    /// Phase 3 shared bot workspaces).
+    insert_workspace: fn(StoredWorkspace) -> Result(Nil, StoreError),
     // ---- provider rows (docs/plans/multi-provider.md §5.3) ----
     /// Every stored provider, ordered by id (registry boot load). The
     /// ciphertext rides along: decryption lives in the registry.
