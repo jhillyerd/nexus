@@ -45,6 +45,7 @@ fn set_all(pairs: List(#(String, String))) -> Nil {
   envoy.unset("NEXUS_HTTP_FETCH_TIMEOUT_MS")
   envoy.unset("NEXUS_HTTP_FETCH_ALLOW_PRIVATE")
   envoy.unset("NEXUS_WEB_FETCH_MAX_RAW_BYTES")
+  envoy.unset("NEXUS_WEB_FETCH_MAX_DECOMPRESSED_BYTES")
   envoy.unset("NEXUS_WEB_FETCH_DEFAULT_CHARS")
   envoy.unset("NEXUS_WEB_FETCH_MAX_CHARS")
   envoy.unset("NEXUS_WEB_FETCH_CACHE_TTL_MS")
@@ -566,6 +567,7 @@ pub fn web_fetch_defaults_and_overrides_test() {
   set_all([#("NEXUS_ENCRYPTION_KEY", key_b64)])
   let assert Ok(cfg) = config.load()
   cfg.web_fetch_max_raw_bytes |> should.equal(1_048_576)
+  cfg.web_fetch_max_decompressed_bytes |> should.equal(8_388_608)
   cfg.web_fetch_default_chars |> should.equal(12_000)
   cfg.web_fetch_max_chars |> should.equal(32_000)
   cfg.web_fetch_cache_ttl_ms |> should.equal(600_000)
@@ -573,12 +575,14 @@ pub fn web_fetch_defaults_and_overrides_test() {
   set_all([
     #("NEXUS_ENCRYPTION_KEY", key_b64),
     #("NEXUS_WEB_FETCH_MAX_RAW_BYTES", "524288"),
+    #("NEXUS_WEB_FETCH_MAX_DECOMPRESSED_BYTES", "4194304"),
     #("NEXUS_WEB_FETCH_DEFAULT_CHARS", "8000"),
     #("NEXUS_WEB_FETCH_MAX_CHARS", "16000"),
     #("NEXUS_WEB_FETCH_CACHE_TTL_MS", "0"),
   ])
   let assert Ok(custom) = config.load()
   custom.web_fetch_max_raw_bytes |> should.equal(524_288)
+  custom.web_fetch_max_decompressed_bytes |> should.equal(4_194_304)
   custom.web_fetch_default_chars |> should.equal(8000)
   custom.web_fetch_max_chars |> should.equal(16_000)
   custom.web_fetch_cache_ttl_ms |> should.equal(0)
@@ -598,6 +602,16 @@ pub fn web_fetch_rejects_invalid_bounds_test() {
   ])
   let assert Error(msg2) = config.load()
   should.be_true(string.contains(msg2, "NEXUS_WEB_FETCH_DEFAULT_CHARS"))
+
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_WEB_FETCH_MAX_DECOMPRESSED_BYTES", "0"),
+  ])
+  let assert Error(msg_d) = config.load()
+  should.be_true(string.contains(
+    msg_d,
+    "NEXUS_WEB_FETCH_MAX_DECOMPRESSED_BYTES",
+  ))
 
   // max_chars must be >= default_chars (including when only DEFAULT_CHARS is
   // raised above the 32_000 default MAX_CHARS).

@@ -1,8 +1,8 @@
 ---
 title: Nexus — web_fetch tool (HTML-to-Markdown, pagination, and fetch cache)
-status: draft
+status: "active — v1 (Phases 1-3) shipped in PR 159; v2 bounded decompression shipped 2026-11-22"
 tags: [computing, self-hosting, local-llm, agents, gleam, beam, tools, web-fetch]
-updated: 2026-11-21
+updated: 2026-11-22
 ---
 
 # `web_fetch`: readable web fetching with HTML-to-Markdown and pagination
@@ -174,6 +174,12 @@ streaming byte cap, and hard per-hop deadline, with four focused updates:
      other than `"identity"` before UTF-8 decoding or HTML parsing** with
      `Error("unsupported content-encoding: <encoding>")`. Bounded streaming
      decompression is deferred to a future phase if real-world origins require it.
+
+     > **As-built delta (2026-11-22, v2): superseded.** Real-world origins did
+     > require it. `web_fetch` now advertises `Accept-Encoding: gzip, deflate`
+     > and decodes a single gzip/x-gzip/deflate coding through
+     > `net.inflate_bounded` under `NEXUS_WEB_FETCH_MAX_DECOMPRESSED_BYTES` —
+     > see the as-built deltas section for the full posture.
 4. **Lossy UTF-8 decoding at the boundary:** Web pages occasionally emit
    non-UTF-8 bytes (Latin-1 / Windows-1252 / truncated multi-byte sequences at
    `MaxBytes`). After verifying identity encoding and non-binary `Content-Type`,
@@ -322,7 +328,8 @@ stays one shared knob across both HTTP tools:
 
 | Env var | Default | Validation | Purpose |
 |---|---|---|---|
-| `NEXUS_WEB_FETCH_MAX_RAW_BYTES` | `1048576` (1 MiB) | `> 0` | Streaming raw response cap in `nexus_net_ffi` for `web_fetch` |
+| `NEXUS_WEB_FETCH_MAX_RAW_BYTES` | `1048576` (1 MiB) | `> 0` | Streaming raw response cap in `nexus_net_ffi` for `web_fetch` (bounds COMPRESSED wire bytes) |
+| `NEXUS_WEB_FETCH_MAX_DECOMPRESSED_BYTES` | `8388608` (8 MiB) | `> 0` | Hard cap on decompressed bytes when decoding gzip/deflate; over-cap or terminator-less (cut-short) streams flag `raw_truncated` (v2) |
 | `NEXUS_WEB_FETCH_DEFAULT_CHARS` | `12000` | `> 0` | Default `max_length` when the model omits it |
 | `NEXUS_WEB_FETCH_MAX_CHARS` | `32000` | `>= default_chars` | Hard upper clamp on `max_length` per call |
 | `NEXUS_WEB_FETCH_CACHE_TTL_MS` | `600000` (10m) | `>= 0` (`0` disables cache) | In-memory extracted-doc TTL |
@@ -330,6 +337,71 @@ stays one shared knob across both HTTP tools:
 *(Update `README.md` env table and all `Config(...)` test constructors.)*
 
 ---
+
+## As-built deltas
+
+**v1 (Phases 1–3) shipped in
+[#159](https://github.com/jhillyerd/nexus/pull/159) (2026-11-21).** The
+implementation plan above landed essentially as written; deltas worth
+recording:
+
+- `title` is OMITTED from the result JSON when absent (the design allowed
+  "omitted or null"; omission keeps absent titles invisible to models that
+  branch on key presence).
+- Non-2xx failures return a JSON error object
+  `{"status":N,"error":"non-success status"}` (rendered as failed tool
+  content, per the plan's convention).
+- `web_fetch_cache` runs in its own standalone `OneForOne` supervisor
+  started at boot OUTSIDE the `OneForAll` root (the plan offered either an
+  isolated child or an independent sibling; the sibling keeps a cache crash
+  from restarting threads by construction).
+- `test/m3_prefix_test.gleam` pins its captured fixture to
+  `tools.by_names(smoke_config(), ["http_fetch", "web_search"])` as
+  planned, keeping the golden envelope byte-faithful to the capture.
+
+**v2 (2026-11-22): bounded streaming decompression — replaces the v1
+identity-only posture (§3 item 3 above).**
+
+- `web_fetch` now sends `Accept-Encoding: gzip, deflate` and decodes a
+  SINGLE supported coding — `gzip`, `x-gzip`, or `deflate` — via the new
+  `net.inflate_bounded` (FFI `nexus_net_ffi:inflate_bounded/3`). `identity`
+  tokens are filtered out of the header, so an `"identity, gzip"` list
+  decodes; brotli, zstd, and stacked non-identity codings are still refused
+  before any decoding, with all offending tokens named.
+- **Boundedness:** the compressed body (already capped on the wire by
+  `max_raw_bytes`) is enqueued to zlib once, and `zlib:safeInflate`
+  returns at most one fixed 16 KiB output chunk per call (the NIF's chunk
+  size — probe-verified on a 1000:1 bomb: every call returned exactly
+  16 384 bytes), with the accumulated size checked after every call
+  against `NEXUS_WEB_FETCH_MAX_DECOMPRESSED_BYTES`. The bound is enforced
+  by zlib itself, independent of the stream's compression ratio; peak
+  memory is the cap plus one chunk. Over-cap TRUNCATES — `raw_truncated`
+  in the result now ORs the wire-cap flag and the inflate-side flags, so
+  the model sees one "the document was cut" signal.
+- **Formats:** zlib auto-detection (windowBits 15+32) accepts gzip and
+  zlib-wrapped deflate (RFC 1950); a `deflate` coding that fails there is
+  retried as RAW deflate (windowBits -15) — servers that send RFC 1951
+  bytes under the `deflate` token. Only the first gzip member of a
+  multi-member stream is decoded (zlib stops at the first member end;
+  HTTP origins emit single members), and trailing bytes after a complete
+  member are ignored — neither flags truncation. A stream that ends
+  WITHOUT its terminator (cut upstream, even on a cleanly closed
+  connection) decodes its partial output and flags `raw_truncated` —
+  the verdict comes from `zlib:inflateEnd`, because `safeInflate`'s
+  `{finished,_}` is spurious when input runs dry (zlib maps the
+  no-progress condition to finished — probe-verified). A corrupt stream
+  is the tool error `"failed to decode <coding>: corrupt compressed
+  stream"`; an EMPTY body passes through untouched (nothing to decode).
+- **hackney does none of this:** the pinned hackney 1.25's manual
+  `stream_body` path performs no content-encoding decoding (verified in
+  source — its parser handles only transfer-encoding), so decompression is
+  wholly nexus's, and `http_fetch` (which sends no `Accept-Encoding`)
+  observes no behavior change.
+- New knob `NEXUS_WEB_FETCH_MAX_DECOMPRESSED_BYTES` (default 8 MiB, `> 0`,
+  fail-fast at boot, README row added). No cross-validation against
+  `NEXUS_WEB_FETCH_MAX_RAW_BYTES`: a smaller decompressed cap is a
+  legitimate aggressive-memory configuration, not a contradiction (the
+  knobs bound different things — wire bytes vs expanded bytes).
 
 ## Phased implementation plan
 

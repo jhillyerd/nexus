@@ -15,6 +15,21 @@ import nexus/net.{FetchResponse}
 import nexus/web_fetch
 import nexus/web_fetch_cache
 
+@external(erlang, "net_test_ffi", "gzip")
+fn gzip(body: String) -> String
+
+@external(erlang, "net_test_ffi", "zlib_wrap")
+fn zlib_wrap(body: String) -> String
+
+@external(erlang, "net_test_ffi", "deflate_raw")
+fn deflate_raw(body: String) -> String
+
+@external(erlang, "net_test_ffi", "gzip_corrupt")
+fn gzip_corrupt() -> String
+
+@external(erlang, "net_test_ffi", "gzip_cut")
+fn gzip_cut() -> String
+
 type PageResult {
   PageResult(
     status: Int,
@@ -76,6 +91,7 @@ fn opts(cache: Option(web_fetch_cache.Seam)) -> web_fetch.Options {
     allow_private: False,
     default_chars: 12_000,
     max_chars: 32_000,
+    max_decompressed_bytes: 8_388_608,
     cache: cache,
   )
 }
@@ -99,13 +115,16 @@ fn ok_resp(
 pub fn html_conversion_and_headers_test() {
   let run =
     web_fetch.run_with(opts(None), fn(_url, headers) {
-      // Request headers must advertise Markdown preference and identity encoding.
+      // Request headers must advertise Markdown preference and the codings
+      // `net.inflate_bounded` can decode boundedly.
       should.be_true(
         list.any(headers, fn(h) {
           h.0 == "Accept" && string.contains(h.1, "text/markdown")
         }),
       )
-      should.be_true(list.contains(headers, #("Accept-Encoding", "identity")))
+      should.be_true(
+        list.contains(headers, #("Accept-Encoding", "gzip, deflate")),
+      )
       Ok(ok_resp(
         "text/html; charset=utf-8",
         "https://example.com/docs/v1/intro.html",
@@ -184,20 +203,212 @@ pub fn native_markdown_and_text_json_passthrough_test() {
   should.be_true(string.contains(reason, "unsupported binary content-type"))
 }
 
-pub fn rejects_unsolicited_content_encoding_and_binary_types_test() {
+pub fn gzip_and_deflate_responses_decoded_test() {
+  // gzip HTML rides the full pipeline: bounded decode, conversion, title.
   let gz_run =
     web_fetch.run_with(opts(None), fn(url, _) {
       Ok(
         FetchResponse(
-          ..ok_resp("text/html", url, "compressed-bytes"),
+          ..ok_resp(
+            "text/html; charset=utf-8",
+            url,
+            gzip(
+              "<html><head><title>Gz</title></head><body><h1>Head</h1></body></html>",
+            ),
+          ),
           content_encoding: "gzip",
         ),
       )
     })
-  let assert Error(reason) = gz_run("{\"url\":\"https://example.com/gz\"}")
-  reason |> should.equal("unsupported content-encoding: gzip")
+  let assert Ok(raw_gz) = gz_run("{\"url\":\"https://example.com/gz\"}")
+  let gz = decode_page(raw_gz)
+  gz.status |> should.equal(200)
+  gz.title |> should.equal(Some("Gz"))
+  gz.format |> should.equal("markdown")
+  gz.content |> should.equal("# Head")
+  gz.raw_truncated |> should.equal(False)
 
-  // Explicit "identity" is accepted.
+  // The x-gzip alias decodes identically.
+  let xgz_run =
+    web_fetch.run_with(opts(None), fn(url, _) {
+      Ok(
+        FetchResponse(
+          ..ok_resp("text/plain", url, gzip("x-gzip body")),
+          content_encoding: "x-gzip",
+        ),
+      )
+    })
+  let assert Ok(raw_xgz) = xgz_run("{\"url\":\"https://example.com/xgz\"}")
+  decode_page(raw_xgz).content |> should.equal("x-gzip body")
+
+  // Correct deflate (zlib-wrapped RFC 1950) and the broken-server shape
+  // (raw RFC 1951) both decode through the -15 retry.
+  let deflate_runs =
+    web_fetch.run_with(opts(None), fn(url, _) {
+      Ok(
+        FetchResponse(
+          ..ok_resp("text/plain", url, zlib_wrap("wrapped-deflate")),
+          content_encoding: "deflate",
+        ),
+      )
+    })
+  let assert Ok(raw_df) = deflate_runs("{\"url\":\"https://example.com/df\"}")
+  decode_page(raw_df).content |> should.equal("wrapped-deflate")
+
+  let raw_df_run =
+    web_fetch.run_with(opts(None), fn(url, _) {
+      Ok(
+        FetchResponse(
+          ..ok_resp("text/plain", url, deflate_raw("raw-deflate")),
+          content_encoding: "deflate",
+        ),
+      )
+    })
+  let assert Ok(raw_rd) = raw_df_run("{\"url\":\"https://example.com/rd\"}")
+  decode_page(raw_rd).content |> should.equal("raw-deflate")
+
+  // An "identity, gzip" token list decodes (identity is filtered out).
+  let multi_ok_run =
+    web_fetch.run_with(opts(None), fn(url, _) {
+      Ok(
+        FetchResponse(
+          ..ok_resp("text/plain", url, gzip("mixed tokens")),
+          content_encoding: "identity, gzip",
+        ),
+      )
+    })
+  let assert Ok(raw_mixed) =
+    multi_ok_run("{\"url\":\"https://example.com/mixed\"}")
+  decode_page(raw_mixed).content |> should.equal("mixed tokens")
+}
+
+pub fn decompressed_cap_truncates_and_corrupt_fails_test() {
+  // Over-cap decompression truncates (never errors) and surfaces
+  // raw_truncated, mirroring the wire cap's semantics.
+  let capped = web_fetch.Options(..opts(None), max_decompressed_bytes: 10)
+  let cap_run =
+    web_fetch.run_with(capped, fn(url, _) {
+      Ok(
+        FetchResponse(
+          ..ok_resp("text/plain", url, gzip("0123456789abcdefghij")),
+          content_encoding: "gzip",
+        ),
+      )
+    })
+  let assert Ok(raw_cap) = cap_run("{\"url\":\"https://example.com/cap\"}")
+  let cap = decode_page(raw_cap)
+  cap.content |> should.equal("0123456789")
+  cap.total_chars |> should.equal(10)
+  cap.has_more |> should.equal(False)
+  cap.raw_truncated |> should.equal(True)
+
+  // A wire-truncated gzip stream decodes partially (deterministically
+  // "012345678" for the 20-byte cut). The fetcher here reports an
+  // UNTRUNCATED wire — a connection that closed cleanly short of the
+  // member end — so raw_truncated can only come from the stream-level
+  // detector (the inflateEnd verdict), proving the two flags OR together
+  // from independent sources.
+  let wire_trunc_run =
+    web_fetch.run_with(opts(None), fn(url, _) {
+      Ok(
+        FetchResponse(
+          ..ok_resp("text/plain", url, gzip_cut()),
+          truncated: False,
+          content_encoding: "gzip",
+        ),
+      )
+    })
+  let assert Ok(raw_wt) = wire_trunc_run("{\"url\":\"https://example.com/wt\"}")
+  let wt = decode_page(raw_wt)
+  wt.content |> should.equal("012345678")
+  wt.raw_truncated |> should.equal(True)
+
+  // A corrupt stream is a tool error naming the coding — never a crash.
+  let bad_run =
+    web_fetch.run_with(opts(None), fn(url, _) {
+      Ok(
+        FetchResponse(
+          ..ok_resp("text/plain", url, gzip_corrupt()),
+          content_encoding: "gzip",
+        ),
+      )
+    })
+  let assert Error(reason) = bad_run("{\"url\":\"https://example.com/bad\"}")
+  reason |> should.equal("failed to decode gzip: corrupt compressed stream")
+
+  // An empty body with a stale Content-Encoding passes through untouched.
+  let empty_run =
+    web_fetch.run_with(opts(None), fn(url, _) {
+      Ok(
+        FetchResponse(
+          ..ok_resp("text/plain", url, ""),
+          content_encoding: "gzip",
+        ),
+      )
+    })
+  let assert Ok(raw_empty) = empty_run("{\"url\":\"https://example.com/204\"}")
+  decode_page(raw_empty).content |> should.equal("")
+}
+
+pub fn gzip_fetched_once_then_cached_test() {
+  let cache_name = process.new_name("nexus_web_fetch_test_gz_cache")
+  let assert Ok(_started) = web_fetch_cache.start_named(cache_name, 60_000)
+  let seam = web_fetch_cache.named_seam(cache_name)
+
+  let calls = process.new_subject()
+  let run =
+    web_fetch.run_with(opts(Some(seam)), fn(url, _) {
+      process.send(calls, url)
+      Ok(
+        FetchResponse(
+          ..ok_resp("text/plain", url, gzip("cached gzip body")),
+          content_encoding: "gzip",
+        ),
+      )
+    })
+
+  let assert Ok(r1) = run("{\"url\":\"https://example.com/doc\"}")
+  decode_page(r1).content |> should.equal("cached gzip body")
+
+  // Second call is served from the cache: decompressed content, no refetch.
+  let assert Ok(r2) = run("{\"url\":\"https://example.com/doc\"}")
+  let p2 = decode_page(r2)
+  p2.cached |> should.equal(True)
+  p2.content |> should.equal("cached gzip body")
+
+  let assert Ok(_) = process.receive(calls, 100)
+  process.receive(calls, 50) |> should.equal(Error(Nil))
+}
+
+pub fn unsupported_codings_and_binary_types_refused_test() {
+  // Codings we cannot decode boundedly are refused before any decoding.
+  let br_run =
+    web_fetch.run_with(opts(None), fn(url, _) {
+      Ok(
+        FetchResponse(
+          ..ok_resp("text/html", url, "compressed-bytes"),
+          content_encoding: "br",
+        ),
+      )
+    })
+  let assert Error(br_err) = br_run("{\"url\":\"https://example.com/br\"}")
+  br_err |> should.equal("unsupported content-encoding: br")
+
+  // Multiple non-identity codings stacked are refused with both named.
+  let stacked_run =
+    web_fetch.run_with(opts(None), fn(url, _) {
+      Ok(
+        FetchResponse(
+          ..ok_resp("text/html", url, "compressed-bytes"),
+          content_encoding: "gzip, br",
+        ),
+      )
+    })
+  let assert Error(stacked_err) =
+    stacked_run("{\"url\":\"https://example.com/stacked\"}")
+  stacked_err |> should.equal("unsupported content-encoding: gzip, br")
+
+  // Explicit "identity" alone is accepted.
   let id_run =
     web_fetch.run_with(opts(None), fn(url, _) {
       Ok(
@@ -209,21 +420,6 @@ pub fn rejects_unsolicited_content_encoding_and_binary_types_test() {
     })
   let assert Ok(raw) = id_run("{\"url\":\"https://example.com/id\"}")
   decode_page(raw).content |> should.equal("ok")
-
-  // Comma-separated / repeated Content-Encoding values are rejected if any
-  // token is non-identity.
-  let multi_gz_run =
-    web_fetch.run_with(opts(None), fn(url, _) {
-      Ok(
-        FetchResponse(
-          ..ok_resp("text/html", url, "compressed-bytes"),
-          content_encoding: "identity, gzip",
-        ),
-      )
-    })
-  let assert Error(multi_reason) =
-    multi_gz_run("{\"url\":\"https://example.com/multi-gz\"}")
-  multi_reason |> should.equal("unsupported content-encoding: gzip")
 
   // Binary Content-Types (including image/svg+xml) are rejected cleanly.
   let pdf_run =

@@ -1,5 +1,6 @@
 //// The `web_fetch` tool: fetches public http(s) URLs with a bounded raw-byte
-//// budget, converts HTML to compact Markdown (passing Markdown/plain/JSON
+//// budget, decodes gzip/deflate responses under a bounded decompressed-byte
+//// cap, converts HTML to compact Markdown (passing Markdown/plain/JSON
 //// through), caches converted 2xx documents in memory for instant,
 //// offset-stable pagination, and returns bounded character slices.
 
@@ -29,12 +30,14 @@ const parameters =
   <> "},\"required\":[\"url\"],\"additionalProperties\":false}"
 
 /// Request headers sent on every `web_fetch` hop: prefer native Markdown when
-/// the origin supports it, send an honest User-Agent, and request identity
-/// encoding so `max_raw_bytes` bounds uncompressed bytes directly.
+/// the origin supports it, send an honest User-Agent, and advertise the two
+/// codings `net.inflate_bounded` can decode boundedly (gzip and deflate).
+/// Codings we cannot decode boundedly (brotli, zstd) are never advertised,
+/// and an origin that sends one anyway is refused before decoding.
 pub const request_headers = [
   #("Accept", "text/markdown, text/html;q=0.9, text/plain;q=0.8, */*;q=0.5"),
   #("User-Agent", "nexus-web-fetch/1.0"),
-  #("Accept-Encoding", "identity"),
+  #("Accept-Encoding", "gzip, deflate"),
 ]
 
 /// Maximum manual redirect hops per fetch (each hop re-validated via SSRF
@@ -49,6 +52,7 @@ pub type Options {
     allow_private: Bool,
     default_chars: Int,
     max_chars: Int,
+    max_decompressed_bytes: Int,
     cache: Option(web_fetch_cache.Seam),
   )
 }
@@ -100,7 +104,7 @@ pub fn run_with(
           fetcher(args.url, request_headers)
           |> result.map_error(fn(reason) { "fetch failed: " <> reason }),
         )
-        use doc <- result.try(process_response(args.url, response))
+        use doc <- result.try(process_response(opts, args.url, response))
         store_cache(opts.cache, cache_key, doc)
         Ok(encode_page(doc, args.start_index, args.max_length, cached: False))
       }
@@ -158,6 +162,7 @@ fn parse_args(arguments: String, opts: Options) -> Result(Args, String) {
 // ---------------------------------------------------------------------------
 
 fn process_response(
+  opts: Options,
   requested_url: String,
   response: net.FetchResponse,
 ) -> Result(CachedDoc, String) {
@@ -171,14 +176,19 @@ fn process_response(
         |> json.to_string,
       )
     True -> {
-      use Nil <- result.try(check_encoding(response.content_encoding))
+      use encoding <- result.try(check_encoding(response.content_encoding))
       let final_url = case string.trim(response.final_url) {
         "" -> requested_url
         url -> url
       }
+      use #(body, inflate_truncated) <- result.try(decode_body(
+        encoding,
+        response.body,
+        opts.max_decompressed_bytes,
+      ))
       use #(format, title, content) <- result.try(dispatch_body(
         response.content_type,
-        response.body,
+        body,
         final_url,
       ))
       Ok(CachedDoc(
@@ -189,21 +199,57 @@ fn process_response(
         format: format,
         content: content,
         total_chars: string.length(content),
-        raw_truncated: response.truncated,
+        raw_truncated: response.truncated || inflate_truncated,
       ))
     }
   }
 }
 
-fn check_encoding(raw_encoding: String) -> Result(Nil, String) {
+/// The single supported Content-Encoding token, if any: `identity` (and an
+/// empty header) maps to `None` — nothing to decode; exactly one of
+/// gzip/x-gzip/deflate maps to itself (decoded bounded via
+/// `net.inflate_bounded`). Anything else — brotli, zstd, or multiple
+/// non-identity codings stacked — is refused with the token(s) named.
+fn check_encoding(raw_encoding: String) -> Result(Option(String), String) {
   let tokens =
     raw_encoding
     |> string.split(",")
     |> list.map(fn(part) { string.lowercase(string.trim(part)) })
-    |> list.filter(fn(part) { part != "" })
-  case list.find(tokens, fn(token) { token != "identity" }) {
-    Error(Nil) -> Ok(Nil)
-    Ok(unsupported) -> Error("unsupported content-encoding: " <> unsupported)
+    |> list.filter(fn(part) { part != "" && part != "identity" })
+  case tokens {
+    [] -> Ok(None)
+    [token] ->
+      case token {
+        "gzip" | "x-gzip" | "deflate" -> Ok(Some(token))
+        unsupported -> Error("unsupported content-encoding: " <> unsupported)
+      }
+    unsupported ->
+      Error("unsupported content-encoding: " <> string.join(unsupported, ", "))
+  }
+}
+
+/// Transport decoding: inflate the supported Content-Encoding under a hard
+/// decompressed-byte cap. The wire cap already bounds the COMPRESSED body;
+/// this bounds the expansion — zlib itself returns at most 16 KiB of output
+/// per call (`safeInflate`), checked against the cap after every call — so
+/// a decompression bomb costs at most the cap plus one chunk, and over-cap
+/// truncates (never errors) so the model still gets the head of the
+/// document with `raw_truncated` set. A stream that ends without its
+/// terminator (cut upstream, even on a cleanly closed connection) is also
+/// flagged `raw_truncated`; a corrupt stream is a tool error; an empty
+/// body passes through (nothing to decode).
+fn decode_body(
+  encoding: Option(String),
+  body: String,
+  max_decompressed_bytes: Int,
+) -> Result(#(String, Bool), String) {
+  case encoding {
+    None -> Ok(#(body, False))
+    Some(enc) ->
+      net.inflate_bounded(body, enc, max_decompressed_bytes)
+      |> result.map_error(fn(reason) {
+        "failed to decode " <> enc <> ": " <> reason
+      })
   }
 }
 

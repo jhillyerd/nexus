@@ -3,7 +3,7 @@
 %% multi-gigabyte response cannot be materialised before truncation.
 -module(nexus_net_ffi).
 
--export([bounded_get/4, resolve_host/1, to_text_lossy/1]).
+-export([bounded_get/4, resolve_host/1, to_text_lossy/1, inflate_bounded/3]).
 
 %% GET with connect/receive timeouts and a hard byte cap. Does NOT follow
 %% redirects (policy — including re-validating every hop against the SSRF
@@ -126,6 +126,114 @@ headers_joined(Headers, Name) ->
 
 format_reason(Reason) ->
     unicode:characters_to_binary(io_lib:format("~tp", [Reason])).
+
+%% Boundedly inflate a complete, already-wire-capped gzip/deflate body.
+%%
+%% The caller (`web_fetch`) advertises `Accept-Encoding: gzip, deflate`, so
+%% origins may answer compressed even though bounded_get's MaxBytes bounds
+%% only the COMPRESSED wire bytes; a decompression bomb would otherwise
+%% expand post-receipt without bound. Like the wire cap, over-cap here
+%% TRUNCATES ({ok, {Out, true}}) instead of erroring — the model sees
+%% raw_truncated and knows the tail is gone.
+%%
+%% Memory is bounded BY ZLIB ITSELF, not by our own slicing: the whole
+%% (wire-capped) body is enqueued once and `safeInflate` then returns at
+%% most one fixed 16 KiB output chunk per call (the NIF's output chunk
+%% size — probe-verified on a 1000:1 bomb), with the accumulated size
+%% checked after every call. Peak cost is MaxOut plus one 16 KiB chunk
+%% (the chunk that crosses the cap), independent of the stream's
+%% compression ratio.
+%%
+%% truncated=true means the DOCUMENT is incomplete: either the decompressed
+%% size crossed MaxOut (output cut there) or the compressed stream ended
+%% without its terminator (cut upstream — e.g. a wire-truncated body whose
+%% connection still closed cleanly). The verdict comes from `inflateEnd`,
+%% NOT from safeInflate's {finished, _}, which is SPURIOUS when the input
+%% runs dry mid-stream (zlib maps the no-progress condition to finished;
+%% probe-verified) and so only means "no more output will come".
+%%
+%% Encoding is the normalized lowercase Content-Encoding token: "gzip",
+%% "x-gzip", or "deflate". All use zlib auto-detection (windowBits 15+32,
+%% which accepts both gzip and zlib-wrapped streams); a `deflate` token that
+%% fails there is retried as RAW deflate (windowBits -15) — servers that
+%% send RFC 1951 bytes under the `deflate` token. Only the FIRST gzip member
+%% of a multi-member stream is decoded (zlib stops at the first member end;
+%% HTTP origins emit single members), and trailing bytes after a complete
+%% member are ignored. An empty body carries no member to decode and passes
+%% through untouched (e.g. 204 with a stale header).
+inflate_bounded(<<>>, _Encoding, _MaxOut) ->
+    {ok, {<<>>, false}};
+inflate_bounded(Body, Encoding0, MaxOut) ->
+    Encoding = case Encoding0 of
+        <<"x-gzip">> -> <<"gzip">>;
+        E -> E
+    end,
+    try
+        case run_inflate(Body, MaxOut, 47) of
+            {error, _} when Encoding =:= <<"deflate">> ->
+                run_inflate(Body, MaxOut, -15);
+            Outcome -> Outcome
+        end
+    catch
+        Class:Reason -> {error, format_reason({Class, Reason})}
+    end.
+
+run_inflate(Body, MaxOut, Wbits) ->
+    Z = zlib:open(),
+    try
+        ok = zlib:inflateInit(Z, Wbits),
+        case drain(Z, Body, MaxOut, <<>>) of
+            {ok, Acc, cut} ->
+                {ok, {Acc, true}};
+            {ok, Acc, drained} ->
+                %% The authoritative completeness verdict: inflateEnd
+                %% succeeds only when end-of-stream was reached (its
+                %% data_error here is expected for an incomplete stream,
+                %% caught by `case catch`, never leaked as a crash).
+                case catch zlib:inflateEnd(Z) of
+                    ok -> {ok, {Acc, false}};
+                    _ -> {ok, {Acc, true}}
+                end
+        end
+    catch
+        error:data_error -> {error, <<"corrupt compressed stream">>};
+        Class:Reason -> {error, format_reason({Class, Reason})}
+    after
+        %% close/1 frees the stream even when inflateInit or inflate failed;
+        %% guarded so a close fault cannot mask the outcome above.
+        catch zlib:close(Z)
+    end.
+
+%% Drains the enqueued body through fixed-size output chunks until the
+%% stream runs dry ({finished, _} — possibly spurious, see module notes)
+%% or the accumulated output crosses MaxOut (cut there). The third tuple
+%% element records which.
+drain(Z, Body, MaxOut, Acc) ->
+    case zlib:safeInflate(Z, Body) of
+        {finished, Out} -> step(Z, Out, MaxOut, Acc, true);
+        {continue, Out} -> step(Z, Out, MaxOut, Acc, false);
+        %% We never negotiate preset dictionaries; treat one as corruption.
+        {need_dictionary, _, _} -> erlang:error(data_error)
+    end.
+
+step(_Z, Out, MaxOut, Acc, true = _Dry) ->
+    Acc2 = <<Acc/binary, (iolist_to_binary(Out))/binary>>,
+    case byte_size(Acc2) > MaxOut of
+        true ->
+            <<Kept:MaxOut/binary, _/binary>> = Acc2,
+            {ok, Kept, cut};
+        false ->
+            {ok, Acc2, drained}
+    end;
+step(Z, Out, MaxOut, Acc, false) ->
+    Acc2 = <<Acc/binary, (iolist_to_binary(Out))/binary>>,
+    case byte_size(Acc2) > MaxOut of
+        true ->
+            <<Kept:MaxOut/binary, _/binary>> = Acc2,
+            {ok, Kept, cut};
+        false ->
+            drain(Z, [], MaxOut, Acc2)
+    end.
 
 %% Resolve a hostname (or IP literal) to all its addresses, as printable
 %% strings ("127.0.0.1", "::1"). The Gleam side applies the private-range
