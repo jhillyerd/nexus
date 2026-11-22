@@ -1326,7 +1326,7 @@ fn start_new_thread_bot(
                   toolset,
                   id,
                   root,
-                  option.map(workspaces, fn(ws) { ws.rel_path }),
+                  workspaces,
                   state.self,
                   state.cfg,
                 ),
@@ -2427,7 +2427,7 @@ fn lazy_start(state: State, summary: StoredSummary) -> Resolved {
                 resolved,
                 summary.id,
                 root,
-                option.map(summary.workspaces, fn(ws) { ws.rel_path }),
+                summary.workspaces,
                 state.self,
                 state.cfg,
               )
@@ -3529,10 +3529,12 @@ fn env_toolset(
   toolset: thread.Toolset,
   thread_id: String,
   workspace_root: String,
-  workspace_rel_path: Option(String),
+  workspaces: Option(store.ThreadWorkspaces),
   registry: Subject(Msg),
   cfg: Config,
 ) -> thread.Toolset {
+  let workspace_rel_path = option.map(workspaces, fn(ws) { ws.rel_path })
+  let tmp_rel_path = option.then(workspaces, fn(ws) { ws.tmp_rel_path })
   let base = toolset.runner
   let router: env.RemoteRouter = fn(target, tool, arguments, cancel) {
     case route_env_ask(registry, thread_id, target, cancel) {
@@ -3561,6 +3563,7 @@ fn env_toolset(
           workspace_root: workspace_root,
           thread_id: thread_id,
           workspace_rel_path: workspace_rel_path,
+          tmp_rel_path: tmp_rel_path,
           roster: env.attached_targets(),
           remote: Some(router),
         )),

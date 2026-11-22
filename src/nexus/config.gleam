@@ -150,6 +150,31 @@ pub type Config {
     /// creation (`thread.workspace_root`), so changing it later affects
     /// new threads only.
     workspace_root: Option(String),
+    /// Workspace sandbox backend (`NEXUS_WORKSPACE_SANDBOX`: `none`, `bwrap`,
+    /// or `nono`; default `none` so offline tests and unsupported platforms
+    /// stay deterministic).
+    workspace_sandbox: WorkspaceSandbox,
+    /// Optional explicit absolute path to the sandbox binary (`bwrap` or
+    /// `nono`, `NEXUS_WORKSPACE_SANDBOX_BIN`). `None` resolves on `PATH`.
+    workspace_sandbox_bin: Option(String),
+    /// Optional absolute path to the immutable workspace toolchain profile
+    /// directory (`NEXUS_WORKSPACE_TOOLCHAIN`, e.g. a Nix `pkgs.buildEnv`
+    /// carrying `/bin` and `/etc/ssl`).
+    workspace_toolchain: Option(String),
+    /// Optional absolute directory for sandbox state/profiles outside every
+    /// workspace grant (`NEXUS_WORKSPACE_STATE_DIR`). Required when
+    /// `workspace_sandbox == SandboxNono` (Phase 0 embedding contract: nono
+    /// refuses any grant overlapping its `HOME`/`XDG_*` state roots) and
+    /// forbidden from overlapping `workspace_root` (checked lexically in pure
+    /// `from_env` — symlinks are not resolved at config load, matching
+    /// `env.confined` and `workspace_gc.safe_target_path`).
+    workspace_state_dir: Option(String),
+    /// Per-command workspace memory cap in MiB (`NEXUS_WORKSPACE_MAX_MEMORY_MB`,
+    /// default `1024`, floor `16`).
+    workspace_max_memory_mb: Int,
+    /// Per-command workspace PID cap (`NEXUS_WORKSPACE_MAX_PIDS`, default `64`,
+    /// floor `4`).
+    workspace_max_pids: Int,
     /// Environments: per-call wall-clock deadline for `bash`, in ms.
     env_timeout_ms: Int,
     /// Environments: the byte cap enforced WHILE READING bash output
@@ -166,6 +191,17 @@ pub type Config {
     /// `warn`/`warning`, `error`; default `info`).
     log_level: log.Level,
   )
+}
+
+/// Local workspace `bash` sandbox backend (workspace-sandbox plan, Phase 0/2):
+/// `SandboxNone` runs directly with the allowlist env scrub (default for
+/// offline tests and unsupported platforms); `SandboxBwrap` is the primary
+/// Linux mount/PID/net namespace backend; `SandboxNono` is the Landlock /
+/// Seatbelt alternate.
+pub type WorkspaceSandbox {
+  SandboxNone
+  SandboxBwrap
+  SandboxNono
 }
 
 /// One configured MCP server (plugin-api plan Phase 2): a stdio child
@@ -357,15 +393,84 @@ pub fn from_env(
   // never default membership; the timeout floor keeps a sub-second
   // bash deadline from configuring a broken tool (the loud-boot
   // philosophy, the codemode/plugin precedent).
-  use workspace_root <- result.try(
-    case optional_string(get, "NEXUS_WORKSPACE_ROOT") {
-      // Absolute only, never `/` or containing `..` / NUL bytes: matches
-      // `workspace_gc.safe_target_path` so every configured root can be
-      // tracked and garbage-collected cleanly (loud-boot philosophy).
-      None -> Ok(None)
-      Some(root) -> validate_workspace_root(root) |> result.map(Some)
-    },
-  )
+  use workspace_root <- result.try(optional_abs_path(
+    get,
+    "NEXUS_WORKSPACE_ROOT",
+  ))
+  use workspace_sandbox <- result.try(optional_workspace_sandbox(
+    get,
+    "NEXUS_WORKSPACE_SANDBOX",
+  ))
+  use workspace_sandbox_bin <- result.try(optional_abs_path(
+    get,
+    "NEXUS_WORKSPACE_SANDBOX_BIN",
+  ))
+  use workspace_toolchain <- result.try(optional_abs_path(
+    get,
+    "NEXUS_WORKSPACE_TOOLCHAIN",
+  ))
+  use workspace_state_dir <- result.try(optional_abs_path(
+    get,
+    "NEXUS_WORKSPACE_STATE_DIR",
+  ))
+  use Nil <- result.try(case workspace_sandbox {
+    SandboxNone ->
+      case workspace_sandbox_bin, workspace_toolchain, workspace_state_dir {
+        Some(_), _, _ ->
+          Error(
+            "environment variable NEXUS_WORKSPACE_SANDBOX_BIN requires"
+            <> " NEXUS_WORKSPACE_SANDBOX to be bwrap or nono",
+          )
+        _, Some(_), _ ->
+          Error(
+            "environment variable NEXUS_WORKSPACE_TOOLCHAIN requires"
+            <> " NEXUS_WORKSPACE_SANDBOX to be bwrap or nono",
+          )
+        _, _, Some(_) ->
+          Error(
+            "environment variable NEXUS_WORKSPACE_STATE_DIR requires"
+            <> " NEXUS_WORKSPACE_SANDBOX to be bwrap or nono",
+          )
+        None, None, None -> Ok(Nil)
+      }
+    SandboxBwrap -> Ok(Nil)
+    SandboxNono ->
+      case workspace_state_dir {
+        None ->
+          Error(
+            "environment variable NEXUS_WORKSPACE_STATE_DIR is required when"
+            <> " NEXUS_WORKSPACE_SANDBOX=nono",
+          )
+        Some(_) -> Ok(Nil)
+      }
+  })
+  use Nil <- result.try(case workspace_root, workspace_state_dir {
+    Some(root), Some(state) ->
+      case paths_overlap(root, state) {
+        True ->
+          Error(
+            "environment variable NEXUS_WORKSPACE_STATE_DIR ("
+            <> state
+            <> ") must not overlap NEXUS_WORKSPACE_ROOT ("
+            <> root
+            <> ")",
+          )
+        False -> Ok(Nil)
+      }
+    _, _ -> Ok(Nil)
+  })
+  use workspace_max_memory_mb <- result.try(optional_min_int(
+    get,
+    "NEXUS_WORKSPACE_MAX_MEMORY_MB",
+    1024,
+    min: 16,
+  ))
+  use workspace_max_pids <- result.try(optional_min_int(
+    get,
+    "NEXUS_WORKSPACE_MAX_PIDS",
+    64,
+    min: 4,
+  ))
   use env_timeout_ms <- result.try(optional_min_int(
     get,
     "NEXUS_ENV_TIMEOUT_MS",
@@ -435,6 +540,12 @@ pub fn from_env(
     plugin_max_output_chars: plugin_max_output_chars,
     mcp_servers: mcp_servers,
     workspace_root: workspace_root,
+    workspace_sandbox: workspace_sandbox,
+    workspace_sandbox_bin: workspace_sandbox_bin,
+    workspace_toolchain: workspace_toolchain,
+    workspace_state_dir: workspace_state_dir,
+    workspace_max_memory_mb: workspace_max_memory_mb,
+    workspace_max_pids: workspace_max_pids,
     env_timeout_ms: env_timeout_ms,
     env_max_output_bytes: env_max_output_bytes,
     node_idle_days: node_idle_days,
@@ -756,30 +867,62 @@ fn required_encryption_key(
   }
 }
 
-/// Validate `NEXUS_WORKSPACE_ROOT` at boot so every configured root satisfies
+fn optional_workspace_sandbox(
+  get: fn(String) -> Result(String, Nil),
+  name: String,
+) -> Result(WorkspaceSandbox, String) {
+  case optional_string(get, name) {
+    None -> Ok(SandboxNone)
+    Some(raw) ->
+      case string.lowercase(raw) {
+        "none" -> Ok(SandboxNone)
+        "bwrap" -> Ok(SandboxBwrap)
+        "nono" -> Ok(SandboxNono)
+        _ ->
+          Error(
+            "environment variable "
+            <> name
+            <> " must be one of: none, bwrap, nono: "
+            <> raw,
+          )
+      }
+  }
+}
+
+fn optional_abs_path(
+  get: fn(String) -> Result(String, Nil),
+  name: String,
+) -> Result(Option(String), String) {
+  case optional_string(get, name) {
+    None -> Ok(None)
+    Some(path) -> validate_abs_path(name, path) |> result.map(Some)
+  }
+}
+
+/// Validate an absolute path env var at boot so every configured path satisfies
 /// `workspace_gc.safe_target_path`: absolute, no NUL bytes, no `..` segments,
 /// and never collapsing to `/`.
-fn validate_workspace_root(root: String) -> Result(String, String) {
-  case string.starts_with(root, "/") {
+fn validate_abs_path(name: String, path: String) -> Result(String, String) {
+  case string.starts_with(path, "/") {
     False ->
       Error(
-        "environment variable NEXUS_WORKSPACE_ROOT must be an"
-        <> " absolute path: "
-        <> root,
+        "environment variable " <> name <> " must be an absolute path: " <> path,
       )
     True ->
-      case string.contains(root, "\u{0}") {
+      case string.contains(path, "\u{0}") {
         True ->
           Error(
-            "environment variable NEXUS_WORKSPACE_ROOT must not contain NUL bytes",
+            "environment variable " <> name <> " must not contain NUL bytes",
           )
         False -> {
-          let raw_segments = string.split(root, "/")
+          let raw_segments = string.split(path, "/")
           case list.any(raw_segments, fn(seg) { seg == ".." }) {
             True ->
               Error(
-                "environment variable NEXUS_WORKSPACE_ROOT must not contain '..': "
-                <> root,
+                "environment variable "
+                <> name
+                <> " must not contain '..': "
+                <> path,
               )
             False -> {
               let clean =
@@ -787,8 +930,10 @@ fn validate_workspace_root(root: String) -> Result(String, String) {
               case clean {
                 [] ->
                   Error(
-                    "environment variable NEXUS_WORKSPACE_ROOT cannot be '/': "
-                    <> root,
+                    "environment variable "
+                    <> name
+                    <> " cannot be '/': "
+                    <> path,
                   )
                 _ -> Ok("/" <> string.join(clean, "/"))
               }
@@ -797,4 +942,11 @@ fn validate_workspace_root(root: String) -> Result(String, String) {
         }
       }
   }
+}
+
+/// True when two normalized absolute paths are equal or one is an ancestor
+/// directory of the other. Lexical only (pure `from_env` performs no
+/// filesystem I/O / symlink resolution).
+fn paths_overlap(a: String, b: String) -> Bool {
+  a == b || string.starts_with(a, b <> "/") || string.starts_with(b, a <> "/")
 }

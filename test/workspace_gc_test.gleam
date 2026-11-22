@@ -63,6 +63,12 @@ fn test_config(root: String) -> config.Config {
     plugin_max_output_chars: 32_768,
     mcp_servers: [],
     workspace_root: Some(root),
+    workspace_sandbox: config.SandboxNone,
+    workspace_sandbox_bin: None,
+    workspace_toolchain: None,
+    workspace_state_dir: None,
+    workspace_max_memory_mb: 1024,
+    workspace_max_pids: 64,
     env_timeout_ms: 60_000,
     env_max_output_bytes: 262_144,
     node_idle_days: 0,
@@ -508,23 +514,28 @@ pub fn env_workspace_dir_uses_rel_path_when_present_test() {
       workspace_root: "/srv/ws",
       thread_id: "s5",
       workspace_rel_path: Some("threads/s5"),
+      tmp_rel_path: Some("tmp/s5"),
       roster: env.attached_targets(),
       remote: None,
     )
   env.workspace_dir(new_env) |> should.equal("/srv/ws/threads/s5")
+  env.tmp_dir(new_env) |> should.equal(Some("/srv/ws/tmp/s5"))
 
   let legacy_env =
     env.Environment(
       workspace_root: "/srv/ws",
       thread_id: "s5",
       workspace_rel_path: Some("s5"),
+      tmp_rel_path: None,
       roster: env.attached_targets(),
       remote: None,
     )
   env.workspace_dir(legacy_env) |> should.equal("/srv/ws/s5")
+  env.tmp_dir(legacy_env) |> should.equal(None)
 
   // Malformed rel_paths (traversal, absolute, blank, '.') fall back safely
-  // to `<root>/<thread_id>` instead of escaping workspace_root.
+  // to `<root>/<thread_id>` instead of escaping workspace_root (and None for
+  // tmp_dir).
   list.each(
     ["../etc", "threads/../../etc", "/etc/passwd", "", ".", "./."],
     fn(bad) {
@@ -533,10 +544,12 @@ pub fn env_workspace_dir_uses_rel_path_when_present_test() {
           workspace_root: "/srv/ws",
           thread_id: "s5",
           workspace_rel_path: Some(bad),
+          tmp_rel_path: Some(bad),
           roster: env.attached_targets(),
           remote: None,
         )
       env.workspace_dir(bad_env) |> should.equal("/srv/ws/s5")
+      env.tmp_dir(bad_env) |> should.equal(None)
     },
   )
 }

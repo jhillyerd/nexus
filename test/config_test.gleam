@@ -34,6 +34,12 @@ fn set_all(pairs: List(#(String, String))) -> Nil {
   envoy.unset("NEXUS_PLUGIN_MAX_OUTPUT_CHARS")
   envoy.unset("NEXUS_MCP_SERVERS_JSON")
   envoy.unset("NEXUS_WORKSPACE_ROOT")
+  envoy.unset("NEXUS_WORKSPACE_SANDBOX")
+  envoy.unset("NEXUS_WORKSPACE_SANDBOX_BIN")
+  envoy.unset("NEXUS_WORKSPACE_TOOLCHAIN")
+  envoy.unset("NEXUS_WORKSPACE_STATE_DIR")
+  envoy.unset("NEXUS_WORKSPACE_MAX_MEMORY_MB")
+  envoy.unset("NEXUS_WORKSPACE_MAX_PIDS")
   envoy.unset("NEXUS_ENV_TIMEOUT_MS")
   envoy.unset("NEXUS_ENV_MAX_OUTPUT_BYTES")
   // TUI pairing hygiene (tui-pairing plan): the default-7 assertion is
@@ -650,4 +656,161 @@ pub fn web_fetch_rejects_invalid_bounds_test() {
   ])
   let assert Error(msg4) = config.load()
   should.be_true(string.contains(msg4, "NEXUS_WEB_FETCH_CACHE_TTL_MS"))
+}
+
+// ---------------------------------------------------------------------------
+// Workspace sandbox & cap knobs (workspace-sandbox plan Phase 2)
+// ---------------------------------------------------------------------------
+
+pub fn workspace_sandbox_defaults_and_overrides_test() {
+  set_all([#("NEXUS_ENCRYPTION_KEY", key_b64)])
+  let assert Ok(cfg) = config.load()
+  cfg.workspace_sandbox |> should.equal(config.SandboxNone)
+  cfg.workspace_sandbox_bin |> should.equal(None)
+  cfg.workspace_toolchain |> should.equal(None)
+  cfg.workspace_state_dir |> should.equal(None)
+  cfg.workspace_max_memory_mb |> should.equal(1024)
+  cfg.workspace_max_pids |> should.equal(64)
+
+  // bwrap with explicit bin, toolchain, state dir, and custom caps.
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_WORKSPACE_ROOT", "/var/lib/nexus/workspaces/"),
+    #("NEXUS_WORKSPACE_SANDBOX", "BWRAP"),
+    #("NEXUS_WORKSPACE_SANDBOX_BIN", "/nix/store/abc-bwrap/bin/bwrap"),
+    #("NEXUS_WORKSPACE_TOOLCHAIN", "/nix/store/def-ws-tools/"),
+    #("NEXUS_WORKSPACE_STATE_DIR", "/var/lib/nexus/state/"),
+    #("NEXUS_WORKSPACE_MAX_MEMORY_MB", "512"),
+    #("NEXUS_WORKSPACE_MAX_PIDS", "32"),
+  ])
+  let assert Ok(bwrap) = config.load()
+  bwrap.workspace_root |> should.equal(Some("/var/lib/nexus/workspaces"))
+  bwrap.workspace_sandbox |> should.equal(config.SandboxBwrap)
+  bwrap.workspace_sandbox_bin
+  |> should.equal(Some("/nix/store/abc-bwrap/bin/bwrap"))
+  bwrap.workspace_toolchain |> should.equal(Some("/nix/store/def-ws-tools"))
+  bwrap.workspace_state_dir |> should.equal(Some("/var/lib/nexus/state"))
+  bwrap.workspace_max_memory_mb |> should.equal(512)
+  bwrap.workspace_max_pids |> should.equal(32)
+
+  // nono with a non-overlapping state dir (including sibling-prefix paths).
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_WORKSPACE_ROOT", "/var/lib/nexus/ws"),
+    #("NEXUS_WORKSPACE_SANDBOX", "nono"),
+    #("NEXUS_WORKSPACE_STATE_DIR", "/var/lib/nexus/ws-state"),
+  ])
+  let assert Ok(nono) = config.load()
+  nono.workspace_sandbox |> should.equal(config.SandboxNono)
+  nono.workspace_state_dir |> should.equal(Some("/var/lib/nexus/ws-state"))
+}
+
+pub fn workspace_sandbox_rejects_invalid_values_test() {
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_WORKSPACE_SANDBOX", "docker"),
+  ])
+  let assert Error(msg1) = config.load()
+  msg1
+  |> should.equal(
+    "environment variable NEXUS_WORKSPACE_SANDBOX must be one of: none, bwrap, nono: docker",
+  )
+
+  // Phase 0 embedding contract: nono requires a state dir outside grants.
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_WORKSPACE_SANDBOX", "nono"),
+  ])
+  let assert Error(msg2) = config.load()
+  should.be_true(string.contains(msg2, "NEXUS_WORKSPACE_STATE_DIR"))
+  should.be_true(string.contains(msg2, "nono"))
+
+  // Inert sandbox-only knobs fail loudly when NEXUS_WORKSPACE_SANDBOX is
+  // unset or explicitly `none` (prevents silent unsandboxed execution).
+  list.each(
+    [
+      #("NEXUS_WORKSPACE_SANDBOX_BIN", "/usr/bin/bwrap"),
+      #("NEXUS_WORKSPACE_TOOLCHAIN", "/nix/store/def-ws-tools"),
+      #("NEXUS_WORKSPACE_STATE_DIR", "/var/lib/nexus/state"),
+    ],
+    fn(pair) {
+      set_all([
+        #("NEXUS_ENCRYPTION_KEY", key_b64),
+        pair,
+      ])
+      let assert Error(msg_unset) = config.load()
+      should.be_true(string.contains(msg_unset, pair.0))
+      should.be_true(string.contains(msg_unset, "NEXUS_WORKSPACE_SANDBOX"))
+
+      set_all([
+        #("NEXUS_ENCRYPTION_KEY", key_b64),
+        #("NEXUS_WORKSPACE_SANDBOX", "none"),
+        pair,
+      ])
+      let assert Error(msg_none) = config.load()
+      should.be_true(string.contains(msg_none, pair.0))
+      should.be_true(string.contains(msg_none, "NEXUS_WORKSPACE_SANDBOX"))
+    },
+  )
+
+  // State dir must not overlap workspace root (equal, child, or parent).
+  list.each(
+    [
+      #("/var/lib/nexus/ws", "/var/lib/nexus/ws"),
+      #("/var/lib/nexus/ws", "/var/lib/nexus/ws/state"),
+      #("/var/lib/nexus/ws/sub", "/var/lib/nexus/ws"),
+    ],
+    fn(pair) {
+      set_all([
+        #("NEXUS_ENCRYPTION_KEY", key_b64),
+        #("NEXUS_WORKSPACE_SANDBOX", "nono"),
+        #("NEXUS_WORKSPACE_ROOT", pair.0),
+        #("NEXUS_WORKSPACE_STATE_DIR", pair.1),
+      ])
+      let assert Error(msg) = config.load()
+      should.be_true(string.contains(msg, "must not overlap"))
+    },
+  )
+
+  // Path hygiene applies to sandbox bin, toolchain, and state dir (run with
+  // NEXUS_WORKSPACE_SANDBOX=bwrap so the inert-knob check cannot mask it).
+  list.each(
+    [
+      #("NEXUS_WORKSPACE_SANDBOX_BIN", "bwrap", "must be an absolute path"),
+      #("NEXUS_WORKSPACE_SANDBOX_BIN", "/", "cannot be '/'"),
+      #("NEXUS_WORKSPACE_TOOLCHAIN", "tools", "must be an absolute path"),
+      #(
+        "NEXUS_WORKSPACE_TOOLCHAIN",
+        "/nix/store/../etc",
+        "must not contain '..'",
+      ),
+      #("NEXUS_WORKSPACE_STATE_DIR", "state", "must be an absolute path"),
+      #("NEXUS_WORKSPACE_STATE_DIR", "/var/../etc", "must not contain '..'"),
+    ],
+    fn(case_) {
+      set_all([
+        #("NEXUS_ENCRYPTION_KEY", key_b64),
+        #("NEXUS_WORKSPACE_SANDBOX", "bwrap"),
+        #(case_.0, case_.1),
+      ])
+      let assert Error(msg) = config.load()
+      should.be_true(string.contains(msg, case_.0))
+      should.be_true(string.contains(msg, case_.2))
+    },
+  )
+
+  // Cap floors reject unusable memory / PID limits.
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_WORKSPACE_MAX_MEMORY_MB", "15"),
+  ])
+  let assert Error(msg_mem) = config.load()
+  should.be_true(string.contains(msg_mem, "NEXUS_WORKSPACE_MAX_MEMORY_MB"))
+
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_WORKSPACE_MAX_PIDS", "3"),
+  ])
+  let assert Error(msg_pids) = config.load()
+  should.be_true(string.contains(msg_pids, "NEXUS_WORKSPACE_MAX_PIDS"))
 }

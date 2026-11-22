@@ -119,6 +119,10 @@ pub type Environment {
     /// for shared bot workspaces, or `<id>` for legacy Phase 1 rows.
     /// `None` falls back to `thread_id` (legacy fixtures and TUI nodes).
     workspace_rel_path: Option(String),
+    /// Relative path beneath `workspace_root` for the thread's isolated
+    /// scratch temp directory (e.g. `"tmp/<id>"`). `None` for legacy
+    /// Phase 1 rows without a managed `tmp` workspace and TUI nodes.
+    tmp_rel_path: Option(String),
     roster: List(String),
     remote: Option(RemoteRouter),
   )
@@ -195,6 +199,23 @@ pub fn workspace_dir(env: Environment) -> String {
     None -> env.thread_id
   }
   filepath.join(env.workspace_root, rel)
+}
+
+/// The thread's per-thread temp directory: `Some("<root>/<tmp_rel_path>")`
+/// when `tmp_rel_path` is `Some` and passes lexical validation, otherwise
+/// `None` (legacy Phase 1 rows without a `tmp` workspace row, TUI nodes, or
+/// malformed `rel_path` values). Mirrors `workspace_dir` and
+/// `workspace_gc.safe_target_path` so use-time and GC-time invariants agree.
+/// Lazy — nothing creates it until `bash` runs (`ensure_tmp_dir`).
+pub fn tmp_dir(env: Environment) -> Option(String) {
+  case env.tmp_rel_path {
+    Some(candidate) ->
+      case safe_rel_path(candidate) {
+        Ok(valid) -> Some(filepath.join(env.workspace_root, valid))
+        Error(Nil) -> None
+      }
+    None -> None
+  }
 }
 
 /// Lexical check for a `workspace.rel_path` value: non-empty, no NUL bytes,
@@ -472,6 +493,24 @@ pub fn ensure_workspace(env: Environment) -> Result(Nil, String) {
   }
 }
 
+/// Create the thread's per-thread temp directory (idempotent) when one is
+/// configured on `env`. Called lazily before spawning `bash`, returning
+/// `Ok(Some(path))` when ready or `Ok(None)` when the environment carries no
+/// managed temp dir (legacy rows and TUI nodes).
+pub fn ensure_tmp_dir(env: Environment) -> Result(Option(String), String) {
+  case tmp_dir(env) {
+    None -> Ok(None)
+    Some(dir) ->
+      case simplifile.create_directory_all(dir) {
+        Ok(Nil) -> Ok(Some(dir))
+        Error(error) ->
+          Error(
+            "workspace tmp unavailable: " <> simplifile.describe_error(error),
+          )
+      }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Execution: bash
 // ---------------------------------------------------------------------------
@@ -587,6 +626,7 @@ fn bash_workspace(
 ) -> Result(String, String) {
   use env <- result.try(route(environment, args.target))
   use _ <- result.try(ensure_workspace(env))
+  use tmp <- result.try(ensure_tmp_dir(env))
   use bash_path <- result.try(case ffi_resolve("bash") {
     Ok(path) -> Ok(path)
     Error(_) -> Error("bash: no bash executable found on PATH")
@@ -639,7 +679,7 @@ fn bash_workspace(
     )
     Error(_) -> #(bash_path, ["-c", prelude <> args.command], False)
   }
-  case ffi_open_port(exe, argv, workspace_dir(env)) {
+  case ffi_open_port(exe, argv, workspace_dir(env), tmp) {
     Error(reason) -> Error("bash: " <> reason)
     Ok(p) -> {
       let deadline_us = timing.now_us() + timeout_ms * 1000
@@ -1422,6 +1462,7 @@ fn ffi_open_port(
   command: String,
   args: List(String),
   cwd: String,
+  tmp_dir: Option(String),
 ) -> Result(Port, String)
 
 @external(erlang, "nexus_env_ffi", "kill_tree")
