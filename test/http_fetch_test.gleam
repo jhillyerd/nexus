@@ -109,6 +109,7 @@ fn echo_response(req: Request(mist.Connection)) -> Response(mist.ResponseData) {
           #("method", json.string(http.method_to_string(req.method))),
           #("body", json.string(body)),
           #("authorization", json.string(seen("authorization"))),
+          #("cookie", json.string(seen("cookie"))),
           #("x_probe", json.string(seen("x-probe"))),
           #("x_note", json.string(seen("x-note"))),
           #("content_type", json.string(seen("content-type"))),
@@ -239,6 +240,7 @@ type Echo {
     method: String,
     body: String,
     authorization: String,
+    cookie: String,
     x_probe: String,
     x_note: String,
     content_type: String,
@@ -250,6 +252,7 @@ fn decode_echo(tool: ToolResult) -> Echo {
     use method <- decode.field("method", decode.string)
     use body <- decode.field("body", decode.string)
     use authorization <- decode.field("authorization", decode.string)
+    use cookie <- decode.field("cookie", decode.string)
     use x_probe <- decode.field("x_probe", decode.string)
     use x_note <- decode.field("x_note", decode.string)
     use content_type <- decode.field("content_type", decode.string)
@@ -257,6 +260,7 @@ fn decode_echo(tool: ToolResult) -> Echo {
       method:,
       body:,
       authorization:,
+      cookie:,
       x_probe:,
       x_note:,
       content_type:,
@@ -423,9 +427,8 @@ pub fn cross_origin_redirect_strips_credentials_test() {
   |> should.equal("http://localhost:" <> int.to_string(port) <> "/echo")
   let reflected = decode_echo(tool)
   reflected.authorization |> should.equal("")
-  // x-probe survives; only credential-bearing headers are stripped. (The
-  // reflected Cookie is not decoded by the Echo type — mist's cookie may
-  // be re-encoded; the Authorization strip is the security-relevant one.)
+  reflected.cookie |> should.equal("")
+  // x-probe survives; only credential-bearing headers are stripped.
   reflected.x_probe |> should.equal("kept")
 }
 
@@ -723,4 +726,27 @@ pub fn set_cookie_headers_stay_separate_test() {
   // And the body rides along as usual.
   let assert Ok(body) = json.parse(content, decode.at(["body"], decode.string))
   body |> should.equal("two cookies")
+}
+
+/// The schema says additionalProperties: false — enforce it argument-side
+/// too, so a misspelled field (`data` meant as `body`) is a loud tool
+/// error instead of a request silently sent without its payload.
+pub fn unknown_argument_field_is_rejected_test() {
+  start_service()
+  let assert Error(reason) =
+    run()("{\"url\":\"" <> base() <> "/echo\",\"data\":\"x\"}")
+  should.be_true(string.contains(reason, "unknown argument field"))
+  should.be_true(string.contains(reason, "data"))
+  // Known fields still parse.
+  let assert Ok(_) = run()(json_args("/echo", None, [], None))
+}
+
+/// Header names are case-insensitive per RFC 9110: "Authorization" and
+/// "authorization" are the same header, so both on one request is a
+/// duplicate and refused.
+pub fn case_insensitive_duplicate_header_names_are_rejected_test() {
+  start_service()
+  let assert Error(reason) =
+    run()(json_args("/echo", None, [#("X-Probe", "a"), #("x-probe", "b")], None))
+  should.be_true(string.contains(reason, "unique"))
 }

@@ -502,15 +502,19 @@ rules that bite silently:
 - **`net.fetch` is a GET wrapper over `net.request`; `web_fetch` and
   `web_search` ride the wrapper and must not observe method/body.** The
   method+body path is `http_fetch`'s alone. Redirects on `net.request`
-  follow curl -L / the fetch spec: 303 switches every verb except HEAD
-  to a bodiless GET (RFC 9110 §15.4.4); 301/302 rewrite only
-  body-carrying POST/PUT/PATCH; 307/308 preserve method+body. A rewrite
-  drops the body AND the caller's `content-length`/
-  `transfer-encoding` (framing must never describe a body that is no
-  longer sent), and a hop crossing scheme/host/port (scheme-default
-  ports normalised: `http://h` ≡ `http://h:80`) strips `authorization` /
-  `cookie` / `proxy-authorization` from the CALLER's headers (default
-  curl posture — `--location-trusted` is deliberately absent).
+  follow RFC 9110 / the fetch spec / curl -L: 303 switches every verb
+  except HEAD to a bodiless GET (GET itself loses any pathological
+  body); 301/302 rewrite ONLY POST — the single rewrite the RFC
+  sanctions (§15.4.2/§15.4.3); rewriting PUT/PATCH would silently turn
+  an update into a read. 307/308 preserve method+body. A rewrite drops
+  the body AND the caller's `content-length`/`transfer-encoding`
+  (framing must never describe a body that is no longer sent), and a
+  hop crossing scheme/host/port (scheme-default ports normalised:
+  `http://h` ≡ `http://h:80`) strips `authorization` / `cookie` /
+  `proxy-authorization` — exactly those three names, and for `fetch`
+  callers too (web_search's SearxNG bearer never crosses an origin).
+  A custom `x-api-key`-style header still follows the redirect, as in
+  curl (default posture — `--location-trusted` is deliberately absent).
 - **The method whitelist is enforced twice**: `http_fetch.parse_method`
   (GET/HEAD/POST/PUT/PATCH/DELETE/OPTIONS) and `method_atom` in the FFI
   — model bytes are never `binary_to_atom`-ed, so no atom-table
@@ -522,8 +526,13 @@ rules that bite silently:
   `proxy-connection`, `te`, `trailer`, `upgrade`, `expect` — hackney
   owns those, and a model-supplied `Expect: 100-continue` can stall a
   request past every soft bound), values carry no C0 controls/DEL (TAB
-  and non-ASCII obs-text pass). This plus the method whitelist is the
-  STRUCTURAL request-splitting guard; do not loosen it piecemeal.
+  and non-ASCII obs-text pass), and case-insensitive DUPLICATE names
+  are refused ("Authorization" + "authorization" are one header).
+  Unknown argument FIELDS are rejected too (the schema says
+  `additionalProperties: false`; a misspelled `data` for `body` is a
+  loud tool error, never a silently payload-less request). This plus
+  the method whitelist is the STRUCTURAL request-splitting guard; do
+  not loosen it piecemeal.
 - **Response headers are capped at collection** (FFI): lowercased
   names, combinable duplicates joined ", " per RFC 9110 in FIRST-SEEN
   order — except `set-cookie`, which §5.2 excludes from combination

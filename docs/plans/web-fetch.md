@@ -429,19 +429,24 @@ low-level tool grew `method`, `headers`, and `body`; the plan bullet in
   request.
 - **Transport**: `net.fetch` is a thin GET wrapper over the new
   `net.request(method, url, headers, body, …)`; `web_fetch` and
-  `web_search` behavior is byte-identical. Redirect semantics for
-  non-GET follow curl -L / browsers / the fetch spec: 303 switches every
-  verb except HEAD to a bodiless GET (RFC 9110 §15.4.4 — a
-  DELETE-with-body must not replay against the "see other" target);
-  301/302 rewrite only the body-carrying POST/PUT/PATCH (the historical
-  browser rewrite the RFC leaves optional); 307/308 preserve method and
-  body verbatim. A rewrite also drops the caller's framing headers
+  `web_search` keep their existing method/body behavior — the shared
+  transport additionally turns bodiless responses (HEAD/204/304) that
+  previously surfaced as case-clause fetch errors into ordinary empty
+  responses, and now strips credential headers on cross-origin redirect
+  hops (below), which also covers `web_search`'s SearxNG bearer: those
+  headers never cross to a different origin. Redirect semantics for
+  non-GET follow RFC 9110 / the fetch spec / curl -L: 303 switches every
+  verb except HEAD to a bodiless GET — including GET itself, whose
+  (pathological) body is dropped; 301/302 rewrite only POST — the
+  single rewrite §15.4.2/§15.4.3 sanctions ("a user agent MAY change
+  the request method from POST to GET"), so PUT/PATCH updates survive
+  with method and body intact; 307/308 preserve method and body
+  verbatim. A rewrite also drops the caller's framing headers
   (`content-length`, `transfer-encoding`) so the bodiless next hop
   cannot be mis-framed, and a redirect crossing scheme/host/port strips
-  `authorization`, `cookie`, and `proxy-authorization` from the caller's
-  headers (curl -L without `--location-trusted`; scheme-default ports
-  normalised — `http://h` ≡ `http://h:80`), so a credential minted for
-  one origin is never replayed at another.
+  `authorization`, `cookie`, and `proxy-authorization` — exactly those
+  three names (a custom `x-api-key`-style header still follows, as in
+  curl; scheme-default ports are normalised, `http://h` ≡ `http://h:80`).
 - **Result shape**: both the 2xx Ok object and the non-2xx Error object
   carry `url` (final, post-redirect), `content_type`, `headers`,
   `headers_truncated`, `truncated`, and `body`. `headers` is an object

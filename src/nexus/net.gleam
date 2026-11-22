@@ -129,17 +129,23 @@ pub fn fetch(
 /// to `follow_limit`), each hop re-validated. Redirect semantics follow
 /// the de-facto client standard (curl -L, browsers):
 ///
-/// - `303` switches every method except HEAD to a bodiless GET (RFC
-///   9110 §15.4.4 directs the agent to GET); `301`/`302` rewrite only
-///   the body-carrying POST/PUT/PATCH — the historical browser rewrite
-///   the RFC leaves optional. A rewrite drops the body AND the caller's
-///   framing headers (`content-length`, `transfer-encoding`) so the
-///   next hop cannot be mis-framed.
+/// - `303` switches every method except HEAD to a bodiless GET —
+///   including GET itself, whose (pathological) body is dropped (RFC
+///   9110 §15.4.4 directs the agent to GET). `301`/`302` rewrite only
+///   POST — the sole rewrite RFC 9110 §15.4.2/§15.4.3 sanctions ("a
+///   user agent MAY change the request method from POST to GET"), so a
+///   PUT/PATCH update survives a 301/302 with method and body intact.
+///   A rewrite drops the body AND the caller's framing headers
+///   (`content-length`, `transfer-encoding`) so the next hop cannot be
+///   mis-framed.
 /// - `307`/`308` preserve method and body verbatim;
 /// - a redirect whose scheme/host/port differs from the current hop
 ///   strips `authorization`, `cookie`, and `proxy-authorization` from the
-///   caller's headers (curl -L without `--location-trusted`), so a
-///   credential minted for one origin is never replayed at another.
+///   caller's headers (curl -L without `--location-trusted`) — exactly
+///   those three names; a custom `x-api-key`-style header still follows
+///   the redirect, as it does in curl. This applies to `fetch` callers
+///   too (web_search's SearxNG bearer rides this path): those credential
+///   headers never cross to a different origin.
 pub fn request(
   method: Method,
   url: String,
@@ -232,10 +238,10 @@ fn do_request(
 
 /// Redirect method rewriting. `303` (RFC 9110 §15.4.4, matching the
 /// fetch spec and curl) switches every verb except HEAD to a bodiless
-/// GET. `301`/`302` rewrite only the body-carrying POST/PUT/PATCH (the
-/// historical browser behaviour the RFC leaves optional; rewriting
-/// DELETE would surprise). `307`/`308` never rewrite anything — that is
-/// their contract.
+/// GET — GET itself loses any (pathological) body. `301`/`302` rewrite
+/// only POST: the single rewrite RFC 9110 §15.4.2/§15.4.3 sanctions —
+/// rewriting PUT/PATCH would silently turn an update into a read.
+/// `307`/`308` never rewrite anything — that is their contract.
 fn downgrade_on_redirect(
   method: Method,
   body: String,
@@ -244,12 +250,12 @@ fn downgrade_on_redirect(
   case status {
     303 ->
       case method {
-        http.Get | http.Head -> #(method, body)
+        http.Head -> #(method, body)
         _ -> #(http.Get, "")
       }
     301 | 302 ->
       case method {
-        http.Post | http.Put | http.Patch -> #(http.Get, "")
+        http.Post -> #(http.Get, "")
         _ -> #(method, body)
       }
     _ -> #(method, body)

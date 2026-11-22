@@ -1,6 +1,7 @@
 //// Unit tests for `nexus/net`: RFC 3986 relative URL / redirect resolution,
 //// `final_url` & `content_encoding` plumbing, and lossy UTF-8 decoding.
 
+import gleam/bit_array
 import gleam/bytes_tree
 import gleam/erlang/process
 import gleam/http.{Get, Post}
@@ -160,14 +161,32 @@ fn handler(req: Request(mist.Connection)) -> Response(mist.ResponseData) {
       |> response.prepend_header("x-list", "two")
       |> response.prepend_header("x-list", "one")
       |> response.set_body(mist.Bytes(bytes_tree.from_string("dup")))
-    "/post-echo", Post ->
-      response.new(200)
-      |> response.set_header("content-type", "text/plain")
-      |> response.set_body(mist.Bytes(bytes_tree.from_string("saw-post")))
     "/post-echo", _ ->
-      response.new(200)
-      |> response.set_header("content-type", "text/plain")
-      |> response.set_body(mist.Bytes(bytes_tree.from_string("saw-other")))
+      // Reflects the arriving METHOD and BODY so redirect semantics are
+      // assertable: a bare "saw-other" could not distinguish GET from
+      // DELETE, and nothing ever verified body preservation.
+      case mist.read_body(req, max_body_limit: 65_536) {
+        Ok(read) -> {
+          let body = case bit_array.to_string(read.body) {
+            Ok(text) -> text
+            Error(Nil) -> ""
+          }
+          response.new(200)
+          |> response.set_header("content-type", "text/plain")
+          |> response.set_body(
+            mist.Bytes(bytes_tree.from_string(
+              "method=" <> http.method_to_string(req.method) <> " body=" <> body,
+            )),
+          )
+        }
+        Error(_) ->
+          response.new(400)
+          |> response.set_body(mist.Bytes(bytes_tree.new()))
+      }
+    "/moved-302", _ ->
+      response.new(302)
+      |> response.set_header("location", "/post-echo")
+      |> response.set_body(mist.Bytes(bytes_tree.new()))
     "/moved-303", _ ->
       response.new(303)
       |> response.set_header("location", "/post-echo")
@@ -372,7 +391,7 @@ pub fn request_redirect_semantics_test() {
       True,
       3,
     )
-  r303.body |> should.equal("saw-other")
+  r303.body |> should.equal("method=GET body=")
   // 308 preserves the method and body verbatim.
   let assert Ok(r308) =
     net.request(
@@ -385,7 +404,7 @@ pub fn request_redirect_semantics_test() {
       True,
       3,
     )
-  r308.body |> should.equal("saw-post")
+  r308.body |> should.equal("method=POST body=cargo")
 }
 
 pub fn response_headers_are_collected_lowercase_and_joined_test() {
@@ -415,7 +434,56 @@ pub fn request_303_downgrades_delete_too_test() {
       True,
       3,
     )
-  r.body |> should.equal("saw-other")
+  r.body |> should.equal("method=GET body=")
+}
+
+pub fn redirect_303_drops_get_pathological_body_test() {
+  start_service()
+  // A GET with a body (http_fetch's body arg is method-independent) loses
+  // the body on 303: the "see other" retrieval is bodiless for GET too.
+  let assert Ok(r) =
+    net.request(
+      http.Get,
+      base() <> "/moved-303",
+      [],
+      "payload",
+      4096,
+      2000,
+      True,
+      3,
+    )
+  r.body |> should.equal("method=GET body=")
+}
+
+pub fn redirect_301_302_rewrite_post_only_test() {
+  start_service()
+  // POST is the single rewrite RFC 9110 sanctions for 301/302.
+  let assert Ok(post) =
+    net.request(
+      http.Post,
+      base() <> "/moved-302",
+      [],
+      "cargo",
+      4096,
+      2000,
+      True,
+      3,
+    )
+  post.body |> should.equal("method=GET body=")
+  // PUT survives a 302 with method AND body — rewriting it would silently
+  // turn an update into a read.
+  let assert Ok(put) =
+    net.request(
+      http.Put,
+      base() <> "/moved-302",
+      [],
+      "update",
+      4096,
+      2000,
+      True,
+      3,
+    )
+  put.body |> should.equal("method=PUT body=update")
 }
 
 pub fn no_content_status_is_a_bodiless_response_test() {

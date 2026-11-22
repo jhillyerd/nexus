@@ -110,7 +110,10 @@ const blocked_header_names = [
   "proxy-connection", "te", "trailer", "upgrade", "expect",
 ]
 
+const argument_fields = ["url", "method", "headers", "body"]
+
 fn parse_args(arguments: String) -> Result(Args, String) {
+  use Nil <- result.try(check_known_fields(arguments))
   let decoder = {
     use url <- decode.field("url", decode.string)
     use method <- decode.optional_field(
@@ -151,6 +154,35 @@ fn parse_args(arguments: String) -> Result(Args, String) {
     headers: headers,
     body: option.unwrap(raw_body, ""),
   ))
+}
+
+/// The schema declares `additionalProperties: false`, but a decoder that
+/// merely reads the known fields would silently DROP a misspelled one —
+/// a `data` meant as `body` sends the request out without its payload
+/// and the model never learns why. Surface the mistake as a tool error.
+fn check_known_fields(arguments: String) -> Result(Nil, String) {
+  case json.parse(arguments, decode.dict(decode.string, decode.dynamic)) {
+    Ok(object) ->
+      case
+        list.find(dict.keys(object), fn(key) {
+          !list.contains(argument_fields, key)
+        })
+      {
+        Ok(unknown) ->
+          Error(
+            "unknown argument field: \""
+            <> unknown
+            <> "\" (expected one of "
+            <> string.join(argument_fields, ", ")
+            <> ")",
+          )
+        Error(Nil) -> Ok(Nil)
+      }
+    Error(_) ->
+      Error(
+        "arguments must be JSON with a string \"url\" field (optional \"method\", \"headers\", \"body\")",
+      )
+  }
 }
 
 fn parse_method(raw: String) -> Result(http.Method, String) {
@@ -211,7 +243,14 @@ fn parse_headers(
       }
     }),
   )
-  Ok(raw)
+  // JSON object keys are case-sensitive, so "Authorization" and
+  // "authorization" would BOTH survive and both reach the wire; header
+  // names are case-insensitive per RFC 9110, so refuse duplicates.
+  let lowercased = list.map(raw, fn(pair) { string.lowercase(pair.0) })
+  case list.length(list.unique(lowercased)) == list.length(raw) {
+    True -> Ok(raw)
+    False -> Error("header names must be unique (case-insensitive)")
+  }
 }
 
 /// RFC 9110 token: 1*`tchar` — visible ASCII minus delimiters, checked
