@@ -772,23 +772,30 @@ pub fn workspace_sandbox_rejects_invalid_values_test() {
     },
   )
 
-  // Path hygiene applies to sandbox bin, toolchain, and state dir.
+  // Path hygiene applies to sandbox bin, toolchain, and state dir (run with
+  // NEXUS_WORKSPACE_SANDBOX=bwrap so the inert-knob check cannot mask it).
   list.each(
     [
-      #("NEXUS_WORKSPACE_SANDBOX_BIN", "bwrap"),
-      #("NEXUS_WORKSPACE_SANDBOX_BIN", "/"),
-      #("NEXUS_WORKSPACE_TOOLCHAIN", "tools"),
-      #("NEXUS_WORKSPACE_TOOLCHAIN", "/nix/store/../etc"),
-      #("NEXUS_WORKSPACE_STATE_DIR", "state"),
-      #("NEXUS_WORKSPACE_STATE_DIR", "/var/../etc"),
+      #("NEXUS_WORKSPACE_SANDBOX_BIN", "bwrap", "must be an absolute path"),
+      #("NEXUS_WORKSPACE_SANDBOX_BIN", "/", "cannot be '/'"),
+      #("NEXUS_WORKSPACE_TOOLCHAIN", "tools", "must be an absolute path"),
+      #(
+        "NEXUS_WORKSPACE_TOOLCHAIN",
+        "/nix/store/../etc",
+        "must not contain '..'",
+      ),
+      #("NEXUS_WORKSPACE_STATE_DIR", "state", "must be an absolute path"),
+      #("NEXUS_WORKSPACE_STATE_DIR", "/var/../etc", "must not contain '..'"),
     ],
-    fn(pair) {
+    fn(case_) {
       set_all([
         #("NEXUS_ENCRYPTION_KEY", key_b64),
-        pair,
+        #("NEXUS_WORKSPACE_SANDBOX", "bwrap"),
+        #(case_.0, case_.1),
       ])
       let assert Error(msg) = config.load()
-      should.be_true(string.contains(msg, pair.0))
+      should.be_true(string.contains(msg, case_.0))
+      should.be_true(string.contains(msg, case_.2))
     },
   )
 
