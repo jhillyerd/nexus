@@ -370,8 +370,12 @@ Bifrost/SearxNG, and the production cache check whose golden fixture is
 | `NEXUS_MAX_TOOL_ITERATIONS` | `32` | agent-loop guard: max model round-trips per user turn |
 | `NEXUS_MAX_BOT_HOPS` | `4` | bot-to-bot delivery guard: max hops in an inter-bot message chain (bots plan P3c) |
 | `NEXUS_HTTP_FETCH_MAX_BYTES` | `20000` | `http_fetch`: response body cap per call |
-| `NEXUS_HTTP_FETCH_TIMEOUT_MS` | `15000` | `http_fetch` HTTP connect+receive timeout per hop |
-| `NEXUS_HTTP_FETCH_ALLOW_PRIVATE` | `false` | dev/test escape hatch for private/loopback targets; never in production |
+| `NEXUS_HTTP_FETCH_TIMEOUT_MS` | `15000` | `http_fetch` / `web_fetch` HTTP connect+receive timeout per hop |
+| `NEXUS_HTTP_FETCH_ALLOW_PRIVATE` | `false` | dev/test escape hatch for private/loopback targets (`http_fetch` / `web_fetch`); never in production |
+| `NEXUS_WEB_FETCH_MAX_RAW_BYTES` | `1048576` | `web_fetch`: streaming raw response byte cap before HTML-to-Markdown conversion (> 0) |
+| `NEXUS_WEB_FETCH_DEFAULT_CHARS` | `12000` | `web_fetch`: default `max_length` returned per call in characters (> 0) |
+| `NEXUS_WEB_FETCH_MAX_CHARS` | `32000` | `web_fetch`: hard upper clamp on `max_length` per call (>= `NEXUS_WEB_FETCH_DEFAULT_CHARS`) |
+| `NEXUS_WEB_FETCH_CACHE_TTL_MS` | `600000` | `web_fetch`: in-memory extracted-document cache TTL in ms (`0` disables caching) |
 | `NEXUS_SEARXNG_BASE_URL` | unset | enables the `web_search` tool (SearxNG instance) |
 | `NEXUS_SEARXNG_TOKEN` | unset | optional SearxNG bearer token; never logged or echoed |
 | `NEXUS_PG_HOST` | `127.0.0.1` | Postgres host (compose maps port 5433) |

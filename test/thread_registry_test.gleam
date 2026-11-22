@@ -44,6 +44,10 @@ fn test_config() -> config.Config {
     http_fetch_max_bytes: 20_000,
     http_fetch_timeout_ms: 2000,
     http_fetch_allow_private: False,
+    web_fetch_max_raw_bytes: 1_048_576,
+    web_fetch_default_chars: 12_000,
+    web_fetch_max_chars: 32_000,
+    web_fetch_cache_ttl_ms: 600_000,
     searxng_base_url: None,
     searxng_token: None,
     pg_host: "127.0.0.1",
@@ -1297,6 +1301,7 @@ pub fn create_rejects_disabled_provider_test() {
       process.new_name("nexus_bot_registry"),
       dict.new(),
       dict.new(),
+      None,
     )
   thread_registry.create_with_toolset(
     started.data,
@@ -1371,6 +1376,7 @@ fn start_registry_keeping_seam_with(
       process.new_name("nexus_bot_registry"),
       dict.new(),
       dict.new(),
+      None,
     )
   #(started.data, persistence)
 }
@@ -1477,6 +1483,7 @@ fn boot_with_config(
       process.new_name("nexus_bot_registry"),
       dict.new(),
       dict.new(),
+      None,
     )
   Boot(registry: started.data)
 }
@@ -1697,6 +1704,7 @@ pub fn plugin_toolset_create_resolves_through_provider_table_test() {
       process.new_name("nexus_bot_registry"),
       providers,
       dict.new(),
+      None,
     )
   let registry = started.data
 
@@ -1862,6 +1870,7 @@ pub fn create_from_bot_orchestration_carries_bot_toolset_test() {
       process.new_name("nexus_bot_registry"),
       dict.new(),
       dict.new(),
+      None,
     )
   let registry = started_registry.data
 
@@ -1975,7 +1984,7 @@ pub fn toolset_snapshot_survives_changed_default_config_test() {
   let codemode_on = config.Config(..test_config(), codemode: True)
   should.equal(tools.default_names(codemode_on), [
     "codemode",
-    "http_fetch",
+    "web_fetch",
   ])
   let spec_captor = process.new_subject()
   let booted = boot_with_config(seam, codemode_on, spec_captor)
@@ -2024,6 +2033,7 @@ pub fn create_with_toolset_carries_the_whole_bundle_test() {
       process.new_name("nexus_bot_registry"),
       dict.new(),
       dict.new(),
+      None,
     )
   let registry = started.data
   let ping = process.new_subject()
@@ -2110,6 +2120,7 @@ pub fn dormant_summary_carries_bot_provenance_test() {
       process.new_name("nexus_bot_registry"),
       dict.new(),
       dict.new(),
+      None,
     )
 
   let summaries = thread_registry.list_threads(booted.data)
@@ -2138,6 +2149,7 @@ pub fn dormant_summary_carries_bot_provenance_test() {
       process.new_name("nexus_bot_registry"),
       dict.new(),
       dict.new(),
+      None,
     )
   let after = thread_registry.list_threads(rebooted.data)
   let assert Ok(after_found) = list.find(after, fn(s) { s.id == "s9" })

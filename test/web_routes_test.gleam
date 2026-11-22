@@ -51,6 +51,10 @@ fn test_config() -> Config {
     http_fetch_max_bytes: 20_000,
     http_fetch_timeout_ms: 2000,
     http_fetch_allow_private: False,
+    web_fetch_max_raw_bytes: 1_048_576,
+    web_fetch_default_chars: 12_000,
+    web_fetch_max_chars: 32_000,
+    web_fetch_cache_ttl_ms: 600_000,
     searxng_base_url: None,
     searxng_token: None,
     pg_host: "127.0.0.1",
@@ -221,6 +225,7 @@ fn start_server_rig(
       bots_name,
       dict.new(),
       dict.new(),
+      None,
     )
   // Port 0: the kernel picks a free port and mist's after_start hands
   // it back; a bind failure now fails the test loudly at this line

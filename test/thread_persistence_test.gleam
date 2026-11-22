@@ -40,6 +40,10 @@ fn test_config() -> config.Config {
     http_fetch_max_bytes: 20_000,
     http_fetch_timeout_ms: 2000,
     http_fetch_allow_private: False,
+    web_fetch_max_raw_bytes: 1_048_576,
+    web_fetch_default_chars: 12_000,
+    web_fetch_max_chars: 32_000,
+    web_fetch_cache_ttl_ms: 600_000,
     searxng_base_url: None,
     searxng_token: None,
     pg_host: "127.0.0.1",
@@ -866,6 +870,7 @@ pub fn boot_fails_when_store_unreachable_test() {
       process.new_name("nexus_bot_registry"),
       dict.new(),
       dict.new(),
+      None,
     )
   case started {
     Ok(_) -> panic as "registry must not start with an unreachable store"

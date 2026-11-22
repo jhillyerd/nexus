@@ -458,6 +458,28 @@ the rules that bite silently:
   re-ask live and refuse with the honest reason) because it is an
   external dependency, not part of the release.
 
+## `web_fetch` invariants (`docs/plans/web-fetch.md`)
+
+- **Default vs opt-in split:** `web_fetch` is in `tools.default_names(cfg)`;
+  `http_fetch` stays in `tools.catalog_names()` as an explicit opt-in raw
+  HTTP tool (preserving existing frozen `http_fetch` manifests without
+  migration).
+- **Identity-only compression posture (v1):** `web_fetch` sends
+  `Accept-Encoding: identity` so `nexus_net_ffi`'s `MaxBytes` bounds raw
+  uncompressed bytes directly (no decompression-bomb amplification), and
+  rejects any non-empty `content-encoding` other than `"identity"` before
+  UTF-8 decoding or HTML parsing.
+- **Whitespace preservation in HTML parsing:** `htmgrrrl` invokes `htmerl`
+  with `{preserve_ws, true}` so `<pre>` indentation/blank lines and inline
+  tag boundary spaces survive; `nexus/html_markdown` normalizes whitespace
+  only outside `<pre>`.
+- **Fault-isolated in-memory cache:** `nexus/web_fetch_cache` runs in its
+  own standalone `OneForOne` supervisor started at boot (outside the
+  `OneForAll` root), accessed through `named_seam` (`process.named` +
+  `rescue.rescue` + 250 ms call timeout), so a cache crash or timeout
+  never restarts threads or fails turns. Only 2xx responses are cached,
+  keyed by fragment-stripped normalized URL.
+
 ## Changing the transcript / request-encoding path
 
 `test/m3_prefix_test.gleam` is the offline golden: it replays the archived

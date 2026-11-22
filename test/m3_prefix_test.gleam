@@ -204,10 +204,15 @@ fn smoke_config() -> Config {
 }
 
 fn loop_options() -> Options {
+  // Pin the captured fixture's exact toolset ([http_fetch, web_search]) so
+  // the golden keeps testing the captured envelope faithfully even after
+  // `web_fetch` replaces `http_fetch` in `tools.default_names`.
+  let assert Ok(specs) =
+    tools.by_names(smoke_config(), ["http_fetch", "web_search"])
   transcript.Options(
     ..transcript.default_options(),
     stream: True,
-    tools: tools.default(smoke_config()) |> tools.schemas,
+    tools: specs |> tools.schemas,
     tool_choice: Some(chat.ToolChoiceModeChoice(chat.ToolChoiceAuto)),
   )
 }
@@ -399,6 +404,7 @@ fn start_registry() -> process.Subject(thread_registry.Msg) {
       process.new_name("nexus_bot_registry"),
       dict.new(),
       dict.new(),
+      None,
     )
   started.data
 }

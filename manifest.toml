@@ -35,6 +35,8 @@ packages = [
   { name = "hackney", version = "1.25.0", build_tools = ["rebar3"], requirements = ["certifi", "idna", "metrics", "mimerl", "parse_trans", "ssl_verify_fun", "unicode_util_compat"], otp_app = "hackney", source = "hex", outer_checksum = "7209BFD75FD1F42467211FF8F59EA74D6F2A9E81CBCEE95A56711EE79FD6B1D4" },
   { name = "houdini", version = "1.2.1", build_tools = ["gleam"], requirements = [], otp_app = "houdini", source = "hex", outer_checksum = "6F8AC2F12974567FB744BEA66AC93CEB76AAEA19AD28564623F76CDA9BC26A85" },
   { name = "hpack_erl", version = "0.3.0", build_tools = ["rebar3"], requirements = [], otp_app = "hpack", source = "hex", outer_checksum = "D6137D7079169D8C485C6962DFE261AF5B9EF60FBC557344511C1E65E3D95FB0" },
+  { name = "htmerl", version = "0.2.1", build_tools = ["rebar3"], requirements = [], otp_app = "htmerl", source = "hex", outer_checksum = "EBD3F54E6DC98594F54BB3C214F5B96CAE90D1AE2A4B7E487FBE94A929110015" },
+  { name = "htmgrrrl", version = "1.0.1", build_tools = ["gleam"], requirements = ["gleam_stdlib", "htmerl"], otp_app = "htmgrrrl", source = "hex", outer_checksum = "2FE14FE588737FA5A6E41FC6DBA66056CCAC2E14F737E3A4FA602C473A9A40B5" },
   { name = "idna", version = "6.1.1", build_tools = ["rebar3"], requirements = ["unicode_util_compat"], otp_app = "idna", source = "hex", outer_checksum = "92376EB7894412ED19AC475E4A86F7B413C1B9FBB5BD16DCCD57934157944CEA" },
   { name = "justin", version = "1.1.0", build_tools = ["gleam"], requirements = ["gleam_stdlib"], otp_app = "justin", source = "hex", outer_checksum = "8B1C62269E8607D0A0ED698B7903984CE0BF7B6B3C0DEA3C6C8302B39402837B" },
   { name = "logging", version = "1.5.0", build_tools = ["gleam"], requirements = ["gleam_stdlib"], otp_app = "logging", source = "hex", outer_checksum = "BC5F18CE5DD9686100229FE5409BDC3DD5C46D5A7DF2F804AD2D8F0DD6C5060E" },
@@ -76,6 +78,7 @@ gleeunit = { version = ">= 1.0.0 and < 2.0.0" }
 glopenai = { version = ">= 1.0.0 and < 2.0.0" }
 glua = { version = ">= 2.0.0 and < 3.0.0" }
 hackney = { version = ">= 1.18.0 and < 2.0.0" }
+htmgrrrl = { version = ">= 1.0.1 and < 2.0.0" }
 lustre = { version = ">= 5.0.0 and < 6.0.0" }
 mist = { version = ">= 6.0.0 and < 7.0.0" }
 mork = { version = ">= 1.12.0 and < 2.0.0" }

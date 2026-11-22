@@ -695,6 +695,7 @@ pub fn create_freezes_live_schema_into_manifest_test() {
       dict.from_list([
         #("fakesrv", tools.ForeignServer(name: fake.name, timeout_ms: 30_000)),
       ]),
+      None,
     )
   // Create naming the foreign tool: the freeze asks the server LIVE.
   let reply = process.new_subject()
@@ -750,6 +751,7 @@ pub fn unmounted_server_create_is_honest_400_test() {
       process.new_name("nexus_unmount_bots"),
       dict.new(),
       dict.new(),
+      None,
     )
   let reply = process.new_subject()
   process.send(
@@ -797,6 +799,7 @@ pub fn hydration_replays_frozen_schema_without_server_contact_test() {
       dict.from_list([
         #("fakesrv", tools.ForeignServer(name: fake.name, timeout_ms: 30_000)),
       ]),
+      None,
     )
   let reply = process.new_subject()
   process.send(
@@ -839,6 +842,7 @@ pub fn hydration_replays_frozen_schema_without_server_contact_test() {
       dict.from_list([
         #("fakesrv", tools.ForeignServer(name: fake2.name, timeout_ms: 30_000)),
       ]),
+      None,
     )
   let assert Ok(_subject) = thread_registry.get(started2.data, summary.id)
   // NO tools/list frame may arrive: hydration replays the frozen text.
@@ -1014,6 +1018,7 @@ pub fn corrupt_row_ids_are_not_reminted_test() {
       process.new_name("nexus_corrupt_bots"),
       dict.new(),
       dict.new(),
+      None,
     )
   let reply = process.new_subject()
   process.send(

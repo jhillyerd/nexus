@@ -46,13 +46,13 @@ fn names(specs: List(tools.ToolSpec)) -> List(String) {
 // ---- default_names: the config-gated selection ---------------------------
 
 pub fn default_names_minimal_test() {
-  tools.default_names(plain()) |> should.equal(["http_fetch"])
+  tools.default_names(plain()) |> should.equal(["web_fetch"])
 }
 
 pub fn default_names_searxng_gate_test() {
   let configured = cfg([#("NEXUS_SEARXNG_BASE_URL", "http://127.0.0.1:8888")])
   tools.default_names(configured)
-  |> should.equal(["http_fetch", "web_search"])
+  |> should.equal(["web_fetch", "web_search"])
 }
 
 pub fn default_names_codemode_gate_test() {
@@ -60,7 +60,7 @@ pub fn default_names_codemode_gate_test() {
   // Sorted catalog order; codemode's SCHEMA still registers last in
   // `by_names_with` wherever the name sits.
   tools.default_names(enabled)
-  |> should.equal(["codemode", "http_fetch"])
+  |> should.equal(["codemode", "web_fetch"])
 }
 
 /// The env tools join the default exactly when a workspace root exists
@@ -71,17 +71,17 @@ pub fn default_names_env_gate_test() {
   tools.default_names(rooted)
   |> should.equal([
     "bash",
-    "http_fetch",
     "list_dir",
     "read_file",
+    "web_fetch",
     "write_file",
   ])
 }
 
-/// Everything usable on: the full catalog minus `bot_message` (the
-/// registry injects it into bot threads itself), in sorted catalog
-/// order — a future compiled tool joins the default automatically
-/// unless it needs its own gate line in `default_names`.
+/// Everything usable on: the full catalog minus `bot_message`, `list_bots`,
+/// and opt-in `http_fetch`, in sorted catalog order — a future compiled tool
+/// joins the default automatically unless it needs its own gate line in
+/// `default_names`.
 pub fn default_names_everything_usable_test() {
   let everything =
     cfg([
@@ -93,17 +93,33 @@ pub fn default_names_everything_usable_test() {
   |> should.equal([
     "bash",
     "codemode",
-    "http_fetch",
     "list_dir",
     "read_file",
+    "web_fetch",
     "web_search",
     "write_file",
   ])
-  // And the m3 golden's exact envelope is untouched by the widening:
-  // the smoke shape (SearxNG on, no codemode, no root) resolves to the
-  // same two names, same order, the fixture was captured with.
   let smoke = cfg([#("NEXUS_SEARXNG_BASE_URL", "https://searx.example")])
-  tools.default_names(smoke) |> should.equal(["http_fetch", "web_search"])
+  tools.default_names(smoke) |> should.equal(["web_fetch", "web_search"])
+}
+
+/// `http_fetch` remains in the compiled catalog as an opt-in raw HTTP tool
+/// so explicit bot toolsets and existing frozen snapshots keep resolving.
+pub fn http_fetch_stays_in_catalog_and_resolves_opt_in_test() {
+  tools.catalog_names() |> list.contains("http_fetch") |> should.be_true
+  tools.default_names(plain()) |> list.contains("http_fetch") |> should.be_false
+  let assert Ok(specs) = tools.by_names(plain(), ["http_fetch"])
+  names(specs) |> should.equal(["http_fetch"])
+}
+
+/// Codemode scripts automatically receive `tools.web_fetch` when both are in
+/// the toolset (registered before `codemode`).
+pub fn codemode_sees_web_fetch_host_test() {
+  let assert Ok(specs) = tools.by_names(plain(), ["web_fetch", "codemode"])
+  names(specs) |> should.equal(["web_fetch", "codemode"])
+  let assert Error(result) =
+    run_toolset_codemode(specs, "await(tools.web_fetch({url = ''}))")
+  should.be_true(string.contains(result, "url must be non-empty"))
 }
 
 // ---- default: the boot-frozen registry -----------------------------------
@@ -115,7 +131,7 @@ pub fn default_resolves_its_own_names_test() {
   // depends on it byte-for-byte).
   let assert Ok(specs) = tools.by_names(config, tools.default_names(config))
   tools.default(config) |> names |> should.equal(names(specs))
-  tools.default(config) |> names |> should.equal(["http_fetch"])
+  tools.default(config) |> names |> should.equal(["web_fetch"])
 }
 
 // ---- by_names: the config-independent catalog ----------------------------
@@ -213,6 +229,7 @@ pub fn catalog_enumerates_compiled_plugin_and_foreign_test() {
     "mcpsrv__ping",
     "nexus_example__echo",
     "read_file",
+    "web_fetch",
     "web_search",
     "write_file",
   ])
