@@ -1,6 +1,6 @@
 ---
 title: Nexus — web_fetch tool (HTML-to-Markdown, pagination, and fetch cache)
-status: active — v1 (Phases 1–3) shipped in #159; v2 bounded decompression shipped 2026-11-22
+status: "active — v1 (Phases 1-3) shipped in PR 159; v2 bounded decompression shipped 2026-11-22"
 tags: [computing, self-hosting, local-llm, agents, gleam, beam, tools, web-fetch]
 updated: 2026-11-22
 ---
@@ -329,7 +329,7 @@ stays one shared knob across both HTTP tools:
 | Env var | Default | Validation | Purpose |
 |---|---|---|---|
 | `NEXUS_WEB_FETCH_MAX_RAW_BYTES` | `1048576` (1 MiB) | `> 0` | Streaming raw response cap in `nexus_net_ffi` for `web_fetch` (bounds COMPRESSED wire bytes) |
-| `NEXUS_WEB_FETCH_MAX_DECOMPRESSED_BYTES` | `8388608` (8 MiB) | `> 0` | Hard cap on decompressed bytes when decoding gzip/deflate; over-cap truncates with `raw_truncated` set (v2) |
+| `NEXUS_WEB_FETCH_MAX_DECOMPRESSED_BYTES` | `8388608` (8 MiB) | `> 0` | Hard cap on decompressed bytes when decoding gzip/deflate; over-cap or terminator-less (cut-short) streams flag `raw_truncated` (v2) |
 | `NEXUS_WEB_FETCH_DEFAULT_CHARS` | `12000` | `> 0` | Default `max_length` when the model omits it |
 | `NEXUS_WEB_FETCH_MAX_CHARS` | `32000` | `>= default_chars` | Hard upper clamp on `max_length` per call |
 | `NEXUS_WEB_FETCH_CACHE_TTL_MS` | `600000` (10m) | `>= 0` (`0` disables cache) | In-memory extracted-doc TTL |
@@ -369,24 +369,29 @@ identity-only posture (§3 item 3 above).**
   decodes; brotli, zstd, and stacked non-identity codings are still refused
   before any decoding, with all offending tokens named.
 - **Boundedness:** the compressed body (already capped on the wire by
-  `max_raw_bytes`) is fed to zlib in fixed 4 KiB slices with the accumulated
-  output checked after every slice against
-  `NEXUS_WEB_FETCH_MAX_DECOMPRESSED_BYTES`. Over-cap TRUNCATES —
-  `raw_truncated` in the result now ORs the wire-cap flag and the
-  inflate-cap flag, so the model sees one "the document was cut" signal.
-  Peak memory is the cap plus one slice's worst-case expansion; post-hoc
-  truncation would not have bounded allocation (the env-tools "cap while
-  reading" rule).
+  `max_raw_bytes`) is enqueued to zlib once, and `zlib:safeInflate`
+  returns at most one fixed 16 KiB output chunk per call (the NIF's chunk
+  size — probe-verified on a 1000:1 bomb: every call returned exactly
+  16 384 bytes), with the accumulated size checked after every call
+  against `NEXUS_WEB_FETCH_MAX_DECOMPRESSED_BYTES`. The bound is enforced
+  by zlib itself, independent of the stream's compression ratio; peak
+  memory is the cap plus one chunk. Over-cap TRUNCATES — `raw_truncated`
+  in the result now ORs the wire-cap flag and the inflate-side flags, so
+  the model sees one "the document was cut" signal.
 - **Formats:** zlib auto-detection (windowBits 15+32) accepts gzip and
   zlib-wrapped deflate (RFC 1950); a `deflate` coding that fails there is
   retried as RAW deflate (windowBits -15) — servers that send RFC 1951
   bytes under the `deflate` token. Only the first gzip member of a
-  multi-member stream is decoded (zlib ignores trailing member bytes —
-  probe-verified; HTTP origins emit single members). A corrupt stream is
-  the tool error `"failed to decode <coding>: corrupt compressed stream"`;
-  an EMPTY body passes through untouched (nothing to decode); a
-  wire-truncated gzip decodes partially with `raw_truncated` carried from
-  the wire cap.
+  multi-member stream is decoded (zlib stops at the first member end;
+  HTTP origins emit single members), and trailing bytes after a complete
+  member are ignored — neither flags truncation. A stream that ends
+  WITHOUT its terminator (cut upstream, even on a cleanly closed
+  connection) decodes its partial output and flags `raw_truncated` —
+  the verdict comes from `zlib:inflateEnd`, because `safeInflate`'s
+  `{finished,_}` is spurious when input runs dry (zlib maps the
+  no-progress condition to finished — probe-verified). A corrupt stream
+  is the tool error `"failed to decode <coding>: corrupt compressed
+  stream"`; an EMPTY body passes through untouched (nothing to decode).
 - **hackney does none of this:** the pinned hackney 1.25's manual
   `stream_body` path performs no content-encoding decoding (verified in
   source — its parser handles only transfer-encoding), so decompression is

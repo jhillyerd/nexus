@@ -56,17 +56,31 @@ pub fn bytes_to_text_lossy(bytes: BitArray) -> String
 /// Boundedly inflate a complete gzip / x-gzip / deflate body (already capped
 /// on the wire by `max_bytes`) to at most `max_out_bytes` DECOMPRESSED bytes.
 ///
-/// Returns `#(text, truncated)` where `truncated` is true when the
-/// decompressed size exceeded the cap and the output was cut there — the
-/// decompression-bomb guard. Over-cap truncates rather than erroring,
-/// mirroring the wire cap's semantics; a corrupt stream is an error. The
-/// expansion is bounded DURING inflation: the compressed input is fed to
-/// zlib in fixed slices with the accumulated output checked after every
-/// slice, so peak memory is the cap plus one slice's worst-case expansion.
+/// Returns `#(text, truncated)` where `truncated` is true when the document
+/// is incomplete — either the decompressed size crossed the cap and the
+/// output was cut there (the decompression-bomb guard), or the compressed
+/// stream ended without its terminator (cut upstream). Over-cap truncates
+/// rather than erroring, mirroring the wire cap's semantics; a corrupt
+/// stream is an error.
+///
+/// The expansion is bounded BY zlib itself: the whole body is enqueued once
+/// and `safeInflate` returns at most one fixed 16 KiB output chunk per call
+/// (the NIF's chunk size), with the accumulated size checked after every
+/// call — peak memory is the cap plus one chunk, independent of the stream's
+/// compression ratio. The completeness verdict comes from `inflateEnd`, not
+/// `safeInflate`'s finished signal (which is spurious when input runs dry).
+///
 /// A `deflate` coding that fails zlib/gzip auto-detection is retried as raw
 /// deflate (windowBits -15) — for servers that send RFC 1951 bytes under the
 /// `deflate` token. Only the first gzip member of a multi-member stream is
-/// decoded; an empty body passes through untouched.
+/// decoded; trailing bytes after a complete member are ignored; an empty
+/// body passes through untouched.
+///
+/// The returned `text` is RAW BYTES: it may not be valid UTF-8, and a
+/// cap-side cut lands on a byte offset that can split a multi-byte
+/// codepoint. Callers feeding it to text handling must decode lossily
+/// (`decode_utf8_lossy`), as `web_fetch` does before HTML parsing or JSON
+/// encoding.
 @external(erlang, "nexus_net_ffi", "inflate_bounded")
 pub fn inflate_bounded(
   body: String,

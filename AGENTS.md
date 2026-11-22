@@ -466,18 +466,23 @@ the rules that bite silently:
   migration).
 - **Bounded streaming decompression (v2):** `web_fetch` advertises
   `Accept-Encoding: gzip, deflate` and decodes a single gzip/x-gzip/deflate
-  coding via `net.inflate_bounded`: zlib is fed the wire-capped body in
-  fixed 4 KiB slices with the accumulated output checked after every slice
-  against `NEXUS_WEB_FETCH_MAX_DECOMPRESSED_BYTES` (default 8 MiB), so a
-  decompression bomb costs at most the cap plus one slice's worst-case
-  expansion — over-cap TRUNCATES and surfaces `raw_truncated` (mirroring
-  the wire cap; post-hoc truncation would not bound memory), a corrupt
-  stream is a tool error, and a wire-truncated gzip decodes partially with
-  the flag carried. `deflate` is retried as raw deflate (windowBits -15)
-  after auto-detection fails — the broken-server case; brotli, zstd, and
-  stacked codings are still refused before decoding. hackney 1.25's manual
-  `stream_body` path performs no content-encoding decoding itself (verified
-  in source), so decompression is wholly nexus's.
+  coding via `net.inflate_bounded`: the wire-capped body is enqueued once
+  and zlib's `safeInflate` returns at most one fixed 16 KiB output chunk
+  per call (the NIF's chunk size), with the accumulated size checked
+  against `NEXUS_WEB_FETCH_MAX_DECOMPRESSED_BYTES` (default 8 MiB) after
+  every call — a decompression bomb costs at most the cap plus one chunk,
+  ENFORCED BY ZLIB ITSELF rather than our own input slicing. Over-cap
+  TRUNCATES and surfaces `raw_truncated` (mirroring the wire cap; post-hoc
+  truncation would not bound memory), and so does a stream that ends
+  without its terminator (cut upstream, even on a cleanly closed
+  connection) — the completeness verdict is `zlib:inflateEnd`, never
+  `safeInflate`'s `{finished,_}`, which is spurious when input runs dry.
+  A corrupt stream is a tool error. `deflate` is retried as raw deflate
+  (windowBits -15) after auto-detection fails — the broken-server case;
+  brotli, zstd, and stacked codings are still refused before decoding.
+  hackney 1.25's manual `stream_body` path performs no content-encoding
+  decoding itself (verified in source), so decompression is wholly
+  nexus's.
 - **Whitespace preservation in HTML parsing:** `htmgrrrl` invokes `htmerl`
   with `{preserve_ws, true}` so `<pre>` indentation/blank lines and inline
   tag boundary spaces survive; `nexus/html_markdown` normalizes whitespace

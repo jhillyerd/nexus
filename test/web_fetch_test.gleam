@@ -303,13 +303,17 @@ pub fn decompressed_cap_truncates_and_corrupt_fails_test() {
   cap.raw_truncated |> should.equal(True)
 
   // A wire-truncated gzip stream decodes partially (deterministically
-  // "012345678" for the 20-byte cut) and keeps the wire cap's flag.
+  // "012345678" for the 20-byte cut). The fetcher here reports an
+  // UNTRUNCATED wire — a connection that closed cleanly short of the
+  // member end — so raw_truncated can only come from the stream-level
+  // detector (the inflateEnd verdict), proving the two flags OR together
+  // from independent sources.
   let wire_trunc_run =
     web_fetch.run_with(opts(None), fn(url, _) {
       Ok(
         FetchResponse(
           ..ok_resp("text/plain", url, gzip_cut()),
-          truncated: True,
+          truncated: False,
           content_encoding: "gzip",
         ),
       )

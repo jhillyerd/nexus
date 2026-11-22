@@ -230,10 +230,14 @@ fn check_encoding(raw_encoding: String) -> Result(Option(String), String) {
 
 /// Transport decoding: inflate the supported Content-Encoding under a hard
 /// decompressed-byte cap. The wire cap already bounds the COMPRESSED body;
-/// this bounds the expansion, truncating (never erroring) on over-cap so a
-/// decompression bomb costs at most the cap and the model still gets the
-/// head of the document with `raw_truncated` set. A corrupt stream is a
-/// tool error; an empty body passes through (nothing to decode).
+/// this bounds the expansion — zlib itself returns at most 16 KiB of output
+/// per call (`safeInflate`), checked against the cap after every call — so
+/// a decompression bomb costs at most the cap plus one chunk, and over-cap
+/// truncates (never errors) so the model still gets the head of the
+/// document with `raw_truncated` set. A stream that ends without its
+/// terminator (cut upstream, even on a cleanly closed connection) is also
+/// flagged `raw_truncated`; a corrupt stream is a tool error; an empty
+/// body passes through (nothing to decode).
 fn decode_body(
   encoding: Option(String),
   body: String,

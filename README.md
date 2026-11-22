@@ -373,7 +373,7 @@ Bifrost/SearxNG, and the production cache check whose golden fixture is
 | `NEXUS_HTTP_FETCH_TIMEOUT_MS` | `15000` | `http_fetch` / `web_fetch` timeout input per hop; hard deadline covers connect, TLS handshake, response head, and body streaming |
 | `NEXUS_HTTP_FETCH_ALLOW_PRIVATE` | `false` | dev/test escape hatch for private/loopback targets (`http_fetch` / `web_fetch`); never in production |
 | `NEXUS_WEB_FETCH_MAX_RAW_BYTES` | `1048576` | `web_fetch`: streaming raw response byte cap (bounds COMPRESSED wire bytes) before decompression and HTML-to-Markdown conversion (> 0) |
-| `NEXUS_WEB_FETCH_MAX_DECOMPRESSED_BYTES` | `8388608` | `web_fetch`: hard cap on decompressed bytes when decoding a gzip/deflate response; over-cap truncates with `raw_truncated` set (> 0) |
+| `NEXUS_WEB_FETCH_MAX_DECOMPRESSED_BYTES` | `8388608` | `web_fetch`: hard cap on decompressed bytes when decoding a gzip/deflate response; over-cap or terminator-less (cut-short) streams flag `raw_truncated` (> 0) |
 | `NEXUS_WEB_FETCH_DEFAULT_CHARS` | `12000` | `web_fetch`: default `max_length` returned per call in characters (> 0) |
 | `NEXUS_WEB_FETCH_MAX_CHARS` | `32000` | `web_fetch`: hard upper clamp on `max_length` per call (>= `NEXUS_WEB_FETCH_DEFAULT_CHARS`) |
 | `NEXUS_WEB_FETCH_CACHE_TTL_MS` | `600000` | `web_fetch`: in-memory extracted-document cache TTL in ms (`0` disables caching) |

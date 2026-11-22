@@ -3,7 +3,7 @@
 -module(net_test_ffi).
 
 -export([start_silent_listener/1, now_ms/0, gzip/1, gzip_corrupt/0,
-         gzip_cut/0, zlib_wrap/1, deflate_raw/1]).
+         gzip_cut/0, incompressible/1, zlib_wrap/1, deflate_raw/1]).
 
 %% A plain TCP listener that accepts and then never sends a byte. To an
 %% https:// client this is exactly the stalled-TLS-handshake wedge: the
@@ -38,17 +38,32 @@ now_ms() ->
 gzip(Bin) ->
     zlib:gzip(Bin).
 
-%% A plausible-looking gzip prefix (valid header, then garbage) — the
-%% corrupt-stream case `inflate_bounded` must answer as a decode error.
 %% A wire-cap-truncated gzip stream: the first 20 bytes of a 40-byte gzip
 %% of "0123456789abcdefghij" — inflates (deterministically, verified by
-%% probe) to just "012345678" with no error, like a body cut mid-stream.
+%% probe) to just "012345678" with no decode error, like a body cut
+%% mid-stream. The stream ends WITHOUT its terminator, so `inflate_bounded`
+%% must flag it truncated via the inflateEnd verdict.
 gzip_cut() ->
     <<(zlib:gzip(<<"0123456789abcdefghij">>)):20/binary>>.
 
+%% A plausible-looking gzip prefix (valid header, then garbage) — the
+%% corrupt-stream case `inflate_bounded` must answer as a decode error.
 gzip_corrupt() ->
     Gz = zlib:gzip(binary:copy(<<"hello world ">>, 1000)),
     <<Gz:20/binary, "garbage garbage garbage">>.
+
+%% Deterministic pseudo-random bytes (a plain LCG — stable across OTP
+%% versions, unlike rand): effectively incompressible, so gzip(N) is ~N
+%% bytes and > 8 KiB of input / > 16 KiB of output — enough to exercise
+%% `safeInflate`'s multi-chunk drain path in both directions.
+incompressible(N) ->
+    lcg(N, 16#2A7F9E31, <<>>).
+
+lcg(0, _X, Acc) ->
+    Acc;
+lcg(N, X, Acc) ->
+    X2 = (X * 1103515245 + 12345) band 16#FFFFFFFF,
+    lcg(N - 1, X2, <<Acc/binary, (X2 bsr 16):8>>).
 
 zlib_wrap(Bin) ->
     zlib:compress(Bin).

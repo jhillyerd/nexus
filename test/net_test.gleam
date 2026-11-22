@@ -25,6 +25,12 @@ fn deflate_raw(body: String) -> String
 @external(erlang, "net_test_ffi", "gzip_corrupt")
 fn gzip_corrupt() -> String
 
+@external(erlang, "net_test_ffi", "gzip_cut")
+fn gzip_cut() -> String
+
+@external(erlang, "net_test_ffi", "incompressible")
+fn incompressible(size: Int) -> String
+
 // ---------------------------------------------------------------------------
 // RFC 3986 relative URL resolution (pure)
 // ---------------------------------------------------------------------------
@@ -227,6 +233,22 @@ pub fn inflate_bounded_roundtrips_all_three_formats_test() {
   // Broken-server deflate: raw RFC 1951 bytes (windowBits -15 retry).
   net.inflate_bounded(deflate_raw(plain), "deflate", 1_000_000)
   |> should.equal(Ok(#(plain, False)))
+
+  // Multi-chunk drain in BOTH directions: ~50 KB of incompressible input
+  // spans several 8 KiB NIF input chunks, and its ~50 KB of output spans
+  // several 16 KiB output chunks — the path the small cases never reach.
+  let big = incompressible(50_000)
+  should.be_true(string.byte_size(gzip(big)) > 16_384)
+  net.inflate_bounded(gzip(big), "gzip", 1_000_000)
+  |> should.equal(Ok(#(big, False)))
+
+  // Trailing bytes after a complete member are ignored, and only the
+  // FIRST member of a multi-member stream is decoded — neither flags
+  // truncation (the member that WAS decoded ended cleanly).
+  net.inflate_bounded(gzip(plain) <> "trailing garbage", "gzip", 1_000_000)
+  |> should.equal(Ok(#(plain, False)))
+  net.inflate_bounded(gzip(plain) <> gzip("second member"), "gzip", 1_000_000)
+  |> should.equal(Ok(#(plain, False)))
 }
 
 pub fn inflate_bounded_caps_bombs_and_truncates_test() {
@@ -251,6 +273,12 @@ pub fn inflate_bounded_corrupt_and_empty_test() {
   // a crash (zlib raises error:data_error inside the FFI).
   net.inflate_bounded(gzip_corrupt(), "gzip", 1000)
   |> should.equal(Error("corrupt compressed stream"))
+
+  // A stream cut mid-way (no terminator) decodes its partial output and
+  // is flagged TRUNCATED — the verdict comes from inflateEnd, because
+  // safeInflate's finished signal is spurious when input runs dry.
+  net.inflate_bounded(gzip_cut(), "gzip", 1000)
+  |> should.equal(Ok(#("012345678", True)))
 
   // An empty body carries no member to decode and passes through.
   net.inflate_bounded("", "gzip", 1000)

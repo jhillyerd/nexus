@@ -134,19 +134,33 @@ format_reason(Reason) ->
 %% only the COMPRESSED wire bytes; a decompression bomb would otherwise
 %% expand post-receipt without bound. Like the wire cap, over-cap here
 %% TRUNCATES ({ok, {Out, true}}) instead of erroring — the model sees
-%% raw_truncated and knows the tail is gone. Memory stays bounded because
-%% the compressed input is fed to zlib in fixed slices with the accumulated
-%% output checked after every slice: peak cost is MaxOut plus one slice's
-%% worst-case expansion.
+%% raw_truncated and knows the tail is gone.
+%%
+%% Memory is bounded BY ZLIB ITSELF, not by our own slicing: the whole
+%% (wire-capped) body is enqueued once and `safeInflate` then returns at
+%% most one fixed 16 KiB output chunk per call (the NIF's output chunk
+%% size — probe-verified on a 1000:1 bomb), with the accumulated size
+%% checked after every call. Peak cost is MaxOut plus one 16 KiB chunk
+%% (the chunk that crosses the cap), independent of the stream's
+%% compression ratio.
+%%
+%% truncated=true means the DOCUMENT is incomplete: either the decompressed
+%% size crossed MaxOut (output cut there) or the compressed stream ended
+%% without its terminator (cut upstream — e.g. a wire-truncated body whose
+%% connection still closed cleanly). The verdict comes from `inflateEnd`,
+%% NOT from safeInflate's {finished, _}, which is SPURIOUS when the input
+%% runs dry mid-stream (zlib maps the no-progress condition to finished;
+%% probe-verified) and so only means "no more output will come".
 %%
 %% Encoding is the normalized lowercase Content-Encoding token: "gzip",
 %% "x-gzip", or "deflate". All use zlib auto-detection (windowBits 15+32,
 %% which accepts both gzip and zlib-wrapped streams); a `deflate` token that
 %% fails there is retried as RAW deflate (windowBits -15) — servers that
 %% send RFC 1951 bytes under the `deflate` token. Only the FIRST gzip member
-%% of a multi-member stream is decoded (zlib ignores trailing member bytes;
-%% HTTP origins emit single members). An empty body carries no member to
-%% decode and passes through untouched (e.g. 204 with a stale header).
+%% of a multi-member stream is decoded (zlib stops at the first member end;
+%% HTTP origins emit single members), and trailing bytes after a complete
+%% member are ignored. An empty body carries no member to decode and passes
+%% through untouched (e.g. 204 with a stale header).
 inflate_bounded(<<>>, _Encoding, _MaxOut) ->
     {ok, {<<>>, false}};
 inflate_bounded(Body, Encoding0, MaxOut) ->
@@ -164,13 +178,23 @@ inflate_bounded(Body, Encoding0, MaxOut) ->
         Class:Reason -> {error, format_reason({Class, Reason})}
     end.
 
--define(INFLATE_SLICE, 4096).
-
 run_inflate(Body, MaxOut, Wbits) ->
     Z = zlib:open(),
     try
         ok = zlib:inflateInit(Z, Wbits),
-        feed_inflate(Z, Body, MaxOut, <<>>)
+        case drain(Z, Body, MaxOut, <<>>) of
+            {ok, Acc, cut} ->
+                {ok, {Acc, true}};
+            {ok, Acc, drained} ->
+                %% The authoritative completeness verdict: inflateEnd
+                %% succeeds only when end-of-stream was reached (its
+                %% data_error here is expected for an incomplete stream,
+                %% caught by `case catch`, never leaked as a crash).
+                case catch zlib:inflateEnd(Z) of
+                    ok -> {ok, {Acc, false}};
+                    _ -> {ok, {Acc, true}}
+                end
+        end
     catch
         error:data_error -> {error, <<"corrupt compressed stream">>};
         Class:Reason -> {error, format_reason({Class, Reason})}
@@ -180,19 +204,35 @@ run_inflate(Body, MaxOut, Wbits) ->
         catch zlib:close(Z)
     end.
 
-feed_inflate(_Z, <<>>, _MaxOut, Acc) ->
-    {ok, {Acc, false}};
-feed_inflate(Z, Body, MaxOut, Acc) ->
-    SliceSize = erlang:min(?INFLATE_SLICE, byte_size(Body)),
-    <<Slice:SliceSize/binary, Rest/binary>> = Body,
-    Out = iolist_to_binary(zlib:inflate(Z, Slice)),
-    Acc2 = <<Acc/binary, Out/binary>>,
+%% Drains the enqueued body through fixed-size output chunks until the
+%% stream runs dry ({finished, _} — possibly spurious, see module notes)
+%% or the accumulated output crosses MaxOut (cut there). The third tuple
+%% element records which.
+drain(Z, Body, MaxOut, Acc) ->
+    case zlib:safeInflate(Z, Body) of
+        {finished, Out} -> step(Z, Out, MaxOut, Acc, true);
+        {continue, Out} -> step(Z, Out, MaxOut, Acc, false);
+        %% We never negotiate preset dictionaries; treat one as corruption.
+        {need_dictionary, _, _} -> erlang:error(data_error)
+    end.
+
+step(_Z, Out, MaxOut, Acc, true = _Dry) ->
+    Acc2 = <<Acc/binary, (iolist_to_binary(Out))/binary>>,
     case byte_size(Acc2) > MaxOut of
         true ->
             <<Kept:MaxOut/binary, _/binary>> = Acc2,
-            {ok, {Kept, true}};
+            {ok, Kept, cut};
         false ->
-            feed_inflate(Z, Rest, MaxOut, Acc2)
+            {ok, Acc2, drained}
+    end;
+step(Z, Out, MaxOut, Acc, false) ->
+    Acc2 = <<Acc/binary, (iolist_to_binary(Out))/binary>>,
+    case byte_size(Acc2) > MaxOut of
+        true ->
+            <<Kept:MaxOut/binary, _/binary>> = Acc2,
+            {ok, Kept, cut};
+        false ->
+            drain(Z, [], MaxOut, Acc2)
     end.
 
 %% Resolve a hostname (or IP literal) to all its addresses, as printable
