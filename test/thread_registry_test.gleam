@@ -2833,3 +2833,115 @@ pub fn route_env_resolves_live_thread_and_attaches_plane_test() {
 
   process.kill(node_pid)
 }
+
+/// Regression: `delivery_toolset` and `resolve_entries` must not capture
+/// `thread_registry.State` in their per-thread / per-toolset closures.
+/// Capturing `State` chains every prior thread's `Record` (and its own
+/// captured `State`) into a DAG whose flattened size grows exponentially
+/// with thread count; when `codemode` spawns its heap-capped engine child
+/// with `hosts` closing over `ToolCtx`, BEAM's term copy blows straight
+/// past `max_heap_size` even on a trivial pure-Lua script.
+pub fn codemode_survives_many_prior_threads_without_heap_blowup_test() {
+  let factory_name = process.new_name("nexus_codemode_heap_factory")
+  let assert Ok(_factory) =
+    factory_supervisor.start(thread_registry.factory_builder(factory_name))
+  let persistence = store_mock.seam(store_mock.start())
+  store_mock.ensure_fixture_provider(persistence)
+  store_mock.ensure_fixture_bot(persistence)
+  let root = "/tmp/nexus-codemode-heap-" <> int.to_string(timing.now_us())
+  let cfg =
+    config.Config(..test_config(), codemode: True, workspace_root: Some(root))
+  let assert Ok(started) =
+    thread_registry.start(
+      cfg,
+      factory_supervisor.get_by_name(factory_name),
+      process.new_name("nexus_codemode_heap_registry"),
+      persistence,
+      fixture_resolver(),
+      process.new_name("nexus_codemode_heap_bots"),
+      dict.new(),
+      dict.new(),
+      None,
+    )
+  let registry = started.data
+
+  // Create several real codemode+env bot threads first — including
+  // distinct toolsets so `resolve_entries` caches multiple bundles — to
+  // mirror a live server with many active threads.
+  let full_toolset = [
+    "bash",
+    "bot_message",
+    "codemode",
+    "http_fetch",
+    "list_bots",
+    "list_dir",
+    "read_file",
+    "web_fetch",
+    "write_file",
+  ]
+  let alt_toolset = ["codemode", "http_fetch", "web_fetch"]
+  list.index_map(list.repeat(Nil, 25), fn(_, idx) {
+    let chosen = case idx % 3 == 0 {
+      True -> alt_toolset
+      False -> full_toolset
+    }
+    let assert Ok(_) =
+      thread_registry.create(
+        registry,
+        thread_registry.NewThread(
+          ..new_thread(store_mock.fixture_provider_id, "alpha"),
+          toolset: Some(chosen),
+          parent_thread_id: None,
+          title: "",
+        ),
+      )
+  })
+
+  // Now run a real codemode script through the registry's delivery + env
+  // wrappers on the next thread (real `tools.by_names` -> `codemode_spec`
+  // -> `codemode.run` -> heap-capped engine child).
+  let assert Ok(specs) = tools.by_names(cfg, full_toolset)
+  let outcome_sub = process.new_subject()
+  let runner: thread.TurnRunner = fn(
+    _endpoint,
+    tr,
+    cancel,
+    delivery,
+    environment,
+    _on_event,
+  ) {
+    let ctx = tools.ToolCtx(cancel:, delivery:, environment:)
+    let res =
+      tools.execute(
+        specs,
+        ctx,
+        "codemode",
+        "{\"code\":\"text(\\\"pure script ok\\\")\\nreturn 1 + 1\"}",
+      )
+    process.send(outcome_sub, res)
+    thread.StreamDone(stats(), transcript.append_assistant(tr, "done"))
+  }
+  let bundle =
+    thread.Toolset(
+      names: list.map(specs, tools.tool_name),
+      specs: specs,
+      runner: runner,
+      utility_runner: fn(_, _, _, _) { Error("unused") },
+    )
+  let assert Ok(summary) =
+    thread_registry.create_with_toolset(
+      registry,
+      thread_registry.NewThread(
+        ..new_thread(store_mock.fixture_provider_id, "alpha"),
+        toolset: Some(full_toolset),
+        parent_thread_id: None,
+        title: "",
+      ),
+      bundle,
+    )
+  let assert Ok(sess) = thread_registry.get(registry, summary.id)
+  should.equal(thread.send_message(sess, "run codemode"), thread.Sent)
+  let assert Ok(res) = process.receive(outcome_sub, 10_000)
+  let assert Ok(output) = res
+  string.contains(output, "pure script ok") |> should.be_true
+}

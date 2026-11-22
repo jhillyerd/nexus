@@ -177,10 +177,11 @@ fn handle(state: SdkState, msg: SdkMsg) -> actor.Next(SdkState, SdkMsg) {
           // queues behind this handle, so `pending` is always inserted
           // before the outcome can be processed.
           let call = state.plugin.call
+          let internal = state.internal
           let worker =
             process.spawn_unlinked(fn() {
               let outcome = call(tool, arguments)
-              process.send(state.internal, WorkerDone(ref, outcome))
+              process.send(internal, WorkerDone(ref, outcome))
             })
           let monitor = process.monitor(worker)
           actor.continue(
@@ -452,6 +453,8 @@ fn catalog_entries(
     // SAME pre-minted `Name` value the supervisor registered (a fresh
     // `tool_provider.name` call would mint a different atom: never
     // re-derive it) — and truncates centrally at the adapter.
+    let tool_name = def.name
+    let max_output_chars = cfg.plugin_max_output_chars
     let spec =
       tools.ToolSpec(
         tool: tools.function_tool(
@@ -462,9 +465,9 @@ fn catalog_entries(
         run: fn(ctx, arguments) {
           tool_provider.run(
             provider: name,
-            tool: def.name,
+            tool: tool_name,
             timeout_ms: timeout_ms,
-            max_output_chars: cfg.plugin_max_output_chars,
+            max_output_chars: max_output_chars,
             cancel: ctx.cancel,
             arguments: arguments,
           )

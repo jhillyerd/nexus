@@ -364,9 +364,11 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       // closure and routes the result back through `CatalogDone`; if
       // the worker dies, no reply lands and the CALLER's timeout
       // fires (the UI turns that into its degraded field).
+      let tool_catalog = state.tool_catalog
+      let self = state.self
       process.spawn_unlinked(fn() {
-        let catalog = state.tool_catalog()
-        process.send(state.self, CatalogDone(reply, catalog))
+        let catalog = tool_catalog()
+        process.send(self, CatalogDone(reply, catalog))
       })
       actor.continue(state)
     }

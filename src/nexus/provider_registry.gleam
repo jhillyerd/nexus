@@ -501,11 +501,13 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
               actor.continue(state)
             }
             True, Ok(resolved) -> {
+              let fetch = state.fetch
+              let endpoint = resolved.endpoint
               process.spawn_unlinked(fn() {
                 // Runs in the caller-concurrency world, not the actor:
                 // up to the first-response timeout of slow time.
                 let outcome =
-                  state.fetch(resolved.endpoint)
+                  fetch(endpoint)
                   |> result.map_error(fn(error) {
                     ModelsFailed(describe_stream_error(error))
                   })

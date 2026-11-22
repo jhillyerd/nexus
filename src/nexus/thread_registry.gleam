@@ -1041,13 +1041,18 @@ fn resolve_entries(
           // here: the actor already exists by the time a bundle is
           // first needed.
           let names = list.map(entries, fn(entry) { entry.name })
+          // Bind `self` outside the closure: referencing `state.self`
+          // inside `fn()` captures the entire `State` (including prior
+          // `toolsets` and `threads`), chaining snapshots into a DAG that
+          // explodes on cross-process term copy.
+          let registry = state.self
           let toolset =
             thread.Toolset(
               names: names,
               specs: specs,
               runner: thread.agent_runner(state.cfg.max_tool_iterations, specs),
               utility_runner: thread.utility_runner(specs, fn() {
-                tag_corpus(state.self)
+                tag_corpus(registry)
               }),
             )
           Ok(#(
@@ -1344,7 +1349,8 @@ fn start_new_thread_bot(
                 // carry the environment wrapper above, and a wrap of
                 // the base would silently drop it.
                 toolset: delivery_toolset(
-                  state,
+                  state.self,
+                  state.bots_name,
                   spec.toolset,
                   id,
                   requested.bot_id,
@@ -2440,7 +2446,13 @@ fn lazy_start(state: State, summary: StoredSummary) -> Resolved {
           // unwrapped bundle; the wrap is per thread.
           let toolset = case summary.meta.bot_id {
             Some(bot_id) ->
-              delivery_toolset(state, resolved, summary.id, bot_id)
+              delivery_toolset(
+                state.self,
+                state.bots_name,
+                resolved,
+                summary.id,
+                bot_id,
+              )
             None -> resolved
           }
           case rebuild_transcript(state, summary.id) {
@@ -3534,6 +3546,11 @@ fn env_toolset(
   cfg: Config,
 ) -> thread.Toolset {
   let base = toolset.runner
+  // Bind only the needed scalars outside `router` so the full `Config`
+  // (including secrets and system prompt) is not captured into per-thread
+  // closures or copied into codemode engine processes.
+  let timeout_ms = cfg.env_timeout_ms
+  let max_output_bytes = cfg.env_max_output_bytes
   let router: env.RemoteRouter = fn(target, tool, arguments, cancel) {
     case route_env_ask(registry, thread_id, target, cancel) {
       Ok(exec) ->
@@ -3541,8 +3558,8 @@ fn env_toolset(
           provider: exec.sub,
           owner: exec.pid,
           tool: tool,
-          timeout_ms: cfg.env_timeout_ms,
-          max_output_chars: cfg.env_max_output_bytes,
+          timeout_ms: timeout_ms,
+          max_output_chars: max_output_bytes,
           cancel: cancel,
           arguments: arguments,
         )
@@ -3619,13 +3636,22 @@ type RouteAskMsg {
 /// data, so the counter survives restarts. The ignored `delivery`
 /// parameter is always `None` here — the base bundle runner receives the
 /// wrapper-built context instead.
+/// Take `registry` and `bots_name` directly — NEVER `state: State`:
+/// capturing `State` in the runner closure retains every prior thread's
+/// `Record` (and its own captured `State`), forming a DAG whose flattened
+/// size grows exponentially with thread count and blows past codemode's
+/// `max_heap_size` when BEAM copies `hosts` into the engine child.
 fn delivery_toolset(
-  state: State,
+  registry: Subject(Msg),
+  bots_name: process.Name(bot_registry.Msg),
   toolset: thread.Toolset,
   thread_id: String,
   bot_id: String,
 ) -> thread.Toolset {
   let base = toolset.runner
+  let deliver = fn(request) { deliver_ask(registry, request) }
+  let sender_name = fn() { sender_name_ask(bots_name, bot_id) }
+  let list_bots = fn() { list_bots_ask(bots_name) }
   thread.Toolset(
     ..toolset,
     runner: fn(endpoint, tr, cancel, _delivery, environment, on_event) {
@@ -3634,9 +3660,9 @@ fn delivery_toolset(
           thread_id: thread_id,
           bot_id: bot_id,
           depth: initiating_depth(tr) + 1,
-          deliver: fn(request) { deliver_ask(state.self, request) },
-          sender_name: fn() { sender_name_ask(state.bots_name, bot_id) },
-          list_bots: fn() { list_bots_ask(state.bots_name) },
+          deliver: deliver,
+          sender_name: sender_name,
+          list_bots: list_bots,
         )
       base(endpoint, tr, cancel, Some(ctx), environment, on_event)
     },
