@@ -520,6 +520,7 @@ fn stored_summary(
     ),
     toolset: [],
     workspace_root: None,
+    workspaces: None,
     roster: None,
     last_active_at: 1_700_000_000,
     message_count: 1,
@@ -736,6 +737,7 @@ fn stored(id: String) -> store.StoredSummary {
     last_active_at: timing.wall_now_s(),
     toolset: thread_registry.plain_entries(tools.default_names(test_config())),
     workspace_root: None,
+    workspaces: None,
     roster: None,
     message_count: 1,
   )

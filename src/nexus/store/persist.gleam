@@ -40,6 +40,7 @@ import nexus/store
 import nexus/store/sql
 import nexus/thread
 import nexus/transcript.{type Transcript}
+import nexus/workspace_gc
 import pog
 
 pub type Msg {
@@ -79,10 +80,22 @@ pub type Msg {
   SetPinned(id: String, pinned: Bool, reply: Subject(Result(Nil, String)))
   Archive(id: String, reply: Subject(Result(Nil, String)))
   Unarchive(id: String, reply: Subject(Result(Nil, String)))
-  DeleteThread(id: String, reply: Subject(Result(Nil, String)))
+  DeleteThread(
+    id: String,
+    reply: Subject(Result(List(store.TombstonedWorkspace), String)),
+  )
   /// Boot sweep (see `prune_never_used.sql`): bulk delete of stale
   /// never-used threads, replying with the deleted ids.
   PruneNeverUsed(reply: Subject(Result(List(String), String)))
+  // ---- workspace rows (docs/plans/workspace-sandbox.md, Phase 1) ----
+  ListDeletedWorkspaces(
+    reply: Subject(Result(List(store.TombstonedWorkspace), String)),
+  )
+  DeleteWorkspace(id: String, reply: Subject(Result(Nil, String)))
+  InsertWorkspace(
+    workspace: store.StoredWorkspace,
+    reply: Subject(Result(Nil, String)),
+  )
   // ---- provider rows (docs/plans/multi-provider.md §5.3) ----
   ListProviders(reply: Subject(Result(List(store.StoredProvider), String)))
   GetProvider(id: String, reply: Subject(Result(store.StoredProvider, String)))
@@ -104,7 +117,10 @@ pub type Msg {
   GetBot(id: String, reply: Subject(Result(store.StoredBot, String)))
   InsertBot(bot: store.StoredBot, reply: Subject(Result(Nil, String)))
   UpdateBot(bot: store.StoredBot, reply: Subject(Result(Nil, String)))
-  DeleteBot(id: String, reply: Subject(Result(Nil, String)))
+  DeleteBot(
+    id: String,
+    reply: Subject(Result(List(store.TombstonedWorkspace), String)),
+  )
   CountBotsForProvider(id: String, reply: Subject(Result(Int, String)))
   // ---- node rows (docs/plans/environments.md, Phase 2b) ----
   ListNodes(reply: Subject(Result(List(store.StoredNode), String)))
@@ -267,6 +283,19 @@ pub fn seam(store_actor: Subject(Msg)) -> store.Store {
     },
     prune_never_used: fn() {
       actor.call(store_actor, call_timeout_ms, PruneNeverUsed)
+    },
+    list_deleted_workspaces: fn() {
+      actor.call(store_actor, call_timeout_ms, ListDeletedWorkspaces)
+    },
+    delete_workspace: fn(id) {
+      actor.call(store_actor, call_timeout_ms, fn(reply) {
+        DeleteWorkspace(id, reply)
+      })
+    },
+    insert_workspace: fn(workspace) {
+      actor.call(store_actor, call_timeout_ms, fn(reply) {
+        InsertWorkspace(workspace, reply)
+      })
     },
     list_providers: fn() {
       actor.call(store_actor, call_timeout_ms, ListProviders)
@@ -439,6 +468,12 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
                       ),
                       toolset: entries,
                       workspace_root: row.workspace_root,
+                      workspaces: thread_workspaces_from_row(
+                        row.workspace_id,
+                        row.workspace_rel_path,
+                        row.tmp_workspace_id,
+                        row.tmp_rel_path,
+                      ),
                       roster: option.None,
                       last_active_at: row.last_active_s,
                       // The column already counts the system prompt
@@ -526,6 +561,24 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           // sentinel inserts NULL (ordinary threads) — the same nullif
           // pattern as bot_id/workspace_root above.
           option.unwrap(summary.meta.parent_thread_id, ""),
+          // Workspace rows (workspace-sandbox plan Phase 1, $17..$20):
+          // '' sentinels insert NULL / skip workspace row creation.
+          case summary.workspaces {
+            Some(ws) -> ws.workspace_id
+            None -> ""
+          },
+          case summary.workspaces {
+            Some(ws) -> option.unwrap(ws.tmp_id, "")
+            None -> ""
+          },
+          case summary.workspaces {
+            Some(ws) -> ws.rel_path
+            None -> ""
+          },
+          case summary.workspaces {
+            Some(ws) -> option.unwrap(ws.tmp_rel_path, "")
+            None -> ""
+          },
         )
         |> result.map(fn(_) { Nil })
         |> result.map_error(query_error)
@@ -622,19 +675,90 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
     }
 
     DeleteThread(id, reply) -> {
-      process.send(reply, update(sql.delete_thread(state.db, id)))
-      actor.continue(
-        State(..state, persisted: dict.delete(state.persisted, id)),
-      )
+      // Two sequential statements in ONE transaction: tombstoning owned
+      // workspaces FIRST clears workspace.thread_id = NULL before DELETE FROM
+      // thread runs, so ON DELETE SET NULL never overlaps with setting
+      // deleted_at. Returning the full deleted subtree also lets us evict
+      // every cascaded channel descendant from state.persisted.
+      let outcome =
+        pog.transaction(state.db, fn(tx) {
+          use subtree_rows <- result.try(
+            sql.select_thread_subtree(tx, id) |> result.map_error(query_error),
+          )
+          let subtree_ids = list.map(subtree_rows.rows, fn(row) { row.id })
+          case subtree_ids {
+            [] -> Ok(#([], []))
+            _ -> {
+              use ws_rows <- result.try(
+                sql.tombstone_workspaces_for_threads(tx, subtree_ids)
+                |> result.map_error(query_error),
+              )
+              use _ <- result.try(
+                sql.delete_thread(tx, id) |> result.map_error(query_error),
+              )
+              let tombstoned =
+                ws_rows.rows
+                |> list.map(fn(row) {
+                  store.TombstonedWorkspace(
+                    id: row.id,
+                    root: row.root,
+                    rel_path: row.rel_path,
+                  )
+                })
+                |> list.sort(fn(a, b) { string.compare(a.id, b.id) })
+              Ok(#(tombstoned, subtree_ids))
+            }
+          }
+        })
+        |> result.map_error(transaction_error)
+      case outcome {
+        Ok(#(tombstoned, subtree_ids)) -> {
+          let persisted =
+            list.fold([id, ..subtree_ids], state.persisted, fn(acc, sid) {
+              dict.delete(acc, sid)
+            })
+          process.send(reply, Ok(tombstoned))
+          actor.continue(State(..state, persisted: persisted))
+        }
+        Error(error) -> {
+          process.send(reply, Error(error))
+          actor.continue(state)
+        }
+      }
     }
 
     PruneNeverUsed(reply) -> {
-      case sql.prune_never_used(state.db) {
-        Ok(returned) -> {
-          let ids =
-            returned.rows
-            |> list.map(fn(row) { row.id })
-            |> list.sort(string.compare)
+      // Lock candidates FOR UPDATE, tombstone their workspaces, then delete
+      // the locked threads — sequential statements in ONE transaction so
+      // ON DELETE SET NULL never races setting deleted_at.
+      let outcome =
+        pog.transaction(state.db, fn(tx) {
+          use candidates <- result.try(
+            sql.select_never_used_threads(tx) |> result.map_error(query_error),
+          )
+          let candidate_ids = list.map(candidates.rows, fn(row) { row.id })
+          case candidate_ids {
+            [] -> Ok([])
+            _ -> {
+              use _ <- result.try(
+                sql.tombstone_workspaces_for_threads(tx, candidate_ids)
+                |> result.map_error(query_error),
+              )
+              use deleted <- result.try(
+                sql.prune_never_used(tx, candidate_ids)
+                |> result.map_error(query_error),
+              )
+              Ok(
+                deleted.rows
+                |> list.map(fn(row) { row.id })
+                |> list.sort(string.compare),
+              )
+            }
+          }
+        })
+        |> result.map_error(transaction_error)
+      case outcome {
+        Ok(ids) -> {
           // Same bookkeeping as DeleteThread: a pruned row is gone, so
           // its persisted-length watermark must not survive it.
           let persisted =
@@ -645,7 +769,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           actor.continue(State(..state, persisted: persisted))
         }
         Error(error) -> {
-          process.send(reply, Error(query_error(error)))
+          process.send(reply, Error(error))
           actor.continue(state)
         }
       }
@@ -841,7 +965,29 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
     }
 
     DeleteBot(id, reply) -> {
-      process.send(reply, update(sql.delete_bot(state.db, id)))
+      let outcome =
+        pog.transaction(state.db, fn(tx) {
+          use ws_rows <- result.try(
+            sql.tombstone_bot_workspaces(tx, id)
+            |> result.map_error(query_error),
+          )
+          use _ <- result.try(
+            sql.delete_bot(tx, id) |> result.map_error(query_error),
+          )
+          Ok(
+            ws_rows.rows
+            |> list.map(fn(row) {
+              store.TombstonedWorkspace(
+                id: row.id,
+                root: row.root,
+                rel_path: row.rel_path,
+              )
+            })
+            |> list.sort(fn(a, b) { string.compare(a.id, b.id) }),
+          )
+        })
+        |> result.map_error(transaction_error)
+      process.send(reply, outcome)
       actor.continue(state)
     }
 
@@ -983,6 +1129,49 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
         Error(error) -> Error(query_error(error))
       }
       process.send(reply, deleted)
+      actor.continue(state)
+    }
+
+    ListDeletedWorkspaces(reply) -> {
+      let result = case sql.list_deleted_workspaces(state.db) {
+        Ok(returned) ->
+          Ok(
+            list.map(returned.rows, fn(row) {
+              store.TombstonedWorkspace(
+                id: row.id,
+                root: row.root,
+                rel_path: row.rel_path,
+              )
+            }),
+          )
+        Error(error) -> Error(query_error(error))
+      }
+      process.send(reply, result)
+      actor.continue(state)
+    }
+
+    DeleteWorkspace(id, reply) -> {
+      process.send(reply, update(sql.delete_workspace(state.db, id)))
+      actor.continue(state)
+    }
+
+    InsertWorkspace(workspace, reply) -> {
+      let result =
+        sql.insert_workspace(
+          state.db,
+          workspace.id,
+          store.workspace_kind_to_string(workspace.kind),
+          workspace.root,
+          workspace.rel_path,
+          option.unwrap(workspace.thread_id, ""),
+          option.unwrap(workspace.bot_id, ""),
+          int.to_float(workspace.created_at),
+          option.unwrap(workspace.last_used_at, 0),
+          option.unwrap(workspace.deleted_at, 0),
+        )
+        |> result.map(fn(_) { Nil })
+        |> result.map_error(query_error)
+      process.send(reply, result)
       actor.continue(state)
     }
   }
@@ -1208,6 +1397,12 @@ fn stored_summary_from_row(
         // entries.
         toolset: entries,
         workspace_root: row.workspace_root,
+        workspaces: thread_workspaces_from_row(
+          row.workspace_id,
+          row.workspace_rel_path,
+          row.tmp_workspace_id,
+          row.tmp_rel_path,
+        ),
         roster: option.None,
         last_active_at: row.last_active_s,
         // The column already counts the system prompt (Phase 1
@@ -1371,6 +1566,39 @@ fn message_row_from_row(row: sql.LoadMessagesRow) -> store.MessageRow {
   }
 }
 
+fn thread_workspaces_from_row(
+  workspace_id: option.Option(String),
+  workspace_rel_path: String,
+  tmp_workspace_id: option.Option(String),
+  tmp_rel_path: String,
+) -> option.Option(store.ThreadWorkspaces) {
+  case workspace_id, workspace_rel_path {
+    Some(id), rel if rel != "" ->
+      Some(
+        store.ThreadWorkspaces(
+          workspace_id: id,
+          rel_path: rel,
+          tmp_id: case tmp_workspace_id, tmp_rel_path {
+            Some(tid), trel if trel != "" -> Some(tid)
+            _, _ -> None
+          },
+          tmp_rel_path: case tmp_workspace_id, tmp_rel_path {
+            Some(_), trel if trel != "" -> Some(trel)
+            _, _ -> None
+          },
+        ),
+      )
+    _, _ -> None
+  }
+}
+
+fn transaction_error(error: pog.TransactionError(String)) -> String {
+  case error {
+    pog.TransactionQueryError(query_err) -> query_error(query_err)
+    pog.TransactionRolledBack(message) -> message
+  }
+}
+
 fn title_source(text: String) -> thread.TitleSource {
   case text {
     "manual" -> thread.ManualTitle
@@ -1452,4 +1680,5 @@ pub fn boot_sweeps(cfg: Config, db: store.Store) -> Nil {
           ])
       }
   }
+  workspace_gc.sweep(db)
 }

@@ -6,24 +6,30 @@
 -- as ONE json text — the entries a dormant thread rehydrates its
 -- runner bundle from, without contacting any server.
 select
-  id,
-  provider_id,
-  title,
-  title_source,
-  model,
-  pinned,
-  (archived_at is not null) as archived,
-  tags,
-  tags_manual,
-  tags_source,
+  thread.id,
+  thread.provider_id,
+  thread.title,
+  thread.title_source,
+  thread.model,
+  thread.pinned,
+  (thread.archived_at is not null) as archived,
+  thread.tags,
+  thread.tags_manual,
+  thread.tags_source,
   (select coalesce(json_agg(row_to_json(e) order by e.seq), '[]'::json)::text
      from thread_toolset e
     where e.thread_id = thread.id) as toolset,
-  bot_id,
-  workspace_root,
-  parent_thread_id,
-  extract(epoch from created_at)::int8 as created_s,
-  extract(epoch from last_active_at)::int8 as last_active_s,
-  message_count
+  thread.bot_id,
+  thread.workspace_root,
+  thread.workspace_id,
+  coalesce(w.rel_path, '') as workspace_rel_path,
+  thread.tmp_workspace_id,
+  coalesce(tw.rel_path, '') as tmp_rel_path,
+  thread.parent_thread_id,
+  extract(epoch from thread.created_at)::int8 as created_s,
+  extract(epoch from thread.last_active_at)::int8 as last_active_s,
+  thread.message_count
 from thread
-order by id
+left join workspace w on w.id = thread.workspace_id
+left join workspace tw on tw.id = thread.tmp_workspace_id
+order by thread.id

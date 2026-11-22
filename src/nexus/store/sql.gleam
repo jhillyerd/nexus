@@ -547,8 +547,9 @@ delete from provider where id = $1
   |> pog.execute(db)
 }
 
-/// Runs the `delete_thread` query
-/// defined in `./src/nexus/store/sql/delete_thread.sql`.
+/// Hard-delete a thread (cascading its channel subtree and messages).
+/// Run inside a transaction after tombstoning owned workspaces so
+/// ON DELETE SET NULL never overlaps with setting deleted_at.
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
@@ -559,7 +560,36 @@ pub fn delete_thread(
 ) -> Result(pog.Returned(Nil), pog.QueryError) {
   let decoder = decode.map(decode.dynamic, fn(_) { Nil })
 
-  "delete from thread where id = $1
+  "-- Hard-delete a thread (cascading its channel subtree and messages).
+-- Run inside a transaction after tombstoning owned workspaces so
+-- ON DELETE SET NULL never overlaps with setting deleted_at.
+delete from thread where id = $1
+"
+  |> pog.query
+  |> pog.parameter(pog.text(id))
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
+/// Hard-delete one tombstoned workspace row after its directory has been
+/// removed on disk (or confirmed absent). Scoped to `deleted_at is not null`
+/// so GC can never drop a live workspace row.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn delete_workspace(
+  db: pog.Connection,
+  id: String,
+) -> Result(pog.Returned(Nil), pog.QueryError) {
+  let decoder = decode.map(decode.dynamic, fn(_) { Nil })
+
+  "-- Hard-delete one tombstoned workspace row after its directory has been
+-- removed on disk (or confirmed absent). Scoped to `deleted_at is not null`
+-- so GC can never drop a live workspace row.
+delete from workspace
+where id = $1
+  and deleted_at is not null
 "
   |> pog.query
   |> pog.parameter(pog.text(id))
@@ -799,6 +829,10 @@ pub type GetThreadRow {
     toolset: String,
     bot_id: Option(String),
     workspace_root: Option(String),
+    workspace_id: Option(String),
+    workspace_rel_path: String,
+    tmp_workspace_id: Option(String),
+    tmp_rel_path: String,
     parent_thread_id: Option(String),
     created_s: Int,
     last_active_s: Int,
@@ -821,7 +855,7 @@ pub type GetThreadRow {
 ///
 pub fn get_thread(
   db: pog.Connection,
-  id: String,
+  thread_id: String,
 ) -> Result(pog.Returned(GetThreadRow), pog.QueryError) {
   let decoder = {
     use id <- decode.field(0, decode.string)
@@ -838,10 +872,14 @@ pub fn get_thread(
     use toolset <- decode.field(11, decode.string)
     use bot_id <- decode.field(12, decode.optional(decode.string))
     use workspace_root <- decode.field(13, decode.optional(decode.string))
-    use parent_thread_id <- decode.field(14, decode.optional(decode.string))
-    use created_s <- decode.field(15, decode.int)
-    use last_active_s <- decode.field(16, decode.int)
-    use message_count <- decode.field(17, decode.int)
+    use workspace_id <- decode.field(14, decode.optional(decode.string))
+    use workspace_rel_path <- decode.field(15, decode.string)
+    use tmp_workspace_id <- decode.field(16, decode.optional(decode.string))
+    use tmp_rel_path <- decode.field(17, decode.string)
+    use parent_thread_id <- decode.field(18, decode.optional(decode.string))
+    use created_s <- decode.field(19, decode.int)
+    use last_active_s <- decode.field(20, decode.int)
+    use message_count <- decode.field(21, decode.int)
     decode.success(GetThreadRow(
       id:,
       provider_id:,
@@ -857,6 +895,10 @@ pub fn get_thread(
       toolset:,
       bot_id:,
       workspace_root:,
+      workspace_id:,
+      workspace_rel_path:,
+      tmp_workspace_id:,
+      tmp_rel_path:,
       parent_thread_id:,
       created_s:,
       last_active_s:,
@@ -874,31 +916,37 @@ pub fn get_thread(
 -- ordered entries hydration replays through the config-independent
 -- catalog ∪ foreign mounts, NEVER contacting the server.
 select
-  id,
-  provider_id,
-  title,
-  title_source,
-  model,
-  system_prompt,
-  pinned,
-  (archived_at is not null) as archived,
-  tags,
-  tags_manual,
-  tags_source,
+  thread.id,
+  thread.provider_id,
+  thread.title,
+  thread.title_source,
+  thread.model,
+  thread.system_prompt,
+  thread.pinned,
+  (thread.archived_at is not null) as archived,
+  thread.tags,
+  thread.tags_manual,
+  thread.tags_source,
   (select coalesce(json_agg(row_to_json(e) order by e.seq), '[]'::json)::text
      from thread_toolset e
     where e.thread_id = thread.id) as toolset,
-  bot_id,
-  workspace_root,
-  parent_thread_id,
-  extract(epoch from created_at)::int8 as created_s,
-  extract(epoch from last_active_at)::int8 as last_active_s,
-  message_count
+  thread.bot_id,
+  thread.workspace_root,
+  thread.workspace_id,
+  coalesce(w.rel_path, '') as workspace_rel_path,
+  thread.tmp_workspace_id,
+  coalesce(tw.rel_path, '') as tmp_rel_path,
+  thread.parent_thread_id,
+  extract(epoch from thread.created_at)::int8 as created_s,
+  extract(epoch from thread.last_active_at)::int8 as last_active_s,
+  thread.message_count
 from thread
-where id = $1
+left join workspace w on w.id = thread.workspace_id
+left join workspace tw on tw.id = thread.tmp_workspace_id
+where thread.id = $1
 "
   |> pog.query
-  |> pog.parameter(pog.text(id))
+  |> pog.parameter(pog.text(thread_id))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }
@@ -1186,6 +1234,10 @@ values ($1, $2, $3, nullif($4, ''::bytea), $5, $6, $7, to_timestamp($8), to_time
 /// tags_manual is '{}' literally and tags_source is left to its column
 /// default 'auto' (utility-tags plan §3.5): a new thread has no tags and
 /// an open auto path.
+/// workspace_id ($17), tmp_workspace_id ($18), workspace_rel_path ($19),
+/// and tmp_rel_path ($20) persist the thread's managed workspace rows
+/// atomically with the thread row ('' sentinels insert NULL / skip workspace
+/// rows).
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
@@ -1208,6 +1260,10 @@ pub fn insert_thread(
   arg_14: String,
   arg_15: Int,
   arg_16: String,
+  w_id: String,
+  arg_18: String,
+  arg_19: String,
+  arg_20: String,
 ) -> Result(pog.Returned(Nil), pog.QueryError) {
   let decoder = decode.map(decode.dynamic, fn(_) { Nil })
 
@@ -1232,10 +1288,37 @@ pub fn insert_thread(
 -- tags_manual is '{}' literally and tags_source is left to its column
 -- default 'auto' (utility-tags plan §3.5): a new thread has no tags and
 -- an open auto path.
+-- workspace_id ($17), tmp_workspace_id ($18), workspace_rel_path ($19),
+-- and tmp_rel_path ($20) persist the thread's managed workspace rows
+-- atomically with the thread row ('' sentinels insert NULL / skip workspace
+-- rows).
 with new_thread as (
-  insert into thread (id, provider_id, title, title_source, model, system_prompt, pinned, tags, tags_manual, created_at, last_active_at, message_count, bot_id, workspace_root, parent_thread_id)
-  values ($1, $2, $3, $4, $5, $6, $7, $8, '{}', to_timestamp($9), to_timestamp($9), $10, nullif($11, ''), nullif($13, ''), nullif($16, ''))
+  insert into thread (id, provider_id, title, title_source, model, system_prompt, pinned, tags, tags_manual, created_at, last_active_at, message_count, bot_id, workspace_root, parent_thread_id, workspace_id, tmp_workspace_id)
+  values ($1, $2, $3, $4, $5, $6, $7, $8, '{}', to_timestamp($9), to_timestamp($9), $10, nullif($11, ''), nullif($13, ''), nullif($16, ''), nullif($17, ''), nullif($18, ''))
   returning id
+),
+ws_main as (
+  insert into workspace (id, kind, root, rel_path, thread_id, bot_id, created_at)
+  select $17, 'thread', $13, $19, new_thread.id, null, to_timestamp($9)
+  from new_thread
+  where $17 <> ''
+    and $13 <> ''
+    and $19 <> ''
+    -- Linking to an existing live bot workspace skips inserting a new
+    -- 'thread' row while keeping workspace_pkey strict for duplicate
+    -- thread workspaces or tombstoned rows.
+    and not exists (
+      select 1 from workspace w
+      where w.id = $17
+        and w.kind = 'bot'
+        and w.deleted_at is null
+    )
+),
+ws_tmp as (
+  insert into workspace (id, kind, root, rel_path, thread_id, bot_id, created_at)
+  select $18, 'tmp', $13, $20, new_thread.id, null, to_timestamp($9)
+  from new_thread
+  where $18 <> '' and $13 <> '' and $20 <> ''
 ),
 manifest as (
   insert into thread_toolset (thread_id, seq, name, description, schema_json)
@@ -1278,6 +1361,63 @@ on conflict (thread_id, seq) do nothing
   |> pog.parameter(pog.text(arg_14))
   |> pog.parameter(pog.int(arg_15))
   |> pog.parameter(pog.text(arg_16))
+  |> pog.parameter(pog.text(w_id))
+  |> pog.parameter(pog.text(arg_18))
+  |> pog.parameter(pog.text(arg_19))
+  |> pog.parameter(pog.text(arg_20))
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
+/// Insert a managed workspace row directly (used for standalone/shared
+/// workspaces and crash-recovery fixtures). Empty-string sentinels for
+/// thread_id / bot_id insert NULL; 0 sentinels for last_used_at / deleted_at
+/// insert NULL.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn insert_workspace(
+  db: pog.Connection,
+  arg_1: String,
+  arg_2: String,
+  arg_3: String,
+  arg_4: String,
+  arg_5: String,
+  arg_6: String,
+  arg_7: Float,
+  arg_8: Int,
+  arg_9: Int,
+) -> Result(pog.Returned(Nil), pog.QueryError) {
+  let decoder = decode.map(decode.dynamic, fn(_) { Nil })
+
+  "-- Insert a managed workspace row directly (used for standalone/shared
+-- workspaces and crash-recovery fixtures). Empty-string sentinels for
+-- thread_id / bot_id insert NULL; 0 sentinels for last_used_at / deleted_at
+-- insert NULL.
+insert into workspace (id, kind, root, rel_path, thread_id, bot_id, created_at, last_used_at, deleted_at)
+values (
+  $1,
+  $2,
+  $3,
+  $4,
+  nullif($5, ''),
+  nullif($6, ''),
+  to_timestamp($7),
+  to_timestamp(nullif($8, 0::bigint)),
+  to_timestamp(nullif($9, 0::bigint))
+)
+"
+  |> pog.query
+  |> pog.parameter(pog.text(arg_1))
+  |> pog.parameter(pog.text(arg_2))
+  |> pog.parameter(pog.text(arg_3))
+  |> pog.parameter(pog.text(arg_4))
+  |> pog.parameter(pog.text(arg_5))
+  |> pog.parameter(pog.text(arg_6))
+  |> pog.parameter(pog.float(arg_7))
+  |> pog.parameter(pog.int(arg_8))
+  |> pog.parameter(pog.int(arg_9))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }
@@ -1358,6 +1498,47 @@ select
   extract(epoch from updated_at)::int8 as updated_s
 from bot
 order by id
+"
+  |> pog.query
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
+/// A row you get from running the `list_deleted_workspaces` query
+/// defined in `./src/nexus/store/sql/list_deleted_workspaces.sql`.
+///
+/// > 🐿️ This type definition was generated automatically using v4.7.0 of the
+/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub type ListDeletedWorkspacesRow {
+  ListDeletedWorkspacesRow(id: String, root: String, rel_path: String)
+}
+
+/// Pending disk GC rows: every tombstoned workspace awaiting guarded recursive
+/// removal on disk, oldest tombstone first.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn list_deleted_workspaces(
+  db: pog.Connection,
+) -> Result(pog.Returned(ListDeletedWorkspacesRow), pog.QueryError) {
+  let decoder = {
+    use id <- decode.field(0, decode.string)
+    use root <- decode.field(1, decode.string)
+    use rel_path <- decode.field(2, decode.string)
+    decode.success(ListDeletedWorkspacesRow(id:, root:, rel_path:))
+  }
+
+  "-- Pending disk GC rows: every tombstoned workspace awaiting guarded recursive
+-- removal on disk, oldest tombstone first.
+select
+  id,
+  root,
+  rel_path
+from workspace
+where deleted_at is not null
+order by deleted_at asc, id asc
 "
   |> pog.query
   |> pog.returning(decoder)
@@ -1593,6 +1774,10 @@ pub type ListSummariesRow {
     toolset: String,
     bot_id: Option(String),
     workspace_root: Option(String),
+    workspace_id: Option(String),
+    workspace_rel_path: String,
+    tmp_workspace_id: Option(String),
+    tmp_rel_path: String,
     parent_thread_id: Option(String),
     created_s: Int,
     last_active_s: Int,
@@ -1628,10 +1813,14 @@ pub fn list_summaries(
     use toolset <- decode.field(10, decode.string)
     use bot_id <- decode.field(11, decode.optional(decode.string))
     use workspace_root <- decode.field(12, decode.optional(decode.string))
-    use parent_thread_id <- decode.field(13, decode.optional(decode.string))
-    use created_s <- decode.field(14, decode.int)
-    use last_active_s <- decode.field(15, decode.int)
-    use message_count <- decode.field(16, decode.int)
+    use workspace_id <- decode.field(13, decode.optional(decode.string))
+    use workspace_rel_path <- decode.field(14, decode.string)
+    use tmp_workspace_id <- decode.field(15, decode.optional(decode.string))
+    use tmp_rel_path <- decode.field(16, decode.string)
+    use parent_thread_id <- decode.field(17, decode.optional(decode.string))
+    use created_s <- decode.field(18, decode.int)
+    use last_active_s <- decode.field(19, decode.int)
+    use message_count <- decode.field(20, decode.int)
     decode.success(ListSummariesRow(
       id:,
       provider_id:,
@@ -1646,6 +1835,10 @@ pub fn list_summaries(
       toolset:,
       bot_id:,
       workspace_root:,
+      workspace_id:,
+      workspace_rel_path:,
+      tmp_workspace_id:,
+      tmp_rel_path:,
       parent_thread_id:,
       created_s:,
       last_active_s:,
@@ -1661,27 +1854,33 @@ pub fn list_summaries(
 -- as ONE json text — the entries a dormant thread rehydrates its
 -- runner bundle from, without contacting any server.
 select
-  id,
-  provider_id,
-  title,
-  title_source,
-  model,
-  pinned,
-  (archived_at is not null) as archived,
-  tags,
-  tags_manual,
-  tags_source,
+  thread.id,
+  thread.provider_id,
+  thread.title,
+  thread.title_source,
+  thread.model,
+  thread.pinned,
+  (thread.archived_at is not null) as archived,
+  thread.tags,
+  thread.tags_manual,
+  thread.tags_source,
   (select coalesce(json_agg(row_to_json(e) order by e.seq), '[]'::json)::text
      from thread_toolset e
     where e.thread_id = thread.id) as toolset,
-  bot_id,
-  workspace_root,
-  parent_thread_id,
-  extract(epoch from created_at)::int8 as created_s,
-  extract(epoch from last_active_at)::int8 as last_active_s,
-  message_count
+  thread.bot_id,
+  thread.workspace_root,
+  thread.workspace_id,
+  coalesce(w.rel_path, '') as workspace_rel_path,
+  thread.tmp_workspace_id,
+  coalesce(tw.rel_path, '') as tmp_rel_path,
+  thread.parent_thread_id,
+  extract(epoch from thread.created_at)::int8 as created_s,
+  extract(epoch from thread.last_active_at)::int8 as last_active_s,
+  thread.message_count
 from thread
-order by id
+left join workspace w on w.id = thread.workspace_id
+left join workspace tw on tw.id = thread.tmp_workspace_id
+order by thread.id
 "
   |> pog.query
   |> pog.returning(decoder)
@@ -1802,71 +2001,65 @@ pub type PruneNeverUsedRow {
   PruneNeverUsedRow(id: String)
 }
 
-/// Boot sweep: hard-delete never-used threads older than the grace
-/// window, in ONE statement (bounded startup work — the registry runs
-/// this inside its actor-initialiser deadline).
-///
-/// Never-used = holds nothing but the frozen system prompt
-/// (message_count <= 1 — the same "no user message yet" rule the send
-/// paths use for auto-titling) PLUS, for environment threads, the
-/// creation-time roster row (workspace_root IS NOT NULL AND
-/// message_count <= 2 — the row exists from creation and the first send
-/// takes the count to >= 3; without the second arm an abandoned empty
-/// env thread would never be swept), never titled
-/// (title_source 'auto'; a manual rename is intent and survives), never
-/// pinned (also intent). Archived or not: an archived empty is still
-/// litter.
-///
-/// The grace window protects a thread another concurrently-running
-/// server created moments ago and still holds live — it stays empty
-/// until its first turn commits. 15 minutes is far past any first turn.
-///
-/// Parents with channel children are NEVER swept: the FK's CASCADE
-/// would take the channels' committed history with them — a parent
-/// looks never-used until its first turn commits, so a crash
-/// mid-first-turn plus a restart after the grace window is exactly the
-/// state where an old parent row still hangs a channel with durable
-/// transcripts. The child check reads the same table CASCADE would
-/// delete from.
+/// Delete locked never-used candidate thread ids inside the boot-prune
+/// transaction, after their workspaces have been tombstoned.
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
 ///
 pub fn prune_never_used(
   db: pog.Connection,
+  arg_1: List(String),
 ) -> Result(pog.Returned(PruneNeverUsedRow), pog.QueryError) {
   let decoder = {
     use id <- decode.field(0, decode.string)
     decode.success(PruneNeverUsedRow(id:))
   }
 
-  "-- Boot sweep: hard-delete never-used threads older than the grace
--- window, in ONE statement (bounded startup work — the registry runs
--- this inside its actor-initialiser deadline).
---
--- Never-used = holds nothing but the frozen system prompt
--- (message_count <= 1 — the same \"no user message yet\" rule the send
--- paths use for auto-titling) PLUS, for environment threads, the
--- creation-time roster row (workspace_root IS NOT NULL AND
--- message_count <= 2 — the row exists from creation and the first send
--- takes the count to >= 3; without the second arm an abandoned empty
--- env thread would never be swept), never titled
--- (title_source 'auto'; a manual rename is intent and survives), never
--- pinned (also intent). Archived or not: an archived empty is still
--- litter.
---
--- The grace window protects a thread another concurrently-running
--- server created moments ago and still holds live — it stays empty
--- until its first turn commits. 15 minutes is far past any first turn.
---
--- Parents with channel children are NEVER swept: the FK's CASCADE
--- would take the channels' committed history with them — a parent
--- looks never-used until its first turn commits, so a crash
--- mid-first-turn plus a restart after the grace window is exactly the
--- state where an old parent row still hangs a channel with durable
--- transcripts. The child check reads the same table CASCADE would
--- delete from.
+  "-- Delete locked never-used candidate thread ids inside the boot-prune
+-- transaction, after their workspaces have been tombstoned.
 delete from thread
+where id = any($1::text[])
+returning id
+"
+  |> pog.query
+  |> pog.parameter(pog.array(fn(value) { pog.text(value) }, arg_1))
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
+/// A row you get from running the `select_never_used_threads` query
+/// defined in `./src/nexus/store/sql/select_never_used_threads.sql`.
+///
+/// > 🐿️ This type definition was generated automatically using v4.7.0 of the
+/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub type SelectNeverUsedThreadsRow {
+  SelectNeverUsedThreadsRow(id: String)
+}
+
+/// Select never-used threads older than the 15-minute grace window for boot
+/// pruning, locking matching rows for update inside the caller's transaction.
+/// Parents with channel children are excluded so CASCADE cannot take a
+/// child's committed history.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn select_never_used_threads(
+  db: pog.Connection,
+) -> Result(pog.Returned(SelectNeverUsedThreadsRow), pog.QueryError) {
+  let decoder = {
+    use id <- decode.field(0, decode.string)
+    decode.success(SelectNeverUsedThreadsRow(id:))
+  }
+
+  "-- Select never-used threads older than the 15-minute grace window for boot
+-- pruning, locking matching rows for update inside the caller's transaction.
+-- Parents with channel children are excluded so CASCADE cannot take a
+-- child's committed history.
+select id
+from thread
 where (message_count <= 1 or (workspace_root is not null and message_count <= 2))
   and title_source = 'auto'
   and pinned = false
@@ -1874,9 +2067,54 @@ where (message_count <= 1 or (workspace_root is not null and message_count <= 2)
   and not exists (
     select 1 from thread c where c.parent_thread_id = thread.id
   )
-returning id
+order by id
+for update
 "
   |> pog.query
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
+/// A row you get from running the `select_thread_subtree` query
+/// defined in `./src/nexus/store/sql/select_thread_subtree.sql`.
+///
+/// > 🐿️ This type definition was generated automatically using v4.7.0 of the
+/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub type SelectThreadSubtreeRow {
+  SelectThreadSubtreeRow(id: String)
+}
+
+/// Return a thread and all of its cascaded channel descendants, ordered by id.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn select_thread_subtree(
+  db: pog.Connection,
+  id: String,
+) -> Result(pog.Returned(SelectThreadSubtreeRow), pog.QueryError) {
+  let decoder = {
+    use id <- decode.field(0, decode.string)
+    decode.success(SelectThreadSubtreeRow(id:))
+  }
+
+  "-- Return a thread and all of its cascaded channel descendants, ordered by id.
+with recursive subtree as (
+  select id
+  from thread
+  where id = $1
+  union all
+  select child.id
+  from thread child
+  join subtree s on child.parent_thread_id = s.id
+)
+select id
+from subtree
+order by id
+"
+  |> pog.query
+  |> pog.parameter(pog.text(id))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }
@@ -1954,6 +2192,132 @@ where id = $2
   |> pog.query
   |> pog.parameter(pog.text(arg_1))
   |> pog.parameter(pog.text(id))
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
+/// A row you get from running the `tombstone_bot_workspaces` query
+/// defined in `./src/nexus/store/sql/tombstone_bot_workspaces.sql`.
+///
+/// > 🐿️ This type definition was generated automatically using v4.7.0 of the
+/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub type TombstoneBotWorkspacesRow {
+  TombstoneBotWorkspacesRow(id: String, root: String, rel_path: String)
+}
+
+/// Tombstone any live shared bot workspace owned by this bot that no thread
+/// currently references, clearing bot_id = NULL so the subsequent DELETE FROM
+/// bot triggers no overlapping ON DELETE SET NULL update. Bot workspaces
+/// still referenced by any thread remain live so deleting the bot clears
+/// bot_id and lets the last referencing thread's delete tombstone them.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn tombstone_bot_workspaces(
+  db: pog.Connection,
+  w_bot_id: String,
+) -> Result(pog.Returned(TombstoneBotWorkspacesRow), pog.QueryError) {
+  let decoder = {
+    use id <- decode.field(0, decode.string)
+    use root <- decode.field(1, decode.string)
+    use rel_path <- decode.field(2, decode.string)
+    decode.success(TombstoneBotWorkspacesRow(id:, root:, rel_path:))
+  }
+
+  "-- Tombstone any live shared bot workspace owned by this bot that no thread
+-- currently references, clearing bot_id = NULL so the subsequent DELETE FROM
+-- bot triggers no overlapping ON DELETE SET NULL update. Bot workspaces
+-- still referenced by any thread remain live so deleting the bot clears
+-- bot_id and lets the last referencing thread's delete tombstone them.
+update workspace w
+set deleted_at = now(),
+    bot_id = null
+where w.kind = 'bot'
+  and w.bot_id = $1
+  and w.deleted_at is null
+  and not exists (
+    select 1 from thread t
+    where t.workspace_id = w.id
+  )
+returning w.id, w.root, w.rel_path
+"
+  |> pog.query
+  |> pog.parameter(pog.text(w_bot_id))
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
+/// A row you get from running the `tombstone_workspaces_for_threads` query
+/// defined in `./src/nexus/store/sql/tombstone_workspaces_for_threads.sql`.
+///
+/// > 🐿️ This type definition was generated automatically using v4.7.0 of the
+/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub type TombstoneWorkspacesForThreadsRow {
+  TombstoneWorkspacesForThreadsRow(id: String, root: String, rel_path: String)
+}
+
+/// Tombstone every owned workspace ('thread', 'tmp') belonging to the given
+/// thread ids, plus any orphaned ('bot', bot_id IS NULL) workspace whose only
+/// remaining referencing threads are in the same set. Clears thread_id = NULL
+/// on owned rows so a subsequent DELETE FROM thread triggers no overlapping
+/// ON DELETE SET NULL update on those rows.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn tombstone_workspaces_for_threads(
+  db: pog.Connection,
+  arg_1: List(String),
+) -> Result(pog.Returned(TombstoneWorkspacesForThreadsRow), pog.QueryError) {
+  let decoder = {
+    use id <- decode.field(0, decode.string)
+    use root <- decode.field(1, decode.string)
+    use rel_path <- decode.field(2, decode.string)
+    decode.success(TombstoneWorkspacesForThreadsRow(id:, root:, rel_path:))
+  }
+
+  "-- Tombstone every owned workspace ('thread', 'tmp') belonging to the given
+-- thread ids, plus any orphaned ('bot', bot_id IS NULL) workspace whose only
+-- remaining referencing threads are in the same set. Clears thread_id = NULL
+-- on owned rows so a subsequent DELETE FROM thread triggers no overlapping
+-- ON DELETE SET NULL update on those rows.
+update workspace w
+set deleted_at = now(),
+    thread_id = case when w.kind in ('thread', 'tmp') then null else w.thread_id end
+where w.deleted_at is null
+  and (
+    (
+      w.kind in ('thread', 'tmp')
+      and (
+        w.thread_id = any($1::text[])
+        or w.id in (
+          select workspace_id from thread where id = any($1::text[]) and workspace_id is not null
+        )
+        or w.id in (
+          select tmp_workspace_id from thread where id = any($1::text[]) and tmp_workspace_id is not null
+        )
+      )
+    )
+    or (
+      w.kind = 'bot'
+      and w.bot_id is null
+      and w.id in (
+        select workspace_id from thread where id = any($1::text[]) and workspace_id is not null
+      )
+      and not exists (
+        select 1 from thread t
+        where t.workspace_id = w.id
+          and not (t.id = any($1::text[]))
+      )
+    )
+  )
+returning w.id, w.root, w.rel_path
+"
+  |> pog.query
+  |> pog.parameter(pog.array(fn(value) { pog.text(value) }, arg_1))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }

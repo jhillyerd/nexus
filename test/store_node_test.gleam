@@ -43,6 +43,7 @@ fn seed_thread(seam: store.Store, id: String) -> Nil {
         last_active_at: 1_700_000_000,
         toolset: [],
         workspace_root: None,
+        workspaces: None,
         roster: None,
         message_count: 1,
       ),

@@ -66,6 +66,7 @@ import nexus/tools
 import nexus/transcript.{type Transcript}
 import nexus/utility
 import nexus/web_fetch_cache
+import nexus/workspace_gc
 
 /// The factory's child-start argument: everything needed to (re)start one
 /// thread actor identically.
@@ -691,6 +692,7 @@ fn stored_summary_with_id(id: String) -> StoredSummary {
     ),
     toolset: [],
     workspace_root: None,
+    workspaces: None,
     roster: None,
     last_active_at: 0,
     message_count: 0,
@@ -1140,6 +1142,20 @@ fn start_new_thread_bot(
             True -> state.cfg.workspace_root
             False -> None
           }
+          // Workspace-sandbox plan Phase 1: new env threads get managed
+          // `thread` (`threads/<id>`) and `tmp` (`tmp/<id>`) workspace rows
+          // persisted atomically with the thread row; directories on disk
+          // stay lazy until the first env tool call (`ensure_workspace`).
+          let workspaces = case workspace_root {
+            Some(_) ->
+              Some(store.ThreadWorkspaces(
+                workspace_id: "ws-thread-" <> id,
+                rel_path: "threads/" <> id,
+                tmp_id: Some("ws-tmp-" <> id),
+                tmp_rel_path: Some("tmp/" <> id),
+              ))
+            None -> None
+          }
           let transcript = transcript.new(alias, prompt)
           // The creation-time roster message (environments plan):
           // roster changes ride MESSAGES, never the envelope — a
@@ -1206,6 +1222,7 @@ fn start_new_thread_bot(
                 // Environments plan Phase 1: the frozen root (None =
                 // no env tools).
                 workspace_root: workspace_root,
+                workspaces: workspaces,
                 // The roster row rides the INSERT (persisted
                 // atomically — see StoredSummary.roster) so the
                 // write-behind watermark matches the stored rows.
@@ -1274,12 +1291,13 @@ fn start_new_thread_bot(
               commit_hook: commit_hook_for(state.store, id),
               transcript: transcript,
               hydrated: False,
-              // Fresh threads seed the roster from the FROZEN fact
-              // still in scope: an env thread starts with `workspace`
-              // attached, a plain thread with none.
-              roster: case workspace_root {
-                Some(_) -> env.attached_targets()
-                None -> []
+              // Fresh threads seed the roster from the FROZEN fact still in
+              // scope — gated on `persisted` (matching bot_id/delivery_toolset)
+              // so an unpersisted create with no durable workspace row never
+              // presents or runs local env tools against an untracked dir.
+              roster: case workspace_root, persisted {
+                Some(_), True -> env.attached_targets()
+                _, _ -> []
               },
               utility_apply: utility_apply_for(state.self, id),
               parent_thread_id: case requested.parent_thread_id, persisted {
@@ -1300,13 +1318,20 @@ fn start_new_thread_bot(
           // thread's runner closes over its FROZEN root + id. The two
           // wrappers compose (each passes the other's parameter
           // through untouched).
-          let spec = case workspace_root {
-            Some(root) ->
+          let spec = case workspace_root, persisted {
+            Some(root), True ->
               thread.ThreadSpec(
                 ..spec,
-                toolset: env_toolset(toolset, id, root, state.self, state.cfg),
+                toolset: env_toolset(
+                  toolset,
+                  id,
+                  root,
+                  option.map(workspaces, fn(ws) { ws.rel_path }),
+                  state.self,
+                  state.cfg,
+                ),
               )
-            None -> spec
+            _, _ -> spec
           }
           let spec = case persisted {
             // Every thread is bot-sourced now: a PERSISTED one wraps (the
@@ -1391,7 +1416,10 @@ fn start_new_thread_bot(
               let state = case persisted {
                 True ->
                   case state.store.delete_thread(id) {
-                    Ok(_) -> state
+                    Ok(tombstoned) -> {
+                      workspace_gc.cleanup_async(state.store, tombstoned)
+                      state
+                    }
                     Error(error) -> {
                       log_store_error("delete ghost thread " <> id, error)
                       state
@@ -1889,31 +1917,48 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
               process.send(reply, False)
               actor.continue(state)
             }
-            Ok(_) -> {
-              // Stop + kill every LIVE member (the parent's existing
-              // treatment, applied to each descendant: demonitor first
-              // so no DOWN can trigger a replacement — factory children
-              // are Temporary, only the registry restarts them — then
-              // the cancel-commit Stop, then the kill).
-              list.each(subtree, fn(sid) {
-                case dict.get(state.threads, sid) {
-                  Ok(record) -> {
-                    let _ = process.demonitor_process(record.monitor)
-                    // The archive notify's try_send discipline: a record
-                    // with a failed start or a queued DOWN has no owner
-                    // behind its named subject, and no liveness check
-                    // closes the check→send window (the actor can exit
-                    // between the two) — the send itself runs rescued,
-                    // so a dying descendant can never take THIS actor
-                    // down mid-delete (CodeRabbit PR review on #137).
-                    // The kill below is the real stop; Stop is the
-                    // graceful cancel-commit for live actors.
-                    let _ = try_send_named(record.name, thread.Stop)
-                    process.kill(record.pid)
+            Ok(tombstoned) -> {
+              // Stop + kill every LIVE member in the subtree. Ask `CancelTurn`
+              // BEFORE `process.kill` so an active unlinked turn worker actually
+              // receives its cancel signal and hands back its PID for disk GC
+              // to await before removing directories and dropping tombstones.
+              let #(worker_pids, uncertain_workers) =
+                list.fold(subtree, #([], False), fn(acc, sid) {
+                  let #(pids, uncertain) = acc
+                  case dict.get(state.threads, sid) {
+                    Ok(record) -> {
+                      let _ = process.demonitor_process(record.monitor)
+                      let #(next_pids, next_uncertain) = case
+                        try_ask_cancel_turn(record.name)
+                      {
+                        Ok(Some(worker)) -> #([worker, ..pids], uncertain)
+                        Ok(None) -> #(pids, uncertain)
+                        Error(Nil) -> #(pids, True)
+                      }
+                      process.kill(record.pid)
+                      #(next_pids, next_uncertain)
+                    }
+                    Error(_) -> acc
                   }
-                  Error(_) -> Nil
-                }
-              })
+                })
+              // Spawn guarded disk GC once cancelled workers have exited; if a
+              // live actor failed to answer `CancelTurn` within the bound, keep
+              // the tombstones for boot sweep rather than racing an unknown
+              // worker.
+              case uncertain_workers {
+                True ->
+                  log.warn(
+                    "registry",
+                    "deferring workspace cleanup to boot sweep: actor did not answer CancelTurn",
+                    [log.str("thread_id", id)],
+                  )
+                False ->
+                  workspace_gc.cleanup_async_after(
+                    state.store,
+                    tombstoned,
+                    worker_pids,
+                  )
+              }
               process.send(reply, True)
               actor.continue(
                 State(
@@ -2378,7 +2423,14 @@ fn lazy_start(state: State, summary: StoredSummary) -> Resolved {
           // changed or was removed (its files stay where they were).
           let resolved = case summary.workspace_root {
             Some(root) ->
-              env_toolset(resolved, summary.id, root, state.self, state.cfg)
+              env_toolset(
+                resolved,
+                summary.id,
+                root,
+                option.map(summary.workspaces, fn(ws) { ws.rel_path }),
+                state.self,
+                state.cfg,
+              )
             None -> resolved
           }
           // The delivery wrapper rides hydration too (bots P3c, #97): a
@@ -3477,6 +3529,7 @@ fn env_toolset(
   toolset: thread.Toolset,
   thread_id: String,
   workspace_root: String,
+  workspace_rel_path: Option(String),
   registry: Subject(Msg),
   cfg: Config,
 ) -> thread.Toolset {
@@ -3507,6 +3560,7 @@ fn env_toolset(
         Some(env.Environment(
           workspace_root: workspace_root,
           thread_id: thread_id,
+          workspace_rel_path: workspace_rel_path,
           roster: env.attached_targets(),
           remote: Some(router),
         )),
@@ -3702,6 +3756,20 @@ fn list_bots_ask(
 /// the owner (an instant `False` for a name nobody holds) and running
 /// the send under the catch-all turns every failure shape into "best
 /// not sent".
+/// Ask a live thread actor to cancel its in-flight turn and return the active
+/// worker's PID (if any). Returns `Ok(None)` when no process owns the name
+/// (already dead / failed start) or when the thread is idle; `Error(Nil)` if a
+/// live actor did not answer within the bounded timeout.
+fn try_ask_cancel_turn(
+  to: process.Name(thread.Msg),
+) -> Result(Option(Pid), Nil) {
+  let reply = process.new_subject()
+  case try_send_named(to, thread.CancelTurn(reply)) {
+    False -> Ok(None)
+    True -> process.receive(reply, 500)
+  }
+}
+
 fn try_send_named(to: process.Name(msg), msg: msg) -> Bool {
   case process.named(to) {
     Error(_) -> False
