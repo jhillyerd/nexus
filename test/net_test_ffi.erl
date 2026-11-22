@@ -3,7 +3,36 @@
 -module(net_test_ffi).
 
 -export([start_silent_listener/1, now_ms/0, gzip/1, gzip_corrupt/0,
-         gzip_cut/0, incompressible/1, zlib_wrap/1, deflate_raw/1]).
+         gzip_cut/0, incompressible/1, zlib_wrap/1, deflate_raw/1,
+         ensure_listener/2]).
+
+%% Idempotent mist-listener start for the offline loopback test services.
+%% gleeunit runs every test in a fresh process, so the `let _ = mist.start`
+%% idempotency pattern only works ONCE per module: a second mist.start on
+%% the already-bound port fails the glisten supervision cascade loudly
+%% enough to abort the whole eunit run. Memoize per port in
+%% persistent_term instead. Returns true when THIS call started the
+%% listener (so the caller can sleep before first use), false when it was
+%% already up. A start error leaves the memo unset so the next caller
+%% retries (loud, not silently swallowed).
+ensure_listener(Port, StartThunk) ->
+    Key = {nexus_test_listener_started, Port},
+    case persistent_term:get(Key, false) of
+        true ->
+            false;
+        false ->
+            case StartThunk() of
+                {ok, _} ->
+                    persistent_term:put(Key, true),
+                    true;
+                {error, Reason} ->
+                    %% A failed start must surface ITS reason: returning
+                    %% false would read as "already up", and every later
+                    %% test in the module would fail with a misleading
+                    %% connection-refused instead of the real diagnosis.
+                    error({listener_start_failed, Port, Reason})
+            end
+    end.
 
 %% A plain TCP listener that accepts and then never sends a byte. To an
 %% https:// client this is exactly the stalled-TLS-handshake wedge: the

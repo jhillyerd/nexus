@@ -1,21 +1,26 @@
-%% M3 tool-adapter FFI: bounded buffered GETs and host resolution for the
-%% http_fetch SSRF guard. Body size is enforced here (not in Gleam) so a
-%% multi-gigabyte response cannot be materialised before truncation.
+%% M3 tool-adapter FFI: bounded buffered requests and host resolution for
+%% the http_fetch / web_fetch SSRF guard. Body size is enforced here (not
+%% in Gleam) so a multi-gigabyte response cannot be materialised before
+%% truncation.
 -module(nexus_net_ffi).
 
--export([bounded_get/4, resolve_host/1, to_text_lossy/1, inflate_bounded/3]).
+-export([bounded_request/6, resolve_host/1, to_text_lossy/1,
+         inflate_bounded/3]).
 
-%% GET with connect/receive timeouts and a hard byte cap. Does NOT follow
-%% redirects (policy — including re-validating every hop against the SSRF
-%% guard — lives in nexus/http_fetch.gleam). Returns:
-%%   {ok, {Status, ContentType, Body, Truncated}} | {error, Reason}
-%% where ContentType is <<>> when absent and Truncated is true when the body
-%% was cut at MaxBytes.
-%%
-%% The whole hop runs under a HARD total deadline (see bounded_get/4): the
-%% whole call — TLS handshake included — must return to the caller within
-%% it. bounded_get_inner is the pre-deadline body, unchanged.
-bounded_get(Url, Headers, MaxBytes, TimeoutMs) ->
+%% Hard caps on the collected response-header set (context-window hygiene,
+%% not memory: hackney has already materialised the head by the time we see
+%% it). Pairs are counted as `name: value` bytes; a set that would cross
+%% either cap is cut and flagged so the model knows headers were dropped.
+-define(MAX_HEADER_PAIRS, 128).
+-define(MAX_HEADERS_BYTES, 8192).
+
+%% Method+body bounded request (Phase 5 curl upgrades,
+%% docs/plans/web-fetch.md): cap/deadline posture plus the full
+%% response-header set (lowercased, duplicates joined, capped) alongside
+%% the existing derived fields. The former bounded_get/4 GET wrapper was
+%% removed when net.gleam's fetch became a GET wrapper over
+%% bounded_request/6 — it had no remaining callers.
+bounded_request(Method, Url, Headers, Body, MaxBytes, TimeoutMs) ->
     %% Hard total deadline. hackney's {connect_timeout, T} bounds only the
     %% TCP stage: hackney 1.25's hackney_ssl:connect/4 then performs the
     %% TLS handshake with ssl:connect(Sock, Opts) — the two-argument form,
@@ -38,7 +43,8 @@ bounded_get(Url, Headers, MaxBytes, TimeoutMs) ->
     Owner = self(),
     Ref = make_ref(),
     Pid = spawn(fun() ->
-        Result = try bounded_get_inner(Url, Headers, MaxBytes, TimeoutMs) of
+        Result = try bounded_request_inner(Method, Url, Headers, Body,
+                                           MaxBytes, TimeoutMs) of
             Outcome -> Outcome
         catch
             Class:Reason -> {error, format_reason({Class, Reason})}
@@ -62,24 +68,121 @@ flush_result(Ref) ->
     after 0 -> ok
     end.
 
-bounded_get_inner(Url, Headers, MaxBytes, TimeoutMs) ->
+bounded_request_inner(Method, Url, Headers, Body, MaxBytes, TimeoutMs) ->
+    case method_atom(Method) of
+        {error, Reason} ->
+            {error, Reason};
+        {ok, MethodAtom} ->
+            do_bounded_request(MethodAtom, Url, Headers, Body, MaxBytes,
+                               TimeoutMs)
+    end.
+
+do_bounded_request(MethodAtom, Url, Headers, Body, MaxBytes, TimeoutMs) ->
     Opts = [{connect_timeout, TimeoutMs}, {recv_timeout, TimeoutMs}],
-    case hackney:request(get, Url, Headers, <<>>, Opts) of
+    case hackney:request(MethodAtom, Url, Headers, Body, Opts) of
+        %% Bodiless responses — HEAD requests, and 204/304 statuses — come
+        %% back WITHOUT a client ref (hackney closes the connection
+        %% itself): the body is empty by definition and nothing streams.
+        {ok, Status, RespHeaders} ->
+            {ok, make_fetch_response(Status, RespHeaders, Url, <<>>, false)};
         {ok, Status, RespHeaders, Client} ->
-            ContentType = header(RespHeaders, <<"content-type">>),
-            ContentEncoding =
-                string:lowercase(headers_joined(RespHeaders, <<"content-encoding">>)),
-            Location = header(RespHeaders, <<"location">>),
             case read_body(Client, MaxBytes, <<>>, false) of
-                {ok, Body, Truncated} ->
-                    {ok, {fetch_response, Status, ContentType, Location, Body,
-                          Truncated, Url, ContentEncoding}};
+                {ok, RespBody, Truncated} ->
+                    {ok, make_fetch_response(Status, RespHeaders, Url,
+                                             RespBody, Truncated)};
                 {error, Reason} ->
                     hackney:close(Client),
                     {error, format_reason(Reason)}
             end;
         {error, Reason} ->
             {error, format_reason(Reason)}
+    end.
+
+make_fetch_response(Status, RespHeaders, Url, RespBody, Truncated) ->
+    ContentType = header(RespHeaders, <<"content-type">>),
+    ContentEncoding =
+        string:lowercase(headers_joined(RespHeaders, <<"content-encoding">>)),
+    Location = header(RespHeaders, <<"location">>),
+    {RespHeaderList, HeadersTruncated} = collect_headers(RespHeaders),
+    {fetch_response, Status, ContentType, Location, RespBody, Truncated,
+     Url, ContentEncoding, RespHeaderList, HeadersTruncated}.
+
+%% Whitelist-map the method string to a hackney atom. The Gleam layer only
+%% produces the seven standard verbs (http.Method), but the FFI never
+%% trusts its caller: binary_to_atom on model-supplied bytes would mint
+%% atoms (atom-table exhaustion) and arbitrary verbs could smuggle
+%% request-splitting past the adapter — an unknown string is an error.
+method_atom(<<"GET">>) -> {ok, get};
+method_atom(<<"HEAD">>) -> {ok, head};
+method_atom(<<"POST">>) -> {ok, post};
+method_atom(<<"PUT">>) -> {ok, put};
+method_atom(<<"PATCH">>) -> {ok, patch};
+method_atom(<<"DELETE">>) -> {ok, delete};
+method_atom(<<"OPTIONS">>) -> {ok, options};
+method_atom(Other) ->
+    {error, <<"unsupported method: ", Other/binary>>}.
+
+%% The full response-header set as {LowercaseName, Value} pairs: names
+%% lowercased, duplicate names' values joined with ", " per RFC 9110 —
+%% which EXCLUDES set-cookie from combination (§5.2: cookie values legally
+%% embed commas, e.g. Expires=Wed, 21 Oct 2015 07:28:00 GMT, so joining
+%% would corrupt the cookie and it could not be split back) — first-seen
+%% order preserved, and the whole set capped at ?MAX_HEADER_PAIRS pairs /
+%% ?MAX_HEADERS_BYTES rendered bytes with Truncated=true when the cap cut
+%% it (the model sees headers_truncated and knows the tail was dropped).
+%% set-cookie pairs stay SEPARATE verbatim entries; the Gleam tool layer
+%% chooses their representation.
+collect_headers(RespHeaders) ->
+    collect_capped(group_headers(RespHeaders), [], 0).
+
+group_headers(Headers) ->
+    {Values, RevOrder} = lists:foldl(fun({K, V}, {Acc, Order}) ->
+        Name = string:lowercase(string:trim(K)),
+        Value = string:trim(V),
+        case Name of
+            <<"set-cookie">> ->
+                {Acc, [{pair, Name, Value} | Order]};
+            _ ->
+                case maps:is_key(Name, Acc) of
+                    false ->
+                        {Acc#{Name => [Value]}, [Name | Order]};
+                    true ->
+                        {Acc#{Name => [Value | maps:get(Name, Acc)]}, Order}
+                end
+        end
+    end, {#{}, []}, Headers),
+    {_Emitted, RevPairs} = lists:foldl(fun
+        ({pair, Name, Value}, {Emitted, Pairs}) ->
+            {Emitted, [{Name, Value} | Pairs]};
+        (Name, {Emitted, Pairs}) ->
+            case sets:is_element(Name, Emitted) of
+                true ->
+                    {Emitted, Pairs};
+                false ->
+                    Joined = join_values(lists:reverse(maps:get(Name, Values))),
+                    {sets:add_element(Name, Emitted),
+                     [{Name, Joined} | Pairs]}
+            end
+    end, {sets:new([{version, 2}]), []}, lists:reverse(RevOrder)),
+    lists:reverse(RevPairs).
+
+%% Join a combinable field's values with ", ", dropping empty values —
+%% the same rule headers_joined applies to the derived fields, kept in
+%% parity so the surfaced set and content_encoding cannot disagree.
+join_values(Values) ->
+    Kept = [V || V <- Values, V =/= <<>>],
+    iolist_to_binary(lists:join(<<", ">>, Kept)).
+
+collect_capped([], Acc, _Size) ->
+    {lists:reverse(Acc), false};
+collect_capped([{Name, Value} | Rest], Acc, Size) ->
+    PairSize = byte_size(Name) + byte_size(Value) + 2,
+    case length(Acc) >= ?MAX_HEADER_PAIRS
+         orelse Size + PairSize > ?MAX_HEADERS_BYTES of
+        true ->
+            {lists:reverse(Acc), true};
+        false ->
+            collect_capped(Rest, [{Name, Value} | Acc], Size + PairSize)
     end.
 
 read_body(Client, MaxBytes, Acc, Dropped) ->
@@ -116,7 +219,11 @@ header(Headers, Name) ->
     end.
 
 %% Collect all values for a repeated header (e.g. multiple Content-Encoding
-%% headers) joined with ", " per RFC 9110.
+%% headers) joined with ", " per RFC 9110. Unlike group_headers (the
+%% surfaced, capped set) this runs over the UNCAPPED list for the derived
+%% fields — content-encoding must survive even when the surfaced set is
+%% cut by the caps — and shares the same drop-empty join rule (see
+%% join_values).
 headers_joined(Headers, Name) ->
     Target = string:lowercase(Name),
     Values = [string:trim(V) || {K, V} <- Headers,
@@ -130,7 +237,7 @@ format_reason(Reason) ->
 %% Boundedly inflate a complete, already-wire-capped gzip/deflate body.
 %%
 %% The caller (`web_fetch`) advertises `Accept-Encoding: gzip, deflate`, so
-%% origins may answer compressed even though bounded_get's MaxBytes bounds
+%% origins may answer compressed even though bounded_request's MaxBytes bounds
 %% only the COMPRESSED wire bytes; a decompression bomb would otherwise
 %% expand post-receipt without bound. Like the wire cap, over-cap here
 %% TRUNCATES ({ok, {Out, true}}) instead of erroring — the model sees

@@ -109,6 +109,8 @@ fn ok_resp(
     truncated: False,
     final_url: final_url,
     content_encoding: "",
+    headers: [],
+    headers_truncated: False,
   )
 }
 

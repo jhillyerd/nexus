@@ -494,6 +494,54 @@ the rules that bite silently:
   never restarts threads or fails turns. Only 2xx responses are cached,
   keyed by fragment-stripped normalized URL.
 
+## `http_fetch` curl upgrades (Phase 5 shipped)
+
+`docs/plans/web-fetch.md`'s v3 as-built delta carries the design; the
+rules that bite silently:
+
+- **`net.fetch` is a GET wrapper over `net.request`; `web_fetch` and
+  `web_search` ride the wrapper and must not observe method/body.** The
+  method+body path is `http_fetch`'s alone. Redirects on `net.request`
+  follow curl -L / the fetch spec: 303 switches every verb except HEAD
+  to a bodiless GET (RFC 9110 §15.4.4); 301/302 rewrite only
+  body-carrying POST/PUT/PATCH; 307/308 preserve method+body. A rewrite
+  drops the body AND the caller's `content-length`/
+  `transfer-encoding` (framing must never describe a body that is no
+  longer sent), and a hop crossing scheme/host/port (scheme-default
+  ports normalised: `http://h` ≡ `http://h:80`) strips `authorization` /
+  `cookie` / `proxy-authorization` from the CALLER's headers (default
+  curl posture — `--location-trusted` is deliberately absent).
+- **The method whitelist is enforced twice**: `http_fetch.parse_method`
+  (GET/HEAD/POST/PUT/PATCH/DELETE/OPTIONS) and `method_atom` in the FFI
+  — model bytes are never `binary_to_atom`-ed, so no atom-table
+  exhaustion and no verb smuggling.
+- **Request headers are validated BEFORE the wire**: names are RFC 9110
+  tokens (checked per CODEPOINT — a grapheme-level range check has an
+  NFD hole) outside the blocked framing/hop-by-hop set (`host`,
+  `content-length`, `transfer-encoding`, `connection`, `keep-alive`,
+  `proxy-connection`, `te`, `trailer`, `upgrade`, `expect` — hackney
+  owns those, and a model-supplied `Expect: 100-continue` can stall a
+  request past every soft bound), values carry no C0 controls/DEL (TAB
+  and non-ASCII obs-text pass). This plus the method whitelist is the
+  STRUCTURAL request-splitting guard; do not loosen it piecemeal.
+- **Response headers are capped at collection** (FFI): lowercased
+  names, combinable duplicates joined ", " per RFC 9110 in FIRST-SEEN
+  order — except `set-cookie`, which §5.2 excludes from combination
+  (cookie values embed commas) and keeps as separate verbatim pairs —
+  at most 128 pairs / 8 KiB rendered bytes, `headers_truncated`
+  flagging the cut. The tool layer renders the cookie pairs as ONE
+  array-valued `set-cookie` key. Context-window hygiene — hackney
+  already materialized the head; the cap bounds what the TOOL RESULT
+  carries.
+- **Both result paths carry the full payload**: the 2xx Ok object and
+  the non-2xx Error object (which keeps its `error` key) include final
+  `url`, `headers`, `headers_truncated`, `truncated`, and `body`. The
+  body is lossily UTF-8-decoded at the boundary before JSON encoding —
+  never JSON-encode raw response bytes.
+- **Bodiless hackney responses are a 3-tuple** (`{ok, Status, Headers}`
+  — HEAD requests, 204/304): handled as empty bodies, never fed to
+  `read_body`.
+
 ## Changing the transcript / request-encoding path
 
 `test/m3_prefix_test.gleam` is the offline golden: it replays the archived
@@ -598,7 +646,10 @@ pinned gleam_stdlib is 1.0.5 (`manifest.toml`) — confirm API existence in
   `print`/`println` (plus `_error` variants); debug printing moved to the
   `echo` keyword expression (Gleam v1.9:
   https://gleam.run/news/hello-echo-hello-git/) — `echo some_expression`
-  prints the value with file:line to stderr. Use `nexus/log` for server
+  prints the value with file:line to stderr. Because it is a KEYWORD,
+  `echo` cannot be a function or variable name either (a helper named
+  `echo` fails at its CALL SITE with "This parenthesis cannot be
+  understood here" — misleading; rename it). Use `nexus/log` for server
   logging and `io.println` only for deliberate CLI stdout output.
 - **`string.find` does not exist.** Use `string.contains` (Bool) or
   `string.split_once` instead. (The `string.find` text in

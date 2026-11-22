@@ -3,10 +3,11 @@
 
 import gleam/bytes_tree
 import gleam/erlang/process
-import gleam/http.{Get}
+import gleam/http.{Get, Post}
 import gleam/http/request.{type Request}
 import gleam/http/response.{type Response}
 import gleam/int
+import gleam/list
 import gleam/option.{type Option, Some}
 import gleam/string
 import gleeunit/should
@@ -15,6 +16,11 @@ import nexus/net
 
 @external(erlang, "net_test_ffi", "gzip")
 fn gzip(body: String) -> String
+
+/// Memoized listener start (see net_test_ffi:ensure_listener) — true on
+/// the first call, which is the one that needs the settle sleep.
+@external(erlang, "net_test_ffi", "ensure_listener")
+fn ensure_listener(port: Int, start: fn() -> a) -> Bool
 
 @external(erlang, "net_test_ffi", "zlib_wrap")
 fn zlib_wrap(body: String) -> String
@@ -148,6 +154,60 @@ fn handler(req: Request(mist.Connection)) -> Response(mist.ResponseData) {
       |> response.set_header("content-type", "text/html")
       |> response.set_header("content-encoding", "GZIP")
       |> response.set_body(mist.Bytes(bytes_tree.from_string("fake-gz")))
+    "/dup-headers", Get ->
+      response.new(200)
+      |> response.set_header("content-type", "text/plain")
+      |> response.prepend_header("x-list", "two")
+      |> response.prepend_header("x-list", "one")
+      |> response.set_body(mist.Bytes(bytes_tree.from_string("dup")))
+    "/post-echo", Post ->
+      response.new(200)
+      |> response.set_header("content-type", "text/plain")
+      |> response.set_body(mist.Bytes(bytes_tree.from_string("saw-post")))
+    "/post-echo", _ ->
+      response.new(200)
+      |> response.set_header("content-type", "text/plain")
+      |> response.set_body(mist.Bytes(bytes_tree.from_string("saw-other")))
+    "/moved-303", _ ->
+      response.new(303)
+      |> response.set_header("location", "/post-echo")
+      |> response.set_body(mist.Bytes(bytes_tree.new()))
+    "/moved-308", _ ->
+      response.new(308)
+      |> response.set_header("location", "/post-echo")
+      |> response.set_body(mist.Bytes(bytes_tree.new()))
+    "/moved-308-auth", _ ->
+      response.new(308)
+      |> response.set_header("location", "/auth-echo")
+      |> response.set_body(mist.Bytes(bytes_tree.new()))
+    "/no-content", Get ->
+      response.new(204)
+      |> response.set_header("x-note", "empty")
+      |> response.set_body(mist.Bytes(bytes_tree.new()))
+    "/auth-echo", _ ->
+      response.new(200)
+      |> response.set_header("content-type", "text/plain")
+      |> response.set_body(
+        mist.Bytes(bytes_tree.from_string(
+          "auth="
+          <> case request.get_header(req, "authorization") {
+            Ok(value) -> value
+            Error(Nil) -> ""
+          }
+          <> ",probe="
+          <> case request.get_header(req, "x-probe") {
+            Ok(value) -> value
+            Error(Nil) -> ""
+          },
+        )),
+      )
+    "/cross-auth", _ ->
+      response.new(302)
+      |> response.set_header(
+        "location",
+        "http://localhost:" <> int.to_string(port) <> "/auth-echo",
+      )
+      |> response.set_body(mist.Bytes(bytes_tree.new()))
     "/gz-real", Get ->
       response.new(200)
       |> response.set_header("content-type", "text/plain")
@@ -168,12 +228,20 @@ fn handler(req: Request(mist.Connection)) -> Response(mist.ResponseData) {
 }
 
 fn start_service() -> Nil {
-  let _ =
-    mist.new(handler)
-    |> mist.bind("127.0.0.1")
-    |> mist.port(port)
-    |> mist.start
-  process.sleep(100)
+  // Memoized (see net_test_ffi:ensure_listener): several tests in this
+  // module fetch against the one listener; re-binding the fixed port
+  // would abort eunit.
+  case
+    ensure_listener(port, fn() {
+      mist.new(handler)
+      |> mist.bind("127.0.0.1")
+      |> mist.port(port)
+      |> mist.start
+    })
+  {
+    True -> process.sleep(100)
+    False -> Nil
+  }
 }
 
 fn base() -> String {
@@ -283,4 +351,133 @@ pub fn inflate_bounded_corrupt_and_empty_test() {
   // An empty body carries no member to decode and passes through.
   net.inflate_bounded("", "gzip", 1000)
   |> should.equal(Ok(#("", False)))
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5: net.request method/body + redirect semantics + response headers
+// ---------------------------------------------------------------------------
+
+pub fn request_redirect_semantics_test() {
+  start_service()
+  // 303 downgrades POST to GET (RFC 9110 mandates GET); the echo route
+  // answers per the arriving method.
+  let assert Ok(r303) =
+    net.request(
+      http.Post,
+      base() <> "/moved-303",
+      [],
+      "cargo",
+      4096,
+      2000,
+      True,
+      3,
+    )
+  r303.body |> should.equal("saw-other")
+  // 308 preserves the method and body verbatim.
+  let assert Ok(r308) =
+    net.request(
+      http.Post,
+      base() <> "/moved-308",
+      [],
+      "cargo",
+      4096,
+      2000,
+      True,
+      3,
+    )
+  r308.body |> should.equal("saw-post")
+}
+
+pub fn response_headers_are_collected_lowercase_and_joined_test() {
+  start_service()
+  let assert Ok(dup) =
+    net.fetch(base() <> "/dup-headers", [], 4096, 2000, True, 3)
+  // Duplicate names join with ", " per RFC 9110, first-seen order.
+  list.key_find(dup.headers, "x-list") |> should.equal(Ok("one, two"))
+  // Names are lowercased; the set is complete under the caps.
+  list.key_find(dup.headers, "content-type") |> should.equal(Ok("text/plain"))
+  dup.headers_truncated |> should.equal(False)
+}
+
+pub fn request_303_downgrades_delete_too_test() {
+  start_service()
+  // 303 switches EVERY verb except HEAD to GET (RFC 9110 §15.4.4) — a
+  // DELETE-with-body must not replay its method or body against the
+  // "see other" target.
+  let assert Ok(r) =
+    net.request(
+      http.Delete,
+      base() <> "/moved-303",
+      [],
+      "cargo",
+      4096,
+      2000,
+      True,
+      3,
+    )
+  r.body |> should.equal("saw-other")
+}
+
+pub fn no_content_status_is_a_bodiless_response_test() {
+  start_service()
+  // 204 answers hackney's bodiless 3-tuple shape (no client ref): empty
+  // body, truncated=false, and the response HEADERS still surface.
+  let assert Ok(r) = net.fetch(base() <> "/no-content", [], 4096, 2000, True, 3)
+  r.status |> should.equal(204)
+  r.body |> should.equal("")
+  r.truncated |> should.equal(False)
+  list.key_find(r.headers, "x-note") |> should.equal(Ok("empty"))
+}
+
+pub fn cross_origin_redirect_strips_credentials_at_net_layer_test() {
+  start_service()
+  // Same-origin redirect (308 preserves everything): credentials kept.
+  let assert Ok(kept) =
+    net.fetch(
+      base() <> "/moved-308-auth",
+      [#("authorization", "secret"), #("x-probe", "kept")],
+      4096,
+      2000,
+      True,
+      3,
+    )
+  kept.body |> should.equal("auth=secret,probe=kept")
+
+  // Cross-origin (host spelling 127.0.0.1 -> localhost): authorization
+  // stripped, non-credential headers survive.
+  let assert Ok(stripped) =
+    net.fetch(
+      base() <> "/cross-auth",
+      [#("authorization", "secret"), #("x-probe", "kept")],
+      4096,
+      2000,
+      True,
+      3,
+    )
+  stripped.body |> should.equal("auth=,probe=kept")
+  stripped.final_url
+  |> should.equal("http://localhost:" <> int.to_string(port) <> "/auth-echo")
+}
+
+pub fn same_origin_normalises_default_ports_test() {
+  // Explicit scheme-default ports are the SAME origin.
+  net.same_origin("http://example.com/a", "http://example.com:80/b")
+  |> should.be_true
+  net.same_origin("https://example.com/a", "https://example.com:443/b")
+  |> should.be_true
+  // Non-default ports must match exactly.
+  net.same_origin("http://example.com:8080/", "http://example.com:8080/x")
+  |> should.be_true
+  net.same_origin("http://example.com:8080/", "http://example.com:8081/")
+  |> should.be_false
+  // Scheme or host differences are cross-origin (host case-insensitive).
+  net.same_origin("http://example.com/", "https://example.com/")
+  |> should.be_false
+  net.same_origin("http://EXAMPLE.com/", "http://example.com/")
+  |> should.be_true
+  net.same_origin("http://example.com/", "http://other.example/")
+  |> should.be_false
+  // A parse failure answers False (the safe side: strip credentials).
+  net.same_origin("http://example.com/", "::::")
+  |> should.be_false
 }

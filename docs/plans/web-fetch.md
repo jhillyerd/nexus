@@ -1,6 +1,6 @@
 ---
 title: Nexus — web_fetch tool (HTML-to-Markdown, pagination, and fetch cache)
-status: "active — v1 (Phases 1-3) shipped in PR 159; v2 bounded decompression shipped 2026-11-22"
+status: "active — v1 (Phases 1-3) shipped in PR 159; v2 bounded decompression shipped 2026-11-22; v3 http_fetch curl upgrades (Phase 5) shipped 2026-11-22"
 tags: [computing, self-hosting, local-llm, agents, gleam, beam, tools, web-fetch]
 updated: 2026-11-22
 ---
@@ -403,6 +403,75 @@ identity-only posture (§3 item 3 above).**
   legitimate aggressive-memory configuration, not a contradiction (the
   knobs bound different things — wire bytes vs expanded bytes).
 
+**v3 (2026-11-22): Phase 5 — `http_fetch` curl upgrades.** The opt-in
+low-level tool grew `method`, `headers`, and `body`; the plan bullet in
+"Future phases" is shipped. Deltas from the one-line sketch:
+
+- **Method is a whitelist, not any RFC 9110 token**: GET, HEAD, POST,
+  PUT, PATCH, DELETE, OPTIONS (lowercase accepted, uppercased on the
+  wire). CONNECT/TRACE and arbitrary verbs are refused as argument
+  errors, and the FFI re-whitelists before calling hackney — model bytes
+  are never `binary_to_atom`-ed (atom-table exhaustion) and can never
+  smuggle a verb past the adapter.
+- **Request headers are validated before the wire**: names must be
+  RFC 9110 tokens (no `:`, spaces, or control bytes — checked per
+  CODEPOINT: a grapheme-level range check has an NFD hole, where a
+  decomposed "e" + U+0301 clusters into one grapheme whose leading
+  codepoint is a tchar) outside a blocked set — `host`,
+  `content-length`, `transfer-encoding`, `connection`, `keep-alive`,
+  `proxy-connection`, `te`, `trailer`, `upgrade`, `expect` (framing and
+  hop-by-hop are hackney's; a second content-length invites request
+  smuggling; a model-supplied `Expect: 100-continue` can stall the
+  request past every soft bound) — and values refuse CR/LF/NUL and
+  other C0 controls (TAB allowed; non-ASCII obs-text allowed and sent
+  verbatim). Together with the method whitelist this is the structural
+  request-splitting guard: nothing model-authored can re-frame the
+  request.
+- **Transport**: `net.fetch` is a thin GET wrapper over the new
+  `net.request(method, url, headers, body, …)`; `web_fetch` and
+  `web_search` behavior is byte-identical. Redirect semantics for
+  non-GET follow curl -L / browsers / the fetch spec: 303 switches every
+  verb except HEAD to a bodiless GET (RFC 9110 §15.4.4 — a
+  DELETE-with-body must not replay against the "see other" target);
+  301/302 rewrite only the body-carrying POST/PUT/PATCH (the historical
+  browser rewrite the RFC leaves optional); 307/308 preserve method and
+  body verbatim. A rewrite also drops the caller's framing headers
+  (`content-length`, `transfer-encoding`) so the bodiless next hop
+  cannot be mis-framed, and a redirect crossing scheme/host/port strips
+  `authorization`, `cookie`, and `proxy-authorization` from the caller's
+  headers (curl -L without `--location-trusted`; scheme-default ports
+  normalised — `http://h` ≡ `http://h:80`), so a credential minted for
+  one origin is never replayed at another.
+- **Result shape**: both the 2xx Ok object and the non-2xx Error object
+  carry `url` (final, post-redirect), `content_type`, `headers`,
+  `headers_truncated`, `truncated`, and `body`. `headers` is an object
+  with lowercased names; combinable duplicates join ", " per RFC 9110
+  in first-seen order — EXCEPT `set-cookie`, which §5.2 excludes from
+  combination (cookie values legally embed commas:
+  `Expires=Wed, 21 Oct 2015 07:28:00 GMT`), so each Set-Cookie line
+  stays a separate verbatim pair and the tool renders them as ONE
+  array-valued `set-cookie` key. Collection happens in the FFI under a
+  128-pair / 8-KiB-rendered cap with `headers_truncated` flagging the
+  cut — context-window hygiene, not memory (hackney has already
+  materialized the head by then). Non-2xx keeps the `error:
+  "non-success status"` key for branching and now carries the error
+  body and headers curl-style (a 429's `retry-after` is reachable). The
+  body is lossily UTF-8-decoded at the boundary
+  (`net.decode_utf8_lossy`) — fixing a latent pre-Phase-5 bug where a
+  non-UTF-8 body could corrupt the JSON envelope.
+- **Bodiless hackney responses** (HEAD requests; 204/304 statuses)
+  return `{ok, Status, Headers}` WITHOUT a client ref — handled as
+  empty bodies. (A pre-Phase-5 GET against a 204 answer hit this
+  `case_clause` and surfaced as a fetch error.)
+- **Test infra**: `net_test_ffi:ensure_listener/2` memoizes the per-port
+  mist listener in `persistent_term` — gleeunit runs every test in a
+  fresh process, and a second `mist.start` on the already-bound port
+  fails the glisten supervision cascade loudly enough to abort eunit,
+  so the old `let _ = mist.start` "idempotency" only ever worked with
+  ONE caller per module. Also repaired `test/workspace_gc_test.gleam`,
+  whose `Config` literal lost `web_fetch_max_decompressed_bytes` in the
+  #161 merge (the suite had not compiled since).
+
 ## Phased implementation plan
 
 ### Phase 1 — Transport prep + pure HTML-to-Markdown converter
@@ -482,10 +551,6 @@ identity-only posture (§3 item 3 above).**
   safe for local GPUs), add an optional `prompt: String` parameter to
   `web_fetch` that runs over the cached Markdown document and returns a focused
   answer.
-- **Phase 5 — `http_fetch` curl upgrades:**
-  Now that `http_fetch` is cleanly separated as the low-level opt-in tool for
-  bots without `bash`, it can grow optional `method`, custom `headers`,
-  response headers, and request `body` without bloating `web_fetch`'s schema.
 - **Readability scoring:** If heuristic `<nav>`/`<footer>`/`<aside>` dropping
   leaves too much clutter on news/blog sites, add a pure-Gleam link-density /
   text-density scorer over the parsed block tree behind the same
