@@ -1251,26 +1251,88 @@ fn finalize_doc(doc: DocBuf) -> String {
   |> list.reverse
   |> string.concat
   |> string.split("\n")
-  |> list.map(string.trim_end)
-  |> collapse_blank_lines([], 0)
+  |> finalize_lines(None, [], 0)
+  |> trim_outer_blank_lines
   |> string.join("\n")
-  |> string.trim
 }
 
-fn collapse_blank_lines(
+/// Normalize non-`<pre>` lines (trim trailing whitespace, collapse runs of
+/// consecutive blank lines to a single blank line) while preserving every line
+/// inside fenced code blocks verbatim.
+fn finalize_lines(
   lines: List(String),
+  fence_len: Option(Int),
   acc: List(String),
   blanks: Int,
 ) -> List(String) {
   case lines {
     [] -> list.reverse(acc)
-    ["", ..rest] ->
-      case blanks >= 1 {
-        True -> collapse_blank_lines(rest, acc, blanks + 1)
-        False -> collapse_blank_lines(rest, ["", ..acc], blanks + 1)
+    [line, ..rest] ->
+      case fence_len {
+        Some(open_len) ->
+          case is_closing_fence_line(line, open_len) {
+            True ->
+              finalize_lines(rest, None, [string.trim_end(line), ..acc], 0)
+            False -> finalize_lines(rest, Some(open_len), [line, ..acc], 0)
+          }
+        None -> {
+          let trimmed = string.trim_end(line)
+          case opening_fence_len(trimmed) {
+            Some(len) -> finalize_lines(rest, Some(len), [trimmed, ..acc], 0)
+            None ->
+              case trimmed == "" {
+                True ->
+                  case blanks >= 1 {
+                    True -> finalize_lines(rest, None, acc, blanks + 1)
+                    False -> finalize_lines(rest, None, ["", ..acc], blanks + 1)
+                  }
+                False -> finalize_lines(rest, None, [trimmed, ..acc], 0)
+              }
+          }
+        }
       }
-    [line, ..rest] -> collapse_blank_lines(rest, [line, ..acc], 0)
   }
+}
+
+fn strip_bq_prefix(line: String) -> String {
+  case string.starts_with(line, "> ") {
+    True -> strip_bq_prefix(string.drop_start(line, 2))
+    False ->
+      case line == ">" {
+        True -> ""
+        False -> line
+      }
+  }
+}
+
+fn leading_backticks(s: String, count: Int) -> #(Int, String) {
+  case string.starts_with(s, "`") {
+    True -> leading_backticks(string.drop_start(s, 1), count + 1)
+    False -> #(count, s)
+  }
+}
+
+fn opening_fence_len(trimmed_line: String) -> Option(Int) {
+  let inner = strip_bq_prefix(trimmed_line)
+  let #(ticks, rest) = leading_backticks(inner, 0)
+  case ticks >= 3 && !string.contains(rest, "`") {
+    True -> Some(ticks)
+    False -> None
+  }
+}
+
+fn is_closing_fence_line(line: String, open_len: Int) -> Bool {
+  let inner = strip_bq_prefix(string.trim_end(line))
+  let #(ticks, rest) = leading_backticks(inner, 0)
+  ticks >= open_len && rest == ""
+}
+
+fn trim_outer_blank_lines(lines: List(String)) -> List(String) {
+  lines
+  |> list.drop_while(fn(line) { line == "" })
+  |> list.reverse
+  |> list.drop_while(fn(line) { line == "" })
+  |> list.reverse
 }
 
 fn finalize_title(chunks: List(String)) -> Option(String) {

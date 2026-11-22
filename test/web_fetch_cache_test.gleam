@@ -55,11 +55,20 @@ pub fn ttl_expiry_evicts_on_get_and_put_test() {
   let #(c, hit) = web_fetch_cache.get(c, "https://example.com/a", 1099)
   hit |> should.equal(Some(d))
 
-  // Expired at t=1100 (age 1000ms >= 1000ms) -> lazily removed.
+  // Expired at t=1100 (age 1000ms >= 1000ms) -> lazily removed on get.
   let #(c, expired) = web_fetch_cache.get(c, "https://example.com/a", 1100)
   expired |> should.equal(None)
   web_fetch_cache.size(c) |> should.equal(0)
   web_fetch_cache.total_bytes(c) |> should.equal(0)
+
+  // Expired entry is also swept during `put` of another URL.
+  let d2 = doc("https://example.com/b", "world!")
+  let c = web_fetch_cache.put(c, "https://example.com/a", d, 2000)
+  let c = web_fetch_cache.put(c, "https://example.com/b", d2, 3000)
+  web_fetch_cache.size(c) |> should.equal(1)
+  web_fetch_cache.total_bytes(c) |> should.equal(6)
+  let #(_c, gone_a) = web_fetch_cache.get(c, "https://example.com/a", 3001)
+  gone_a |> should.equal(None)
 }
 
 pub fn lru_eviction_by_entry_count_test() {
@@ -103,12 +112,19 @@ pub fn lru_eviction_by_byte_cap_and_oversized_skip_test() {
   let #(c, check3) = web_fetch_cache.get(c, "https://example.com/3", 35)
   check3 |> should.equal(Some(d3))
 
-  // Oversized doc (11 > 10) is silently skipped without evicting /3.
+  // Oversized doc (11 > 10) for a new URL is skipped without evicting /3.
   let c = web_fetch_cache.put(c, "https://example.com/huge", huge, 40)
   let #(c, check_huge) = web_fetch_cache.get(c, "https://example.com/huge", 45)
   check_huge |> should.equal(None)
-  let #(_c, still_there) = web_fetch_cache.get(c, "https://example.com/3", 45)
+  let #(c, still_there) = web_fetch_cache.get(c, "https://example.com/3", 45)
   still_there |> should.equal(Some(d3))
+
+  // Oversized doc for an EXISTING cached URL invalidates the stale entry.
+  let c = web_fetch_cache.put(c, "https://example.com/3", huge, 50)
+  let #(c, evicted) = web_fetch_cache.get(c, "https://example.com/3", 55)
+  evicted |> should.equal(None)
+  web_fetch_cache.size(c) |> should.equal(0)
+  web_fetch_cache.total_bytes(c) |> should.equal(0)
 }
 
 pub fn named_actor_roundtrip_and_dead_actor_degrades_cleanly_test() {

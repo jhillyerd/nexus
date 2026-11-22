@@ -40,16 +40,17 @@ pub fn pre_code_preserves_indentation_and_blank_lines_test() {
     "<p>Before</p>"
     <> "<pre><code class=\"language-gleam\">\n"
     <> "pub fn main() {\n"
-    <> "  let x = 1\n"
+    <> "  let x = 1  \n"
     <> "\n"
-    <> "  x + 2\n"
+    <> "\n"
+    <> "  x + 2\t\n"
     <> "}\n"
     <> "</code></pre>"
     <> "<p>After</p>"
   let converted = html_markdown.convert(html, "")
   converted.markdown
   |> should.equal(
-    "Before\n\n```gleam\npub fn main() {\n  let x = 1\n\n  x + 2\n}\n```\n\nAfter",
+    "Before\n\n```gleam\npub fn main() {\n  let x = 1  \n\n\n  x + 2\t\n}\n```\n\nAfter",
   )
 }
 
@@ -180,7 +181,7 @@ pub fn void_tags_in_dropped_subtrees_and_unclosed_inline_or_cell_test() {
   let unclosed_td = "<table><tr><td>c1<td>c2</table><p>After table</p>"
   let td_md = html_markdown.convert(unclosed_td, "").markdown
   should.be_true(string.contains(td_md, "c1"))
-  should.be_true(string.contains(td_md, "After table"))
+  should.be_true(string.ends_with(td_md, "\n\nAfter table"))
 
   let unclosed_a = "<p><a href=\"/x\">unclosed link</p><p>After link</p>"
   let a_md = html_markdown.convert(unclosed_a, "https://example.com").markdown

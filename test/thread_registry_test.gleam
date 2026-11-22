@@ -1973,13 +1973,13 @@ pub fn toolset_snapshot_survives_changed_default_config_test() {
   let seam = store_mock.seam(mock)
   store_mock.ensure_fixture_provider(seam)
   store_mock.ensure_fixture_bot(seam)
-  // Created under a default of ["http_fetch"], the thread pinned a
+  // Created under a default of ["web_fetch"], the thread pinned a
   // DIFFERENT explicit toolset.
   let assert Ok(Nil) =
     seam.insert_thread(stored_with_toolset("s-pin", ["web_search"]), "sys")
 
   // The next boot runs with codemode ON — its default tuple is now
-  // ["codemode", "http_fetch"] (the sorted catalog order; codemode's
+  // ["codemode", "web_fetch"] (the sorted catalog order; codemode's
   // schema still registers last wherever the name sits).
   let codemode_on = config.Config(..test_config(), codemode: True)
   should.equal(tools.default_names(codemode_on), [
@@ -1993,7 +1993,7 @@ pub fn toolset_snapshot_survives_changed_default_config_test() {
   // config-independently), not the new default. The captured child spec
   // is the observable that the persisted tuple SELECTED the bundle: a
   // fallback-to-default design would hand the actor
-  // ["http_fetch", "codemode"] here. The config-independent schemas are
+  // ["web_fetch", "codemode"] here. The config-independent schemas are
   // pinned by tools_test, the wire bytes by loop_test.
   thread_registry.get(booted.registry, "s-pin") |> should.be_ok
   let assert Ok(spec) = process.receive(spec_captor, 5000)

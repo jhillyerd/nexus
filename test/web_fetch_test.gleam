@@ -210,13 +210,35 @@ pub fn rejects_unsolicited_content_encoding_and_binary_types_test() {
   let assert Ok(raw) = id_run("{\"url\":\"https://example.com/id\"}")
   decode_page(raw).content |> should.equal("ok")
 
-  // Binary Content-Types are rejected cleanly.
+  // Comma-separated / repeated Content-Encoding values are rejected if any
+  // token is non-identity.
+  let multi_gz_run =
+    web_fetch.run_with(opts(None), fn(url, _) {
+      Ok(
+        FetchResponse(
+          ..ok_resp("text/html", url, "compressed-bytes"),
+          content_encoding: "identity, gzip",
+        ),
+      )
+    })
+  let assert Error(multi_reason) =
+    multi_gz_run("{\"url\":\"https://example.com/multi-gz\"}")
+  multi_reason |> should.equal("unsupported content-encoding: gzip")
+
+  // Binary Content-Types (including image/svg+xml) are rejected cleanly.
   let pdf_run =
     web_fetch.run_with(opts(None), fn(url, _) {
       Ok(ok_resp("application/pdf", url, "%PDF-1.7"))
     })
   let assert Error(pdf_err) = pdf_run("{\"url\":\"https://example.com/f.pdf\"}")
   pdf_err |> should.equal("unsupported binary content-type: application/pdf")
+
+  let svg_run =
+    web_fetch.run_with(opts(None), fn(url, _) {
+      Ok(ok_resp("image/svg+xml", url, "<svg/>"))
+    })
+  let assert Error(svg_err) = svg_run("{\"url\":\"https://example.com/a.svg\"}")
+  svg_err |> should.equal("unsupported binary content-type: image/svg+xml")
 }
 
 pub fn pagination_cache_hit_fragment_key_clamping_and_past_end_test() {
@@ -251,30 +273,40 @@ pub fn pagination_cache_hit_fragment_key_clamping_and_past_end_test() {
   p1.has_more |> should.equal(True)
   p1.content |> should.equal("0123456789")
 
-  // Second call with different fragment and huge max_length: cache HIT,
-  // clamped to max_chars=15, reads remaining 12 graphemes safely (incl. emoji).
+  // Second call with different fragment and huge max_length from index 0:
+  // cache HIT, clamped to max_chars=15 (out of 22 total graphemes).
   let assert Ok(r2) =
     run(
-      "{\"url\":\"https://example.com/doc#bottom\",\"start_index\":10,\"max_length\":999999}",
+      "{\"url\":\"https://example.com/doc#bottom\",\"start_index\":0,\"max_length\":999999}",
     )
   let p2 = decode_page(r2)
   p2.cached |> should.equal(True)
-  p2.start_index |> should.equal(10)
-  p2.returned_chars |> should.equal(12)
-  p2.has_more |> should.equal(False)
-  p2.content |> should.equal("abcdefghij—🚀")
+  p2.start_index |> should.equal(0)
+  p2.returned_chars |> should.equal(15)
+  p2.has_more |> should.equal(True)
+  p2.content |> should.equal("0123456789abcde")
 
-  // Third call with start_index past end: clean empty tail, still cached.
+  // Third call reads remaining 7 graphemes safely (including em-dash + emoji).
   let assert Ok(r3) =
-    run("{\"url\":\"https://example.com/doc\",\"start_index\":100}")
+    run("{\"url\":\"https://example.com/doc#tail\",\"start_index\":15}")
   let p3 = decode_page(r3)
   p3.cached |> should.equal(True)
-  p3.start_index |> should.equal(100)
-  p3.returned_chars |> should.equal(0)
+  p3.start_index |> should.equal(15)
+  p3.returned_chars |> should.equal(7)
   p3.has_more |> should.equal(False)
-  p3.content |> should.equal("")
+  p3.content |> should.equal("fghij—🚀")
 
-  // Upstream fetcher ran EXACTLY ONCE across all three calls.
+  // Fourth call with start_index past end: clean empty tail, still cached.
+  let assert Ok(r4) =
+    run("{\"url\":\"https://example.com/doc\",\"start_index\":100}")
+  let p4 = decode_page(r4)
+  p4.cached |> should.equal(True)
+  p4.start_index |> should.equal(100)
+  p4.returned_chars |> should.equal(0)
+  p4.has_more |> should.equal(False)
+  p4.content |> should.equal("")
+
+  // Upstream fetcher ran EXACTLY ONCE across all four calls.
   let assert Ok(_) = process.receive(calls, 100)
   process.receive(calls, 50) |> should.equal(Error(Nil))
 }
@@ -293,18 +325,25 @@ pub fn non_2xx_not_cached_and_errors_surface_cleanly_test() {
   // Never cached.
   seam.get("https://example.com/404") |> should.equal(None)
 
-  // Transport / SSRF error carries "fetch failed: " prefix.
-  let ssrf =
+  // Transport errors from the fetcher carry the "fetch failed: " prefix.
+  let transport_fail =
     web_fetch.run_with(opts(None), fn(_url, _) {
-      Error("refusing private address for localhost: 127.0.0.1")
+      Error("timeout (hard deadline)")
     })
-  let assert Error(ssrf_err) = ssrf("{\"url\":\"http://localhost/\"}")
+  let assert Error(transport_err) =
+    transport_fail("{\"url\":\"https://example.com/slow\"}")
+  transport_err |> should.equal("fetch failed: timeout (hard deadline)")
+
+  // Production `web_fetch.run` rejects private/loopback URLs via `nexus/net`'s
+  // SSRF guard (offline: IP literal, no network or DNS).
+  let prod_run = web_fetch.run(opts(None))
+  let assert Error(ssrf_err) = prod_run("{\"url\":\"http://127.0.0.1/\"}")
   should.be_true(string.contains(ssrf_err, "fetch failed: refusing private"))
 
   // Invalid arguments: negative start_index, missing url, bad json.
   let assert Error(neg) =
-    ssrf("{\"url\":\"https://example.com/\",\"start_index\":-1}")
+    transport_fail("{\"url\":\"https://example.com/\",\"start_index\":-1}")
   should.be_true(string.contains(neg, "start_index"))
-  let assert Error(_) = ssrf("{\"url\":\"   \"}")
-  let assert Error(_) = ssrf("not json")
+  let assert Error(_) = transport_fail("{\"url\":\"   \"}")
+  let assert Error(_) = transport_fail("not json")
 }

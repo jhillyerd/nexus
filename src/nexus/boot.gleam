@@ -148,9 +148,10 @@ pub fn main() -> Nil {
           halt(2)
         }
       }
-      // Web-fetch cache THIRD (web-fetch plan): its own isolated OneForOne
-      // supervisor outside the OneForAll root so a cache crash never restarts
-      // threads. Disabled when `web_fetch_cache_ttl_ms == 0`.
+      // Web-fetch cache THIRD (web-fetch plan): its own unlinked OneForOne
+      // supervisor outside the OneForAll root so a cache crash or crash-loop
+      // never restarts threads or halts boot. Disabled when
+      // `web_fetch_cache_ttl_ms == 0`.
       let fetch_cache = web_fetch_cache.boot(cfg.web_fetch_cache_ttl_ms)
       // Names are stable across restarts of the supervisor itself.
       let store_name = process.new_name("nexus_store")

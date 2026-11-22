@@ -57,7 +57,7 @@ pub type Seam {
 /// Messages accepted by the cache actor.
 pub type Msg {
   Get(key: String, reply: Subject(Option(CachedDoc)))
-  Put(key: String, doc: CachedDoc)
+  Put(key: String, doc: CachedDoc, reply: Subject(Nil))
 }
 
 // ---------------------------------------------------------------------------
@@ -191,10 +191,10 @@ pub fn get(
 /// `max_bytes` (or when `ttl_ms <= 0` / `max_entries <= 0`) are not cached.
 pub fn put(cache: Cache, url: String, doc: CachedDoc, now_ms: Int) -> Cache {
   let bytes = doc_bytes(doc)
+  let key = cache_key(url)
   case cache.ttl_ms <= 0 || cache.max_entries <= 0 || bytes > cache.max_bytes {
-    True -> sweep_expired(cache, now_ms)
+    True -> delete_key(sweep_expired(cache, now_ms), key)
     False -> {
-      let key = cache_key(url)
       let cache =
         cache
         |> sweep_expired(now_ms)
@@ -330,15 +330,16 @@ fn handle_message(state: ActorState, msg: Msg) -> actor.Next(ActorState, Msg) {
       process.send(reply, hit)
       actor.continue(ActorState(..state, cache: next_cache))
     }
-    Put(key, doc) -> {
+    Put(key, doc, reply) -> {
       let next_cache = put(state.cache, key, doc, now)
+      process.send(reply, Nil)
       actor.continue(ActorState(..state, cache: next_cache))
     }
   }
 }
 
 /// Build a fault-isolated `Seam` addressing `name`. Resolves `process.named`
-/// first and wraps every call/send in `rescue.rescue` — a dead, absent,
+/// first and wraps every bounded call in `rescue.rescue` — a dead, absent,
 /// restarting, or wedged cache actor degrades silently to a miss / no-op.
 pub fn named_seam(name: Name(Msg)) -> Seam {
   Seam(
@@ -366,7 +367,11 @@ pub fn named_seam(name: Name(Msg)) -> Seam {
         Ok(_) -> {
           let _ =
             rescue.rescue(fn() {
-              process.send(process.named_subject(name), Put(url, doc))
+              actor.call(
+                process.named_subject(name),
+                call_timeout_ms,
+                fn(reply) { Put(url, doc, reply) },
+              )
             })
           Nil
         }
@@ -376,9 +381,12 @@ pub fn named_seam(name: Name(Msg)) -> Seam {
 }
 
 /// Boot the cache actor inside its own standalone `OneForOne` supervisor
-/// (outside the `OneForAll` root tree) when `ttl_ms > 0`. Returns `None` when
-/// disabled (`ttl_ms <= 0`) or if startup fails (logged; degrades cleanly to
-/// uncached fetches rather than failing boot).
+/// (outside the `OneForAll` root tree and unlinked from the caller) when
+/// `ttl_ms > 0`. Returns `None` when disabled (`ttl_ms <= 0`) or if startup
+/// fails (logged; degrades cleanly to uncached fetches rather than failing
+/// boot). Because the supervisor is unlinked after start, even a cache
+/// crash-loop exhausting restart tolerance only disables caching and never
+/// terminates the server.
 pub fn boot(ttl_ms: Int) -> Option(Seam) {
   case ttl_ms <= 0 {
     True -> None
@@ -390,7 +398,10 @@ pub fn boot(ttl_ms: Int) -> Option(Seam) {
           supervision.worker(fn() { start_named(name, ttl_ms) }),
         )
       case supervisor.start(sup) {
-        Ok(_) -> Some(named_seam(name))
+        Ok(started) -> {
+          process.unlink(started.pid)
+          Some(named_seam(name))
+        }
         Error(reason) -> {
           log.warn(
             "web_fetch_cache",

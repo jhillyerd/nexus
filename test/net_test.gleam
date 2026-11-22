@@ -130,6 +130,12 @@ fn handler(req: Request(mist.Connection)) -> Response(mist.ResponseData) {
       |> response.set_header("content-type", "text/html")
       |> response.set_header("content-encoding", "GZIP")
       |> response.set_body(mist.Bytes(bytes_tree.from_string("fake-gz")))
+    "/multi-encoding", Get ->
+      response.new(200)
+      |> response.set_header("content-type", "text/html")
+      |> response.prepend_header("content-encoding", "gzip")
+      |> response.prepend_header("content-encoding", "identity")
+      |> response.set_body(mist.Bytes(bytes_tree.from_string("fake-gz")))
     _, _ ->
       response.new(404)
       |> response.set_body(mist.Bytes(bytes_tree.from_string("missing")))
@@ -163,4 +169,10 @@ pub fn nested_relative_redirects_and_final_url_test() {
   gz.status |> should.equal(200)
   gz.content_encoding |> should.equal("gzip")
   should.be_true(string.ends_with(gz.final_url, "/gzipped"))
+
+  // Repeated Content-Encoding headers are all collected and joined.
+  let assert Ok(multi) =
+    net.fetch(base() <> "/multi-encoding", [], 4096, 2000, True, 3)
+  multi.status |> should.equal(200)
+  multi.content_encoding |> should.equal("identity, gzip")
 }

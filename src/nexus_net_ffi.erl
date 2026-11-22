@@ -68,7 +68,7 @@ bounded_get_inner(Url, Headers, MaxBytes, TimeoutMs) ->
         {ok, Status, RespHeaders, Client} ->
             ContentType = header(RespHeaders, <<"content-type">>),
             ContentEncoding =
-                string:lowercase(string:trim(header(RespHeaders, <<"content-encoding">>))),
+                string:lowercase(headers_joined(RespHeaders, <<"content-encoding">>)),
             Location = header(RespHeaders, <<"location">>),
             case read_body(Client, MaxBytes, <<>>, false) of
                 {ok, Body, Truncated} ->
@@ -114,6 +114,15 @@ header(Headers, Name) ->
         {value, {_, Value}} -> Value;
         false -> <<>>
     end.
+
+%% Collect all values for a repeated header (e.g. multiple Content-Encoding
+%% headers) joined with ", " per RFC 9110.
+headers_joined(Headers, Name) ->
+    Target = string:lowercase(Name),
+    Values = [string:trim(V) || {K, V} <- Headers,
+              string:lowercase(K) =:= Target,
+              string:trim(V) =/= <<>>],
+    iolist_to_binary(lists:join(<<", ">>, Values)).
 
 format_reason(Reason) ->
     unicode:characters_to_binary(io_lib:format("~tp", [Reason])).

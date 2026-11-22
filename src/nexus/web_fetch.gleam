@@ -196,10 +196,14 @@ fn process_response(
 }
 
 fn check_encoding(raw_encoding: String) -> Result(Nil, String) {
-  let encoding = string.lowercase(string.trim(raw_encoding))
-  case encoding {
-    "" | "identity" -> Ok(Nil)
-    other -> Error("unsupported content-encoding: " <> other)
+  let tokens =
+    raw_encoding
+    |> string.split(",")
+    |> list.map(fn(part) { string.lowercase(string.trim(part)) })
+    |> list.filter(fn(part) { part != "" })
+  case list.find(tokens, fn(token) { token != "identity" }) {
+    Error(Nil) -> Ok(Nil)
+    Ok(unsupported) -> Error("unsupported content-encoding: " <> unsupported)
   }
 }
 
@@ -269,9 +273,18 @@ fn is_passthrough_text_type(media_type: String) -> Bool {
     | "application/graphql"
     | "application/x-ndjson" -> True
     _ ->
-      string.starts_with(media_type, "text/")
-      || string.ends_with(media_type, "+json")
-      || string.ends_with(media_type, "+xml")
+      case
+        string.starts_with(media_type, "image/")
+        || string.starts_with(media_type, "audio/")
+        || string.starts_with(media_type, "video/")
+        || string.starts_with(media_type, "font/")
+      {
+        True -> False
+        False ->
+          string.starts_with(media_type, "text/")
+          || string.ends_with(media_type, "+json")
+          || string.ends_with(media_type, "+xml")
+      }
   }
 }
 

@@ -370,7 +370,7 @@ Bifrost/SearxNG, and the production cache check whose golden fixture is
 | `NEXUS_MAX_TOOL_ITERATIONS` | `32` | agent-loop guard: max model round-trips per user turn |
 | `NEXUS_MAX_BOT_HOPS` | `4` | bot-to-bot delivery guard: max hops in an inter-bot message chain (bots plan P3c) |
 | `NEXUS_HTTP_FETCH_MAX_BYTES` | `20000` | `http_fetch`: response body cap per call |
-| `NEXUS_HTTP_FETCH_TIMEOUT_MS` | `15000` | `http_fetch` / `web_fetch` HTTP connect+receive timeout per hop |
+| `NEXUS_HTTP_FETCH_TIMEOUT_MS` | `15000` | `http_fetch` / `web_fetch` timeout input per hop; hard deadline covers connect, TLS handshake, response head, and body streaming |
 | `NEXUS_HTTP_FETCH_ALLOW_PRIVATE` | `false` | dev/test escape hatch for private/loopback targets (`http_fetch` / `web_fetch`); never in production |
 | `NEXUS_WEB_FETCH_MAX_RAW_BYTES` | `1048576` | `web_fetch`: streaming raw response byte cap before HTML-to-Markdown conversion (> 0) |
 | `NEXUS_WEB_FETCH_DEFAULT_CHARS` | `12000` | `web_fetch`: default `max_length` returned per call in characters (> 0) |
