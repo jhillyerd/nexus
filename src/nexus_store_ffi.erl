@@ -21,9 +21,11 @@ with_checked_out(PoolName, Fun) ->
                 {ok, pgo:with_conn(Conn, Fun)}
             catch
                 Class:Reason:Stack ->
-                    catch pgo_handler:extended_query(
-                        Conn, <<"ROLLBACK">>, [], #{queue_time => undefined}
-                    ),
+                    try
+                        pgo_handler:extended_query(
+                            Conn, <<"ROLLBACK">>, [], #{queue_time => undefined}
+                        )
+                    catch _:_ -> ok end,
                     erlang:raise(Class, Reason, Stack)
             after
                 pgo:checkin(Ref, Conn)
@@ -144,7 +146,7 @@ find_type_server([], _Marks, Found) ->
 %% the '$ancestors' entry in the process dictionary (note the $ prefix)
 %% pins the process to OUR pool.
 our_type_server(Pid, Marks) ->
-    case catch proc_lib:translate_initial_call(Pid) of
+    case (try proc_lib:translate_initial_call(Pid) catch _:_ -> not_found end) of
         {pgo_type_server, init, 1} ->
             case erlang:process_info(Pid, dictionary) of
                 {dictionary, Dict} ->

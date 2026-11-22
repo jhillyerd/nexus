@@ -9,12 +9,17 @@
 //// - response bodies are capped in the FFI, never materialised whole;
 //// - requests are bounded in time by connect+receive timeouts.
 
+import gleam/http.{type Method}
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import gleam/uri
+
+/// Default manual-redirect chain bound shared by the fetch adapters
+/// (`http_fetch`, `web_fetch`) so the budget stays one policy decision.
+pub const default_follow_limit = 3
 
 pub type FetchResponse {
   FetchResponse(
@@ -25,16 +30,24 @@ pub type FetchResponse {
     truncated: Bool,
     final_url: String,
     content_encoding: String,
+    /// The full response-header set: names lowercased, duplicate names'
+    /// values joined with ", " (RFC 9110), first-seen order, capped by the
+    /// FFI at 128 pairs / 8 KiB rendered bytes (`headers_truncated` flags
+    /// the cut).
+    headers: List(#(String, String)),
+    headers_truncated: Bool,
   )
 }
 
 @external(erlang, "nexus_boot_ffi", "ensure_hackney_started")
 fn ensure_hackney_started() -> Result(Nil, String)
 
-@external(erlang, "nexus_net_ffi", "bounded_get")
-fn bounded_get(
+@external(erlang, "nexus_net_ffi", "bounded_request")
+fn bounded_request(
+  method: String,
   url: String,
   headers: List(#(String, String)),
+  body: String,
   max_bytes: Int,
   timeout_ms: Int,
 ) -> Result(FetchResponse, String)
@@ -88,9 +101,9 @@ pub fn inflate_bounded(
   max_out_bytes: Int,
 ) -> Result(#(String, Bool), String)
 
-/// One fetch including manual redirects (up to `follow_limit`), each hop
-/// re-validated. Errors are already sanitised strings safe to return to the
-/// model.
+/// One GET including manual redirects (up to `follow_limit`), each hop
+/// re-validated. Errors are already sanitised strings safe to return to
+/// the model.
 pub fn fetch(
   url: String,
   headers: List(#(String, String)),
@@ -99,13 +112,68 @@ pub fn fetch(
   allow_private: Bool,
   follow_limit: Int,
 ) -> Result(FetchResponse, String) {
-  use <- ensure_boot
-  do_fetch(url, headers, max_bytes, timeout_ms, allow_private, follow_limit)
+  request(
+    http.Get,
+    url,
+    headers,
+    "",
+    max_bytes,
+    timeout_ms,
+    allow_private,
+    follow_limit,
+  )
 }
 
-fn do_fetch(
+/// Method+body generalisation of `fetch` (Phase 5 curl upgrades,
+/// docs/plans/web-fetch.md): one request including manual redirects (up
+/// to `follow_limit`), each hop re-validated. Redirect semantics follow
+/// the de-facto client standard (curl -L, browsers):
+///
+/// - `303` switches every method except HEAD to a bodiless GET —
+///   including GET itself, whose (pathological) body is dropped (RFC
+///   9110 §15.4.4 directs the agent to GET). `301`/`302` rewrite only
+///   POST — the sole rewrite RFC 9110 §15.4.2/§15.4.3 sanctions ("a
+///   user agent MAY change the request method from POST to GET"), so a
+///   PUT/PATCH update survives a 301/302 with method and body intact.
+///   A rewrite drops the body AND the caller's framing headers
+///   (`content-length`, `transfer-encoding`) so the next hop cannot be
+///   mis-framed.
+/// - `307`/`308` preserve method and body verbatim;
+/// - a redirect whose scheme/host/port differs from the current hop
+///   strips `authorization`, `cookie`, and `proxy-authorization` from the
+///   caller's headers (curl -L without `--location-trusted`) — exactly
+///   those three names; a custom `x-api-key`-style header still follows
+///   the redirect, as it does in curl. This applies to `fetch` callers
+///   too (web_search's SearxNG bearer rides this path): those credential
+///   headers never cross to a different origin.
+pub fn request(
+  method: Method,
+  url: String,
+  headers: List(#(String, String)),
+  body: String,
+  max_bytes: Int,
+  timeout_ms: Int,
+  allow_private: Bool,
+  follow_limit: Int,
+) -> Result(FetchResponse, String) {
+  use <- ensure_boot
+  do_request(
+    method,
+    url,
+    headers,
+    body,
+    max_bytes,
+    timeout_ms,
+    allow_private,
+    follow_limit,
+  )
+}
+
+fn do_request(
+  method,
   url,
   headers,
+  body,
   max_bytes,
   timeout_ms,
   allow_private,
@@ -115,7 +183,16 @@ fn do_fetch(
   case remaining < 0 {
     True -> Error("too many redirects")
     False ->
-      case bounded_get(validated.url, headers, max_bytes, timeout_ms) {
+      case
+        bounded_request(
+          http.method_to_string(method),
+          validated.url,
+          headers,
+          body,
+          max_bytes,
+          timeout_ms,
+        )
+      {
         Ok(response) ->
           case is_redirect(response.status) {
             True ->
@@ -123,9 +200,28 @@ fn do_fetch(
                 "" -> Error("redirect without a location header")
                 location -> {
                   let next = resolve_location(validated, location)
-                  do_fetch(
+                  let #(next_method, next_body) =
+                    downgrade_on_redirect(method, body, response.status)
+                  let rewritten = next_method != method || next_body != body
+                  let next_headers =
+                    headers
+                    |> fn(kept) {
+                      case same_origin(validated.url, next) {
+                        True -> kept
+                        False -> strip_credentials(kept)
+                      }
+                    }
+                    |> fn(kept) {
+                      case rewritten {
+                        True -> strip_framing(kept)
+                        False -> kept
+                      }
+                    }
+                  do_request(
+                    next_method,
                     next,
-                    headers,
+                    next_headers,
+                    next_body,
                     max_bytes,
                     timeout_ms,
                     allow_private,
@@ -136,6 +232,86 @@ fn do_fetch(
             False -> Ok(response)
           }
         Error(reason) -> Error(reason)
+      }
+  }
+}
+
+/// Redirect method rewriting. `303` (RFC 9110 §15.4.4, matching the
+/// fetch spec and curl) switches every verb except HEAD to a bodiless
+/// GET — GET itself loses any (pathological) body. `301`/`302` rewrite
+/// only POST: the single rewrite RFC 9110 §15.4.2/§15.4.3 sanctions —
+/// rewriting PUT/PATCH would silently turn an update into a read.
+/// `307`/`308` never rewrite anything — that is their contract.
+fn downgrade_on_redirect(
+  method: Method,
+  body: String,
+  status: Int,
+) -> #(Method, String) {
+  case status {
+    303 ->
+      case method {
+        http.Head -> #(method, body)
+        _ -> #(http.Get, "")
+      }
+    301 | 302 ->
+      case method {
+        http.Post -> #(http.Get, "")
+        _ -> #(method, body)
+      }
+    _ -> #(method, body)
+  }
+}
+
+/// Credential-bearing headers stripped when a redirect crosses an origin
+/// (scheme/host/port). Names compared lowercased.
+fn strip_credentials(
+  headers: List(#(String, String)),
+) -> List(#(String, String)) {
+  list.filter(headers, fn(pair) {
+    case string.lowercase(pair.0) {
+      "authorization" | "cookie" | "proxy-authorization" -> False
+      _ -> True
+    }
+  })
+}
+
+/// Framing headers stripped when a redirect rewrite empties the body: a
+/// caller-carried `content-length`/`transfer-encoding` would mis-frame
+/// the bodiless next hop. The tool layer blocks these outright, but
+/// `net.request` is a pub surface future callers may use directly.
+fn strip_framing(headers: List(#(String, String))) -> List(#(String, String)) {
+  list.filter(headers, fn(pair) {
+    case string.lowercase(pair.0) {
+      "content-length" | "transfer-encoding" -> False
+      _ -> True
+    }
+  })
+}
+
+/// Same RFC 3986 origin (scheme, host, port — with scheme-default ports
+/// normalised: `http://h` ≡ `http://h:80`, `https://h` ≡ `https://h:443`)?
+/// A parse failure on either side answers False so the caller treats the
+/// hop as cross-origin and strips credentials (the safe side; an
+/// unparseable target errors on validation anyway). Pub for offline
+/// tests — a pure predicate.
+pub fn same_origin(a: String, b: String) -> Bool {
+  case uri.parse(a), uri.parse(b) {
+    Ok(pa), Ok(pb) ->
+      option.unwrap(pa.scheme, "") == option.unwrap(pb.scheme, "")
+      && string.lowercase(option.unwrap(pa.host, ""))
+      == string.lowercase(option.unwrap(pb.host, ""))
+      && effective_port(pa) == effective_port(pb)
+    _, _ -> False
+  }
+}
+
+fn effective_port(parsed: uri.Uri) -> Int {
+  case parsed.port {
+    Some(port) -> port
+    None ->
+      case parsed.scheme {
+        Some("https") -> 443
+        _ -> 80
       }
   }
 }

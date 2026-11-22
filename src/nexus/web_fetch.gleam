@@ -41,8 +41,8 @@ pub const request_headers = [
 ]
 
 /// Maximum manual redirect hops per fetch (each hop re-validated via SSRF
-/// guard in `nexus/net`).
-const max_redirects = 3
+/// guard in `nexus/net`) — one shared policy decision with `http_fetch`.
+const max_redirects = net.default_follow_limit
 
 /// Runtime configuration + optional cache seam for `web_fetch`.
 pub type Options {
