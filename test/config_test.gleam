@@ -44,6 +44,10 @@ fn set_all(pairs: List(#(String, String))) -> Nil {
   envoy.unset("NEXUS_HTTP_FETCH_MAX_BYTES")
   envoy.unset("NEXUS_HTTP_FETCH_TIMEOUT_MS")
   envoy.unset("NEXUS_HTTP_FETCH_ALLOW_PRIVATE")
+  envoy.unset("NEXUS_WEB_FETCH_MAX_RAW_BYTES")
+  envoy.unset("NEXUS_WEB_FETCH_DEFAULT_CHARS")
+  envoy.unset("NEXUS_WEB_FETCH_MAX_CHARS")
+  envoy.unset("NEXUS_WEB_FETCH_CACHE_TTL_MS")
   list.each(pairs, fn(pair) { envoy.set(pair.0, pair.1) })
 }
 
@@ -552,4 +556,72 @@ pub fn log_level_rejects_invalid_value_test() {
   |> should.equal(
     "environment variable NEXUS_LOG_LEVEL must be one of: debug, info, warn, error: verbose",
   )
+}
+
+// ---------------------------------------------------------------------------
+// web_fetch knobs
+// ---------------------------------------------------------------------------
+
+pub fn web_fetch_defaults_and_overrides_test() {
+  set_all([#("NEXUS_ENCRYPTION_KEY", key_b64)])
+  let assert Ok(cfg) = config.load()
+  cfg.web_fetch_max_raw_bytes |> should.equal(1_048_576)
+  cfg.web_fetch_default_chars |> should.equal(12_000)
+  cfg.web_fetch_max_chars |> should.equal(32_000)
+  cfg.web_fetch_cache_ttl_ms |> should.equal(600_000)
+
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_WEB_FETCH_MAX_RAW_BYTES", "524288"),
+    #("NEXUS_WEB_FETCH_DEFAULT_CHARS", "8000"),
+    #("NEXUS_WEB_FETCH_MAX_CHARS", "16000"),
+    #("NEXUS_WEB_FETCH_CACHE_TTL_MS", "0"),
+  ])
+  let assert Ok(custom) = config.load()
+  custom.web_fetch_max_raw_bytes |> should.equal(524_288)
+  custom.web_fetch_default_chars |> should.equal(8000)
+  custom.web_fetch_max_chars |> should.equal(16_000)
+  custom.web_fetch_cache_ttl_ms |> should.equal(0)
+}
+
+pub fn web_fetch_rejects_invalid_bounds_test() {
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_WEB_FETCH_MAX_RAW_BYTES", "0"),
+  ])
+  let assert Error(msg1) = config.load()
+  should.be_true(string.contains(msg1, "NEXUS_WEB_FETCH_MAX_RAW_BYTES"))
+
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_WEB_FETCH_DEFAULT_CHARS", "0"),
+  ])
+  let assert Error(msg2) = config.load()
+  should.be_true(string.contains(msg2, "NEXUS_WEB_FETCH_DEFAULT_CHARS"))
+
+  // max_chars must be >= default_chars (including when only DEFAULT_CHARS is
+  // raised above the 32_000 default MAX_CHARS).
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_WEB_FETCH_DEFAULT_CHARS", "20000"),
+    #("NEXUS_WEB_FETCH_MAX_CHARS", "10000"),
+  ])
+  let assert Error(msg3) = config.load()
+  should.be_true(string.contains(msg3, "NEXUS_WEB_FETCH_MAX_CHARS"))
+  should.be_true(string.contains(msg3, "NEXUS_WEB_FETCH_DEFAULT_CHARS"))
+
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_WEB_FETCH_DEFAULT_CHARS", "40000"),
+  ])
+  let assert Error(msg3b) = config.load()
+  should.be_true(string.contains(msg3b, "NEXUS_WEB_FETCH_MAX_CHARS (32000)"))
+  should.be_true(string.contains(msg3b, "NEXUS_WEB_FETCH_DEFAULT_CHARS (40000)"))
+
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_WEB_FETCH_CACHE_TTL_MS", "-1"),
+  ])
+  let assert Error(msg4) = config.load()
+  should.be_true(string.contains(msg4, "NEXUS_WEB_FETCH_CACHE_TTL_MS"))
 }

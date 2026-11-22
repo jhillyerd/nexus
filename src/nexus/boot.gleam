@@ -52,6 +52,7 @@ import nexus/thread_registry
 import nexus/tool_provider
 import nexus/tools
 import nexus/web
+import nexus/web_fetch_cache
 
 @external(erlang, "nexus_boot_ffi", "halt")
 fn halt(code: Int) -> a
@@ -147,6 +148,11 @@ pub fn main() -> Nil {
           halt(2)
         }
       }
+      // Web-fetch cache THIRD (web-fetch plan): its own unlinked OneForOne
+      // supervisor outside the OneForAll root so a cache crash or crash-loop
+      // never restarts threads or halts boot. Disabled when
+      // `web_fetch_cache_ttl_ms == 0`.
+      let fetch_cache = web_fetch_cache.boot(cfg.web_fetch_cache_ttl_ms)
       // Names are stable across restarts of the supervisor itself.
       let store_name = process.new_name("nexus_store")
       let provider_registry_name = process.new_name("nexus_provider_registry")
@@ -259,6 +265,8 @@ pub fn main() -> Nil {
               // The mounted MCP servers (plugin-api plan Phase 2): the
               // freeze seam for create-time schema snapshots.
               foreign,
+              // Optional in-memory web_fetch cache seam (isolated OneForOne).
+              fetch_cache,
             )
           }),
         )

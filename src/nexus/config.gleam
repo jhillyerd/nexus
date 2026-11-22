@@ -69,6 +69,17 @@ pub type Config {
     /// M3 http_fetch: dev/test escape hatch allowing private/loopback
     /// targets. Never enable in production (SSRF guard).
     http_fetch_allow_private: Bool,
+    /// web_fetch: streaming raw response byte cap enforced in `nexus_net_ffi`
+    /// before HTML-to-Markdown conversion.
+    web_fetch_max_raw_bytes: Int,
+    /// web_fetch: default returned Markdown/text slice length in characters
+    /// when the model omits `max_length`.
+    web_fetch_default_chars: Int,
+    /// web_fetch: hard upper clamp on `max_length` per call, in characters.
+    web_fetch_max_chars: Int,
+    /// web_fetch: in-memory extracted-document cache TTL in ms (`0` disables
+    /// the cache).
+    web_fetch_cache_ttl_ms: Int,
     /// M3 web_search: SearxNG base URL (e.g. `https://searx.example`).
     searxng_base_url: Option(String),
     /// M3 web_search: optional bearer token; never logged or echoed.
@@ -230,6 +241,40 @@ pub fn from_env(
     "NEXUS_HTTP_FETCH_ALLOW_PRIVATE",
     False,
   ))
+  use web_fetch_max_raw_bytes <- result.try(optional_min_int(
+    get,
+    "NEXUS_WEB_FETCH_MAX_RAW_BYTES",
+    1_048_576,
+    min: 1,
+  ))
+  use web_fetch_default_chars <- result.try(optional_min_int(
+    get,
+    "NEXUS_WEB_FETCH_DEFAULT_CHARS",
+    12_000,
+    min: 1,
+  ))
+  use web_fetch_max_chars <- result.try(optional_min_int(
+    get,
+    "NEXUS_WEB_FETCH_MAX_CHARS",
+    32_000,
+    min: 1,
+  ))
+  use Nil <- result.try(case web_fetch_max_chars < web_fetch_default_chars {
+    True ->
+      Error(
+        "environment variable NEXUS_WEB_FETCH_MAX_CHARS ("
+        <> int.to_string(web_fetch_max_chars)
+        <> ") must be >= NEXUS_WEB_FETCH_DEFAULT_CHARS ("
+        <> int.to_string(web_fetch_default_chars)
+        <> ")",
+      )
+    False -> Ok(Nil)
+  })
+  use web_fetch_cache_ttl_ms <- result.try(optional_non_negative_int(
+    get,
+    "NEXUS_WEB_FETCH_CACHE_TTL_MS",
+    600_000,
+  ))
   // ---- Phase 2 persistence (NEXUS_PG_*): defaults match the repo's
   // docker-compose.yml. Persistence is mandatory: invalid values fail
   // loudly here, and an unreachable database fails boot (see
@@ -367,6 +412,10 @@ pub fn from_env(
     http_fetch_max_bytes: http_fetch_max_bytes,
     http_fetch_timeout_ms: http_fetch_timeout_ms,
     http_fetch_allow_private: http_fetch_allow_private,
+    web_fetch_max_raw_bytes: web_fetch_max_raw_bytes,
+    web_fetch_default_chars: web_fetch_default_chars,
+    web_fetch_max_chars: web_fetch_max_chars,
+    web_fetch_cache_ttl_ms: web_fetch_cache_ttl_ms,
     searxng_base_url: optional_string(get, "NEXUS_SEARXNG_BASE_URL"),
     searxng_token: optional_string(get, "NEXUS_SEARXNG_TOKEN"),
     pg_host: pg_host,

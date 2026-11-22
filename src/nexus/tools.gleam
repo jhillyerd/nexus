@@ -37,6 +37,8 @@ import nexus/delivery.{type Delivery}
 import nexus/env.{type Environment}
 import nexus/http_fetch
 import nexus/tool_provider
+import nexus/web_fetch
+import nexus/web_fetch_cache
 import nexus/web_search
 
 /// Per-turn context handed to every executor alongside the raw arguments.
@@ -133,6 +135,7 @@ pub const freeze_ask_ms = 4000
 pub fn catalog_names() -> List(String) {
   [
     "http_fetch",
+    "web_fetch",
     "web_search",
     "bot_message",
     "list_bots",
@@ -175,7 +178,7 @@ pub fn default_names(cfg: Config) -> List(String) {
   catalog_names()
   |> list.filter(fn(name) {
     case name {
-      "bot_message" | "list_bots" -> False
+      "bot_message" | "list_bots" | "http_fetch" -> False
       "web_search" -> option.is_some(cfg.searxng_base_url)
       "codemode" -> cfg.codemode
       name -> !env.is_env_name(name) || option.is_some(cfg.workspace_root)
@@ -211,6 +214,17 @@ pub fn by_names_with(
   providers: ProviderTable,
   names: List(String),
 ) -> Result(List(ToolSpec), String) {
+  by_names_with_cache(cfg, providers, None, names)
+}
+
+/// Like `by_names_with`, wiring an optional `web_fetch_cache.Seam` into
+/// `web_fetch` specs (used by `thread_registry` at boot).
+pub fn by_names_with_cache(
+  cfg: Config,
+  providers: ProviderTable,
+  cache: Option(web_fetch_cache.Seam),
+  names: List(String),
+) -> Result(List(ToolSpec), String) {
   // A toolset is a set: duplicates would send one schema twice and make
   // the name tuple → envelope mapping order-dependent.
   let names = list.unique(names)
@@ -218,6 +232,7 @@ pub fn by_names_with(
     list.try_map(names, fn(name) {
       case name {
         "http_fetch" -> Ok([fetch_spec(cfg)])
+        "web_fetch" -> Ok([web_fetch_spec(cfg, cache)])
         "web_search" -> Ok([web_search_spec(cfg)])
         "bot_message" -> Ok([bot_message_spec()])
         "list_bots" -> Ok([list_bots_spec()])
@@ -389,6 +404,24 @@ pub fn by_entries_with(
   foreign foreign: Dict(String, ForeignServer),
   entries entries: List(ToolsetEntry),
 ) -> Result(List(ToolSpec), String) {
+  by_entries_with_cache(
+    cfg: cfg,
+    providers: providers,
+    foreign: foreign,
+    web_fetch_cache: None,
+    entries: entries,
+  )
+}
+
+/// Like `by_entries_with`, threading an optional `web_fetch_cache.Seam` into
+/// `web_fetch` specs.
+pub fn by_entries_with_cache(
+  cfg cfg: Config,
+  providers providers: ProviderTable,
+  foreign foreign: Dict(String, ForeignServer),
+  web_fetch_cache web_fetch_cache: Option(web_fetch_cache.Seam),
+  entries entries: List(ToolsetEntry),
+) -> Result(List(ToolSpec), String) {
   // A toolset is a set: duplicates would send one schema twice and
   // make the entry tuple → envelope mapping order-dependent.
   let names = list.map(entries, fn(entry) { entry.name })
@@ -410,7 +443,8 @@ pub fn by_entries_with(
           case plain_with_schema {
             True ->
               Error(Reason("corrupt manifest entry '" <> entry.name <> "'"))
-            False -> dispatch_entry(cfg, providers, foreign, entry)
+            False ->
+              dispatch_entry(cfg, providers, foreign, web_fetch_cache, entry)
           }
         })
       case built {
@@ -437,10 +471,13 @@ fn dispatch_entry(
   cfg: Config,
   providers: ProviderTable,
   foreign: Dict(String, ForeignServer),
+  web_fetch_cache: Option(web_fetch_cache.Seam),
   entry: ToolsetEntry,
 ) -> Result(List(ToolSpec), ResolutionError) {
   case entry {
     ToolsetEntry("http_fetch", _, _) -> Ok([fetch_spec(cfg)])
+    ToolsetEntry("web_fetch", _, _) ->
+      Ok([web_fetch_spec(cfg, web_fetch_cache)])
     ToolsetEntry("web_search", _, _) -> Ok([web_search_spec(cfg)])
     ToolsetEntry("bot_message", _, _) -> Ok([bot_message_spec()])
     ToolsetEntry("list_bots", _, _) -> Ok([list_bots_spec()])
@@ -845,6 +882,24 @@ fn fetch_spec(cfg: Config) -> ToolSpec {
       )(arguments)
     },
   )
+}
+
+fn web_fetch_spec(
+  cfg: Config,
+  cache: Option(web_fetch_cache.Seam),
+) -> ToolSpec {
+  let opts =
+    web_fetch.Options(
+      max_raw_bytes: cfg.web_fetch_max_raw_bytes,
+      timeout_ms: cfg.http_fetch_timeout_ms,
+      allow_private: cfg.http_fetch_allow_private,
+      default_chars: cfg.web_fetch_default_chars,
+      max_chars: cfg.web_fetch_max_chars,
+      cache: cache,
+    )
+  ToolSpec(tool: web_fetch.schema(), run: fn(_ctx, arguments) {
+    web_fetch.run(opts)(arguments)
+  })
 }
 
 fn web_search_spec(cfg: Config) -> ToolSpec {

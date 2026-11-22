@@ -23,6 +23,8 @@ pub type FetchResponse {
     location: String,
     body: String,
     truncated: Bool,
+    final_url: String,
+    content_encoding: String,
   )
 }
 
@@ -39,6 +41,17 @@ fn bounded_get(
 
 @external(erlang, "nexus_net_ffi", "resolve_host")
 fn resolve_host(host: String) -> Result(List(String), String)
+
+/// Decode a raw response body string lossily into valid UTF-8 so Latin-1
+/// pages or multi-byte sequences truncated at `max_bytes` never crash
+/// downstream HTML parsing or JSON encoding.
+@external(erlang, "nexus_net_ffi", "to_text_lossy")
+pub fn decode_utf8_lossy(text: String) -> String
+
+/// Byte-level variant of `decode_utf8_lossy` for callers/tests holding raw
+/// `BitArray` bytes.
+@external(erlang, "nexus_net_ffi", "to_text_lossy")
+pub fn bytes_to_text_lossy(bytes: BitArray) -> String
 
 /// One fetch including manual redirects (up to `follow_limit`), each hop
 /// re-validated. Errors are already sanitised strings safe to return to the
@@ -94,31 +107,57 @@ fn do_fetch(
 
 /// Resolve a possibly-relative Location against the hop we just fetched.
 fn resolve_location(previous: ValidatedUrl, location: String) -> String {
-  case uri.parse(location) {
-    Ok(parsed) ->
-      case parsed.host {
-        // Absolute: use as-is.
-        Some(_) -> location
-        None -> relative_to(previous, parsed)
-      }
-    Error(_) -> location
+  case resolve_url(previous.url, location) {
+    Ok(resolved) -> resolved
+    Error(Nil) -> location
   }
 }
 
-fn relative_to(previous: ValidatedUrl, parsed: uri.Uri) -> String {
-  let path = case parsed.path {
-    "" -> "/"
-    "/" -> "/"
-    path ->
-      case string.starts_with(path, "/") {
-        True -> path
-        False -> "/" <> path
+/// Resolve a relative or absolute URI reference against `base_url` per
+/// RFC 3986 (used for HTTP redirect `Location` headers and HTML `<a href>`
+/// links).
+///
+/// Guards two quirks in `gleam_stdlib`'s `uri.merge`:
+/// - Absolute references (with a scheme) are returned verbatim so a target
+///   never inherits the base's port or loses its userinfo (the SSRF guard
+///   must still see userinfo on redirect hops).
+/// - Protocol-relative references (`//host/...`) inherit only `base.scheme`,
+///   not `base.port`, and preserve `relative.userinfo`.
+/// - Trailing directory slashes (`dir/`, `.`, `..`) are preserved so later
+///   relative links against the resolved URL stay in the right directory.
+pub fn resolve_url(base_url: String, reference: String) -> Result(String, Nil) {
+  use base <- result.try(uri.parse(base_url))
+  use rel <- result.try(uri.parse(reference))
+  case base.scheme, base.host {
+    Some(_), Some(_) ->
+      case rel.scheme, rel.host {
+        // Already absolute: return verbatim.
+        Some(_), _ -> Ok(reference)
+        // Protocol-relative (`//host/...`): inherit only the base scheme.
+        None, Some(_) -> Ok(uri.to_string(uri.Uri(..rel, scheme: base.scheme)))
+        // Relative path / query / fragment: delegate to RFC 3986 merge.
+        None, None -> {
+          use merged <- result.try(uri.merge(base, rel))
+          let path = case preserve_trailing_slash(rel.path, merged.path) {
+            True -> merged.path <> "/"
+            False -> merged.path
+          }
+          Ok(uri.to_string(uri.Uri(..merged, path: path)))
+        }
       }
+    _, _ -> Error(Nil)
   }
-  case parsed.query {
-    Some(query) ->
-      previous.scheme <> "://" <> previous.host <> path <> "?" <> query
-    None -> previous.scheme <> "://" <> previous.host <> path
+}
+
+fn preserve_trailing_slash(rel_path: String, merged_path: String) -> Bool {
+  rel_path != ""
+  && !string.ends_with(merged_path, "/")
+  && {
+    string.ends_with(rel_path, "/")
+    || string.ends_with(rel_path, "/.")
+    || string.ends_with(rel_path, "/..")
+    || rel_path == "."
+    || rel_path == ".."
   }
 }
 

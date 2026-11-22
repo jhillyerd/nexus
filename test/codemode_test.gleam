@@ -531,7 +531,7 @@ pub fn spam_then_final_item_survives_test() {
 /// list — the frozen envelope is unchanged until codemode is enabled.
 pub fn registry_unchanged_with_flag_off_test() {
   let names = tools.default(base_config()) |> spec_names
-  should.equal(names, ["http_fetch"])
+  should.equal(names, ["web_fetch"])
 }
 
 pub fn registry_appends_codemode_when_enabled_test() {
@@ -542,7 +542,7 @@ pub fn registry_appends_codemode_when_enabled_test() {
       searxng_base_url: Some("https://searx.example"),
     )
   let names = tools.default(cfg) |> spec_names
-  should.equal(names, ["http_fetch", "web_search", "codemode"])
+  should.equal(names, ["web_fetch", "web_search", "codemode"])
 }
 
 /// codemode is structurally absent from its own host list: the captured

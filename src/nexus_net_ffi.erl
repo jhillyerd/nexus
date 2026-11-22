@@ -3,7 +3,7 @@
 %% multi-gigabyte response cannot be materialised before truncation.
 -module(nexus_net_ffi).
 
--export([bounded_get/4, resolve_host/1]).
+-export([bounded_get/4, resolve_host/1, to_text_lossy/1]).
 
 %% GET with connect/receive timeouts and a hard byte cap. Does NOT follow
 %% redirects (policy — including re-validating every hop against the SSRF
@@ -67,10 +67,13 @@ bounded_get_inner(Url, Headers, MaxBytes, TimeoutMs) ->
     case hackney:request(get, Url, Headers, <<>>, Opts) of
         {ok, Status, RespHeaders, Client} ->
             ContentType = header(RespHeaders, <<"content-type">>),
+            ContentEncoding =
+                string:lowercase(headers_joined(RespHeaders, <<"content-encoding">>)),
             Location = header(RespHeaders, <<"location">>),
             case read_body(Client, MaxBytes, <<>>, false) of
                 {ok, Body, Truncated} ->
-                    {ok, {fetch_response, Status, ContentType, Location, Body, Truncated}};
+                    {ok, {fetch_response, Status, ContentType, Location, Body,
+                          Truncated, Url, ContentEncoding}};
                 {error, Reason} ->
                     hackney:close(Client),
                     {error, format_reason(Reason)}
@@ -112,6 +115,15 @@ header(Headers, Name) ->
         false -> <<>>
     end.
 
+%% Collect all values for a repeated header (e.g. multiple Content-Encoding
+%% headers) joined with ", " per RFC 9110.
+headers_joined(Headers, Name) ->
+    Target = string:lowercase(Name),
+    Values = [string:trim(V) || {K, V} <- Headers,
+              string:lowercase(K) =:= Target,
+              string:trim(V) =/= <<>>],
+    iolist_to_binary(lists:join(<<", ">>, Values)).
+
 format_reason(Reason) ->
     unicode:characters_to_binary(io_lib:format("~tp", [Reason])).
 
@@ -135,3 +147,61 @@ resolve_family(Host, Family) ->
             [unicode:characters_to_binary(inet:ntoa(Addr))];
         {error, _} -> []
     end.
+
+%% Arbitrary response bytes -> valid UTF-8 binary.
+%% - Pure valid UTF-8 takes the fast zero-copy path.
+%% - A trailing incomplete multi-byte UTF-8 sequence (e.g. cut at MaxBytes)
+%%   drops only the unfinished trailing bytes instead of corrupting earlier
+%%   valid UTF-8 in the document.
+%% - Any invalid UTF-8 byte is decoded as Latin-1 (U+0000..U+00FF), with
+%%   0x80-0x9F mapped per WHATWG Windows-1252 (smart quotes, dashes, euro)
+%%   so legacy-encoded or mixed pages decode legibly and never crash
+%%   downstream HTML parsing or JSON encoding.
+to_text_lossy(Bin) when is_binary(Bin) ->
+    case unicode:characters_to_binary(Bin, utf8) of
+        Text when is_binary(Text) -> Text;
+        {incomplete, Good, _Rest} -> Good;
+        {error, Good, <<Bad, Rest/binary>>} ->
+            to_text_lossy_loop(Rest, [lossy_byte(Bad), Good])
+    end.
+
+to_text_lossy_loop(<<>>, Acc) ->
+    iolist_to_binary(lists:reverse(Acc));
+to_text_lossy_loop(Bin, Acc) ->
+    case unicode:characters_to_binary(Bin, utf8) of
+        Text when is_binary(Text) ->
+            iolist_to_binary(lists:reverse([Text | Acc]));
+        {incomplete, Good, _Rest} ->
+            iolist_to_binary(lists:reverse([Good | Acc]));
+        {error, Good, <<Bad, Rest/binary>>} ->
+            to_text_lossy_loop(Rest, [lossy_byte(Bad), Good | Acc])
+    end.
+
+lossy_byte(16#80) -> <<16#20AC/utf8>>;
+lossy_byte(16#82) -> <<16#201A/utf8>>;
+lossy_byte(16#83) -> <<16#0192/utf8>>;
+lossy_byte(16#84) -> <<16#201E/utf8>>;
+lossy_byte(16#85) -> <<16#2026/utf8>>;
+lossy_byte(16#86) -> <<16#2020/utf8>>;
+lossy_byte(16#87) -> <<16#2021/utf8>>;
+lossy_byte(16#88) -> <<16#02C6/utf8>>;
+lossy_byte(16#89) -> <<16#2030/utf8>>;
+lossy_byte(16#8A) -> <<16#0160/utf8>>;
+lossy_byte(16#8B) -> <<16#2039/utf8>>;
+lossy_byte(16#8C) -> <<16#0152/utf8>>;
+lossy_byte(16#8E) -> <<16#017D/utf8>>;
+lossy_byte(16#91) -> <<16#2018/utf8>>;
+lossy_byte(16#92) -> <<16#2019/utf8>>;
+lossy_byte(16#93) -> <<16#201C/utf8>>;
+lossy_byte(16#94) -> <<16#201D/utf8>>;
+lossy_byte(16#95) -> <<16#2022/utf8>>;
+lossy_byte(16#96) -> <<16#2013/utf8>>;
+lossy_byte(16#97) -> <<16#2014/utf8>>;
+lossy_byte(16#98) -> <<16#02DC/utf8>>;
+lossy_byte(16#99) -> <<16#2122/utf8>>;
+lossy_byte(16#9A) -> <<16#0161/utf8>>;
+lossy_byte(16#9B) -> <<16#203A/utf8>>;
+lossy_byte(16#9C) -> <<16#0153/utf8>>;
+lossy_byte(16#9E) -> <<16#017E/utf8>>;
+lossy_byte(16#9F) -> <<16#0178/utf8>>;
+lossy_byte(Bad) -> <<Bad/utf8>>.

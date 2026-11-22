@@ -181,16 +181,20 @@ fn smoke_config() -> Config {
         _ -> Error(Nil)
       }
     })
-  // The smoke server ran with SearxNG configured, so the registry froze
-  // [http_fetch, web_search] — same order, same schemas, as production.
+  // The smoke server ran with SearxNG configured.
   config.Config(..base, searxng_base_url: Some("https://searx.example"))
 }
 
 fn loop_options() -> Options {
+  // Pin the captured fixture's exact toolset ([http_fetch, web_search]) so
+  // the envelope matches the recorded fixture even after `web_fetch` replaced
+  // `http_fetch` in `tools.default_names`.
+  let assert Ok(specs) =
+    tools.by_names(smoke_config(), ["http_fetch", "web_search"])
   transcript.Options(
     ..transcript.default_options(),
     stream: True,
-    tools: tools.default(smoke_config()) |> tools.schemas,
+    tools: specs |> tools.schemas,
     tool_choice: Some(chat.ToolChoiceModeChoice(chat.ToolChoiceAuto)),
   )
 }

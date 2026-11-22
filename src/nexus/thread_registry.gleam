@@ -65,6 +65,7 @@ import nexus/tool_provider
 import nexus/tools
 import nexus/transcript.{type Transcript}
 import nexus/utility
+import nexus/web_fetch_cache
 
 /// The factory's child-start argument: everything needed to (re)start one
 /// thread actor identically.
@@ -391,6 +392,9 @@ type State {
     /// LIVE through the mount here. A server that degraded at boot is
     /// absent: creates naming its tools are the honest 400.
     foreign: Dict(String, tools.ForeignServer),
+    /// Optional in-memory `web_fetch` document cache seam wired at boot
+    /// (isolated OneForOne actor; `None` when disabled or in tests).
+    web_fetch_cache: Option(web_fetch_cache.Seam),
     /// The default toolset's resolved names — the key under which the
     /// boot-built bundle is cached below (as plain entries), and what
     /// plain creates resolve through the cache (the default snapshot
@@ -506,6 +510,7 @@ pub fn start(
   bots_name: process.Name(bot_registry.Msg),
   providers: tools.ProviderTable,
   foreign: Dict(String, tools.ForeignServer),
+  web_fetch_cache: Option(web_fetch_cache.Seam),
 ) -> actor.StartResult(Subject(Msg)) {
   // The tool registry is built once, here, from the global config — before
   // any thread exists — so every request any thread of the default toolset
@@ -518,7 +523,8 @@ pub fn start(
   // generation-side only, so the dynamic corpus can never touch the
   // cached prefix (utility-tags plan §3.3).
   let names = tools.default_names(cfg)
-  let assert Ok(specs) = tools.by_names(cfg, names)
+  let assert Ok(specs) =
+    tools.by_names_with_cache(cfg, dict.new(), web_fetch_cache, names)
   let corpus = tag_corpus_for(name)
   let default_toolset =
     thread.Toolset(
@@ -527,7 +533,7 @@ pub fn start(
       runner: thread.agent_runner(cfg.max_tool_iterations, specs),
       utility_runner: thread.utility_runner(specs, corpus),
     )
-  start_with_toolset(
+  do_start(
     cfg,
     factory,
     name,
@@ -538,6 +544,7 @@ pub fn start(
     bots_name,
     providers,
     foreign,
+    web_fetch_cache,
   )
 }
 
@@ -556,11 +563,39 @@ pub fn start_with_toolset(
   name: process.Name(Msg),
   persistence: Store,
   default_toolset: thread.Toolset,
+  corpus: fn() -> List(String),
+  resolve_provider: ResolveProvider,
+  bots_name: process.Name(bot_registry.Msg),
+  providers: tools.ProviderTable,
+  foreign: Dict(String, tools.ForeignServer),
+) -> actor.StartResult(Subject(Msg)) {
+  do_start(
+    cfg,
+    factory,
+    name,
+    persistence,
+    default_toolset,
+    corpus,
+    resolve_provider,
+    bots_name,
+    providers,
+    foreign,
+    None,
+  )
+}
+
+fn do_start(
+  cfg: Config,
+  factory: Factory,
+  name: process.Name(Msg),
+  persistence: Store,
+  default_toolset: thread.Toolset,
   _corpus: fn() -> List(String),
   resolve_provider: ResolveProvider,
   bots_name: process.Name(bot_registry.Msg),
   providers: tools.ProviderTable,
   foreign: Dict(String, tools.ForeignServer),
+  web_fetch_cache: Option(web_fetch_cache.Seam),
 ) -> actor.StartResult(Subject(Msg)) {
   let builder =
     actor.new_with_initialiser(5000, fn(self) {
@@ -582,6 +617,7 @@ pub fn start_with_toolset(
             cfg: cfg,
             providers: providers,
             foreign: foreign,
+            web_fetch_cache: web_fetch_cache,
             default_names: default_toolset.names,
             toolsets: dict.from_list([
               #(plain_entries(default_toolset.names), default_toolset),
@@ -984,11 +1020,12 @@ fn resolve_entries(
     Ok(toolset) -> Ok(#(state, toolset))
     Error(_) ->
       case
-        tools.by_entries_with(
-          state.cfg,
-          state.providers,
-          state.foreign,
-          entries,
+        tools.by_entries_with_cache(
+          cfg: state.cfg,
+          providers: state.providers,
+          foreign: state.foreign,
+          web_fetch_cache: state.web_fetch_cache,
+          entries: entries,
         )
       {
         Error(reason) -> Error(reason)
