@@ -70,8 +70,12 @@ pub type Config {
     /// targets. Never enable in production (SSRF guard).
     http_fetch_allow_private: Bool,
     /// web_fetch: streaming raw response byte cap enforced in `nexus_net_ffi`
-    /// before HTML-to-Markdown conversion.
+    /// before decompression and HTML-to-Markdown conversion.
     web_fetch_max_raw_bytes: Int,
+    /// web_fetch: hard cap on DECOMPRESSED bytes when decoding a gzip/deflate
+    /// response (`net.inflate_bounded` truncates there, mirroring the wire
+    /// cap, so a decompression bomb costs at most this much).
+    web_fetch_max_decompressed_bytes: Int,
     /// web_fetch: default returned Markdown/text slice length in characters
     /// when the model omits `max_length`.
     web_fetch_default_chars: Int,
@@ -247,6 +251,12 @@ pub fn from_env(
     1_048_576,
     min: 1,
   ))
+  use web_fetch_max_decompressed_bytes <- result.try(optional_min_int(
+    get,
+    "NEXUS_WEB_FETCH_MAX_DECOMPRESSED_BYTES",
+    8_388_608,
+    min: 1,
+  ))
   use web_fetch_default_chars <- result.try(optional_min_int(
     get,
     "NEXUS_WEB_FETCH_DEFAULT_CHARS",
@@ -413,6 +423,7 @@ pub fn from_env(
     http_fetch_timeout_ms: http_fetch_timeout_ms,
     http_fetch_allow_private: http_fetch_allow_private,
     web_fetch_max_raw_bytes: web_fetch_max_raw_bytes,
+    web_fetch_max_decompressed_bytes: web_fetch_max_decompressed_bytes,
     web_fetch_default_chars: web_fetch_default_chars,
     web_fetch_max_chars: web_fetch_max_chars,
     web_fetch_cache_ttl_ms: web_fetch_cache_ttl_ms,

@@ -895,6 +895,7 @@ fn web_fetch_spec(
       allow_private: cfg.http_fetch_allow_private,
       default_chars: cfg.web_fetch_default_chars,
       max_chars: cfg.web_fetch_max_chars,
+      max_decompressed_bytes: cfg.web_fetch_max_decompressed_bytes,
       cache: cache,
     )
   ToolSpec(tool: web_fetch.schema(), run: fn(_ctx, arguments) {

@@ -53,6 +53,27 @@ pub fn decode_utf8_lossy(text: String) -> String
 @external(erlang, "nexus_net_ffi", "to_text_lossy")
 pub fn bytes_to_text_lossy(bytes: BitArray) -> String
 
+/// Boundedly inflate a complete gzip / x-gzip / deflate body (already capped
+/// on the wire by `max_bytes`) to at most `max_out_bytes` DECOMPRESSED bytes.
+///
+/// Returns `#(text, truncated)` where `truncated` is true when the
+/// decompressed size exceeded the cap and the output was cut there — the
+/// decompression-bomb guard. Over-cap truncates rather than erroring,
+/// mirroring the wire cap's semantics; a corrupt stream is an error. The
+/// expansion is bounded DURING inflation: the compressed input is fed to
+/// zlib in fixed slices with the accumulated output checked after every
+/// slice, so peak memory is the cap plus one slice's worst-case expansion.
+/// A `deflate` coding that fails zlib/gzip auto-detection is retried as raw
+/// deflate (windowBits -15) — for servers that send RFC 1951 bytes under the
+/// `deflate` token. Only the first gzip member of a multi-member stream is
+/// decoded; an empty body passes through untouched.
+@external(erlang, "nexus_net_ffi", "inflate_bounded")
+pub fn inflate_bounded(
+  body: String,
+  encoding: String,
+  max_out_bytes: Int,
+) -> Result(#(String, Bool), String)
+
 /// One fetch including manual redirects (up to `follow_limit`), each hop
 /// re-validated. Errors are already sanitised strings safe to return to the
 /// model.

@@ -47,6 +47,7 @@ fn test_config() -> config.Config {
     web_fetch_max_raw_bytes: 1_048_576,
     web_fetch_default_chars: 12_000,
     web_fetch_max_chars: 32_000,
+    web_fetch_max_decompressed_bytes: 8_388_608,
     web_fetch_cache_ttl_ms: 600_000,
     searxng_base_url: None,
     searxng_token: None,

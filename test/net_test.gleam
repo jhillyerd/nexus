@@ -13,6 +13,18 @@ import gleeunit/should
 import mist
 import nexus/net
 
+@external(erlang, "net_test_ffi", "gzip")
+fn gzip(body: String) -> String
+
+@external(erlang, "net_test_ffi", "zlib_wrap")
+fn zlib_wrap(body: String) -> String
+
+@external(erlang, "net_test_ffi", "deflate_raw")
+fn deflate_raw(body: String) -> String
+
+@external(erlang, "net_test_ffi", "gzip_corrupt")
+fn gzip_corrupt() -> String
+
 // ---------------------------------------------------------------------------
 // RFC 3986 relative URL resolution (pure)
 // ---------------------------------------------------------------------------
@@ -130,6 +142,13 @@ fn handler(req: Request(mist.Connection)) -> Response(mist.ResponseData) {
       |> response.set_header("content-type", "text/html")
       |> response.set_header("content-encoding", "GZIP")
       |> response.set_body(mist.Bytes(bytes_tree.from_string("fake-gz")))
+    "/gz-real", Get ->
+      response.new(200)
+      |> response.set_header("content-type", "text/plain")
+      |> response.set_header("content-encoding", "gzip")
+      |> response.set_body(
+        mist.Bytes(bytes_tree.from_string(gzip("round-trip through hackney"))),
+      )
     "/multi-encoding", Get ->
       response.new(200)
       |> response.set_header("content-type", "text/html")
@@ -175,4 +194,65 @@ pub fn nested_relative_redirects_and_final_url_test() {
     net.fetch(base() <> "/multi-encoding", [], 4096, 2000, True, 3)
   multi.status |> should.equal(200)
   multi.content_encoding |> should.equal("identity, gzip")
+
+  // hackney 1.25 passes content-encoded bytes through UNDECODED in the
+  // manual stream_body path (verified in source; pinned here so a hackney
+  // upgrade that starts decoding fails loudly) — decoding is wholly
+  // `web_fetch`'s, via `net.inflate_bounded`.
+  let assert Ok(raw_gz) =
+    net.fetch(base() <> "/gz-real", [], 4096, 2000, True, 3)
+  raw_gz.content_encoding |> should.equal("gzip")
+  should.be_true(raw_gz.body != "round-trip through hackney")
+  net.inflate_bounded(raw_gz.body, "gzip", 1000)
+  |> should.equal(Ok(#("round-trip through hackney", False)))
+}
+
+// ---------------------------------------------------------------------------
+// Bounded gzip/deflate inflation (`net.inflate_bounded`)
+// ---------------------------------------------------------------------------
+
+pub fn inflate_bounded_roundtrips_all_three_formats_test() {
+  let plain = "hello compressible world " <> string.repeat("x", 5000)
+
+  // gzip and the x-gzip alias (auto-detect windowBits 15+32).
+  net.inflate_bounded(gzip(plain), "gzip", 1_000_000)
+  |> should.equal(Ok(#(plain, False)))
+  net.inflate_bounded(gzip(plain), "x-gzip", 1_000_000)
+  |> should.equal(Ok(#(plain, False)))
+
+  // Correct deflate: zlib-wrapped (RFC 1950).
+  net.inflate_bounded(zlib_wrap(plain), "deflate", 1_000_000)
+  |> should.equal(Ok(#(plain, False)))
+
+  // Broken-server deflate: raw RFC 1951 bytes (windowBits -15 retry).
+  net.inflate_bounded(deflate_raw(plain), "deflate", 1_000_000)
+  |> should.equal(Ok(#(plain, False)))
+}
+
+pub fn inflate_bounded_caps_bombs_and_truncates_test() {
+  // A ~9 MB decompression bomb: 9 MB of zeros compresses to under 20 KB,
+  // so the WIRE cap could never stop it — only the decompressed cap does.
+  let bomb = gzip(string.repeat("0", 9_000_000))
+  should.be_true(string.byte_size(bomb) < 20_000)
+
+  let assert Ok(#(out, truncated)) = net.inflate_bounded(bomb, "gzip", 4096)
+  truncated |> should.equal(True)
+  string.byte_size(out) |> should.equal(4096)
+  out |> should.equal(string.repeat("0", 4096))
+
+  // Output at EXACTLY the cap is not truncated (over-cap truncates).
+  let exact = string.repeat("a", 100)
+  net.inflate_bounded(gzip(exact), "gzip", 100)
+  |> should.equal(Ok(#(exact, False)))
+}
+
+pub fn inflate_bounded_corrupt_and_empty_test() {
+  // A gzip header prefix followed by garbage fails as a decode error, not
+  // a crash (zlib raises error:data_error inside the FFI).
+  net.inflate_bounded(gzip_corrupt(), "gzip", 1000)
+  |> should.equal(Error("corrupt compressed stream"))
+
+  // An empty body carries no member to decode and passes through.
+  net.inflate_bounded("", "gzip", 1000)
+  |> should.equal(Ok(#("", False)))
 }

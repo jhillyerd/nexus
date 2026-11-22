@@ -3,7 +3,7 @@
 %% multi-gigabyte response cannot be materialised before truncation.
 -module(nexus_net_ffi).
 
--export([bounded_get/4, resolve_host/1, to_text_lossy/1]).
+-export([bounded_get/4, resolve_host/1, to_text_lossy/1, inflate_bounded/3]).
 
 %% GET with connect/receive timeouts and a hard byte cap. Does NOT follow
 %% redirects (policy — including re-validating every hop against the SSRF
@@ -126,6 +126,74 @@ headers_joined(Headers, Name) ->
 
 format_reason(Reason) ->
     unicode:characters_to_binary(io_lib:format("~tp", [Reason])).
+
+%% Boundedly inflate a complete, already-wire-capped gzip/deflate body.
+%%
+%% The caller (`web_fetch`) advertises `Accept-Encoding: gzip, deflate`, so
+%% origins may answer compressed even though bounded_get's MaxBytes bounds
+%% only the COMPRESSED wire bytes; a decompression bomb would otherwise
+%% expand post-receipt without bound. Like the wire cap, over-cap here
+%% TRUNCATES ({ok, {Out, true}}) instead of erroring — the model sees
+%% raw_truncated and knows the tail is gone. Memory stays bounded because
+%% the compressed input is fed to zlib in fixed slices with the accumulated
+%% output checked after every slice: peak cost is MaxOut plus one slice's
+%% worst-case expansion.
+%%
+%% Encoding is the normalized lowercase Content-Encoding token: "gzip",
+%% "x-gzip", or "deflate". All use zlib auto-detection (windowBits 15+32,
+%% which accepts both gzip and zlib-wrapped streams); a `deflate` token that
+%% fails there is retried as RAW deflate (windowBits -15) — servers that
+%% send RFC 1951 bytes under the `deflate` token. Only the FIRST gzip member
+%% of a multi-member stream is decoded (zlib ignores trailing member bytes;
+%% HTTP origins emit single members). An empty body carries no member to
+%% decode and passes through untouched (e.g. 204 with a stale header).
+inflate_bounded(<<>>, _Encoding, _MaxOut) ->
+    {ok, {<<>>, false}};
+inflate_bounded(Body, Encoding0, MaxOut) ->
+    Encoding = case Encoding0 of
+        <<"x-gzip">> -> <<"gzip">>;
+        E -> E
+    end,
+    try
+        case run_inflate(Body, MaxOut, 47) of
+            {error, _} when Encoding =:= <<"deflate">> ->
+                run_inflate(Body, MaxOut, -15);
+            Outcome -> Outcome
+        end
+    catch
+        Class:Reason -> {error, format_reason({Class, Reason})}
+    end.
+
+-define(INFLATE_SLICE, 4096).
+
+run_inflate(Body, MaxOut, Wbits) ->
+    Z = zlib:open(),
+    try
+        ok = zlib:inflateInit(Z, Wbits),
+        feed_inflate(Z, Body, MaxOut, <<>>)
+    catch
+        error:data_error -> {error, <<"corrupt compressed stream">>};
+        Class:Reason -> {error, format_reason({Class, Reason})}
+    after
+        %% close/1 frees the stream even when inflateInit or inflate failed;
+        %% guarded so a close fault cannot mask the outcome above.
+        catch zlib:close(Z)
+    end.
+
+feed_inflate(_Z, <<>>, _MaxOut, Acc) ->
+    {ok, {Acc, false}};
+feed_inflate(Z, Body, MaxOut, Acc) ->
+    SliceSize = erlang:min(?INFLATE_SLICE, byte_size(Body)),
+    <<Slice:SliceSize/binary, Rest/binary>> = Body,
+    Out = iolist_to_binary(zlib:inflate(Z, Slice)),
+    Acc2 = <<Acc/binary, Out/binary>>,
+    case byte_size(Acc2) > MaxOut of
+        true ->
+            <<Kept:MaxOut/binary, _/binary>> = Acc2,
+            {ok, {Kept, true}};
+        false ->
+            feed_inflate(Z, Rest, MaxOut, Acc2)
+    end.
 
 %% Resolve a hostname (or IP literal) to all its addresses, as printable
 %% strings ("127.0.0.1", "::1"). The Gleam side applies the private-range

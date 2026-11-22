@@ -464,11 +464,20 @@ the rules that bite silently:
   `http_fetch` stays in `tools.catalog_names()` as an explicit opt-in raw
   HTTP tool (preserving existing frozen `http_fetch` manifests without
   migration).
-- **Identity-only compression posture (v1):** `web_fetch` sends
-  `Accept-Encoding: identity` so `nexus_net_ffi`'s `MaxBytes` bounds raw
-  uncompressed bytes directly (no decompression-bomb amplification), and
-  rejects any non-empty `content-encoding` other than `"identity"` before
-  UTF-8 decoding or HTML parsing.
+- **Bounded streaming decompression (v2):** `web_fetch` advertises
+  `Accept-Encoding: gzip, deflate` and decodes a single gzip/x-gzip/deflate
+  coding via `net.inflate_bounded`: zlib is fed the wire-capped body in
+  fixed 4 KiB slices with the accumulated output checked after every slice
+  against `NEXUS_WEB_FETCH_MAX_DECOMPRESSED_BYTES` (default 8 MiB), so a
+  decompression bomb costs at most the cap plus one slice's worst-case
+  expansion — over-cap TRUNCATES and surfaces `raw_truncated` (mirroring
+  the wire cap; post-hoc truncation would not bound memory), a corrupt
+  stream is a tool error, and a wire-truncated gzip decodes partially with
+  the flag carried. `deflate` is retried as raw deflate (windowBits -15)
+  after auto-detection fails — the broken-server case; brotli, zstd, and
+  stacked codings are still refused before decoding. hackney 1.25's manual
+  `stream_body` path performs no content-encoding decoding itself (verified
+  in source), so decompression is wholly nexus's.
 - **Whitespace preservation in HTML parsing:** `htmgrrrl` invokes `htmerl`
   with `{preserve_ws, true}` so `<pre>` indentation/blank lines and inline
   tag boundary spaces survive; `nexus/html_markdown` normalizes whitespace
