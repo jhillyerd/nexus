@@ -164,6 +164,12 @@ fn test_config() -> config.Config {
     plugin_max_output_chars: 32_768,
     mcp_servers: [],
     workspace_root: None,
+    workspace_sandbox: config.SandboxNone,
+    workspace_sandbox_bin: None,
+    workspace_toolchain: None,
+    workspace_state_dir: None,
+    workspace_max_memory_mb: 1024,
+    workspace_max_pids: 64,
     env_timeout_ms: 60_000,
     // The boundary cap the adapter applies to node results on receipt
     // (small so `adapter_caps_node_result_test` stays cheap).

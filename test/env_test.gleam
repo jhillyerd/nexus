@@ -26,6 +26,7 @@ fn env_for(root: String) -> Option(env.Environment) {
     workspace_root: root,
     thread_id: "t1",
     workspace_rel_path: None,
+    tmp_rel_path: None,
     roster: env.attached_targets(),
     remote: None,
   ))
@@ -141,6 +142,7 @@ fn node_for(root: String) -> env.Environment {
     workspace_root: root,
     thread_id: "srv-thread",
     workspace_rel_path: None,
+    tmp_rel_path: None,
     roster: env.attached_targets(),
     remote: None,
   )
@@ -270,6 +272,7 @@ pub fn route_names_live_roster_test() {
       workspace_root: "/srv/nexus",
       thread_id: "s12",
       workspace_rel_path: None,
+      tmp_rel_path: None,
       roster: [
         "workspace",
         "proxmox-2",
@@ -309,6 +312,7 @@ pub fn bash_runs_in_workspace_cwd_test() {
         workspace_root: root,
         thread_id: "t1",
         workspace_rel_path: None,
+        tmp_rel_path: None,
         roster: env.attached_targets(),
         remote: None,
       )),
@@ -343,9 +347,11 @@ pub fn bash_environment_is_allowlisted_test() {
   let root = fresh_root()
   let original_cert = get_env("SSL_CERT_FILE")
   let original_tz = get_env("TZ")
+  let original_tmp = get_env("TMPDIR")
   put_env("NEXUS_TEST_SECRET_CANARY", "hunter2-database-url")
   put_env("SSL_CERT_FILE", root <> "/fake-ca.pem")
   put_env("TZ", "UTC")
+  put_env("TMPDIR", "/tmp/host-tmpdir-canary")
   // Failure-safe cleanup (OCR review): bind WITHOUT asserting first, so
   // a failing bash call cannot skip the restore and leave the plants in
   // the emulator's process-global environment for the rest of the run.
@@ -353,11 +359,15 @@ pub fn bash_environment_is_allowlisted_test() {
   unset_env("NEXUS_TEST_SECRET_CANARY")
   restore("SSL_CERT_FILE", original_cert)
   restore("TZ", original_tz)
+  restore("TMPDIR", original_tmp)
   let assert Ok(out) = out
   // The BEAM's secrets do NOT ride into the child (#126): the canary
   // planted in the emulator's own environment is absent…
   let assert False = string.contains(out, "hunter2-database-url")
   let assert False = string.contains(out, "NEXUS_TEST_SECRET_CANARY")
+  // Host TMPDIR is scrubbed when tmp_rel_path is None (legacy / TUI).
+  let assert False = string.contains(out, "TMPDIR=")
+  let assert False = string.contains(out, "host-tmpdir-canary")
   // …while the allowlist keeps the child working: PATH resolves bare
   // names, HOME is REWRITTEN to the workspace dir (not the operator's
   // home, which may well be this test's real HOME).
@@ -367,6 +377,7 @@ pub fn bash_environment_is_allowlisted_test() {
       workspace_root: root,
       thread_id: "t1",
       workspace_rel_path: None,
+      tmp_rel_path: None,
       roster: env.attached_targets(),
       remote: None,
     ))
@@ -379,6 +390,40 @@ pub fn bash_environment_is_allowlisted_test() {
   // Bare-name resolution really works through the passed PATH.
   let assert Ok(tr) = bash(env_for(root), 5000, "command -v cat")
   let assert True = string.contains(tr, "/cat")
+  let _ = simplifile.delete(root)
+}
+
+pub fn bash_sets_and_lazily_creates_per_thread_tmpdir_test() {
+  let root = fresh_root()
+  let handle =
+    env.Environment(
+      workspace_root: root,
+      thread_id: "t1",
+      workspace_rel_path: Some("threads/t1"),
+      tmp_rel_path: Some("tmp/t1"),
+      roster: env.attached_targets(),
+      remote: None,
+    )
+  let expected_tmp = filepath.join(root, "tmp/t1")
+  env.tmp_dir(handle) |> should_equal(Some(expected_tmp))
+  // Lazy creation: the tmp directory does not exist before bash runs.
+  simplifile.is_directory(expected_tmp) |> should_equal(Ok(False))
+
+  let original_tmp = get_env("TMPDIR")
+  put_env("TMPDIR", "/tmp/host-tmpdir-canary")
+  let out =
+    bash(
+      Some(handle),
+      5000,
+      "printf '%s' $TMPDIR && printf 'hi' > $TMPDIR/scratch.txt",
+    )
+  restore("TMPDIR", original_tmp)
+
+  let assert Ok(got_tmp) = out
+  got_tmp |> should_equal(expected_tmp)
+  simplifile.is_directory(expected_tmp) |> should_equal(Ok(True))
+  simplifile.read(filepath.join(expected_tmp, "scratch.txt"))
+  |> should_equal(Ok("hi"))
   let _ = simplifile.delete(root)
 }
 
@@ -907,6 +952,7 @@ pub fn confinement_normalization_test() {
       workspace_root: "/srv/nexus",
       thread_id: "s12",
       workspace_rel_path: None,
+      tmp_rel_path: None,
       roster: env.attached_targets(),
       remote: None,
     )
@@ -927,6 +973,7 @@ pub fn workspace_dir_derivation_test() {
     workspace_root: "/srv/nx",
     thread_id: "s3",
     workspace_rel_path: None,
+    tmp_rel_path: None,
     roster: env.attached_targets(),
     remote: None,
   ))
@@ -969,6 +1016,7 @@ pub fn remote_dispatch_routes_all_four_tools_test() {
       workspace_root: "/srv/nx",
       thread_id: "t1",
       workspace_rel_path: None,
+      tmp_rel_path: None,
       roster: ["workspace", "node-a"],
       remote: Some(capture_router(seen)),
     ))
@@ -1032,6 +1080,7 @@ pub fn remote_errors_pass_through_test() {
       workspace_root: "/srv/nx",
       thread_id: "t1",
       workspace_rel_path: None,
+      tmp_rel_path: None,
       roster: ["workspace", "node-a"],
       remote: Some(fn(_t, _tool, _args, _c) {
         Error("target \"node-a\" is not attached. attached targets: workspace")
@@ -1059,6 +1108,7 @@ pub fn remote_none_falls_back_to_local_route_test() {
       workspace_root: "/srv/nx",
       thread_id: "t1",
       workspace_rel_path: None,
+      tmp_rel_path: None,
       roster: ["workspace", "node-a"],
       remote: None,
     ))
@@ -1087,6 +1137,7 @@ pub fn workspace_target_never_dispatches_remotely_test() {
       workspace_root: root,
       thread_id: "t1",
       workspace_rel_path: None,
+      tmp_rel_path: None,
       roster: ["workspace"],
       remote: Some(capture_router(seen)),
     ))

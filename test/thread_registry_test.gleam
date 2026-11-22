@@ -70,6 +70,12 @@ fn test_config() -> config.Config {
     plugin_max_output_chars: 32_768,
     mcp_servers: [],
     workspace_root: None,
+    workspace_sandbox: config.SandboxNone,
+    workspace_sandbox_bin: None,
+    workspace_toolchain: None,
+    workspace_state_dir: None,
+    workspace_max_memory_mb: 1024,
+    workspace_max_pids: 64,
     env_timeout_ms: 60_000,
     env_max_output_bytes: 100_000,
     node_idle_days: 7,
@@ -2506,11 +2512,18 @@ pub fn env_toolset_runner_receives_environment_handle_test() {
     )
   let assert Ok(sess) = thread_registry.get(registry, summary.id)
   let assert thread.Sent = thread.send_message(sess, "run something")
-  let assert Ok(Some(env.Environment(got_root, id, rel_path, roster, _remote))) =
-    process.receive(seen, 5000)
+  let assert Ok(Some(env.Environment(
+    got_root,
+    id,
+    rel_path,
+    tmp_rel_path,
+    roster,
+    _remote,
+  ))) = process.receive(seen, 5000)
   should.equal(got_root, root)
   should.equal(id, summary.id)
   should.equal(rel_path, Some("threads/" <> summary.id))
+  should.equal(tmp_rel_path, Some("tmp/" <> summary.id))
   should.equal(roster, ["workspace"])
 }
 
@@ -2610,6 +2623,84 @@ pub fn env_toolset_hydrates_from_persisted_root_test() {
     ),
     _,
   ] = list.reverse(messages)
+}
+
+/// Hydration (`lazy_start`) threads BOTH `rel_path` and `tmp_rel_path` from
+/// `summary.workspaces` into the injected `env.Environment` handle — pinning
+/// the dormant-thread twin of `env_toolset_runner_receives_environment_handle_test`.
+pub fn env_toolset_hydrate_injects_workspace_and_tmp_rel_paths_test() {
+  let old_root = "/srv/old-root"
+  let seam = store_mock.seam(store_mock.start())
+  store_mock.ensure_fixture_provider(seam)
+  store_mock.ensure_fixture_bot(seam)
+  let assert Ok(Nil) =
+    seam.insert_thread(
+      store.StoredSummary(
+        id: "s78",
+        provider_id: store_mock.fixture_provider_id,
+        model: "alpha",
+        meta: fresh_meta(),
+        toolset: thread_registry.plain_entries(["bash"]),
+        workspace_root: Some(old_root),
+        workspaces: Some(store.ThreadWorkspaces(
+          workspace_id: "ws-thread-s78",
+          rel_path: "threads/s78",
+          tmp_id: Some("ws-tmp-s78"),
+          tmp_rel_path: Some("tmp/s78"),
+        )),
+        roster: Some(#(
+          env.roster_attach_text("workspace", env.attached_targets()),
+          1_700_000_000,
+        )),
+        last_active_at: timing.wall_now_s(),
+        message_count: 1,
+      ),
+      "prompt",
+    )
+  let seen = process.new_subject()
+  let capture_bundle =
+    thread.Toolset(
+      names: ["bash"],
+      specs: tools.default(test_config()),
+      runner: fn(_endpoint, tr, _cancel, _delivery, environment, _on_event) {
+        process.send(seen, environment)
+        thread.StreamDone(stats(), transcript.append_assistant(tr, "ok"))
+      },
+      utility_runner: fn(_endpoint, _tr, _cancel, _allow_pass) {
+        Error("no utility call in this test")
+      },
+    )
+  let factory_name = process.new_name("nexus_test_factory")
+  let assert Ok(_factory) =
+    factory_supervisor.start(thread_registry.factory_builder(factory_name))
+  let assert Ok(started) =
+    thread_registry.start_with_toolset(
+      config.Config(..test_config(), workspace_root: Some("/srv/new-root")),
+      factory_supervisor.get_by_name(factory_name),
+      process.new_name("nexus_test_registry"),
+      seam,
+      capture_bundle,
+      fn() { [] },
+      fixture_resolver(),
+      process.new_name("nexus_bot_registry"),
+      dict.new(),
+      dict.new(),
+    )
+  let assert Ok(sess) = thread_registry.get(started.data, "s78")
+  let assert thread.Sent = thread.send_message(sess, "run hydrated")
+  let assert Ok(Some(env.Environment(
+    got_root,
+    id,
+    rel_path,
+    tmp_rel_path,
+    roster,
+    _remote,
+  ))) = process.receive(seen, 5000)
+  should.equal(got_root, old_root)
+  should.equal(id, "s78")
+  should.equal(rel_path, Some("threads/s78"))
+  should.equal(tmp_rel_path, Some("tmp/s78"))
+  should.equal(roster, ["workspace"])
 }
 
 /// The legacy-wording fallback (Phase 1 → Phase 2a, environments plan

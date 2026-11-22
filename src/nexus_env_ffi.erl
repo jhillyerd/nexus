@@ -6,10 +6,10 @@
 %%
 %% - resolve/1: PATH resolution for a bare command name (spawn_executable
 %%   does NOT search PATH). First regular-file execute-bit hit wins.
-%% - open_port/3: spawn a child with its stdio wired to the port
+%% - open_port/4: spawn a child with its stdio wired to the port
 %%   (use_stdio, binary, exit_status, hide, stderr_to_stdout) with a
 %%   working directory ({cd, Dir}) — the workspace's cwd default — and
-%%   a SCRUBBED environment ({env, sandbox_env/1}; see below).
+%%   a SCRUBBED environment ({env, sandbox_env/2}; see below).
 %% - kill_tree/1: best-effort kill of the child AND its process group.
 %%   The workspace bash prints its own pid (== its process-group id when
 %%   launched under setsid) as the first stdout line; the caller parses
@@ -31,7 +31,7 @@
 
 -define(DEFAULT_PATH, "/usr/local/bin:/usr/bin:/bin").
 
--export([resolve/1, open_port/3, kill_tree/2, to_text_lossy/1, read_capped/2,
+-export([resolve/1, open_port/4, kill_tree/2, to_text_lossy/1, read_capped/2,
          split_line/1, kill_group_marker/1, kill_pid_marker/1]).
 
 -include_lib("kernel/include/file.hrl").
@@ -86,7 +86,7 @@ executable(F) ->
 %% child working without the secrets; it is NOT a sandbox (bash still
 %% runs as this uid and can read the filesystem and dial out — #126's
 %% real work).
-open_port(Command, Args, Cwd) ->
+open_port(Command, Args, Cwd, TmpDir) ->
     try
         Port =
             erlang:open_port({spawn_executable,
@@ -99,14 +99,14 @@ open_port(Command, Args, Cwd) ->
                               {args,
                                [unicode:characters_to_list(A) || A <- Args]},
                               {cd, unicode:characters_to_list(Cwd)},
-                              {env, sandbox_env(Cwd)}]),
+                              {env, sandbox_env(Cwd, TmpDir)}]),
         {ok, Port}
     catch
         _:_ -> {error, <<"spawn failed">>}
     end.
 
 %% The workspace-child allowlist — the child's environment is EXACTLY
-%% these, nothing inherited. Three variables, each earning its place:
+%% these, nothing inherited. Variables, each earning its place:
 %%
 %% - PATH passes through (default matches resolve/1) because bare
 %%   command names are the common shape of model-authored commands;
@@ -117,6 +117,10 @@ open_port(Command, Args, Cwd) ->
 %%   operator's home (exactly the direction an injected `cat ~/…`
 %%   wants); the workspace keeps `~` inside the confined tree and tool
 %%   caches/lockfiles land in the disposable per-thread dir.
+%% - TMPDIR is SET to the per-thread temp dir when provided (`{some, Dir}`),
+%%   overriding any inherited TMPDIR; when `none` (legacy rows / TUI nodes),
+%%   inherited TMPDIR is explicitly scrubbed like every other non-allowlisted
+%%   variable.
 %% - TZ passes through when set: no secret, and it keeps `date`-style
 %%   output stable across the scrub.
 %% - SSL_CERT_FILE / SSL_CERT_DIR pass through when set (OCR review):
@@ -130,15 +134,21 @@ open_port(Command, Args, Cwd) ->
 %%
 %% Everything inherited and not on that list is {Name, false} — the
 %% unset that turns the MERGING {env, …} option into a replace (see
-%% open_port/3 above for the experiment that pinned this).
+%% open_port/4 above for the experiment that pinned this).
 %%
 %% Deliberately NOT a passthrough knob: operators needing vars inside
 %% the workspace is a sandbox-config question (#126), not an env one.
-sandbox_env(Cwd) ->
+sandbox_env(Cwd, TmpDir) ->
+    TmpEntry =
+        case TmpDir of
+            {some, Dir} -> [{"TMPDIR", unicode:characters_to_list(Dir)}];
+            none -> []
+        end,
     Allow =
         maps:from_list(
           [{"HOME", unicode:characters_to_list(Cwd)},
            {"PATH", os:getenv("PATH", ?DEFAULT_PATH)}]
+          ++ TmpEntry
           ++ pass_through(["TZ", "SSL_CERT_FILE", "SSL_CERT_DIR"])),
     Unset =
         [{Name, false}
