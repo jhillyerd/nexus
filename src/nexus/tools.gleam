@@ -245,7 +245,7 @@ pub fn by_names_with_cache(
         // the gate, the web_search rule); CREATE refuses when no root
         // can be frozen (the registry's gate), and hydration replays
         // the persisted per-thread root.
-        "bash" -> Ok([env_spec(cfg, env.bash_schema(), env_bash_run)])
+        "bash" -> Ok([env_bash_spec(cfg)])
         "read_file" -> Ok([env_spec(cfg, env.read_file_schema(), env_read_run)])
         "write_file" ->
           Ok([env_spec(cfg, env.write_file_schema(), env_write_run)])
@@ -483,8 +483,7 @@ fn dispatch_entry(
     ToolsetEntry("list_bots", _, _) -> Ok([list_bots_spec()])
     // Codemode is built last below, over the full sibling list.
     ToolsetEntry("codemode", _, _) -> Ok([])
-    ToolsetEntry("bash", _, _) ->
-      Ok([env_spec(cfg, env.bash_schema(), env_bash_run)])
+    ToolsetEntry("bash", _, _) -> Ok([env_bash_spec(cfg)])
     ToolsetEntry("read_file", _, _) ->
       Ok([
         env_spec(cfg, env.read_file_schema(), env_read_run),
@@ -807,19 +806,33 @@ type EnvRun =
   fn(Int, Int, Option(Environment), Subject(Nil), String) ->
     Result(String, String)
 
-fn env_bash_run(
-  timeout_ms: Int,
-  max_bytes: Int,
-  environment: Option(Environment),
-  cancel: Subject(Nil),
-  arguments: String,
-) -> Result(String, String) {
-  env.bash(
-    timeout_ms: timeout_ms,
-    max_output_bytes: max_bytes,
-    environment: environment,
-    cancel: cancel,
-    arguments: arguments,
+fn env_bash_spec(cfg: Config) -> ToolSpec {
+  let sandbox = sandbox_config(cfg)
+  ToolSpec(tool: env.bash_schema(), run: fn(ctx, arguments) {
+    env.bash_with_sandbox(
+      timeout_ms: cfg.env_timeout_ms,
+      max_output_bytes: cfg.env_max_output_bytes,
+      sandbox: sandbox,
+      environment: ctx.environment,
+      cancel: ctx.cancel,
+      arguments: arguments,
+    )
+  })
+}
+
+fn sandbox_config(cfg: Config) -> env.SandboxConfig {
+  let backend = case cfg.workspace_sandbox {
+    config.SandboxNone -> env.SandboxNone
+    config.SandboxBwrap -> env.SandboxBwrap
+    config.SandboxNono -> env.SandboxNono
+  }
+  env.SandboxConfig(
+    backend: backend,
+    sandbox_bin: cfg.workspace_sandbox_bin,
+    toolchain: cfg.workspace_toolchain,
+    state_dir: cfg.workspace_state_dir,
+    max_memory_mb: cfg.workspace_max_memory_mb,
+    max_pids: cfg.workspace_max_pids,
   )
 }
 

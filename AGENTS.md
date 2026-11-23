@@ -360,10 +360,31 @@ deltas; the rules that bite silently:
   4.x silently no-ops without it), and the kill helper must wait for
   the binary to act (see `nexus_env_ffi.kill_tree`). The port spawns
   with an ALLOWLIST environment, never the BEAM's inherited one (the
-  FFI's internal `sandbox_env/1` helper: PATH passthrough, HOME
-  rewritten to the workspace dir, TZ and CA-path vars when set) — a
-  workspace `env` must not print `DATABASE_URL` and friends into the
-  transcript (#126).
+  FFI's internal `sandbox_env/2` helper: allowlisted overrides +
+  `TZ`/`SSL_CERT_FILE`/`SSL_CERT_DIR` passthrough, all other inherited
+  vars explicitly unset) — a workspace `env` must not print
+  `DATABASE_URL` and friends into the transcript (#126).
+- **Local `bash` sandboxing (workspace-sandbox Phase 2 shipped):**
+  `env.build_spawn_plan` + `env.bash_with_sandbox` wrap local `bash`
+  behind `NEXUS_WORKSPACE_SANDBOX` (`none` | `bwrap` | `nono`), keeping
+  the tool wire schema untouched (KV-cache contract). Under `bwrap
+  --unshare-pid --die-with-parent`, the stdout marker PID is
+  in-namespace (`KillPortOsPid`), so host-side `kill` MUST target the
+  port's host `os_pid` (read immediately after `open_port`, arming the
+  watchdog from instant zero) — NEVER the in-namespace marker PID. Under
+  `nono`, `HOME`/`XDG_*` point at `NEXUS_WORKSPACE_STATE_DIR` (outside
+  all grants, with `config/nono/profiles/nexus.json` written atomically
+  excluding `system_write_linux`), the bash prelude silently re-exports
+  `HOME`/`TMPDIR` and unsets `XDG_*`, and a silent `-s` non-zero exit
+  before the PID marker surfaces as a tool `Error`. Resource caps use a
+  transient Linux cgroup v2 sub-cgroup (`memory.max`, `memory.swap.max=0`,
+  `pids.max`, `cgroup.kill` + `rmdir`, serialized one-time `beam/`
+  rehoming with stale `ws-*` sweep) plus `prlimit --fsize` (256 MiB) on
+  both paths, adding `prlimit --as` when cgroup delegation is unavailable
+  (never `--nproc` on a shared UID, no `--cpu` so multi-threaded builds
+  honor wall-clock timeout; outside `bwrap`, inside `nono`). Real
+  `bwrap`/`nono` tests stay strictly opt-in (`NEXUS_TEST_BWRAP=1` /
+  `NEXUS_TEST_NONO=1`), never PATH-probed.
 - **Caps are enforced WHILE READING** (bash output, `read_file` via
   the FFI's chunked read) — post-hoc truncation does not bound
   memory. Non-UTF-8 command output decodes lossily (latin-1
