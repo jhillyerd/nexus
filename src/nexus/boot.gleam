@@ -107,13 +107,10 @@ pub fn bot_validate_tools(
 pub fn main() -> Nil {
   log.configure(log.Info)
   case config.load() {
-    Error(message) -> {
+    Error(error) -> {
       log.error("boot", "config error", [
-        log.str("error", message),
-        log.str(
-          "hint",
-          "required: NEXUS_ENCRYPTION_KEY (base64 of 32 bytes); see the README env table",
-        ),
+        log.str("error", error.message),
+        log.str("hint", config.hint(error)),
       ])
       halt(2)
     }
