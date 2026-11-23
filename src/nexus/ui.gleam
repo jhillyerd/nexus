@@ -358,10 +358,15 @@ pub type Model {
     // NOTHING else bumps it: the compose-new bot picker must be able to
     // change while a draft is typed, and a re-key would wipe the draft.
     composer: Int,
-    // Header fallback label (ui-polish F8): what the `#model` span shows
-    // while NO thread is selected — "connecting…" at boot and on select,
-    // "thread ended" after the selection drops. With a selection the
-    // header shows the thread's title instead (see `header_title`).
+    // Header fallback label: what the `#model` span shows when the
+    // selection cannot resolve to a title. Blank while nothing is
+    // selected — the empty span reads as "no thread open", and a
+    // "connecting…" placeholder would claim a connection state the
+    // `.conn` indicator on the right already owns. The genuine feedback
+    // labels keep their role: "thread ended" after the selection drops,
+    // and the deselect entry points pass their own ("new thread",
+    // "no thread selected"). With a selection the header shows the
+    // thread's title instead (see `header_title`).
     model_label: String,
     // ---- Thread organization (registry metadata, display only) ----
     /// Free-text filter over titles + tags, case-insensitive.
@@ -742,7 +747,7 @@ pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
       guard: False,
       turn_base: 0,
       composer: 0,
-      model_label: "connecting…",
+      model_label: "",
       tag_filter: "",
       filter_gen: 0,
       show_archived: False,
@@ -1128,7 +1133,12 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               loop: None,
               guard: False,
               turn_base: 0,
-              model_label: "connecting…",
+              // The fallback label clears with the old thread's state:
+              // a row click's title renders from the list, but a
+              // breadcrumb click can target a channel (absent from the
+              // list), which stays blank until its context resolution
+              // lands.
+              model_label: "",
               // The popup belongs to the previous thread's log; its
               // ids cannot resolve against the new selection's.
               pop: None,
@@ -1898,7 +1908,7 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               loop: None,
               guard: False,
               turn_base: 0,
-              model_label: "connecting…",
+              model_label: "",
               pop: None,
               suppress_autoselect: False,
               channel_ctx: Some(thread_registry.ChannelContext(
@@ -2300,7 +2310,8 @@ fn after_threads(model: Model, summaries: List(thread.ThreadSummary)) -> Model {
     // the replacement's (the CodeRabbit review finding; routine for
     // channels, whose CASCADE delete drops a viewed channel while the
     // user watches). A changed label role: ended says "thread ended",
-    // a switch says "connecting…" for its fresh replay.
+    // a switch clears the stale label — the replacement's title rides
+    // the list lookup, so there is nothing for the fallback to say.
     log: case ended || switched {
       True -> []
       False -> model.log
@@ -2350,7 +2361,7 @@ fn after_threads(model: Model, summaries: List(thread.ThreadSummary)) -> Model {
     },
     model_label: case ended, switched {
       True, _ -> "thread ended"
-      False, True -> "connecting…"
+      False, True -> ""
       False, False -> model.model_label
     },
     // The popup belongs to the ended thread's log — same rule as the
@@ -3660,7 +3671,8 @@ fn bucket_groups(
 /// The header's thread context (ui-polish F8): the selected thread's
 /// title. An untitled thread falls back to "Untitled thread" (the
 /// row-title rule); with nothing selected the `model_label` fallbacks
-/// ("connecting…", "thread ended") keep their feedback role. A selected
+/// render — blank until there is something to say ("thread ended"),
+/// never a connection state (the `.conn` group owns that). A selected
 /// CHANNEL is not in the list (the sidebar projection hides channels) —
 /// its label is the target bot's name, falling back to the frozen
 /// creation title when the bot row is gone (rehydrate NULLs the
