@@ -226,6 +226,28 @@ pub type McpServer {
 /// ONE definition so the two rules cannot drift apart.
 pub const plugin_timeout_floor_ms = 100
 
+/// A remediation hint for a config error, derived from the error message
+/// itself. Boot logs this beside the error; the hardcoded encryption-key
+/// hint it replaced logged a wrong variable name for every non-key
+/// failure (e.g. the workspace-sandbox rules), which read as two
+/// unrelated problems in one line.
+pub fn hint(message: String) -> String {
+  case
+    string.contains(message, "NEXUS_ENCRYPTION_KEY"),
+    string.contains(message, "NEXUS_WORKSPACE_SANDBOX")
+    || string.contains(message, "NEXUS_WORKSPACE_STATE_DIR")
+  {
+    True, _ ->
+      "required: NEXUS_ENCRYPTION_KEY (base64 of 32 bytes); see the README env table"
+    False, True ->
+      "workspace sandboxing: NEXUS_WORKSPACE_SANDBOX selects the backend"
+      <> " (none | bwrap | nono); nono requires NEXUS_WORKSPACE_STATE_DIR"
+      <> " outside NEXUS_WORKSPACE_ROOT; see the README env table"
+      <> " and docs/plans/workspace-sandbox.md"
+    _, _ -> "see the README env table"
+  }
+}
+
 /// Load config from the process environment.
 pub fn load() -> Result(Config, String) {
   from_env(envoy.get)

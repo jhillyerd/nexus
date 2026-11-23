@@ -110,10 +110,7 @@ pub fn main() -> Nil {
     Error(message) -> {
       log.error("boot", "config error", [
         log.str("error", message),
-        log.str(
-          "hint",
-          "required: NEXUS_ENCRYPTION_KEY (base64 of 32 bytes); see the README env table",
-        ),
+        log.str("hint", config.hint(message)),
       ])
       halt(2)
     }

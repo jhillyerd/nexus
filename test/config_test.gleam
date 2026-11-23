@@ -814,3 +814,41 @@ pub fn workspace_sandbox_rejects_invalid_values_test() {
   let assert Error(msg_pids) = config.load()
   should.be_true(string.contains(msg_pids, "NEXUS_WORKSPACE_MAX_PIDS"))
 }
+
+// Boot's config-error hint must match the error it accompanies. It is
+// derived from the message (config.hint) because the old hardcoded hint
+// named NEXUS_ENCRYPTION_KEY on every failure — confusing next to a
+// workspace-sandbox error that had nothing to do with the master key.
+pub fn hint_matches_the_error_test() {
+  // Key errors keep the key hint.
+  let key_hint =
+    config.hint("missing required environment variable: NEXUS_ENCRYPTION_KEY")
+  should.be_true(string.contains(key_hint, "NEXUS_ENCRYPTION_KEY"))
+
+  let bad_key_hint = config.hint("NEXUS_ENCRYPTION_KEY: not valid base64: ...")
+  should.be_true(string.contains(bad_key_hint, "base64 of 32 bytes"))
+
+  // Workspace-sandbox errors point at the sandbox vars, never the key.
+  let nono_hint =
+    config.hint(
+      "environment variable NEXUS_WORKSPACE_STATE_DIR is required when"
+      <> " NEXUS_WORKSPACE_SANDBOX=nono",
+    )
+  should.be_true(string.contains(nono_hint, "NEXUS_WORKSPACE_STATE_DIR"))
+  should.be_true(string.contains(nono_hint, "NEXUS_WORKSPACE_SANDBOX"))
+  should.be_false(string.contains(nono_hint, "NEXUS_ENCRYPTION_KEY"))
+
+  let inert_hint =
+    config.hint(
+      "environment variable NEXUS_WORKSPACE_SANDBOX_BIN requires"
+      <> " NEXUS_WORKSPACE_SANDBOX to be bwrap or nono",
+    )
+  should.be_true(string.contains(inert_hint, "NEXUS_WORKSPACE_SANDBOX"))
+  should.be_false(string.contains(inert_hint, "NEXUS_ENCRYPTION_KEY"))
+
+  // Anything else gets the plain README pointer.
+  should.equal(
+    config.hint("some unrelated failure"),
+    "see the README env table",
+  )
+}
