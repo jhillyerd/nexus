@@ -1424,10 +1424,11 @@ pub fn view_header_shows_thread_title_test() {
 
 pub fn view_header_fallback_labels_test() {
   // No selection yet: the context span renders EMPTY — no placeholder
-  // text — while the span itself stays for the title to land in.
+  // text — while the span itself stays for the title to land in. The
+  // exact empty-span fragment pins the blank: any non-empty fallback
+  // (a placeholder reintroduced, stray text) fails here.
   let html = new_model() |> view_string
-  should.be_true(string.contains(html, "id=\"model\""))
-  should.be_false(string.contains(html, "connecting…"))
+  should.be_true(string.contains(html, "id=\"model\"></span>"))
   // Selection dropped (thread vanished): the terminal label.
   let html =
     new_model()

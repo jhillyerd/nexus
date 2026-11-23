@@ -1133,8 +1133,11 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               loop: None,
               guard: False,
               turn_base: 0,
-              // The fallback label clears with the old thread's state;
-              // the clicked row is in the list, so the title renders.
+              // The fallback label clears with the old thread's state:
+              // a row click's title renders from the list, but a
+              // breadcrumb click can target a channel (absent from the
+              // list), which stays blank until its context resolution
+              // lands.
               model_label: "",
               // The popup belongs to the previous thread's log; its
               // ids cannot resolve against the new selection's.
