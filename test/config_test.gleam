@@ -65,8 +65,11 @@ pub fn workspace_root_must_be_absolute_test() {
     #("NEXUS_ENCRYPTION_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="),
     #("NEXUS_WORKSPACE_ROOT", "ws"),
   ])
-  let assert Error(message) = config.load()
-  should.be_true(string.contains(message, "NEXUS_WORKSPACE_ROOT must be an"))
+  let assert Error(error) = config.load()
+  should.be_true(string.contains(
+    error.message,
+    "NEXUS_WORKSPACE_ROOT must be an",
+  ))
   set_all([
     #("NEXUS_ENCRYPTION_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="),
     #("NEXUS_WORKSPACE_ROOT", "/srv/ws"),
@@ -92,14 +95,14 @@ pub fn env_knob_bounds_test() {
     #("NEXUS_ENCRYPTION_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="),
     #("NEXUS_ENV_TIMEOUT_MS", "10"),
   ])
-  let assert Error(message) = config.load()
-  should.be_true(string.contains(message, "NEXUS_ENV_TIMEOUT_MS"))
+  let assert Error(error) = config.load()
+  should.be_true(string.contains(error.message, "NEXUS_ENV_TIMEOUT_MS"))
 }
 
 pub fn load_requires_encryption_key_test() {
   set_all([])
-  let assert Error(message) = config.load()
-  should.be_true(string.contains(message, "NEXUS_ENCRYPTION_KEY"))
+  let assert Error(error) = config.load()
+  should.be_true(string.contains(error.message, "NEXUS_ENCRYPTION_KEY"))
 }
 
 pub fn empty_string_counts_as_missing_test() {
@@ -109,9 +112,9 @@ pub fn empty_string_counts_as_missing_test() {
 
 pub fn load_rejects_wrong_length_encryption_key_test() {
   set_all([#("NEXUS_ENCRYPTION_KEY", "c2hvcnQ=")])
-  let assert Error(message) = config.load()
+  let assert Error(error) = config.load()
   // Fixed crypto error text — never the submitted value.
-  should.be_true(string.contains(message, "32 bytes"))
+  should.be_true(string.contains(error.message, "32 bytes"))
 }
 
 pub fn load_rejects_non_base64_encryption_key_test() {
@@ -207,8 +210,11 @@ pub fn load_rejects_non_integer_test() {
     #("NEXUS_ENCRYPTION_KEY", key_b64),
     #("NEXUS_SSE_FIRST_RESPONSE_TIMEOUT_MS", "soon"),
   ])
-  let assert Error(message) = config.load()
-  should.be_true(string.contains(message, "NEXUS_SSE_FIRST_RESPONSE_TIMEOUT_MS"))
+  let assert Error(error) = config.load()
+  should.be_true(string.contains(
+    error.message,
+    "NEXUS_SSE_FIRST_RESPONSE_TIMEOUT_MS",
+  ))
 }
 
 /// A negative delay would only surface as a timer crash at the first
@@ -218,8 +224,8 @@ pub fn load_rejects_negative_utility_delay_test() {
     #("NEXUS_ENCRYPTION_KEY", key_b64),
     #("NEXUS_UTILITY_DELAY_MS", "-1"),
   ])
-  let assert Error(message) = config.load()
-  message
+  let assert Error(error) = config.load()
+  error.message
   |> should.equal(
     "environment variable NEXUS_UTILITY_DELAY_MS must be >= 0: -1",
   )
@@ -230,8 +236,8 @@ pub fn load_rejects_negative_http_fetch_timeout_test() {
     #("NEXUS_ENCRYPTION_KEY", key_b64),
     #("NEXUS_HTTP_FETCH_TIMEOUT_MS", "-1"),
   ])
-  let assert Error(message) = config.load()
-  message
+  let assert Error(error) = config.load()
+  error.message
   |> should.equal(
     "environment variable NEXUS_HTTP_FETCH_TIMEOUT_MS must be >= 0: -1",
   )
@@ -285,8 +291,8 @@ pub fn load_rejects_low_plugin_timeout_test() {
     #("NEXUS_ENCRYPTION_KEY", key_b64),
     #("NEXUS_PLUGIN_TIMEOUT_MS", "99"),
   ])
-  let assert Error(message) = config.load()
-  message
+  let assert Error(error) = config.load()
+  error.message
   |> should.equal(
     "environment variable NEXUS_PLUGIN_TIMEOUT_MS must be >= 100: 99",
   )
@@ -297,8 +303,8 @@ pub fn load_rejects_negative_plugin_output_cap_test() {
     #("NEXUS_ENCRYPTION_KEY", key_b64),
     #("NEXUS_PLUGIN_MAX_OUTPUT_CHARS", "-1"),
   ])
-  let assert Error(message) = config.load()
-  message
+  let assert Error(error) = config.load()
+  error.message
   |> should.equal(
     "environment variable NEXUS_PLUGIN_MAX_OUTPUT_CHARS must be >= 0: -1",
   )
@@ -323,8 +329,8 @@ pub fn load_rejects_low_codemode_timeout_test() {
     #("NEXUS_ENCRYPTION_KEY", key_b64),
     #("NEXUS_CODEMODE_TIMEOUT_MS", "999"),
   ])
-  let assert Error(message) = config.load()
-  message
+  let assert Error(error) = config.load()
+  error.message
   |> should.equal(
     "environment variable NEXUS_CODEMODE_TIMEOUT_MS must be >= 1000: 999",
   )
@@ -335,8 +341,8 @@ pub fn load_rejects_negative_codemode_timeout_test() {
     #("NEXUS_ENCRYPTION_KEY", key_b64),
     #("NEXUS_CODEMODE_TIMEOUT_MS", "-1"),
   ])
-  let assert Error(message) = config.load()
-  should.be_true(string.contains(message, "NEXUS_CODEMODE_TIMEOUT_MS"))
+  let assert Error(error) = config.load()
+  should.be_true(string.contains(error.message, "NEXUS_CODEMODE_TIMEOUT_MS"))
 }
 
 pub fn load_rejects_non_integer_codemode_timeout_test() {
@@ -344,8 +350,8 @@ pub fn load_rejects_non_integer_codemode_timeout_test() {
     #("NEXUS_ENCRYPTION_KEY", key_b64),
     #("NEXUS_CODEMODE_TIMEOUT_MS", "soon"),
   ])
-  let assert Error(message) = config.load()
-  should.be_true(string.contains(message, "NEXUS_CODEMODE_TIMEOUT_MS"))
+  let assert Error(error) = config.load()
+  should.be_true(string.contains(error.message, "NEXUS_CODEMODE_TIMEOUT_MS"))
 }
 
 pub fn load_rejects_negative_codemode_output_cap_test() {
@@ -353,8 +359,8 @@ pub fn load_rejects_negative_codemode_output_cap_test() {
     #("NEXUS_ENCRYPTION_KEY", key_b64),
     #("NEXUS_CODEMODE_MAX_OUTPUT_CHARS", "-1"),
   ])
-  let assert Error(message) = config.load()
-  message
+  let assert Error(error) = config.load()
+  error.message
   |> should.equal(
     "environment variable NEXUS_CODEMODE_MAX_OUTPUT_CHARS must be >= 0: -1",
   )
@@ -365,8 +371,8 @@ pub fn load_rejects_non_boolean_codemode_flag_test() {
     #("NEXUS_ENCRYPTION_KEY", key_b64),
     #("NEXUS_CODEMODE", "maybe"),
   ])
-  let assert Error(message) = config.load()
-  should.be_true(string.contains(message, "NEXUS_CODEMODE"))
+  let assert Error(error) = config.load()
+  should.be_true(string.contains(error.message, "NEXUS_CODEMODE"))
 }
 
 // ---- MCP servers (plugin-api plan Phase 2) --------------------------------
@@ -424,8 +430,8 @@ pub fn mcp_servers_rejects_invalid_json_test() {
     #("NEXUS_ENCRYPTION_KEY", key_b64),
     #("NEXUS_MCP_SERVERS_JSON", "[{name: github}]"),
   ])
-  let assert Error(message) = config.load()
-  should.be_true(string.contains(message, "NEXUS_MCP_SERVERS_JSON"))
+  let assert Error(error) = config.load()
+  should.be_true(string.contains(error.message, "NEXUS_MCP_SERVERS_JSON"))
 }
 
 pub fn mcp_servers_rejects_bad_name_test() {
@@ -433,8 +439,8 @@ pub fn mcp_servers_rejects_bad_name_test() {
     #("NEXUS_ENCRYPTION_KEY", key_b64),
     #("NEXUS_MCP_SERVERS_JSON", "[{\"name\":\"bad__name\",\"command\":\"x\"}]"),
   ])
-  let assert Error(message) = config.load()
-  should.be_true(string.contains(message, "bad__name"))
+  let assert Error(error) = config.load()
+  should.be_true(string.contains(error.message, "bad__name"))
 }
 
 pub fn mcp_servers_rejects_duplicate_names_test() {
@@ -445,8 +451,8 @@ pub fn mcp_servers_rejects_duplicate_names_test() {
       "[{\"name\":\"a\",\"command\":\"x\"},{\"name\":\"a\",\"command\":\"y\"}]",
     ),
   ])
-  let assert Error(message) = config.load()
-  should.be_true(string.contains(message, "duplicate"))
+  let assert Error(error) = config.load()
+  should.be_true(string.contains(error.message, "duplicate"))
 }
 
 pub fn mcp_servers_rejects_empty_command_test() {
@@ -454,8 +460,8 @@ pub fn mcp_servers_rejects_empty_command_test() {
     #("NEXUS_ENCRYPTION_KEY", key_b64),
     #("NEXUS_MCP_SERVERS_JSON", "[{\"name\":\"a\",\"command\":\"  \"}]"),
   ])
-  let assert Error(message) = config.load()
-  should.be_true(string.contains(message, "command"))
+  let assert Error(error) = config.load()
+  should.be_true(string.contains(error.message, "command"))
 }
 
 pub fn mcp_servers_rejects_env_key_with_equals_test() {
@@ -466,8 +472,8 @@ pub fn mcp_servers_rejects_env_key_with_equals_test() {
       "[{\"name\":\"a\",\"command\":\"x\",\"env\":{\"A=B\":\"v\"}}]",
     ),
   ])
-  let assert Error(message) = config.load()
-  should.be_true(string.contains(message, "'='"))
+  let assert Error(error) = config.load()
+  should.be_true(string.contains(error.message, "'='"))
 }
 
 pub fn mcp_servers_rejects_low_timeout_test() {
@@ -478,8 +484,8 @@ pub fn mcp_servers_rejects_low_timeout_test() {
       "[{\"name\":\"a\",\"command\":\"x\",\"timeout_ms\":10}]",
     ),
   ])
-  let assert Error(message) = config.load()
-  should.be_true(string.contains(message, "timeout_ms"))
+  let assert Error(error) = config.load()
+  should.be_true(string.contains(error.message, "timeout_ms"))
 }
 
 pub fn mcp_servers_rejects_nul_in_env_test() {
@@ -490,8 +496,8 @@ pub fn mcp_servers_rejects_nul_in_env_test() {
       "[{\"name\":\"a\",\"command\":\"x\",\"env\":{\"K\":\"v\\u0000\"}}]",
     ),
   ])
-  let assert Error(message) = config.load()
-  should.be_true(string.contains(message, "NUL"))
+  let assert Error(error) = config.load()
+  should.be_true(string.contains(error.message, "NUL"))
 }
 
 pub fn mcp_servers_rejects_nul_in_command_test() {
@@ -499,8 +505,8 @@ pub fn mcp_servers_rejects_nul_in_command_test() {
     #("NEXUS_ENCRYPTION_KEY", key_b64),
     #("NEXUS_MCP_SERVERS_JSON", "[{\"name\":\"a\",\"command\":\"x\\u0000y\"}]"),
   ])
-  let assert Error(message) = config.load()
-  should.be_true(string.contains(message, "NUL"))
+  let assert Error(error) = config.load()
+  should.be_true(string.contains(error.message, "NUL"))
 }
 
 // ---------------------------------------------------------------------------
@@ -533,8 +539,8 @@ pub fn node_idle_days_rejects_negative_test() {
     #("NEXUS_ENCRYPTION_KEY", key_b64),
     #("NEXUS_NODE_IDLE_DAYS", "-1"),
   ])
-  let assert Error(message) = config.load()
-  message
+  let assert Error(error) = config.load()
+  error.message
   |> should.equal("environment variable NEXUS_NODE_IDLE_DAYS must be >= 0: -1")
 }
 
@@ -570,8 +576,8 @@ pub fn log_level_rejects_invalid_value_test() {
     #("NEXUS_ENCRYPTION_KEY", key_b64),
     #("NEXUS_LOG_LEVEL", "verbose"),
   ])
-  let assert Error(message) = config.load()
-  message
+  let assert Error(error) = config.load()
+  error.message
   |> should.equal(
     "environment variable NEXUS_LOG_LEVEL must be one of: debug, info, warn, error: verbose",
   )
@@ -611,23 +617,23 @@ pub fn web_fetch_rejects_invalid_bounds_test() {
     #("NEXUS_ENCRYPTION_KEY", key_b64),
     #("NEXUS_WEB_FETCH_MAX_RAW_BYTES", "0"),
   ])
-  let assert Error(msg1) = config.load()
-  should.be_true(string.contains(msg1, "NEXUS_WEB_FETCH_MAX_RAW_BYTES"))
+  let assert Error(error) = config.load()
+  should.be_true(string.contains(error.message, "NEXUS_WEB_FETCH_MAX_RAW_BYTES"))
 
   set_all([
     #("NEXUS_ENCRYPTION_KEY", key_b64),
     #("NEXUS_WEB_FETCH_DEFAULT_CHARS", "0"),
   ])
-  let assert Error(msg2) = config.load()
-  should.be_true(string.contains(msg2, "NEXUS_WEB_FETCH_DEFAULT_CHARS"))
+  let assert Error(error) = config.load()
+  should.be_true(string.contains(error.message, "NEXUS_WEB_FETCH_DEFAULT_CHARS"))
 
   set_all([
     #("NEXUS_ENCRYPTION_KEY", key_b64),
     #("NEXUS_WEB_FETCH_MAX_DECOMPRESSED_BYTES", "0"),
   ])
-  let assert Error(msg_d) = config.load()
+  let assert Error(error) = config.load()
   should.be_true(string.contains(
-    msg_d,
+    error.message,
     "NEXUS_WEB_FETCH_MAX_DECOMPRESSED_BYTES",
   ))
 
@@ -638,24 +644,30 @@ pub fn web_fetch_rejects_invalid_bounds_test() {
     #("NEXUS_WEB_FETCH_DEFAULT_CHARS", "20000"),
     #("NEXUS_WEB_FETCH_MAX_CHARS", "10000"),
   ])
-  let assert Error(msg3) = config.load()
-  should.be_true(string.contains(msg3, "NEXUS_WEB_FETCH_MAX_CHARS"))
-  should.be_true(string.contains(msg3, "NEXUS_WEB_FETCH_DEFAULT_CHARS"))
+  let assert Error(error) = config.load()
+  should.be_true(string.contains(error.message, "NEXUS_WEB_FETCH_MAX_CHARS"))
+  should.be_true(string.contains(error.message, "NEXUS_WEB_FETCH_DEFAULT_CHARS"))
 
   set_all([
     #("NEXUS_ENCRYPTION_KEY", key_b64),
     #("NEXUS_WEB_FETCH_DEFAULT_CHARS", "40000"),
   ])
-  let assert Error(msg3b) = config.load()
-  should.be_true(string.contains(msg3b, "NEXUS_WEB_FETCH_MAX_CHARS (32000)"))
-  should.be_true(string.contains(msg3b, "NEXUS_WEB_FETCH_DEFAULT_CHARS (40000)"))
+  let assert Error(error) = config.load()
+  should.be_true(string.contains(
+    error.message,
+    "NEXUS_WEB_FETCH_MAX_CHARS (32000)",
+  ))
+  should.be_true(string.contains(
+    error.message,
+    "NEXUS_WEB_FETCH_DEFAULT_CHARS (40000)",
+  ))
 
   set_all([
     #("NEXUS_ENCRYPTION_KEY", key_b64),
     #("NEXUS_WEB_FETCH_CACHE_TTL_MS", "-1"),
   ])
-  let assert Error(msg4) = config.load()
-  should.be_true(string.contains(msg4, "NEXUS_WEB_FETCH_CACHE_TTL_MS"))
+  let assert Error(error) = config.load()
+  should.be_true(string.contains(error.message, "NEXUS_WEB_FETCH_CACHE_TTL_MS"))
 }
 
 // ---------------------------------------------------------------------------
@@ -710,8 +722,8 @@ pub fn workspace_sandbox_rejects_invalid_values_test() {
     #("NEXUS_ENCRYPTION_KEY", key_b64),
     #("NEXUS_WORKSPACE_SANDBOX", "docker"),
   ])
-  let assert Error(msg1) = config.load()
-  msg1
+  let assert Error(error) = config.load()
+  error.message
   |> should.equal(
     "environment variable NEXUS_WORKSPACE_SANDBOX must be one of: none, bwrap, nono: docker",
   )
@@ -721,9 +733,9 @@ pub fn workspace_sandbox_rejects_invalid_values_test() {
     #("NEXUS_ENCRYPTION_KEY", key_b64),
     #("NEXUS_WORKSPACE_SANDBOX", "nono"),
   ])
-  let assert Error(msg2) = config.load()
-  should.be_true(string.contains(msg2, "NEXUS_WORKSPACE_STATE_DIR"))
-  should.be_true(string.contains(msg2, "nono"))
+  let assert Error(error) = config.load()
+  should.be_true(string.contains(error.message, "NEXUS_WORKSPACE_STATE_DIR"))
+  should.be_true(string.contains(error.message, "nono"))
 
   // Inert sandbox-only knobs fail loudly when NEXUS_WORKSPACE_SANDBOX is
   // unset or explicitly `none` (prevents silent unsandboxed execution).
@@ -738,18 +750,18 @@ pub fn workspace_sandbox_rejects_invalid_values_test() {
         #("NEXUS_ENCRYPTION_KEY", key_b64),
         pair,
       ])
-      let assert Error(msg_unset) = config.load()
-      should.be_true(string.contains(msg_unset, pair.0))
-      should.be_true(string.contains(msg_unset, "NEXUS_WORKSPACE_SANDBOX"))
+      let assert Error(error) = config.load()
+      should.be_true(string.contains(error.message, pair.0))
+      should.be_true(string.contains(error.message, "NEXUS_WORKSPACE_SANDBOX"))
 
       set_all([
         #("NEXUS_ENCRYPTION_KEY", key_b64),
         #("NEXUS_WORKSPACE_SANDBOX", "none"),
         pair,
       ])
-      let assert Error(msg_none) = config.load()
-      should.be_true(string.contains(msg_none, pair.0))
-      should.be_true(string.contains(msg_none, "NEXUS_WORKSPACE_SANDBOX"))
+      let assert Error(error) = config.load()
+      should.be_true(string.contains(error.message, pair.0))
+      should.be_true(string.contains(error.message, "NEXUS_WORKSPACE_SANDBOX"))
     },
   )
 
@@ -767,8 +779,8 @@ pub fn workspace_sandbox_rejects_invalid_values_test() {
         #("NEXUS_WORKSPACE_ROOT", pair.0),
         #("NEXUS_WORKSPACE_STATE_DIR", pair.1),
       ])
-      let assert Error(msg) = config.load()
-      should.be_true(string.contains(msg, "must not overlap"))
+      let assert Error(error) = config.load()
+      should.be_true(string.contains(error.message, "must not overlap"))
     },
   )
 
@@ -793,9 +805,9 @@ pub fn workspace_sandbox_rejects_invalid_values_test() {
         #("NEXUS_WORKSPACE_SANDBOX", "bwrap"),
         #(case_.0, case_.1),
       ])
-      let assert Error(msg) = config.load()
-      should.be_true(string.contains(msg, case_.0))
-      should.be_true(string.contains(msg, case_.2))
+      let assert Error(error) = config.load()
+      should.be_true(string.contains(error.message, case_.0))
+      should.be_true(string.contains(error.message, case_.2))
     },
   )
 
@@ -804,15 +816,15 @@ pub fn workspace_sandbox_rejects_invalid_values_test() {
     #("NEXUS_ENCRYPTION_KEY", key_b64),
     #("NEXUS_WORKSPACE_MAX_MEMORY_MB", "15"),
   ])
-  let assert Error(msg_mem) = config.load()
-  should.be_true(string.contains(msg_mem, "NEXUS_WORKSPACE_MAX_MEMORY_MB"))
+  let assert Error(error) = config.load()
+  should.be_true(string.contains(error.message, "NEXUS_WORKSPACE_MAX_MEMORY_MB"))
 
   set_all([
     #("NEXUS_ENCRYPTION_KEY", key_b64),
     #("NEXUS_WORKSPACE_MAX_PIDS", "3"),
   ])
-  let assert Error(msg_pids) = config.load()
-  should.be_true(string.contains(msg_pids, "NEXUS_WORKSPACE_MAX_PIDS"))
+  let assert Error(error) = config.load()
+  should.be_true(string.contains(error.message, "NEXUS_WORKSPACE_MAX_PIDS"))
 }
 
 // Boot's config-error hint must match the error it accompanies. It is
@@ -820,35 +832,54 @@ pub fn workspace_sandbox_rejects_invalid_values_test() {
 // named NEXUS_ENCRYPTION_KEY on every failure — confusing next to a
 // workspace-sandbox error that had nothing to do with the master key.
 pub fn hint_matches_the_error_test() {
-  // Key errors keep the key hint.
-  let key_hint =
-    config.hint("missing required environment variable: NEXUS_ENCRYPTION_KEY")
-  should.be_true(string.contains(key_hint, "NEXUS_ENCRYPTION_KEY"))
-
-  let bad_key_hint = config.hint("NEXUS_ENCRYPTION_KEY: not valid base64: ...")
-  should.be_true(string.contains(bad_key_hint, "base64 of 32 bytes"))
-
-  // Workspace-sandbox errors point at the sandbox vars, never the key.
-  let nono_hint =
-    config.hint(
-      "environment variable NEXUS_WORKSPACE_STATE_DIR is required when"
-      <> " NEXUS_WORKSPACE_SANDBOX=nono",
-    )
-  should.be_true(string.contains(nono_hint, "NEXUS_WORKSPACE_STATE_DIR"))
-  should.be_true(string.contains(nono_hint, "NEXUS_WORKSPACE_SANDBOX"))
-  should.be_false(string.contains(nono_hint, "NEXUS_ENCRYPTION_KEY"))
-
-  let inert_hint =
-    config.hint(
-      "environment variable NEXUS_WORKSPACE_SANDBOX_BIN requires"
-      <> " NEXUS_WORKSPACE_SANDBOX to be bwrap or nono",
-    )
-  should.be_true(string.contains(inert_hint, "NEXUS_WORKSPACE_SANDBOX"))
-  should.be_false(string.contains(inert_hint, "NEXUS_ENCRYPTION_KEY"))
-
-  // Anything else gets the plain README pointer.
+  // The hint is a pure mapping from the error's tag — never re-derived
+  // from the message text, which is free-form and echoes operator
+  // values (a path containing "NEXUS_ENCRYPTION_KEY" once misclassified
+  // under the substring matcher this replaced).
   should.equal(
-    config.hint("some unrelated failure"),
+    config.hint(config.ConfigError("anything", config.KeyHint)),
+    "required: NEXUS_ENCRYPTION_KEY (base64 of 32 bytes); see the README env table",
+  )
+  should.be_true(string.contains(
+    config.hint(config.ConfigError("anything", config.WorkspaceSandboxHint)),
+    "NEXUS_WORKSPACE_SANDBOX",
+  ))
+  should.be_false(string.contains(
+    config.hint(config.ConfigError("anything", config.WorkspaceSandboxHint)),
+    "NEXUS_ENCRYPTION_KEY",
+  ))
+  should.equal(
+    config.hint(config.ConfigError("anything", config.GenericHint)),
     "see the README env table",
   )
+
+  // The tags are attached at construction, end to end: the nono rule
+  // and the overlap rule (whose message echoes operator paths) both
+  // carry the sandbox tag, and any other parse failure stays generic.
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_WORKSPACE_SANDBOX", "nono"),
+  ])
+  let assert Error(error) = config.load()
+  should.equal(error.hint, config.WorkspaceSandboxHint)
+
+  // The overlap error echoes the operator's root path — which contains
+  // a var name — and must still classify as a sandbox error, not a key
+  // error.
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_WORKSPACE_ROOT", "/srv/ws"),
+    #("NEXUS_WORKSPACE_SANDBOX", "nono"),
+    #("NEXUS_WORKSPACE_STATE_DIR", "/srv/ws/NEXUS_ENCRYPTION_KEY-state"),
+  ])
+  let assert Error(overlap) = config.load()
+  should.equal(overlap.hint, config.WorkspaceSandboxHint)
+  should.be_true(string.contains(overlap.message, "NEXUS_ENCRYPTION_KEY"))
+
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_LOG_LEVEL", "loud"),
+  ])
+  let assert Error(generic) = config.load()
+  should.equal(generic.hint, config.GenericHint)
 }

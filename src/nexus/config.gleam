@@ -226,38 +226,73 @@ pub type McpServer {
 /// ONE definition so the two rules cannot drift apart.
 pub const plugin_timeout_floor_ms = 100
 
-/// A remediation hint for a config error, derived from the error message
-/// itself. Boot logs this beside the error; the hardcoded encryption-key
-/// hint it replaced logged a wrong variable name for every non-key
-/// failure (e.g. the workspace-sandbox rules), which read as two
-/// unrelated problems in one line.
-pub fn hint(message: String) -> String {
-  case
-    string.contains(message, "NEXUS_ENCRYPTION_KEY"),
-    string.contains(message, "NEXUS_WORKSPACE_SANDBOX")
-    || string.contains(message, "NEXUS_WORKSPACE_STATE_DIR")
-  {
-    True, _ ->
+/// Which remediation applies to a config error. Attached AT CONSTRUCTION
+/// (the key step and the workspace-sandbox rules), never re-derived from
+/// the message: error text is free-form and echoes operator-supplied
+/// values (paths, raw values), so substring-matching it misclassifies —
+/// an overlap error echoing a root path that happens to contain
+/// "NEXUS_ENCRYPTION_KEY" once got the key hint that way.
+pub type Hint {
+  KeyHint
+  WorkspaceSandboxHint
+  GenericHint
+}
+
+/// A failed `load`: the human-readable message and the hint class
+/// attached where the failure was raised.
+pub type ConfigError {
+  ConfigError(message: String, hint: Hint)
+}
+
+/// The remediation text boot logs beside a config error — a pure mapping
+/// from the hint class, so reworded messages can never silently drop a
+/// hint to the generic pointer. The hardcoded encryption-key hint this
+/// replaced logged a wrong variable name for every non-key failure
+/// (e.g. the workspace-sandbox rules), which read as two unrelated
+/// problems in one line.
+pub fn hint(error: ConfigError) -> String {
+  case error.hint {
+    KeyHint ->
       "required: NEXUS_ENCRYPTION_KEY (base64 of 32 bytes); see the README env table"
-    False, True ->
+    WorkspaceSandboxHint ->
       "workspace sandboxing: NEXUS_WORKSPACE_SANDBOX selects the backend"
       <> " (none | bwrap | nono); nono requires NEXUS_WORKSPACE_STATE_DIR"
       <> " outside NEXUS_WORKSPACE_ROOT; see the README env table"
       <> " and docs/plans/workspace-sandbox.md"
-    _, _ -> "see the README env table"
+    GenericHint -> "see the README env table"
   }
 }
 
 /// Load config from the process environment.
-pub fn load() -> Result(Config, String) {
+pub fn load() -> Result(Config, ConfigError) {
   from_env(envoy.get)
 }
 
 /// Pure variant of `load` over a lookup function, for offline tests.
 pub fn from_env(
   get: fn(String) -> Result(String, Nil),
+) -> Result(Config, ConfigError) {
+  use encryption_key <- result.try(
+    required_encryption_key(get)
+    |> result.map_error(fn(message) { ConfigError(message, KeyHint) }),
+  )
+  use cfg <- result.try(
+    parse_env(get, encryption_key)
+    |> result.map_error(fn(message) { ConfigError(message, GenericHint) }),
+  )
+  use Nil <- result.try(validate_workspace(cfg))
+  Ok(cfg)
+}
+
+/// The parse chain behind `from_env`: every env var read, its default,
+/// and the inline cross-checks, on plain String errors. `from_env` maps
+/// a failure here to the generic hint; the workspace-sandbox rules live
+/// in `validate_workspace` instead of this chain precisely because they
+/// classify themselves instead of being guessed from their text.
+fn parse_env(
+  get: fn(String) -> Result(String, Nil),
+  encryption_key: String,
 ) -> Result(Config, String) {
-  use encryption_key <- result.try(required_encryption_key(get))
   use first_response_ms <- result.try(optional_int(
     get,
     "NEXUS_SSE_FIRST_RESPONSE_TIMEOUT_MS",
@@ -435,52 +470,6 @@ pub fn from_env(
     get,
     "NEXUS_WORKSPACE_STATE_DIR",
   ))
-  use Nil <- result.try(case workspace_sandbox {
-    SandboxNone ->
-      case workspace_sandbox_bin, workspace_toolchain, workspace_state_dir {
-        Some(_), _, _ ->
-          Error(
-            "environment variable NEXUS_WORKSPACE_SANDBOX_BIN requires"
-            <> " NEXUS_WORKSPACE_SANDBOX to be bwrap or nono",
-          )
-        _, Some(_), _ ->
-          Error(
-            "environment variable NEXUS_WORKSPACE_TOOLCHAIN requires"
-            <> " NEXUS_WORKSPACE_SANDBOX to be bwrap or nono",
-          )
-        _, _, Some(_) ->
-          Error(
-            "environment variable NEXUS_WORKSPACE_STATE_DIR requires"
-            <> " NEXUS_WORKSPACE_SANDBOX to be bwrap or nono",
-          )
-        None, None, None -> Ok(Nil)
-      }
-    SandboxBwrap -> Ok(Nil)
-    SandboxNono ->
-      case workspace_state_dir {
-        None ->
-          Error(
-            "environment variable NEXUS_WORKSPACE_STATE_DIR is required when"
-            <> " NEXUS_WORKSPACE_SANDBOX=nono",
-          )
-        Some(_) -> Ok(Nil)
-      }
-  })
-  use Nil <- result.try(case workspace_root, workspace_state_dir {
-    Some(root), Some(state) ->
-      case paths_overlap(root, state) {
-        True ->
-          Error(
-            "environment variable NEXUS_WORKSPACE_STATE_DIR ("
-            <> state
-            <> ") must not overlap NEXUS_WORKSPACE_ROOT ("
-            <> root
-            <> ")",
-          )
-        False -> Ok(Nil)
-      }
-    _, _ -> Ok(Nil)
-  })
   use workspace_max_memory_mb <- result.try(optional_min_int(
     get,
     "NEXUS_WORKSPACE_MAX_MEMORY_MB",
@@ -573,6 +562,70 @@ pub fn from_env(
     node_idle_days: node_idle_days,
     log_level: log_level,
   ))
+}
+
+/// The workspace-sandbox rules, validated against the PARSED config so
+/// each error carries its WorkspaceSandboxHint from construction — the
+/// messages echo operator-supplied paths, so their text cannot classify
+/// them. Checked after the parse chain rather than mid-chain: error
+/// ordering among independent misconfigurations is not load-bearing,
+/// and every failure is still a loud, named, load-refusing one.
+fn validate_workspace(cfg: Config) -> Result(Nil, ConfigError) {
+  use Nil <- result.try(case cfg.workspace_sandbox {
+    SandboxNone ->
+      case
+        cfg.workspace_sandbox_bin,
+        cfg.workspace_toolchain,
+        cfg.workspace_state_dir
+      {
+        Some(_), _, _ ->
+          Error(ConfigError(
+            "environment variable NEXUS_WORKSPACE_SANDBOX_BIN requires"
+              <> " NEXUS_WORKSPACE_SANDBOX to be bwrap or nono",
+            WorkspaceSandboxHint,
+          ))
+        _, Some(_), _ ->
+          Error(ConfigError(
+            "environment variable NEXUS_WORKSPACE_TOOLCHAIN requires"
+              <> " NEXUS_WORKSPACE_SANDBOX to be bwrap or nono",
+            WorkspaceSandboxHint,
+          ))
+        _, _, Some(_) ->
+          Error(ConfigError(
+            "environment variable NEXUS_WORKSPACE_STATE_DIR requires"
+              <> " NEXUS_WORKSPACE_SANDBOX to be bwrap or nono",
+            WorkspaceSandboxHint,
+          ))
+        None, None, None -> Ok(Nil)
+      }
+    SandboxBwrap -> Ok(Nil)
+    SandboxNono ->
+      case cfg.workspace_state_dir {
+        None ->
+          Error(ConfigError(
+            "environment variable NEXUS_WORKSPACE_STATE_DIR is required when"
+              <> " NEXUS_WORKSPACE_SANDBOX=nono",
+            WorkspaceSandboxHint,
+          ))
+        Some(_) -> Ok(Nil)
+      }
+  })
+  case cfg.workspace_root, cfg.workspace_state_dir {
+    Some(root), Some(state) ->
+      case paths_overlap(root, state) {
+        True ->
+          Error(ConfigError(
+            "environment variable NEXUS_WORKSPACE_STATE_DIR ("
+              <> state
+              <> ") must not overlap NEXUS_WORKSPACE_ROOT ("
+              <> root
+              <> ")",
+            WorkspaceSandboxHint,
+          ))
+        False -> Ok(Nil)
+      }
+    _, _ -> Ok(Nil)
+  }
 }
 
 /// Parse `NEXUS_MCP_SERVERS_JSON` (plugin-api plan Phase 2): a JSON

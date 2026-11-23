@@ -107,10 +107,10 @@ pub fn bot_validate_tools(
 pub fn main() -> Nil {
   log.configure(log.Info)
   case config.load() {
-    Error(message) -> {
+    Error(error) -> {
       log.error("boot", "config error", [
-        log.str("error", message),
-        log.str("hint", config.hint(message)),
+        log.str("error", error.message),
+        log.str("hint", config.hint(error)),
       ])
       halt(2)
     }
