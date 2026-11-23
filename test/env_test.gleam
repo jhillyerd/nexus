@@ -7,8 +7,10 @@
 
 import filepath
 import gleam/dict
+import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/int
+import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/string
@@ -1813,14 +1815,97 @@ pub fn sandbox_silent_wrapper_exit_surfaces_as_error_test() {
   string.contains(reason, "sandbox wrapper (nono) exited with status 1")
   |> should_equal(True)
 
-  // Verify the nexus profile was lazily created with system_write_linux excluded.
+  // Verify the nexus profile was lazily created with system_write_linux
+  // specifically in `groups.exclude` (not merely mentioned anywhere).
   let profile_path = filepath.join(state_dir, "config/nono/profiles/nexus.json")
   let assert Ok(profile) = simplifile.read(profile_path)
-  string.contains(profile, "system_write_linux") |> should_equal(True)
+  let exclude_decoder =
+    decode.at(["groups", "exclude"], decode.list(decode.string))
+  let assert Ok(excluded_groups) = json.parse(profile, exclude_decoder)
+  list.contains(excluded_groups, "system_write_linux") |> should_equal(True)
 
   let _ = simplifile.delete(root)
   let _ = simplifile.delete(state_dir)
   let _ = simplifile.delete(root <> "-bin")
+}
+
+/// Verify end-to-end that a cgroup join failure sentinel + exit 125 surfaces
+/// as a tool `Error` (never `Ok("exit status 125...")`), while a normal bash
+/// command exiting 125 still returns `Ok`.
+pub fn sandbox_cgroup_join_failure_surfaces_as_error_test() {
+  let root = fresh_root()
+  let tc = root <> "-tc"
+  write_executable_script(tc <> "/bin/bash", "#!/bin/sh\nexit 0\n")
+  let fake_bwrap = root <> "-bin/fake-bwrap-cgfail"
+  write_executable_script(
+    fake_bwrap,
+    "#!/bin/sh\nprintf '__nexus_cgroup_join_failed__\\n'\nexit 125\n",
+  )
+
+  let sandbox =
+    env.SandboxConfig(
+      backend: env.SandboxBwrap,
+      sandbox_bin: Some(fake_bwrap),
+      toolchain: Some(tc),
+      state_dir: None,
+      max_memory_mb: 1024,
+      max_pids: 64,
+    )
+  let res =
+    env.bash_with_sandbox(
+      timeout_ms: 5000,
+      max_output_bytes: 10_000,
+      sandbox: sandbox,
+      environment: env_for(root),
+      cancel: process.new_subject(),
+      arguments: "{\"target\":\"workspace\",\"command\":\"echo hi\"}",
+    )
+  let _ = simplifile.delete(root)
+  let _ = simplifile.delete(tc)
+  let _ = simplifile.delete(root <> "-bin")
+  let assert Error("bash: failed to join transient sandbox cgroup") = res
+}
+
+/// Verify explicit toolchain on a non-Nix FHS host does NOT emit `--symlink`
+/// for `/bin/sh` or `/usr/bin/env` over the read-only `/bin` and `/usr` binds
+/// (bubblewrap 0.9.0 refuses `--symlink` over existing files in ro-binds).
+pub fn sandbox_plan_bwrap_fhs_explicit_toolchain_skips_colliding_symlinks_test() {
+  let tc = "/opt/ws-tools"
+  let host =
+    fake_probe(
+      resolved: [#("bwrap", "/usr/bin/bwrap")],
+      executables: [
+        "/usr/bin/bwrap",
+        tc <> "/bin/bash",
+        tc <> "/bin/sh",
+        tc <> "/bin/env",
+      ],
+      existing: ["/usr", "/bin", "/lib", "/lib64"],
+      dirs: ["/usr", "/bin", "/lib", "/lib64"],
+      inherited_path: "/usr/bin:/bin",
+      cgroup_dir: None,
+    )
+  let sandbox =
+    env.SandboxConfig(
+      backend: env.SandboxBwrap,
+      sandbox_bin: None,
+      toolchain: Some(tc),
+      state_dir: None,
+      max_memory_mb: 1024,
+      max_pids: 64,
+    )
+  let assert Ok(plan) =
+    env.build_spawn_plan(
+      sandbox: sandbox,
+      host: host,
+      workspace_dir: "/srv/ws/threads/t1",
+      tmp_dir: Some("/srv/ws/tmp/t1"),
+      command: "true",
+    )
+  has_triple(plan.argv, "--ro-bind", tc, tc) |> should_equal(True)
+  has_triple(plan.argv, "--ro-bind", "/bin", "/bin") |> should_equal(True)
+  has_triple(plan.argv, "--ro-bind", "/usr", "/usr") |> should_equal(True)
+  list.contains(plan.argv, "--symlink") |> should_equal(False)
 }
 
 /// Verify end-to-end through a real port that `SandboxNono` launches the
@@ -1863,6 +1948,7 @@ pub fn sandbox_nono_fake_wrapper_env_and_reexport_test() {
       max_memory_mb: 1024,
       max_pids: 64,
     )
+  let original_canary = get_env("NEXUS_TEST_SECRET_CANARY")
   put_env("NEXUS_TEST_SECRET_CANARY", "secret-must-not-leak")
   let res =
     env.bash_with_sandbox(
@@ -1873,7 +1959,7 @@ pub fn sandbox_nono_fake_wrapper_env_and_reexport_test() {
       cancel: process.new_subject(),
       arguments: "{\"target\":\"workspace\",\"command\":\"printf 'INNER_HOME=%s\\nINNER_TMP=%s\\nINNER_XDG=%s\\n' \\\"$HOME\\\" \\\"$TMPDIR\\\" \\\"$XDG_CONFIG_HOME\\\"\"}",
     )
-  unset_env("NEXUS_TEST_SECRET_CANARY")
+  restore("NEXUS_TEST_SECRET_CANARY", original_canary)
 
   let assert Ok(out) = res
   let assert Ok(wrap_env) = simplifile.read(wrapper_log)
@@ -1909,26 +1995,37 @@ fn close_socket(socket: LoopbackSocket) -> Nil
 /// and ignores an in-namespace marker PID (`2`) on the host.
 pub fn sandbox_bwrap_fake_wrapper_kill_port_os_pid_test() {
   let root = fresh_root()
+  let tc = root <> "-tc"
   let fake_bwrap = root <> "-bin/fake-bwrap"
   let uniq = int.to_string(timing.now_us())
   let tag = "nxfakebw" <> uniq <> "q"
+  // Controlled toolchain stub so `build_bwrap_plan` never depends on where
+  // host `bash` resolves on a developer's PATH; resolve real host `bash` and
+  // `sleep` explicitly because `allow_env` sets `PATH=<tc>/bin`.
+  let assert Ok(real_bash) = bash(env_for(root), 5000, "command -v bash")
+  let assert Ok(real_sleep) = bash(env_for(root), 5000, "command -v sleep")
+  write_executable_script(tc <> "/bin/bash", "#!/bin/sh\nexit 0\n")
   // Emulate a PID-namespace wrapper printing in-namespace PID `2` as line 1,
   // flushing output, and blocking under a unique argv tag until killed by its
   // own host OS PID (bash `exec -a` tags the process in `ps`).
   let script =
-    "#!/usr/bin/env bash\n"
+    "#!"
+    <> string.trim(real_bash)
+    <> "\n"
     <> "printf '2\\n'\n"
     <> "printf 'ready-in-fake-bwrap\\n'\n"
     <> "exec -a "
     <> tag
-    <> " sleep 30\n"
+    <> " "
+    <> env.shell_single_quote(string.trim(real_sleep))
+    <> " 30\n"
   write_executable_script(fake_bwrap, script)
 
   let sandbox =
     env.SandboxConfig(
       backend: env.SandboxBwrap,
       sandbox_bin: Some(fake_bwrap),
-      toolchain: None,
+      toolchain: Some(tc),
       state_dir: None,
       max_memory_mb: 1024,
       max_pids: 64,
@@ -1959,6 +2056,7 @@ pub fn sandbox_bwrap_fake_wrapper_kill_port_os_pid_test() {
   // Confirm `KillPortOsPid` actually terminated the wrapper process.
   poll_tag_gone("nxfakebw" <> uniq <> "[q]", 50)
   let _ = simplifile.delete(root)
+  let _ = simplifile.delete(tc)
   let _ = simplifile.delete(root <> "-bin")
 
   let assert Error(text) = res
@@ -2070,29 +2168,36 @@ fn run_real_bwrap_integration() -> Nil {
   string.starts_with(out3, "exit status") |> should_equal(True)
 
   // 3. Offline netns blocks TCP loopback (with a real local listener as
-  //    positive control so the check cannot pass vacuously).
+  //    positive control, and a distinct completion marker proving the
+  //    sandboxed probe actually executed and failed rather than failing launch).
   let assert Ok(#(sock, port)) = listen_loopback()
   let tcp_probe =
     "bash -c 'exec 3<>/dev/tcp/127.0.0.1/"
     <> int.to_string(port)
-    <> "' 2>&1; echo rc=$?"
+    <> "' 2>&1; echo probe_done rc=$?"
   let host_probe = bash(handle, 10_000, tcp_probe)
   let sandbox_probe = run(10_000, tcp_probe)
   close_socket(sock)
   let assert Ok(host_out) = host_probe
-  string.contains(host_out, "rc=0") |> should_equal(True)
+  string.contains(host_out, "probe_done rc=0") |> should_equal(True)
   let assert Ok(out4) = sandbox_probe
-  string.contains(out4, "rc=0") |> should_equal(False)
+  string.contains(out4, "probe_done rc=") |> should_equal(True)
+  string.contains(out4, "probe_done rc=0") |> should_equal(False)
 
-  // 4. Timeout reaps background children inside the PID namespace.
-  let tag = "nxbwrap" <> int.to_string(timing.now_us()) <> "q"
-  let assert Error(timeout_msg) =
-    run(500, "exec -a " <> tag <> " sleep 30 & sleep 30")
+  // 4. Timeout reaps background children inside the PID namespace (observe
+  //    the tagged child running first so absence cannot pass vacuously).
+  let uniq = int.to_string(timing.now_us())
+  let tag = "nxbwrap" <> uniq <> "q"
+  let timeout_reply = process.new_subject()
+  let _worker =
+    process.spawn_unlinked(fn() {
+      let res = run(2500, "exec -a " <> tag <> " sleep 30 & sleep 30")
+      process.send(timeout_reply, res)
+    })
+  poll_tag_present("nxbwrap" <> uniq <> "[q] 3[0]", 50)
+  let assert Ok(Error(timeout_msg)) = process.receive(timeout_reply, 10_000)
   string.contains(timeout_msg, "timed out") |> should_equal(True)
-  poll_tag_gone(
-    "nxbwrap" <> string.drop_start(tag, 7) |> string.drop_end(1) <> "[q]",
-    25,
-  )
+  poll_tag_gone("nxbwrap" <> uniq <> "[q]", 25)
 
   let _ = simplifile.delete(root)
   Nil
@@ -2115,7 +2220,8 @@ fn run_real_nono_integration() -> Nil {
     Error(Nil) ->
       case get_env("HOME") {
         Ok(home) -> filepath.join(home, ".cache/nexus-nono-test")
-        Error(Nil) -> "/var/tmp/nexus-nono-test"
+        Error(Nil) ->
+          panic as "NEXUS_TEST_NONO=1 requires NEXUS_TEST_NONO_ROOT (outside /tmp and /var/tmp) when HOME is unset"
       }
   }
   let uniq = int.to_string(timing.now_us())
@@ -2177,24 +2283,33 @@ fn run_real_nono_integration() -> Nil {
   simplifile.is_file(host_tmp_probe) |> should_equal(Ok(False))
 
   // 3. Offline --block-net blocks TCP loopback connect (with a real local
-  //    listener as positive control).
+  //    listener as positive control and a completion marker proving the
+  //    sandboxed probe actually ran).
   let assert Ok(#(sock, port)) = listen_loopback()
   let tcp_probe =
     "bash -c 'exec 3<>/dev/tcp/127.0.0.1/"
     <> int.to_string(port)
-    <> "' 2>&1; echo rc=$?"
+    <> "' 2>&1; echo probe_done rc=$?"
   let host_probe = bash(handle, 10_000, tcp_probe)
   let sandbox_probe = run(10_000, tcp_probe)
   close_socket(sock)
   let assert Ok(host_out) = host_probe
-  string.contains(host_out, "rc=0") |> should_equal(True)
+  string.contains(host_out, "probe_done rc=0") |> should_equal(True)
   let assert Ok(out4) = sandbox_probe
-  string.contains(out4, "rc=0") |> should_equal(False)
+  string.contains(out4, "probe_done rc=") |> should_equal(True)
+  string.contains(out4, "probe_done rc=0") |> should_equal(False)
 
-  // 4. Timeout reaps background children under nono (setsid group kill).
+  // 4. Timeout reaps background children under nono (observe the tagged child
+  //    running first so absence cannot pass vacuously).
   let tag = "nxnono" <> uniq <> "q"
-  let assert Error(timeout_msg) =
-    run(500, "exec -a " <> tag <> " sleep 30 & sleep 30")
+  let timeout_reply = process.new_subject()
+  let _worker =
+    process.spawn_unlinked(fn() {
+      let res = run(2500, "exec -a " <> tag <> " sleep 30 & sleep 30")
+      process.send(timeout_reply, res)
+    })
+  poll_tag_present("nxnono" <> uniq <> "[q] 3[0]", 50)
+  let assert Ok(Error(timeout_msg)) = process.receive(timeout_reply, 10_000)
   string.contains(timeout_msg, "timed out") |> should_equal(True)
   poll_tag_gone("nxnono" <> uniq <> "[q]", 25)
 

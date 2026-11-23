@@ -377,14 +377,18 @@ deltas; the rules that bite silently:
   excluding `system_write_linux`), the bash prelude silently re-exports
   `HOME`/`TMPDIR` and unsets `XDG_*`, and a silent `-s` non-zero exit
   before the PID marker surfaces as a tool `Error`. Resource caps use a
-  transient Linux cgroup v2 sub-cgroup (`memory.max`, `memory.swap.max=0`,
-  `pids.max`, `cgroup.kill` + `rmdir`, serialized one-time `beam/`
-  rehoming with stale `ws-*` sweep) plus `prlimit --fsize` (256 MiB) on
-  both paths, adding `prlimit --as` when cgroup delegation is unavailable
-  (never `--nproc` on a shared UID, no `--cpu` so multi-threaded builds
-  honor wall-clock timeout; outside `bwrap`, inside `nono`). Real
-  `bwrap`/`nono` tests stay strictly opt-in (`NEXUS_TEST_BWRAP=1` /
-  `NEXUS_TEST_NONO=1`), never PATH-probed.
+  transient Linux cgroup v2 sub-cgroup (`memory.max`, best-effort
+  `memory.swap.max=0`, `pids.max`, `cgroup.kill` + `rmdir`, serialized
+  one-time `beam/` rehoming moving both the BEAM and `erl_child_setup`
+  with dead-owner-only stale `ws-*` sweep) plus `prlimit --fsize` (256 MiB)
+  when `prlimit` is available, adding `prlimit --as` when cgroup delegation
+  is unavailable (never `--nproc` on a shared UID, no `--cpu` so
+  multi-threaded builds honor wall-clock timeout; outside `bwrap`, inside
+  `nono`). Selecting a sandbox backend does not guarantee every cap:
+  without cgroup delegation no PID cap applies, and without `prlimit`
+  neither `--fsize` nor the `--as` fallback applies (supporting `nono` on
+  macOS/minimal hosts). Real `bwrap`/`nono` tests stay strictly opt-in
+  (`NEXUS_TEST_BWRAP=1` / `NEXUS_TEST_NONO=1`), never PATH-probed.
 - **Caps are enforced WHILE READING** (bash output, `read_file` via
   the FFI's chunked read) — post-hoc truncation does not bound
   memory. Non-UTF-8 command output decodes lossily (latin-1

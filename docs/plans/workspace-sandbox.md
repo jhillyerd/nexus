@@ -394,10 +394,13 @@ to keep threads self-contained even after bot edits/deletes, freeze
     `Delegate=cpu memory pids` so each sandboxed command runs inside a
     transient sub-cgroup (`memory.max`, `pids.max`).
   - Lightweight fallback when cgroup delegation isn't available:
-    `prlimit` for `RLIMIT_FSIZE` / `RLIMIT_AS` (deliberately NOT
-    `RLIMIT_NPROC` when sharing UID with the BEAM, and no `RLIMIT_CPU` so
-    multi-threaded workloads honor the port loop's wall-clock deadline;
-    `RLIMIT_FSIZE` also stays active alongside cgroups).
+    `prlimit` (when resolved on `PATH` or in the toolchain) for
+    `RLIMIT_FSIZE` / `RLIMIT_AS` (deliberately NOT `RLIMIT_NPROC` when
+    sharing UID with the BEAM, and no `RLIMIT_CPU` so multi-threaded
+    workloads honor the port loop's wall-clock deadline; `RLIMIT_FSIZE`
+    also stays active alongside cgroups when `prlimit` is available). If
+    `prlimit` is unavailable, both `RLIMIT_FSIZE` and the `RLIMIT_AS`
+    fallback are omitted; without cgroup delegation, no PID cap applies.
 - **NixOS module (`nixosModules.default` in `flake.nix`):**
   - `services.nexus.workspace.enable`
   - `services.nexus.workspace.sandbox` (`"nono"` | `"bwrap"` | `"none"`,
@@ -454,12 +457,15 @@ to keep threads self-contained even after bot edits/deletes, freeze
     silent `-s` non-zero wrapper exits before the PID marker as tool errors).
   - Resource caps: transient Linux cgroup v2 sub-cgroup (`memory.max`,
     best-effort `memory.swap.max=0`, `pids.max`, `cgroup.kill` + `rmdir`
-    cleanup, serialized one-time BEAM rehoming into a `beam/` leaf with stale
-    `ws-*` sweep) plus `prlimit --fsize` (256 MiB single-file disk cap) on
-    both paths, adding `prlimit --as` as the memory fallback when cgroup
-    delegation is unavailable (deliberately no `--nproc` on a shared UID and
-    no `--cpu` so parallel workloads run up to the port loop's real
-    wall-clock deadline; outside `bwrap`, inside `nono`).
+    cleanup, serialized one-time BEAM + `erl_child_setup` rehoming into a
+    `beam/` leaf with dead-owner-only stale `ws-*` sweep) plus
+    `prlimit --fsize` (256 MiB single-file disk cap) on both paths when
+    `prlimit` is available, adding `prlimit --as` as the memory fallback
+    when cgroup delegation is unavailable (omitted if `prlimit` cannot be
+    resolved; no PID cap without cgroup delegation; deliberately no
+    `--nproc` on a shared UID and no `--cpu` so parallel workloads run up
+    to the port loop's real wall-clock deadline; outside `bwrap`, inside
+    `nono`).
   - Offline `gleam test` pins pure spawn planning + fake-wrapper end-to-end
     port/kill/env/silent-exit tests; real `bwrap`/`nono` integration tests
     are gated strictly on `NEXUS_TEST_BWRAP=1` / `NEXUS_TEST_NONO=1`.

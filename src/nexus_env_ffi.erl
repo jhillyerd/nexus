@@ -44,7 +44,7 @@
 
 -define(DEFAULT_PATH, "/usr/local/bin:/usr/bin:/bin").
 
--export([resolve/1, is_executable/1, inherited_path/0, open_port/5,
+-export([resolve/1, is_executable/1, inherited_path/0, unique_id/0, open_port/5,
          port_os_pid/1, cgroup_create/2, cgroup_cleanup/1, kill_tree/2,
          to_text_lossy/1, read_capped/2, split_line/1, kill_group_marker/1,
          kill_pid_marker/1]).
@@ -86,6 +86,9 @@ is_executable(Path) ->
 
 inherited_path() ->
     unicode:characters_to_binary(os:getenv("PATH", ?DEFAULT_PATH)).
+
+unique_id() ->
+    integer_to_binary(erlang:unique_integer([positive, monotonic])).
 
 executable(F) ->
     case file:read_file_info(F) of
@@ -269,16 +272,17 @@ find_cgroup_parent_uncached() ->
             {error, nil}
     end.
 
-%% Best-effort once-per-boot cleanup of empty stale `ws-*` cgroup directories
-%% left by a prior crashed BEAM. Deliberately uses `file:del_dir/1` ONLY (never
-%% `cgroup.kill`): in Linux cgroupfs, `rmdir` succeeds strictly on empty
-%% cgroups and returns `ebusy` for any live sibling owned by another instance.
+%% Best-effort once-per-boot cleanup of empty stale `ws-<pid>-<id>` cgroup
+%% directories left by a prior crashed BEAM. Deliberately verifies the owning
+%% BEAM OS PID is dead (`/proc/<pid>` absent) AND uses `file:del_dir/1` ONLY
+%% (never `cgroup.kill`), so a pending empty cgroup created by another live
+%% Nexus instance sharing the delegated parent is never touched.
 sweep_empty_ws_cgroups(Parent) ->
     case file:list_dir(Parent) of
         {ok, Entries} ->
             lists:foreach(
               fun(Entry) ->
-                  case lists:prefix("ws-", Entry) of
+                  case ws_owner_dead(Entry) of
                       true ->
                           CgDir = filename:join(Parent, Entry),
                           case filelib:is_dir(CgDir) of
@@ -292,6 +296,19 @@ sweep_empty_ws_cgroups(Parent) ->
         _ ->
             ok
     end.
+
+ws_owner_dead(Entry) ->
+    case string:split(Entry, "-", all) of
+        ["ws", PidStr, _Id] when PidStr =/= "" ->
+            is_digits(PidStr) andalso not filelib:is_dir("/proc/" ++ PidStr);
+        _ ->
+            false
+    end.
+
+is_digits([]) ->
+    false;
+is_digits(Str) ->
+    lists:all(fun(C) -> C >= $0 andalso C =< $9 end, Str).
 
 read_self_cgroup_v2() ->
     case file:read_file("/proc/self/cgroup") of
@@ -324,6 +341,10 @@ has_mem_and_pids(Path) ->
             false
     end.
 
+%% Rehome the BEAM AND its direct child helper processes (specifically OTP 27's
+%% `erl_child_setup`, which starts inside the service cgroup as a separate OS
+%% process) into `SelfDir/beam/` so `SelfDir/cgroup.procs` is empty and Linux
+%% allows enabling `+memory +pids` in `SelfDir/cgroup.subtree_control`.
 prepare_delegated_parent(SelfDir) ->
     BeamDir = filename:join(SelfDir, "beam"),
     Created =
@@ -336,27 +357,33 @@ prepare_delegated_parent(SelfDir) ->
         failed ->
             {error, nil};
         _ ->
-            PidLine = os:getpid() ++ "\n",
-            case file:write_file(filename:join(BeamDir, "cgroup.procs"), PidLine) of
-                ok ->
+            SelfPid = os:getpid(),
+            PidsToMove = beam_tree_pids_in_cgroup(SelfDir, SelfPid),
+            BeamProcs = filename:join(BeamDir, "cgroup.procs"),
+            Moved = move_pids(PidsToMove, BeamProcs),
+            case lists:member(SelfPid, Moved) of
+                true ->
                     SubtreePath = filename:join(SelfDir, "cgroup.subtree_control"),
                     _ = file:write_file(SubtreePath, "+memory +pids\n"),
                     case has_mem_and_pids(SubtreePath) of
                         true ->
                             {ok, SelfDir};
                         false ->
-                            %% Roll back our move if enabling controllers failed
-                            %% (e.g. another process shares SelfDir), deleting
-                            %% `beam/` only if the rollback write succeeded.
-                            case file:write_file(filename:join(SelfDir, "cgroup.procs"), PidLine) of
-                                ok when Created =:= created ->
-                                    _ = file:del_dir(BeamDir);
-                                _ ->
-                                    ok
+                            %% Roll back every moved PID if enabling controllers
+                            %% failed (e.g. an unrelated process shares SelfDir),
+                            %% deleting `beam/` only when rollback succeeded.
+                            SelfProcs = filename:join(SelfDir, "cgroup.procs"),
+                            Restored = move_pids(Moved, SelfProcs),
+                            case length(Restored) =:= length(Moved)
+                                 andalso Created =:= created of
+                                true -> _ = file:del_dir(BeamDir);
+                                false -> ok
                             end,
                             {error, nil}
                     end;
-                _ ->
+                false ->
+                    SelfProcs = filename:join(SelfDir, "cgroup.procs"),
+                    _ = move_pids(Moved, SelfProcs),
                     case Created of
                         created -> _ = file:del_dir(BeamDir);
                         existed -> ok
@@ -364,6 +391,44 @@ prepare_delegated_parent(SelfDir) ->
                     {error, nil}
             end
     end.
+
+beam_tree_pids_in_cgroup(SelfDir, SelfPid) ->
+    Procs =
+        case file:read_file(filename:join(SelfDir, "cgroup.procs")) of
+            {ok, Bin} ->
+                string:lexemes(unicode:characters_to_list(Bin), " \t\r\n");
+            _ ->
+                [SelfPid]
+        end,
+    Owned =
+        [P || P <- Procs, P =:= SelfPid orelse proc_ppid(P) =:= SelfPid],
+    case lists:member(SelfPid, Owned) of
+        true -> Owned;
+        false -> [SelfPid | Owned]
+    end.
+
+proc_ppid(PidStr) ->
+    case file:read_file("/proc/" ++ PidStr ++ "/status") of
+        {ok, Bin} ->
+            Lines = binary:split(Bin, <<"\n">>, [global]),
+            find_ppid_line(Lines);
+        _ ->
+            ""
+    end.
+
+find_ppid_line([]) ->
+    "";
+find_ppid_line([<<"PPid:", Rest/binary>> | _]) ->
+    string:trim(unicode:characters_to_list(Rest));
+find_ppid_line([_ | T]) ->
+    find_ppid_line(T).
+
+move_pids(Pids, TargetProcsFile) ->
+    lists:filter(
+      fun(PidStr) ->
+          file:write_file(TargetProcsFile, PidStr ++ "\n") =:= ok
+      end,
+      Pids).
 
 %% Best-effort kill + removal of a transient sandbox cgroup. Writing "1"
 %% to `cgroup.kill` (Linux 5.14+) atomically SIGKILLs every task still in

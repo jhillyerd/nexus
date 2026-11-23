@@ -679,6 +679,11 @@ const default_passthrough_env = ["TZ", "SSL_CERT_FILE", "SSL_CERT_DIR"]
 const nono_nexus_profile_json =
   "{\"meta\":{\"name\":\"nexus\"},\"groups\":{\"exclude\":[\"system_write_linux\"]}}\n"
 
+/// Sentinel line emitted by the cgroup launcher when joining `cgroup.procs`
+/// fails before execing the sandbox wrapper, so `finish` surfaces it as a
+/// sandbox startup `Error` rather than command output data.
+const cgroup_join_failed_sentinel = "__nexus_cgroup_join_failed__"
+
 /// POSIX single-quote escaping for shell embedding (`'foo'\''bar'`).
 pub fn shell_single_quote(value: String) -> String {
   "'" <> string.replace(value, "'", "'\"'\"'") <> "'"
@@ -705,10 +710,10 @@ pub fn ensure_nono_state(state_dir: String) -> Result(Nil, String) {
   case simplifile.is_file(profile_path) {
     Ok(True) -> Ok(Nil)
     _ -> {
-      // Atomic write-then-rename so concurrent first-ever runs never observe
-      // a partially written profile file.
-      let tmp_path =
-        profile_path <> "." <> int.to_string(timing.now_us()) <> ".tmp"
+      // Atomic write-then-rename with a strictly unique BEAM integer so
+      // concurrent first-ever runs never collide on the same temp file or
+      // observe a partially written profile.
+      let tmp_path = profile_path <> "." <> ffi_unique_id() <> ".tmp"
       use _ <- result.try(
         simplifile.write(tmp_path, nono_nexus_profile_json)
         |> result.map_error(fn(e) {
@@ -838,18 +843,28 @@ fn build_bwrap_plan(
         }
         False -> #([], [])
       }
+      // Only add `/bin/sh` and `/usr/bin/env` symlinks when those mount
+      // prefixes are absent (the self-contained Nix `--tmpfs /` rootfs). On an
+      // FHS host where `/bin` and `/usr` are ro-bound, bwrap 0.9.0 refuses
+      // `--symlink` over existing files in read-only mounts.
       let tc_sh = filepath.join(tc, "bin/sh")
       let sh_target = case host.is_executable(tc_sh) {
         True -> tc_sh
         False -> tc_bash
       }
+      let sh_symlink = case has_nix_store || !host.path_exists("/bin") {
+        True -> ["--symlink", sh_target, "/bin/sh"]
+        False -> []
+      }
       let tc_env = filepath.join(tc, "bin/env")
-      let env_symlink = case host.is_executable(tc_env) {
+      let env_symlink = case
+        { has_nix_store || !host.path_exists("/usr") }
+        && host.is_executable(tc_env)
+      {
         True -> ["--symlink", tc_env, "/usr/bin/env"]
         False -> []
       }
-      let symlinks =
-        list.append(["--symlink", sh_target, "/bin/sh"], env_symlink)
+      let symlinks = list.append(sh_symlink, env_symlink)
       Ok(#(
         tc_bash,
         setsid,
@@ -1236,7 +1251,9 @@ fn wrap_with_cgroup(
   case host_sh {
     Ok(sh) -> #(sh, [
       "-c",
-      "printf '%d\\n' \"$$\" > \"$1/cgroup.procs\" && shift && exec \"$@\"",
+      "if printf '%d\\n' \"$$\" > \"$1/cgroup.procs\" 2>/dev/null; then shift && exec \"$@\"; else printf '"
+        <> cgroup_join_failed_sentinel
+        <> "\\n'; exit 125; fi",
       "_",
       cg_dir,
       exe,
@@ -1475,7 +1492,6 @@ fn run_spawn_plan(
                 deadline_us: deadline_us,
                 max_output_bytes: max_output_bytes,
                 kill_mode: plan.kill_mode,
-                os_pid: os_pid,
                 sandbox_backend: sandbox_backend,
                 watch: gate,
               ),
@@ -1486,11 +1502,11 @@ fn run_spawn_plan(
                 killed: False,
               ),
             )
-          // Whatever the outcome, the loop is done with the port: the
-          // watchdog stands down (it demonitors and exits) and any transient
-          // cgroup is killed and removed.
-          process.send(gate, WatchDone)
+          // Clean up any transient cgroup BEFORE standing down the watchdog:
+          // if the worker dies mid-cleanup, the still-armed watchdog finishes
+          // `cleanup_cgroup` on `OwnerDown`.
           cleanup_cgroup(cgroup_dir)
+          process.send(gate, WatchDone)
           outcome
         }
       }
@@ -1542,8 +1558,6 @@ type BashLoop {
     max_output_bytes: Int,
     /// Host-side kill discipline (see `KillMode`).
     kill_mode: KillMode,
-    /// Host OS PID of the direct port child (used under `KillPortOsPid`).
-    os_pid: Option(Int),
     /// Configured sandbox backend (used to surface silent wrapper failures).
     sandbox_backend: SandboxBackend,
     /// The owner-death watchdog's gate (see `watch`).
@@ -1725,9 +1739,18 @@ fn finish(
       )
     False -> {
       let output = render_output(state, max_output_bytes)
-      case code {
-        0 -> Ok(output)
-        n -> Ok("exit status " <> int.to_string(n) <> "\n" <> output)
+      case
+        sandbox_backend != SandboxNone
+        && code == 125
+        && state.marker == MarkerAbsent
+        && output == cgroup_join_failed_sentinel
+      {
+        True -> Error("bash: failed to join transient sandbox cgroup")
+        False ->
+          case code {
+            0 -> Ok(output)
+            n -> Ok("exit status " <> int.to_string(n) <> "\n" <> output)
+          }
       }
     }
   }
@@ -1802,12 +1825,15 @@ fn absorb(loop: BashLoop, state: BashState, bytes: BitArray) -> BashState {
 }
 
 /// Resolve the host kill target for the running loop.
+/// Under `KillPortOsPid`, re-query `port_os_pid` while the port is live so an
+/// already-exited launcher is not signaled via a stale cached PID.
 fn loop_kill_target(
   loop: BashLoop,
   marker: Marker,
 ) -> Result(ErlangKillTarget, Nil) {
   case loop.kill_mode {
-    KillPortOsPid -> target_kill(loop.os_pid, KillPortOsPid)
+    KillPortOsPid ->
+      target_kill(ffi_port_os_pid(loop.p) |> option.from_result, KillPortOsPid)
     KillGroup | KillPid ->
       case marker {
         MarkerLeader(n) -> target_kill(Some(n), loop.kill_mode)
@@ -2266,6 +2292,9 @@ fn ffi_is_executable(path: String) -> Bool
 
 @external(erlang, "nexus_env_ffi", "inherited_path")
 fn ffi_inherited_path() -> String
+
+@external(erlang, "nexus_env_ffi", "unique_id")
+fn ffi_unique_id() -> String
 
 @external(erlang, "nexus_env_ffi", "open_port")
 fn ffi_open_port(
