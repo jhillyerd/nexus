@@ -175,7 +175,7 @@ cgroup_create(MaxMemoryMb, MaxPids) ->
         case find_cgroup_parent() of
             {ok, Parent} ->
                 Id = integer_to_list(erlang:unique_integer([positive, monotonic])),
-                CgDir = filename:join(Parent, "ws-" ++ Id),
+                CgDir = filename:join(Parent, "ws-" ++ os:getpid() ++ "-" ++ Id),
                 case file:make_dir(CgDir) of
                     ok ->
                         MemBytes = integer_to_list(MaxMemoryMb * 1024 * 1024) ++ "\n",
@@ -209,13 +209,17 @@ find_cgroup_parent() ->
                 true -> {ok, Parent};
                 false -> prepare_cgroup_parent_serialized()
             end;
+        unavailable ->
+            {error, nil};
         undefined ->
             prepare_cgroup_parent_serialized()
     end.
 
 prepare_cgroup_parent_serialized() ->
+    %% Requester id MUST be per-process (`self()`), not `node()`, so concurrent
+    %% first-time callers on the same BEAM node are mutually excluded.
     global:trans(
-      {nexus_env_cgroup_prepare, node()},
+      {nexus_env_cgroup_prepare, self()},
       fun() ->
           case persistent_term:get(nexus_env_cgroup_parent, undefined) of
               {ok, Cached} ->
@@ -223,6 +227,8 @@ prepare_cgroup_parent_serialized() ->
                       true -> {ok, Cached};
                       false -> prepare_and_cache_parent()
                   end;
+              unavailable ->
+                  {error, nil};
               undefined ->
                   prepare_and_cache_parent()
           end
@@ -231,10 +237,14 @@ prepare_cgroup_parent_serialized() ->
 prepare_and_cache_parent() ->
     case find_cgroup_parent_uncached() of
         {ok, Parent} ->
-            sweep_stale_ws_cgroups(Parent),
+            sweep_empty_ws_cgroups(Parent),
             persistent_term:put(nexus_env_cgroup_parent, {ok, Parent}),
             {ok, Parent};
         {error, nil} ->
+            %% Cgroup delegation is fixed at service start; cache unavailability
+            %% so non-delegated hosts take no lock or filesystem probes on
+            %% subsequent bash calls.
+            persistent_term:put(nexus_env_cgroup_parent, unavailable),
             {error, nil}
     end.
 
@@ -259,7 +269,11 @@ find_cgroup_parent_uncached() ->
             {error, nil}
     end.
 
-sweep_stale_ws_cgroups(Parent) ->
+%% Best-effort once-per-boot cleanup of empty stale `ws-*` cgroup directories
+%% left by a prior crashed BEAM. Deliberately uses `file:del_dir/1` ONLY (never
+%% `cgroup.kill`): in Linux cgroupfs, `rmdir` succeeds strictly on empty
+%% cgroups and returns `ebusy` for any live sibling owned by another instance.
+sweep_empty_ws_cgroups(Parent) ->
     case file:list_dir(Parent) of
         {ok, Entries} ->
             lists:foreach(
@@ -268,7 +282,7 @@ sweep_stale_ws_cgroups(Parent) ->
                       true ->
                           CgDir = filename:join(Parent, Entry),
                           case filelib:is_dir(CgDir) of
-                              true -> cgroup_cleanup(unicode:characters_to_binary(CgDir));
+                              true -> _ = file:del_dir(CgDir);
                               false -> ok
                           end;
                       false -> ok

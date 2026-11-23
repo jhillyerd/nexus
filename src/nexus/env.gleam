@@ -1446,7 +1446,7 @@ fn run_spawn_plan(
       // the executor — receives on it).
       let gate_back = process.new_subject()
       let owner = process.self()
-      let _watchdog =
+      let watchdog =
         process.spawn_unlinked(fn() {
           let gate = process.new_subject()
           process.send(gate_back, gate)
@@ -1455,10 +1455,11 @@ fn run_spawn_plan(
         })
       // The watchdog's gate handshake, degraded honestly instead of
       // asserted (cubic PR review): a scheduler delay past the budget
-      // must answer the call, not crash the per-turn worker. Nothing
-      // ran yet, so closing the port and refusing is clean.
+      // must answer the call, not crash the per-turn worker. Kill the
+      // unlinked watchdog too so it cannot outlive the failed handshake.
       case process.receive(gate_back, 1000) {
         Error(Nil) -> {
+          process.kill(watchdog)
           ffi_kill_tree(p, target_kill(initial_watch_pid, plan.kill_mode))
           cleanup_cgroup(cgroup_dir)
           Error("bash: the kill watchdog failed to start")

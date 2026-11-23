@@ -1896,19 +1896,32 @@ pub fn sandbox_nono_fake_wrapper_env_and_reexport_test() {
   let _ = simplifile.delete(root <> "-bin")
 }
 
+type LoopbackSocket
+
+@external(erlang, "nexus_env_test_ffi", "listen_loopback")
+fn listen_loopback() -> Result(#(LoopbackSocket, Int), Nil)
+
+@external(erlang, "nexus_env_test_ffi", "close_socket")
+fn close_socket(socket: LoopbackSocket) -> Nil
+
 /// Verify `KillPortOsPid` (the `bwrap` PID-namespace kill path) kills the
 /// direct wrapper host PID on cancel, re-signals the one-shot cancel subject,
 /// and ignores an in-namespace marker PID (`2`) on the host.
 pub fn sandbox_bwrap_fake_wrapper_kill_port_os_pid_test() {
   let root = fresh_root()
   let fake_bwrap = root <> "-bin/fake-bwrap"
+  let uniq = int.to_string(timing.now_us())
+  let tag = "nxfakebw" <> uniq <> "q"
   // Emulate a PID-namespace wrapper printing in-namespace PID `2` as line 1,
-  // flushing output, and blocking until killed by its own host OS PID.
+  // flushing output, and blocking under a unique argv tag until killed by its
+  // own host OS PID (bash `exec -a` tags the process in `ps`).
   let script =
-    "#!/bin/sh\n"
+    "#!/usr/bin/env bash\n"
     <> "printf '2\\n'\n"
     <> "printf 'ready-in-fake-bwrap\\n'\n"
-    <> "exec sleep 30\n"
+    <> "exec -a "
+    <> tag
+    <> " sleep 30\n"
   write_executable_script(fake_bwrap, script)
 
   let sandbox =
@@ -1920,15 +1933,12 @@ pub fn sandbox_bwrap_fake_wrapper_kill_port_os_pid_test() {
       max_memory_mb: 1024,
       max_pids: 64,
     )
+  let handoff = process.new_subject()
   let reply = process.new_subject()
   let _worker =
     process.spawn_unlinked(fn() {
       let cancel = process.new_subject()
-      let _timer =
-        process.spawn_unlinked(fn() {
-          process.sleep(300)
-          process.send(cancel, Nil)
-        })
+      process.send(handoff, cancel)
       let res =
         env.bash_with_sandbox(
           timeout_ms: 30_000,
@@ -1941,7 +1951,13 @@ pub fn sandbox_bwrap_fake_wrapper_kill_port_os_pid_test() {
       let resignalled = process.receive(cancel, 1000)
       process.send(reply, #(res, resignalled))
     })
+  let assert Ok(cancel) = process.receive(handoff, 5000)
+  // Positive control: observe the tagged fake wrapper running before cancel.
+  poll_tag_present("nxfakebw" <> uniq <> "[q] 3[0]", 50)
+  process.send(cancel, Nil)
   let assert Ok(#(res, resignalled)) = process.receive(reply, 10_000)
+  // Confirm `KillPortOsPid` actually terminated the wrapper process.
+  poll_tag_gone("nxfakebw" <> uniq <> "[q]", 50)
   let _ = simplifile.delete(root)
   let _ = simplifile.delete(root <> "-bin")
 
@@ -2053,9 +2069,19 @@ fn run_real_bwrap_integration() -> Nil {
   let assert Ok(out3) = run(10_000, "cat /etc/shadow")
   string.starts_with(out3, "exit status") |> should_equal(True)
 
-  // 3. Offline netns blocks TCP loopback and UDP/DNS.
-  let assert Ok(out4) =
-    run(10_000, "bash -c 'exec 3<>/dev/tcp/127.0.0.1/5433' 2>&1; echo rc=$?")
+  // 3. Offline netns blocks TCP loopback (with a real local listener as
+  //    positive control so the check cannot pass vacuously).
+  let assert Ok(#(sock, port)) = listen_loopback()
+  let tcp_probe =
+    "bash -c 'exec 3<>/dev/tcp/127.0.0.1/"
+    <> int.to_string(port)
+    <> "' 2>&1; echo rc=$?"
+  let host_probe = bash(handle, 10_000, tcp_probe)
+  let sandbox_probe = run(10_000, tcp_probe)
+  close_socket(sock)
+  let assert Ok(host_out) = host_probe
+  string.contains(host_out, "rc=0") |> should_equal(True)
+  let assert Ok(out4) = sandbox_probe
   string.contains(out4, "rc=0") |> should_equal(False)
 
   // 4. Timeout reaps background children inside the PID namespace.
@@ -2150,9 +2176,19 @@ fn run_real_nono_integration() -> Nil {
   string.starts_with(out3, "exit status") |> should_equal(True)
   simplifile.is_file(host_tmp_probe) |> should_equal(Ok(False))
 
-  // 3. Offline --block-net blocks TCP loopback connect.
-  let assert Ok(out4) =
-    run(10_000, "bash -c 'exec 3<>/dev/tcp/127.0.0.1/5433' 2>&1; echo rc=$?")
+  // 3. Offline --block-net blocks TCP loopback connect (with a real local
+  //    listener as positive control).
+  let assert Ok(#(sock, port)) = listen_loopback()
+  let tcp_probe =
+    "bash -c 'exec 3<>/dev/tcp/127.0.0.1/"
+    <> int.to_string(port)
+    <> "' 2>&1; echo rc=$?"
+  let host_probe = bash(handle, 10_000, tcp_probe)
+  let sandbox_probe = run(10_000, tcp_probe)
+  close_socket(sock)
+  let assert Ok(host_out) = host_probe
+  string.contains(host_out, "rc=0") |> should_equal(True)
+  let assert Ok(out4) = sandbox_probe
   string.contains(out4, "rc=0") |> should_equal(False)
 
   // 4. Timeout reaps background children under nono (setsid group kill).

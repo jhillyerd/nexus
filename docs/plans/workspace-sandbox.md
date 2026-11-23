@@ -394,8 +394,10 @@ to keep threads self-contained even after bot edits/deletes, freeze
     `Delegate=cpu memory pids` so each sandboxed command runs inside a
     transient sub-cgroup (`memory.max`, `pids.max`).
   - Lightweight fallback when cgroup delegation isn't available:
-    `prlimit` for `RLIMIT_CPU` / `RLIMIT_FSIZE` / `RLIMIT_AS` (deliberately
-    NOT `RLIMIT_NPROC` when sharing UID with the BEAM).
+    `prlimit` for `RLIMIT_FSIZE` / `RLIMIT_AS` (deliberately NOT
+    `RLIMIT_NPROC` when sharing UID with the BEAM, and no `RLIMIT_CPU` so
+    multi-threaded workloads honor the port loop's wall-clock deadline;
+    `RLIMIT_FSIZE` also stays active alongside cgroups).
 - **NixOS module (`nixosModules.default` in `flake.nix`):**
   - `services.nexus.workspace.enable`
   - `services.nexus.workspace.sandbox` (`"nono"` | `"bwrap"` | `"none"`,
