@@ -101,7 +101,7 @@ pub fn init_starts_empty_test() {
   model.bubble |> should.equal(None)
   model.streaming |> should.be_false
   model.log |> should.equal([])
-  model.model_label |> should.equal("connecting…")
+  model.model_label |> should.equal("")
 }
 
 // ---------------------------------------------------------------------------
@@ -238,7 +238,7 @@ pub fn select_resets_log_and_streams_test() {
   model.log |> should.equal([])
   model.bubble |> should.equal(None)
   model.streaming |> should.be_false
-  model.model_label |> should.equal("connecting…")
+  model.model_label |> should.equal("")
 }
 
 /// Every fan-out delivery carries the emitting thread's id AND the
@@ -1396,8 +1396,10 @@ pub fn view_empty_transcript_note_test() {
 
 // ui-polish F8: the header's context span shows the selected thread's
 // title, not the bare model alias. The alias stays as the untitled
-// fallback (the row-title rule), and model_label's "connecting…" /
-// "thread ended" keep their roles while nothing is selected.
+// fallback (the row-title rule); with nothing selected the fallback
+// span is BLANK until there is something to say ("thread ended") — the
+// old "connecting…" placeholder claimed a connection state the conn
+// indicator already owns.
 pub fn view_header_shows_thread_title_test() {
   let titled =
     thread.ThreadSummary(..summary("s-1", False), title: "Renamed thread")
@@ -1421,9 +1423,11 @@ pub fn view_header_shows_thread_title_test() {
 }
 
 pub fn view_header_fallback_labels_test() {
-  // No selection yet: the boot label.
+  // No selection yet: the context span renders EMPTY — no placeholder
+  // text — while the span itself stays for the title to land in.
   let html = new_model() |> view_string
-  should.be_true(string.contains(html, "connecting…"))
+  should.be_true(string.contains(html, "id=\"model\""))
+  should.be_false(string.contains(html, "connecting…"))
   // Selection dropped (thread vanished): the terminal label.
   let html =
     new_model()
@@ -1701,7 +1705,9 @@ pub fn archived_selection_survives_refresh_test() {
   // `Archived` arm clears the selection itself — see
   // archive_of_selection_clears_selection_test.)
   model.selected |> should.equal(Some("s-1"))
-  model.model_label |> should.equal("connecting…")
+  // The fallback label is blank — a not-yet-resolved selection renders
+  // nothing, never a connection state.
+  model.model_label |> should.equal("")
 }
 
 pub fn all_archived_leaves_compose_new_test() {
@@ -5746,7 +5752,7 @@ pub fn threads_loaded_keeps_channel_selection_test() {
     ))
     |> step(ui.ThreadsLoaded([summary("s-parent", False)]))
   model.selected |> should.equal(Some("s-channel"))
-  model.model_label |> should.equal("connecting…")
+  model.model_label |> should.equal("")
   // Once the context is gone (the channel was deleted — CASCADE), the
   // next refresh drops the selection and the ordinary auto-select picks
   // a replacement; the dropped channel's pane state goes with it (the
