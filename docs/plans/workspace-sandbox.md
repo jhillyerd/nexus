@@ -1,8 +1,8 @@
 ---
 title: Nexus — local workspace sandboxing, lifecycle GC, and shared bot workspaces
-status: draft
+status: in-progress
 tags: [computing, self-hosting, local-llm, agents, gleam, beam, environments, security, nixos]
-updated: 2026-11-21
+updated: 2026-11-22
 ---
 
 # Workspace sandbox: isolate local bash, track and GC directories, support persistent bot workspaces
@@ -394,8 +394,13 @@ to keep threads self-contained even after bot edits/deletes, freeze
     `Delegate=cpu memory pids` so each sandboxed command runs inside a
     transient sub-cgroup (`memory.max`, `pids.max`).
   - Lightweight fallback when cgroup delegation isn't available:
-    `prlimit` for `RLIMIT_CPU` / `RLIMIT_FSIZE` / `RLIMIT_AS` (deliberately
-    NOT `RLIMIT_NPROC` when sharing UID with the BEAM).
+    `prlimit` (when resolved on `PATH` or in the toolchain) for
+    `RLIMIT_FSIZE` / `RLIMIT_AS` (deliberately NOT `RLIMIT_NPROC` when
+    sharing UID with the BEAM, and no `RLIMIT_CPU` so multi-threaded
+    workloads honor the port loop's wall-clock deadline; `RLIMIT_FSIZE`
+    also stays active alongside cgroups when `prlimit` is available). If
+    `prlimit` is unavailable, both `RLIMIT_FSIZE` and the `RLIMIT_AS`
+    fallback are omitted; without cgroup delegation, no PID cap applies.
 - **NixOS module (`nixosModules.default` in `flake.nix`):**
   - `services.nexus.workspace.enable`
   - `services.nexus.workspace.sandbox` (`"nono"` | `"bwrap"` | `"none"`,
@@ -412,13 +417,13 @@ to keep threads self-contained even after bot edits/deletes, freeze
 
 ## Phased rollout
 
-### Phase 0 — Spike (`nono` vs `bwrap`)
+### Phase 0 — Spike (`nono` vs `bwrap`) *(shipped)*
 - Run the 6-item spike checklist on NixOS, record latency, UDP/DNS
   blocking, kill-tree behavior, and `/tmp` ergonomics.
 - Decide primary backend (and whether to keep both behind a small
   `Sandbox` config enum).
 
-### Phase 1 — `workspace` table + crash-safe GC + per-thread `/tmp`
+### Phase 1 — `workspace` table + crash-safe GC + per-thread `/tmp` *(shipped)*
 - Schema additions (`workspace`, `thread.workspace_id`,
   `thread.tmp_workspace_id`, backfill for existing `thread.workspace_root`
   rows) + Squirrel regen (`gleam run -m squirrel`).
@@ -430,18 +435,40 @@ to keep threads self-contained even after bot edits/deletes, freeze
 - Wire `TMPDIR` to the per-thread `tmp` directory even before sandboxing
   lands.
 
-### Phase 2 — Sandbox execution wrapper + resource caps
-- Add sandbox config in `src/nexus/config.gleam` (`NEXUS_WORKSPACE_SANDBOX`,
-  toolchain profile path, cgroup/rlimit caps).
-- Integrate the chosen Phase 0 wrapper into `bash_workspace` in
-  `src/nexus/env.gleam` + `src/nexus_env_ffi.erl`, preserving:
-  - allowlist env scrub (`sandbox_env/1`),
-  - first-line PID marker / cancel / timeout / partial output,
-  - byte-capped streaming read,
-  - offline `gleam test` (unsandboxed fallback + sandbox integration
-    tests gated on an explicit opt-in env var, never binary-on-PATH
-    detection, so the default suite stays deterministic and offline).
-- Bind-mount or wire per-thread `/tmp` per Phase 0 decision.
+### Phase 2 — Sandbox execution wrapper + resource caps *(shipped)*
+- Config in `src/nexus/config.gleam` (`NEXUS_WORKSPACE_SANDBOX`,
+  `NEXUS_WORKSPACE_SANDBOX_BIN`, `NEXUS_WORKSPACE_TOOLCHAIN`,
+  `NEXUS_WORKSPACE_STATE_DIR`, `NEXUS_WORKSPACE_MAX_MEMORY_MB`,
+  `NEXUS_WORKSPACE_MAX_PIDS`).
+- Pluggable wrapper in `src/nexus/env.gleam` (`build_spawn_plan`,
+  `bash_with_sandbox`) + `src/nexus_env_ffi.erl` + `src/nexus/tools.gleam`:
+  - `SandboxBwrap`: `--tmpfs /`, read-only `/nix/store` + toolchain `/etc/ssl`
+    + `/bin/sh` & `/usr/bin/env` symlinks (or safe read-only FHS subset when
+    no toolchain is set), `--dev /dev`, `--proc /proc`, `--bind <ws> /workspace`,
+    `--bind <tmp> /tmp` (`--tmpfs /tmp` for legacy rows without `tmp_rel_path`),
+    `--unshare-net --unshare-pid --die-with-parent`, and `KillPortOsPid`
+    (queries host `os_pid` immediately on spawn, arms the watchdog from
+    instant zero, and kills the host `bwrap` process so `--die-with-parent`
+    reaps the PID namespace without targeting the in-namespace marker PID).
+  - `SandboxNono`: honors the Phase 0 embedding contract (`HOME`/`XDG_*`
+    redirected into `workspace_state_dir`, lazy atomic write of
+    `config/nono/profiles/nexus.json` excluding `system_write_linux`, bash
+    prelude re-exporting `HOME`/`TMPDIR` and unsetting `XDG_*`, and surfacing
+    silent `-s` non-zero wrapper exits before the PID marker as tool errors).
+  - Resource caps: transient Linux cgroup v2 sub-cgroup (`memory.max`,
+    best-effort `memory.swap.max=0`, `pids.max`, `cgroup.kill` + `rmdir`
+    cleanup, serialized one-time BEAM + `erl_child_setup` rehoming into a
+    `beam/` leaf with dead-owner-only stale `ws-*` sweep) plus
+    `prlimit --fsize` (256 MiB single-file disk cap) on both paths when
+    `prlimit` is available, adding `prlimit --as` as the memory fallback
+    when cgroup delegation is unavailable (omitted if `prlimit` cannot be
+    resolved; no PID cap without cgroup delegation; deliberately no
+    `--nproc` on a shared UID and no `--cpu` so parallel workloads run up
+    to the port loop's real wall-clock deadline; outside `bwrap`, inside
+    `nono`).
+  - Offline `gleam test` pins pure spawn planning + fake-wrapper end-to-end
+    port/kill/env/silent-exit tests; real `bwrap`/`nono` integration tests
+    are gated strictly on `NEXUS_TEST_BWRAP=1` / `NEXUS_TEST_NONO=1`.
 
 ### Phase 3 — Per-bot policies: network tiers + Option B bot-shared workspace
 - Schema additions on `bot` (`workspace_mode`, `workspace_net`,

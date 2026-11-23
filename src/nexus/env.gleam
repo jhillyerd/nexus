@@ -590,18 +590,766 @@ type BashState {
   )
 }
 
-/// Run one bash command in the routed environment's working directory.
+// ---------------------------------------------------------------------------
+// Sandbox configuration & spawn planning (workspace-sandbox plan, Phase 2)
+// ---------------------------------------------------------------------------
+
+/// Local workspace `bash` sandbox backend (mirrors `config.WorkspaceSandbox`
+/// so this leaf module stays independent of `nexus/config`).
+pub type SandboxBackend {
+  SandboxNone
+  SandboxBwrap
+  SandboxNono
+}
+
+/// Execution-time sandbox & resource-cap parameters for local workspace `bash`.
+pub type SandboxConfig {
+  SandboxConfig(
+    backend: SandboxBackend,
+    sandbox_bin: Option(String),
+    toolchain: Option(String),
+    state_dir: Option(String),
+    max_memory_mb: Int,
+    max_pids: Int,
+  )
+}
+
+/// Unsandboxed default matching Phase 1 / offline tests / TUI remote nodes.
+pub fn default_sandbox() -> SandboxConfig {
+  SandboxConfig(
+    backend: SandboxNone,
+    sandbox_bin: None,
+    toolchain: None,
+    state_dir: None,
+    max_memory_mb: 1024,
+    max_pids: 64,
+  )
+}
+
+/// How the BEAM kills a bash process tree on cancel, timeout, output cap, or
+/// owner death:
+/// - `KillGroup`: host PID namespace under `setsid`; marker PID is a host pgid.
+/// - `KillPid`: host PID namespace without `setsid`; marker PID is the direct
+///   child's host PID.
+/// - `KillPortOsPid`: inside a PID namespace (`bwrap --unshare-pid`); the
+///   stdout marker PID is in-namespace (e.g. `2`), so host-side `kill` MUST
+///   NOT target it (Phase 0 spike amendment). Instead, kill the port's direct
+///   host OS PID (`bwrap` itself) + `port_close`, letting `--die-with-parent`
+///   reap the entire PID namespace atomically.
+pub type KillMode {
+  KillGroup
+  KillPid
+  KillPortOsPid
+}
+
+/// Pure, inspectable spawn specification built by `build_spawn_plan`.
+pub type SpawnPlan {
+  SpawnPlan(
+    exe: String,
+    argv: List(String),
+    allow_env: List(#(String, String)),
+    passthrough_env: List(String),
+    kill_mode: KillMode,
+  )
+}
+
+/// Host filesystem & PATH probes injected into `build_spawn_plan` so offline
+/// unit tests can pin NixOS, FHS, cgroup, and `prlimit` spawn plans without
+/// requiring `bwrap` or `nono` on the test machine.
+pub type HostProbe {
+  HostProbe(
+    resolve: fn(String) -> Result(String, Nil),
+    is_executable: fn(String) -> Bool,
+    path_exists: fn(String) -> Bool,
+    is_dir: fn(String) -> Bool,
+    inherited_path: String,
+    cgroup_dir: Option(String),
+  )
+}
+
+/// Single-file write limit under `prlimit` fallback (256 MiB): large enough
+/// for datasets/SQLite/builds while preventing runaway disk writes.
+const prlimit_fsize_bytes = 268_435_456
+
+const default_passthrough_env = ["TZ", "SSL_CERT_FILE", "SSL_CERT_DIR"]
+
+/// The `nono` profile written lazily into `<state_dir>/config/nono/profiles/`
+/// (Phase 0 spike §5): excludes `system_write_linux` so hardcoded host `/tmp`
+/// writes fail closed (`EACCES`) instead of leaking into shared host `/tmp`.
+const nono_nexus_profile_json =
+  "{\"meta\":{\"name\":\"nexus\"},\"groups\":{\"exclude\":[\"system_write_linux\"]}}\n"
+
+/// Sentinel line emitted by the cgroup launcher when joining `cgroup.procs`
+/// fails before execing the sandbox wrapper, so `finish` surfaces it as a
+/// sandbox startup `Error` rather than command output data.
+const cgroup_join_failed_sentinel = "__nexus_cgroup_join_failed__"
+
+/// POSIX single-quote escaping for shell embedding (`'foo'\''bar'`).
+pub fn shell_single_quote(value: String) -> String {
+  "'" <> string.replace(value, "'", "'\"'\"'") <> "'"
+}
+
+/// Lazily prepare `<state_dir>` subdirectories and the `nexus` profile for
+/// `nono` (Phase 0 embedding contract).
+pub fn ensure_nono_state(state_dir: String) -> Result(Nil, String) {
+  let subdirs = [
+    filepath.join(state_dir, "state"),
+    filepath.join(state_dir, "cache"),
+    filepath.join(state_dir, "config/nono/profiles"),
+    filepath.join(state_dir, "data"),
+  ]
+  use _ <- result.try(
+    list.try_each(subdirs, fn(dir) {
+      simplifile.create_directory_all(dir)
+      |> result.map_error(fn(e) {
+        "bash: nono state dir unavailable: " <> simplifile.describe_error(e)
+      })
+    }),
+  )
+  let profile_path = filepath.join(state_dir, "config/nono/profiles/nexus.json")
+  case simplifile.is_file(profile_path) {
+    Ok(True) -> Ok(Nil)
+    _ -> {
+      // Atomic write-then-rename with a strictly unique BEAM integer so
+      // concurrent first-ever runs never collide on the same temp file or
+      // observe a partially written profile.
+      let tmp_path = profile_path <> "." <> ffi_unique_id() <> ".tmp"
+      use _ <- result.try(
+        simplifile.write(tmp_path, nono_nexus_profile_json)
+        |> result.map_error(fn(e) {
+          "bash: failed to write nono profile: " <> simplifile.describe_error(e)
+        }),
+      )
+      case simplifile.rename(at: tmp_path, to: profile_path) {
+        Ok(Nil) -> Ok(Nil)
+        Error(e) -> {
+          let _ = simplifile.delete(tmp_path)
+          Error(
+            "bash: failed to install nono profile: "
+            <> simplifile.describe_error(e),
+          )
+        }
+      }
+    }
+  }
+}
+
+/// Build the exact command, arguments, scrubbed environment, and kill mode
+/// for one local workspace `bash` invocation.
+pub fn build_spawn_plan(
+  sandbox sandbox: SandboxConfig,
+  host host: HostProbe,
+  workspace_dir ws_dir: String,
+  tmp_dir tmp_dir: Option(String),
+  command command: String,
+) -> Result(SpawnPlan, String) {
+  case sandbox.backend {
+    SandboxNone -> build_unsandboxed_plan(host, ws_dir, tmp_dir, command)
+    SandboxBwrap -> build_bwrap_plan(sandbox, host, ws_dir, tmp_dir, command)
+    SandboxNono -> build_nono_plan(sandbox, host, ws_dir, tmp_dir, command)
+  }
+}
+
+fn build_unsandboxed_plan(
+  host: HostProbe,
+  ws_dir: String,
+  tmp_dir: Option(String),
+  command: String,
+) -> Result(SpawnPlan, String) {
+  use bash_path <- result.try(case host.resolve("bash") {
+    Ok(path) -> Ok(path)
+    Error(_) -> Error("bash: no bash executable found on PATH")
+  })
+  let setsid = host.resolve("setsid")
+  let #(exe, argv, kill_mode) = build_bash_inner(bash_path, setsid, "", command)
+  let tmp_entry = case tmp_dir {
+    Some(dir) -> [#("TMPDIR", dir)]
+    None -> []
+  }
+  Ok(SpawnPlan(
+    exe: exe,
+    argv: argv,
+    allow_env: [#("HOME", ws_dir), #("PATH", host.inherited_path), ..tmp_entry],
+    passthrough_env: default_passthrough_env,
+    kill_mode: kill_mode,
+  ))
+}
+
+fn build_bwrap_plan(
+  sandbox: SandboxConfig,
+  host: HostProbe,
+  ws_dir: String,
+  tmp_dir: Option(String),
+  command: String,
+) -> Result(SpawnPlan, String) {
+  use bwrap_bin <- result.try(resolve_sandbox_binary(
+    "bwrap",
+    sandbox.sandbox_bin,
+    host,
+  ))
+  let has_nix_store = host.is_dir("/nix/store")
+  use
+    #(
+      inner_bash,
+      inner_setsid,
+      inner_path,
+      ro_binds,
+      ssl_bind,
+      symlinks,
+      ssl_env,
+    )
+  <- result.try(case sandbox.toolchain {
+    Some(tc) -> {
+      let tc_bash = filepath.join(tc, "bin/bash")
+      use Nil <- result.try(case host.is_executable(tc_bash) {
+        True -> Ok(Nil)
+        False ->
+          Error(
+            "bash: workspace toolchain missing executable bash: " <> tc_bash,
+          )
+      })
+      let tc_setsid = filepath.join(tc, "bin/setsid")
+      let setsid = case host.is_executable(tc_setsid) {
+        True -> Ok(tc_setsid)
+        False -> Error(Nil)
+      }
+      let store_binds = case has_nix_store {
+        True ->
+          case string.starts_with(tc, "/nix/store/") {
+            True -> ["--ro-bind", "/nix/store", "/nix/store"]
+            False -> [
+              "--ro-bind",
+              "/nix/store",
+              "/nix/store",
+              "--ro-bind",
+              tc,
+              tc,
+            ]
+          }
+        False -> list.append(["--ro-bind", tc, tc], fhs_ro_binds(host))
+      }
+      let tc_ssl_dir = filepath.join(tc, "etc/ssl")
+      let #(ssl_bind, ssl_env) = case host.is_dir(tc_ssl_dir) {
+        True -> {
+          let ca_bundle = filepath.join(tc_ssl_dir, "certs/ca-bundle.crt")
+          let env_entries = case host.path_exists(ca_bundle) {
+            True -> [
+              #("SSL_CERT_FILE", "/etc/ssl/certs/ca-bundle.crt"),
+              #("SSL_CERT_DIR", "/etc/ssl/certs"),
+            ]
+            False -> []
+          }
+          #(["--ro-bind", tc_ssl_dir, "/etc/ssl"], env_entries)
+        }
+        False -> #([], [])
+      }
+      // Only add `/bin/sh` and `/usr/bin/env` symlinks when those mount
+      // prefixes are absent (the self-contained Nix `--tmpfs /` rootfs). On an
+      // FHS host where `/bin` and `/usr` are ro-bound, bwrap 0.9.0 refuses
+      // `--symlink` over existing files in read-only mounts.
+      let tc_sh = filepath.join(tc, "bin/sh")
+      let sh_target = case host.is_executable(tc_sh) {
+        True -> tc_sh
+        False -> tc_bash
+      }
+      let sh_symlink = case has_nix_store || !host.path_exists("/bin") {
+        True -> ["--symlink", sh_target, "/bin/sh"]
+        False -> []
+      }
+      let tc_env = filepath.join(tc, "bin/env")
+      let env_symlink = case
+        { has_nix_store || !host.path_exists("/usr") }
+        && host.is_executable(tc_env)
+      {
+        True -> ["--symlink", tc_env, "/usr/bin/env"]
+        False -> []
+      }
+      let symlinks = list.append(sh_symlink, env_symlink)
+      Ok(#(
+        tc_bash,
+        setsid,
+        filepath.join(tc, "bin"),
+        store_binds,
+        ssl_bind,
+        symlinks,
+        ssl_env,
+      ))
+    }
+    None -> {
+      use bash_path <- result.try(case host.resolve("bash") {
+        Ok(path) -> Ok(path)
+        Error(_) -> Error("bash: no bash executable found on PATH")
+      })
+      // On NixOS without an explicit `NEXUS_WORKSPACE_TOOLCHAIN`, system
+      // binaries live under `/run/current-system/sw/bin` (symlinks into
+      // `/nix/store`). Mount only `/run/current-system/sw` (immutable profile),
+      // never `/run` or `/run/secrets`.
+      let nix_prefixes = case has_nix_store {
+        True ->
+          case host.is_dir("/run/current-system/sw") {
+            True -> ["/nix/store", "/run/current-system/sw"]
+            False -> ["/nix/store"]
+          }
+        False -> []
+      }
+      let mounted_prefixes = list.append(nix_prefixes, existing_fhs_paths(host))
+      use Nil <- result.try(case path_under_any(bash_path, mounted_prefixes) {
+        True -> Ok(Nil)
+        False ->
+          Error(
+            "bash: resolved bash ("
+            <> bash_path
+            <> ") is outside the bwrap read-only mount set; set"
+            <> " NEXUS_WORKSPACE_TOOLCHAIN",
+          )
+      })
+      let setsid = case host.resolve("setsid") {
+        Ok(p) ->
+          case path_under_any(p, mounted_prefixes) {
+            True -> Ok(p)
+            False -> Error(Nil)
+          }
+        Error(_) -> Error(Nil)
+      }
+      let filtered_path =
+        filter_mounted_path(
+          host.inherited_path,
+          mounted_prefixes,
+          filepath.directory_name(bash_path),
+        )
+      let ro_binds =
+        list.flat_map(mounted_prefixes, fn(p) { ["--ro-bind", p, p] })
+      Ok(#(bash_path, setsid, filtered_path, ro_binds, [], [], []))
+    }
+  })
+  let #(inner_exe, inner_argv, _inner_kill) =
+    build_bash_inner(inner_bash, inner_setsid, "", command)
+  let tmp_bind = case tmp_dir {
+    Some(dir) -> ["--bind", dir, "/tmp"]
+    None -> ["--tmpfs", "/tmp"]
+  }
+  let bwrap_argv =
+    list.flatten([
+      ["--tmpfs", "/"],
+      ro_binds,
+      ["--dev", "/dev", "--proc", "/proc"],
+      ssl_bind,
+      symlinks,
+      ["--bind", ws_dir, "/workspace", "--chdir", "/workspace"],
+      tmp_bind,
+      ["--unshare-net", "--unshare-pid", "--die-with-parent", "--", inner_exe],
+      inner_argv,
+    ])
+  // Under delegated cgroup v2, memory and PID caps ride the cgroup while
+  // `prlimit --fsize` keeps the 256 MiB single-file disk cap active (cgroup v2
+  // has no fsize equivalent). Without cgroup delegation, `prlimit` also adds
+  // `--as` (virtual memory fallback). Wall-clock time is enforced by the port
+  // loop, so `--cpu` (summed across threads) is deliberately omitted.
+  let #(capped_exe, capped_argv) = case
+    host.cgroup_dir,
+    host.resolve("prlimit")
+  {
+    Some(_), Ok(prlimit_bin) -> #(
+      prlimit_bin,
+      list.flatten([prlimit_fsize_args(), [bwrap_bin], bwrap_argv]),
+    )
+    None, Ok(prlimit_bin) -> #(
+      prlimit_bin,
+      list.flatten([prlimit_fallback_args(sandbox), [bwrap_bin], bwrap_argv]),
+    )
+    _, Error(_) -> #(bwrap_bin, bwrap_argv)
+  }
+  let #(final_exe, final_argv) = case host.cgroup_dir {
+    Some(cg_dir) ->
+      wrap_with_cgroup(host, sandbox.toolchain, cg_dir, capped_exe, capped_argv)
+    None -> #(capped_exe, capped_argv)
+  }
+  Ok(SpawnPlan(
+    exe: final_exe,
+    argv: final_argv,
+    allow_env: list.append(
+      [#("HOME", "/workspace"), #("TMPDIR", "/tmp"), #("PATH", inner_path)],
+      ssl_env,
+    ),
+    passthrough_env: default_passthrough_env,
+    kill_mode: KillPortOsPid,
+  ))
+}
+
+fn build_nono_plan(
+  sandbox: SandboxConfig,
+  host: HostProbe,
+  ws_dir: String,
+  tmp_dir: Option(String),
+  command: String,
+) -> Result(SpawnPlan, String) {
+  use state_dir <- result.try(case sandbox.state_dir {
+    Some(dir) -> Ok(dir)
+    None -> Error("bash: nono sandbox requires workspace_state_dir")
+  })
+  use nono_bin <- result.try(resolve_sandbox_binary(
+    "nono",
+    sandbox.sandbox_bin,
+    host,
+  ))
+  use #(inner_bash, inner_setsid, inner_path) <- result.try(
+    case sandbox.toolchain {
+      Some(tc) -> {
+        let tc_bash = filepath.join(tc, "bin/bash")
+        use Nil <- result.try(case host.is_executable(tc_bash) {
+          True -> Ok(Nil)
+          False ->
+            Error(
+              "bash: workspace toolchain missing executable bash: " <> tc_bash,
+            )
+        })
+        let tc_setsid = filepath.join(tc, "bin/setsid")
+        let setsid = case host.is_executable(tc_setsid) {
+          True -> Ok(tc_setsid)
+          False -> host.resolve("setsid")
+        }
+        Ok(#(tc_bash, setsid, filepath.join(tc, "bin")))
+      }
+      None -> {
+        use bash_path <- result.try(case host.resolve("bash") {
+          Ok(path) -> Ok(path)
+          Error(_) -> Error("bash: no bash executable found on PATH")
+        })
+        Ok(#(bash_path, host.resolve("setsid"), host.inherited_path))
+      }
+    },
+  )
+  // Phase 0 embedding contract: nono itself runs with HOME/XDG_* pointing at
+  // `state_dir` (outside all grants), and the bash prelude immediately
+  // re-exports HOME/TMPDIR and unsets XDG_* as its first silent statement.
+  let tmp_export = case tmp_dir {
+    Some(dir) -> "export TMPDIR=" <> shell_single_quote(dir) <> "; "
+    None -> "unset TMPDIR; "
+  }
+  let prelude_prefix =
+    "export HOME="
+    <> shell_single_quote(ws_dir)
+    <> "; unset XDG_STATE_HOME XDG_CACHE_HOME XDG_CONFIG_HOME XDG_DATA_HOME; "
+    <> tmp_export
+  let #(inner_exe, inner_argv, kill_mode) =
+    build_bash_inner(inner_bash, inner_setsid, prelude_prefix, command)
+  // Apply `prlimit` INSIDE `nono` (after `--`) so `RLIMIT_AS` caps the user
+  // command rather than nono's own Rust runtime; under cgroup delegation keep
+  // `prlimit --fsize` so the 256 MiB single-file disk cap stays uniform.
+  let inner_cmd = case
+    host.cgroup_dir,
+    resolve_inner_prlimit(sandbox.toolchain, host)
+  {
+    Some(_), Ok(prlimit_bin) ->
+      list.flatten([
+        [prlimit_bin],
+        prlimit_fsize_args(),
+        [inner_exe],
+        inner_argv,
+      ])
+    None, Ok(prlimit_bin) ->
+      list.flatten([
+        [prlimit_bin],
+        prlimit_fallback_args(sandbox),
+        [inner_exe],
+        inner_argv,
+      ])
+    _, Error(_) -> [inner_exe, ..inner_argv]
+  }
+  let tmp_grant = case tmp_dir {
+    Some(dir) -> ["--allow", dir]
+    None -> []
+  }
+  let nix_grant = case host.is_dir("/nix/store") {
+    True -> ["--read", "/nix/store"]
+    False -> []
+  }
+  let tc_grant = case sandbox.toolchain {
+    Some(tc) ->
+      case host.is_dir("/nix/store") && string.starts_with(tc, "/nix/store/") {
+        True -> []
+        False -> ["--read", tc]
+      }
+    None -> []
+  }
+  let nono_argv =
+    list.flatten([
+      [
+        "wrap",
+        "-s",
+        "--block-net",
+        "--allow-cwd",
+        "-p",
+        "nexus",
+        "--allow-file",
+        "/dev/null",
+        "--allow-file",
+        "/dev/zero",
+        "--allow-file",
+        "/dev/full",
+        "--allow",
+        ws_dir,
+      ],
+      tmp_grant,
+      nix_grant,
+      tc_grant,
+      ["--"],
+      inner_cmd,
+    ])
+  let #(final_exe, final_argv) = case host.cgroup_dir {
+    Some(cg_dir) ->
+      wrap_with_cgroup(host, sandbox.toolchain, cg_dir, nono_bin, nono_argv)
+    None -> #(nono_bin, nono_argv)
+  }
+  Ok(SpawnPlan(
+    exe: final_exe,
+    argv: final_argv,
+    allow_env: [
+      #("HOME", state_dir),
+      #("XDG_STATE_HOME", filepath.join(state_dir, "state")),
+      #("XDG_CACHE_HOME", filepath.join(state_dir, "cache")),
+      #("XDG_CONFIG_HOME", filepath.join(state_dir, "config")),
+      #("XDG_DATA_HOME", filepath.join(state_dir, "data")),
+      #("PATH", inner_path),
+    ],
+    passthrough_env: default_passthrough_env,
+    kill_mode: kill_mode,
+  ))
+}
+
+fn resolve_sandbox_binary(
+  name: String,
+  explicit: Option(String),
+  host: HostProbe,
+) -> Result(String, String) {
+  case explicit {
+    Some(path) ->
+      case host.is_executable(path) {
+        True -> Ok(path)
+        False ->
+          Error(
+            "bash: " <> name <> " binary not found or not executable: " <> path,
+          )
+      }
+    None ->
+      case host.resolve(name) {
+        Ok(path) -> Ok(path)
+        Error(_) ->
+          Error(
+            "bash: "
+            <> name
+            <> " sandbox configured but no "
+            <> name
+            <> " executable found on PATH",
+          )
+      }
+  }
+}
+
+fn resolve_inner_prlimit(
+  toolchain: Option(String),
+  host: HostProbe,
+) -> Result(String, Nil) {
+  case toolchain {
+    Some(tc) -> {
+      let tc_prlimit = filepath.join(tc, "bin/prlimit")
+      case host.is_executable(tc_prlimit) {
+        True -> Ok(tc_prlimit)
+        False -> host.resolve("prlimit")
+      }
+    }
+    None -> host.resolve("prlimit")
+  }
+}
+
+/// Safe read-only FHS host mounts for `bwrap` when no self-contained Nix
+/// toolchain is active. Deliberately omits `/etc` as a whole (no `/etc/shadow`
+/// or host secrets), `/home`, `/root`, `/run`, and `/var`.
+fn existing_fhs_paths(host: HostProbe) -> List(String) {
+  [
+    "/usr",
+    "/bin",
+    "/lib",
+    "/lib64",
+    "/lib32",
+    "/etc/ssl",
+    "/etc/ca-certificates",
+    "/etc/alternatives",
+    "/etc/ld.so.cache",
+  ]
+  |> list.filter(host.path_exists)
+}
+
+fn fhs_ro_binds(host: HostProbe) -> List(String) {
+  existing_fhs_paths(host)
+  |> list.flat_map(fn(path) { ["--ro-bind", path, path] })
+}
+
+fn path_under_any(path: String, prefixes: List(String)) -> Bool {
+  let clean = normalize(path)
+  list.any(prefixes, fn(prefix) {
+    let p = normalize(prefix)
+    clean == p || string.starts_with(clean, p <> "/")
+  })
+}
+
+fn filter_mounted_path(
+  inherited_path: String,
+  mounted_prefixes: List(String),
+  fallback_dir: String,
+) -> String {
+  let kept =
+    inherited_path
+    |> string.split(":")
+    |> list.filter(fn(entry) {
+      entry != "" && path_under_any(entry, mounted_prefixes)
+    })
+  case kept {
+    [] -> fallback_dir
+    _ -> string.join(kept, ":")
+  }
+}
+
+fn prlimit_fsize_args() -> List(String) {
+  ["--fsize=" <> int.to_string(prlimit_fsize_bytes), "--"]
+}
+
+fn prlimit_fallback_args(sandbox: SandboxConfig) -> List(String) {
+  let mem_bytes = sandbox.max_memory_mb * 1024 * 1024
+  [
+    "--as=" <> int.to_string(mem_bytes),
+    "--fsize=" <> int.to_string(prlimit_fsize_bytes),
+    "--",
+  ]
+}
+
+fn wrap_with_cgroup(
+  host: HostProbe,
+  toolchain: Option(String),
+  cg_dir: String,
+  exe: String,
+  argv: List(String),
+) -> #(String, List(String)) {
+  let host_sh = case host.resolve("bash") {
+    Ok(p) -> Ok(p)
+    Error(_) ->
+      case host.resolve("sh") {
+        Ok(p) -> Ok(p)
+        Error(_) ->
+          case toolchain {
+            Some(tc) -> {
+              let tc_bash = filepath.join(tc, "bin/bash")
+              case host.is_executable(tc_bash) {
+                True -> Ok(tc_bash)
+                False -> Error(Nil)
+              }
+            }
+            None -> Error(Nil)
+          }
+      }
+  }
+  case host_sh {
+    Ok(sh) -> #(sh, [
+      "-c",
+      "if printf '%d\\n' \"$$\" > \"$1/cgroup.procs\" 2>/dev/null; then shift && exec \"$@\"; else printf '"
+        <> cgroup_join_failed_sentinel
+        <> "\\n'; exit 125; fi",
+      "_",
+      cg_dir,
+      exe,
+      ..argv
+    ])
+    Error(_) -> #(exe, argv)
+  }
+}
+
+/// Build the inner `[setsid -w] bash -c "<prelude><command>"` invocation
+/// carrying the first-line PID marker and the owner-death stdin-EOF sentinel.
+fn build_bash_inner(
+  bash_path: String,
+  setsid: Result(String, Nil),
+  prelude_prefix: String,
+  command: String,
+) -> #(String, List(String), KillMode) {
+  let sentinel_kill = case setsid {
+    Ok(_) -> "kill -9 -- -$$"
+    Error(_) -> "kill -9 $$"
+  }
+  let prelude =
+    prelude_prefix
+    <> "printf '%d\\n' $$; exec 3<&0 0</dev/null; "
+    <> "(while read -r _line <&3; do :; done; kill -0 $$ 2>/dev/null && "
+    <> sentinel_kill
+    <> ") >/dev/null 2>&1 & "
+  case setsid {
+    Ok(setsid_path) -> #(
+      setsid_path,
+      ["-w", bash_path, "-c", prelude <> command],
+      KillGroup,
+    )
+    Error(_) -> #(bash_path, ["-c", prelude <> command], KillPid)
+  }
+}
+
+fn sandbox_backend_name(backend: SandboxBackend) -> String {
+  case backend {
+    SandboxNone -> "none"
+    SandboxBwrap -> "bwrap"
+    SandboxNono -> "nono"
+  }
+}
+
+fn live_host_probe(cgroup_dir: Option(String)) -> HostProbe {
+  HostProbe(
+    resolve: ffi_resolve,
+    is_executable: ffi_is_executable,
+    path_exists: fn(path) { simplifile.file_info(path) |> result.is_ok },
+    is_dir: fn(path) { simplifile.is_directory(path) == Ok(True) },
+    inherited_path: ffi_inherited_path(),
+    cgroup_dir: cgroup_dir,
+  )
+}
+
+fn cleanup_cgroup(cgroup_dir: Option(String)) -> Nil {
+  case cgroup_dir {
+    Some(dir) -> ffi_cgroup_cleanup(dir)
+    None -> Nil
+  }
+}
+
+/// Run one bash command in the routed environment's working directory using
+/// the unsandboxed default posture (`default_sandbox()`).
+pub fn bash(
+  timeout_ms timeout_ms: Int,
+  max_output_bytes max_output_bytes: Int,
+  environment environment: Option(Environment),
+  cancel cancel: Subject(Nil),
+  arguments arguments: String,
+) -> Result(String, String) {
+  bash_with_sandbox(
+    timeout_ms: timeout_ms,
+    max_output_bytes: max_output_bytes,
+    sandbox: default_sandbox(),
+    environment: environment,
+    cancel: cancel,
+    arguments: arguments,
+  )
+}
+
+/// Run one bash command in the routed environment's working directory under
+/// the given sandbox and resource-cap configuration.
 /// The select loop is the codemode pattern over a port: {data,
 /// exit_status, cancel, deadline}. `exit_status` 0 → Ok(output);
 /// non-zero → Ok("exit status N" + output) — a failing command is
 /// DATA, not a transport failure (the http_fetch non-2xx rule);
-/// spawn/cancel/timeout are the errors, each honestly worded, and
+/// spawn/wrapper/cancel/timeout are the errors, each honestly worded, and
 /// cancel/timeout carry the partial output. The over-cap kill renders
 /// the capped output as data with an omission note (like every other
 /// truncation in the harness).
-pub fn bash(
+pub fn bash_with_sandbox(
   timeout_ms timeout_ms: Int,
   max_output_bytes max_output_bytes: Int,
+  sandbox sandbox: SandboxConfig,
   environment environment: Option(Environment),
   cancel cancel: Subject(Nil),
   arguments arguments: String,
@@ -610,16 +1358,24 @@ pub fn bash(
   case remote_result(environment, args.target, "bash", arguments, cancel) {
     Some(result) -> result
     None ->
-      bash_workspace(timeout_ms, max_output_bytes, environment, cancel, args)
+      bash_workspace(
+        timeout_ms,
+        max_output_bytes,
+        sandbox,
+        environment,
+        cancel,
+        args,
+      )
   }
 }
 
-/// The local `workspace` path (Phase 1): everything after the routing
-/// fork in `bash` — the route/ensure pair, the kill-tree wrapper, and
-/// the port select loop.
+/// The local `workspace` path (Phase 1 + Phase 2 sandbox wrapper):
+/// route/ensure workspace + tmp, prepare nono state / transient cgroup when
+/// configured, build the spawn plan, and run the bounded port select loop.
 fn bash_workspace(
   timeout_ms: Int,
   max_output_bytes: Int,
+  sandbox: SandboxConfig,
   environment: Option(Environment),
   cancel: Subject(Nil),
   args: BashArgs,
@@ -627,61 +1383,76 @@ fn bash_workspace(
   use env <- result.try(route(environment, args.target))
   use _ <- result.try(ensure_workspace(env))
   use tmp <- result.try(ensure_tmp_dir(env))
-  use bash_path <- result.try(case ffi_resolve("bash") {
-    Ok(path) -> Ok(path)
-    Error(_) -> Error("bash: no bash executable found on PATH")
+  use _ <- result.try(case sandbox.backend, sandbox.state_dir {
+    SandboxNono, Some(state_dir) -> ensure_nono_state(state_dir)
+    SandboxNono, None ->
+      Error("bash: nono sandbox requires workspace_state_dir")
+    _, _ -> Ok(Nil)
   })
-  // Kill-tree hygiene (Linux): wrap in setsid so the bash becomes its
-  // own session/group leader, and have it print its pid (== pgid) as
-  // the FIRST stdout line — the loop parses it and `kill_tree` can
-  // signal the whole group on cancel/timeout/cap. `-w` matters twice:
-  // when setsid forks (its child already a group leader — never the
-  // case for a fresh port child, but kept honest) the parent WAITS
-  // and propagates the exit status, which the result encodes; without
-  // it a forked setsid exits 0 and swallows the child's status
-  // (verified against util-linux). Without setsid at all (macOS dev
-  // machines) there is no marker and no pgid: the kill degrades to
-  // port_close (direct child only) — the documented fallback.
-  let setsid = ffi_resolve("setsid")
-  // BOTH paths print the first-line pid marker: under setsid it is the
-  // process-group id (the child is its own session leader); without
-  // setsid it is still the direct child's pid, and the kill targets
-  // THAT single process — port_close alone provably kills nothing
-  // (CodeRabbit review: an owner-killed port left `/bin/sleep`
-  // running). Descendants survive the fallback (documented posture).
-  //
-  // The death-with-port SENTINEL (cubic PR review) closes the window
-  // no BEAM-side kill can: the owner dying before the marker pid was
-  // parsed leaves every kill targetless, and port_close kills nothing.
-  // A subshell inside the wrapper dup's the stdin pipe (fd 3) and
-  // blocks reading it; EOF on that pipe means the PORT closed, and a
-  // `kill -0 $$` check distinguishes the two closes — parent bash
-  // still alive means the owner vanished mid-command (kill the tree
-  // from inside, no pid handoff needed); parent gone means normal
-  // completion, so deliberate background strays survive (the
-  // documented posture). The command itself runs with stdin on
-  // /dev/null — the port never writes stdin, and instant EOF beats
-  // blocking on a writeless pipe.
-  let sentinel_kill = case setsid {
-    Ok(_) -> "kill -9 -- -$$"
-    Error(_) -> "kill -9 $$"
+  let cgroup_dir = case sandbox.backend {
+    SandboxNone -> None
+    SandboxBwrap | SandboxNono ->
+      ffi_cgroup_create(sandbox.max_memory_mb, sandbox.max_pids)
+      |> option.from_result
   }
-  let prelude =
-    "printf '%d\\n' $$; exec 3<&0 0</dev/null; "
-    <> "(while read -r _line <&3; do :; done; kill -0 $$ 2>/dev/null && "
-    <> sentinel_kill
-    <> ") >/dev/null 2>&1 & "
-  let #(exe, argv, kill_group) = case setsid {
-    Ok(setsid_path) -> #(
-      setsid_path,
-      ["-w", bash_path, "-c", prelude <> args.command],
-      True,
+  let host = live_host_probe(cgroup_dir)
+  case
+    build_spawn_plan(
+      sandbox: sandbox,
+      host: host,
+      workspace_dir: workspace_dir(env),
+      tmp_dir: tmp,
+      command: args.command,
     )
-    Error(_) -> #(bash_path, ["-c", prelude <> args.command], False)
+  {
+    Error(reason) -> {
+      cleanup_cgroup(cgroup_dir)
+      Error(reason)
+    }
+    Ok(plan) ->
+      run_spawn_plan(
+        plan,
+        sandbox.backend,
+        workspace_dir(env),
+        cgroup_dir,
+        timeout_ms,
+        max_output_bytes,
+        cancel,
+      )
   }
-  case ffi_open_port(exe, argv, workspace_dir(env), tmp) {
-    Error(reason) -> Error("bash: " <> reason)
+}
+
+fn run_spawn_plan(
+  plan: SpawnPlan,
+  sandbox_backend: SandboxBackend,
+  cwd: String,
+  cgroup_dir: Option(String),
+  timeout_ms: Int,
+  max_output_bytes: Int,
+  cancel: Subject(Nil),
+) -> Result(String, String) {
+  case
+    ffi_open_port(
+      plan.exe,
+      plan.argv,
+      cwd,
+      plan.allow_env,
+      plan.passthrough_env,
+    )
+  {
+    Error(reason) -> {
+      cleanup_cgroup(cgroup_dir)
+      Error("bash: " <> reason)
+    }
     Ok(p) -> {
+      // Query the host OS PID immediately while the port is live: for
+      // PID-namespace backends (`KillPortOsPid`), this arms both the loop and
+      // the owner-death watchdog from instant zero with no marker-handoff race.
+      let os_pid = ffi_port_os_pid(p) |> option.from_result
+      let initial_watch_pid = case plan.kill_mode {
+        KillPortOsPid -> os_pid
+        KillGroup | KillPid -> None
+      }
       let deadline_us = timing.now_us() + timeout_ms * 1000
       let selector =
         process.new_selector()
@@ -692,20 +1463,22 @@ fn bash_workspace(
       // the executor — receives on it).
       let gate_back = process.new_subject()
       let owner = process.self()
-      let _watchdog =
+      let watchdog =
         process.spawn_unlinked(fn() {
           let gate = process.new_subject()
           process.send(gate_back, gate)
           let mon = process.monitor(owner)
-          watch(gate, mon, p, kill_group, None)
+          watch(gate, mon, p, plan.kill_mode, initial_watch_pid, cgroup_dir)
         })
       // The watchdog's gate handshake, degraded honestly instead of
       // asserted (cubic PR review): a scheduler delay past the budget
-      // must answer the call, not crash the per-turn worker. Nothing
-      // ran yet, so closing the port and refusing is clean.
+      // must answer the call, not crash the per-turn worker. Kill the
+      // unlinked watchdog too so it cannot outlive the failed handshake.
       case process.receive(gate_back, 1000) {
         Error(Nil) -> {
-          ffi_kill_tree(p, Error(Nil))
+          process.kill(watchdog)
+          ffi_kill_tree(p, target_kill(initial_watch_pid, plan.kill_mode))
+          cleanup_cgroup(cgroup_dir)
           Error("bash: the kill watchdog failed to start")
         }
         Ok(gate) -> {
@@ -718,7 +1491,8 @@ fn bash_workspace(
                 timeout_ms: timeout_ms,
                 deadline_us: deadline_us,
                 max_output_bytes: max_output_bytes,
-                kill_group: kill_group,
+                kill_mode: plan.kill_mode,
+                sandbox_backend: sandbox_backend,
                 watch: gate,
               ),
               BashState(
@@ -728,8 +1502,10 @@ fn bash_workspace(
                 killed: False,
               ),
             )
-          // Whatever the outcome, the loop is done with the port: the
-          // watchdog stands down (it demonitors and exits).
+          // Clean up any transient cgroup BEFORE standing down the watchdog:
+          // if the worker dies mid-cleanup, the still-armed watchdog finishes
+          // `cleanup_cgroup` on `OwnerDown`.
+          cleanup_cgroup(cgroup_dir)
           process.send(gate, WatchDone)
           outcome
         }
@@ -742,33 +1518,31 @@ fn bash_workspace(
 /// live (a codemode task child killed at the script deadline, a
 /// crashed per-turn worker), the port closes and the BEAM kills only
 /// the DIRECT child — the setsid'd process group would survive. The
-/// watchdog fires the group kill on the owner's DOWN. It learns the
-/// pgid when the executor parses the marker (WatchPgid); an owner
-/// death before that degrades to port_close, no worse than before.
-/// One tiny process per bash call, gone when the loop returns.
+/// watchdog fires the configured kill on the owner's DOWN and cleans up
+/// any transient cgroup. Under `KillPortOsPid` it is armed from spawn with
+/// the host PID of `bwrap`; under `KillGroup`/`KillPid` it learns the pgid
+/// when the executor parses the marker (`WatchPgid`).
 fn watch(
   gate: Subject(WatchMsg),
   mon: process.Monitor,
   p: Port,
-  kill_group: Bool,
-  pgid: Option(Int),
+  kill_mode: KillMode,
+  target_pid: Option(Int),
+  cgroup_dir: Option(String),
 ) -> Nil {
   let selector =
     process.new_selector()
     |> process.select_map(gate, Gate)
     |> process.select_specific_monitor(mon, fn(_down) { OwnerDown })
   case process.selector_receive_forever(selector) {
-    Gate(WatchPgid(n)) -> watch(gate, mon, p, kill_group, Some(n))
+    Gate(WatchPgid(n)) -> watch(gate, mon, p, kill_mode, Some(n), cgroup_dir)
     Gate(WatchDone) -> {
       process.demonitor_process(mon)
       Nil
     }
     OwnerDown -> {
-      ffi_kill_tree(p, case pgid, kill_group {
-        Some(n), True -> Ok(ffi_kill_group(n))
-        Some(n), False -> Ok(ffi_kill_pid(n))
-        None, _ -> Error(Nil)
-      })
+      ffi_kill_tree(p, target_kill(target_pid, kill_mode))
+      cleanup_cgroup(cgroup_dir)
       Nil
     }
   }
@@ -782,10 +1556,10 @@ type BashLoop {
     timeout_ms: Int,
     deadline_us: Int,
     max_output_bytes: Int,
-    /// True under the setsid wrapper: the marker pid is a process-group
-    /// id and kills target the whole group; false (wrapperless
-    /// fallback): the marker pid is the direct child, killed alone.
-    kill_group: Bool,
+    /// Host-side kill discipline (see `KillMode`).
+    kill_mode: KillMode,
+    /// Configured sandbox backend (used to surface silent wrapper failures).
+    sandbox_backend: SandboxBackend,
     /// The owner-death watchdog's gate (see `watch`).
     watch: Subject(WatchMsg),
   )
@@ -856,7 +1630,8 @@ fn bash_receive(loop: BashLoop, state: BashState) -> Result(String, String) {
         False -> bash_loop(loop, state)
       }
     }
-    Ok(Port(Exited(code))) -> finish(state, loop.max_output_bytes, code)
+    Ok(Port(Exited(code))) ->
+      finish(state, loop.max_output_bytes, code, loop.sandbox_backend)
   }
 }
 
@@ -871,13 +1646,16 @@ fn bash_receive(loop: BashLoop, state: BashState) -> Result(String, String) {
 /// `cancel_pending` check, exactly as before.
 fn kill_and_reap(loop: BashLoop, state: BashState) -> BashState {
   // Marker still pending (cancel/timeout raced the child's first
-  // output): give the pid line its brief chance so the kill is armed
-  // instead of a port_close that kills nothing.
-  let state = case state.marker {
-    MarkerPending -> await_marker(loop, state, timing.now_us())
-    MarkerLeader(_) | MarkerAbsent -> state
+  // output): give the pid line its brief chance so host-PID kills are armed
+  // instead of a port_close that kills nothing. Under `KillPortOsPid`
+  // (`bwrap --unshare-pid`), we already hold the host `bwrap` PID and never
+  // target the in-namespace marker, so skip the wait.
+  let state = case loop.kill_mode, state.marker {
+    KillPortOsPid, _ -> state
+    _, MarkerPending -> await_marker(loop, state, timing.now_us())
+    _, MarkerLeader(_) | _, MarkerAbsent -> state
   }
-  ffi_kill_tree(loop.p, marker_kill(state.marker, loop.kill_group))
+  ffi_kill_tree(loop.p, loop_kill_target(loop, state.marker))
   let reap_selector = port_selector(loop.p)
   case process.selector_receive(reap_selector, reap_ms) {
     Ok(Port(Data(bytes))) -> kill_and_reap(loop, absorb(loop, state, bytes))
@@ -933,15 +1711,48 @@ fn port_selector(p: Port) -> process.Selector(SelectMsg) {
 /// A completed run: marker consumed, output capped and lossily
 /// decoded; exit 0 is plain output, non-zero prefixes the status (a
 /// failing command is data — the model reacts, the round commits).
+///
+/// Phase 0 `nono` embedding contract: `-s` suppresses even fatal sandbox
+/// errors (rc=1, empty output). When a sandboxed wrapper exits non-zero
+/// without bash ever printing its first-line PID marker or any byte of output,
+/// surface that as a tool `Error` rather than a silent `exit status N`.
 fn finish(
   state: BashState,
   max_output_bytes: Int,
   code: Int,
+  sandbox_backend: SandboxBackend,
 ) -> Result(String, String) {
-  let output = render_output(state, max_output_bytes)
-  case code {
-    0 -> Ok(output)
-    n -> Ok("exit status " <> int.to_string(n) <> "\n" <> output)
+  case
+    sandbox_backend != SandboxNone
+    && code != 0
+    && state.marker == MarkerPending
+    && state.head == <<>>
+    && state.out == <<>>
+  {
+    True ->
+      Error(
+        "bash: sandbox wrapper ("
+        <> sandbox_backend_name(sandbox_backend)
+        <> ") exited with status "
+        <> int.to_string(code)
+        <> " before starting bash",
+      )
+    False -> {
+      let output = render_output(state, max_output_bytes)
+      case
+        sandbox_backend != SandboxNone
+        && code == 125
+        && state.marker == MarkerAbsent
+        && output == cgroup_join_failed_sentinel
+      {
+        True -> Error("bash: failed to join transient sandbox cgroup")
+        False ->
+          case code {
+            0 -> Ok(output)
+            n -> Ok("exit status " <> int.to_string(n) <> "\n" <> output)
+          }
+      }
+    }
   }
 }
 
@@ -969,8 +1780,14 @@ fn absorb(loop: BashLoop, state: BashState, bytes: BitArray) -> BashState {
           }
           case marker {
             MarkerLeader(n) -> {
-              // Arm the watchdog's group kill with the parsed pgid.
-              process.send(loop.watch, WatchPgid(n))
+              // Arm the watchdog's host kill ONLY when the marker is a real
+              // host PID/PGID; under `KillPortOsPid` (bwrap PID namespace),
+              // `n` is an in-namespace PID and the watchdog is already armed
+              // with the host `bwrap` PID.
+              case loop.kill_mode {
+                KillPortOsPid -> Nil
+                KillGroup | KillPid -> process.send(loop.watch, WatchPgid(n))
+              }
               absorb_out(
                 BashState(..state, head: <<>>, marker: marker),
                 rest,
@@ -1007,21 +1824,33 @@ fn absorb(loop: BashLoop, state: BashState, bytes: BitArray) -> BashState {
   }
 }
 
-/// The kill-tree target: a parsed `MarkerLeader` pid — as a GROUP id
-/// under the setsid wrapper, as the single direct pid in the
-/// wrapperless fallback; `Error` when no marker was parsed (port_close
-/// only).
-fn marker_kill(
+/// Resolve the host kill target for the running loop.
+/// Under `KillPortOsPid`, re-query `port_os_pid` while the port is live so an
+/// already-exited launcher is not signaled via a stale cached PID.
+fn loop_kill_target(
+  loop: BashLoop,
   marker: Marker,
-  kill_group: Bool,
 ) -> Result(ErlangKillTarget, Nil) {
-  case marker {
-    MarkerLeader(n) ->
-      case kill_group {
-        True -> Ok(ffi_kill_group(n))
-        False -> Ok(ffi_kill_pid(n))
+  case loop.kill_mode {
+    KillPortOsPid ->
+      target_kill(ffi_port_os_pid(loop.p) |> option.from_result, KillPortOsPid)
+    KillGroup | KillPid ->
+      case marker {
+        MarkerLeader(n) -> target_kill(Some(n), loop.kill_mode)
+        MarkerPending | MarkerAbsent -> Error(Nil)
       }
-    MarkerPending | MarkerAbsent -> Error(Nil)
+  }
+}
+
+/// Convert a host PID/PGID and `KillMode` to the FFI's kill target.
+fn target_kill(
+  pid: Option(Int),
+  kill_mode: KillMode,
+) -> Result(ErlangKillTarget, Nil) {
+  case pid, kill_mode {
+    Some(n), KillGroup -> Ok(ffi_kill_group(n))
+    Some(n), KillPid | Some(n), KillPortOsPid -> Ok(ffi_kill_pid(n))
+    None, _ -> Error(Nil)
   }
 }
 
@@ -1290,6 +2119,7 @@ pub fn serve_node_call(
           bash_workspace(
             timeout_ms,
             max_output_bytes,
+            default_sandbox(),
             Some(handle),
             cancel,
             BashArgs(..args, target: "workspace"),
@@ -1457,13 +2287,32 @@ fn parse_write_args(arguments: String) -> Result(WriteArgs, String) {
 @external(erlang, "nexus_env_ffi", "resolve")
 fn ffi_resolve(name: String) -> Result(String, Nil)
 
+@external(erlang, "nexus_env_ffi", "is_executable")
+fn ffi_is_executable(path: String) -> Bool
+
+@external(erlang, "nexus_env_ffi", "inherited_path")
+fn ffi_inherited_path() -> String
+
+@external(erlang, "nexus_env_ffi", "unique_id")
+fn ffi_unique_id() -> String
+
 @external(erlang, "nexus_env_ffi", "open_port")
 fn ffi_open_port(
   command: String,
   args: List(String),
   cwd: String,
-  tmp_dir: Option(String),
+  allow_env: List(#(String, String)),
+  passthrough_env: List(String),
 ) -> Result(Port, String)
+
+@external(erlang, "nexus_env_ffi", "port_os_pid")
+fn ffi_port_os_pid(port: Port) -> Result(Int, Nil)
+
+@external(erlang, "nexus_env_ffi", "cgroup_create")
+fn ffi_cgroup_create(max_memory_mb: Int, max_pids: Int) -> Result(String, Nil)
+
+@external(erlang, "nexus_env_ffi", "cgroup_cleanup")
+fn ffi_cgroup_cleanup(cgroup_dir: String) -> Nil
 
 @external(erlang, "nexus_env_ffi", "kill_tree")
 fn ffi_kill_tree(port: Port, target: Result(ErlangKillTarget, Nil)) -> Nil

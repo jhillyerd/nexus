@@ -6,11 +6,24 @@
 %%
 %% - resolve/1: PATH resolution for a bare command name (spawn_executable
 %%   does NOT search PATH). First regular-file execute-bit hit wins.
-%% - open_port/4: spawn a child with its stdio wired to the port
+%% - is_executable/1: true when a path resolves (following symlinks) to a
+%%   regular file with at least one execute bit set.
+%% - inherited_path/0: the BEAM's inherited PATH (or ?DEFAULT_PATH), so
+%%   Gleam-side spawn planning stays pure and testable.
+%% - open_port/5: spawn a child with its stdio wired to the port
 %%   (use_stdio, binary, exit_status, hide, stderr_to_stdout) with a
-%%   working directory ({cd, Dir}) — the workspace's cwd default — and
-%%   a SCRUBBED environment ({env, sandbox_env/2}; see below).
-%% - kill_tree/1: best-effort kill of the child AND its process group.
+%%   working directory ({cd, Dir}) and a SCRUBBED environment
+%%   ({env, sandbox_env/2}; see below).
+%% - port_os_pid/1: query the spawned child's host OS PID while the port
+%%   is open (used for PID-namespace backends like `bwrap --unshare-pid`
+%%   where the first-line stdout marker is an in-namespace PID and killing
+%%   the host `bwrap` process lets `--die-with-parent` reap the namespace).
+%% - cgroup_create/2, cgroup_cleanup/1: best-effort Linux cgroup v2
+%%   transient sub-cgroup (`memory.max`, `memory.swap.max`, `pids.max`)
+%%   under a systemd-delegated subtree (`Delegate=cpu memory pids`), with
+%%   `cgroup.kill` + `rmdir` cleanup; returns `{error, nil}` on any host
+%%   without writable delegation so the caller falls back to `prlimit`.
+%% - kill_tree/2: best-effort kill of the child AND its process group.
 %%   The workspace bash prints its own pid (== its process-group id when
 %%   launched under setsid) as the first stdout line; the caller parses
 %%   it and hands it back here. A group kill with no pgid degrades to
@@ -31,8 +44,10 @@
 
 -define(DEFAULT_PATH, "/usr/local/bin:/usr/bin:/bin").
 
--export([resolve/1, open_port/4, kill_tree/2, to_text_lossy/1, read_capped/2,
-         split_line/1, kill_group_marker/1, kill_pid_marker/1]).
+-export([resolve/1, is_executable/1, inherited_path/0, unique_id/0, open_port/5,
+         port_os_pid/1, cgroup_create/2, cgroup_cleanup/1, kill_tree/2,
+         to_text_lossy/1, read_capped/2, split_line/1, kill_group_marker/1,
+         kill_pid_marker/1]).
 
 -include_lib("kernel/include/file.hrl").
 
@@ -62,6 +77,19 @@ resolve(Name) ->
         _:_ -> {error, nil}
     end.
 
+is_executable(Path) ->
+    try
+        executable(unicode:characters_to_list(Path))
+    catch
+        _:_ -> false
+    end.
+
+inherited_path() ->
+    unicode:characters_to_binary(os:getenv("PATH", ?DEFAULT_PATH)).
+
+unique_id() ->
+    integer_to_binary(erlang:unique_integer([positive, monotonic])).
+
 executable(F) ->
     case file:read_file_info(F) of
         {ok, Info} ->
@@ -81,12 +109,9 @@ executable(F) ->
 %% transcript. Note {env, …} MERGES into the inherited environment
 %% (verified against OTP 27: a canary planted via os:putenv rides
 %% straight through the tuple form; the old replace-all string-list
-%% form is removed), so sandbox_env/1 must explicitly UNSET everything
-%% not allowed, not just set the allowed. The allowlist keeps the
-%% child working without the secrets; it is NOT a sandbox (bash still
-%% runs as this uid and can read the filesystem and dial out — #126's
-%% real work).
-open_port(Command, Args, Cwd, TmpDir) ->
+%% form is removed), so sandbox_env/2 must explicitly UNSET everything
+%% not allowed, not just set the allowed.
+open_port(Command, Args, Cwd, AllowEnv, PassthroughNames) ->
     try
         Port =
             erlang:open_port({spawn_executable,
@@ -99,62 +124,335 @@ open_port(Command, Args, Cwd, TmpDir) ->
                               {args,
                                [unicode:characters_to_list(A) || A <- Args]},
                               {cd, unicode:characters_to_list(Cwd)},
-                              {env, sandbox_env(Cwd, TmpDir)}]),
+                              {env, sandbox_env(AllowEnv, PassthroughNames)}]),
         {ok, Port}
     catch
         _:_ -> {error, <<"spawn failed">>}
     end.
 
+%% Query the spawned child's host OS PID while the port is still live.
+port_os_pid(Port) ->
+    try
+        case erlang:port_info(Port, os_pid) of
+            {os_pid, Pid} when is_integer(Pid) -> {ok, Pid};
+            _ -> {error, nil}
+        end
+    catch
+        _:_ -> {error, nil}
+    end.
+
 %% The workspace-child allowlist — the child's environment is EXACTLY
-%% these, nothing inherited. Variables, each earning its place:
-%%
-%% - PATH passes through (default matches resolve/1) because bare
-%%   command names are the common shape of model-authored commands;
-%%   setsid/bash themselves are already PATH-resolved BEAM-side against
-%%   the same value, so the wrapper never needs it.
-%% - HOME is REWRITTEN to the workspace dir: unset makes common tools
-%%   (git, pip…) warn or misbehave, inherited points `~` at the
-%%   operator's home (exactly the direction an injected `cat ~/…`
-%%   wants); the workspace keeps `~` inside the confined tree and tool
-%%   caches/lockfiles land in the disposable per-thread dir.
-%% - TMPDIR is SET to the per-thread temp dir when provided (`{some, Dir}`),
-%%   overriding any inherited TMPDIR; when `none` (legacy rows / TUI nodes),
-%%   inherited TMPDIR is explicitly scrubbed like every other non-allowlisted
-%%   variable.
-%% - TZ passes through when set: no secret, and it keeps `date`-style
-%%   output stable across the scrub.
-%% - SSL_CERT_FILE / SSL_CERT_DIR pass through when set (OCR review):
-%%   CA paths, not secrets — but dropping them breaks TLS in workspace
-%%   bash on env-configured systems (custom CAs, NixOS), which the
-%%   recorded "can still dial out" posture explicitly promises works.
-%%
-%% Locale (LANG/LC_*) stays deliberately dropped: the deterministic C
-%% locale is the right default for model-driven tooling (stable sort,
-%% stable messages), not an accident to paper over.
-%%
-%% Everything inherited and not on that list is {Name, false} — the
-%% unset that turns the MERGING {env, …} option into a replace (see
-%% open_port/4 above for the experiment that pinned this).
-%%
-%% Deliberately NOT a passthrough knob: operators needing vars inside
-%% the workspace is a sandbox-config question (#126), not an env one.
-sandbox_env(Cwd, TmpDir) ->
-    TmpEntry =
-        case TmpDir of
-            {some, Dir} -> [{"TMPDIR", unicode:characters_to_list(Dir)}];
-            none -> []
-        end,
-    Allow =
-        maps:from_list(
-          [{"HOME", unicode:characters_to_list(Cwd)},
-           {"PATH", os:getenv("PATH", ?DEFAULT_PATH)}]
-          ++ TmpEntry
-          ++ pass_through(["TZ", "SSL_CERT_FILE", "SSL_CERT_DIR"])),
+%% PassthroughNames (when set in the host env) overridden by AllowEnv,
+%% with every other inherited variable explicitly unset via {Name, false}.
+sandbox_env(AllowEnv, PassthroughNames) ->
+    Pass =
+        pass_through([unicode:characters_to_list(N) || N <- PassthroughNames]),
+    Explicit =
+        [{unicode:characters_to_list(K), unicode:characters_to_list(V)}
+         || {K, V} <- AllowEnv],
+    Allow = maps:from_list(Pass ++ Explicit),
     Unset =
         [{Name, false}
          || Name <- inherited_env_names(),
             not maps:is_key(Name, Allow)],
     maps:to_list(Allow) ++ Unset.
+
+%% Create a transient Linux cgroup v2 sub-cgroup enforcing `memory.max`
+%% (plus best-effort `memory.swap.max = 0`) and `pids.max` beneath a
+%% systemd-delegated subtree (`Delegate=cpu memory pids`).
+%%
+%% Under cgroup v2's "no internal processes" rule, a cgroup with live
+%% processes cannot enable controllers in `cgroup.subtree_control`. When
+%% the BEAM starts directly in a delegated cgroup (e.g.
+%% `/sys/fs/cgroup/system.slice/nexus.service`), this lazily creates a
+%% sibling `beam/` leaf, moves the BEAM PID into `beam/cgroup.procs`, and
+%% enables `+memory +pids` in `cgroup.subtree_control`. One-time preparation
+%% (and a once-per-boot sweep of any stale `ws-*` children left by a prior
+%% crashed BEAM) is serialized via `global:trans/2` and cached in
+%% `persistent_term` so steady-state calls take no lock. Any failure
+%% (non-Linux, missing delegation, read-only cgroupfs, sibling processes
+%% preventing subtree_control) rolls back cleanly and returns `{error, nil}`
+%% so the caller falls back to `prlimit --as`.
+cgroup_create(MaxMemoryMb, MaxPids) ->
+    try
+        case find_cgroup_parent() of
+            {ok, Parent} ->
+                Id = integer_to_list(erlang:unique_integer([positive, monotonic])),
+                CgDir = filename:join(Parent, "ws-" ++ os:getpid() ++ "-" ++ Id),
+                case file:make_dir(CgDir) of
+                    ok ->
+                        MemBytes = integer_to_list(MaxMemoryMb * 1024 * 1024) ++ "\n",
+                        PidsVal = integer_to_list(MaxPids) ++ "\n",
+                        MemRes = file:write_file(filename:join(CgDir, "memory.max"), MemBytes),
+                        _ = file:write_file(filename:join(CgDir, "memory.swap.max"), "0\n"),
+                        PidRes = file:write_file(filename:join(CgDir, "pids.max"), PidsVal),
+                        case {MemRes, PidRes} of
+                            {ok, ok} ->
+                                {ok, unicode:characters_to_binary(CgDir)};
+                            _ ->
+                                %% cgroupfs control files are kernel-virtual and
+                                %% never unlinked; rmdir removes an empty cgroup.
+                                _ = file:del_dir(CgDir),
+                                {error, nil}
+                        end;
+                    _ ->
+                        {error, nil}
+                end;
+            {error, nil} ->
+                {error, nil}
+        end
+    catch
+        _:_ -> {error, nil}
+    end.
+
+find_cgroup_parent() ->
+    case persistent_term:get(nexus_env_cgroup_parent, undefined) of
+        {ok, Parent} ->
+            case filelib:is_dir(Parent) of
+                true -> {ok, Parent};
+                false -> prepare_cgroup_parent_serialized()
+            end;
+        unavailable ->
+            {error, nil};
+        undefined ->
+            prepare_cgroup_parent_serialized()
+    end.
+
+prepare_cgroup_parent_serialized() ->
+    %% Requester id MUST be per-process (`self()`), not `node()`, so concurrent
+    %% first-time callers on the same BEAM node are mutually excluded.
+    global:trans(
+      {nexus_env_cgroup_prepare, self()},
+      fun() ->
+          case persistent_term:get(nexus_env_cgroup_parent, undefined) of
+              {ok, Cached} ->
+                  case filelib:is_dir(Cached) of
+                      true -> {ok, Cached};
+                      false -> prepare_and_cache_parent()
+                  end;
+              unavailable ->
+                  {error, nil};
+              undefined ->
+                  prepare_and_cache_parent()
+          end
+      end).
+
+prepare_and_cache_parent() ->
+    case find_cgroup_parent_uncached() of
+        {ok, Parent} ->
+            sweep_empty_ws_cgroups(Parent),
+            persistent_term:put(nexus_env_cgroup_parent, {ok, Parent}),
+            {ok, Parent};
+        {error, nil} ->
+            %% Cgroup delegation is fixed at service start; cache unavailability
+            %% so non-delegated hosts take no lock or filesystem probes on
+            %% subsequent bash calls.
+            persistent_term:put(nexus_env_cgroup_parent, unavailable),
+            {error, nil}
+    end.
+
+find_cgroup_parent_uncached() ->
+    case read_self_cgroup_v2() of
+        {ok, SelfDir} ->
+            case filename:basename(SelfDir) of
+                "beam" ->
+                    Parent = filename:dirname(SelfDir),
+                    case Parent =/= "/sys/fs/cgroup"
+                         andalso has_mem_and_pids(filename:join(Parent, "cgroup.subtree_control")) of
+                        true -> {ok, Parent};
+                        false -> {error, nil}
+                    end;
+                _ ->
+                    case has_mem_and_pids(filename:join(SelfDir, "cgroup.controllers")) of
+                        true -> prepare_delegated_parent(SelfDir);
+                        false -> {error, nil}
+                    end
+            end;
+        {error, nil} ->
+            {error, nil}
+    end.
+
+%% Best-effort once-per-boot cleanup of empty stale `ws-<pid>-<id>` cgroup
+%% directories left by a prior crashed BEAM. Deliberately verifies the owning
+%% BEAM OS PID is dead (`/proc/<pid>` absent) AND uses `file:del_dir/1` ONLY
+%% (never `cgroup.kill`), so a pending empty cgroup created by another live
+%% Nexus instance sharing the delegated parent is never touched.
+sweep_empty_ws_cgroups(Parent) ->
+    case file:list_dir(Parent) of
+        {ok, Entries} ->
+            lists:foreach(
+              fun(Entry) ->
+                  case ws_owner_dead(Entry) of
+                      true ->
+                          CgDir = filename:join(Parent, Entry),
+                          case filelib:is_dir(CgDir) of
+                              true -> _ = file:del_dir(CgDir);
+                              false -> ok
+                          end;
+                      false -> ok
+                  end
+              end,
+              Entries);
+        _ ->
+            ok
+    end.
+
+ws_owner_dead(Entry) ->
+    case string:split(Entry, "-", all) of
+        ["ws", PidStr, _Id] when PidStr =/= "" ->
+            is_digits(PidStr) andalso not filelib:is_dir("/proc/" ++ PidStr);
+        _ ->
+            false
+    end.
+
+is_digits([]) ->
+    false;
+is_digits(Str) ->
+    lists:all(fun(C) -> C >= $0 andalso C =< $9 end, Str).
+
+read_self_cgroup_v2() ->
+    case file:read_file("/proc/self/cgroup") of
+        {ok, Bin} ->
+            Lines = binary:split(Bin, <<"\n">>, [global]),
+            case find_v2_line(Lines) of
+                {ok, Rel} when Rel =/= "", Rel =/= "/" ->
+                    {ok, "/sys/fs/cgroup" ++ Rel};
+                _ ->
+                    {error, nil}
+            end;
+        _ ->
+            {error, nil}
+    end.
+
+find_v2_line([]) ->
+    {error, nil};
+find_v2_line([<<"0::", Rest/binary>> | _]) ->
+    Trimmed = string:trim(unicode:characters_to_list(Rest)),
+    {ok, Trimmed};
+find_v2_line([_ | T]) ->
+    find_v2_line(T).
+
+has_mem_and_pids(Path) ->
+    case file:read_file(Path) of
+        {ok, Bin} ->
+            Tokens = string:lexemes(unicode:characters_to_list(Bin), " \t\r\n"),
+            lists:member("memory", Tokens) andalso lists:member("pids", Tokens);
+        _ ->
+            false
+    end.
+
+%% Rehome the BEAM AND its direct child helper processes (specifically OTP 27's
+%% `erl_child_setup`, which starts inside the service cgroup as a separate OS
+%% process) into `SelfDir/beam/` so `SelfDir/cgroup.procs` is empty and Linux
+%% allows enabling `+memory +pids` in `SelfDir/cgroup.subtree_control`.
+prepare_delegated_parent(SelfDir) ->
+    BeamDir = filename:join(SelfDir, "beam"),
+    Created =
+        case file:make_dir(BeamDir) of
+            ok -> created;
+            {error, eexist} -> existed;
+            _ -> failed
+        end,
+    case Created of
+        failed ->
+            {error, nil};
+        _ ->
+            SelfPid = os:getpid(),
+            PidsToMove = beam_tree_pids_in_cgroup(SelfDir, SelfPid),
+            BeamProcs = filename:join(BeamDir, "cgroup.procs"),
+            Moved = move_pids(PidsToMove, BeamProcs),
+            case lists:member(SelfPid, Moved) of
+                true ->
+                    SubtreePath = filename:join(SelfDir, "cgroup.subtree_control"),
+                    _ = file:write_file(SubtreePath, "+memory +pids\n"),
+                    case has_mem_and_pids(SubtreePath) of
+                        true ->
+                            {ok, SelfDir};
+                        false ->
+                            %% Roll back every moved PID if enabling controllers
+                            %% failed (e.g. an unrelated process shares SelfDir),
+                            %% deleting `beam/` only when rollback succeeded.
+                            SelfProcs = filename:join(SelfDir, "cgroup.procs"),
+                            Restored = move_pids(Moved, SelfProcs),
+                            case length(Restored) =:= length(Moved)
+                                 andalso Created =:= created of
+                                true -> _ = file:del_dir(BeamDir);
+                                false -> ok
+                            end,
+                            {error, nil}
+                    end;
+                false ->
+                    SelfProcs = filename:join(SelfDir, "cgroup.procs"),
+                    _ = move_pids(Moved, SelfProcs),
+                    case Created of
+                        created -> _ = file:del_dir(BeamDir);
+                        existed -> ok
+                    end,
+                    {error, nil}
+            end
+    end.
+
+beam_tree_pids_in_cgroup(SelfDir, SelfPid) ->
+    Procs =
+        case file:read_file(filename:join(SelfDir, "cgroup.procs")) of
+            {ok, Bin} ->
+                string:lexemes(unicode:characters_to_list(Bin), " \t\r\n");
+            _ ->
+                [SelfPid]
+        end,
+    Owned =
+        [P || P <- Procs, P =:= SelfPid orelse proc_ppid(P) =:= SelfPid],
+    case lists:member(SelfPid, Owned) of
+        true -> Owned;
+        false -> [SelfPid | Owned]
+    end.
+
+proc_ppid(PidStr) ->
+    case file:read_file("/proc/" ++ PidStr ++ "/status") of
+        {ok, Bin} ->
+            Lines = binary:split(Bin, <<"\n">>, [global]),
+            find_ppid_line(Lines);
+        _ ->
+            ""
+    end.
+
+find_ppid_line([]) ->
+    "";
+find_ppid_line([<<"PPid:", Rest/binary>> | _]) ->
+    string:trim(unicode:characters_to_list(Rest));
+find_ppid_line([_ | T]) ->
+    find_ppid_line(T).
+
+move_pids(Pids, TargetProcsFile) ->
+    lists:filter(
+      fun(PidStr) ->
+          file:write_file(TargetProcsFile, PidStr ++ "\n") =:= ok
+      end,
+      Pids).
+
+%% Best-effort kill + removal of a transient sandbox cgroup. Writing "1"
+%% to `cgroup.kill` (Linux 5.14+) atomically SIGKILLs every task still in
+%% the cgroup before removing the directory.
+cgroup_cleanup(CgDirBin) ->
+    try
+        CgDir = unicode:characters_to_list(CgDirBin),
+        _ = file:write_file(filename:join(CgDir, "cgroup.kill"), "1\n"),
+        remove_cgroup_dir(CgDir, 10)
+    catch
+        _:_ -> nil
+    end.
+
+remove_cgroup_dir(_CgDir, 0) ->
+    nil;
+remove_cgroup_dir(CgDir, Attempts) ->
+    case file:del_dir(CgDir) of
+        ok -> nil;
+        {error, enoent} -> nil;
+        {error, ebusy} ->
+            timer:sleep(10),
+            remove_cgroup_dir(CgDir, Attempts - 1);
+        _ -> nil
+    end.
 
 %% The inherited environment's variable names (os:getenv/0 answers
 %% "NAME=VALUE" strings; a leading-= split is the whole parse).

@@ -6,14 +6,19 @@
 //// test, so faking it would test nothing.
 
 import filepath
+import gleam/dict
+import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/int
+import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/string
 import gleeunit/should
+import nexus/config
 import nexus/env
 import nexus/timing
+import nexus/tools
 import simplifile
 
 /// A fresh workspace root per test: `/tmp/nexus-env-test-<now_us>`.
@@ -1153,4 +1158,1162 @@ pub fn workspace_target_never_dispatches_remotely_test() {
   // No router call was recorded.
   should.equal(Error(Nil), process.receive(seen, 0))
   let _ = simplifile.delete(root)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: sandbox spawn planning (offline, pure)
+// ---------------------------------------------------------------------------
+
+fn fake_probe(
+  resolved resolved: List(#(String, String)),
+  executables executables: List(String),
+  existing existing: List(String),
+  dirs dirs: List(String),
+  inherited_path inherited_path: String,
+  cgroup_dir cgroup_dir: Option(String),
+) -> env.HostProbe {
+  let resolve_map = dict.from_list(resolved)
+  env.HostProbe(
+    resolve: fn(name) { dict.get(resolve_map, name) },
+    is_executable: fn(path) { list.contains(executables, path) },
+    path_exists: fn(path) {
+      list.contains(existing, path)
+      || list.contains(dirs, path)
+      || list.contains(executables, path)
+    },
+    is_dir: fn(path) { list.contains(dirs, path) },
+    inherited_path: inherited_path,
+    cgroup_dir: cgroup_dir,
+  )
+}
+
+pub fn sandbox_plan_none_matches_phase1_test() {
+  let host =
+    fake_probe(
+      resolved: [#("bash", "/usr/bin/bash"), #("setsid", "/usr/bin/setsid")],
+      executables: ["/usr/bin/bash", "/usr/bin/setsid"],
+      existing: [],
+      dirs: [],
+      inherited_path: "/usr/bin:/bin",
+      cgroup_dir: None,
+    )
+  let assert Ok(plan) =
+    env.build_spawn_plan(
+      sandbox: env.default_sandbox(),
+      host: host,
+      workspace_dir: "/srv/ws/threads/t1",
+      tmp_dir: Some("/srv/ws/tmp/t1"),
+      command: "echo hi",
+    )
+  plan.exe |> should_equal("/usr/bin/setsid")
+  plan.kill_mode |> should_equal(env.KillGroup)
+  plan.allow_env
+  |> should_equal([
+    #("HOME", "/srv/ws/threads/t1"),
+    #("PATH", "/usr/bin:/bin"),
+    #("TMPDIR", "/srv/ws/tmp/t1"),
+  ])
+  plan.passthrough_env |> should_equal(["TZ", "SSL_CERT_FILE", "SSL_CERT_DIR"])
+  let assert ["-w", "/usr/bin/bash", "-c", script] = plan.argv
+  string.ends_with(script, "echo hi") |> should_equal(True)
+
+  // Without setsid, falls back to direct bash + KillPid.
+  let host_no_setsid =
+    fake_probe(
+      resolved: [#("bash", "/usr/bin/bash")],
+      executables: ["/usr/bin/bash"],
+      existing: [],
+      dirs: [],
+      inherited_path: "/usr/bin:/bin",
+      cgroup_dir: None,
+    )
+  let assert Ok(plan2) =
+    env.build_spawn_plan(
+      sandbox: env.default_sandbox(),
+      host: host_no_setsid,
+      workspace_dir: "/srv/ws/threads/t1",
+      tmp_dir: None,
+      command: "true",
+    )
+  plan2.exe |> should_equal("/usr/bin/bash")
+  plan2.kill_mode |> should_equal(env.KillPid)
+  plan2.allow_env
+  |> should_equal([
+    #("HOME", "/srv/ws/threads/t1"),
+    #("PATH", "/usr/bin:/bin"),
+  ])
+}
+
+pub fn sandbox_plan_bwrap_nixos_toolchain_test() {
+  let tc = "/nix/store/abc123-ws-tools"
+  let host =
+    fake_probe(
+      resolved: [
+        #("bwrap", "/nix/store/bw-1/bin/bwrap"),
+        #("prlimit", "/nix/store/ul-1/bin/prlimit"),
+      ],
+      executables: [
+        tc <> "/bin/bash",
+        tc <> "/bin/setsid",
+        tc <> "/bin/sh",
+        tc <> "/bin/env",
+      ],
+      existing: [tc <> "/etc/ssl/certs/ca-bundle.crt"],
+      dirs: ["/nix/store", tc <> "/etc/ssl"],
+      inherited_path: "/run/current-system/sw/bin",
+      cgroup_dir: None,
+    )
+  let sandbox =
+    env.SandboxConfig(
+      backend: env.SandboxBwrap,
+      sandbox_bin: None,
+      toolchain: Some(tc),
+      state_dir: None,
+      max_memory_mb: 512,
+      max_pids: 64,
+    )
+  let assert Ok(plan) =
+    env.build_spawn_plan(
+      sandbox: sandbox,
+      host: host,
+      workspace_dir: "/var/lib/nexus/ws/threads/t1",
+      tmp_dir: Some("/var/lib/nexus/ws/tmp/t1"),
+      command: "python3 -c 'print(1)'",
+    )
+  // Fallback prlimit wraps bwrap in-place (no --nproc, no --cpu).
+  plan.exe |> should_equal("/nix/store/ul-1/bin/prlimit")
+  plan.kill_mode |> should_equal(env.KillPortOsPid)
+  list.any(plan.argv, fn(a) { string.starts_with(a, "--nproc") })
+  |> should_equal(False)
+  list.any(plan.argv, fn(a) { string.starts_with(a, "--cpu") })
+  |> should_equal(False)
+  let assert [
+    "--as=536870912",
+    "--fsize=268435456",
+    "--",
+    "/nix/store/bw-1/bin/bwrap",
+    "--tmpfs",
+    "/",
+    "--ro-bind",
+    "/nix/store",
+    "/nix/store",
+    "--dev",
+    "/dev",
+    "--proc",
+    "/proc",
+    "--ro-bind",
+    "/nix/store/abc123-ws-tools/etc/ssl",
+    "/etc/ssl",
+    "--symlink",
+    "/nix/store/abc123-ws-tools/bin/sh",
+    "/bin/sh",
+    "--symlink",
+    "/nix/store/abc123-ws-tools/bin/env",
+    "/usr/bin/env",
+    "--bind",
+    "/var/lib/nexus/ws/threads/t1",
+    "/workspace",
+    "--chdir",
+    "/workspace",
+    "--bind",
+    "/var/lib/nexus/ws/tmp/t1",
+    "/tmp",
+    "--unshare-net",
+    "--unshare-pid",
+    "--die-with-parent",
+    "--",
+    "/nix/store/abc123-ws-tools/bin/setsid",
+    "-w",
+    "/nix/store/abc123-ws-tools/bin/bash",
+    "-c",
+    script,
+  ] = plan.argv
+  string.ends_with(script, "python3 -c 'print(1)'") |> should_equal(True)
+  plan.allow_env
+  |> should_equal([
+    #("HOME", "/workspace"),
+    #("TMPDIR", "/tmp"),
+    #("PATH", tc <> "/bin"),
+    #("SSL_CERT_FILE", "/etc/ssl/certs/ca-bundle.crt"),
+    #("SSL_CERT_DIR", "/etc/ssl/certs"),
+  ])
+}
+
+pub fn sandbox_plan_bwrap_nixos_without_toolchain_test() {
+  // NixOS host without explicit NEXUS_WORKSPACE_TOOLCHAIN: mounts /nix/store
+  // and /run/current-system/sw (never /run or /run/secrets) and filters
+  // unmounted host PATH entries (e.g. ~/.local/bin) out of PATH.
+  let host =
+    fake_probe(
+      resolved: [
+        #("bwrap", "/run/current-system/sw/bin/bwrap"),
+        #("bash", "/run/current-system/sw/bin/bash"),
+        #("setsid", "/run/current-system/sw/bin/setsid"),
+      ],
+      executables: [
+        "/run/current-system/sw/bin/bwrap",
+        "/run/current-system/sw/bin/bash",
+        "/run/current-system/sw/bin/setsid",
+      ],
+      existing: ["/etc/ssl"],
+      dirs: ["/nix/store", "/run/current-system/sw", "/etc/ssl"],
+      inherited_path: "/home/james/.local/bin:/run/current-system/sw/bin",
+      cgroup_dir: None,
+    )
+  let sandbox =
+    env.SandboxConfig(
+      backend: env.SandboxBwrap,
+      sandbox_bin: None,
+      toolchain: None,
+      state_dir: None,
+      max_memory_mb: 1024,
+      max_pids: 64,
+    )
+  let assert Ok(plan) =
+    env.build_spawn_plan(
+      sandbox: sandbox,
+      host: host,
+      workspace_dir: "/var/lib/nexus/ws/threads/t1",
+      tmp_dir: Some("/var/lib/nexus/ws/tmp/t1"),
+      command: "echo nixos-ok",
+    )
+  has_triple(plan.argv, "--ro-bind", "/nix/store", "/nix/store")
+  |> should_equal(True)
+  has_triple(
+    plan.argv,
+    "--ro-bind",
+    "/run/current-system/sw",
+    "/run/current-system/sw",
+  )
+  |> should_equal(True)
+  has_triple(plan.argv, "--ro-bind", "/run", "/run") |> should_equal(False)
+  has_triple(plan.argv, "--ro-bind", "/run/secrets", "/run/secrets")
+  |> should_equal(False)
+  // Unmounted host PATH entry `/home/james/.local/bin` is filtered out.
+  plan.allow_env
+  |> should_equal([
+    #("HOME", "/workspace"),
+    #("TMPDIR", "/tmp"),
+    #("PATH", "/run/current-system/sw/bin"),
+  ])
+}
+
+pub fn sandbox_plan_bwrap_fhs_and_legacy_no_tmp_test() {
+  let host =
+    fake_probe(
+      resolved: [
+        #("bwrap", "/usr/bin/bwrap"),
+        #("bash", "/usr/bin/bash"),
+        #("setsid", "/usr/bin/setsid"),
+      ],
+      executables: ["/usr/bin/bwrap", "/usr/bin/bash", "/usr/bin/setsid"],
+      existing: [
+        "/usr",
+        "/bin",
+        "/lib",
+        "/lib64",
+        "/etc/ssl",
+        "/etc/ld.so.cache",
+      ],
+      dirs: ["/usr", "/bin", "/lib", "/lib64", "/etc/ssl"],
+      inherited_path: "/home/james/.local/bin:/usr/bin:/bin",
+      cgroup_dir: None,
+    )
+  let sandbox =
+    env.SandboxConfig(
+      backend: env.SandboxBwrap,
+      sandbox_bin: None,
+      toolchain: None,
+      state_dir: None,
+      max_memory_mb: 1024,
+      max_pids: 64,
+    )
+  let assert Ok(plan) =
+    env.build_spawn_plan(
+      sandbox: sandbox,
+      host: host,
+      workspace_dir: "/srv/ws/t-legacy",
+      tmp_dir: None,
+      command: "pwd",
+    )
+  // Without prlimit or cgroup, bwrap is spawned directly.
+  plan.exe |> should_equal("/usr/bin/bwrap")
+  plan.kill_mode |> should_equal(env.KillPortOsPid)
+  // Legacy thread without tmp_dir gets an ephemeral --tmpfs /tmp.
+  has_pair(plan.argv, "--tmpfs", "/tmp") |> should_equal(True)
+  // Safe FHS mounts are present; host /etc as a whole, /home, /run are absent.
+  has_triple(plan.argv, "--ro-bind", "/usr", "/usr") |> should_equal(True)
+  has_triple(plan.argv, "--ro-bind", "/etc/ssl", "/etc/ssl")
+  |> should_equal(True)
+  has_triple(plan.argv, "--ro-bind", "/etc", "/etc") |> should_equal(False)
+  has_triple(plan.argv, "--ro-bind", "/home", "/home") |> should_equal(False)
+  has_triple(plan.argv, "--ro-bind", "/run", "/run") |> should_equal(False)
+  // PATH keeps only mounted prefixes.
+  plan.allow_env
+  |> should_equal([
+    #("HOME", "/workspace"),
+    #("TMPDIR", "/tmp"),
+    #("PATH", "/usr/bin:/bin"),
+  ])
+}
+
+pub fn sandbox_plan_bwrap_cgroup_keeps_fsize_drops_as_test() {
+  let host =
+    fake_probe(
+      resolved: [
+        #("bwrap", "/usr/bin/bwrap"),
+        #("bash", "/usr/bin/bash"),
+        #("setsid", "/usr/bin/setsid"),
+        #("prlimit", "/usr/bin/prlimit"),
+      ],
+      executables: ["/usr/bin/bwrap", "/usr/bin/bash", "/usr/bin/setsid"],
+      existing: ["/usr", "/bin", "/lib64"],
+      dirs: ["/usr", "/bin", "/lib64"],
+      inherited_path: "/usr/bin:/bin",
+      cgroup_dir: Some("/sys/fs/cgroup/system.slice/nexus.service/ws-42"),
+    )
+  let sandbox =
+    env.SandboxConfig(
+      backend: env.SandboxBwrap,
+      sandbox_bin: None,
+      toolchain: None,
+      state_dir: None,
+      max_memory_mb: 1024,
+      max_pids: 64,
+    )
+  let assert Ok(plan) =
+    env.build_spawn_plan(
+      sandbox: sandbox,
+      host: host,
+      workspace_dir: "/srv/ws/threads/t1",
+      tmp_dir: Some("/srv/ws/tmp/t1"),
+      command: "true",
+    )
+  plan.exe |> should_equal("/usr/bin/bash")
+  // Cgroup handles memory.max + pids.max (no --as), while prlimit --fsize
+  // keeps the 256 MiB single-file disk cap active on delegated hosts too.
+  let assert [
+    "-c",
+    cg_script,
+    "_",
+    "/sys/fs/cgroup/system.slice/nexus.service/ws-42",
+    "/usr/bin/prlimit",
+    "--fsize=268435456",
+    "--",
+    "/usr/bin/bwrap",
+    ..rest
+  ] = plan.argv
+  string.contains(cg_script, "cgroup.procs") |> should_equal(True)
+  string.contains(cg_script, "exec \"$@\"") |> should_equal(True)
+  list.any(rest, fn(a) { string.starts_with(a, "--as=") })
+  |> should_equal(False)
+}
+
+pub fn sandbox_plan_bwrap_symlink_toolchain_outside_store_test() {
+  let tc = "/etc/nexus/toolchain"
+  let host =
+    fake_probe(
+      resolved: [],
+      executables: ["/opt/bin/bwrap", tc <> "/bin/bash"],
+      existing: [],
+      dirs: ["/nix/store"],
+      inherited_path: "/usr/bin",
+      cgroup_dir: None,
+    )
+  let sandbox =
+    env.SandboxConfig(
+      backend: env.SandboxBwrap,
+      sandbox_bin: Some("/opt/bin/bwrap"),
+      toolchain: Some(tc),
+      state_dir: None,
+      max_memory_mb: 1024,
+      max_pids: 64,
+    )
+  let assert Ok(plan) =
+    env.build_spawn_plan(
+      sandbox: sandbox,
+      host: host,
+      workspace_dir: "/var/lib/nexus/threads/t1",
+      tmp_dir: Some("/var/lib/nexus/tmp/t1"),
+      command: "true",
+    )
+  plan.exe |> should_equal("/opt/bin/bwrap")
+  has_triple(plan.argv, "--ro-bind", "/nix/store", "/nix/store")
+  |> should_equal(True)
+  has_triple(plan.argv, "--ro-bind", tc, tc) |> should_equal(True)
+}
+
+pub fn sandbox_plan_nono_embedding_contract_test() {
+  let tc = "/nix/store/abc-ws-tools"
+  let state = "/var/lib/nexus/sandbox-state"
+  let ws = "/var/lib/nexus/ws/threads/t1"
+  let tmp = "/var/lib/nexus/ws/tmp/t1"
+  let host =
+    fake_probe(
+      resolved: [#("nono", "/nix/store/nono-1/bin/nono")],
+      executables: [
+        tc <> "/bin/bash",
+        tc <> "/bin/setsid",
+        tc <> "/bin/prlimit",
+      ],
+      existing: [],
+      dirs: ["/nix/store"],
+      inherited_path: "/usr/bin",
+      cgroup_dir: None,
+    )
+  let sandbox =
+    env.SandboxConfig(
+      backend: env.SandboxNono,
+      sandbox_bin: None,
+      toolchain: Some(tc),
+      state_dir: Some(state),
+      max_memory_mb: 256,
+      max_pids: 32,
+    )
+  let assert Ok(plan) =
+    env.build_spawn_plan(
+      sandbox: sandbox,
+      host: host,
+      workspace_dir: ws,
+      tmp_dir: Some(tmp),
+      command: "echo ok",
+    )
+  plan.exe |> should_equal("/nix/store/nono-1/bin/nono")
+  // nono shares the host PID namespace so setsid group-kill stays active.
+  plan.kill_mode |> should_equal(env.KillGroup)
+  // Wrapper HOME/XDG_* point at state_dir outside all grants.
+  plan.allow_env
+  |> should_equal([
+    #("HOME", state),
+    #("XDG_STATE_HOME", state <> "/state"),
+    #("XDG_CACHE_HOME", state <> "/cache"),
+    #("XDG_CONFIG_HOME", state <> "/config"),
+    #("XDG_DATA_HOME", state <> "/data"),
+    #("PATH", tc <> "/bin"),
+  ])
+  // prlimit runs INSIDE nono (after `--`) so RLIMIT_AS does not cap nono.
+  let assert [
+    "wrap",
+    "-s",
+    "--block-net",
+    "--allow-cwd",
+    "-p",
+    "nexus",
+    "--allow-file",
+    "/dev/null",
+    "--allow-file",
+    "/dev/zero",
+    "--allow-file",
+    "/dev/full",
+    "--allow",
+    got_ws,
+    "--allow",
+    got_tmp,
+    "--read",
+    "/nix/store",
+    "--",
+    got_prlimit,
+    "--as=268435456",
+    "--fsize=268435456",
+    "--",
+    got_setsid,
+    "-w",
+    got_bash,
+    "-c",
+    script,
+  ] = plan.argv
+  got_ws |> should_equal(ws)
+  got_tmp |> should_equal(tmp)
+  got_prlimit |> should_equal(tc <> "/bin/prlimit")
+  got_setsid |> should_equal(tc <> "/bin/setsid")
+  got_bash |> should_equal(tc <> "/bin/bash")
+  // Prelude re-exports HOME/TMPDIR and unsets XDG_* BEFORE the PID marker.
+  let expected_prefix =
+    "export HOME='"
+    <> ws
+    <> "'; unset XDG_STATE_HOME XDG_CACHE_HOME XDG_CONFIG_HOME XDG_DATA_HOME; "
+    <> "export TMPDIR='"
+    <> tmp
+    <> "'; printf '%d\\n' $$;"
+  string.starts_with(script, expected_prefix) |> should_equal(True)
+  string.ends_with(script, "echo ok") |> should_equal(True)
+}
+
+pub fn sandbox_plan_nono_quotes_special_paths_test() {
+  env.shell_single_quote("/srv/o'brien/$ws")
+  |> should_equal("'/srv/o'\"'\"'brien/$ws'")
+}
+
+pub fn sandbox_plan_refusals_test() {
+  let empty_host =
+    fake_probe(
+      resolved: [#("bash", "/usr/bin/bash")],
+      executables: ["/usr/bin/bash"],
+      existing: [],
+      dirs: [],
+      inherited_path: "/usr/bin",
+      cgroup_dir: None,
+    )
+  // bwrap missing on PATH
+  let assert Error(msg1) =
+    env.build_spawn_plan(
+      sandbox: env.SandboxConfig(
+        ..env.default_sandbox(),
+        backend: env.SandboxBwrap,
+      ),
+      host: empty_host,
+      workspace_dir: "/srv/ws/t1",
+      tmp_dir: None,
+      command: "true",
+    )
+  string.contains(msg1, "no bwrap executable found") |> should_equal(True)
+
+  // explicit non-executable sandbox_bin
+  let assert Error(msg2) =
+    env.build_spawn_plan(
+      sandbox: env.SandboxConfig(
+        ..env.default_sandbox(),
+        backend: env.SandboxBwrap,
+        sandbox_bin: Some("/opt/missing-bwrap"),
+      ),
+      host: empty_host,
+      workspace_dir: "/srv/ws/t1",
+      tmp_dir: None,
+      command: "true",
+    )
+  string.contains(msg2, "/opt/missing-bwrap") |> should_equal(True)
+
+  // nono without state_dir
+  let assert Error(msg3) =
+    env.build_spawn_plan(
+      sandbox: env.SandboxConfig(
+        ..env.default_sandbox(),
+        backend: env.SandboxNono,
+      ),
+      host: empty_host,
+      workspace_dir: "/srv/ws/t1",
+      tmp_dir: None,
+      command: "true",
+    )
+  string.contains(msg3, "workspace_state_dir") |> should_equal(True)
+
+  // toolchain missing bin/bash
+  let host_with_bwrap =
+    fake_probe(
+      resolved: [#("bwrap", "/usr/bin/bwrap")],
+      executables: ["/usr/bin/bwrap"],
+      existing: [],
+      dirs: [],
+      inherited_path: "/usr/bin",
+      cgroup_dir: None,
+    )
+  let assert Error(msg4) =
+    env.build_spawn_plan(
+      sandbox: env.SandboxConfig(
+        ..env.default_sandbox(),
+        backend: env.SandboxBwrap,
+        toolchain: Some("/opt/empty-tc"),
+      ),
+      host: host_with_bwrap,
+      workspace_dir: "/srv/ws/t1",
+      tmp_dir: None,
+      command: "true",
+    )
+  string.contains(msg4, "/opt/empty-tc/bin/bash") |> should_equal(True)
+
+  // no-toolchain bwrap refuses loudly when resolved bash lives outside mounts
+  let host_unmounted_bash =
+    fake_probe(
+      resolved: [
+        #("bwrap", "/usr/bin/bwrap"),
+        #("bash", "/home/james/.local/bin/bash"),
+      ],
+      executables: ["/usr/bin/bwrap", "/home/james/.local/bin/bash"],
+      existing: ["/usr"],
+      dirs: ["/usr"],
+      inherited_path: "/home/james/.local/bin:/usr/bin",
+      cgroup_dir: None,
+    )
+  let assert Error(msg5) =
+    env.build_spawn_plan(
+      sandbox: env.SandboxConfig(
+        ..env.default_sandbox(),
+        backend: env.SandboxBwrap,
+      ),
+      host: host_unmounted_bash,
+      workspace_dir: "/srv/ws/t1",
+      tmp_dir: None,
+      command: "true",
+    )
+  string.contains(msg5, "outside the bwrap read-only mount set")
+  |> should_equal(True)
+}
+
+fn has_pair(xs: List(String), a: String, b: String) -> Bool {
+  case xs {
+    [x, y, ..rest] ->
+      case x == a && y == b {
+        True -> True
+        False -> has_pair([y, ..rest], a, b)
+      }
+    _ -> False
+  }
+}
+
+fn has_triple(xs: List(String), a: String, b: String, c: String) -> Bool {
+  case xs {
+    [x, y, z, ..rest] ->
+      case x == a && y == b && z == c {
+        True -> True
+        False -> has_triple([y, z, ..rest], a, b, c)
+      }
+    _ -> False
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: offline end-to-end wrapper tests (fake sandbox_bin scripts)
+// ---------------------------------------------------------------------------
+
+fn write_executable_script(path: String, body: String) -> Nil {
+  let assert Ok(Nil) =
+    simplifile.create_directory_all(filepath.directory_name(path))
+  let assert Ok(Nil) = simplifile.write(path, body)
+  let assert Ok(Nil) = simplifile.set_permissions_octal(path, 0o755)
+  Nil
+}
+
+/// Phase 0 embedding contract: `nono -s` hides even fatal sandbox errors
+/// (exit 1, empty output). Verify `bash_with_sandbox` surfaces a silent
+/// non-zero exit before the PID marker as a tool `Error`, AND lazily creates
+/// `<state_dir>/config/nono/profiles/nexus.json` excluding `system_write_linux`.
+pub fn sandbox_silent_wrapper_exit_surfaces_as_error_test() {
+  let root = fresh_root()
+  let state_dir = root <> "-state"
+  let fake_nono = root <> "-bin/fake-nono"
+  write_executable_script(fake_nono, "#!/bin/sh\nexit 1\n")
+
+  let sandbox =
+    env.SandboxConfig(
+      backend: env.SandboxNono,
+      sandbox_bin: Some(fake_nono),
+      toolchain: None,
+      state_dir: Some(state_dir),
+      max_memory_mb: 1024,
+      max_pids: 64,
+    )
+  let result =
+    env.bash_with_sandbox(
+      timeout_ms: 5000,
+      max_output_bytes: 10_000,
+      sandbox: sandbox,
+      environment: env_for(root),
+      cancel: process.new_subject(),
+      arguments: "{\"target\":\"workspace\",\"command\":\"echo should-not-run\"}",
+    )
+  let assert Error(reason) = result
+  string.contains(reason, "sandbox wrapper (nono) exited with status 1")
+  |> should_equal(True)
+
+  // Verify the nexus profile was lazily created with system_write_linux
+  // specifically in `groups.exclude` (not merely mentioned anywhere).
+  let profile_path = filepath.join(state_dir, "config/nono/profiles/nexus.json")
+  let assert Ok(profile) = simplifile.read(profile_path)
+  let exclude_decoder =
+    decode.at(["groups", "exclude"], decode.list(decode.string))
+  let assert Ok(excluded_groups) = json.parse(profile, exclude_decoder)
+  list.contains(excluded_groups, "system_write_linux") |> should_equal(True)
+
+  let _ = simplifile.delete(root)
+  let _ = simplifile.delete(state_dir)
+  let _ = simplifile.delete(root <> "-bin")
+}
+
+/// Verify end-to-end that a cgroup join failure sentinel + exit 125 surfaces
+/// as a tool `Error` (never `Ok("exit status 125...")`), while a normal bash
+/// command exiting 125 still returns `Ok`.
+pub fn sandbox_cgroup_join_failure_surfaces_as_error_test() {
+  let root = fresh_root()
+  let tc = root <> "-tc"
+  write_executable_script(tc <> "/bin/bash", "#!/bin/sh\nexit 0\n")
+  let fake_bwrap = root <> "-bin/fake-bwrap-cgfail"
+  write_executable_script(
+    fake_bwrap,
+    "#!/bin/sh\nprintf '__nexus_cgroup_join_failed__\\n'\nexit 125\n",
+  )
+
+  let sandbox =
+    env.SandboxConfig(
+      backend: env.SandboxBwrap,
+      sandbox_bin: Some(fake_bwrap),
+      toolchain: Some(tc),
+      state_dir: None,
+      max_memory_mb: 1024,
+      max_pids: 64,
+    )
+  let res =
+    env.bash_with_sandbox(
+      timeout_ms: 5000,
+      max_output_bytes: 10_000,
+      sandbox: sandbox,
+      environment: env_for(root),
+      cancel: process.new_subject(),
+      arguments: "{\"target\":\"workspace\",\"command\":\"echo hi\"}",
+    )
+  let _ = simplifile.delete(root)
+  let _ = simplifile.delete(tc)
+  let _ = simplifile.delete(root <> "-bin")
+  let assert Error("bash: failed to join transient sandbox cgroup") = res
+}
+
+/// Verify explicit toolchain on a non-Nix FHS host does NOT emit `--symlink`
+/// for `/bin/sh` or `/usr/bin/env` over the read-only `/bin` and `/usr` binds
+/// (bubblewrap 0.9.0 refuses `--symlink` over existing files in ro-binds).
+pub fn sandbox_plan_bwrap_fhs_explicit_toolchain_skips_colliding_symlinks_test() {
+  let tc = "/opt/ws-tools"
+  let host =
+    fake_probe(
+      resolved: [#("bwrap", "/usr/bin/bwrap")],
+      executables: [
+        "/usr/bin/bwrap",
+        tc <> "/bin/bash",
+        tc <> "/bin/sh",
+        tc <> "/bin/env",
+      ],
+      existing: ["/usr", "/bin", "/lib", "/lib64"],
+      dirs: ["/usr", "/bin", "/lib", "/lib64"],
+      inherited_path: "/usr/bin:/bin",
+      cgroup_dir: None,
+    )
+  let sandbox =
+    env.SandboxConfig(
+      backend: env.SandboxBwrap,
+      sandbox_bin: None,
+      toolchain: Some(tc),
+      state_dir: None,
+      max_memory_mb: 1024,
+      max_pids: 64,
+    )
+  let assert Ok(plan) =
+    env.build_spawn_plan(
+      sandbox: sandbox,
+      host: host,
+      workspace_dir: "/srv/ws/threads/t1",
+      tmp_dir: Some("/srv/ws/tmp/t1"),
+      command: "true",
+    )
+  has_triple(plan.argv, "--ro-bind", tc, tc) |> should_equal(True)
+  has_triple(plan.argv, "--ro-bind", "/bin", "/bin") |> should_equal(True)
+  has_triple(plan.argv, "--ro-bind", "/usr", "/usr") |> should_equal(True)
+  list.contains(plan.argv, "--symlink") |> should_equal(False)
+}
+
+/// Verify end-to-end through a real port that `SandboxNono` launches the
+/// wrapper with `HOME`/`XDG_*` in `state_dir` and scrubbed BEAM secrets, while
+/// the inner bash command sees `HOME=<workspace>`, `TMPDIR=<thread_tmp>`, and
+/// unset `XDG_*`.
+pub fn sandbox_nono_fake_wrapper_env_and_reexport_test() {
+  let root = fresh_root()
+  let state_dir = root <> "-state"
+  let wrapper_log = root <> "-wrapper.env"
+  let fake_nono = root <> "-bin/fake-nono"
+  // Record wrapper's env, strip everything up to `--`, and exec the inner cmd.
+  let script =
+    "#!/bin/sh\n"
+    <> "printf 'WRAP_HOME=%s\\nWRAP_XDG=%s\\nWRAP_CANARY=%s\\n' \"$HOME\" \"$XDG_CONFIG_HOME\" \"$NEXUS_TEST_SECRET_CANARY\" > "
+    <> env.shell_single_quote(wrapper_log)
+    <> "\n"
+    <> "while [ \"$#\" -gt 0 ]; do\n"
+    <> "  arg=\"$1\"; shift\n"
+    <> "  if [ \"$arg\" = \"--\" ]; then exec \"$@\"; fi\n"
+    <> "done\n"
+    <> "exit 99\n"
+  write_executable_script(fake_nono, script)
+
+  let handle =
+    env.Environment(
+      workspace_root: root,
+      thread_id: "t1",
+      workspace_rel_path: Some("threads/t1"),
+      tmp_rel_path: Some("tmp/t1"),
+      roster: env.attached_targets(),
+      remote: None,
+    )
+  let sandbox =
+    env.SandboxConfig(
+      backend: env.SandboxNono,
+      sandbox_bin: Some(fake_nono),
+      toolchain: None,
+      state_dir: Some(state_dir),
+      max_memory_mb: 1024,
+      max_pids: 64,
+    )
+  let original_canary = get_env("NEXUS_TEST_SECRET_CANARY")
+  put_env("NEXUS_TEST_SECRET_CANARY", "secret-must-not-leak")
+  let res =
+    env.bash_with_sandbox(
+      timeout_ms: 5000,
+      max_output_bytes: 10_000,
+      sandbox: sandbox,
+      environment: Some(handle),
+      cancel: process.new_subject(),
+      arguments: "{\"target\":\"workspace\",\"command\":\"printf 'INNER_HOME=%s\\nINNER_TMP=%s\\nINNER_XDG=%s\\n' \\\"$HOME\\\" \\\"$TMPDIR\\\" \\\"$XDG_CONFIG_HOME\\\"\"}",
+    )
+  restore("NEXUS_TEST_SECRET_CANARY", original_canary)
+
+  let assert Ok(out) = res
+  let assert Ok(wrap_env) = simplifile.read(wrapper_log)
+  string.contains(wrap_env, "WRAP_HOME=" <> state_dir) |> should_equal(True)
+  string.contains(wrap_env, "WRAP_XDG=" <> state_dir <> "/config")
+  |> should_equal(True)
+  string.contains(wrap_env, "secret-must-not-leak") |> should_equal(False)
+
+  string.contains(out, "INNER_HOME=" <> filepath.join(root, "threads/t1"))
+  |> should_equal(True)
+  string.contains(out, "INNER_TMP=" <> filepath.join(root, "tmp/t1"))
+  |> should_equal(True)
+  string.contains(out, "INNER_XDG=\n")
+  |> fn(matched) { matched || string.ends_with(out, "INNER_XDG=") }
+  |> should_equal(True)
+
+  let _ = simplifile.delete(root)
+  let _ = simplifile.delete(state_dir)
+  let _ = simplifile.delete(wrapper_log)
+  let _ = simplifile.delete(root <> "-bin")
+}
+
+type LoopbackSocket
+
+@external(erlang, "nexus_env_test_ffi", "listen_loopback")
+fn listen_loopback() -> Result(#(LoopbackSocket, Int), Nil)
+
+@external(erlang, "nexus_env_test_ffi", "close_socket")
+fn close_socket(socket: LoopbackSocket) -> Nil
+
+/// Verify `KillPortOsPid` (the `bwrap` PID-namespace kill path) kills the
+/// direct wrapper host PID on cancel, re-signals the one-shot cancel subject,
+/// and ignores an in-namespace marker PID (`2`) on the host.
+pub fn sandbox_bwrap_fake_wrapper_kill_port_os_pid_test() {
+  let root = fresh_root()
+  let tc = root <> "-tc"
+  let fake_bwrap = root <> "-bin/fake-bwrap"
+  let uniq = int.to_string(timing.now_us())
+  let tag = "nxfakebw" <> uniq <> "q"
+  // Controlled toolchain stub so `build_bwrap_plan` never depends on where
+  // host `bash` resolves on a developer's PATH; resolve real host `bash` and
+  // `sleep` explicitly because `allow_env` sets `PATH=<tc>/bin`.
+  let assert Ok(real_bash) = bash(env_for(root), 5000, "command -v bash")
+  let assert Ok(real_sleep) = bash(env_for(root), 5000, "command -v sleep")
+  write_executable_script(tc <> "/bin/bash", "#!/bin/sh\nexit 0\n")
+  // Emulate a PID-namespace wrapper printing in-namespace PID `2` as line 1,
+  // flushing output, and blocking under a unique argv tag until killed by its
+  // own host OS PID (bash `exec -a` tags the process in `ps`).
+  let script =
+    "#!"
+    <> string.trim(real_bash)
+    <> "\n"
+    <> "printf '2\\n'\n"
+    <> "printf 'ready-in-fake-bwrap\\n'\n"
+    <> "exec -a "
+    <> tag
+    <> " "
+    <> env.shell_single_quote(string.trim(real_sleep))
+    <> " 30\n"
+  write_executable_script(fake_bwrap, script)
+
+  let sandbox =
+    env.SandboxConfig(
+      backend: env.SandboxBwrap,
+      sandbox_bin: Some(fake_bwrap),
+      toolchain: Some(tc),
+      state_dir: None,
+      max_memory_mb: 1024,
+      max_pids: 64,
+    )
+  let handoff = process.new_subject()
+  let reply = process.new_subject()
+  let _worker =
+    process.spawn_unlinked(fn() {
+      let cancel = process.new_subject()
+      process.send(handoff, cancel)
+      let res =
+        env.bash_with_sandbox(
+          timeout_ms: 30_000,
+          max_output_bytes: 10_000,
+          sandbox: sandbox,
+          environment: env_for(root),
+          cancel: cancel,
+          arguments: "{\"target\":\"workspace\",\"command\":\"sleep 30\"}",
+        )
+      let resignalled = process.receive(cancel, 1000)
+      process.send(reply, #(res, resignalled))
+    })
+  let assert Ok(cancel) = process.receive(handoff, 5000)
+  // Positive control: observe the tagged fake wrapper running before cancel.
+  poll_tag_present("nxfakebw" <> uniq <> "[q] 3[0]", 50)
+  process.send(cancel, Nil)
+  let assert Ok(#(res, resignalled)) = process.receive(reply, 10_000)
+  // Confirm `KillPortOsPid` actually terminated the wrapper process.
+  poll_tag_gone("nxfakebw" <> uniq <> "[q]", 50)
+  let _ = simplifile.delete(root)
+  let _ = simplifile.delete(tc)
+  let _ = simplifile.delete(root <> "-bin")
+
+  let assert Error(text) = res
+  string.contains(text, "cancelled") |> should_equal(True)
+  string.contains(text, "ready-in-fake-bwrap") |> should_equal(True)
+  // Marker line `2` was consumed cleanly, not leaked into user output.
+  string.contains(text, "\n2\n") |> should_equal(False)
+  let assert Ok(Nil) = resignalled
+}
+
+/// Pin the `tools.gleam` bridge: configuring `workspace_sandbox = SandboxBwrap`
+/// with a missing `sandbox_bin` routes through `env.bash_with_sandbox` when
+/// the `bash` ToolSpec runs (wire schema unchanged).
+pub fn sandbox_tools_wiring_passes_config_test() {
+  let base =
+    config.from_env(fn(name) {
+      case name {
+        "NEXUS_ENCRYPTION_KEY" ->
+          Ok("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+        "NEXUS_WORKSPACE_ROOT" -> Ok("/tmp/nexus-tools-wiring-test")
+        "NEXUS_WORKSPACE_SANDBOX" -> Ok("bwrap")
+        "NEXUS_WORKSPACE_SANDBOX_BIN" -> Ok("/nonexistent/test-bwrap-bin")
+        _ -> Error(Nil)
+      }
+    })
+  let assert Ok(cfg) = base
+  let assert Ok([spec]) = tools.by_names(cfg, ["bash"])
+  let root = fresh_root()
+  let ctx =
+    tools.ToolCtx(
+      cancel: process.new_subject(),
+      delivery: None,
+      environment: env_for(root),
+    )
+  let res = spec.run(ctx, "{\"target\":\"workspace\",\"command\":\"echo hi\"}")
+  let _ = simplifile.delete(root)
+  let assert Error(reason) = res
+  string.contains(reason, "/nonexistent/test-bwrap-bin") |> should_equal(True)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: opt-in real sandbox integration tests (never PATH-probed)
+// ---------------------------------------------------------------------------
+
+/// Real `bwrap` isolation suite. Runs ONLY when `NEXUS_TEST_BWRAP=1` is set
+/// explicitly (workspace-sandbox plan: default `gleam test` stays deterministic
+/// and offline). Optional overrides: `NEXUS_TEST_BWRAP_BIN`,
+/// `NEXUS_TEST_TOOLCHAIN`.
+pub fn sandbox_bwrap_integration_opt_in_test() {
+  case get_env("NEXUS_TEST_BWRAP") {
+    Ok("1") -> run_real_bwrap_integration()
+    _ -> Nil
+  }
+}
+
+fn run_real_bwrap_integration() -> Nil {
+  let root = fresh_root()
+  let sibling_dir = filepath.join(root, "threads/sibling")
+  let assert Ok(Nil) = simplifile.create_directory_all(sibling_dir)
+  let assert Ok(Nil) =
+    simplifile.write(filepath.join(sibling_dir, "secret.txt"), "sibling-secret")
+
+  let handle =
+    Some(env.Environment(
+      workspace_root: root,
+      thread_id: "t1",
+      workspace_rel_path: Some("threads/t1"),
+      tmp_rel_path: Some("tmp/t1"),
+      roster: env.attached_targets(),
+      remote: None,
+    ))
+  let sandbox =
+    env.SandboxConfig(
+      backend: env.SandboxBwrap,
+      sandbox_bin: get_env("NEXUS_TEST_BWRAP_BIN") |> option.from_result,
+      toolchain: get_env("NEXUS_TEST_TOOLCHAIN") |> option.from_result,
+      state_dir: None,
+      max_memory_mb: 1024,
+      max_pids: 64,
+    )
+  let run = fn(timeout_ms, cmd) {
+    env.bash_with_sandbox(
+      timeout_ms: timeout_ms,
+      max_output_bytes: 50_000,
+      sandbox: sandbox,
+      environment: handle,
+      cancel: process.new_subject(),
+      arguments: json_args([#("target", "workspace"), #("command", cmd)]),
+    )
+  }
+
+  // 1. In-sandbox cwd/HOME=/workspace and /tmp maps to the thread's tmp dir.
+  let assert Ok(out1) =
+    run(
+      10_000,
+      "pwd && echo HOME=$HOME && echo TMPDIR=$TMPDIR && echo ok > /tmp/probe.txt",
+    )
+  string.contains(out1, "/workspace") |> should_equal(True)
+  string.contains(out1, "HOME=/workspace") |> should_equal(True)
+  string.contains(out1, "TMPDIR=/tmp") |> should_equal(True)
+  simplifile.read(filepath.join(root, "tmp/t1/probe.txt"))
+  |> should_equal(Ok("ok\n"))
+
+  // 2. Sibling workspace and host secrets are unreachable.
+  let assert Ok(out2) =
+    run(10_000, "cat " <> filepath.join(sibling_dir, "secret.txt"))
+  string.contains(out2, "sibling-secret") |> should_equal(False)
+  let assert Ok(out3) = run(10_000, "cat /etc/shadow")
+  string.starts_with(out3, "exit status") |> should_equal(True)
+
+  // 3. Offline netns blocks TCP loopback (with a real local listener as
+  //    positive control, and a distinct completion marker proving the
+  //    sandboxed probe actually executed and failed rather than failing launch).
+  let assert Ok(#(sock, port)) = listen_loopback()
+  let tcp_probe =
+    "bash -c 'exec 3<>/dev/tcp/127.0.0.1/"
+    <> int.to_string(port)
+    <> "' 2>&1; echo probe_done rc=$?"
+  let host_probe = bash(handle, 10_000, tcp_probe)
+  let sandbox_probe = run(10_000, tcp_probe)
+  close_socket(sock)
+  let assert Ok(host_out) = host_probe
+  string.contains(host_out, "probe_done rc=0") |> should_equal(True)
+  let assert Ok(out4) = sandbox_probe
+  string.contains(out4, "probe_done rc=") |> should_equal(True)
+  string.contains(out4, "probe_done rc=0") |> should_equal(False)
+
+  // 4. Timeout reaps background children inside the PID namespace (observe
+  //    the tagged child running first so absence cannot pass vacuously).
+  let uniq = int.to_string(timing.now_us())
+  let tag = "nxbwrap" <> uniq <> "q"
+  let timeout_reply = process.new_subject()
+  let _worker =
+    process.spawn_unlinked(fn() {
+      let res = run(2500, "exec -a " <> tag <> " sleep 30 & sleep 30")
+      process.send(timeout_reply, res)
+    })
+  poll_tag_present("nxbwrap" <> uniq <> "[q] 3[0]", 50)
+  let assert Ok(Error(timeout_msg)) = process.receive(timeout_reply, 10_000)
+  string.contains(timeout_msg, "timed out") |> should_equal(True)
+  poll_tag_gone("nxbwrap" <> uniq <> "[q]", 25)
+
+  let _ = simplifile.delete(root)
+  Nil
+}
+
+/// Real `nono` isolation suite. Runs ONLY when `NEXUS_TEST_NONO=1` is set
+/// explicitly. Optional overrides: `NEXUS_TEST_NONO_BIN`,
+/// `NEXUS_TEST_TOOLCHAIN`, `NEXUS_TEST_NONO_ROOT` (a parent dir outside
+/// `/tmp` and `/var/tmp`, which nono treats as protected state roots).
+pub fn sandbox_nono_integration_opt_in_test() {
+  case get_env("NEXUS_TEST_NONO") {
+    Ok("1") -> run_real_nono_integration()
+    _ -> Nil
+  }
+}
+
+fn run_real_nono_integration() -> Nil {
+  let base = case get_env("NEXUS_TEST_NONO_ROOT") {
+    Ok(dir) -> dir
+    Error(Nil) ->
+      case get_env("HOME") {
+        Ok(home) -> filepath.join(home, ".cache/nexus-nono-test")
+        Error(Nil) ->
+          panic as "NEXUS_TEST_NONO=1 requires NEXUS_TEST_NONO_ROOT (outside /tmp and /var/tmp) when HOME is unset"
+      }
+  }
+  let uniq = int.to_string(timing.now_us())
+  let root = filepath.join(base, "ws-" <> uniq)
+  let state_dir = filepath.join(base, "state-" <> uniq)
+  let sibling_dir = filepath.join(root, "threads/sibling")
+  let assert Ok(Nil) = simplifile.create_directory_all(sibling_dir)
+  let assert Ok(Nil) =
+    simplifile.write(filepath.join(sibling_dir, "secret.txt"), "sibling-secret")
+
+  let handle =
+    Some(env.Environment(
+      workspace_root: root,
+      thread_id: "t1",
+      workspace_rel_path: Some("threads/t1"),
+      tmp_rel_path: Some("tmp/t1"),
+      roster: env.attached_targets(),
+      remote: None,
+    ))
+  let sandbox =
+    env.SandboxConfig(
+      backend: env.SandboxNono,
+      sandbox_bin: get_env("NEXUS_TEST_NONO_BIN") |> option.from_result,
+      toolchain: get_env("NEXUS_TEST_TOOLCHAIN") |> option.from_result,
+      state_dir: Some(state_dir),
+      max_memory_mb: 1024,
+      max_pids: 64,
+    )
+  let run = fn(timeout_ms, cmd) {
+    env.bash_with_sandbox(
+      timeout_ms: timeout_ms,
+      max_output_bytes: 50_000,
+      sandbox: sandbox,
+      environment: handle,
+      cancel: process.new_subject(),
+      arguments: json_args([#("target", "workspace"), #("command", cmd)]),
+    )
+  }
+
+  // 1. HOME/TMPDIR re-exported; XDG_* unset.
+  let assert Ok(out1) =
+    run(
+      10_000,
+      "echo HOME=$HOME && echo TMPDIR=$TMPDIR && echo XDG=$XDG_CONFIG_HOME",
+    )
+  string.contains(out1, "HOME=" <> filepath.join(root, "threads/t1"))
+  |> should_equal(True)
+  string.contains(out1, "TMPDIR=" <> filepath.join(root, "tmp/t1"))
+  |> should_equal(True)
+  string.contains(out1, state_dir) |> should_equal(False)
+
+  // 2. Sibling workspace read blocked and hardcoded /tmp write blocked.
+  let assert Ok(out2) =
+    run(10_000, "cat " <> filepath.join(sibling_dir, "secret.txt"))
+  string.contains(out2, "sibling-secret") |> should_equal(False)
+  let host_tmp_probe = "/tmp/nexus-nono-escape-" <> uniq
+  let assert Ok(out3) = run(10_000, "echo bad > " <> host_tmp_probe)
+  string.starts_with(out3, "exit status") |> should_equal(True)
+  simplifile.is_file(host_tmp_probe) |> should_equal(Ok(False))
+
+  // 3. Offline --block-net blocks TCP loopback connect (with a real local
+  //    listener as positive control and a completion marker proving the
+  //    sandboxed probe actually ran).
+  let assert Ok(#(sock, port)) = listen_loopback()
+  let tcp_probe =
+    "bash -c 'exec 3<>/dev/tcp/127.0.0.1/"
+    <> int.to_string(port)
+    <> "' 2>&1; echo probe_done rc=$?"
+  let host_probe = bash(handle, 10_000, tcp_probe)
+  let sandbox_probe = run(10_000, tcp_probe)
+  close_socket(sock)
+  let assert Ok(host_out) = host_probe
+  string.contains(host_out, "probe_done rc=0") |> should_equal(True)
+  let assert Ok(out4) = sandbox_probe
+  string.contains(out4, "probe_done rc=") |> should_equal(True)
+  string.contains(out4, "probe_done rc=0") |> should_equal(False)
+
+  // 4. Timeout reaps background children under nono (observe the tagged child
+  //    running first so absence cannot pass vacuously).
+  let tag = "nxnono" <> uniq <> "q"
+  let timeout_reply = process.new_subject()
+  let _worker =
+    process.spawn_unlinked(fn() {
+      let res = run(2500, "exec -a " <> tag <> " sleep 30 & sleep 30")
+      process.send(timeout_reply, res)
+    })
+  poll_tag_present("nxnono" <> uniq <> "[q] 3[0]", 50)
+  let assert Ok(Error(timeout_msg)) = process.receive(timeout_reply, 10_000)
+  string.contains(timeout_msg, "timed out") |> should_equal(True)
+  poll_tag_gone("nxnono" <> uniq <> "[q]", 25)
+
+  let _ = simplifile.delete(root)
+  let _ = simplifile.delete(state_dir)
+  Nil
 }
