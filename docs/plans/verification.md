@@ -22,10 +22,11 @@ However, four structural verification gaps remain where bugs can pass
 every automated check and still break production:
 
 1. **Mock-to-Postgres drift.** `test/store_mock.gleam` is ~2,000 lines of
-   hand-maintained simulation of 47 SQL files in `src/nexus/store/sql/`.
+   hand-maintained simulation of 48 SQL files in `src/nexus/store/sql/`.
    CI already boots `postgres:17` on every PR (`.github/workflows/test.yml`)
-   for migrations and `squirrel check`, then never runs a single query
-   against it.
+   for migrations and `squirrel check` (which prepares/type-checks the
+   SQL against Postgres), but Nexus's `store/persist` code paths and
+   behavioral contracts never execute against Postgres in tests.
 2. **Example-only coverage on state-machine invariants.** Crown-jewel
    invariants (KV-cache prefix monotonicity across restarts, UI ↔ server
    commit/rollback/replay parity, multi-hop bot-channel archive/delete
@@ -73,7 +74,7 @@ Ordered by **bugs-prevented per unit of engineering effort and ongoing cost**:
 
 | Phase | Workstream | LLM cost | Primary failure classes caught | Effort |
 | :--- | :--- | :--- | :--- | :--- |
-| **P1** | Differential `Store` contract suite (`store_mock` vs real Postgres 17 in CI) | $0 | SQL CTE bugs, FK cascade mismatches, `ON CONFLICT` / `seq` bugs, `timestamptz` drift, mock-vs-Postgres divergence across all 47 queries | Medium |
+| **P1** | Differential `Store` contract suite (`store_mock` vs real Postgres 17 in CI) | $0 | SQL CTE bugs, FK cascade mismatches, `ON CONFLICT` / `seq` bugs, `timestamptz` drift, mock-vs-Postgres divergence across all 48 queries | Medium |
 | **P2** | Deterministic E2E jobs in CI (`browser`, `node`, `tui` + sandbox probes) | $0 | Real WebSocket/Lustre/shadow-DOM/auth/reconnect/prefix regressions, node protocol & TUI regressions, sandbox leaks | Low–Med |
 | **P3** | Property-based & adversarial invariant tests (offline in `gleam test`) | $0 | KV-cache prefix breaks across arbitrary sequences/restarts, UI↔server replay drift, bot-channel tree races, SSE chunk-split & malformed-wire bugs | Medium |
 | **P4** | Runtime KV-cache prefix sentinel (always-on, zero wire-byte impact) | $0 | Any real-world prefix divergence in staging/prod caught on the exact turn it happens | Low |
@@ -156,8 +157,9 @@ invoke them locally.
 
 ### Design
 - **Add a second CI job (`e2e`)** in `.github/workflows/test.yml` running on
-  `ubuntu-latest` (host runner with Node ≥ 20 + cached Playwright Chromium +
-  Erlang/Gleam + `postgres:17` service) so the fast `test` container job
+  `ubuntu-latest` (host runner with Node ≥ 22 — required by `node.spec.mjs`'s
+  built-in `WebSocket` per `e2e/README.md` — plus cached Playwright Chromium,
+  Erlang/Gleam, and a `postgres:17` service) so the fast `test` container job
   stays unchanged and lean.
 - **Run all three $0 deterministic suites**:
   - `node e2e/browser.spec.mjs` (upload `e2e/report.json` on failure)
@@ -211,8 +213,12 @@ tiny internal seeded generator if zero new dev deps is preferred.
   and `\n` delimiters, reasoning deltas, parallel tool-call deltas, and
   usage blocks. Split the raw `BitArray` at random chunk sizes (including
   1-byte chunks and splits directly inside UTF-8 sequences and `\r\n\r\n`).
-  Assert that the emitted `List(StreamEvent)` and `StreamStats` are
-  **identical** to delivering the whole stream in one chunk.
+  Assert that the emitted `List(StreamEvent)` and timing-independent
+  `StreamStats` fields (`token_deltas`, `reasoning_deltas`,
+  `tool_call_deltas`, `events_parsed`, `decode_errors`, `saw_done`,
+  `usage`) are **identical** to delivering the whole stream in one chunk;
+  verify `ttft_ms` and `duration_ms` separately with an injected
+  deterministic clock.
 - **Hostile/malformed stream property**: Feed truncated streams, garbage
   JSON lines, duplicate/missing tool call IDs, reasoning-only turns,
   whitespace-only assistant content alongside tool calls, and out-of-order
@@ -236,8 +242,8 @@ tiny internal seeded generator if zero new dev deps is preferred.
      `stream`, `tools`, `tool_choice`).
   3. Mutating any sidecar (`reasoning`, `timestamps`, `origins`,
      `tool_results`) changes **zero bytes** of `to_request`.
-  4. Persisting rows via `store.rows_from_transcript` and rebuilding via
-     `store.hydrate_transcript` produces a **byte-identical** `to_request`
+  4. Persisting rows via `store.transcript_rows` and rebuilding via
+     `store.transcript_from_rows` produces a **byte-identical** `to_request`
      body.
 
 #### 3c. UI ↔ Server commit/rollback/replay parity (`test/ui_parity_property_test.gleam`)
@@ -291,16 +297,27 @@ KV-cache contract at zero extra LLM cost.
 
 ### Design
 - In `src/nexus/transcript.gleam` (or `src/nexus/thread.gleam` /
-  `src/nexus/loop.gleam`), add a small pure helper that hashes the
-  canonical request prefix (envelope + encoded `messages[0..n-1]`,
-  excluding the newly appended suffix) using `gleam_crypto` SHA-256.
-- Store the previous turn's full encoded `messages` byte length and
-  prefix hash in the live thread actor's ephemeral state (never
-  persisted, never encoded into requests).
+  `src/nexus/loop.gleam`), add a small pure helper that extracts and
+  hashes two independent regions of the serialized request body using
+  `gleam_crypto` SHA-256:
+  1. `envelope_hash`: SHA-256 of the serialized request with the
+     `messages` array removed (covering `model`, `stream`, `tools`,
+     `tool_choice`, and any other top-level envelope fields).
+  2. `messages_prefix_hash` + `messages_prefix_len`: SHA-256 and byte
+     length of the serialized `messages` array up to the end of its last
+     element, **excluding the closing `]`** (so appending a message
+     extends the exact byte prefix with `,` + new element(s) + `]`).
+- Store `#(envelope_hash, messages_prefix_len, messages_prefix_hash)`
+  from the previous turn in the live thread actor's ephemeral state
+  (never persisted, never encoded into requests).
 - Before dispatching each subsequent request on a thread:
-  - Verify that the first `prev_len` bytes of the new encoded `messages`
-    array hash identically to `prev_hash`, and that the frozen envelope
-    hash is unchanged.
+  - Verify that `envelope_hash` is identical to the stored value, and
+    that the first `messages_prefix_len` bytes of the new serialized
+    `messages` array (excluding its closing `]`) hash identically to
+    `messages_prefix_hash` (with the next byte being `,` on growth or `]`
+    on an unchanged retry). Then update the stored `messages_prefix_len`
+    and `messages_prefix_hash` from the new request's `messages` slice
+    (again excluding the closing `]`).
   - On mismatch: emit a structured `ERROR` log (`event=kv_prefix_broken`,
     `thread_id`, `turn`, `reason`) and increment an observable counter in
     `GET /threads/<id>/state` (debug dump). Do **not** abort the user's
@@ -336,10 +353,13 @@ structural and statistical gates instead of brittle string checks**.
   `max_completion_tokens` caps).
 - **Wire-capture recorder**: Add an opt-in capture flag (e.g.,
   `NEXUS_CAPTURE_WIRE_DIR` in E2E / proxy layer in `integration.spec.mjs`,
-  never in production runtime) that saves raw SSE byte streams per
-  provider dialect into `test/fixtures/wire/`. Whenever a new provider or
-  backend version is validated live, its raw SSE stream becomes a
-  permanent $0 offline regression fixture in Phase 3a.
+  never in production runtime) restricted strictly to **synthetic smoke
+  prompts**, never live user conversations. Before committing any
+  captured SSE stream into `test/fixtures/wire/`, run an explicit
+  redaction/scrubbing pass (stripping request/response headers, API keys,
+  provider/internal hostnames, org IDs, and any unexpected secrets) so
+  only sanitized synthetic fixtures enter version control and serve as
+  permanent $0 offline regression inputs in Phase 3a.
 - **Invariant-based live gates** (extending `e2e/integration.spec.mjs`):
   - **Streaming & reasoning**: at least one real turn emits content (and
     reasoning on reasoning-capable aliases), completes cleanly, and
@@ -382,7 +402,7 @@ structural and statistical gates instead of brittle string checks**.
 
 1. **Start with Phase 1 (Differential Store Contract Suite)** — highest
    bug-finding probability per hour, leverages CI's existing `postgres:17`
-   container, and protects all 47 SQL queries against `store_mock` drift.
+   container, and protects all 48 SQL queries against `store_mock` drift.
 2. **Immediately follow with Phase 2 (CI E2E job)** — turns existing
    high-signal Playwright/node/TUI suites into automatic PR gates.
 3. **Add Phase 3a (SSE chunk-boundary property test + fix the two
