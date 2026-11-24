@@ -38,6 +38,7 @@ import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:http";
+import { pgEnvFromUrl, resetDatabase as resetDb } from "./lib.mjs";
 
 const ROOT = new URL("..", import.meta.url).pathname;
 const TOKEN = "smoke-token-tui-" + Date.now();
@@ -86,22 +87,7 @@ async function poll(fn, { timeout = 30_000, interval = 250, message = "poll" } =
 // each spec is standalone and validation-only).
 // ---------------------------------------------------------------------------
 
-function resetDatabase() {
-  return new Promise((resolve, reject) => {
-    const child = spawn(
-      "psql",
-      ["-q", DATABASE_URL, "-c", "truncate thread_message, thread, bot, node, provider cascade;"],
-      { stdio: ["ignore", "pipe", "pipe"] },
-    );
-    let out = "";
-    child.stdout.on("data", (d) => (out += d));
-    child.stderr.on("data", (d) => (out += d));
-    child.on("error", (err) => reject(new Error(`psql not found (${err.message})`)));
-    child.on("exit", (code) =>
-      code === 0 ? resolve() : reject(new Error(`database reset failed (${code}):\n${out}`)),
-    );
-  });
-}
+const resetDatabase = () => resetDb(DATABASE_URL);
 
 /// The fake OpenAI-compatible provider. The `nodebash` scenario streams
 /// a bash tool call whose target is THIS suite's node; round 2 answers
@@ -225,11 +211,6 @@ function seedProvider(port) {
 }
 
 function startNexus(providerPort, workspaceRoot) {
-  // Derive the server's Postgres settings from the selected database
-  // URL — reset/seed already honor E2E_DATABASE_URL, so a non-default
-  // URL must not leave the server pointed at the default database
-  // (cubic PR review).
-  const pg = new URL(DATABASE_URL);
   const env = {
     ...process.env,
     NEXUS_ENCRYPTION_KEY: ENC_KEY,
@@ -240,11 +221,7 @@ function startNexus(providerPort, workspaceRoot) {
     NEXUS_WORKSPACE_ROOT: workspaceRoot,
     NEXUS_ENV_TIMEOUT_MS: "20000",
     NEXUS_SYSTEM_PROMPT: "You are nexus under the node-TUI e2e test.",
-    NEXUS_PG_HOST: pg.hostname,
-    NEXUS_PG_PORT: pg.port || "5432",
-    NEXUS_PG_DATABASE: pg.pathname.slice(1),
-    NEXUS_PG_USER: decodeURIComponent(pg.username),
-    ...(pg.password ? { NEXUS_PG_PASSWORD: decodeURIComponent(pg.password) } : {}),
+    ...pgEnvFromUrl(DATABASE_URL),
   };
   const child = spawn("gleam", ["run"], {
     cwd: ROOT,
@@ -494,13 +471,19 @@ async function main() {
   await waitHealthy();
 
   // The thread comes first: a node row binds to its thread (per-thread
-  // node names), so POST /nodes requires the thread id.
+  // node names), so POST /nodes requires the thread id. Threads are
+  // bot-only, so create the env-toolset bot first.
   const envThread = await check("create env-toolset thread", async () => {
-    const res = await api("POST", "/threads", {
+    const botRes = await api("POST", "/bots", {
+      name: "tui-env-bot",
       provider: "faketui",
       model: "smart",
       tools: ["bash", "read_file", "write_file", "list_dir"],
     });
+    if (botRes.status !== 201) {
+      throw new Error(`bot create expected 201, got ${botRes.status}: ${JSON.stringify(botRes.body)}`);
+    }
+    const res = await api("POST", "/threads", { bot: botRes.body.id });
     if (res.status !== 201) throw new Error(`expected 201, got ${res.status}: ${JSON.stringify(res.body)}`);
     return res.body.id;
   });

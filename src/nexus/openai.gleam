@@ -276,6 +276,7 @@ fn stream_request(
                 events_parsed: 0,
                 decode_errors: 0,
                 saw_done: False,
+                saw_finish: False,
                 first_decode_error: None,
                 usage: None,
               ),
@@ -513,6 +514,10 @@ pub type Acc {
     events_parsed: Int,
     decode_errors: Int,
     saw_done: Bool,
+    /// True once any choice delta carried a non-empty `finish_reason`
+    /// (`stop`, `tool_calls`, `length`, etc.). Together with `saw_done`,
+    /// distinguishes a clean completion from a truncated mid-stream TCP drop.
+    saw_finish: Bool,
     first_decode_error: Option(String),
     /// Latest usage block seen on any chunk.
     usage: Option(CompletionUsage),
@@ -544,6 +549,10 @@ pub fn handle_chunk(
     None -> acc
   }
   list.fold(chunk.choices, acc, fn(acc, choice) {
+    let acc = case choice.finish_reason {
+      Some(_) -> Acc(..acc, saw_finish: True)
+      None -> acc
+    }
     let acc = case choice.delta.content {
       Some(text) if text != "" -> {
         on_event(TokenDelta(text))
@@ -578,6 +587,22 @@ pub fn handle_chunk(
   })
 }
 
+/// Pure, offline-testable truncation classification for a closed stream:
+/// `None` when the stream ended cleanly (`[DONE]` or any choice `finish_reason`)
+/// or produced zero events (which takes the buffered status-probe path);
+/// `Some(Transport(...))` when events were delivered and the stream then closed
+/// with neither `[DONE]` nor a `finish_reason`.
+pub fn truncation_error(acc: Acc) -> Option(StreamError) {
+  case acc.events_parsed > 0, acc.saw_done || acc.saw_finish {
+    True, True -> None
+    True, False ->
+      Some(Transport(
+        "upstream stream closed before completion (missing [DONE] and finish_reason)",
+      ))
+    False, _ -> None
+  }
+}
+
 fn finish_stream(
   req: Request(String),
   started_us: Int,
@@ -602,7 +627,15 @@ fn finish_stream(
       usage: acc.usage,
     )
   case acc.events_parsed == 0 && !acc.saw_done {
-    False -> Ok(stats)
+    False ->
+      // A stream that delivered events and then closed with NEITHER
+      // `data: [DONE]` NOR any choice `finish_reason` was truncated mid-flight
+      // (upstream disconnect / proxy reset). Fail as a transport error so the
+      // turn rolls back cleanly instead of committing a half-streamed reply.
+      case truncation_error(acc) {
+        None -> Ok(stats)
+        Some(error) -> Error(error)
+      }
     True -> {
       // Zero parsed events then Closed: classify as non-200-or-empty and
       // re-run buffered once to capture the actual status/body.

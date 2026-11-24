@@ -2,11 +2,12 @@
 //// part of the Nexus runtime):
 ////
 ////   1. fake Bifrost  — an OpenAI-compatible SSE server playing scripted
-////      scenarios (text / slow / fetch / search / loop) so the UI's tool
-////      rendering, loop chip, stop, and guard behaviour are deterministic.
-////      It also records every chat request body verbatim, which lets the
-////      suite assert byte-identical prefix growth turn-over-turn.
-////   2. doc server    — the http_fetch target under our control.
+////      scenarios (text / slow / fetch / search / loop / disconnect / ratelimit)
+////      so the UI's tool rendering, loop chip, stop, guard, and fault rollback
+////      behaviour are deterministic. It also records every chat request body
+////      verbatim, which lets the suite assert byte-identical prefix growth
+////      turn-over-turn.
+////   2. doc server    — the web_fetch target under our control.
 ////   3. searxng stub  — a SearxNG-compatible `/search?format=json` endpoint.
 ////
 //// All servers bind 127.0.0.1 on ephemeral ports and are closed by the
@@ -26,9 +27,14 @@ import { createServer } from "node:http";
 // completed (the freeze test fails loudly on exactly that).
 export const UTILITY_REPLY_DELAY_MS = 15000;
 
+/// Must mirror `src/nexus/utility.gleam` `utility_token_cap` (and
+/// `e2e/browser.spec.mjs` `UTILITY_DELTA`): utility title/tags side calls are
+/// identified — and excluded from the 429 fault gate — by this exact cap.
+const UTILITY_MAX_COMPLETION_TOKENS = 512;
+
 export function startServices() {
   return new Promise((resolve, reject) => {
-    const state = { requests: [], utilityTimeline: [] };
+    const state = { requests: [], utilityTimeline: [], failRateLimit: true };
 
     const doc = createServer((req, res) => {
       const url = new URL(req.url, "http://127.0.0.1");
@@ -111,6 +117,9 @@ export function startServices() {
             bifrostPort: bifrost.address().port,
             requests: state.requests,
             utilityTimeline: state.utilityTimeline,
+            setRateLimitFail: (flag) => {
+              state.failRateLimit = Boolean(flag);
+            },
             close: () =>
               Promise.all(
                 servers.map(
@@ -162,6 +171,26 @@ function usageChunk() {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function playScenario(res, request, state) {
+  const lastUserIndex = request.messages.findLastIndex((m) => m.role === "user");
+  const lastUser = request.messages[lastUserIndex];
+  const userText = String(lastUser?.content ?? "");
+  const scenario = /case:(\w+)/.exec(userText)?.[1] ?? "text";
+
+  // Non-200 / rate-limit chaos scenario (verification plan Phase 2):
+  // returns HTTP 429 before SSE headers while `state.failRateLimit` is true
+  // (covering both the initial streaming request and openai.gleam's buffered
+  // status-probe re-run). Clearing the flag lets a retry of the exact same
+  // prompt succeed with a byte-identical prefix.
+  if (
+    request.max_completion_tokens !== UTILITY_MAX_COMPLETION_TOKENS &&
+    scenario === "ratelimit" &&
+    state.failRateLimit
+  ) {
+    res.writeHead(429, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { message: "rate limit exceeded" } }));
+    return;
+  }
+
   res.writeHead(200, {
     "content-type": "text/event-stream",
     "cache-control": "no-cache",
@@ -169,10 +198,6 @@ async function playScenario(res, request, state) {
   // `: heartbeat` comments like real Bifrost sends.
   res.write(": heartbeat\n\n");
 
-  const lastUserIndex = request.messages.findLastIndex((m) => m.role === "user");
-  const lastUser = request.messages[lastUserIndex];
-  const userText = String(lastUser?.content ?? "");
-  const scenario = /case:(\w+)/.exec(userText)?.[1] ?? "text";
   // Round 2 of a scenario starts once this user message has been answered
   // with a tool result — earlier turns' tool messages don't count.
   const hasToolResult = request.messages
@@ -215,7 +240,7 @@ async function playScenario(res, request, state) {
   // to land). Held for UTILITY_REPLY_DELAY_MS so the suite can save a
   // manual tag set before the apply lands (the store guard must then
   // refuse it).
-  if (request.max_completion_tokens === 512) {
+  if (request.max_completion_tokens === UTILITY_MAX_COMPLETION_TOKENS) {
     // Timeline entry: when the branch request arrived and when its held
     // reply finished streaming. The freeze test uses the pair to prove
     // the manual tag save really preceded the apply (the premise of the
@@ -269,7 +294,7 @@ async function playScenario(res, request, state) {
       const target = /https?:\/\/\S+/.exec(userText)?.[0] ?? "http://127.0.0.1/doc.json";
       if (!hasToolResult) {
         await streamText("Checking that URL now.");
-        await streamToolCall("http_fetch", JSON.stringify({ url: target }));
+        await streamToolCall("web_fetch", JSON.stringify({ url: target }));
         finish();
       } else {
         await streamText("Fetch complete: the document says nexus-e2e-doc.");
@@ -285,7 +310,7 @@ async function playScenario(res, request, state) {
       const target = /https?:\/\/\S+/.exec(userText)?.[0] ?? "http://127.0.0.1/doc.json";
       if (!hasToolResult) {
         await streamText("Checking that URL now.");
-        await streamToolCall("http_fetch", JSON.stringify({ url: target }));
+        await streamToolCall("web_fetch", JSON.stringify({ url: target }));
         finish();
       } else {
         await sleep(8000);
@@ -310,7 +335,26 @@ async function playScenario(res, request, state) {
     case "loop": {
       // Never a final answer: every round issues another tool call, so the
       // iteration guard must trip (used against the max=2 instance).
-      await streamToolCall("http_fetch", JSON.stringify({ url: `http://127.0.0.1:${state.docPort ?? 1}/loop` }));
+      await streamToolCall("web_fetch", JSON.stringify({ url: `http://127.0.0.1:${state.docPort ?? 1}/loop` }));
+      finish();
+      return;
+    }
+    case "disconnect": {
+      // Mid-stream disconnect chaos scenario (verification plan Phase 2):
+      // stream partial tokens so the live bubble renders, then drop the TCP
+      // connection abruptly without sending the chunked terminator or [DONE]
+      // so the client sees a transport error and rolls back uncommitted lines.
+      sse(res, chunk({ role: "assistant", content: "" }));
+      await streamText("Partial uncommitted text before drop", { delay: 40 });
+      await sleep(100);
+      res.socket?.destroy();
+      return;
+    }
+    case "ratelimit": {
+      // Reached only once `state.failRateLimit` is cleared for the retry.
+      sse(res, chunk({ role: "assistant", content: "" }));
+      await streamText("Recovered after rate limit.");
+      sse(res, chunk({}, "stop"));
       finish();
       return;
     }

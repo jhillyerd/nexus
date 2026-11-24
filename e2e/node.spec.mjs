@@ -38,6 +38,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:http";
+import { pgEnvFromUrl, resetDatabase as resetDb } from "./lib.mjs";
 
 const ROOT = new URL("..", import.meta.url).pathname;
 const TOKEN = "smoke-token-node-" + Date.now();
@@ -81,22 +82,7 @@ async function poll(fn, { timeout = 20_000, interval = 250, message = "poll" } =
 
 /// Reset the shared e2e database (node rows included — this suite pairs
 /// through the real table).
-function resetDatabase() {
-  return new Promise((resolve, reject) => {
-    const child = spawn(
-      "psql",
-      ["-q", DATABASE_URL, "-c", "truncate thread_message, thread, bot, node, provider cascade;"],
-      { stdio: ["ignore", "pipe", "pipe"] },
-    );
-    let out = "";
-    child.stdout.on("data", (d) => (out += d));
-    child.stderr.on("data", (d) => (out += d));
-    child.on("error", (err) => reject(new Error(`psql not found (${err.message})`)));
-    child.on("exit", (code) =>
-      code === 0 ? resolve() : reject(new Error(`database reset failed (${code}):\n${out}`)),
-    );
-  });
-}
+const resetDatabase = () => resetDb(DATABASE_URL);
 
 /// The fake OpenAI-compatible provider: /v1/models + scripted SSE
 /// completions. Env-tool scenarios stream a bash tool call whose target
@@ -254,6 +240,7 @@ function startNexus(providerPort, workspaceRoot) {
     // dying), not by this deadline.
     NEXUS_ENV_TIMEOUT_MS: "20000",
     NEXUS_SYSTEM_PROMPT: "You are nexus under node-protocol e2e test.",
+    ...pgEnvFromUrl(DATABASE_URL),
   };
   const child = spawn("gleam", ["run"], {
     cwd: ROOT,
@@ -437,16 +424,31 @@ async function main() {
   await waitHealthy();
 
   // --- Pairing + thread setup -------------------------------------------
+  // Threads are bot-only: create a bot template with the desired toolset
+  // (or default when `tools` is omitted), then start the thread from it.
+  let botSeq = 0;
+  const createBotThread = async (nameHint, tools = undefined) => {
+    botSeq += 1;
+    const botRes = await api("POST", "/bots", {
+      name: `${nameHint}-${botSeq}`,
+      provider: "fakenode",
+      model: "smart",
+      ...(tools !== undefined ? { tools } : {}),
+    });
+    if (botRes.status !== 201) {
+      throw new Error(`bot create (${nameHint}) returned ${botRes.status}: ${JSON.stringify(botRes.body)}`);
+    }
+    const res = await api("POST", "/threads", { bot: botRes.body.id });
+    if (res.status !== 201) {
+      throw new Error(`expected 201, got ${res.status}: ${JSON.stringify(res.body)}`);
+    }
+    return res.body.id;
+  };
+
   // The thread comes first: a node row binds to its thread (per-thread
   // node names), so POST /nodes requires the thread id.
   const envThread = await check("create env-toolset thread", async () => {
-    const res = await api("POST", "/threads", {
-      provider: "fakenode",
-      model: "smart",
-      tools: ["bash", "read_file", "write_file", "list_dir"],
-    });
-    if (res.status !== 201) throw new Error(`expected 201, got ${res.status}: ${JSON.stringify(res.body)}`);
-    return res.body.id;
+    return await createBotThread("node-env-bot", ["bash", "read_file", "write_file", "list_dir"]);
   });
 
   const pair = await check("pair node through POST /nodes", async () => {
@@ -677,18 +679,11 @@ async function main() {
 
   await check("env role refused on a non-env thread (403)", async () => {
     // An EXPLICIT non-env toolset: under the amended default policy
-    // (default = every tool that works here), a no-tools thread on this
-    // rooted server carries the env four and is env-capable — the
+    // (default = every tool that works here), a default-tools bot thread on
+    // this rooted server carries the env four and is env-capable — the
     // refusal gate is exercised by a snapshot that truly lacks them.
-    const plain = await api("POST", "/threads", {
-      provider: "fakenode",
-      model: "smart",
-      tools: ["http_fetch"],
-    });
-    if (plain.status !== 201) {
-      throw new Error(`plain thread creation returned ${plain.status}`);
-    }
-    const bad = new FakeNode(nodeUrlFor("node-plain", await pairInto(plain.body.id, "node-plain"), plain.body.id));
+    const plainId = await createBotThread("node-plain-bot", ["http_fetch"]);
+    const bad = new FakeNode(nodeUrlFor("node-plain", await pairInto(plainId, "node-plain"), plainId));
     // node-plain is bound to THIS thread: auth passes, so the refusal
     // below is the 403 env-capability gate, not the scoped 401 auth
     // lookup a foreign thread's row would hit.
@@ -705,15 +700,9 @@ async function main() {
   // explicit tools) on this rooted server carries the env tools, so the
   // env-role plane ATTACHES to it.
   await check("env role attaches to a default thread on a rooted server", async () => {
-    const def = await api("POST", "/threads", {
-      provider: "fakenode",
-      model: "smart",
-    });
-    if (def.status !== 201) {
-      throw new Error(`default thread creation returned ${def.status}`);
-    }
-    const defToken = await pairInto(def.body.id, "node-def");
-    const node = new FakeNode(nodeUrlFor("node-def", defToken, def.body.id));
+    const defId = await createBotThread("node-default-bot");
+    const defToken = await pairInto(defId, "node-def");
+    const node = new FakeNode(nodeUrlFor("node-def", defToken, defId));
     const opened = await node.connect();
     if (opened === null) {
       throw new Error("env socket closed at connect on a default thread");
@@ -724,14 +713,7 @@ async function main() {
   });
 
   await check("viewer role: events + send, no tool plane", async () => {
-    const plain = await api("POST", "/threads", {
-      provider: "fakenode",
-      model: "smart",
-    });
-    if (plain.status !== 201) {
-      throw new Error(`plain thread creation returned ${plain.status}`);
-    }
-    const threadId = plain.body.id;
+    const threadId = await createBotThread("node-viewer-bot");
     const viewerToken = await pairInto(threadId, "node-view");
     const viewer = new FakeNode(nodeUrlFor("node-view", viewerToken, threadId, "&role=viewer"));
     const opened = await viewer.connect();

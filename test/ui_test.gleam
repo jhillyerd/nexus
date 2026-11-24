@@ -3,15 +3,18 @@
 //// and view rendering (element/text APIs only, no innerHTML).
 
 import gleam/dict
+import gleam/dynamic
 import gleam/erlang/process
 import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/otp/actor
 import gleam/otp/factory_supervisor
 import gleam/string
 import gleeunit/should
 import lustre
+import lustre/effect
 import lustre/element
 import lustre/server_component
 import nexus/bot
@@ -4647,6 +4650,116 @@ pub fn created_selects_and_releases_draft_test() {
   done.pending_send |> should.equal(None)
   done.selected |> should.equal(Some("s-new"))
   list.map(done.threads, fn(t) { t.id }) |> should.equal(["s-new"])
+}
+
+/// Regression: during compose-new, `SendAccepted` can arrive before the fresh
+/// thread's `Hello` replay (whose pre-send summary still has `streaming: False`).
+/// `Hello` must preserve `streaming: True` instead of re-enabling Send mid-turn.
+pub fn hello_preserves_streaming_after_send_accepted_test() {
+  let model =
+    compose_ready_model()
+    |> step(ui.SendRequested("hello"))
+    |> step(ui.Created(summary("s-new", False)))
+    |> step(ui.SendAccepted)
+    |> step(ui.Hello("smart"))
+  model.streaming |> should.be_true
+}
+
+/// Regression: compose-new `Created` MUST deliver `thread.Join` to the fresh
+/// thread actor strictly BEFORE `thread.Describe` / `thread.Send`. Batching
+/// `join_effect` with `send_effect` via `effect.batch` reversed execution order
+/// and dropped initial tokens streamed before Join landed.
+pub fn created_with_draft_joins_before_sending_test() {
+  let order = process.new_subject()
+  // Minimal fake thread actor that records the exact order of Join / Describe /
+  // Send messages it receives.
+  let assert Ok(fake_thread) =
+    actor.new(Nil)
+    |> actor.on_message(fn(state, msg: thread.Msg) {
+      case msg {
+        thread.Join(_, _) -> {
+          process.send(order, "join")
+          actor.continue(state)
+        }
+        thread.Describe(reply) -> {
+          process.send(order, "describe")
+          process.send(
+            reply,
+            thread.ThreadStatus(
+              model: "smart",
+              message_count: 1,
+              streaming: False,
+              metrics: [],
+              last_commit_at: 0,
+            ),
+          )
+          actor.continue(state)
+        }
+        thread.Send(_, _, _, reply) -> {
+          process.send(order, "send")
+          process.send(reply, thread.Sent)
+          actor.continue(state)
+        }
+        _ -> actor.continue(state)
+      }
+    })
+    |> actor.start
+
+  // Minimal fake registry serving `Get("s-new")` with `fake_thread`.
+  let assert Ok(fake_registry) =
+    actor.new(Nil)
+    |> actor.on_message(fn(state, msg: thread_registry.Msg) {
+      case msg {
+        thread_registry.Get(id, reply) if id == "s-new" -> {
+          process.send(reply, Ok(fake_thread.data))
+          actor.continue(state)
+        }
+        thread_registry.List(reply) -> {
+          process.send(reply, [summary("s-new", True)])
+          actor.continue(state)
+        }
+        thread_registry.AutoTitle(_, _, reply) -> {
+          process.send(reply, True)
+          actor.continue(state)
+        }
+        thread_registry.Channels(_, reply) -> {
+          process.send(reply, [])
+          actor.continue(state)
+        }
+        thread_registry.ChannelOf(_, reply) -> {
+          process.send(reply, Error(Nil))
+          actor.continue(state)
+        }
+        _ -> actor.continue(state)
+      }
+    })
+    |> actor.start
+
+  let events = process.new_subject()
+  let pending =
+    ui.Model(
+      ..compose_ready_model(),
+      registry: fake_registry.data,
+      events: Some(events),
+    )
+    |> step(ui.SendRequested("first draft"))
+  let #(_done, eff) = ui.update(pending, ui.Created(summary("s-new", False)))
+  // Perform the returned synchronous effects in Lustre's exact runtime order.
+  effect.perform(
+    eff,
+    fn(_) { Nil },
+    fn(_, _) { Nil },
+    fn(_) { Nil },
+    fn() { dynamic.nil() },
+    fn(_, _) { Nil },
+    fn(_, _) { Nil },
+    fn(_) { Nil },
+  )
+
+  let assert Ok(first) = process.receive(order, 1000)
+  let assert Ok(second) = process.receive(order, 1000)
+  let assert Ok(third) = process.receive(order, 1000)
+  [first, second, third] |> should.equal(["join", "describe", "send"])
 }
 
 /// The worker's failure reply clears the guard and the stash — a

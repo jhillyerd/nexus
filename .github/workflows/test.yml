@@ -7,6 +7,13 @@ on:
       - main
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -67,3 +74,83 @@ jobs:
         run: gleam run -m nexus/store/verify
       - run: gleam test
       - run: gleam format --check src test
+
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:17
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_USER: nexus
+          POSTGRES_PASSWORD: nexus
+          POSTGRES_DB: nexus
+        options: >-
+          --health-cmd "pg_isready -U nexus -d nexus"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 15
+    env:
+      DATABASE_URL: postgres://nexus:nexus@127.0.0.1:5432/nexus
+      E2E_DATABASE_URL: postgres://nexus:nexus@127.0.0.1:5432/nexus
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+        with:
+          otp-version: "27"
+          gleam-version: "1.19.0"
+      - name: Install system tools (psql, bwrap)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bubblewrap postgresql-client
+      - name: Install e2e Node dependencies
+        run: npm --prefix e2e ci
+      - name: Cache Playwright Chromium
+        id: pw-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('e2e/package-lock.json') }}
+      - name: Install Playwright Chromium
+        env:
+          PW_CACHE_HIT: ${{ steps.pw-cache.outputs.cache-hit }}
+        run: |
+          if [ "$PW_CACHE_HIT" != "true" ]; then
+            npm --prefix e2e exec -- playwright install --with-deps chromium
+          else
+            npm --prefix e2e exec -- playwright install-deps chromium
+          fi
+      - name: Download deps and build Gleam
+        run: |
+          gleam deps download
+          gleam build
+      - name: Apply schema
+        run: gleam run -m nexus/store/migrate
+      - name: Deterministic browser E2E suite
+        run: node e2e/browser.spec.mjs
+      - name: Deterministic node-protocol E2E suite
+        run: node e2e/node.spec.mjs
+      - name: Deterministic TUI E2E suite
+        run: node e2e/tui.spec.mjs
+      - name: Linux sandbox escape probes (bwrap)
+        env:
+          NEXUS_VERIFY_SANDBOX: bwrap
+        run: gleam run -m nexus/env/verify
+      - name: Upload E2E reports and screenshots on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-failure-diagnostics
+          if-no-files-found: ignore
+          path: |
+            e2e/report.json
+            e2e/node-report.json
+            e2e/tui-report.json
+            e2e/failure-*.png

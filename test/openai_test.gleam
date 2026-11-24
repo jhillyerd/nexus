@@ -50,6 +50,7 @@ fn acc() -> openai.Acc {
     events_parsed: 0,
     decode_errors: 0,
     saw_done: False,
+    saw_finish: False,
     first_decode_error: None,
     usage: None,
   )
@@ -222,4 +223,30 @@ pub fn done_sentinel_has_no_reasoning_test() {
   events |> should.equal([])
   acc.saw_done |> should.equal(True)
   acc.reasoning_deltas |> should.equal(0)
+}
+
+pub fn finish_reason_sets_saw_finish_flag_test() {
+  let #(plain, _) = fold_data(chunk_json("{\"content\":\"partial\"}"))
+  plain.saw_finish |> should.equal(False)
+  plain.saw_done |> should.equal(False)
+  // Events delivered with neither [DONE] nor finish_reason -> truncated.
+  let assert Some(openai.Transport(_)) = openai.truncation_error(plain)
+
+  let stopped_json =
+    "{\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,"
+    <> "\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},"
+    <> "\"finish_reason\":\"stop\"}]}"
+  let #(finished, _) = fold_data(stopped_json)
+  finished.saw_finish |> should.equal(True)
+  // finish_reason-only completion (no [DONE]) is accepted cleanly.
+  openai.truncation_error(finished) |> should.equal(None)
+
+  // [DONE]-only completion (no finish_reason) is accepted cleanly.
+  let done_only = openai.handle_data("[DONE]", 10, plain, fn(_) { Nil })
+  done_only.saw_done |> should.equal(True)
+  done_only.saw_finish |> should.equal(False)
+  openai.truncation_error(done_only) |> should.equal(None)
+
+  // Zero-event stream defers to finish_stream's buffered status-probe path.
+  openai.truncation_error(acc()) |> should.equal(None)
 }
