@@ -161,19 +161,34 @@ pub fn start(
   cfg: Config,
   name: process.Name(Msg),
 ) -> actor.StartResult(Subject(Msg)) {
+  let pg_config =
+    pog.default_config(pool_name: process.new_name("nexus_store_pool"))
+    |> pog.host(cfg.pg_host)
+    |> pog.port(cfg.pg_port)
+    |> pog.database(cfg.pg_database)
+    |> pog.user(cfg.pg_user)
+    |> pog.password(cfg.pg_password)
+    // Hygiene only (the schema is timestamptz and every read goes
+    // through extract(epoch ...)); pinning keeps ad-hoc renders and any
+    // future naive-typed debugging deterministic.
+    |> pog.connection_parameter("timezone", "UTC")
+  start_with_pg_config(
+    pg_config,
+    name,
+    cfg.pg_host <> ":" <> int.to_string(cfg.pg_port),
+  )
+}
+
+/// Start the store actor with a caller-supplied `pog.Config` (used by
+/// `start` and by the Postgres contract verifier `nexus/store/verify` to
+/// pin an isolated `search_path` or test non-UTC `timezone` settings).
+pub fn start_with_pg_config(
+  pg_config: pog.Config,
+  name: process.Name(Msg),
+  target_label: String,
+) -> actor.StartResult(Subject(Msg)) {
   let builder =
     actor.new_with_initialiser(10_000, fn(self) {
-      let pg_config =
-        pog.default_config(pool_name: process.new_name("nexus_store_pool"))
-        |> pog.host(cfg.pg_host)
-        |> pog.port(cfg.pg_port)
-        |> pog.database(cfg.pg_database)
-        |> pog.user(cfg.pg_user)
-      let pg_config = pog.password(pg_config, cfg.pg_password)
-      // Hygiene only (the schema is timestamptz and every read goes
-      // through extract(epoch ...)); pinning keeps ad-hoc renders and any
-      // future naive-typed debugging deterministic.
-      let pg_config = pog.connection_parameter(pg_config, "timezone", "UTC")
       case pog.start(pg_config) {
         Ok(started) ->
           actor.initialised(State(db: started.data, persisted: dict.new()))
@@ -184,9 +199,7 @@ pub fn start(
           // silent ephemeral mode (see README env table).
           panic as {
             "nexus store: could not start Postgres pool on "
-            <> cfg.pg_host
-            <> ":"
-            <> int.to_string(cfg.pg_port)
+            <> target_label
             <> " ("
             <> start_error_text(reason)
             <> ") — is the database up? see docker-compose.yml"
@@ -497,16 +510,18 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           let rows = returned.rows
           // The joined message_count is the authoritative persisted
           // transcript length (rows undercount when a message carried
-          // several tool calls).
+          // several tool calls). When empty, leave `state.persisted`
+          // untouched so `ensure_persisted` distinguishes a fresh thread
+          // from an unknown thread id on the first commit.
           let persisted = case list.last(rows) {
-            Ok(row) -> row.message_count
-            Error(_) -> 1
+            Ok(row) -> Some(row.message_count)
+            Error(_) -> None
           }
           #(rows |> list.map(message_row_from_row), persisted)
         })
         |> result.map_error(query_error)
       case result {
-        Ok(#(rows, persisted)) -> {
+        Ok(#(rows, Some(persisted))) -> {
           process.send(reply, Ok(rows))
           actor.continue(
             State(
@@ -514,6 +529,10 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
               persisted: dict.insert(state.persisted, id, persisted),
             ),
           )
+        }
+        Ok(#(rows, None)) -> {
+          process.send(reply, Ok(rows))
+          actor.continue(state)
         }
         Error(error) -> {
           process.send(reply, Error(error))
@@ -1177,6 +1196,12 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
   }
 }
 
+type Watermark {
+  Known(count: Int)
+  Dropped
+  Pending
+}
+
 /// The write-behind lane: append the transcript's unpersisted delta in seq
 /// order, then bump recency + the denormalized count. Any row failure
 /// keeps the old persisted length so the next commit retries the delta
@@ -1187,20 +1212,20 @@ fn handle_commit(
   tr: Transcript,
 ) -> actor.Next(State, Msg) {
   case ensure_persisted(state, id) {
-    Error(_) -> actor.continue(state)
-    Ok(state) -> {
-      let already = dict.get(state.persisted, id) |> result.unwrap(1)
+    #(next_state, Dropped) | #(next_state, Pending) ->
+      actor.continue(next_state)
+    #(state, Known(already)) -> {
       case store.has_delta(tr, already) {
         False -> actor.continue(state)
         True -> {
-          let rows = store.transcript_rows(tr, already)
+          let #(base_seq, rows) = store.transcript_delta(tr, already)
           let total = transcript.length(tr)
           let outcome =
             list.index_fold(rows, Ok(Nil), fn(acc, row, index) {
               case acc {
                 Error(error) -> Error(error)
                 Ok(_) ->
-                  append_row(state.db, id, already - 1 + index, row)
+                  append_row(state.db, id, base_seq + index, row)
                   |> result.map(fn(_) { Nil })
                   |> result.map_error(query_error)
               }
@@ -1232,31 +1257,40 @@ fn handle_commit(
 /// Resolve the persisted length for `id`, re-deriving it from the database
 /// when unknown (first commit after this actor restarted, or a thread
 /// created before it existed). Threads with no row at all are marked
-/// dropped (`-1`) so their commit lane stays quiet instead of spamming
-/// foreign-key errors.
-fn ensure_persisted(state: State, id: String) -> Result(State, Nil) {
+/// dropped (`-1` in `state.persisted`) so their commit lane stays quiet
+/// instead of spamming foreign-key errors; transient query errors return
+/// `Pending` without poisoning the cache so the next commit retries cleanly.
+fn ensure_persisted(state: State, id: String) -> #(State, Watermark) {
   case dict.get(state.persisted, id) {
-    Ok(_) -> Ok(state)
+    Ok(already) if already < 0 -> #(state, Dropped)
+    Ok(already) -> #(state, Known(already))
     Error(_) ->
       case sql.get_thread(state.db, id) {
         // The thread's denormalized message_count is the safe source:
         // it only ever advances after the corresponding rows were
         // written, so it can lag but never lead — a lagging value just
         // re-emits rows that `on conflict do nothing` skips.
-        Ok(pog.Returned(_, [row])) ->
-          Ok(
+        Ok(pog.Returned(_, [row])) -> {
+          let next_state =
             State(
               ..state,
               persisted: dict.insert(state.persisted, id, row.message_count),
-            ),
-          )
-        Ok(_) -> Ok(state)
-        Error(_) -> {
+            )
+          #(next_state, Known(row.message_count))
+        }
+        Ok(_) -> {
           log_store_error(
             "commit " <> id,
             "no stored thread row — dropping its write-behind commits",
           )
-          Ok(State(..state, persisted: dict.insert(state.persisted, id, -1)))
+          #(
+            State(..state, persisted: dict.insert(state.persisted, id, -1)),
+            Dropped,
+          )
+        }
+        Error(error) -> {
+          log_store_error("commit " <> id, query_error(error))
+          #(state, Pending)
         }
       }
   }

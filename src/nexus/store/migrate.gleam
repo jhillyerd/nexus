@@ -130,6 +130,21 @@ pub fn main() -> Nil {
   )
 }
 
+/// Apply all pending migrations from `sql/migrations/` to an existing
+/// connection pool (used by `nexus/store/verify` to migrate an isolated
+/// scratch schema before running the Postgres contract suite).
+pub fn apply_to_db(
+  pool_name: process.Name(pog.Message),
+  db: pog.Connection,
+) -> Nil {
+  let migrations =
+    or_panic(
+      load_migrations(migrations_dir),
+      "cannot load migrations from " <> migrations_dir,
+    )
+  apply_migrations(migrations, pool_name, db)
+}
+
 fn apply_migrations(
   migrations: List(Migration),
   pool_name: process.Name(pog.Message),

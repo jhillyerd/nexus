@@ -509,120 +509,112 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
       }
 
     LoadMessages(id, reply) ->
+      // Mirrors load_messages.sql: a plain SELECT returns [] when no
+      // rows match (including an unknown thread id).
       case dict.get(state.threads, id) {
         Ok(stored) -> {
           process.send(reply, Ok(stored.rows))
           actor.continue(state)
         }
         Error(_) -> {
-          process.send(reply, Error("no stored thread " <> id))
+          process.send(reply, Ok([]))
           actor.continue(state)
         }
       }
 
     InsertThread(summary, system_prompt, reply) ->
-      // thread_provider_id_fkey: the pinned provider must exist, like
-      // the real store's FK refuses unknown ids.
-      case dict.get(state.providers, summary.provider_id) {
-        Error(_) -> {
-          process.send(reply, Error("unknown provider " <> summary.provider_id))
+      // thread_pkey: duplicate thread id is refused like Postgres.
+      case dict.has_key(state.threads, summary.id) {
+        True -> {
+          process.send(reply, Error("thread " <> summary.id <> " exists"))
           actor.continue(state)
         }
-        Ok(_) -> {
-          // thread_bot_id_fkey: a non-NULL provenance pointer must
-          // reference a stored bot (the insert-time half; the delete-time
-          // half is SET NULL, so no later guard).
-          let bot_ok = case summary.meta.bot_id {
-            None -> True
-            Some(bot_id) -> dict.has_key(state.bots, bot_id)
-          }
-          // thread_parent_thread_id_fkey: a non-NULL parent link must
-          // reference a stored thread (bot-channels plan, #123). CASCADE
-          // is the delete-time half, mirrored by DeleteThread below.
-          let parent_ok = case summary.meta.parent_thread_id {
-            None -> True
-            Some(parent) -> dict.has_key(state.threads, parent)
-          }
-          // thread_channel unique index: at most one channel per
-          // (parent, bot) (bot-channels plan, #123) — the mock mirrors
-          // the real store's rejection so tests fail the same way
-          // production would.
-          let channel_free = case
-            summary.meta.parent_thread_id,
-            summary.meta.bot_id
-          {
-            Some(parent), Some(bot_id) ->
-              state.threads
-              |> dict.values
-              |> list.any(fn(stored) {
-                stored.summary.meta.parent_thread_id == option.Some(parent)
-                && stored.summary.meta.bot_id == option.Some(bot_id)
-              })
-              |> fn(taken) { !taken }
-            _, _ -> True
-          }
-          case bot_ok, parent_ok, channel_free {
-            False, _, _ -> {
-              let assert Some(bot_id) = summary.meta.bot_id
-              process.send(reply, Error("unknown bot " <> bot_id))
-              actor.continue(state)
-            }
-            _, False, _ -> {
-              let assert Some(parent) = summary.meta.parent_thread_id
-              process.send(reply, Error("unknown parent thread " <> parent))
-              actor.continue(state)
-            }
-            _, _, False -> {
+        False ->
+          // thread_provider_id_fkey: the pinned provider must exist, like
+          // the real store's FK refuses unknown ids.
+          case dict.get(state.providers, summary.provider_id) {
+            Error(_) -> {
               process.send(
                 reply,
-                Error("duplicate channel for parent/bot (thread_channel)"),
+                Error("unknown provider " <> summary.provider_id),
               )
               actor.continue(state)
             }
-            True, True, True -> {
-              // Workspace-sandbox plan Phase 1: insert_thread creates the
-              // thread's managed `thread` and `tmp` workspace rows in the
-              // same atomic statement when summary.workspaces is Some.
-              let next_workspaces = case
-                summary.workspace_root,
-                summary.workspaces
+            Ok(_) -> {
+              // thread_bot_id_fkey: a non-NULL provenance pointer must
+              // reference a stored bot (the insert-time half; the delete-time
+              // half is SET NULL, so no later guard).
+              let bot_ok = case summary.meta.bot_id {
+                None -> True
+                Some(bot_id) -> dict.has_key(state.bots, bot_id)
+              }
+              // thread_parent_thread_id_fkey: a non-NULL parent link must
+              // reference a stored thread (bot-channels plan, #123). CASCADE
+              // is the delete-time half, mirrored by DeleteThread below.
+              let parent_ok = case summary.meta.parent_thread_id {
+                None -> True
+                Some(parent) -> dict.has_key(state.threads, parent)
+              }
+              // thread_channel unique index: at most one channel per
+              // (parent, bot) (bot-channels plan, #123) — the mock mirrors
+              // the real store's rejection so tests fail the same way
+              // production would.
+              let channel_free = case
+                summary.meta.parent_thread_id,
+                summary.meta.bot_id
               {
-                Some(root), Some(ws) -> {
-                  let after_main = case
-                    dict.get(state.workspaces, ws.workspace_id)
+                Some(parent), Some(bot_id) ->
+                  state.threads
+                  |> dict.values
+                  |> list.any(fn(stored) {
+                    stored.summary.meta.parent_thread_id == option.Some(parent)
+                    && stored.summary.meta.bot_id == option.Some(bot_id)
+                  })
+                  |> fn(taken) { !taken }
+                _, _ -> True
+              }
+              case bot_ok, parent_ok, channel_free {
+                False, _, _ -> {
+                  let assert Some(bot_id) = summary.meta.bot_id
+                  process.send(reply, Error("unknown bot " <> bot_id))
+                  actor.continue(state)
+                }
+                _, False, _ -> {
+                  let assert Some(parent) = summary.meta.parent_thread_id
+                  process.send(reply, Error("unknown parent thread " <> parent))
+                  actor.continue(state)
+                }
+                _, _, False -> {
+                  process.send(
+                    reply,
+                    Error("duplicate channel for parent/bot (thread_channel)"),
+                  )
+                  actor.continue(state)
+                }
+                True, True, True -> {
+                  // Workspace-sandbox plan Phase 1: insert_thread creates the
+                  // thread's managed `thread` and `tmp` workspace rows in the
+                  // same atomic statement when summary.workspaces is Some.
+                  let next_workspaces = case
+                    summary.workspace_root,
+                    summary.workspaces
                   {
-                    Ok(existing)
-                      if existing.kind == store.BotWorkspace
-                      && existing.deleted_at == None
-                    -> Ok(state.workspaces)
-                    _ ->
-                      insert_workspace_checked(
-                        state.workspaces,
-                        store.StoredWorkspace(
-                          id: ws.workspace_id,
-                          kind: store.ThreadWorkspace,
-                          root: root,
-                          rel_path: ws.rel_path,
-                          thread_id: Some(summary.id),
-                          bot_id: None,
-                          created_at: summary.meta.created_at,
-                          last_used_at: None,
-                          deleted_at: None,
-                        ),
-                      )
-                  }
-                  case after_main {
-                    Error(err) -> Error(err)
-                    Ok(after_main) ->
-                      case ws.tmp_id, ws.tmp_rel_path {
-                        Some(tid), Some(trel) ->
+                    Some(root), Some(ws) -> {
+                      let after_main = case
+                        dict.get(state.workspaces, ws.workspace_id)
+                      {
+                        Ok(existing)
+                          if existing.kind == store.BotWorkspace
+                          && existing.deleted_at == None
+                        -> Ok(state.workspaces)
+                        _ ->
                           insert_workspace_checked(
-                            after_main,
+                            state.workspaces,
                             store.StoredWorkspace(
-                              id: tid,
-                              kind: store.TmpWorkspace,
+                              id: ws.workspace_id,
+                              kind: store.ThreadWorkspace,
                               root: root,
-                              rel_path: trel,
+                              rel_path: ws.rel_path,
                               thread_id: Some(summary.id),
                               bot_id: None,
                               created_at: summary.meta.created_at,
@@ -630,66 +622,110 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
                               deleted_at: None,
                             ),
                           )
-                        _, _ -> Ok(after_main)
                       }
+                      case after_main {
+                        Error(err) -> Error(err)
+                        Ok(after_main) ->
+                          case ws.tmp_id, ws.tmp_rel_path {
+                            Some(tid), Some(trel) ->
+                              insert_workspace_checked(
+                                after_main,
+                                store.StoredWorkspace(
+                                  id: tid,
+                                  kind: store.TmpWorkspace,
+                                  root: root,
+                                  rel_path: trel,
+                                  thread_id: Some(summary.id),
+                                  bot_id: None,
+                                  created_at: summary.meta.created_at,
+                                  last_used_at: None,
+                                  deleted_at: None,
+                                ),
+                              )
+                            _, _ -> Ok(after_main)
+                          }
+                      }
+                    }
+                    None, Some(ws) -> {
+                      // Both thread.workspace_id and thread.tmp_workspace_id
+                      // carry deferred FKs in insert_thread.sql (migration
+                      // 0002) — check both, like the statement's commit does.
+                      let main_ok =
+                        dict.has_key(state.workspaces, ws.workspace_id)
+                      let tmp_ok = case ws.tmp_id {
+                        None -> True
+                        Some(tid) -> dict.has_key(state.workspaces, tid)
+                      }
+                      case main_ok, tmp_ok {
+                        True, True -> Ok(state.workspaces)
+                        False, _ ->
+                          Error("unknown workspace " <> ws.workspace_id)
+                        True, False ->
+                          Error(
+                            "unknown workspace " <> option.unwrap(ws.tmp_id, ""),
+                          )
+                      }
+                    }
+                    _, None -> Ok(state.workspaces)
                   }
-                }
-                _, _ -> Ok(state.workspaces)
-              }
-              case next_workspaces {
-                Error(err) -> {
-                  process.send(reply, Error(err))
-                  actor.continue(state)
-                }
-                Ok(workspaces) -> {
-                  process.send(reply, Ok(Nil))
-                  actor.continue(
-                    State(
-                      ..state,
-                      workspaces: workspaces,
-                      threads: dict.insert(
-                        state.threads,
-                        summary.id,
-                        // insert_thread.sql: tags_manual '{}' literally and
-                        // tags_source DEFAULT 'auto' — a new row's auto path is
-                        // open, regardless of what the passed summary carried
-                        // (a fresh insert never inherits provenance).
-                        Stored(
-                          store.StoredSummary(
-                            ..summary,
-                            meta: thread.ThreadMeta(
-                              ..summary.meta,
-                              tags_manual: [],
-                              tags_source: thread.AutoTags,
+                  case next_workspaces {
+                    Error(err) -> {
+                      process.send(reply, Error(err))
+                      actor.continue(state)
+                    }
+                    Ok(workspaces) -> {
+                      process.send(reply, Ok(Nil))
+                      actor.continue(
+                        State(
+                          ..state,
+                          workspaces: workspaces,
+                          threads: dict.insert(
+                            state.threads,
+                            summary.id,
+                            // insert_thread.sql: tags_manual '{}' literally,
+                            // tags_source DEFAULT 'auto', archived_at NULL,
+                            // last_active_at = created_at, and get_thread /
+                            // list_summaries always return roster: None.
+                            Stored(
+                              store.StoredSummary(
+                                ..summary,
+                                meta: thread.ThreadMeta(
+                                  ..summary.meta,
+                                  archived: False,
+                                  tags_manual: [],
+                                  tags_source: thread.AutoTags,
+                                ),
+                                roster: None,
+                                last_active_at: summary.meta.created_at,
+                              ),
+                              system_prompt,
+                              // insert_thread's roster CTE: the creation-time
+                              // roster row is stored WITH the thread (seq 0,
+                              // system-authored) — the watermark (messages)
+                              // already counts it.
+                              case summary.roster {
+                                option.Some(#(text, stamp)) -> [
+                                  store.UserRow(
+                                    content: text,
+                                    author: option.Some("system"),
+                                    hop_depth: 0,
+                                    at: option.Some(stamp),
+                                  ),
+                                ]
+                                option.None -> []
+                              },
+                              summary.message_count,
                             ),
                           ),
-                          system_prompt,
-                          // insert_thread's roster CTE: the creation-time
-                          // roster row is stored WITH the thread (seq 0,
-                          // system-authored) — the watermark (messages)
-                          // already counts it.
-                          case summary.roster {
-                            option.Some(#(text, stamp)) -> [
-                              store.UserRow(
-                                content: text,
-                                author: option.Some("system"),
-                                hop_depth: 0,
-                                at: option.Some(stamp),
-                              ),
-                            ]
-                            option.None -> []
-                          },
-                          summary.message_count,
+                          events: [EvInsertThread(summary.id), ..state.events],
                         ),
-                      ),
-                      events: [EvInsertThread(summary.id), ..state.events],
-                    ),
-                  )
+                      )
+                    }
+                  }
                 }
               }
             }
           }
-        }
       }
 
     FindChannel(parent_thread_id, bot_id, reply) -> {
@@ -766,9 +802,11 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
     }
 
     AutoTitle(id, title, reply) ->
+      // Mirrors auto_title.sql: UPDATE ... WHERE id = $2 returns count > 0,
+      // so an unknown thread id answers Ok(False) (0 rows updated).
       case dict.get(state.threads, id) {
         Error(_) -> {
-          process.send(reply, Error("no stored thread " <> id))
+          process.send(reply, Ok(False))
           actor.continue(state)
         }
         Ok(stored) ->
@@ -799,10 +837,11 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
       // guard is provenance ONLY, on BOTH columns — an auto title may be
       // replaced and the display tags written while `title_source` AND
       // `tags_source` are 'auto'; a manual rename OR a manual tag save
-      // refuses the whole write, atomically.
+      // refuses the whole write, atomically. An unknown id updates 0 rows
+      // and answers Ok(False), matching Postgres.
       case dict.get(state.threads, id) {
         Error(_) -> {
-          process.send(reply, Error("no stored thread " <> id))
+          process.send(reply, Ok(False))
           actor.continue(state)
         }
         Ok(stored) ->
@@ -1194,11 +1233,15 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
           actor.continue(state)
         }
         False, False -> {
+          // insert_provider.sql writes created_at and updated_at from the
+          // same $8 timestamp.
+          let stored =
+            store.StoredProvider(..provider, updated_at: provider.created_at)
           process.send(reply, Ok(Nil))
           actor.continue(
             State(
               ..state,
-              providers: dict.insert(state.providers, provider.id, provider),
+              providers: dict.insert(state.providers, provider.id, stored),
               events: [EvInsertProvider(provider.id), ..state.events],
             ),
           )
@@ -1357,12 +1400,16 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
           actor.continue(state)
         }
         False, False, True -> {
+          // insert_bot.sql writes created_at and updated_at from the same
+          // $9 timestamp.
+          let stored = bot.Bot(..bot, updated_at: bot.created_at)
           process.send(reply, Ok(Nil))
           actor.continue(
-            State(..state, bots: dict.insert(state.bots, bot.id, bot), events: [
-              EvInsertBot(bot.id),
-              ..state.events
-            ]),
+            State(
+              ..state,
+              bots: dict.insert(state.bots, bot.id, stored),
+              events: [EvInsertBot(bot.id), ..state.events],
+            ),
           )
         }
       }
@@ -1375,7 +1422,7 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
           process.send(reply, Ok(Nil))
           actor.continue(state)
         }
-        Ok(_) ->
+        Ok(stored) ->
           // bot_name: renaming onto another bot's name is refused, like
           // the schema's lower(name) UNIQUE index (#127) — case-
           // insensitive, no state change, no event.
@@ -1396,11 +1443,19 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
               actor.continue(state)
             }
             False, True -> {
+              // Mirrors update_bot.sql: created_at stays from the stored
+              // row, and updated_at is server-side now().
+              let updated =
+                bot.Bot(
+                  ..bot,
+                  created_at: stored.created_at,
+                  updated_at: timing.wall_now_s(),
+                )
               process.send(reply, Ok(Nil))
               actor.continue(
                 State(
                   ..state,
-                  bots: dict.insert(state.bots, bot.id, bot),
+                  bots: dict.insert(state.bots, bot.id, updated),
                   events: [EvUpdateBot(bot.id), ..state.events],
                 ),
               )
@@ -1906,8 +1961,9 @@ fn never_used(summary: StoredSummary, cutoff_s: Int) -> Bool {
   && summary.last_active_at < cutoff_s
 }
 
-/// Insert a workspace row enforcing the `workspace_pkey` and `workspace_path`
-/// (`UNIQUE (root, rel_path)`) constraints.
+/// Insert a workspace row enforcing the `workspace_pkey`, `workspace_path`
+/// (`UNIQUE (root, rel_path)`), and `workspace_bot_live`
+/// (`UNIQUE (bot_id) WHERE kind = 'bot' AND deleted_at IS NULL`) constraints.
 fn insert_workspace_checked(
   workspaces: Dict(String, store.StoredWorkspace),
   ws: store.StoredWorkspace,
@@ -1921,10 +1977,22 @@ fn insert_workspace_checked(
         |> list.any(fn(existing) {
           existing.root == ws.root && existing.rel_path == ws.rel_path
         })
-      case path_taken {
-        True ->
+      let bot_live_taken = case ws.kind, ws.deleted_at, ws.bot_id {
+        store.BotWorkspace, None, Some(bid) ->
+          workspaces
+          |> dict.values
+          |> list.any(fn(existing) {
+            existing.kind == store.BotWorkspace
+            && existing.deleted_at == None
+            && existing.bot_id == Some(bid)
+          })
+        _, _, _ -> False
+      }
+      case path_taken, bot_live_taken {
+        True, _ ->
           Error("duplicate workspace_path " <> ws.root <> "/" <> ws.rel_path)
-        False -> Ok(dict.insert(workspaces, ws.id, ws))
+        False, True -> Error("duplicate workspace_bot_live")
+        False, False -> Ok(dict.insert(workspaces, ws.id, ws))
       }
     }
   }

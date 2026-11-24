@@ -1134,7 +1134,7 @@ pub fn auto_meta_upgrade_replaces_auto_title_test() {
 
 /// `title_source = 'manual'`: the upgrade is REFUSED and replies False —
 /// a rename wins forever, in the store exactly as in memory. An unknown
-/// id is an error, like the real store.
+/// id updates 0 rows and also replies Ok(False), like Postgres.
 pub fn auto_meta_upgrade_refuses_manual_title_test() {
   let mock = store_mock.start()
   let seam = store_mock.seam(mock)
@@ -1148,7 +1148,7 @@ pub fn auto_meta_upgrade_refuses_manual_title_test() {
   should.equal(stored.summary.meta.title, "renamed")
   should.equal(stored.summary.meta.title_source, thread.ManualTitle)
 
-  should.be_error(seam.auto_meta_upgrade("nope", "X", []))
+  should.equal(seam.auto_meta_upgrade("nope", "X", []), Ok(False))
 }
 
 /// The tags side of the same guard: a manual tag save (`set_tags.sql`'s

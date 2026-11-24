@@ -1068,7 +1068,13 @@ fn seed_at(
       ),
       "test system prompt",
     )
-  Nil
+  case archived {
+    True -> {
+      let assert Ok(Nil) = seam.archive(id)
+      Nil
+    }
+    False -> Nil
+  }
 }
 
 /// Like `seed`, with a frozen workspace root (an environment thread —
@@ -1082,7 +1088,7 @@ fn seed_env(seam: store.Store, id: String, message_count: Int) -> Nil {
         id: id,
         provider_id: store_mock.fixture_provider_id,
         model: "alpha",
-        meta: fresh_meta(),
+        meta: thread.ThreadMeta(..fresh_meta(), created_at: 1_700_000_000),
         toolset: thread_registry.plain_entries(["bash"]),
         workspace_root: Some("/srv/old-root"),
         workspaces: None,
