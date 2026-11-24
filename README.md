@@ -386,7 +386,7 @@ Bifrost/SearxNG, and the production cache check whose golden fixture is
 | `NEXUS_PG_PASSWORD` | unset | optional password; never logged or echoed |
 | `NEXUS_UTILITY_ENABLED` | `true` | once-per-thread model-generated title upgrade (a side call branched off the committed transcript's cached prefix); `false` keeps the heuristic first-message title forever |
 | `NEXUS_UTILITY_DELAY_MS` | `1500` | debounce after a turn commit before the title side call starts (a send cancels an in-flight call without consuming the thread's one attempt) |
-| `NEXUS_CODEMODE` | `false` | registers the `codemode` tool: Lua scripts that call the sibling tools and return one compact result (`docs/plans/codemode.md`); off keeps the tool envelope unchanged |
+| `NEXUS_CODEMODE` | `false` | registers the `codemode` tool: Lua scripts that call the sibling tools and return one compact result (`docs/plans/completed/codemode.md`); off keeps the tool envelope unchanged |
 | `NEXUS_CODEMODE_TIMEOUT_MS` | `30000` | `codemode`: per-script wall-clock deadline in ms (>= 1000; the engine is killed at the deadline, partial output kept) |
 | `NEXUS_CODEMODE_MAX_OUTPUT_CHARS` | `32768` | `codemode`: rendered-output cap in characters (>= 0; head and tail kept, omission noted) |
 | `NEXUS_PLUGINS` | _(unset)_ | comma-separated compiled-in plugins to start as tool providers (e.g. `example`); plugin tools enter a thread only via an explicit create toolset or a bot template, never the default (`docs/plans/plugin-api.md`) |
