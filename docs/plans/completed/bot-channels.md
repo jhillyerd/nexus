@@ -1,11 +1,20 @@
 ---
 title: Nexus — bot channels (per-parent DM threads + the thread info pane)
-status: active — Phase 1 + Phase 2 (the pane) implemented, review pending
+status: completed
 tags: [nexus, bots, threads, agents, kv-cache, gleam, beam]
 updated: 2026-11-17
 ---
 
 # Bot channels: per-parent DM threads + the thread info pane
+
+> **Landed 2026-11-17** (Phase 1 PR #137; Phase 2 PR #140). Both phases
+> shipped as designed; the as-built deltas under each phase carry the
+> divergences (the CREATE-only column squash, the `ChannelOf`/
+> `SummaryOf` asks, the review-round refinements). One known follow-up
+> stays open, deliberately out of scope: `PATCH /threads/<id>` still
+> resolves through the channel-free `List` projection, so it 404s on
+> channels — fold into the next touch of the per-thread routes if one
+> ever matters (Phase 2 as-built).
 
 **Thesis.** Bot-to-bot DM threads (bots plan P3c) are routed through an
 in-memory map keyed by the **bot pair** — `#(from_bot_id, target_bot_id)`.

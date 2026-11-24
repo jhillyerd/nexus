@@ -71,7 +71,8 @@ The persistence layer lives in `sql/migrations/` + `src/nexus/store/sql/`.
   replay events carry `stamped_at`. The UI never reads a clock to stamp
   a line.
 - **`thread.parent_thread_id` is routing/display metadata, never a
-  request byte** (bot-channels plan, docs/plans/bot-channels.md). It is
+  request byte** (bot-channels plan,
+  docs/plans/completed/bot-channels.md). It is
   `NULL` on every ordinary thread; `ON DELETE CASCADE` is decided (a
   channel is meaningless outside its parent — `SET NULL` would resurrect
   orphaned channels into the sidebar). The partial unique index
@@ -93,7 +94,8 @@ The persistence layer lives in `sql/migrations/` + `src/nexus/store/sql/`.
 
 ## Bot channel invariants (Phase 1 shipped)
 
-`docs/plans/bot-channels.md` carries the design and as-built deltas;
+`docs/plans/completed/bot-channels.md` carries the design and as-built
+deltas;
 the rules that bite silently:
 
 - **Channels are second-class, and the sidebar filter is REGISTRY-SIDE,
