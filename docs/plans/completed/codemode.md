@@ -1,11 +1,16 @@
 ---
 title: Nexus — codemode tool (Lua scripts in the agent loop)
-status: active
+status: completed
 tags: [computing, self-hosting, local-llm, agents, gleam, beam, codemode]
-updated: 2026-11-14
+updated: 2026-11-24
 ---
 
 # Codemode: model-authored Lua scripts as a tool
+
+> **Landed 2026-11-08/14** (Phase 1 #50, review fixes #55/#56, `gmatch`
+> polyfill #61, Phase 2 #57, Phase 3 `await`/`all_settled` #105, closure
+> leak fix #165). All planned phases shipped; the deferred `store`/`load`
+> KV across calls is tracked in #172.
 
 **Thesis.** Give the model a `codemode` tool whose argument is a Lua script.
 The script calls nexus's other tools from inside the tool execution, filters
@@ -251,8 +256,9 @@ before the wall-clock kill — see `batch_deadline_margin_us`):
   Still open: cancellation of a SINGLE awaited task from Lua (today
   only the turn-level Stop exists).
 - `luerl_sandbox` reduction-budget FFI (CPU-hog preemption nicer than kill).
-- `store`/`load` KV across calls — would ride the transcript sidecar pattern
-  (`reasoning_at` precedent) so it can never perturb request bytes.
+- `store`/`load` KV across calls — tracked in #172; would ride the
+  transcript sidecar pattern (`reasoning_at` precedent) so it can never
+  perturb request bytes.
 - Alternative engines (EYG, QuickJS NIF) behind the same `codemode.gleam`
   seam, if model-written Lua proves limiting.
 - Hiding sibling tools from the model (pi's `codemode.mode: only`) — not now.
