@@ -1,6 +1,36 @@
 -module(nexus_store_ffi).
 
--export([database_url/0, with_pool_settled/2, with_checked_out/2]).
+-export([database_url/0, with_pool_settled/2, with_checked_out/2, stop_verify_actor/2, with_cleanup/2]).
+
+%% Run Fun and always invoke Cleanup in an `after` clause (even on panic),
+%% re-raising any exception from Fun untouched.
+with_cleanup(Fun, Cleanup) ->
+    try
+        Fun()
+    after
+        try Cleanup() catch _:_ -> ok end
+    end.
+
+%% Gracefully and synchronously stop a temporary persist actor and its linked
+%% pog pool in `nexus/store/verify` without emitting OTP crash reports.
+stop_verify_actor(ActorPid, PoolName) ->
+    erlang:unlink(ActorPid),
+    case whereis(PoolName) of
+        undefined -> ok;
+        PoolPid ->
+            stop_pool(PoolPid),
+            try
+                gen_server:stop(PoolPid, normal, 5000)
+            catch _:_ -> ok end
+    end,
+    MRef = erlang:monitor(process, ActorPid),
+    erlang:exit(ActorPid, kill),
+    receive
+        {'DOWN', MRef, process, ActorPid, _} -> ok
+    after 5000 ->
+        erlang:demonitor(MRef, [flush])
+    end,
+    nil.
 
 database_url() ->
     case os:getenv("DATABASE_URL") of

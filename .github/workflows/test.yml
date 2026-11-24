@@ -10,10 +10,12 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     container:
       image: ghcr.io/gleam-lang/gleam:v1.19.0-erlang
     services:
-      # Postgres service ONLY for schema apply + the squirrel drift gate.
+      # Postgres service for schema apply, the squirrel drift gate, and the
+      # live contract parity runner (nexus/store/verify, isolated temp schema).
       # The unit tests themselves stay offline: the store is a mockable
       # seam (src/nexus/store.gleam) and never touch this database.
       postgres:
@@ -59,5 +61,9 @@ jobs:
         # Fails (exit 1) when src/nexus/store/sql.gleam is stale relative
         # to src/nexus/store/sql/*.sql.
         run: gleam run -m squirrel check
+      - name: Store Postgres contract parity
+        # Runs the shared nexus/store/contract suite against real Postgres 17
+        # + nexus/store/persist in an isolated temporary schema.
+        run: gleam run -m nexus/store/verify
       - run: gleam test
       - run: gleam format --check src test

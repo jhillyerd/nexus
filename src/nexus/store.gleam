@@ -422,18 +422,24 @@ pub type Store {
 // Pure mappers: transcript ⇄ rows (the ONLY translation code there is)
 // ---------------------------------------------------------------------------
 
-/// The rows for the messages of `tr` past the first `already_persisted`
+/// The write-behind delta for `tr` past the first `already_persisted`
 /// chronological messages (`already_persisted` counts the system prompt,
-/// which is never a row). This is the write-behind delta.
-pub fn transcript_rows(
+/// which is never a row): returns `#(base_seq, rows)`, where `base_seq` is
+/// the 0-based `thread_message.seq` of the first new row.
+///
+/// Computing `base_seq` from the transcript's own prefix row count (rather
+/// than `already_persisted - 1`) is load-bearing whenever an earlier turn
+/// carried a multi-call assistant message (1 message → N rows): using
+/// `already_persisted - 1` under-counts `seq` and causes `ON CONFLICT
+/// (thread_id, seq) DO NOTHING` to silently drop subsequent turn rows.
+pub fn transcript_delta(
   tr: Transcript,
   already_persisted: Int,
-) -> List(MessageRow) {
+) -> #(Int, List(MessageRow)) {
   let base = int_max(already_persisted, 0)
-  let #(rows, _) =
+  let #(all_rows, prefix_rows, _) =
     tr
     |> transcript.messages
-    |> list.drop(base)
     |> messages_to_rows_with(
       base,
       fn(index) { transcript.reasoning_at(tr, index) },
@@ -441,7 +447,17 @@ pub fn transcript_rows(
       fn(index) { transcript.stamped_at(tr, index) },
       fn(index) { transcript.origin_at(tr, index) },
     )
-  rows
+  #(prefix_rows, list.drop(all_rows, prefix_rows))
+}
+
+/// The rows for the messages of `tr` past the first `already_persisted`
+/// chronological messages (`already_persisted` counts the system prompt,
+/// which is never a row). This is the write-behind delta.
+pub fn transcript_rows(
+  tr: Transcript,
+  already_persisted: Int,
+) -> List(MessageRow) {
+  transcript_delta(tr, already_persisted).1
 }
 
 /// Translate chronological transcript messages into rows. Messages this
@@ -450,7 +466,7 @@ pub fn transcript_rows(
 /// the metadata-free shape; the write-behind lane uses
 /// `messages_to_rows_with` against the transcript's sidecars.
 pub fn messages_to_rows(messages: List(ChatMessage)) -> List(MessageRow) {
-  let #(rows, _) =
+  let #(rows, _, _) =
     messages_to_rows_with(
       messages,
       0,
@@ -462,35 +478,32 @@ pub fn messages_to_rows(messages: List(ChatMessage)) -> List(MessageRow) {
   rows
 }
 
-/// The reasoning-aware row mapping: `reasoning_at` resolves a message's
-/// chronological index into its recorded chain-of-thought, so assistant
-/// rows carry it without it ever existing as a message; `tool_ok_at`
-/// resolves a tool message's outcome the same way (True when unknown);
-/// `stamped_at` resolves the wall-clock epoch the message was appended
-/// at (None = unstamped); `origin_at` resolves the bot-delivery
-/// provenance (None = a human sent it — the metadata-free default).
+/// The reasoning-aware row mapping: walks all chronological `messages` from
+/// index 0 so `names` (tool_call_id → tool_name) stays complete across split
+/// boundaries, and records how many rows were emitted by the first `split_at`
+/// messages (`prefix_rows`).
 fn messages_to_rows_with(
   messages: List(ChatMessage),
-  base: Int,
+  split_at: Int,
   reasoning_at: fn(Int) -> Option(String),
   tool_ok_at: fn(Int) -> Option(Bool),
   stamped_at: fn(Int) -> Option(Int),
   origin_at: fn(Int) -> Option(transcript.Origin),
-) -> #(List(MessageRow), dict.Dict(String, String)) {
-  let #(rows, names, _) =
-    list.index_fold(messages, #([], dict.new(), 0), fn(acc, message, index) {
-      let #(rows, names, _index) = acc
-      let reasoning = reasoning_at(base + index)
-      let at = stamped_at(base + index)
-      case message {
+) -> #(List(MessageRow), Int, dict.Dict(String, String)) {
+  let #(rows, prefix_rows, names) =
+    list.index_fold(messages, #([], 0, dict.new()), fn(acc, message, index) {
+      let #(rows, prefix_rows, names) = acc
+      let reasoning = reasoning_at(index)
+      let at = stamped_at(index)
+      let #(next_rows, added, next_names) = case message {
         chat.UserMessage(content: chat.UserTextContent(text), ..) -> {
           // The origin sidecar flattens into the row's author/hop_depth
           // pair; no entry = a human row (None / 0).
-          let #(author, hop_depth) = case origin_at(base + index) {
+          let #(author, hop_depth) = case origin_at(index) {
             Some(transcript.Origin(author, depth)) -> #(Some(author), depth)
             None -> #(None, 0)
           }
-          #([UserRow(text, author, hop_depth, at), ..rows], names, index + 1)
+          #([UserRow(text, author, hop_depth, at), ..rows], 1, names)
         }
         chat.AssistantMessage(content: text, tool_calls: calls, ..) ->
           case calls {
@@ -504,43 +517,43 @@ fn messages_to_rows_with(
               // index_fold prepends, so `new_rows` is newest-first too
               // (last call first) — exactly how it must splice in.
               let #(new_rows, names) =
-                list.index_fold(calls, #([], names), fn(acc, call, index) {
-                  let #(rows, names) = acc
+                list.index_fold(calls, #([], names), fn(acc, call, call_idx) {
+                  let #(call_rows, names) = acc
                   let chat.FunctionToolCall(id: id, function: f) = call
                   #(
                     [
                       ToolCallRow(
-                        content: case index {
+                        content: case call_idx {
                           0 -> text
                           _ -> ""
                         },
                         call_id: id,
                         name: f.name,
                         arguments: f.arguments,
-                        reasoning: case index {
+                        reasoning: case call_idx {
                           0 -> reasoning
                           _ -> None
                         },
-                        at: case index {
+                        at: case call_idx {
                           0 -> at
                           _ -> None
                         },
                       ),
-                      ..rows
+                      ..call_rows
                     ],
                     dict.insert(names, id, f.name),
                   )
                 })
-              #(list.append(new_rows, rows), names, index + 1)
+              #(list.append(new_rows, rows), list.length(calls), names)
             }
             None ->
               case text {
                 Some(chat.AssistantTextContent(content)) -> #(
                   [AssistantRow(content, reasoning, at), ..rows],
+                  1,
                   names,
-                  index + 1,
                 )
-                _ -> #(rows, names, index + 1)
+                _ -> #(rows, 0, names)
               }
           }
         chat.ToolMessage(
@@ -551,22 +564,27 @@ fn messages_to_rows_with(
             ToolResultRow(
               call_id: id,
               name: result.unwrap(dict.get(names, id), "tool"),
-              ok: option.unwrap(tool_ok_at(base + index), True),
+              ok: option.unwrap(tool_ok_at(index), True),
               content: content,
               at: at,
             ),
             ..rows
           ],
+          1,
           names,
-          index + 1,
         )
         // System prompts are not rows (thread.system_prompt); the other
         // shapes have no constructor in nexus — skipping is losing nothing
         // that can exist.
-        _ -> #(rows, names, index + 1)
+        _ -> #(rows, 0, names)
       }
+      let next_prefix = case index < split_at {
+        True -> prefix_rows + added
+        False -> prefix_rows
+      }
+      #(next_rows, next_prefix, next_names)
     })
-  #(list.reverse(rows), names)
+  #(list.reverse(rows), prefix_rows, names)
 }
 
 /// Rebuild a transcript from stored rows through the one construction
