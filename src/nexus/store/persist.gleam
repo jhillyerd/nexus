@@ -1196,16 +1196,16 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
   }
 }
 
-/// The write-behind lane: append the transcript's unpersisted delta in seq
-/// order, then bump recency + the denormalized count. Any row failure
-/// keeps the old persisted length so the next commit retries the delta
-/// (idempotent: duplicate seqs are skipped in SQL).
 type Watermark {
   Known(count: Int)
   Dropped
   Pending
 }
 
+/// The write-behind lane: append the transcript's unpersisted delta in seq
+/// order, then bump recency + the denormalized count. Any row failure
+/// keeps the old persisted length so the next commit retries the delta
+/// (idempotent: duplicate seqs are skipped in SQL).
 fn handle_commit(
   state: State,
   id: String,

@@ -50,7 +50,7 @@ fn stop_verify_actor(
 ) -> Nil
 
 @external(erlang, "nexus_store_ffi", "with_cleanup")
-fn with_cleanup(run: fn() -> a, cleanup: fn() -> Nil) -> a
+fn with_cleanup(run: fn() -> a, cleanup: fn() -> b) -> #(a, b)
 
 pub fn main() -> Nil {
   let url = or_panic(database_url(), "DATABASE_URL is not set")
@@ -75,14 +75,32 @@ pub fn main() -> Nil {
         exec_ddl(admin.data, "CREATE SCHEMA " <> schema),
         "failed to create isolated verify schema " <> schema,
       )
-      let outcome =
+      let #(outcome, drop_res) =
         with_cleanup(fn() { run_suite_in_schema(url, schema) }, fn() {
-          case
-            exec_ddl(
-              admin.data,
-              "DROP SCHEMA IF EXISTS " <> schema <> " CASCADE",
-            )
-          {
+          exec_ddl(admin.data, "DROP SCHEMA IF EXISTS " <> schema <> " CASCADE")
+        })
+      case outcome, drop_res {
+        Ok(count), Ok(Nil) ->
+          io.println(
+            "store/verify: "
+            <> int.to_string(count)
+            <> " passed, 0 failed (schema "
+            <> schema
+            <> " cleaned up)",
+          )
+        Ok(count), Error(err) -> {
+          io.println(
+            "store/verify: "
+            <> int.to_string(count)
+            <> " passed, FAILED cleanup — could not drop schema "
+            <> schema
+            <> ": "
+            <> string.inspect(err),
+          )
+          panic as "store/verify cleanup failed"
+        }
+        Error(failures), drop_status -> {
+          case drop_status {
             Ok(Nil) -> Nil
             Error(err) ->
               io.println(
@@ -92,17 +110,6 @@ pub fn main() -> Nil {
                 <> string.inspect(err),
               )
           }
-        })
-      case outcome {
-        Ok(count) ->
-          io.println(
-            "store/verify: "
-            <> int.to_string(count)
-            <> " passed, 0 failed (schema "
-            <> schema
-            <> " cleaned up)",
-          )
-        Error(failures) -> {
           io.println(
             "store/verify: FAILED ("
             <> int.to_string(list.length(failures))
@@ -379,7 +386,8 @@ fn check_non_utc_timezone_invariance(s: store.Store) -> Result(Nil, String) {
     now,
   ))
 
-  // Touch a node and a grant under Asia/Tokyo and verify server-side now().
+  // Touch a node and a grant, and update provider & bot under Asia/Tokyo to
+  // verify every server-side now() write is timezone-invariant.
   let n =
     node.Node(
       id: "n-tz",
@@ -392,10 +400,57 @@ fn check_non_utc_timezone_invariance(s: store.Store) -> Result(Nil, String) {
   use _ <- result.try(s.insert_node(n))
   use _ <- result.try(s.touch_node("n-tz"))
   use got_n <- result.try(s.get_thread_node("t-tz", "box"))
-  case got_n.last_seen_at {
+  use _ <- result.try(case got_n.last_seen_at {
     Some(ts) -> check_near_now("touch_node last_seen_at", ts, now)
     None -> Error("touch_node last_seen_at was None")
-  }
+  })
+
+  let g =
+    node.Grant(
+      id: "g-tz",
+      code_hash: "ch-tz",
+      thread_id: Some("t-tz"),
+      created_at: fixed_epoch,
+      expires_at: now + 3600,
+      use_count: 0,
+      last_used_at: None,
+    )
+  use _ <- result.try(s.insert_node_grant(g))
+  use _ <- result.try(s.touch_node_grant("g-tz"))
+  use grants <- result.try(s.list_node_grants())
+  use _ <- result.try(case grants {
+    [got_g] ->
+      case got_g.last_used_at {
+        Some(ts) -> check_near_now("touch_node_grant last_used_at", ts, now)
+        None -> Error("touch_node_grant last_used_at was None")
+      }
+    _ -> Error("expected 1 grant for g-tz")
+  })
+
+  use _ <- result.try(s.update_provider(
+    store.StoredProvider(..p, name: "tokyo-test-updated"),
+    False,
+  ))
+  use got_p2 <- result.try(s.get_provider("p-tz"))
+  use _ <- result.try(check_eq(
+    "update_provider preserved created_at",
+    got_p2.created_at,
+    fixed_epoch,
+  ))
+  use _ <- result.try(check_near_now(
+    "update_provider updated_at",
+    got_p2.updated_at,
+    now,
+  ))
+
+  use _ <- result.try(s.update_bot(bot.Bot(..b, name: "TokyoBotUpdated")))
+  use got_b2 <- result.try(s.get_bot("b-tz"))
+  use _ <- result.try(check_eq(
+    "update_bot preserved created_at",
+    got_b2.created_at,
+    fixed_epoch,
+  ))
+  check_near_now("update_bot updated_at", got_b2.updated_at, now)
 }
 
 /// Verify that restarting the `persist` actor mid-conversation (losing its

@@ -2,17 +2,34 @@
 
 -export([database_url/0, with_pool_settled/2, with_checked_out/2, stop_verify_actor/2, with_cleanup/2]).
 
-%% Run Fun and always invoke Cleanup in an `after` clause (even on panic),
-%% re-raising any exception from Fun untouched.
+%% Run Fun and always invoke Cleanup. On normal return, Cleanup runs without
+%% swallowing exceptions and both results are returned as `{FunVal, CleanupVal}`.
+%% On exception in Fun, Cleanup runs best-effort (logging any cleanup failure
+%% to stderr) before re-raising Fun's original exception untouched.
 with_cleanup(Fun, Cleanup) ->
-    try
-        Fun()
-    after
-        try Cleanup() catch _:_ -> ok end
+    try Fun() of
+        Value ->
+            CleanupValue = Cleanup(),
+            {Value, CleanupValue}
+    catch
+        Class:Reason:Stack ->
+            try
+                Cleanup()
+            catch
+                C2:R2 ->
+                    io:format(
+                        standard_error,
+                        "with_cleanup: cleanup failed (~p:~p)~n",
+                        [C2, R2]
+                    )
+            end,
+            erlang:raise(Class, Reason, Stack)
     end.
 
-%% Gracefully and synchronously stop a temporary persist actor and its linked
-%% pog pool in `nexus/store/verify` without emitting OTP crash reports.
+%% Stop a temporary persist actor and its linked pog pool in
+%% `nexus/store/verify`: the pool is stopped gracefully first, then the actor
+%% is unlinked, killed, and awaited via `DOWN` so the caller does not die with
+%% it and teardown completes synchronously.
 stop_verify_actor(ActorPid, PoolName) ->
     erlang:unlink(ActorPid),
     case whereis(PoolName) of

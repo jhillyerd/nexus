@@ -1261,6 +1261,16 @@ fn case_providers_and_bots(s: Store) -> Result(Nil, String) {
     p1.api_key_encrypted,
     Some(env1),
   ))
+  use plain1 <- result.try(case p1.api_key_encrypted {
+    Some(stored_env) ->
+      expect_ok(
+        "p1 decrypt under AAD",
+        crypto.decrypt(key_bytes, "p1", stored_env)
+          |> result.map_error(string.inspect),
+      )
+    None -> Error("p1 ciphertext unexpectedly None")
+  })
+  use _ <- result.try(expect_eq("p1 decrypted plaintext", plain1, "sk-secret-1"))
   use p2 <- result.try(expect_ok("get p2", s.get_provider("p2")))
   use _ <- result.try(expect_eq("p2 keyless", p2.api_key_encrypted, None))
   use all_p <- result.try(expect_ok("list_providers", s.list_providers()))
@@ -1386,6 +1396,7 @@ fn case_providers_and_bots(s: Store) -> Result(Nil, String) {
         tools: Some(["web_search", "http_fetch"]),
         allow_inbound: True,
         created_at: 9_999_999_999,
+        updated_at: 9_999_999_999,
       ),
     ),
   ))
@@ -1412,8 +1423,8 @@ fn case_providers_and_bots(s: Store) -> Result(Nil, String) {
     test_epoch,
   ))
   use _ <- result.try(expect_true(
-    "b1 updated_at >= created_at",
-    got_b1_u.updated_at >= test_epoch,
+    "b1 updated_at bumped strictly past created_at",
+    got_b1_u.updated_at > test_epoch && got_b1_u.updated_at < 9_999_999_999,
   ))
 
   // Switch b1.tools back to None (default sentinel).
