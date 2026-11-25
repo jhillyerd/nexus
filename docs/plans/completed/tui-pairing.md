@@ -1,11 +1,19 @@
 ---
 title: Nexus — TUI pairing grants (web-minted pairing URLs for nexus-tui)
-status: active
+status: completed
 tags: [computing, self-hosting, local-llm, agents, gleam, beam, environments, tui]
-updated: 2026-11-18
+updated: 2026-11-25
 ---
 
 # TUI pairing grants: mint a pairing URL in the web UI, launch nexus-tui with it
+
+> **Landed 2026-11-18/19** (Phase A #141, Phase B #142, Phase C + boot
+> sweeps #143, per-thread node names #144, `@` in node names #146,
+> pane-close one-time URL retirement #148). All planned phases and boot
+> hygiene sweeps shipped; Phase D's two stretch items (`GET /pair/<code>`
+> landing page and in-process reconnect-with-backoff in the PoC Gleam
+> TUI) were deliberately dropped since the high-fidelity Rust TUI now
+> lives in a separate repo.
 
 **Thesis.** Starting `bin/nexus-tui` is painful because the caller must
 supply the UI token (just to pass `protected()` on `POST /nodes`), the
@@ -412,14 +420,15 @@ deliberately).
   Pre-change state files (`tui-<server>-<node>.json`) are orphaned by
   the new key — one re-pair per host, same as the row migration.
 
-### Phase D — stretch
+### Phase D — stretch (dropped)
 
 - ~~Boot sweeps~~ — landed with Phase C (see above).
-- Stretch: human-friendly `GET /pair/<code>` landing page (shows the
+- ~~Stretch: human-friendly `GET /pair/<code>` landing page (shows the
   launch command + expiry — the visitor already holds the code);
   in-process reconnect-with-backoff in the TUI so a *server* restart
   does not kill it (today `on_close` halts the VM — the environments
-  plan's "reconnect with backoff" intent, never built in the PoC).
+  plan's "reconnect with backoff" intent, never built in the PoC).~~
+  Dropped: superseded by the high-fidelity Rust TUI in a separate repo.
 
 ## Non-goals (recorded, not planned)
 
