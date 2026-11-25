@@ -1,11 +1,17 @@
 ---
 title: Nexus — web_fetch tool (HTML-to-Markdown, pagination, and fetch cache)
-status: "active — v1 (Phases 1-3) shipped in PR 159; v2 bounded decompression shipped 2026-11-22; v3 http_fetch curl upgrades (Phase 5) shipped 2026-11-22"
+status: completed
 tags: [computing, self-hosting, local-llm, agents, gleam, beam, tools, web-fetch]
-updated: 2026-11-22
+updated: 2026-11-25
 ---
 
 # `web_fetch`: readable web fetching with HTML-to-Markdown and pagination
+
+> **Landed 2026-11-21/22** (v1 Phases 1–3 [#159](https://github.com/jhillyerd/nexus/pull/159),
+> v2 bounded decompression [#160](https://github.com/jhillyerd/nexus/pull/160),
+> v3 Phase 5 `http_fetch` curl upgrades [#163](https://github.com/jhillyerd/nexus/pull/163)).
+> All planned phases shipped; the deferred Phase 4 utility-model extraction
+> (`prompt` parameter) is tracked in [#179](https://github.com/jhillyerd/nexus/issues/179).
 
 **Thesis.** Introduce a higher-level `web_fetch` tool that fetches public web
 pages with a generous bounded raw-byte budget, converts HTML into compact
@@ -551,7 +557,8 @@ low-level tool grew `method`, `headers`, and `body`; the plan bullet in
 
 ## Future phases (out of scope for v1)
 
-- **Phase 4 — Utility-model extraction (`prompt` / `query` parameter):**
+- **Phase 4 — Utility-model extraction (`prompt` / `query` parameter)** —
+  tracked in [#179](https://github.com/jhillyerd/nexus/issues/179):
   Once Nexus has a configured fast/utility model (or explicit sub-call policy
   safe for local GPUs), add an optional `prompt: String` parameter to
   `web_fetch` that runs over the cached Markdown document and returns a focused

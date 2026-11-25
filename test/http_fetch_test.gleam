@@ -1,7 +1,7 @@
 //// http_fetch adapter tests against a controlled local HTTP service
 //// (mist on loopback — `allow_private` is exactly the dev/test escape
 //// hatch for this), plus pure SSRF-guard tests. Phase 5 (curl upgrades,
-//// docs/plans/web-fetch.md): method/body/header round-trips, redirect
+//// docs/plans/completed/web-fetch.md): method/body/header round-trips, redirect
 //// method semantics, cross-origin credential stripping, response-header
 //// reporting with caps, and argument validation.
 
