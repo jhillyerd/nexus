@@ -39,7 +39,7 @@ export function resetDatabase(databaseUrl) {
         ),
       ),
     );
-    child.on("exit", (code) =>
+    child.on("close", (code) =>
       code === 0
         ? resolve()
         : reject(new Error(`database reset failed (${code}):\n${out}`)),

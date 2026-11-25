@@ -106,6 +106,7 @@ jobs:
         with:
           otp-version: "27"
           gleam-version: "1.19.0"
+          rebar3-version: "3"
       - name: Install system tools (psql, bwrap)
         run: |
           sudo apt-get update

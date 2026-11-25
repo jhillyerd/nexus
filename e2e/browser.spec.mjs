@@ -1723,14 +1723,17 @@ async function main() {
       // MetaUpdated is scoped to subscribers of the mutated thread: desktop
       // is subscribed to `first` (not `second`), so its list stays at 1 until
       // it refreshes, while mobile holds its newly created second thread.
-      // Settle briefly before pinning absence so a late unsolicited refresh
-      // would be caught rather than raced past.
-      await sleep(500);
-      eq(
-        await dpage.locator("#thread-list .thread-main").count(),
-        1,
-        "desktop stays on its own thread list without unsolicited refresh",
-      );
+      // Poll across a bounded window asserting the count stays 1 throughout
+      // (so a transient or delayed unsolicited refresh would be caught).
+      const absenceDeadline = Date.now() + 750;
+      while (Date.now() < absenceDeadline) {
+        eq(
+          await dpage.locator("#thread-list .thread-main").count(),
+          1,
+          "desktop stays on its own thread list without unsolicited refresh",
+        );
+        await sleep(100);
+      }
 
       // Reload: the context's own last-selected thread (the second one —
       // not the auto-selected first) comes back through the client-

@@ -1,5 +1,5 @@
-%% Erlang FFI helpers for the live sandbox escape probe runner
-%% (`src/nexus/env/verify.gleam`, verification plan Phase 2).
+%% Erlang FFI helpers shared by the live sandbox escape probe runner
+%% (`src/nexus/env/verify.gleam`) and `test/env_test.gleam`.
 %%
 %% Kept out of `nexus_env_ffi.erl` so test/verification-only helpers (mutating
 %% the BEAM's own environment for secret-scrub canaries, binding a loopback
@@ -47,10 +47,10 @@ close_socket(Socket) ->
 %% swallowed and the original exception re-raised; on the success path a
 %% `Cleanup()` exception propagates and `Fun()`'s result is lost.
 with_cleanup(Fun, Cleanup) ->
-    try
-        Res = Fun(),
-        _ = Cleanup(),
-        Res
+    try Fun() of
+        Res ->
+            _ = Cleanup(),
+            Res
     catch
         Class:Reason:Stack ->
             _ = try Cleanup() catch _:_ -> ok end,
