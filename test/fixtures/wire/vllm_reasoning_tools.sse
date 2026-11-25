@@ -1,0 +1,18 @@
+: vllm keepalive
+
+data: {"id":"chatcmpl-vllm-001","object":"chat.completion.chunk","created":1730000001,"model":"deepseek-r1-distill","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-vllm-001","object":"chat.completion.chunk","created":1730000001,"model":"deepseek-r1-distill","choices":[{"index":0,"delta":{"reasoning_content":"Thinking: 检查天气 “Tokyo” 🌤️"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-vllm-001","object":"chat.completion.chunk","created":1730000001,"model":"deepseek-r1-distill","choices":[{"index":0,"delta":{"reasoning_content":" and fetching docs."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-vllm-001","object":"chat.completion.chunk","created":1730000002,"model":"deepseek-r1-distill","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_vllm_0","type":"function","function":{"name":"web_search","arguments":"{\"query\":"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-vllm-001","object":"chat.completion.chunk","created":1730000002,"model":"deepseek-r1-distill","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"東京 天気\"}"}},{"index":1,"id":"call_vllm_1","type":"function","function":{"name":"http_fetch","arguments":"{\"url\":\"https://example.test/café\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-vllm-001","object":"chat.completion.chunk","created":1730000002,"model":"deepseek-r1-distill","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: {"id":"chatcmpl-vllm-001","object":"chat.completion.chunk","created":1730000002,"model":"deepseek-r1-distill","choices":[],"usage":{"prompt_tokens":1280,"completion_tokens":44,"total_tokens":1324,"prompt_tokens_details":{"cached_tokens":1152}}}
+
+data: [DONE]
+

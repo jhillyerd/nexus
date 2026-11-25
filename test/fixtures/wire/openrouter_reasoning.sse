@@ -1,0 +1,16 @@
+: OPENROUTER PROCESSING
+
+data: {"id":"gen-or-001","object":"chat.completion.chunk","created":1730000300,"model":"anthropic/claude-synthetic","choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning":"Step 1: parse “quoted” input"},"finish_reason":null}]}
+
+: OPENROUTER PROCESSING
+
+data: {"id":"gen-or-001","object":"chat.completion.chunk","created":1730000301,"model":"anthropic/claude-synthetic","choices":[{"index":0,"delta":{"reasoning":" → done ✨"},"finish_reason":null}]}
+
+data: {"id":"gen-or-001","object":"chat.completion.chunk","created":1730000301,"model":"anthropic/claude-synthetic","choices":[{"index":0,"delta":{"content":"Result: 日本語テスト ✅"},"finish_reason":null}]}
+
+data: {"id":"gen-or-001","object":"chat.completion.chunk","created":1730000302,"model":"anthropic/claude-synthetic","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"gen-or-001","object":"chat.completion.chunk","created":1730000302,"model":"anthropic/claude-synthetic","choices":[],"usage":{"prompt_tokens":900,"completion_tokens":22,"total_tokens":922,"prompt_tokens_details":{"cached_tokens":768}}}
+
+data: [DONE]
+

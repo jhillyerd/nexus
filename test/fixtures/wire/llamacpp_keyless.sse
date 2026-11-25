@@ -1,0 +1,14 @@
+: llama.cpp slot ready
+
+data: {"id":"chatcmpl-llama-001","object":"chat.completion.chunk","created":1730000100,"model":"qwen3-32b","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"Let’s verify: naïve café → OK."},"finish_reason":null}]}
+
+data:{"id":"chatcmpl-llama-001","object":"chat.completion.chunk","created":1730000101,"model":"qwen3-32b","choices":[{"index":0,"delta":{"content":"こんにちは 🌍"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-llama-001","object":"chat.completion.chunk","created":1730000101,"model":"qwen3-32b","choices":[{"index":0,"delta":{"content":" — all clear!"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-llama-001","object":"chat.completion.chunk","created":1730000102,"model":"qwen3-32b","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-llama-001","object":"chat.completion.chunk","created":1730000102,"model":"qwen3-32b","choices":[],"usage":{"prompt_tokens":512,"completion_tokens":18,"total_tokens":530,"prompt_tokens_details":{"cached_tokens":480}}}
+
+data: [DONE]
+
