@@ -329,13 +329,13 @@ pub fn bash_runs_in_workspace_cwd_test() {
 /// converts binaries to the lists os:putenv demands). A plain port
 /// would hand that environment to the child — the scrubbed spawn
 /// must not carry it across.
-@external(erlang, "nexus_env_test_ffi", "put_env")
+@external(erlang, "nexus_env_verify_ffi", "put_env")
 fn put_env(name: String, value: String) -> Nil
 
-@external(erlang, "nexus_env_test_ffi", "unset_env")
+@external(erlang, "nexus_env_verify_ffi", "unset_env")
 fn unset_env(name: String) -> Nil
 
-@external(erlang, "nexus_env_test_ffi", "get_env")
+@external(erlang, "nexus_env_verify_ffi", "get_env")
 fn get_env(name: String) -> Result(String, Nil)
 
 /// Restore a stomped variable to its ORIGINAL value — unset only when
@@ -1984,10 +1984,10 @@ pub fn sandbox_nono_fake_wrapper_env_and_reexport_test() {
 
 type LoopbackSocket
 
-@external(erlang, "nexus_env_test_ffi", "listen_loopback")
+@external(erlang, "nexus_env_verify_ffi", "listen_loopback")
 fn listen_loopback() -> Result(#(LoopbackSocket, Int), Nil)
 
-@external(erlang, "nexus_env_test_ffi", "close_socket")
+@external(erlang, "nexus_env_verify_ffi", "close_socket")
 fn close_socket(socket: LoopbackSocket) -> Nil
 
 /// Verify `KillPortOsPid` (the `bwrap` PID-namespace kill path) kills the

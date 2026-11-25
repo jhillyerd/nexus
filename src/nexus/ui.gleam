@@ -1114,88 +1114,7 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     Select(id) ->
       case model.selected {
         Some(current) if current == id -> #(model, effect.none())
-        _ -> {
-          // A new visit: the view resets AND the generation bumps, so the
-          // old thread's stale deliveries (and any leftovers from an
-          // earlier visit to THIS thread) cannot render after the reset.
-          let next =
-            Model(
-              ..model,
-              selected: Some(id),
-              visit: model.visit + 1,
-              log: [],
-              flushed: [],
-              bubble: None,
-              bubble_hidden: True,
-              thinking: None,
-              streaming: False,
-              pending: [],
-              loop: None,
-              guard: False,
-              turn_base: 0,
-              // The fallback label clears with the old thread's state:
-              // a row click's title renders from the list, but a
-              // breadcrumb click can target a channel (absent from the
-              // list), which stays blank until its context resolution
-              // lands.
-              model_label: "",
-              // The popup belongs to the previous thread's log; its
-              // ids cannot resolve against the new selection's.
-              pop: None,
-              // An explicit pick re-arms the refresh auto-selection
-              // window (see `suppress_autoselect`).
-              suppress_autoselect: False,
-              // Pane state is per-selection: the sidebar lists only
-              // ordinary threads, so a ROW click is never a channel —
-              // but the BREADCRUMB can be: hop chains make channels of
-              // channels, so a grandchild's crumb targets a channel.
-              // The context clears here and the re-resolution restores
-              // it (ChannelOf answers Error(Nil) for ordinary targets,
-              // so the ordinary path is untouched), and the fresh
-              // selection's own rows load below. Until the resolution
-              // lands, `channel_pending` holds the selection against
-              // any list refresh queued before this click — without it
-              // the channel would be dropped as vanished in that
-              // window (the crumb race). Set ONLY for a target absent
-              // from the loaded list (only a channel can be): an
-              // ordinary selection keeps today's vanish-on-refresh
-              // semantics. The popover closes with the selection it
-              // was opened on (the `pop` rule).
-              channel_ctx: None,
-              channel_pending: case
-                list.any(model.threads, fn(s) { s.id == id })
-              {
-                True -> None
-                False -> Some(id)
-              },
-              channels: [],
-              pane_open: False,
-              // Pane state is per-selection (the same rule the channel
-              // rows above follow): the fresh selection's rows load on
-              // its next pane open, and a minted URL belongs to the
-              // thread it was minted for.
-              env_nodes: [],
-              env_grants: [],
-              grant_minted: None,
-              env_error: None,
-            )
-          let eff = case model.selected {
-            Some(current) ->
-              effect.batch([
-                leave_effect(model, current),
-                join_effect(next, id),
-                channels_effect(next),
-                resolve_effect(next),
-              ])
-            None ->
-              effect.batch([
-                join_effect(next, id),
-                channels_effect(next),
-                resolve_effect(next),
-              ])
-          }
-          #(next, eff)
-        }
+        _ -> select_with_primary(model, id, join_effect)
       }
 
     NewThreadToggled ->
@@ -1228,20 +1147,21 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           threads: [summary, ..model.threads],
           create_pending: False,
         )
-      let #(next, eff) = update(model, Select(summary.id))
       // COMPOSE-NEW: the stashed draft is the fresh thread's first
-      // message. The selection is in place (the Select above), so the
-      // ordinary send path runs — its own guards apply, and `SendAccepted`
-      // re-keys the composer, clearing the draft only when the thread has
-      // ACCEPTED the message. A refused send keeps both the stash-free
-      // state and the visible draft (the note explains; the user retries
-      // by sending again — the thread already exists).
+      // message. Lustre's `effect.batch` reverses its synchronous task
+      // list (and explicitly guarantees no order), so batching
+      // `join_effect` with `send_effect` sent the turn BEFORE
+      // subscribing — dropping initial tokens streamed before Join
+      // landed. When a draft rides along, sequence Join strictly BEFORE
+      // Send inside ONE effect (`join_and_send_effect`) so the
+      // subscription is registered in the thread actor's mailbox ahead
+      // of `thread.send_message`.
       case model.pending_send {
-        Some(text) -> #(
-          Model(..next, pending_send: None),
-          effect.batch([eff, send_effect(next, text)]),
-        )
-        None -> #(next, eff)
+        Some(text) -> {
+          let #(next, eff) = select_for_create(model, summary.id, text)
+          #(Model(..next, pending_send: None), eff)
+        }
+        None -> update(model, Select(summary.id))
       }
     }
 
@@ -1311,14 +1231,19 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     StopRequested -> #(model, stop_effect(model))
 
     Hello(name) -> #(
-      Model(..model, model_label: name, streaming: case model.selected {
-        Some(id) ->
-          case list.find(model.threads, fn(s) { s.id == id }) {
-            Ok(summary) -> summary.streaming
-            Error(_) -> False
-          }
-        None -> False
-      }),
+      Model(
+        ..model,
+        model_label: name,
+        streaming: model.streaming
+          || case model.selected {
+            Some(id) ->
+              case list.find(model.threads, fn(s) { s.id == id }) {
+                Ok(summary) -> summary.streaming
+                Error(_) -> False
+              }
+            None -> False
+          },
+      ),
       effect.none(),
     )
 
@@ -2556,6 +2481,130 @@ fn leave_effect(model: Model, id: String) -> Effect(Msg) {
   }
 }
 
+/// Shared per-selection reset and effect batch used by both `Select` and
+/// compose-new `Created` (one single definition of every per-selection field
+/// and batched follow-up effect so they cannot drift).
+fn select_with_primary(
+  model: Model,
+  id: String,
+  primary_effect: fn(Model, String) -> Effect(Msg),
+) -> #(Model, Effect(Msg)) {
+  // A new visit: the view resets AND the generation bumps, so the
+  // old thread's stale deliveries (and any leftovers from an
+  // earlier visit to THIS thread) cannot render after the reset.
+  let next =
+    Model(
+      ..model,
+      selected: Some(id),
+      visit: model.visit + 1,
+      log: [],
+      flushed: [],
+      bubble: None,
+      bubble_hidden: True,
+      thinking: None,
+      streaming: False,
+      pending: [],
+      loop: None,
+      guard: False,
+      turn_base: 0,
+      // The fallback label clears with the old thread's state:
+      // a row click's title renders from the list, but a
+      // breadcrumb click can target a channel (absent from the
+      // list), which stays blank until its context resolution
+      // lands.
+      model_label: "",
+      // The popup belongs to the previous thread's log; its
+      // ids cannot resolve against the new selection's.
+      pop: None,
+      // An explicit pick re-arms the refresh auto-selection
+      // window (see `suppress_autoselect`).
+      suppress_autoselect: False,
+      // Pane state is per-selection: the sidebar lists only
+      // ordinary threads, so a ROW click is never a channel —
+      // but the BREADCRUMB can be: hop chains make channels of
+      // channels, so a grandchild's crumb targets a channel.
+      // The context clears here and the re-resolution restores
+      // it (ChannelOf answers Error(Nil) for ordinary targets,
+      // so the ordinary path is untouched), and the fresh
+      // selection's own rows load below. Until the resolution
+      // lands, `channel_pending` holds the selection against
+      // any list refresh queued before this click — without it
+      // the channel would be dropped as vanished in that
+      // window (the crumb race). Set ONLY for a target absent
+      // from the loaded list (only a channel can be): an
+      // ordinary selection keeps today's vanish-on-refresh
+      // semantics. The popover closes with the selection it
+      // was opened on (the `pop` rule).
+      channel_ctx: None,
+      channel_pending: case list.any(model.threads, fn(s) { s.id == id }) {
+        True -> None
+        False -> Some(id)
+      },
+      channels: [],
+      pane_open: False,
+      // Pane state is per-selection (the same rule the channel
+      // rows above follow): the fresh selection's rows load on
+      // its next pane open, and a minted URL belongs to the
+      // thread it was minted for.
+      env_nodes: [],
+      env_grants: [],
+      grant_minted: None,
+      env_error: None,
+    )
+  let primary = primary_effect(next, id)
+  let eff = case model.selected {
+    Some(current) if current != id ->
+      effect.batch([
+        leave_effect(model, current),
+        primary,
+        channels_effect(next),
+        resolve_effect(next),
+      ])
+    _ ->
+      effect.batch([
+        primary,
+        channels_effect(next),
+        resolve_effect(next),
+      ])
+  }
+  #(next, eff)
+}
+
+fn select_for_create(
+  model: Model,
+  id: String,
+  initial_send: String,
+) -> #(Model, Effect(Msg)) {
+  // If a sidebar refresh listed the new thread and the user selected it before
+  // `Created` arrived, keep that existing visit/subscription intact and send
+  // the draft directly instead of resetting or leaving the same thread.
+  case model.selected {
+    Some(current) if current == id -> #(model, send_effect(model, initial_send))
+    _ ->
+      select_with_primary(model, id, fn(next, target_id) {
+        join_and_send_effect(next, target_id, initial_send)
+      })
+  }
+}
+
+fn join_and_send_effect(model: Model, id: String, text: String) -> Effect(Msg) {
+  let registry = model.registry
+  let visit = model.visit
+  let events = model.events
+  effect.from(fn(dispatch) {
+    case thread_registry.get(registry, id) {
+      Ok(subject) -> {
+        case events {
+          Some(ev) -> process.send(subject, thread.Join(ev, visit))
+          None -> Nil
+        }
+        send_into_subject(registry, Some(id), subject, text, dispatch)
+      }
+      Error(_) -> dispatch(SendRejected("gone"))
+    }
+  })
+}
+
 fn send_effect(model: Model, text: String) -> Effect(Msg) {
   let registry = model.registry
   let id = model.selected
@@ -2565,55 +2614,63 @@ fn send_effect(model: Model, text: String) -> Effect(Msg) {
       None -> Error(Nil)
     }
     case resolved {
-      Ok(subject) -> {
-        // Auto-title at the send boundary — the twin of the HTTP route's
-        // rule. The transcript always carries the system prompt, so "no
-        // user message yet" is a count of 1; the registry refuses to
-        // clobber a manual (or already generated) title regardless.
-        // <= 2, not <= 1: an environment thread starts at 2 (system
-        // prompt + roster row) and its first human send must still
-        // auto-title (CodeRabbit review). A plain thread can never sit
-        // at 2 on a send boundary — its first send commits user +
-        // assistant (>= 3) or fails with nothing (1).
-        let is_first = thread.describe(subject).message_count <= 2
-        case thread.send_message(subject, text) {
-          thread.Sent -> {
-            case is_first, id {
-              True, Some(thread_id) -> {
-                let _ =
-                  thread_registry.auto_title(
-                    registry,
-                    thread_id,
-                    thread_registry.title_from_first_message(text),
-                  )
-                Nil
-              }
-              _, _ -> Nil
-            }
-            // Refresh on EVERY send, not just the first: the thread
-            // bumps its activity at the send itself (the user message
-            // commits on append, even if the turn later fails), so a
-            // previous-day conversation re-buckets to Today and jumps to
-            // the top the moment the message lands. Waiting for the
-            // reply's TurnDone refresh left the row under Yesterday for
-            // the whole turn. The first-message case also lands the new
-            // title here; the turn's own events follow. The pane asks
-            // ride along (the shared refresh shape): a send into a
-            // parent is what CREATES channels — the relay — so the
-            // badge must move on this refresh, not a later one.
-            load_threads_asks(registry, id, dispatch)
-            dispatch(SendAccepted)
-          }
-          thread.Busy -> dispatch(SendRejected("busy"))
-          // An archived channel refuses human Sends (bot-channels plan,
-          // #123): same rejection surface as busy, with the honest
-          // reason text.
-          thread.Refused(reason) -> dispatch(SendRejected(reason))
-        }
-      }
+      Ok(subject) -> send_into_subject(registry, id, subject, text, dispatch)
       Error(_) -> dispatch(SendRejected("gone"))
     }
   })
+}
+
+fn send_into_subject(
+  registry: Subject(thread_registry.Msg),
+  id: Option(String),
+  subject: Subject(thread.Msg),
+  text: String,
+  dispatch: fn(Msg) -> Nil,
+) -> Nil {
+  // Auto-title at the send boundary — the twin of the HTTP route's
+  // rule. The transcript always carries the system prompt, so "no
+  // user message yet" is a count of 1; the registry refuses to
+  // clobber a manual (or already generated) title regardless.
+  // <= 2, not <= 1: an environment thread starts at 2 (system
+  // prompt + roster row) and its first human send must still
+  // auto-title (CodeRabbit review). A plain thread can never sit
+  // at 2 on a send boundary — its first send commits user +
+  // assistant (>= 3) or fails with nothing (1).
+  let is_first = thread.describe(subject).message_count <= 2
+  case thread.send_message(subject, text) {
+    thread.Sent -> {
+      case is_first, id {
+        True, Some(thread_id) -> {
+          let _ =
+            thread_registry.auto_title(
+              registry,
+              thread_id,
+              thread_registry.title_from_first_message(text),
+            )
+          Nil
+        }
+        _, _ -> Nil
+      }
+      // Refresh on EVERY send, not just the first: the thread
+      // bumps its activity at the send itself (the user message
+      // commits on append, even if the turn later fails), so a
+      // previous-day conversation re-buckets to Today and jumps to
+      // the top the moment the message lands. Waiting for the
+      // reply's TurnDone refresh left the row under Yesterday for
+      // the whole turn. The first-message case also lands the new
+      // title here; the turn's own events follow. The pane asks
+      // ride along (the shared refresh shape): a send into a
+      // parent is what CREATES channels — the relay — so the
+      // badge must move on this refresh, not a later one.
+      load_threads_asks(registry, id, dispatch)
+      dispatch(SendAccepted)
+    }
+    thread.Busy -> dispatch(SendRejected("busy"))
+    // An archived channel refuses human Sends (bot-channels plan,
+    // #123): same rejection surface as busy, with the honest
+    // reason text.
+    thread.Refused(reason) -> dispatch(SendRejected(reason))
+  }
 }
 
 fn stop_effect(model: Model) -> Effect(Msg) {

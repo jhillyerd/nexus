@@ -42,6 +42,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { chromium } from "playwright";
+import { pgEnvFromUrl, resetDatabase as resetDb } from "./lib.mjs";
 import { startServices, UTILITY_REPLY_DELAY_MS } from "./services.mjs";
 
 const ROOT = new URL("..", import.meta.url).pathname;
@@ -291,24 +292,7 @@ const DATABASE_URL = process.env.E2E_DATABASE_URL ?? "postgres://nexus@127.0.0.1
 /// panel auto-targets the FIRST enabled provider by name, and e.g. an
 /// integration run's "bifrost" would sort before this suite's "fake").
 /// Requires `psql` next to the (already mandatory) Postgres.
-function resetDatabase() {
-  return new Promise((resolve, reject) => {
-    const child = spawn(
-      "psql",
-      ["-q", DATABASE_URL, "-c", "truncate thread_message, thread, bot, provider cascade;"],
-      { stdio: ["ignore", "pipe", "pipe"] },
-    );
-    let out = "";
-    child.stdout.on("data", (d) => (out += d));
-    child.stderr.on("data", (d) => (out += d));
-    child.on("error", (err) => reject(new Error(`psql not found (${err.message}) — it ships with the Postgres the suite already requires`)));
-    child.on("exit", (code) =>
-      code === 0
-        ? resolve()
-        : reject(new Error(`database reset failed (${code}):\n${out}`)),
-    );
-  });
-}
+const resetDatabase = () => resetDb(DATABASE_URL);
 
 /// A bot over the API, uniquely named (bot names are case-insensitively
 /// unique). Keyless "fake" provider, the given model alias. Returns the
@@ -389,11 +373,12 @@ function startNexus({ port, bifrostPort, searxPort, maxToolIterations, workspace
     NEXUS_HTTP_PORT: String(port),
     NEXUS_UI_TOKEN: TOKEN,
     NEXUS_MAX_TOOL_ITERATIONS: String(maxToolIterations),
-    // The http_fetch target is a loopback service under our control.
+    // The web_fetch target is a loopback service under our control.
     NEXUS_HTTP_FETCH_ALLOW_PRIVATE: "true",
     NEXUS_SEARXNG_BASE_URL: `http://127.0.0.1:${searxPort}`,
     NEXUS_SYSTEM_PROMPT:
       "You are nexus under e2e test. Follow the case: markers exactly.",
+    ...pgEnvFromUrl(DATABASE_URL),
     // Set only for the pairing-pane instance (tui-pairing Phase C): the
     // main instances deliberately have NO root, so their threads carry
     // no env tools and the byte-prefix envelopes stay as captured. The
@@ -940,15 +925,15 @@ async function main() {
       });
       // #67 contract: archiving the OPEN thread deliberately deselects
       // (`deselect` + sticky `suppress_autoselect`) and restoring does not
-      // re-select — the chat pane stays blank until a row is picked. Pin
-      // that contract here, then re-select the restored thread: the
-      // always-visible selected-row controls (and every later test's
-      // composer) come back with the pick.
+      // re-select — the chat pane stays blank (showing the compose-new bot
+      // picker since bots exist) until a row is picked. Pin that contract
+      // here, then re-select the restored thread: the always-visible
+      // selected-row controls come back with the pick.
       eq(await selectedId(page), "", "archive-of-selection cleared the selection");
-      assert(
-        (await page.getAttribute("#input", "disabled")) !== null,
-        "composer disabled after the archive-deselect",
-      );
+      await poll(async () => await page.locator("#composer-bot").isVisible(), {
+        timeout: 10_000,
+        message: "compose-new bot picker shown after archive-deselect",
+      });
       await smartRow.locator(".thread-main").click();
       await poll(
         () =>
@@ -1150,8 +1135,8 @@ async function main() {
       assert(committed.some((t) => t.startsWith(partial.trim().slice(0, 8))), `partial committed: ${committed}`);
     });
 
-    // -- 6. http_fetch tool loop ----------------------------------------------
-    await test("tools: http_fetch chip opens a popup with args, result, and status", async () => {
+    // -- 6. web_fetch tool loop ----------------------------------------------
+    await test("tools: web_fetch chip opens a popup with args, result, and status", async () => {
       await sendAndWaitIdle(
         page,
         `case:fetch fetch http://127.0.0.1:${services.docPort}/doc.json`,
@@ -1166,10 +1151,10 @@ async function main() {
         done: el.classList.contains("done"),
         text: el.textContent,
       }));
-      eq(chipInfo.tool, "http_fetch", "tool name");
+      eq(chipInfo.tool, "web_fetch", "tool name");
       eq(chipInfo.done, true, "terminal tint class");
       assert(chipInfo.label.includes("completed"), `aria status: ${chipInfo.label}`);
-      eq(chipInfo.text.trim(), "http_fetch", "chip is the name only — no inline preview");
+      eq(chipInfo.text.trim(), "web_fetch", "chip is the name only — no inline preview");
       // Clicking the chip opens the full-call popup.
       await chip.first().click();
       const pop = page.locator("dialog[open] article.tool-pop");
@@ -1317,7 +1302,7 @@ async function main() {
           label: el.getAttribute("aria-label"),
         })),
       );
-      const fetchChips = chips.filter((c) => c.tool === "http_fetch");
+      const fetchChips = chips.filter((c) => c.tool === "web_fetch");
       const searchChips = chips.filter((c) => c.tool === "web_search");
       assert(fetchChips.length === 2, `two fetch chips replayed: ${JSON.stringify(chips)}`);
       eq(searchChips.length, 1, "one search chip replayed");
@@ -1337,7 +1322,7 @@ async function main() {
       // Tool events must never render as model text.
       const assistantText = await page.$$eval(".turn.assistant", (els) => els.map((e) => e.textContent));
       assert(
-        assistantText.every((t) => !t.includes("call_") && !t.includes("http_fetch") && !t.includes("web_search")),
+        assistantText.every((t) => !t.includes("call_") && !t.includes("web_fetch") && !t.includes("web_search")),
         `assistant bubbles free of tool noise: ${assistantText}`,
       );
       const userText = await page.$$eval(".turn.user", (els) => els.map((e) => e.textContent));
@@ -1735,14 +1720,20 @@ async function main() {
         first,
         "desktop keeps its own selection while mobile diverges",
       );
-      // Sidebar metadata is GLOBAL (MetaUpdated passes the delivery
-      // filter): the draft's send-time auto-title refreshes every
-      // connected tab's list, so the desktop list learns the new row —
-      // but its SELECTION stays its own (that is the per-client half).
-      await poll(
-        async () => (await dpage.locator("#thread-list .thread-main").count()) === 2,
-        { timeout: 15_000, message: "desktop list refreshes globally" },
-      );
+      // MetaUpdated is scoped to subscribers of the mutated thread: desktop
+      // is subscribed to `first` (not `second`), so its list stays at 1 until
+      // it refreshes, while mobile holds its newly created second thread.
+      // Poll across a bounded window asserting the count stays 1 throughout
+      // (so a transient or delayed unsolicited refresh would be caught).
+      const absenceDeadline = Date.now() + 750;
+      while (Date.now() < absenceDeadline) {
+        eq(
+          await dpage.locator("#thread-list .thread-main").count(),
+          1,
+          "desktop stays on its own thread list without unsolicited refresh",
+        );
+        await sleep(100);
+      }
 
       // Reload: the context's own last-selected thread (the second one —
       // not the auto-selected first) comes back through the client-
@@ -1979,6 +1970,10 @@ async function main() {
       });
       eq(madeBotRes.status(), 201, "bot on the new provider created");
       const madeBotId = (await madeBotRes.json()).id;
+      // An API-side bot create is out of band for a live /ws connection,
+      // so reload to pick up the new bot in the compose picker.
+      await page.reload();
+      await connected(page);
       const threadsBefore = await page.locator("#thread-list .thread-main").count();
       await page.click("#new-thread");
       await poll(
@@ -2037,20 +2032,27 @@ async function main() {
         { timeout: 15_000, message: "409 guard note after pinned delete" },
       );
 
-      // Disable: the row badges as disabled (in Settings), and a bot
-      // create naming it refuses — bots are the only create shape, so
-      // the disabled provider cannot enter any new thread's pin.
+      // Disable: the row badges as disabled (in Settings). A bot is a
+      // template so creating a bot pointing at a disabled provider is
+      // allowed (201), while starting a THREAD from that bot is refused
+      // (400) until the provider is re-enabled.
       await openSettings(page);
       await madeRow.getByRole("button", { name: "Disable", exact: true }).click();
       await poll(
         async () => (await madeRow.locator(".badge.off").textContent()) === "disabled",
         { timeout: 15_000, message: "disabled badge" },
       );
-      const disabledBot = await page.request.post(`${base}/bots`, {
+      const disabledBotRes = await page.request.post(`${base}/bots`, {
         data: { name: `disabled-pin-${Date.now()}`, provider: madeId, model: "smart" },
         headers: headers13,
       });
-      eq(disabledBot.status(), 400, "disabled provider refuses bot create");
+      eq(disabledBotRes.status(), 201, "bot template can reference a disabled provider");
+      const disabledBotId = (await disabledBotRes.json()).id;
+      const disabledThread = await page.request.post(`${base}/threads`, {
+        data: { bot: disabledBotId },
+        headers: headers13,
+      });
+      eq(disabledThread.status(), 400, "disabled provider refuses thread create");
       // Disabling blocks new resolutions, not the already-frozen thread
       // endpoint — the pinned thread keeps streaming either way (the
       // compose-send turn above already ran while enabled; the frozen
@@ -2060,13 +2062,16 @@ async function main() {
         async () => (await madeRow.locator(".badge").count()) === 1,
         { timeout: 15_000, message: "re-enabled provider badge restored" },
       );
-      const reBot = await page.request.post(`${base}/bots`, {
-        data: { name: `re-enabled-pin-${Date.now()}`, provider: madeId, model: "smart" },
+      const reThread = await page.request.post(`${base}/threads`, {
+        data: { bot: disabledBotId },
         headers: headers13,
       });
-      eq(reBot.status(), 201, "re-enabled provider takes bot creates again");
-      const reEnabledBotId = (await reBot.json()).id;
-      void reEnabledBotId;
+      eq(reThread.status(), 201, "re-enabled provider takes thread creates again");
+      const reThreadId = (await reThread.json()).id;
+      const reThreadGone = await page.request.delete(`${base}/threads/${reThreadId}`, {
+        headers: { authorization: `Bearer ${TOKEN}` },
+      });
+      eq(reThreadGone.status(), 204, "re-enabled test thread cleaned up");
     });
 
     // -- 17b. bots: create in Settings, start-from-bot, delete keeps the
@@ -2728,10 +2733,10 @@ async function main() {
     // context, no storage) boots straight into the named thread.
     await test("url: address bar follows the selection; links share; back/forward walks history", async () => {
       const headers = { authorization: `Bearer ${TOKEN}` };
-      const post = (model) =>
-        page.request.post(`${base}/threads`, { headers, data: { provider: "fake", model } });
-      const t1 = await (await post("smart")).json();
-      const t2 = await (await post("fast")).json();
+      const made1 = await createBotThread("smart", "url-bot-1");
+      const made2 = await createBotThread("fast", "url-bot-2");
+      const t1 = made1.thread;
+      const t2 = made2.thread;
       try {
         // An API-side create is invisible to a running client (the list
         // refreshes on own creates and joined broadcasts only), so reload
@@ -2878,6 +2883,176 @@ async function main() {
         eq(gone1.status(), 204, "t1 deleted");
         const gone2 = await page.request.delete(`${base}/threads/${t2.id}`, { headers });
         eq(gone2.status(), 204, "t2 deleted");
+        const botGone1 = await page.request.delete(`${base}/bots/${made1.botId}`, { headers });
+        eq(botGone1.status(), 204, "url bot 1 deleted");
+        const botGone2 = await page.request.delete(`${base}/bots/${made2.botId}`, { headers });
+        eq(botGone2.status(), 204, "url bot 2 deleted");
+      }
+    });
+
+    // -- 18c. faults: mid-stream disconnect rollback & 429 retry prefix -----
+    // Verification plan Phase 2: prove that upstream stream drops roll back
+    // uncommitted UI lines while keeping committed history intact, and that
+    // HTTP 429 errors render cleanly and let a retry resend a byte-identical
+    // request prefix.
+    await test("faults: mid-stream disconnect rolls back; 429 renders error and retry preserves prefix", async () => {
+      const headers = { authorization: `Bearer ${TOKEN}` };
+      const made = await createBotThread("smart", "fault-bot");
+      const faultThread = made.thread;
+      services.setRateLimitFail(true);
+      try {
+        await page.goto(`${base}/threads/${faultThread.id}?token=${TOKEN}`);
+        await connected(page);
+        await poll(async () => (await selectedId(page)) === faultThread.id, {
+          timeout: 15_000,
+          message: "fault thread selected",
+        });
+
+        // 1. Committed baseline turn.
+        const baselinePrompt = "case:text baseline before faults";
+        await sendAndWaitIdle(page, baselinePrompt);
+        eq(await page.locator(".turn.user").count(), 1, "baseline user bubble");
+        eq(await page.locator(".turn.assistant").count(), 1, "baseline assistant bubble");
+        const baselineReq = services.requests.findLast(
+          (r) =>
+            r.url === "/v1/chat/completions" &&
+            !r.body.includes(UTILITY_DELTA) &&
+            r.body.includes(baselinePrompt),
+        );
+        assert(baselineReq, "recorded baseline chat request");
+
+        // 2. Mid-stream disconnect: partial tokens stream, TCP drops without
+        //    [DONE] -> UI surfaces `.note.err` and rolls back uncommitted
+        //    lines while keeping the committed baseline intact (and durable).
+        await page.fill("#input", "case:disconnect drop mid-stream");
+        await page.press("#input", "Enter");
+        await poll(
+          async () => {
+            const notes = await page.locator(".note.err").allTextContents();
+            const idle = await page.locator("#send").evaluate((el) => !el.disabled);
+            return idle && notes.some((n) => n.includes("turn failed:"));
+          },
+          { timeout: 30_000, message: "disconnect surfaced turn-failed note and re-enabled send" },
+        );
+        // Live rollback contract (AGENTS.md + ui.gleam): a failed turn rolls
+        // back to the user line — the partial assistant bubble is discarded
+        // while the user line remains visible above the error note, and
+        // nothing commits server-side (proved by reload below).
+        const assistantsAfterDrop = await page.locator(".turn.assistant").allTextContents();
+        eq(assistantsAfterDrop.length, 1, "partial disconnect assistant bubble rolled back");
+        assert(
+          assistantsAfterDrop.every((t) => !t.includes("Partial uncommitted")),
+          `partial disconnect text rolled back: ${assistantsAfterDrop}`,
+        );
+        assert(
+          assistantsAfterDrop.some((t) => t.includes("Plain answer")),
+          `baseline assistant kept after disconnect: ${assistantsAfterDrop}`,
+        );
+        // Reload proves the partial disconnect output never persisted: the
+        // user prompt committed at Send (preserving prefix monotonicity),
+        // while the failed turn's assistant output rolled back completely.
+        await page.reload();
+        await connected(page);
+        await poll(async () => (await selectedId(page)) === faultThread.id, {
+          timeout: 15_000,
+          message: "fault thread re-opened after disconnect reload",
+        });
+        await poll(async () => (await page.locator(".turn.user").count()) === 2, {
+          timeout: 15_000,
+          message: "baseline + disconnect user prompts replayed after reload",
+        });
+        const assistantsAfterReload = await page.locator(".turn.assistant").allTextContents();
+        eq(assistantsAfterReload.length, 1, "only baseline assistant persisted after disconnect");
+        assert(
+          assistantsAfterReload[0].includes("Plain answer"),
+          `baseline assistant replayed after disconnect: ${assistantsAfterReload}`,
+        );
+
+        // 3. Non-200 / HTTP 429 rate-limit error: renders cleanly with status
+        //    + body snippet and commits no assistant output.
+        const rateLimitPrompt = "case:ratelimit transient 429 retry";
+        const reqsBefore429 = services.requests.length;
+        await page.fill("#input", rateLimitPrompt);
+        await page.press("#input", "Enter");
+        await poll(
+          async () => {
+            const notes = await page.locator(".note.err").allTextContents();
+            const idle = await page.locator("#send").evaluate((el) => !el.disabled);
+            return (
+              idle &&
+              notes.some(
+                (n) => n.includes("429") && n.includes("rate limit exceeded"),
+              )
+            );
+          },
+          { timeout: 30_000, message: "429 rate-limit error rendered cleanly" },
+        );
+        eq(await page.locator(".turn.assistant").count(), 1, "no assistant line on 429 failure");
+        const failed429Req = services.requests
+          .slice(reqsBefore429)
+          .find(
+            (r) =>
+              r.url === "/v1/chat/completions" &&
+              !r.body.includes(UTILITY_DELTA) &&
+              r.body.includes(rateLimitPrompt),
+          );
+        assert(failed429Req, "recorded failed 429 chat request");
+        assert(
+          extendsRequest(baselineReq.body, failed429Req.body),
+          "429 request extends committed baseline prefix byte-for-byte",
+        );
+
+        // 4. Retry after the 429 clears: succeeds AND extends the prior
+        //    request's prefix byte-for-byte (never mutating earlier messages).
+        services.setRateLimitFail(false);
+        const reqsBeforeRetry = services.requests.length;
+        await sendAndWaitIdle(page, rateLimitPrompt);
+        const assistantsAfterRetry = await page.locator(".turn.assistant").allTextContents();
+        assert(
+          assistantsAfterRetry.some((t) => t.includes("Recovered after rate limit")),
+          `retry answer rendered: ${assistantsAfterRetry}`,
+        );
+        const retryReq = services.requests
+          .slice(reqsBeforeRetry)
+          .find(
+            (r) =>
+              r.url === "/v1/chat/completions" &&
+              !r.body.includes(UTILITY_DELTA) &&
+              r.body.includes(rateLimitPrompt),
+          );
+        assert(retryReq, "recorded retry chat request");
+        assert(
+          extendsRequest(failed429Req.body, retryReq.body),
+          "retry after 429 extends the failed request prefix byte-for-byte",
+        );
+        assert(
+          extendsRequest(baselineReq.body, retryReq.body),
+          "retry extends committed baseline request prefix byte-for-byte",
+        );
+        // Reload proves only the two completed assistant replies persisted
+        // (neither the mid-stream disconnect nor the 429 committed partial text).
+        await page.reload();
+        await connected(page);
+        await poll(async () => (await page.locator(".turn.assistant").count()) === 2, {
+          timeout: 15_000,
+          message: "baseline + recovered assistant turns replayed after reload",
+        });
+        eq(await page.locator(".turn.user").count(), 4, "all four sent user prompts persisted");
+      } finally {
+        services.setRateLimitFail(true);
+        // Non-throwing cleanup so a cleanup hiccup never masks the original
+        // test failure inside `try`.
+        const gone = await page.request
+          .delete(`${base}/threads/${faultThread.id}`, { headers })
+          .catch(() => null);
+        const botGone = await page.request
+          .delete(`${base}/bots/${made.botId}`, { headers })
+          .catch(() => null);
+        if (gone?.status() !== 204 || botGone?.status() !== 204) {
+          console.warn(
+            `fault-test cleanup incomplete: thread=${gone?.status() ?? "err"} bot=${botGone?.status() ?? "err"}`,
+          );
+        }
       }
     });
 

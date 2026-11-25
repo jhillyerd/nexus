@@ -10,10 +10,10 @@ nothing here affects `gleam run` / `gleam test` / the project devShell.
 The suite starts everything it needs on loopback:
 
 - **fake Bifrost** — an OpenAI-compatible SSE server with scripted scenarios
-  (`case:text`, `case:slow`, `case:fetch`, `case:search`, `case:loop`) so
-  tool behaviour is deterministic; it also records every chat request body
-  verbatim,
-- **controlled doc server** — the `http_fetch` target (including a
+  (`case:text`, `case:slow`, `case:fetch`, `case:search`, `case:loop`,
+  `case:disconnect`, `case:ratelimit`) so tool behaviour and fault recovery
+  are deterministic; it also records every chat request body verbatim,
+- **controlled doc server** — the `web_fetch` target (including a
   `<script>` string proving previews are inert text nodes),
 - **SearxNG stub** — a `/search?format=json` endpoint,
 - **two real Nexus servers** (`gleam run`): the main one
@@ -21,11 +21,12 @@ The suite starts everything it needs on loopback:
   (`NEXUS_MAX_TOOL_ITERATIONS=2`).
 
 Checks: bearer auth (401/200), alias + thread lists, thread create/switch,
-text-only turn, stop mid-stream with partial commit, `http_fetch` and
+text-only turn, stop mid-stream with partial commit, `web_fetch` and
 `web_search` tool cards (name, stable call id, argument preview, status,
 compact result preview, no script injection), iteration chip, reload →
 replay of the complete tool history as completed cards, iteration-guard
-terminal rendering, byte-identical request-prefix growth per thread
+terminal rendering, mid-stream disconnect rollback and HTTP 429 error
+rendering + byte-identical retry prefix, byte-identical request-prefix growth per thread
 (including after title/tag/pin/archive mutations) plus the utility
 branch's own contract (the once-per-thread title+tags side call:
 suffix-only branch growth off the committed transcript, envelope delta
@@ -94,7 +95,8 @@ on (`NEXUS_HTTP_FETCH_ALLOW_PRIVATE=false`), real Bifrost (llama.cpp and
 vLLM aliases), real SearxNG. Same preconditions as the browser suite
 (Postgres up; the suite truncates and seeds the gateway as a provider row
 itself). Needs network and ~10 minutes — a live-checkpoint activity, never
-CI (the CI runner has no node).
+CI (PR CI runs the deterministic $0 suites `browser.spec.mjs`,
+`node.spec.mjs`, `tui.spec.mjs`, and `nexus/env/verify` only).
 
 ```sh
 node e2e/integration.spec.mjs

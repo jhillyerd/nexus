@@ -37,15 +37,18 @@ Closes # <!-- issue number, or delete the line; GitHub closes it on merge -->
 ## Tests
 
 <!-- Don't restate what the green checks prove — CI already runs gleam test,
-     squirrel check, and gleam format --check. Report the two things CI can't:
-     what coverage changed, and what you verified outside the regular suites. -->
+     squirrel check, nexus/store/verify, gleam format --check, deterministic
+     e2e suites (browser, node, tui), and bwrap sandbox probes
+     (nexus/env/verify). Report the two things CI can't: what coverage changed,
+     and what you verified outside the regular suites. -->
 
 **Coverage** — `<base>` → `<head>` tests. What the new tests pin, by behaviour,
 naming the invariant each holds. Changes pinned by existing tests: name them.
 Docs-only: say so here, and put what you verified under Beyond CI.
 
 **Beyond CI** — delete lines that don't apply:
-- e2e browser suite: run / not run, and why (never runs in CI)
+- live integration smoke (`e2e/integration.spec.mjs`): run / not run, and why
+  (real LLM + SearxNG, never runs in CI)
 - live migration: idempotent re-run on an existing DB (CI only applies to a
   fresh one)
 - manual visual sweep: light/dark/mobile screenshots
