@@ -13,9 +13,10 @@
 ////   - Hostile / malformed stream fuzzing (truncation, garbage JSON,
 ////     missing/duplicate tool call IDs, reasoning-only turns, whitespace-only
 ////     content alongside tool calls, out-of-order usage chunks).
-////   - Recorded dialect fixtures (`test/fixtures/wire/*.sse`) for vLLM,
-////     llama.cpp (keyless), OpenAI, and OpenRouter replayed whole, 1-byte at a
-////     time, and under random chunk splits.
+////   - Synthetic dialect fixtures (`test/fixtures/wire/*.sse`) modeled on
+////     vLLM, llama.cpp (keyless), OpenAI, and OpenRouter wire shapes (until
+////     live Phase 5 captures are added), replayed whole, 1-byte at a time,
+////     and under random chunk splits.
 
 import gleam/bit_array
 import gleam/erlang/process
@@ -343,12 +344,12 @@ pub fn deterministic_clock_ttft_and_duration_test() {
 
 type ExpectedCounts {
   ExpectedCounts(
+    events: List(openai.StreamEvent),
     events_parsed: Int,
     decode_errors: Int,
     token_deltas: Int,
     reasoning_deltas: Int,
     tool_call_deltas: Int,
-    usage_events: Int,
     saw_done: Bool,
     saw_finish: Bool,
   )
@@ -356,12 +357,12 @@ type ExpectedCounts {
 
 fn zero_counts() -> ExpectedCounts {
   ExpectedCounts(
+    events: [],
     events_parsed: 0,
     decode_errors: 0,
     token_deltas: 0,
     reasoning_deltas: 0,
     tool_call_deltas: 0,
-    usage_events: 0,
     saw_done: False,
     saw_finish: False,
   )
@@ -369,12 +370,12 @@ fn zero_counts() -> ExpectedCounts {
 
 fn add_counts(a: ExpectedCounts, b: ExpectedCounts) -> ExpectedCounts {
   ExpectedCounts(
+    events: list.append(a.events, b.events),
     events_parsed: a.events_parsed + b.events_parsed,
     decode_errors: a.decode_errors + b.decode_errors,
     token_deltas: a.token_deltas + b.token_deltas,
     reasoning_deltas: a.reasoning_deltas + b.reasoning_deltas,
     tool_call_deltas: a.tool_call_deltas + b.tool_call_deltas,
-    usage_events: a.usage_events + b.usage_events,
     saw_done: a.saw_done || b.saw_done,
     saw_finish: a.saw_finish || b.saw_finish,
   )
@@ -387,10 +388,10 @@ fn gen_text_fragment(rng: prop.Rng) -> #(String, prop.Rng) {
     "日本語テスト",
     "检查天气 “Tokyo”",
     "🚀🌤️✅",
-    "line1\\nline2",
+    "line1\nline2",
     "   ",
-    "\\t\\n",
-    "quote: \\\"hi\\\"",
+    "\t\n",
+    "quote: \"hi\"",
     "<script>alert(1)</script>",
     "€100 — ½ price",
   ])
@@ -449,7 +450,12 @@ fn gen_valid_chunk_frame(
       #(
         #(
           prefix <> payload <> nl <> nl,
-          ExpectedCounts(..zero_counts(), events_parsed: 1, reasoning_deltas: 1),
+          ExpectedCounts(
+            ..zero_counts(),
+            events: [openai.ReasoningDelta(text)],
+            events_parsed: 1,
+            reasoning_deltas: 1,
+          ),
         ),
         rng,
       )
@@ -465,7 +471,12 @@ fn gen_valid_chunk_frame(
       #(
         #(
           prefix <> payload <> nl <> nl,
-          ExpectedCounts(..zero_counts(), events_parsed: 1, token_deltas: 1),
+          ExpectedCounts(
+            ..zero_counts(),
+            events: [openai.TokenDelta(text)],
+            events_parsed: 1,
+            token_deltas: 1,
+          ),
         ),
         rng,
       )
@@ -477,13 +488,16 @@ fn gen_valid_chunk_frame(
       let #(with_name, rng) = prop.bool(rng)
       let #(args, rng) =
         prop.one_of(rng, "{\"q\":", ["\"東京\"}", "{ \"x\" : 1 }", ""])
-      let id_part = case with_id {
-        True -> ",\"id\":\"call_" <> int.to_string(idx) <> "\""
-        False -> ""
+      let #(id_part, expected_id) = case with_id {
+        True -> {
+          let call_id = "call_" <> int.to_string(idx)
+          #(",\"id\":\"" <> call_id <> "\"", Some(call_id))
+        }
+        False -> #("", None)
       }
-      let name_part = case with_name {
-        True -> "\"name\":\"web_search\","
-        False -> ""
+      let #(name_part, expected_name) = case with_name {
+        True -> #("\"name\":\"web_search\",", Some("web_search"))
+        False -> #("", None)
       }
       let payload =
         "{\"id\":\"p1\",\"object\":\"chat.completion.chunk\",\"created\":1,"
@@ -499,7 +513,19 @@ fn gen_valid_chunk_frame(
       #(
         #(
           prefix <> payload <> nl <> nl,
-          ExpectedCounts(..zero_counts(), events_parsed: 1, tool_call_deltas: 1),
+          ExpectedCounts(
+            ..zero_counts(),
+            events: [
+              openai.ToolCallDelta(
+                index: idx,
+                id: expected_id,
+                name: expected_name,
+                args_fragment: args,
+              ),
+            ],
+            events_parsed: 1,
+            tool_call_deltas: 1,
+          ),
         ),
         rng,
       )
@@ -521,6 +547,7 @@ fn gen_valid_chunk_frame(
           prefix <> payload <> nl <> nl,
           ExpectedCounts(
             ..zero_counts(),
+            events: [openai.ReasoningDelta(r_text), openai.TokenDelta(c_text)],
             events_parsed: 1,
             token_deltas: 1,
             reasoning_deltas: 1,
@@ -534,6 +561,17 @@ fn gen_valid_chunk_frame(
       let #(prompt_toks, rng) = prop.int_range(rng, 10, 2000)
       let #(cached_toks, rng) = prop.int_range(rng, 0, prompt_toks)
       let #(comp_toks, rng) = prop.int_range(rng, 1, 200)
+      let expected_usage =
+        shared.CompletionUsage(
+          prompt_tokens: prompt_toks,
+          completion_tokens: comp_toks,
+          total_tokens: prompt_toks + comp_toks,
+          prompt_tokens_details: Some(shared.PromptTokensDetails(
+            audio_tokens: None,
+            cached_tokens: Some(cached_toks),
+          )),
+          completion_tokens_details: None,
+        )
       let payload =
         "{\"id\":\"p1\",\"object\":\"chat.completion.chunk\",\"created\":1,"
         <> "\"model\":\"m\",\"choices\":[],\"usage\":{\"prompt_tokens\":"
@@ -548,7 +586,11 @@ fn gen_valid_chunk_frame(
       #(
         #(
           prefix <> payload <> nl <> nl,
-          ExpectedCounts(..zero_counts(), events_parsed: 1, usage_events: 1),
+          ExpectedCounts(
+            ..zero_counts(),
+            events: [openai.Usage(expected_usage)],
+            events_parsed: 1,
+          ),
         ),
         rng,
       )
@@ -692,7 +734,31 @@ fn gen_hostile_frame(rng: prop.Rng) -> #(#(String, ExpectedCounts), prop.Rng) {
           <> "]}}]}"
           <> nl
           <> nl,
-        ExpectedCounts(..zero_counts(), events_parsed: 1, tool_call_deltas: 3),
+        ExpectedCounts(
+          ..zero_counts(),
+          events: [
+            openai.ToolCallDelta(
+              index: 0,
+              id: Some("dup"),
+              name: Some("bash"),
+              args_fragment: "{",
+            ),
+            openai.ToolCallDelta(
+              index: 0,
+              id: Some("dup"),
+              name: None,
+              args_fragment: "}",
+            ),
+            openai.ToolCallDelta(
+              index: 1,
+              id: None,
+              name: None,
+              args_fragment: "",
+            ),
+          ],
+          events_parsed: 1,
+          tool_call_deltas: 3,
+        ),
       ),
       rng,
     )
@@ -704,7 +770,12 @@ fn gen_hostile_frame(rng: prop.Rng) -> #(#(String, ExpectedCounts), prop.Rng) {
           <> "\"reasoning_content\":\"only thinking 🧠\"}}]}"
           <> nl
           <> nl,
-        ExpectedCounts(..zero_counts(), events_parsed: 1, reasoning_deltas: 1),
+        ExpectedCounts(
+          ..zero_counts(),
+          events: [openai.ReasoningDelta("only thinking 🧠")],
+          events_parsed: 1,
+          reasoning_deltas: 1,
+        ),
       ),
       rng,
     )
@@ -718,6 +789,15 @@ fn gen_hostile_frame(rng: prop.Rng) -> #(#(String, ExpectedCounts), prop.Rng) {
           <> nl,
         ExpectedCounts(
           ..zero_counts(),
+          events: [
+            openai.TokenDelta("\n\n  "),
+            openai.ToolCallDelta(
+              index: 0,
+              id: Some("c_ws"),
+              name: Some("list_dir"),
+              args_fragment: "{}",
+            ),
+          ],
           events_parsed: 1,
           token_deltas: 1,
           tool_call_deltas: 1,
@@ -729,6 +809,14 @@ fn gen_hostile_frame(rng: prop.Rng) -> #(#(String, ExpectedCounts), prop.Rng) {
       // Out-of-order / repeated usage chunks
       let #(p, rng) = prop.int_range(rng, 1, 500)
       let #(c, rng) = prop.int_range(rng, 0, 100)
+      let expected_usage =
+        shared.CompletionUsage(
+          prompt_tokens: p,
+          completion_tokens: c,
+          total_tokens: p + c,
+          prompt_tokens_details: None,
+          completion_tokens_details: None,
+        )
       #(
         #(
           "data: {\"id\":\"h1\",\"object\":\"chat.completion.chunk\",\"created\":1,"
@@ -741,7 +829,11 @@ fn gen_hostile_frame(rng: prop.Rng) -> #(#(String, ExpectedCounts), prop.Rng) {
             <> "}}"
             <> nl
             <> nl,
-          ExpectedCounts(..zero_counts(), events_parsed: 1, usage_events: 1),
+          ExpectedCounts(
+            ..zero_counts(),
+            events: [openai.Usage(expected_usage)],
+            events_parsed: 1,
+          ),
         ),
         rng,
       )
@@ -753,7 +845,12 @@ fn gen_hostile_frame(rng: prop.Rng) -> #(#(String, ExpectedCounts), prop.Rng) {
           <> "data: \"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"multi\"}}]}"
           <> nl
           <> nl,
-        ExpectedCounts(..zero_counts(), events_parsed: 1, token_deltas: 1),
+        ExpectedCounts(
+          ..zero_counts(),
+          events: [openai.TokenDelta("multi")],
+          events_parsed: 1,
+          token_deltas: 1,
+        ),
       ),
       rng,
     )
@@ -772,55 +869,24 @@ fn check_event_counts(
   events: List(openai.StreamEvent),
   expected: ExpectedCounts,
 ) -> Result(Option(shared.CompletionUsage), String) {
-  let token_count =
-    list.count(events, fn(ev) {
-      case ev {
-        openai.TokenDelta(_) -> True
-        _ -> False
-      }
-    })
-  let reasoning_count =
-    list.count(events, fn(ev) {
-      case ev {
-        openai.ReasoningDelta(_) -> True
-        _ -> False
-      }
-    })
-  let tool_count =
-    list.count(events, fn(ev) {
-      case ev {
-        openai.ToolCallDelta(_, _, _, _) -> True
-        _ -> False
-      }
-    })
-  let usage_count =
-    list.count(events, fn(ev) {
-      case ev {
-        openai.Usage(_) -> True
-        _ -> False
-      }
-    })
-  let last_usage =
-    list.fold(events, None, fn(acc, ev) {
-      case ev {
-        openai.Usage(u) -> Some(u)
-        _ -> acc
-      }
-    })
-  case
-    token_count == expected.token_deltas
-    && reasoning_count == expected.reasoning_deltas
-    && tool_count == expected.tool_call_deltas
-    && usage_count == expected.usage_events
-  {
-    True -> Ok(last_usage)
+  case events == expected.events {
     False ->
       Error(
-        "event counts mismatch: expected="
-        <> string.inspect(expected)
-        <> " actual_events="
+        "emitted events mismatch:\n  expected="
+        <> string.inspect(expected.events)
+        <> "\n  actual="
         <> string.inspect(events),
       )
+    True -> {
+      let last_usage =
+        list.fold(events, None, fn(acc, ev) {
+          case ev {
+            openai.Usage(u) -> Some(u)
+            _ -> acc
+          }
+        })
+      Ok(last_usage)
+    }
   }
 }
 
@@ -990,7 +1056,7 @@ pub fn hostile_specific_accounting_cases_test() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Recorded dialect fixture replay tests (test/fixtures/wire/*.sse)
+// 5. Synthetic dialect fixture replay tests (test/fixtures/wire/*.sse)
 // ---------------------------------------------------------------------------
 
 fn assert_fixture_chunk_invariant(
