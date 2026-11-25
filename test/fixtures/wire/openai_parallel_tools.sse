@@ -1,0 +1,16 @@
+data: {"id":"chatcmpl-oai-001","object":"chat.completion.chunk","created":1730000200,"model":"gpt-4o-mini","service_tier":"default","system_fingerprint":"fp_synthetic","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-oai-001","object":"chat.completion.chunk","created":1730000200,"model":"gpt-4o-mini","service_tier":"default","system_fingerprint":"fp_synthetic","choices":[{"index":0,"delta":{"content":"Checking both sources…"},"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-oai-001","object":"chat.completion.chunk","created":1730000201,"model":"gpt-4o-mini","service_tier":"default","system_fingerprint":"fp_synthetic","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_oai_a","type":"function","function":{"name":"read_file","arguments":""}}]},"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-oai-001","object":"chat.completion.chunk","created":1730000201,"model":"gpt-4o-mini","service_tier":"default","system_fingerprint":"fp_synthetic","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{ \"path\" : \"README.md\" }"}}]},"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-oai-001","object":"chat.completion.chunk","created":1730000201,"model":"gpt-4o-mini","service_tier":"default","system_fingerprint":"fp_synthetic","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_oai_b","type":"function","function":{"name":"list_dir","arguments":"{\"path\":\"src\"}"}}]},"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-oai-001","object":"chat.completion.chunk","created":1730000202,"model":"gpt-4o-mini","service_tier":"default","system_fingerprint":"fp_synthetic","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":null}
+
+data: {"id":"chatcmpl-oai-001","object":"chat.completion.chunk","created":1730000202,"model":"gpt-4o-mini","service_tier":"default","system_fingerprint":"fp_synthetic","choices":[],"usage":{"prompt_tokens":2048,"completion_tokens":31,"total_tokens":2079,"prompt_tokens_details":{"cached_tokens":1920,"audio_tokens":0}}}
+
+data: [DONE]
+

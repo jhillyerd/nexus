@@ -266,20 +266,7 @@ fn stream_request(
               endpoint.stream_idle_timeout_ms,
               on_event,
               False,
-              "",
-              Acc(
-                started_us: started_us,
-                ttft_us: None,
-                token_deltas: 0,
-                reasoning_deltas: 0,
-                tool_call_deltas: 0,
-                events_parsed: 0,
-                decode_errors: 0,
-                saw_done: False,
-                saw_finish: False,
-                first_decode_error: None,
-                usage: None,
-              ),
+              new_feeder(started_us),
             )
           let _ = hackney.close(ref)
           case outcome {
@@ -310,14 +297,114 @@ type LoopOutcome {
   LoopCancelled
 }
 
+/// Pure, byte-level SSE stream feeder: carries incomplete multi-byte UTF-8
+/// trailing bytes across TCP chunks, normalizes `\r\n` / `\r` line endings
+/// across chunk boundaries, extracts complete SSE frames, and folds decoded
+/// payloads into `Acc`.
+///
+/// Used directly by `raw_stream_loop` and exported so offline property and
+/// dialect tests exercise the exact production wire-parsing path.
+pub opaque type StreamFeeder {
+  StreamFeeder(
+    pending_utf8: BitArray,
+    pending_cr: Bool,
+    buffer: String,
+    acc: Acc,
+  )
+}
+
+/// Create a fresh byte-level SSE feeder stamped with `started_us`.
+pub fn new_feeder(started_us: Int) -> StreamFeeder {
+  StreamFeeder(
+    pending_utf8: <<>>,
+    pending_cr: False,
+    buffer: "",
+    acc: Acc(
+      started_us: started_us,
+      ttft_us: None,
+      token_deltas: 0,
+      reasoning_deltas: 0,
+      tool_call_deltas: 0,
+      events_parsed: 0,
+      decode_errors: 0,
+      saw_done: False,
+      saw_finish: False,
+      first_decode_error: None,
+      usage: None,
+    ),
+  )
+}
+
+/// Read the underlying stats accumulator from a `StreamFeeder`.
+pub fn feeder_acc(feeder: StreamFeeder) -> Acc {
+  feeder.acc
+}
+
+/// Feed one raw byte chunk into `feeder` at monotonic timestamp `now_us`,
+/// forwarding any decoded `StreamEvent`s to `on_event`.
+///
+/// Incomplete multi-byte UTF-8 sequences at the end of `bits` are carried into
+/// the next call; invalid UTF-8 bytes fail immediately with `Transport`.
+pub fn feed_bytes(
+  feeder: StreamFeeder,
+  bits: BitArray,
+  now_us: Int,
+  on_event: fn(StreamEvent) -> Nil,
+) -> Result(StreamFeeder, StreamError) {
+  let combined = case bit_array.byte_size(feeder.pending_utf8) {
+    0 -> bits
+    _ -> bit_array.append(feeder.pending_utf8, bits)
+  }
+  case decode_utf8_prefix(combined) {
+    Error(Nil) -> Error(Transport("stream contained non-UTF-8 bytes"))
+    Ok(#(incoming, next_pending_utf8)) -> {
+      let #(normalized, next_pending_cr) =
+        normalize_line_endings(feeder.pending_cr, incoming)
+      let #(datas, next_buffer) =
+        parse_sse_normalized(feeder.buffer, normalized)
+      let next_acc =
+        list.fold(datas, feeder.acc, fn(acc, data) {
+          handle_data(data, now_us, acc, on_event)
+        })
+      Ok(StreamFeeder(
+        pending_utf8: next_pending_utf8,
+        pending_cr: next_pending_cr,
+        buffer: next_buffer,
+        acc: next_acc,
+      ))
+    }
+  }
+}
+
+/// Finalize a `StreamFeeder` at EOF (`ended_us`), enforcing trailing incomplete
+/// UTF-8 rejection, decode-error classification, and truncation checks.
+/// Pure and network-free (live HTTP streams with zero events and no decode
+/// error separately run the buffered status probe in `finish_stream`).
+pub fn finish_feeder(
+  feeder: StreamFeeder,
+  ended_us: Int,
+) -> Result(StreamStats, StreamError) {
+  case bit_array.byte_size(feeder.pending_utf8) > 0 {
+    True -> Error(Transport("stream contained non-UTF-8 bytes"))
+    False -> {
+      let acc = feeder.acc
+      let stats = build_stats(acc.started_us, ended_us, acc)
+      case classify_eof(acc, stats) {
+        EofClean(final_stats) -> Ok(final_stats)
+        EofFailed(error) -> Error(error)
+        EofEmptyNoDecodeError -> Error(Transport("stream produced no events"))
+      }
+    }
+  }
+}
+
 fn raw_stream_loop(
   selector: process.Selector(LoopMsg),
   first_response_timeout_ms: Int,
   idle_timeout_ms: Int,
   on_event: fn(StreamEvent) -> Nil,
   headers_received: Bool,
-  buffer: String,
-  acc: Acc,
+  feeder: StreamFeeder,
 ) -> LoopOutcome {
   let timeout = case headers_received {
     True -> idle_timeout_ms
@@ -345,31 +432,26 @@ fn raw_stream_loop(
         idle_timeout_ms,
         on_event,
         True,
-        buffer,
-        acc,
+        feeder,
       )
     Ok(LoopHttp(hackney.Binary(bits))) ->
-      case bit_array.to_string(bits) {
-        Error(_) -> LoopTimedOut(Transport("stream contained non-UTF-8 bytes"))
-        Ok(incoming) -> {
-          let #(datas, next_buffer) = parse_sse(buffer, incoming)
-          let now_us = timing.now_us()
-          let acc =
-            list.fold(datas, acc, fn(acc, data) {
-              handle_data(data, now_us, acc, on_event)
-            })
+      case feed_bytes(feeder, bits, timing.now_us(), on_event) {
+        Error(err) -> LoopTimedOut(err)
+        Ok(next_feeder) ->
           raw_stream_loop(
             selector,
             first_response_timeout_ms,
             idle_timeout_ms,
             on_event,
             True,
-            next_buffer,
-            acc,
+            next_feeder,
           )
-        }
       }
-    Ok(LoopHttp(hackney.DoneStreaming)) -> LoopEnded(acc)
+    Ok(LoopHttp(hackney.DoneStreaming)) ->
+      case bit_array.byte_size(feeder.pending_utf8) > 0 {
+        True -> LoopTimedOut(Transport("stream contained non-UTF-8 bytes"))
+        False -> LoopEnded(feeder.acc)
+      }
     Ok(LoopHttp(hackney.NotDecoded(reason))) ->
       LoopTimedOut(Transport(
         "upstream stream error: " <> string.inspect(reason),
@@ -424,13 +506,126 @@ pub fn handle_data(
   }
 }
 
-fn parse_sse(buffer: String, incoming: String) -> #(List(String), String) {
-  let full = buffer <> string.replace(incoming, "\r\n", "\n")
-  let parts = string.split(full, "\n\n")
-  let assert Ok(next_buffer) = list.last(parts)
-  let frames = list.take(parts, list.length(parts) - 1)
-  let datas = list.filter_map(frames, frame_data)
-  #(datas, next_buffer)
+fn decode_utf8_prefix(bytes: BitArray) -> Result(#(String, BitArray), Nil) {
+  case bit_array.to_string(bytes) {
+    Ok(text) -> Ok(#(text, <<>>))
+    Error(Nil) -> {
+      let total = bit_array.byte_size(bytes)
+      try_utf8_split(bytes, total, 1)
+      |> result.lazy_or(fn() { try_utf8_split(bytes, total, 2) })
+      |> result.lazy_or(fn() { try_utf8_split(bytes, total, 3) })
+    }
+  }
+}
+
+fn try_utf8_split(
+  bytes: BitArray,
+  total: Int,
+  tail_len: Int,
+) -> Result(#(String, BitArray), Nil) {
+  case tail_len <= total {
+    False -> Error(Nil)
+    True -> {
+      let head_len = total - tail_len
+      use tail <- result.try(bit_array.slice(bytes, head_len, tail_len))
+      case is_incomplete_utf8_prefix(tail) {
+        False -> Error(Nil)
+        True -> {
+          use head <- result.try(bit_array.slice(bytes, 0, head_len))
+          use text <- result.try(bit_array.to_string(head))
+          Ok(#(text, tail))
+        }
+      }
+    }
+  }
+}
+
+fn is_incomplete_utf8_prefix(tail: BitArray) -> Bool {
+  case tail {
+    <<b0:8>> -> b0 >= 0xC2 && b0 <= 0xF4
+    <<b0:8, b1:8>> -> is_valid_utf8_2_of_3_or_4(b0, b1)
+    <<b0:8, b1:8, b2:8>> -> is_valid_utf8_2_of_4(b0, b1) && is_utf8_cont(b2)
+    _ -> False
+  }
+}
+
+fn is_utf8_cont(byte: Int) -> Bool {
+  byte >= 0x80 && byte <= 0xBF
+}
+
+fn is_valid_utf8_2_of_4(b0: Int, b1: Int) -> Bool {
+  case b0 {
+    0xF0 -> b1 >= 0x90 && b1 <= 0xBF
+    0xF1 | 0xF2 | 0xF3 -> is_utf8_cont(b1)
+    0xF4 -> b1 >= 0x80 && b1 <= 0x8F
+    _ -> False
+  }
+}
+
+fn is_valid_utf8_2_of_3_or_4(b0: Int, b1: Int) -> Bool {
+  case b0 {
+    0xE0 -> b1 >= 0xA0 && b1 <= 0xBF
+    0xED -> b1 >= 0x80 && b1 <= 0x9F
+    0xE1
+    | 0xE2
+    | 0xE3
+    | 0xE4
+    | 0xE5
+    | 0xE6
+    | 0xE7
+    | 0xE8
+    | 0xE9
+    | 0xEA
+    | 0xEB
+    | 0xEC
+    | 0xEE
+    | 0xEF -> is_utf8_cont(b1)
+    _ -> is_valid_utf8_2_of_4(b0, b1)
+  }
+}
+
+fn normalize_line_endings(
+  pending_cr: Bool,
+  incoming: String,
+) -> #(String, Bool) {
+  case incoming {
+    "" -> #("", pending_cr)
+    _ -> {
+      let rest = case pending_cr, incoming {
+        True, "\n" <> tail -> tail
+        _, _ -> incoming
+      }
+      let next_pending_cr = string.ends_with(rest, "\r")
+      let normalized =
+        rest
+        |> string.replace("\r\n", "\n")
+        |> string.replace("\r", "\n")
+      #(normalized, next_pending_cr)
+    }
+  }
+}
+
+fn parse_sse_normalized(
+  buffer: String,
+  normalized: String,
+) -> #(List(String), String) {
+  case normalized {
+    "" -> #([], buffer)
+    _ -> {
+      let full = buffer <> normalized
+      let parts = string.split(full, "\n\n")
+      case list.reverse(parts) {
+        [next_buffer, ..rev_frames] -> {
+          let datas =
+            rev_frames
+            |> list.reverse
+            |> list.filter_map(frame_data)
+          #(datas, next_buffer)
+        }
+        [] -> #([], "")
+      }
+    }
+  }
 }
 
 fn frame_data(frame: String) -> Result(String, Nil) {
@@ -603,29 +798,31 @@ pub fn truncation_error(acc: Acc) -> Option(StreamError) {
   }
 }
 
-fn finish_stream(
-  req: Request(String),
-  started_us: Int,
-  acc: Acc,
-  _on_event: fn(StreamEvent) -> Nil,
-) -> Result(StreamStats, StreamError) {
-  let ended_us = timing.now_us()
+fn build_stats(started_us: Int, ended_us: Int, acc: Acc) -> StreamStats {
   let ttft_ms = case acc.ttft_us {
     Some(first_us) -> Some(timing.elapsed_ms(started_us, first_us))
     None -> None
   }
-  let stats =
-    StreamStats(
-      ttft_ms: ttft_ms,
-      duration_ms: timing.elapsed_ms(started_us, ended_us),
-      token_deltas: acc.token_deltas,
-      reasoning_deltas: acc.reasoning_deltas,
-      tool_call_deltas: acc.tool_call_deltas,
-      events_parsed: acc.events_parsed,
-      decode_errors: acc.decode_errors,
-      saw_done: acc.saw_done,
-      usage: acc.usage,
-    )
+  StreamStats(
+    ttft_ms: ttft_ms,
+    duration_ms: timing.elapsed_ms(started_us, ended_us),
+    token_deltas: acc.token_deltas,
+    reasoning_deltas: acc.reasoning_deltas,
+    tool_call_deltas: acc.tool_call_deltas,
+    events_parsed: acc.events_parsed,
+    decode_errors: acc.decode_errors,
+    saw_done: acc.saw_done,
+    usage: acc.usage,
+  )
+}
+
+type EofVerdict {
+  EofClean(stats: StreamStats)
+  EofFailed(error: StreamError)
+  EofEmptyNoDecodeError
+}
+
+fn classify_eof(acc: Acc, stats: StreamStats) -> EofVerdict {
   case acc.events_parsed == 0 && !acc.saw_done {
     False ->
       // A stream that delivered events and then closed with NEITHER
@@ -633,33 +830,48 @@ fn finish_stream(
       // (upstream disconnect / proxy reset). Fail as a transport error so the
       // turn rolls back cleanly instead of committing a half-streamed reply.
       case truncation_error(acc) {
-        None -> Ok(stats)
-        Some(error) -> Error(error)
+        None -> EofClean(stats)
+        Some(error) -> EofFailed(error)
       }
-    True -> {
-      // Zero parsed events then Closed: classify as non-200-or-empty and
-      // re-run buffered once to capture the actual status/body.
+    True ->
+      // Zero parsed events then Closed: either a decode failure prevented any
+      // event from landing, or the upstream returned an empty/non-200 body.
       case acc.first_decode_error {
-        Some(reason) -> Error(Decode(reason))
-        None ->
-          case hackney.send(req) {
-            Error(e) ->
+        Some(reason) -> EofFailed(Decode(reason))
+        None -> EofEmptyNoDecodeError
+      }
+  }
+}
+
+fn finish_stream(
+  req: Request(String),
+  started_us: Int,
+  acc: Acc,
+  _on_event: fn(StreamEvent) -> Nil,
+) -> Result(StreamStats, StreamError) {
+  let stats = build_stats(started_us, timing.now_us(), acc)
+  case classify_eof(acc, stats) {
+    EofClean(final_stats) -> Ok(final_stats)
+    EofFailed(error) -> Error(error)
+    EofEmptyNoDecodeError ->
+      // Zero parsed events then Closed with no decode error: re-run buffered
+      // once to capture the actual status/body.
+      case hackney.send(req) {
+        Error(e) ->
+          Error(Transport(
+            "stream produced no events and buffered retry failed: "
+            <> send_error(e),
+          ))
+        Ok(response) ->
+          case response.status {
+            200 ->
               Error(Transport(
-                "stream produced no events and buffered retry failed: "
-                <> send_error(e),
+                "stream produced no events (status 200); body: "
+                <> snippet(response.body),
               ))
-            Ok(response) ->
-              case response.status {
-                200 ->
-                  Error(Transport(
-                    "stream produced no events (status 200); body: "
-                    <> snippet(response.body),
-                  ))
-                status -> Error(Non200(status, snippet(response.body)))
-              }
+            status -> Error(Non200(status, snippet(response.body)))
           }
       }
-    }
   }
 }
 
