@@ -396,7 +396,7 @@ fn probe_fs_isolation(
       sandbox,
       process.new_subject(),
       10_000,
-      "cat " <> sibling_secret,
+      "cat " <> env.shell_single_quote(sibling_secret),
     )
   assert_false(
     string.contains(out1, "sibling-thread-secret-" <> uniq),
@@ -413,7 +413,7 @@ fn probe_fs_isolation(
       sandbox,
       process.new_subject(),
       10_000,
-      "cat " <> host_sentinel,
+      "cat " <> env.shell_single_quote(host_sentinel),
     )
   assert_false(
     string.contains(out2, "host-sentinel-secret-" <> uniq),
@@ -440,7 +440,7 @@ fn probe_fs_isolation(
           sandbox,
           process.new_subject(),
           10_000,
-          "echo bad > " <> escape_path,
+          "echo bad > " <> env.shell_single_quote(escape_path),
         )
       assert_true(
         string.starts_with(out4, "exit status"),
@@ -495,7 +495,12 @@ fn probe_timeout_reap(
   sandbox: env.SandboxConfig,
 ) -> Nil {
   let tag = "nxvto" <> label <> uniq <> "q"
-  let pattern = "nxvto" <> label <> uniq <> "[q]"
+  // Match the grandchild's own `<tag> 60` argv for presence (so the sandbox
+  // wrapper's `exec -a <tag> sleep 60` command line cannot satisfy it before
+  // `sleep 60` forks), then verify the broader tag is completely gone after
+  // timeout so neither wrapper nor grandchild remains.
+  let present_pattern = "nxvto" <> label <> uniq <> "[q] 6[0]"
+  let gone_pattern = "nxvto" <> label <> uniq <> "[q]"
   let reply = process.new_subject()
   let _worker =
     process.spawn_unlinked(fn() {
@@ -509,13 +514,13 @@ fn probe_timeout_reap(
         )
       process.send(reply, res)
     })
-  poll_tag_present(pattern, 50)
+  poll_tag_present(present_pattern, 50)
   let assert Ok(Error(msg)) = process.receive(reply, 10_000)
   assert_true(
     string.contains(msg, "timed out"),
     "timeout error reported: " <> msg,
   )
-  poll_tag_gone(pattern, 25)
+  poll_tag_gone(gone_pattern, 25)
 }
 
 fn probe_cancel_reap(
@@ -525,7 +530,8 @@ fn probe_cancel_reap(
   sandbox: env.SandboxConfig,
 ) -> Nil {
   let tag = "nxvcn" <> label <> uniq <> "q"
-  let pattern = "nxvcn" <> label <> uniq <> "[q]"
+  let present_pattern = "nxvcn" <> label <> uniq <> "[q] 6[0]"
+  let gone_pattern = "nxvcn" <> label <> uniq <> "[q]"
   // Subjects can only be received on by their owning process: create `cancel`
   // inside the worker and hand it back so the worker's bash_loop can select it
   // and verify the one-shot re-signal afterward.
@@ -547,7 +553,7 @@ fn probe_cancel_reap(
       process.send(reply, #(res, resignalled))
     })
   let assert Ok(cancel) = process.receive(cancel_back, 2000)
-  poll_tag_present(pattern, 50)
+  poll_tag_present(present_pattern, 50)
   process.send(cancel, Nil)
   let assert Ok(#(Error(msg), resignalled)) = process.receive(reply, 10_000)
   assert_true(
@@ -555,7 +561,7 @@ fn probe_cancel_reap(
     "cancel error reported: " <> msg,
   )
   assert_true(resignalled, "one-shot cancel subject re-signalled")
-  poll_tag_gone(pattern, 25)
+  poll_tag_gone(gone_pattern, 25)
 }
 
 fn probe_memory_cap(
@@ -581,9 +587,15 @@ fn probe_memory_cap(
         "memory-capped command exits non-zero as normal tool data: " <> out,
       )
     }
-    // Under aggressive cgroup/RLIMIT_AS failure before the wrapper finishes,
-    // an honest tool Error is also an acceptable non-fatal containment outcome.
-    Error(_) -> Nil
+    // Only a pre-marker non-zero sandbox wrapper exit under the tight 128 MiB
+    // cap (e.g. OOM-killed before bash prints its PID marker) counts as
+    // memory-cap enforcement; timeouts and unrelated errors must fail.
+    Error(msg) ->
+      assert_true(
+        string.starts_with(msg, "bash: sandbox wrapper (")
+          && string.contains(msg, "exited with status "),
+        "memory cap probe failed with non-cap error: " <> msg,
+      )
   }
 
   // Positive follow-up: the BEAM VM and workspace remain completely healthy.

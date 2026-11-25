@@ -4762,6 +4762,115 @@ pub fn created_with_draft_joins_before_sending_test() {
   [first, second, third] |> should.equal(["join", "describe", "send"])
 }
 
+/// Regression (CodeRabbit PR review): if a sidebar refresh lists the newly
+/// created thread and the user selects it before `Created` arrives, `Created`
+/// must send the stashed draft on the existing visit without resetting it or
+/// emitting `thread.Leave` for the same thread.
+pub fn created_with_draft_already_selected_preserves_subscription_test() {
+  let order = process.new_subject()
+  let assert Ok(fake_thread) =
+    actor.new(Nil)
+    |> actor.on_message(fn(state, msg: thread.Msg) {
+      case msg {
+        thread.Join(_, _) -> {
+          process.send(order, "join")
+          actor.continue(state)
+        }
+        thread.Leave(_) -> {
+          process.send(order, "leave")
+          actor.continue(state)
+        }
+        thread.Describe(reply) -> {
+          process.send(order, "describe")
+          process.send(
+            reply,
+            thread.ThreadStatus(
+              model: "smart",
+              message_count: 1,
+              streaming: False,
+              metrics: [],
+              last_commit_at: 0,
+            ),
+          )
+          actor.continue(state)
+        }
+        thread.Send(_, _, _, reply) -> {
+          process.send(order, "send")
+          process.send(reply, thread.Sent)
+          actor.continue(state)
+        }
+        _ -> actor.continue(state)
+      }
+    })
+    |> actor.start
+
+  let assert Ok(fake_registry) =
+    actor.new(Nil)
+    |> actor.on_message(fn(state, msg: thread_registry.Msg) {
+      case msg {
+        thread_registry.Get(id, reply) if id == "s-new" -> {
+          process.send(reply, Ok(fake_thread.data))
+          actor.continue(state)
+        }
+        thread_registry.List(reply) -> {
+          process.send(reply, [summary("s-new", True)])
+          actor.continue(state)
+        }
+        thread_registry.AutoTitle(_, _, reply) -> {
+          process.send(reply, True)
+          actor.continue(state)
+        }
+        thread_registry.Channels(_, reply) -> {
+          process.send(reply, [])
+          actor.continue(state)
+        }
+        thread_registry.ChannelOf(_, reply) -> {
+          process.send(reply, Error(Nil))
+          actor.continue(state)
+        }
+        _ -> actor.continue(state)
+      }
+    })
+    |> actor.start
+
+  let events = process.new_subject()
+  let selected =
+    ui.Model(
+      ..compose_ready_model(),
+      registry: fake_registry.data,
+      events: Some(events),
+    )
+    |> step(ui.SendRequested("first draft"))
+    // Simulate a sidebar refresh listing s-new and the user clicking it before
+    // the create worker dispatches `Created`.
+    |> step(ui.ThreadsLoaded([summary("s-new", False)]))
+    |> step(ui.Select("s-new"))
+  let visit_before = selected.visit
+
+  let #(done, eff) = ui.update(selected, ui.Created(summary("s-new", False)))
+  done.selected |> should.equal(Some("s-new"))
+  done.visit |> should.equal(visit_before)
+  done.create_pending |> should.be_false
+  done.pending_send |> should.equal(None)
+
+  effect.perform(
+    eff,
+    fn(_) { Nil },
+    fn(_, _) { Nil },
+    fn(_) { Nil },
+    fn() { dynamic.nil() },
+    fn(_, _) { Nil },
+    fn(_, _) { Nil },
+    fn(_) { Nil },
+  )
+
+  let assert Ok(first) = process.receive(order, 1000)
+  let assert Ok(second) = process.receive(order, 1000)
+  [first, second] |> should.equal(["describe", "send"])
+  // Neither a redundant Join nor a destructive Leave may be sent.
+  process.receive(order, 100) |> should.equal(Error(Nil))
+}
+
 /// The worker's failure reply clears the guard and the stash — a
 /// refused create must not lock the composer — while the VISIBLE draft
 /// survives (no re-key happened) and a later send can proceed.

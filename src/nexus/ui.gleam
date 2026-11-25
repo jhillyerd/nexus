@@ -2553,14 +2553,14 @@ fn select_with_primary(
     )
   let primary = primary_effect(next, id)
   let eff = case model.selected {
-    Some(current) ->
+    Some(current) if current != id ->
       effect.batch([
         leave_effect(model, current),
         primary,
         channels_effect(next),
         resolve_effect(next),
       ])
-    None ->
+    _ ->
       effect.batch([
         primary,
         channels_effect(next),
@@ -2575,9 +2575,16 @@ fn select_for_create(
   id: String,
   initial_send: String,
 ) -> #(Model, Effect(Msg)) {
-  select_with_primary(model, id, fn(next, target_id) {
-    join_and_send_effect(next, target_id, initial_send)
-  })
+  // If a sidebar refresh listed the new thread and the user selected it before
+  // `Created` arrived, keep that existing visit/subscription intact and send
+  // the draft directly instead of resetting or leaving the same thread.
+  case model.selected {
+    Some(current) if current == id -> #(model, send_effect(model, initial_send))
+    _ ->
+      select_with_primary(model, id, fn(next, target_id) {
+        join_and_send_effect(next, target_id, initial_send)
+      })
+  }
 }
 
 fn join_and_send_effect(model: Model, id: String, text: String) -> Effect(Msg) {
