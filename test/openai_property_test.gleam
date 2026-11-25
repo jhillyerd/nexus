@@ -29,8 +29,15 @@ import gleam/string
 import gleeunit/should
 import glopenai/shared
 import nexus/openai
+import nexus/transcript
 import prop
 import simplifile
+
+@external(erlang, "openai_property_test_ffi", "serve_once")
+fn serve_once(response: BitArray) -> Int
+
+@external(erlang, "prop_ffi", "rescue_check")
+fn rescue_panic(fun: fn() -> Nil) -> Result(Nil, String)
 
 // ---------------------------------------------------------------------------
 // Feeder replay helpers
@@ -252,32 +259,182 @@ pub fn split_crlf_and_mixed_line_endings_across_chunks_test() {
   stats.events_parsed |> should.equal(3)
 }
 
+fn feed_all_bytes(
+  chunks: List(BitArray),
+) -> Result(openai.StreamFeeder, openai.StreamError) {
+  list.try_fold(chunks, openai.new_feeder(0), fn(feeder, chunk) {
+    openai.feed_bytes(feeder, chunk, 1000, fn(_) { Nil })
+  })
+}
+
 pub fn invalid_and_truncated_utf8_rejected_consistently_test() {
-  // Invalid byte sequences: orphan continuation, overlong 2-byte, UTF-16
-  // surrogate (U+D800), out-of-range (> U+10FFFF), and 0xFF.
+  // Invalid byte sequences that are already impossible to complete: orphan
+  // continuation, overlong 2-byte, UTF-16 surrogate (U+D800), out-of-range
+  // (> U+10FFFF), and 0xFF. Must be rejected immediately by `feed_bytes`
+  // (never buffered until `finish_feeder`).
   let invalid_payloads = [
     <<0x80>>,
     <<0xC0, 0xAF>>,
     <<0xED, 0xA0, 0x80>>,
     <<0xF4, 0x90, 0x80, 0x80>>,
     <<0xFF>>,
-    // Valid SSE prefix followed by truncated 4-byte emoji at EOF (first 3 bytes of 🚀).
+  ]
+
+  list.each(invalid_payloads, fn(payload) {
+    let assert Error(openai.Transport("stream contained non-UTF-8 bytes")) =
+      openai.feed_bytes(openai.new_feeder(0), payload, 1000, fn(_) { Nil })
+    let assert Error(openai.Transport("stream contained non-UTF-8 bytes")) =
+      feed_all_bytes(prop.single_byte_chunks(payload))
+  })
+
+  // Valid SSE prefix followed by truncated 4-byte emoji at EOF (first 3 bytes
+  // of 🚀): `feed_bytes` must buffer the incomplete sequence (`Ok`), and
+  // `finish_feeder` must then reject the incomplete UTF-8 at EOF.
+  let truncated_utf8 =
     bit_array.append(
       bit_array.from_string(
         "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,"
         <> "\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n",
       ),
       <<0xF0, 0x9F, 0x9A>>,
-    ),
-  ]
+    )
+  let assert Ok(fed_whole) =
+    openai.feed_bytes(openai.new_feeder(0), truncated_utf8, 1000, fn(_) { Nil })
+  let assert Error(openai.Transport("stream contained non-UTF-8 bytes")) =
+    openai.finish_feeder(fed_whole, 2000)
 
-  list.each(invalid_payloads, fn(payload) {
-    let whole = replay_chunks([payload], 0, 1000)
-    let by_byte = replay_chunks(prop.single_byte_chunks(payload), 0, 1000)
-    let assert Error(openai.Transport("stream contained non-UTF-8 bytes")) =
-      whole.outcome
-    compare_timing_independent(whole, by_byte) |> should.equal(Ok(Nil))
-  })
+  let assert Ok(fed_bytes) =
+    feed_all_bytes(prop.single_byte_chunks(truncated_utf8))
+  let assert Error(openai.Transport("stream contained non-UTF-8 bytes")) =
+    openai.finish_feeder(fed_bytes, 2000)
+}
+
+pub fn leading_utf8_bom_stripped_once_even_when_split_test() {
+  // Leading UTF-8 BOM before a bare-CR token frame + [DONE], plus a non-leading
+  // U+FEFF inside the content payload that MUST be preserved.
+  let bom = <<0xEF, 0xBB, 0xBF>>
+  let body =
+    "data: {\"id\":\"b1\",\"object\":\"chat.completion.chunk\",\"created\":1,"
+    <> "\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\u{FEFF}!\"}}]}\r\r"
+    <> "data: [DONE]\r\r"
+  let raw = bit_array.append(bom, bit_array.from_string(body))
+
+  let whole = replay_chunks([raw], 0, 1000)
+  // Empty chunk before 1-byte chunks splitting the 3-byte BOM.
+  let by_byte = replay_chunks([<<>>, ..prop.single_byte_chunks(raw)], 0, 1000)
+
+  compare_timing_independent(whole, by_byte) |> should.equal(Ok(Nil))
+  whole.events |> should.equal([openai.TokenDelta("ok\u{FEFF}!")])
+  let assert Ok(stats) = whole.outcome
+  stats.token_deltas |> should.equal(1)
+  stats.saw_done |> should.equal(True)
+
+  // Only ONE leading BOM is stripped: a second leading BOM remains part of the
+  // first line so it is not silently dropped.
+  let double_bom = bit_array.append(bom, raw)
+  let double_res = replay_chunks(prop.single_byte_chunks(double_bom), 0, 1000)
+  double_res.events |> should.equal([])
+  let assert Ok(double_stats) = double_res.outcome
+  double_stats.saw_done |> should.equal(True)
+}
+
+pub fn sse_event_buffer_bound_enforced_test() {
+  // 1. A single transport chunk larger than max_sse_event_bytes containing many
+  // small complete events must succeed.
+  let small_event =
+    "data: {\"id\":\"m1\",\"object\":\"chat.completion.chunk\",\"created\":1,"
+    <> "\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"}}]}\n\n"
+  let event_bytes = string.byte_size(small_event)
+  let count = openai.max_sse_event_bytes / event_bytes + 10
+  let big_multi_event =
+    bit_array.from_string(
+      string.repeat(small_event, count) <> "data: [DONE]\n\n",
+    )
+  { bit_array.byte_size(big_multi_event) > openai.max_sse_event_bytes }
+  |> should.equal(True)
+  let assert Ok(multi_feeder) =
+    openai.feed_bytes(openai.new_feeder(0), big_multi_event, 1000, fn(_) { Nil })
+  let assert Ok(multi_stats) = openai.finish_feeder(multi_feeder, 2000)
+  multi_stats.token_deltas |> should.equal(count)
+  multi_stats.saw_done |> should.equal(True)
+
+  // 2. An unfinished event reaching max_sse_event_bytes + 1 via a split UTF-8
+  // trailing byte must fail immediately in `feed_bytes`.
+  let exact_limit =
+    bit_array.from_string(string.repeat("a", openai.max_sse_event_bytes))
+  let assert Ok(at_limit) =
+    openai.feed_bytes(openai.new_feeder(0), exact_limit, 1000, fn(_) { Nil })
+  let assert Error(openai.Transport("sse event exceeded maximum buffer size")) =
+    openai.feed_bytes(at_limit, <<0xF0>>, 2000, fn(_) { Nil })
+
+  // 3. A single oversized complete event fails both whole and chunked.
+  let oversized_complete =
+    bit_array.from_string(
+      "data: " <> string.repeat("a", openai.max_sse_event_bytes) <> "\n\n",
+    )
+  let assert Error(openai.Transport("sse event exceeded maximum buffer size")) =
+    openai.feed_bytes(openai.new_feeder(0), oversized_complete, 1000, fn(_) {
+      Nil
+    })
+}
+
+pub fn non_200_response_with_done_body_never_completes_test() {
+  // Offline loopback HTTP 503 whose body happens to be a valid bare-CR [DONE]
+  // SSE frame: `openai.stream` must preserve status 503 and return `Non200`,
+  // never `Ok`.
+  let raw_response =
+    bit_array.from_string(
+      "HTTP/1.1 503 Service Unavailable\r\n"
+      <> "Content-Type: text/event-stream\r\n"
+      <> "Content-Length: 14\r\n"
+      <> "Connection: close\r\n"
+      <> "\r\n"
+      <> "data: [DONE]\r\r",
+    )
+  let port = serve_once(raw_response)
+  let endpoint =
+    openai.Endpoint(
+      base_url: "http://127.0.0.1:" <> int.to_string(port) <> "/v1",
+      api_key: None,
+      sse_first_response_timeout_ms: 5000,
+      stream_idle_timeout_ms: 5000,
+    )
+  let tr =
+    transcript.new("test-model", "sys")
+    |> transcript.append_user("hi")
+  let opts = transcript.Options(..transcript.default_options(), stream: True)
+  let result = openai.stream(endpoint, tr, opts, fn(_) { Nil })
+  result |> should.equal(Error(openai.Non200(503, "data: [DONE]\r\r")))
+}
+
+pub fn prop_forall_reports_seed_and_trial_on_raised_exception_test() {
+  let seen = process.new_subject()
+  let outcome =
+    rescue_panic(fn() {
+      prop.forall("raise_probe", 42, 10, fn(_rng, trial) {
+        process.send(seen, trial)
+        case trial == 3 {
+          True -> panic as "boom_on_trial_3"
+          False -> Ok(Nil)
+        }
+      })
+    })
+  let assert Error(msg) = outcome
+  string.contains(msg, "raise_probe") |> should.equal(True)
+  string.contains(msg, "root_seed=42") |> should.equal(True)
+  string.contains(msg, "trial=3") |> should.equal(True)
+  string.contains(msg, "trial_seed=") |> should.equal(True)
+  string.contains(msg, "boom_on_trial_3") |> should.equal(True)
+  // Stopped at trial 3 (trials 0, 1, 2, 3 only — never ran trial 4).
+  let ran = drain_ints(seen, [])
+  ran |> should.equal([0, 1, 2, 3])
+}
+
+fn drain_ints(inbox: process.Subject(Int), acc: List(Int)) -> List(Int) {
+  case process.receive(inbox, 0) {
+    Ok(n) -> drain_ints(inbox, [n, ..acc])
+    Error(Nil) -> list.reverse(acc)
+  }
 }
 
 // ---------------------------------------------------------------------------

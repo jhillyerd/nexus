@@ -201,9 +201,15 @@ fn single_byte_loop(
   }
 }
 
+@external(erlang, "prop_ffi", "rescue_check")
+fn rescue_check(
+  fun: fn() -> Result(Nil, String),
+) -> Result(Result(Nil, String), String)
+
 /// Run `trials` deterministic iterations of a property test starting from
 /// `root_seed`. Panics with property name, seed, trial index, and failure
-/// message on the first failing trial so any failure is directly replayable.
+/// message on the first failing trial (whether returning `Error` or raising)
+/// so any failure is directly replayable.
 pub fn forall(
   name: String,
   root_seed: Int,
@@ -225,6 +231,25 @@ pub fn forall(
   }
 }
 
+fn format_failure(
+  name: String,
+  root_seed: Int,
+  trial: Int,
+  trial_seed: Int,
+  reason: String,
+) -> String {
+  "Property failed: "
+  <> name
+  <> " (root_seed="
+  <> int.to_string(root_seed)
+  <> ", trial="
+  <> int.to_string(trial)
+  <> ", trial_seed="
+  <> int.to_string(trial_seed)
+  <> "): "
+  <> reason
+}
+
 fn forall_loop(
   name: String,
   root_seed: Int,
@@ -240,21 +265,18 @@ fn forall_loop(
       // previous trial's stream.
       let #(trial_seed, _) =
         next_u64(seed(mask64(root_seed + trial * sm_gamma)))
-      case check(seed(trial_seed), trial) {
-        Ok(Nil) -> forall_loop(name, root_seed, trial + 1, trials, check)
-        Error(reason) ->
-          panic as {
-            "Property failed: "
-            <> name
-            <> " (root_seed="
-            <> int.to_string(root_seed)
-            <> ", trial="
-            <> int.to_string(trial)
-            <> ", trial_seed="
-            <> int.to_string(trial_seed)
-            <> "): "
-            <> reason
-          }
+      case rescue_check(fn() { check(seed(trial_seed), trial) }) {
+        Ok(Ok(Nil)) -> forall_loop(name, root_seed, trial + 1, trials, check)
+        Ok(Error(reason)) ->
+          panic as format_failure(name, root_seed, trial, trial_seed, reason)
+        Error(raised) ->
+          panic as format_failure(
+              name,
+              root_seed,
+              trial,
+              trial_seed,
+              "raised exception: " <> raised,
+            )
       }
     }
   }
