@@ -485,7 +485,7 @@ the rules that bite silently:
   re-ask live and refuse with the honest reason) because it is an
   external dependency, not part of the release.
 
-## `web_fetch` invariants (`docs/plans/web-fetch.md`)
+## `web_fetch` invariants (`docs/plans/completed/web-fetch.md`)
 
 - **Default vs opt-in split:** `web_fetch` is in `tools.default_names(cfg)`;
   `http_fetch` stays in `tools.catalog_names()` as an explicit opt-in raw
@@ -523,7 +523,7 @@ the rules that bite silently:
 
 ## `http_fetch` curl upgrades (Phase 5 shipped)
 
-`docs/plans/web-fetch.md`'s v3 as-built delta carries the design; the
+`docs/plans/completed/web-fetch.md`'s v3 as-built delta carries the design; the
 rules that bite silently:
 
 - **`net.fetch` is a GET wrapper over `net.request`; `web_fetch` and

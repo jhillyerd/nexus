@@ -125,7 +125,7 @@ pub fn fetch(
 }
 
 /// Method+body generalisation of `fetch` (Phase 5 curl upgrades,
-/// docs/plans/web-fetch.md): one request including manual redirects (up
+/// docs/plans/completed/web-fetch.md): one request including manual redirects (up
 /// to `follow_limit`), each hop re-validated. Redirect semantics follow
 /// the de-facto client standard (curl -L, browsers):
 ///

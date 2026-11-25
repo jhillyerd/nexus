@@ -15,7 +15,7 @@
 -define(MAX_HEADERS_BYTES, 8192).
 
 %% Method+body bounded request (Phase 5 curl upgrades,
-%% docs/plans/web-fetch.md): cap/deadline posture plus the full
+%% docs/plans/completed/web-fetch.md): cap/deadline posture plus the full
 %% response-header set (lowercased, duplicates joined, capped) alongside
 %% the existing derived fields. The former bounded_get/4 GET wrapper was
 %% removed when net.gleam's fetch became a GET wrapper over

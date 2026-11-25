@@ -1,5 +1,5 @@
 //// The `http_fetch` tool adapter (M3; Phase 5 curl upgrades in
-//// docs/plans/web-fetch.md): the low-level opt-in raw HTTP tool for bots
+//// docs/plans/completed/web-fetch.md): the low-level opt-in raw HTTP tool for bots
 //// without `bash`. Fetches one public http/https URL per call with an
 //// optional method, request headers, and request body — under the
 //// SSRF/size/time policy in `nexus/net` — and reports status, final URL,
