@@ -432,8 +432,10 @@ pub fn adapter_ping_test() {
   should.equal(next_frame(rig.frames), "{\"v\":1,\"type\":\"pong\"}")
 }
 
-/// User input rides the thread's Send path: Sent fans the echo back as
-/// an event frame (no ack frame of its own).
+/// User input rides the thread's Send path: EnvRole sends carry the
+/// `[from target: <name>]` prefix so the model knows which machine the
+/// message came from, and Sent fans the echo back as an event frame (no
+/// ack frame of its own).
 pub fn adapter_send_test() {
   let rig = start_rig(node_adapter.EnvRole)
   let _hello = next_frame(rig.frames)
@@ -446,7 +448,7 @@ pub fn adapter_send_test() {
   )
   should.equal(
     next_frame(rig.frames),
-    "{\"v\":1,\"type\":\"user\",\"text\":\"case:bash\",\"at\":null,\"author\":null}",
+    "{\"v\":1,\"type\":\"user\",\"text\":\"[from target: node-a]\\ncase:bash\",\"at\":null,\"author\":null}",
   )
 }
 
@@ -478,7 +480,8 @@ pub fn adapter_empty_send_test() {
 }
 
 /// Viewer role: no execution plane is attached (the fake never reported
-/// one), but events still flow and send works.
+/// one), events still flow, and send works WITHOUT a `[from target: ...]`
+/// prefix (a viewer is not an executable target).
 pub fn adapter_viewer_role_test() {
   let rig = start_rig(node_adapter.ViewerRole)
   let _hello = next_frame(rig.frames)

@@ -2,7 +2,7 @@
 title: Nexus — environments (bot workspaces + remote paired TUI nodes)
 status: active
 tags: [computing, self-hosting, local-llm, agents, gleam, beam, environments]
-updated: 2026-11-16
+updated: 2026-11-27
 ---
 
 # Environments: one execution seam for bot workspaces and paired remote nodes
@@ -647,6 +647,19 @@ settings-surface pairing UX stays plan-deferred — these routes are
 the curl/e2e path (the 2b-4 fake node pairs through them). A revoke
 is NOT retroactive: a live connection keeps running; reconnects
 fail.
+- **Sender target tagging (implemented 2026-11-27).** User messages
+  sent over `/node/ws` by an `EnvRole` node are prefixed in
+  `node_adapter` (`env.target_message_text`) with
+  `[from target: <name>]\n<text>` before reaching `thread.send_message`,
+  so requests referencing "this machine" resolve unambiguously to that
+  node's roster target. `ViewerRole` sends (no execution plane) and web
+  UI / HTTP sends stay untagged. Because the prefix rides append-only
+  `thread_message.content` (never a sidecar, never OpenAI's `user.name`
+  which local chat templates drop, and never the frozen envelope), it
+  stays tail-addressable across small context windows, preserves
+  byte-identical hydration and KV-cache prefix reuse with zero schema
+  changes, and leaves room for a future display-only `via` sidecar to
+  render it as a quiet UI badge without migrating old transcripts.
 - **Offline pins**: `node_protocol_test` (every wire shape, exact
 strings), `node_adapter_test` (the actor against a fake thread
 speaking real `thread.Msg`: connect sequence, call round trip,

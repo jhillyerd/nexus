@@ -540,6 +540,14 @@ async function main() {
     const toolRow = state.messages.find((m) => m.role === "tool");
     if (toolRow.is_error !== false) throw new Error(`tool row flagged error: ${toolRow.content}`);
     if (!/TUI-1/.test(toolRow.content ?? "")) throw new Error(`tool row content: ${toolRow.content}`);
+    // EnvRole sends carry the `[from target: <name>]` prefix so the model
+    // knows which environment the user is typing from.
+    const humanRows = state.messages.filter((m) => m.role === "user" && !m.origin);
+    const lastHuman = humanRows[humanRows.length - 1];
+    const wantUser = `[from target: ${NODE_NAME}]\ncase:nodebash marker:TUI-1`;
+    if (lastHuman?.content !== wantUser) {
+      throw new Error(`expected tagged user text ${JSON.stringify(wantUser)}, got ${JSON.stringify(lastHuman?.content)}`);
+    }
     // The command ran in the TUI's OWN workspace (its workspace dir,
     // scoped by the thread id): the scripted command touched a marker
     // file, asserted there and absent from the server's workspace —

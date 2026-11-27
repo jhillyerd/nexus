@@ -318,6 +318,17 @@ fn strip_trailing_dot(s: String) -> String {
   }
 }
 
+/// Prefix a user message arriving from an attached `EnvRole` node so the
+/// model knows which target "this machine" refers to (environments plan).
+/// Uses the same `target` vocabulary as roster lines and tool schemas;
+/// rides append-only transcript content so the KV-cache prefix survives
+/// and hydration replays byte-identically without any schema change.
+/// Web UI and `ViewerRole` sends stay untagged (a viewer has no execution
+/// plane, so naming it as a target would mislead the model).
+pub fn target_message_text(target: String, text: String) -> String {
+  "[from target: " <> target <> "]\n" <> text
+}
+
 /// Validate a proposed node/roster target name before it enters the
 /// live roster (environments plan Phase 2a): the plugin tool-name
 /// charset plus `@` (so a node can register as `user@host`),

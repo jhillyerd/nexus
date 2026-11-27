@@ -82,6 +82,13 @@ pub fn roster_texts_test() {
   |> should_equal("attached targets: workspace.")
 }
 
+pub fn target_message_text_test() {
+  env.target_message_text("proxmox-2", "why is disk usage spiking?")
+  |> should_equal("[from target: proxmox-2]\nwhy is disk usage spiking?")
+  env.target_message_text("james@laptop", "check logs")
+  |> should_equal("[from target: james@laptop]\ncheck logs")
+}
+
 pub fn roster_parse_roundtrips_test() {
   // The inverse of the tail line (Phase 2b hydration re-derivation): a
   // roster line parses back to its list, and a non-roster line is `None`.

@@ -732,6 +732,13 @@ async function main() {
     }
     const attached = viewer.frames.find((f) => f.type === "attached");
     if (attached) throw new Error("viewer received an attached frame");
+    // ViewerRole sends stay untagged (no `[from target: ...]` prefix — a
+    // viewer has no execution plane).
+    const viewerState = await threadState(threadId);
+    const viewerHumanRows = viewerState.messages.filter((m) => m.role === "user" && !m.origin);
+    if (viewerHumanRows[viewerHumanRows.length - 1]?.content !== "hello from the viewer") {
+      throw new Error(`viewer message unexpectedly modified: ${JSON.stringify(viewerHumanRows[viewerHumanRows.length - 1]?.content)}`);
+    }
     // Ping/pong liveness.
     viewer.send({ v: 1, type: "ping" });
     await viewer.waitFor((f) => f.type === "pong", "pong");

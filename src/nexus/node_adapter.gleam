@@ -64,6 +64,7 @@ import gleam/result
 import gleam/string
 import mist
 import nexus/config.{type Config}
+import nexus/env
 import nexus/node
 import nexus/node_protocol
 import nexus/store.{type Store}
@@ -662,10 +663,17 @@ fn handle_client_frame(
           actor.continue(state)
         }
         trimmed -> {
+          // Tag EnvRole sends with their target name so the model knows
+          // which environment "this machine" refers to; ViewerRole has no
+          // execution plane, so its sends stay untagged.
+          let payload = case state.role {
+            EnvRole -> env.target_message_text(state.name, trimmed)
+            ViewerRole -> trimmed
+          }
           // The same path the web UI and POST /threads/<id>/send use.
           // A bounded ask (the thread actor answers fast — it starts a
           // worker or refuses Busy); the UserEcho lands as an Event.
-          case thread.send_message(state.thread, trimmed) {
+          case thread.send_message(state.thread, payload) {
             thread.Sent -> actor.continue(state)
             thread.Busy -> {
               send_frame(
