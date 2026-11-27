@@ -72,6 +72,14 @@ let
   pgPkg = config.services.postgresql.package;
   pgSuperUser = config.services.postgresql.superUser;
 
+  ensureDbOwnership = pkgs.writeShellScript "nexus-ensure-db-ownership" ''
+    set -euo pipefail
+    printf 'ALTER DATABASE "%s" OWNER TO "%s";\n' \
+      ${lib.escapeShellArg cfg.database.name} ${lib.escapeShellArg cfg.database.user} \
+      | ${pkgs.util-linux}/bin/runuser -u ${lib.escapeShellArg pgSuperUser} -- \
+        ${pgPkg}/bin/psql -X -v ON_ERROR_STOP=1 -p ${toString cfg.database.port} -d postgres >/dev/null
+  '';
+
   syncDbPassword = pkgs.writeShellScript "nexus-sync-db-password" ''
     set -euo pipefail
     pw_file=${lib.escapeShellArg (toString cfg.database.passwordFile)}
@@ -92,10 +100,6 @@ let
       printf 'SET LOCAL standard_conforming_strings = on;\n'
       printf 'ALTER ROLE "%s" WITH LOGIN PASSWORD %s%s%s;\n' \
         ${lib.escapeShellArg cfg.database.user} "$sq" "$pw_escaped" "$sq"
-      ${lib.optionalString (cfg.database.name != cfg.database.user) ''
-        printf 'ALTER DATABASE "%s" OWNER TO "%s";\n' \
-          ${lib.escapeShellArg cfg.database.name} ${lib.escapeShellArg cfg.database.user}
-      ''}
       printf 'COMMIT;\n'
     } | ${pkgs.util-linux}/bin/runuser -u ${lib.escapeShellArg pgSuperUser} -- \
       ${pgPkg}/bin/psql -X -v ON_ERROR_STOP=1 -p ${toString cfg.database.port} -d postgres >/dev/null
@@ -591,7 +595,8 @@ in
         ) "pg-password:${toString cfg.database.passwordFile}";
 
         ExecStartPre =
-          lib.optional (cfg.database.createLocally && cfg.database.passwordFile != null) "+${syncDbPassword}"
+          lib.optional (cfg.database.createLocally && cfg.database.name != cfg.database.user) "+${ensureDbOwnership}"
+          ++ lib.optional (cfg.database.createLocally && cfg.database.passwordFile != null) "+${syncDbPassword}"
           ++ lib.optional cfg.workspace.enable "${ensureWorkspaceDirs}"
           ++ lib.optional cfg.database.runMigrations "${runMigrate}";
         ExecStart = "${runServer}";

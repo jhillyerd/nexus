@@ -520,8 +520,8 @@ the stream timeouts `NEXUS_AUDIT_SSE_FIRST_RESPONSE_TIMEOUT_MS` (30000) /
 ## NixOS deployment
 
 The flake exposes `packages.<system>.default` (`nexus` + `nexus-migrate`),
-`overlays.default`, `nixosModules.default`, and a VM integration check
-(`checks.<system>.nixos-service`).
+`overlays.default`, `nixosModules.default`, and a Linux-only VM integration
+check (`checks.<linux-system>.nixos-service`, `x86_64-linux` / `aarch64-linux`).
 
 ```nix
 {
