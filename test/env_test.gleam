@@ -489,7 +489,11 @@ fn bash_timeout_kills_background_children_with_group_kill() {
   // the spawned argv entirely).
   let tag = "nxenvbg" <> int.to_string(timing.now_us())
   let assert Error(_) =
-    bash(env_for(root), 500, "exec -a " <> tag <> "sleep sleep 30 & sleep 30")
+    bash(
+      env_for(root),
+      500,
+      "exec -a " <> tag <> "sleep bash -c 'sleep 30; true' & sleep 30",
+    )
   // The kill helper is a detached process: poll briefly for the child
   // to disappear (pgrep exits 1 when nothing matches).
   let probe = "pgrep -f '" <> tag <> "slee[p]'"
@@ -634,7 +638,7 @@ pub fn bash_owner_death_kills_group_test() {
           cancel: cancel,
           arguments: "{\"target\":\"workspace\",\"command\":\"exec -a "
             <> tag
-            <> " sleep 45 & sleep 45\"}",
+            <> " bash -c 'sleep 45; true' & sleep 45\"}",
         )
       process.sleep(60_000)
     })
@@ -713,17 +717,18 @@ pub fn bash_cancel_midrun_reaps_group_and_signal_test() {
           cancel: cancel,
           arguments: "{\"target\":\"workspace\",\"command\":\"exec -a "
             <> tag
-            <> " sleep 45 & sleep 45\"}",
+            <> " bash -c 'sleep 45; true' & sleep 45\"}",
         )
       let again = process.receive(cancel, 2000)
       process.send(reply, #(result, again))
     })
   let _ = worker
   let assert Ok(cancel) = process.receive(handoff, 5000)
-  // The tagged child itself is up (its ps line is "nxcancel9x 45" —
-  // exec -a replaces argv[0]; the bracketed probe cannot match its
-  // own command line).
-  poll_tag_present("nxcancel" <> uniq <> "[q] 4[5]", 50)
+  // The tagged child itself is up (its ps line is "nxcancel9x -c sleep 45; true"
+  // — exec -a on bash stays portable on NixOS single-binary coreutils where
+  // renaming `sleep` fails argv[0] applet dispatch; the bracketed probe cannot
+  // match its own command line).
+  poll_tag_present("nxcancel" <> uniq <> "[q] -c sleep 4[5]", 50)
   process.send(cancel, Nil)
   let assert Ok(#(result, again)) = process.receive(reply, 30_000)
   let assert Error(text) = result
@@ -2007,14 +2012,15 @@ pub fn sandbox_bwrap_fake_wrapper_kill_port_os_pid_test() {
   let uniq = int.to_string(timing.now_us())
   let tag = "nxfakebw" <> uniq <> "q"
   // Controlled toolchain stub so `build_bwrap_plan` never depends on where
-  // host `bash` resolves on a developer's PATH; resolve real host `bash` and
-  // `sleep` explicitly because `allow_env` sets `PATH=<tc>/bin`.
+  // host `bash` resolves on a developer's PATH; resolve real host `bash`
+  // explicitly because `allow_env` sets `PATH=<tc>/bin`.
   let assert Ok(real_bash) = bash(env_for(root), 5000, "command -v bash")
-  let assert Ok(real_sleep) = bash(env_for(root), 5000, "command -v sleep")
   write_executable_script(tc <> "/bin/bash", "#!/bin/sh\nexit 0\n")
   // Emulate a PID-namespace wrapper printing in-namespace PID `2` as line 1,
   // flushing output, and blocking under a unique argv tag until killed by its
-  // own host OS PID (bash `exec -a` tags the process in `ps`).
+  // own host OS PID (bash `exec -a` on bash itself avoids NixOS single-binary
+  // coreutils argv[0] dispatch failures; `read -t 30` blocks on the open port
+  // stdin with no child process).
   let script =
     "#!"
     <> string.trim(real_bash)
@@ -2024,8 +2030,8 @@ pub fn sandbox_bwrap_fake_wrapper_kill_port_os_pid_test() {
     <> "exec -a "
     <> tag
     <> " "
-    <> env.shell_single_quote(string.trim(real_sleep))
-    <> " 30\n"
+    <> env.shell_single_quote(string.trim(real_bash))
+    <> " -c 'read -t 30; true'\n"
   write_executable_script(fake_bwrap, script)
 
   let sandbox =
@@ -2057,7 +2063,7 @@ pub fn sandbox_bwrap_fake_wrapper_kill_port_os_pid_test() {
     })
   let assert Ok(cancel) = process.receive(handoff, 5000)
   // Positive control: observe the tagged fake wrapper running before cancel.
-  poll_tag_present("nxfakebw" <> uniq <> "[q] 3[0]", 50)
+  poll_tag_present("nxfakebw" <> uniq <> "[q] -c read -t 3[0]", 50)
   process.send(cancel, Nil)
   let assert Ok(#(res, resignalled)) = process.receive(reply, 10_000)
   // Confirm `KillPortOsPid` actually terminated the wrapper process.
@@ -2198,10 +2204,11 @@ fn run_real_bwrap_integration() -> Nil {
   let timeout_reply = process.new_subject()
   let _worker =
     process.spawn_unlinked(fn() {
-      let res = run(2500, "exec -a " <> tag <> " sleep 30 & sleep 30")
+      let res =
+        run(2500, "exec -a " <> tag <> " bash -c 'sleep 30; true' & sleep 30")
       process.send(timeout_reply, res)
     })
-  poll_tag_present("nxbwrap" <> uniq <> "[q] 3[0]", 50)
+  poll_tag_present("nxbwrap" <> uniq <> "[q] -c sleep 3[0]", 50)
   let assert Ok(Error(timeout_msg)) = process.receive(timeout_reply, 10_000)
   string.contains(timeout_msg, "timed out") |> should_equal(True)
   poll_tag_gone("nxbwrap" <> uniq <> "[q]", 25)
@@ -2312,10 +2319,11 @@ fn run_real_nono_integration() -> Nil {
   let timeout_reply = process.new_subject()
   let _worker =
     process.spawn_unlinked(fn() {
-      let res = run(2500, "exec -a " <> tag <> " sleep 30 & sleep 30")
+      let res =
+        run(2500, "exec -a " <> tag <> " bash -c 'sleep 30; true' & sleep 30")
       process.send(timeout_reply, res)
     })
-  poll_tag_present("nxnono" <> uniq <> "[q] 3[0]", 50)
+  poll_tag_present("nxnono" <> uniq <> "[q] -c sleep 3[0]", 50)
   let assert Ok(Error(timeout_msg)) = process.receive(timeout_reply, 10_000)
   string.contains(timeout_msg, "timed out") |> should_equal(True)
   poll_tag_gone("nxnono" <> uniq <> "[q]", 25)

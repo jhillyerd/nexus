@@ -696,9 +696,8 @@ pub fn lazy_start_is_one_shot_and_continues_ids_test() {
   // and the snapshot grows monotonically).
   let assert Ok(subject_a) = thread_registry.get(booted.registry, "s2")
   let assert Ok(subject_b) = thread_registry.get(booted.registry, "s2")
-  should.equal(thread.send_message(subject_a, "hi"), thread.Sent)
-  should.equal(thread.send_message(subject_b, "again"), thread.Sent)
-  store_mock.await_commits(mock, 4)
+  run_turn(subject_a, "hi", mock, 0)
+  run_turn(subject_b, "again", mock, 2)
   should.equal(
     store_mock.events(mock)
       |> list.filter(fn(e) {

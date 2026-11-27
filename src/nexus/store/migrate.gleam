@@ -1,7 +1,9 @@
 //// Sequential schema migration runner: applies pending numbered SQL files
-//// from `sql/migrations/` to the database in `DATABASE_URL` (the same
-//// convention squirrel uses) and records each applied migration in
-//// `schema_migration`.
+//// from `sql/migrations/` (or `NEXUS_MIGRATIONS_DIR`) to the database in
+//// `DATABASE_URL` (the convention squirrel uses) — falling back to
+//// `NEXUS_PG_*` when `DATABASE_URL` is unset so packaged deployments share
+//// one set of database variables with the server — and records each applied
+//// migration in `schema_migration`.
 ////
 //// This runner is the only schema-apply path: the compose file has no
 //// schema bind mount (its config must stay identical from every
@@ -27,6 +29,7 @@
 //// identifiers, dollar-quoted bodies (`CREATE FUNCTION` / `DO`), and
 //// comments do not break a statement apart.
 
+import envoy
 import filepath
 import gleam/bit_array
 import gleam/crypto
@@ -36,6 +39,7 @@ import gleam/erlang/process
 import gleam/int
 import gleam/io
 import gleam/list
+import gleam/option.{None, Some}
 import gleam/order
 import gleam/result
 import gleam/string
@@ -92,15 +96,12 @@ type TxError {
   ConcurrentDrift(PlanError)
 }
 
-@external(erlang, "nexus_store_ffi", "database_url")
-fn database_url() -> Result(String, Nil)
-
 // Run main's schema work under with_pool_settled: from pog.start onward the
 // VM must neither halt nor panic while the pool's boot is still in flight
 // (intermittent pgo_pool_sup shutdown_error report at teardown); see
 // nexus_store_ffi:with_pool_settled/2. pog.start hands back the pool's
-// queue gen_server. Panics before pog.start (migration files, DATABASE_URL,
-// URL parse) have no pool to race the halt with and stay unwrapped.
+// queue gen_server. Panics before pog.start (migration files, DB config)
+// have no pool to race the halt with and stay unwrapped.
 @external(erlang, "nexus_store_ffi", "with_pool_settled")
 fn with_pool_settled(run: fn() -> Nil, queue: process.Pid) -> Nil
 
@@ -110,22 +111,104 @@ fn with_checked_out(
   run: fn() -> Result(a, e),
 ) -> Result(Result(a, e), String)
 
+/// Resolve the migrations directory from the environment: honors a non-empty
+/// `NEXUS_MIGRATIONS_DIR` override (used by packaged deployments) and falls
+/// back to the repo-relative `sql/migrations`.
+pub fn resolve_migrations_dir(
+  get: fn(String) -> Result(String, Nil),
+) -> String {
+  case env_non_empty(get, "NEXUS_MIGRATIONS_DIR") {
+    Some(dir) -> dir
+    None -> migrations_dir
+  }
+}
+
+/// Build the migration runner's `pog.Config` from the environment:
+/// 1. `DATABASE_URL` when set and non-empty (dev / CI / squirrel convention).
+/// 2. Otherwise `NEXUS_PG_{HOST,PORT,DATABASE,USER,PASSWORD}` (matching
+///    `nexus/config` defaults) when at least one `NEXUS_PG_*` variable is set,
+///    so NixOS/systemd deployments share one DB configuration surface with
+///    the server.
+/// 3. Loud error when neither is configured.
+pub fn pg_config_from_env(
+  pool_name: process.Name(pog.Message),
+  get: fn(String) -> Result(String, Nil),
+) -> Result(pog.Config, String) {
+  case env_non_empty(get, "DATABASE_URL") {
+    Some(url) ->
+      pog.url_config(pool_name, url)
+      |> result.replace_error("invalid DATABASE_URL")
+      |> result.map(fn(cfg) {
+        cfg
+        |> pog.pool_size(1)
+        |> pog.connection_parameter("timezone", "UTC")
+      })
+    None -> {
+      let host = env_non_empty(get, "NEXUS_PG_HOST")
+      let port_raw = env_non_empty(get, "NEXUS_PG_PORT")
+      let database = env_non_empty(get, "NEXUS_PG_DATABASE")
+      let user = env_non_empty(get, "NEXUS_PG_USER")
+      let password = env_non_empty(get, "NEXUS_PG_PASSWORD")
+      case host, port_raw, database, user, password {
+        None, None, None, None, None ->
+          Error("neither DATABASE_URL nor NEXUS_PG_* is set")
+        _, _, _, _, _ -> {
+          use port <- result.try(case port_raw {
+            None -> Ok(5433)
+            Some(raw) ->
+              case int.parse(raw) {
+                Ok(n) if n > 0 && n <= 65_535 -> Ok(n)
+                _ ->
+                  Error(
+                    "environment variable NEXUS_PG_PORT is not a valid port: "
+                    <> raw,
+                  )
+              }
+          })
+          Ok(
+            pog.default_config(pool_name:)
+            |> pog.host(option.unwrap(host, "127.0.0.1"))
+            |> pog.port(port)
+            |> pog.database(option.unwrap(database, "nexus"))
+            |> pog.user(option.unwrap(user, "nexus"))
+            |> pog.password(password)
+            |> pog.pool_size(1)
+            |> pog.connection_parameter("timezone", "UTC"),
+          )
+        }
+      }
+    }
+  }
+}
+
+fn env_non_empty(
+  get: fn(String) -> Result(String, Nil),
+  name: String,
+) -> option.Option(String) {
+  case get(name) {
+    Ok(raw) ->
+      case string.trim(raw) {
+        "" -> None
+        value -> Some(value)
+      }
+    Error(_) -> None
+  }
+}
+
 pub fn main() -> Nil {
+  let dir = resolve_migrations_dir(envoy.get)
   let migrations =
-    or_panic(
-      load_migrations(migrations_dir),
-      "cannot load migrations from " <> migrations_dir,
-    )
-  let url = or_panic(database_url(), "DATABASE_URL is not set")
+    or_panic(load_migrations(dir), "cannot load migrations from " <> dir)
   let pool_name = process.new_name("nexus_migrate")
   let config =
-    or_panic(pog.url_config(pool_name, url), "invalid DATABASE_URL")
-    |> pog.pool_size(1)
-    |> pog.connection_parameter("timezone", "UTC")
+    or_panic(
+      pg_config_from_env(pool_name, envoy.get),
+      "invalid database configuration",
+    )
   let started =
     or_panic(pog.start(config), "could not connect — is the database up?")
   with_pool_settled(
-    fn() { apply_migrations(migrations, pool_name, started.data) },
+    fn() { apply_migrations(migrations, dir, pool_name, started.data) },
     started.pid,
   )
 }
@@ -137,16 +220,15 @@ pub fn apply_to_db(
   pool_name: process.Name(pog.Message),
   db: pog.Connection,
 ) -> Nil {
+  let dir = resolve_migrations_dir(envoy.get)
   let migrations =
-    or_panic(
-      load_migrations(migrations_dir),
-      "cannot load migrations from " <> migrations_dir,
-    )
-  apply_migrations(migrations, pool_name, db)
+    or_panic(load_migrations(dir), "cannot load migrations from " <> dir)
+  apply_migrations(migrations, dir, pool_name, db)
 }
 
 fn apply_migrations(
   migrations: List(Migration),
+  dir: String,
   pool_name: process.Name(pog.Message),
   db: pog.Connection,
 ) -> Nil {
@@ -169,7 +251,7 @@ fn apply_migrations(
       let names = list.map(ahead, fn(m) { m.name }) |> string.join(", ")
       io.println(
         "migrate: note: database has migrations not in "
-        <> migrations_dir
+        <> dir
         <> " (ahead): "
         <> names,
       )
