@@ -38,7 +38,7 @@
       });
 
       overlays.default = final: _prev: {
-        nexus = mkNexus final;
+        nexus-agent = mkNexus final;
       };
 
       nixosModules = {

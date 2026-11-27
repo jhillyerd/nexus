@@ -462,6 +462,17 @@ pub fn pg_config_from_env_falls_back_to_nexus_pg_vars_test() {
   should.equal(partial.database, "nexus")
   should.equal(partial.user, "nexus")
   should.equal(partial.password, None)
+
+  let assert Ok(host_only) =
+    migrate.pg_config_from_env(
+      pool,
+      env_lookup([#("NEXUS_PG_HOST", "db.local")]),
+    )
+  should.equal(host_only.host, "db.local")
+  should.equal(host_only.port, 5433)
+  should.equal(host_only.database, "nexus")
+  should.equal(host_only.user, "nexus")
+  should.equal(host_only.password, None)
 }
 
 pub fn pg_config_from_env_errors_when_unconfigured_or_invalid_test() {

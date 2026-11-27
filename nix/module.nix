@@ -559,6 +559,7 @@ in
 
     services.postgresql = lib.mkIf cfg.database.createLocally {
       enable = true;
+      settings.port = lib.mkDefault cfg.database.port;
       ensureDatabases = [ cfg.database.name ];
       ensureUsers = [
         {
@@ -574,12 +575,20 @@ in
 
     systemd.services.nexus-agent = {
       description = "Nexus AI agent harness";
-      after = [ "network-online.target" ] ++ lib.optional cfg.database.createLocally "postgresql.service";
+      after =
+        [ "network-online.target" ]
+        ++ lib.optionals cfg.database.createLocally [
+          "postgresql.service"
+          "postgresql-setup.service"
+        ];
       wants = [ "network-online.target" ];
-      requires = lib.optional cfg.database.createLocally "postgresql.service";
+      requires = lib.optionals cfg.database.createLocally [
+        "postgresql.service"
+        "postgresql-setup.service"
+      ];
       wantedBy = [ "multi-user.target" ];
 
-      environment = baseEnvironment // cfg.extraEnvironment;
+      environment = cfg.extraEnvironment // baseEnvironment;
 
       serviceConfig = {
         Type = "simple";

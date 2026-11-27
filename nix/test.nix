@@ -76,17 +76,25 @@ EOF
     )
     assert mig_count >= 2, f"expected >= 2 applied migrations, got {mig_count}"
 
-    # Verify cgroup v2 delegation is visible to nexus-agent.service.
+    # Verify cgroup v2 delegation is active for nexus-agent.service:
+    # `cgroup.controllers` exposes memory/pids, and systemd chowns the
+    # service's `cgroup.subtree_control` to `nexus` only when Delegate= is
+    # active (nexus_env_ffi enables +memory +pids lazily on first bash call).
     controllers = machine.succeed(
         "cat /sys/fs/cgroup/system.slice/nexus-agent.service/cgroup.controllers"
     )
     assert "memory" in controllers and "pids" in controllers, (
         f"expected memory and pids in nexus-agent.service cgroup.controllers, got: {controllers!r}"
     )
+    machine.succeed(
+        "stat -c %U /sys/fs/cgroup/system.slice/nexus-agent.service/cgroup.subtree_control | grep -qx nexus"
+    )
 
     # Verify workspace directories exist with nexus ownership.
     machine.succeed("test -d /var/lib/nexus/workspaces")
+    machine.succeed("stat -c %U /var/lib/nexus/workspaces | grep -qx nexus")
     machine.succeed("test -d /var/lib/nexus/sandbox-state")
+    machine.succeed("stat -c %U /var/lib/nexus/sandbox-state | grep -qx nexus")
 
     # Verify sandbox toolchain env vars are wired and bwrap works as the nexus user.
     env_out = machine.succeed("systemctl show -p Environment --value nexus-agent.service")

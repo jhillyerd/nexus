@@ -43,6 +43,7 @@ import gleam/option.{None, Some}
 import gleam/order
 import gleam/result
 import gleam/string
+import nexus/config
 import pog
 import simplifile
 
@@ -144,34 +145,28 @@ pub fn pg_config_from_env(
         |> pog.connection_parameter("timezone", "UTC")
       })
     None -> {
-      let host = env_non_empty(get, "NEXUS_PG_HOST")
-      let port_raw = env_non_empty(get, "NEXUS_PG_PORT")
-      let database = env_non_empty(get, "NEXUS_PG_DATABASE")
-      let user = env_non_empty(get, "NEXUS_PG_USER")
-      let password = env_non_empty(get, "NEXUS_PG_PASSWORD")
-      case host, port_raw, database, user, password {
-        None, None, None, None, None ->
-          Error("neither DATABASE_URL nor NEXUS_PG_* is set")
-        _, _, _, _, _ -> {
-          use port <- result.try(case port_raw {
-            None -> Ok(5433)
-            Some(raw) ->
-              case int.parse(raw) {
-                Ok(n) if n > 0 && n <= 65_535 -> Ok(n)
-                _ ->
-                  Error(
-                    "environment variable NEXUS_PG_PORT is not a valid port: "
-                    <> raw,
-                  )
-              }
-          })
+      let any_pg_var =
+        list.any(
+          [
+            "NEXUS_PG_HOST",
+            "NEXUS_PG_PORT",
+            "NEXUS_PG_DATABASE",
+            "NEXUS_PG_USER",
+            "NEXUS_PG_PASSWORD",
+          ],
+          fn(name) { env_non_empty(get, name) != None },
+        )
+      case any_pg_var {
+        False -> Error("neither DATABASE_URL nor NEXUS_PG_* is set")
+        True -> {
+          use pg <- result.try(config.parse_pg_env(get))
           Ok(
             pog.default_config(pool_name:)
-            |> pog.host(option.unwrap(host, "127.0.0.1"))
-            |> pog.port(port)
-            |> pog.database(option.unwrap(database, "nexus"))
-            |> pog.user(option.unwrap(user, "nexus"))
-            |> pog.password(password)
+            |> pog.host(pg.host)
+            |> pog.port(pg.port)
+            |> pog.database(pg.database)
+            |> pog.user(pg.user)
+            |> pog.password(pg.password)
             |> pog.pool_size(1)
             |> pog.connection_parameter("timezone", "UTC"),
           )
@@ -220,10 +215,12 @@ pub fn apply_to_db(
   pool_name: process.Name(pog.Message),
   db: pog.Connection,
 ) -> Nil {
-  let dir = resolve_migrations_dir(envoy.get)
   let migrations =
-    or_panic(load_migrations(dir), "cannot load migrations from " <> dir)
-  apply_migrations(migrations, dir, pool_name, db)
+    or_panic(
+      load_migrations(migrations_dir),
+      "cannot load migrations from " <> migrations_dir,
+    )
+  apply_migrations(migrations, migrations_dir, pool_name, db)
 }
 
 fn apply_migrations(

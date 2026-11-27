@@ -221,6 +221,72 @@ pub type McpServer {
   )
 }
 
+/// Default Postgres connection settings (matching docker-compose.yml),
+/// shared between the server (`nexus/config`) and the migration runner
+/// (`nexus/store/migrate`).
+pub const default_pg_host = "127.0.0.1"
+
+pub const default_pg_port = 5433
+
+pub const default_pg_database = "nexus"
+
+pub const default_pg_user = "nexus"
+
+/// Parsed `NEXUS_PG_*` settings, shared with `nexus/store/migrate` so the
+/// server and migration runner use identical defaults and port validation.
+pub type PgConfig {
+  PgConfig(
+    host: String,
+    port: Int,
+    database: String,
+    user: String,
+    password: Option(String),
+  )
+}
+
+/// Parse `NEXUS_PG_{HOST,PORT,DATABASE,USER,PASSWORD}` with the canonical
+/// defaults and port bounds (`1..65535`).
+pub fn parse_pg_env(
+  get: fn(String) -> Result(String, Nil),
+) -> Result(PgConfig, String) {
+  use port <- result.try(optional_port(get, "NEXUS_PG_PORT", default_pg_port))
+  use host <- result.try(optional_string_or(
+    get,
+    "NEXUS_PG_HOST",
+    default_pg_host,
+  ))
+  use database <- result.try(optional_string_or(
+    get,
+    "NEXUS_PG_DATABASE",
+    default_pg_database,
+  ))
+  use user <- result.try(optional_string_or(
+    get,
+    "NEXUS_PG_USER",
+    default_pg_user,
+  ))
+  let password = optional_string(get, "NEXUS_PG_PASSWORD")
+  Ok(PgConfig(host:, port:, database:, user:, password:))
+}
+
+fn optional_port(
+  get: fn(String) -> Result(String, Nil),
+  name: String,
+  default: Int,
+) -> Result(Int, String) {
+  case optional_string(get, name) {
+    None -> Ok(default)
+    Some(raw) ->
+      case int.parse(raw) {
+        Ok(n) if n > 0 && n <= 65_535 -> Ok(n)
+        _ ->
+          Error(
+            "environment variable " <> name <> " is not a valid port: " <> raw,
+          )
+      }
+  }
+}
+
 /// Plugins: the per-call timeout floor shared by `NEXUS_PLUGIN_TIMEOUT_MS`
 /// and a plugin's `timeout_ms` override (validated in `nexus/plugin`) —
 /// ONE definition so the two rules cannot drift apart.
@@ -382,19 +448,12 @@ fn parse_env(
   // docker-compose.yml. Persistence is mandatory: invalid values fail
   // loudly here, and an unreachable database fails boot (see
   // nexus/store/persist) — there is no silent ephemeral mode.
-  use pg_port <- result.try(optional_int(get, "NEXUS_PG_PORT", 5433))
-  use pg_host <- result.try(optional_string_or(
-    get,
-    "NEXUS_PG_HOST",
-    "127.0.0.1",
-  ))
-  use pg_database <- result.try(optional_string_or(
-    get,
-    "NEXUS_PG_DATABASE",
-    "nexus",
-  ))
-  use pg_user <- result.try(optional_string_or(get, "NEXUS_PG_USER", "nexus"))
-  let pg_password = optional_string(get, "NEXUS_PG_PASSWORD")
+  use pg <- result.try(parse_pg_env(get))
+  let pg_port = pg.port
+  let pg_host = pg.host
+  let pg_database = pg.database
+  let pg_user = pg.user
+  let pg_password = pg.password
   use utility_enabled <- result.try(optional_bool(
     get,
     "NEXUS_UTILITY_ENABLED",

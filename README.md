@@ -558,8 +558,8 @@ With `database.createLocally = true` and `database.passwordFile` set, the
 unit syncs the password onto the local PostgreSQL role, loads it via
 systemd `LoadCredential` into `NEXUS_PG_PASSWORD`, runs `nexus-migrate` in
 `ExecStartPre`, and starts `nexus` on `127.0.0.1:8080` with `Delegate=cpu
-memory pids` for per-command workspace cgroup caps. See [nix/module.nix](nix/module.nix)
-for all options.
+memory pids` (when `workspace.sandbox` is `bwrap` or `nono`) for per-command
+workspace cgroup caps. See [nix/module.nix](nix/module.nix) for all options.
 
 ## Architecture
 
