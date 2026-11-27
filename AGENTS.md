@@ -443,6 +443,13 @@ deltas; the rules that bite silently:
   plain statuses), `role=env` gated by `thread_registry.env_capable`
   (the frozen toolset), `role=viewer` ungated. Revocation is a row
   delete — future connections fail, live ones keep running.
+- **`EnvRole` sends carry a sender-target prefix; `ViewerRole` sends do
+  not.** `node_adapter` formats `EnvRole` `Send` frames through
+  `env.target_message_text` (`[from target: <name>]\n<text>`) so the
+  model knows which target "this machine" refers to; `ViewerRole` has no
+  execution plane and stays untagged (never overload
+  `thread_message.author` for this — non-`system` authors render as
+  collapsed markdown bot turns).
 
 ## Plugin / tool-provider invariants (Phase 1 shipped)
 
