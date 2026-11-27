@@ -171,7 +171,7 @@ Formatting rules:
   - Unknown `name` (not in this thread's `thread_skill` bindings): `Error("unknown skill \"<name>\". available skills: a, b")` (or `"no skills are attached to this thread"` when empty) — self-healing, matching `env.gleam`'s unknown-target rule.
   - Deleted skill (`skill_id == None`, or row vanished): `Error("skill \"<name>\" is no longer available")`.
   - Unknown `path` (or any `path` in Phase 1 before `skill_file` exists): `Error("skill \"<name>\" has no file at \"<path>\"")` (listing available file paths in Phase 2).
-  - Success: returns `skill.body` (in Phase 2, if the skill has `skill_file` rows, appends a compact `Bundled files:\n- references/…` footer so Tier 3 is discoverable without extra calls), capped at `NEXUS_SKILL_MAX_BYTES`.
+  - Success: returns `skill.body` capped at `NEXUS_SKILL_MAX_BYTES`. In Phase 2, if the skill has `skill_file` rows, appends a compact `Bundled files:\n- references/…` footer under its own separate budget (4 KiB, truncating with `… and N more` if needed) so a max-size body never truncates instructions or drops the file listing.
   - Codemode synergy: because `read_skill` is an ordinary compiled-in tool, Lua codemode scripts can invoke it with zero extra plumbing.
 
 ### 6. Process ownership and supervision (`boot.gleam`)
@@ -179,10 +179,10 @@ Formatting rules:
 Follows the exact `bot_registry` / `provider_registry` pattern (see `docs/plans/completed/bots.md` §Process ownership):
 
 - **`nexus/skill_registry`**: OTP actor started in the `OneForAll` root supervisor right after `provider_registry` and before `bot_registry` (settings entities group).
-  - Loads all `skill` rows from `store` at boot (unreachable DB fails boot loudly).
-  - Owns skill CRUD (`List`, `Get`, `Create`, `Update`, `Delete`) and `sk<N>` ID minting with the multi-instance re-read heal on create (same fix as `bot_registry` `b<N>` / `provider_registry` `p<N>`).
+  - Probes `store` at boot (unreachable DB fails boot loudly).
+  - Owns skill CRUD (`List`, `Get`, `Create`, `Update`, `Delete`) and `sk<N>` ID minting (re-reading from `store` on create, same pattern as `bot_registry` `b<N>` / `provider_registry` `p<N>`). Reads (`List`, `Get`) and mutations read through `store` rather than a boot-only in-memory cache, so multiple instances sharing Postgres stay synchronized without cache invalidation.
   - No cross-registry edges: `skill_registry` depends only on `store`.
-- **`bot_registry`**: gains an injected `validate_skills: fn(List(String)) -> Result(List(String), String)` closure wired in `boot.gleam` (using `skill_registry` or `store`, matching `bot_validate_tools`).
+- **`bot_registry`**: gains an injected `validate_skills: fn(List(String)) -> Result(List(String), String)` closure wired in `boot.gleam` directly against `store` (no stale cache and no cross-registry actor call, matching `allow_inbound`'s store-read pattern and `bot_validate_tools`).
 - **`thread_registry`**: resolves a bot's skills through `state.store` at thread creation — covering **both** user-initiated `create_thread_from_bot` (`thread_create.gleam`) AND bot-to-bot `create_dm` (`thread_registry.gleam`) in one path. On hydration, loads `thread_skill` rows from `state.store` to build `ToolCtx.skills`.
 
 ### 7. Interaction with workspaces and remote TUI nodes
@@ -195,7 +195,7 @@ Answering #152's core question explicitly:
 2. **Phase 3 (executable `scripts/` in local workspaces):**
    - Only activates when a thread has a local workspace (`workspace_id IS NOT NULL`) AND at least one bound skill has `skill_file` rows.
    - **Never copy scripts into the writable thread workspace** — a prompt-injected `bash` call could modify them or confuse them with user artifacts.
-   - Instead, materialize bound skill files into a dedicated, managed **read-only staging directory** beneath `workspace_root` (e.g., `<workspace_root>/skills/<thread_id>/<skill_name>/...`, tracked in `workspace` with `kind = 'skill'` or cleaned up alongside the thread's `tmp` workspace on delete/GC) and mount it read-only inside the sandbox:
+   - Instead, materialize bound skill files into a dedicated, managed **read-only staging directory** beneath `workspace_root` (e.g., `<workspace_root>/skills/<thread_id>/<skill_name>/...`), tracked in `workspace` as `kind = 'skill'` after extending the workspace GC contract (`store.WorkspaceKind`, `tombstone_workspaces_for_threads.sql` to tombstone `w.kind in ('thread', 'tmp', 'skill')`, and `workspace_gc`), and mount it read-only inside the sandbox:
      - `bwrap`: `--ro-bind <staged_dir> /skills`
      - `nono`: read-only path grant on `<staged_dir>` + `NEXUS_SKILLS_DIR` env var in the allowlist prelude
      - `none` (dev/tests): `NEXUS_SKILLS_DIR` pointing at `<staged_dir>` (lexical hygiene only, matching v1 `none` posture).
@@ -209,8 +209,8 @@ Answering #152's core question explicitly:
 
 #### HTTP routes (`src/nexus/web.gleam`, all gated by `requires_auth`)
 
-- `GET /skills` — list skills (`id`, `name`, `description`, `body`, `bot_count`, `created_at`, `updated_at`)
-- `GET /skills/:id` — get one skill (by id or slug name)
+- `GET /skills` — list skills (`id`, `name`, `description`, `body`, `bot_count`, `created_at`, `updated_at`), with optional `?name=<slug>` filter
+- `GET /skills/:id` — get one skill by canonical `id` (ID-only, matching `/bots/:id` and `/providers/:id` so slugs like `sk1` are never ambiguous with generated IDs)
 - `POST /skills` — create skill (`name`, `description`, `body`) → `201` (or `400` validation, `409` duplicate name)
 - `PATCH /skills/:id` — partial update (`name`, `description`, `body`) → `200` (`400` / `404` / `409`)
 - `DELETE /skills/:id` — hard delete (cascades `bot_skill`, nulls `thread_skill.skill_id`) → `204` (`404`)
@@ -233,15 +233,15 @@ Deliverable: end-to-end markdown skills stored in Postgres, editable in Settings
 
 1. **Schema & store:**
    - Add `sql/migrations/0003_skills.sql` (`skill`, `bot.skill_mode`, `bot_skill`, `thread_skill`).
-   - Add SQL queries under `src/nexus/store/sql/` and regenerate `sql.gleam` via `gleam run -m squirrel`.
-   - Extend `nexus/store`, `nexus/store/persist`, `test/store_mock.gleam`, and the differential Postgres-vs-mock contract suite (#174).
+   - Add SQL queries under `src/nexus/store/sql/` (including extending `insert_thread.sql`'s single-statement CTE with a `thread_skill` `json_to_recordset` insert so `thread`, `workspace`, `thread_toolset`, `thread_skill`, and the seed `thread_message` commit atomically) and regenerate `sql.gleam` via `gleam run -m squirrel`.
+   - Extend `nexus/store`, `nexus/store/persist`, `test/store_mock.gleam`, and the differential Postgres-vs-mock contract suite (#174), including an atomicity/rollback test for `insert_thread` with `thread_skill` bindings.
 2. **Domain & registry:**
    - Add `nexus/skill.gleam` (validation, `<available_skills>` formatting, pure unit tests).
    - Add `nexus/skill_registry.gleam` and wire into `boot.gleam` before `bot_registry`.
-   - Extend `nexus/bot.gleam` and `nexus/bot_registry.gleam` (`skill_mode`, `skill_ids`, validation closure, chat-only refusal).
+   - Extend `nexus/bot.gleam` and `nexus/bot_registry.gleam` (`skill_mode`, `skill_ids`, store-backed validation closure, chat-only refusal).
 3. **Thread creation, hydration, and tool execution:**
    - Add `read_skill` to `nexus/tools.gleam` (`ToolCtx.skills`, `catalog_names`, excluded from `default_names`).
-   - Update `nexus/thread_registry.gleam` (`start_new_thread`, `create_dm`, hydration, `effective_toolset`) to resolve skills from `state.store`, append `<available_skills>` to the frozen `system_prompt`, persist `thread_skill`, and inject `ToolCtx.skills`.
+   - Update `nexus/thread_registry.gleam` (`start_new_thread`, `create_dm`, hydration, `effective_toolset`) to resolve skills from `state.store`, append `<available_skills>` to the frozen `system_prompt`, pass the resolved bindings into `insert_thread` (atomic with `thread` and `thread_toolset`), and inject `ToolCtx.skills`.
 4. **HTTP API & Settings UI:**
    - Add `/skills` CRUD routes and bot `skill_mode`/`skill_ids` fields in `nexus/web.gleam`.
    - Add `SkillsTab` and bot-form skill picker in `nexus/ui_settings.gleam`, plus frozen skill display in the thread info pane.
@@ -263,7 +263,8 @@ Deliverable: multi-file skills (`references/`, `scripts/`, `assets/`) in Postgre
 
 Deliverable: local sandboxed `bash` can execute bundled `scripts/` without weakening `workspace-sandbox.md` guarantees.
 
-- Stage bound `skill_file` rows lazily (on first env tool call) into a managed read-only staging dir tracked for crash-safe GC alongside the thread's `tmp` workspace.
+- Extend the workspace GC contract (`store.WorkspaceKind`, `tombstone_workspaces_for_threads.sql` to include `'skill'` beside `'thread'` and `'tmp'`, and `workspace_gc`) so staged skill directories are tombstoned atomically on thread delete/prune and swept on boot.
+- Stage bound `skill_file` rows lazily (on first env tool call) into a managed `kind = 'skill'` read-only staging dir under `<workspace_root>/skills/<thread_id>/`.
 - Mount read-only in `env.build_spawn_plan` (`bwrap` `--ro-bind <dir> /skills`, `nono` read-only grant + `NEXUS_SKILLS_DIR`).
 - Set `0o555` / `0o444` permissions based on `skill_file.executable`.
 - Sandbox escape probes verifying `bash` can execute `/skills/<name>/scripts/...` but cannot write to `/skills` or read skills not bound to the thread.
@@ -281,7 +282,7 @@ Deliverable: local sandboxed `bash` can execute bundled `scripts/` without weake
 
 1. **Skill deletion cascades bot links:** `ON DELETE CASCADE` on `bot_skill` (deleting a skill detaches it cleanly from bots; the Settings UI two-step delete confirmation reports the referencing bot count) and `ON DELETE SET NULL` on `thread_skill` (existing threads degrade cleanly to a `read_skill` tool error).
 2. **Zero skills by default on new bots:** both the schema default and the UI add-bot form default to `skill_mode = 'selected'` with no skills checked, keeping cold prefill token budgets predictable and existing bots unchanged.
-3. **Body size cap:** `NEXUS_SKILL_MAX_BYTES` defaults to 64 KiB (65,536 bytes) per skill body, enforced on save and on `read_skill` output.
+3. **Body size cap:** `NEXUS_SKILL_MAX_BYTES` defaults to 64 KiB (65,536 bytes) per skill body (and per `skill_file.content` in Phase 2), enforced on save and on `read_skill` output; the Phase 2 `Bundled files:` footer carries a separate 4 KiB cap so a full-size body never drops the file listing.
 
 ---
 
