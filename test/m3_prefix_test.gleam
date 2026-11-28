@@ -33,6 +33,7 @@ import gleam/string
 import gleeunit/should
 import glopenai/chat
 import glopenai/config as oai_config
+import nexus/compaction
 import nexus/config.{type Config}
 import nexus/loop
 import nexus/openai
@@ -377,6 +378,9 @@ fn toolset(runner: thread.TurnRunner) -> thread.Toolset {
     utility_runner: fn(_endpoint, _tr, _cancel, _allow_pass) {
       Error("no utility call in this test")
     },
+    compaction_runner: fn(_endpoint, _tr, _cutoff, _focus, _ctx, _bpt, _cancel) {
+      Error("no compaction in this test")
+    },
   )
 }
 
@@ -537,4 +541,35 @@ pub fn golden_key_change_never_alters_request_bytes_test() {
   let dropped = openai.drop_empty_bearer(keyless_raw, keyless_endpoint)
   should.be_error(request.get_header(dropped, "authorization"))
   dropped.body |> should.equal(keyed.body)
+}
+
+/// Context compaction Phase 2 (§5.3): cache-piggybacked summarization shares
+/// the EXACT serialized JSON prefix bytes with the preceding turn's request
+/// (identical model, system, messages[0..cutoff), and frozen tools/tool_choice)
+/// so KV-cache backends hit on the full prefix up to `cutoff_index`.
+pub fn golden_compaction_summarization_shares_kv_prefix_test() {
+  let fixture = load_fixture()
+  let opts = loop_options()
+  let tr =
+    list.fold(
+      fixture.turns,
+      transcript.new(fixture.alias, fixture.system),
+      fn(tr, turn) { apply_turn(tr, turn.messages) },
+    )
+  let total = transcript.length(tr)
+  let base_body = transcript.request_body(tr, opts)
+  // Cut at `total` (full conversation) and build the compaction request.
+  let compact_tr = compaction.prepare(tr, total, Some("keep key facts"))
+  let compact_opts = compaction.options(opts, 4096, Some(32_768))
+  let compact_body = transcript.request_body(compact_tr, compact_opts)
+
+  // Both bodies start with identical `{"model":...,"messages":[...messages...`
+  // up to the unambiguous closing `]` of `messages` in `base_body`.
+  let assert [messages_prefix, _rest] =
+    string.split(base_body, on: "],\"stream\"")
+  string.slice(compact_body, 0, string.length(messages_prefix) + 1)
+  |> should.equal(messages_prefix <> ",")
+  // Frozen tools / tool_choice envelope is preserved verbatim on the tail.
+  should.be_true(string.contains(compact_body, "\"tools\":["))
+  should.be_true(string.contains(compact_body, "\"max_completion_tokens\":4096"))
 }

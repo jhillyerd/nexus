@@ -194,6 +194,13 @@ pub type Config {
     /// bots that leave `bot.context_window` unset (`NEXUS_DEFAULT_CONTEXT_WINDOW`,
     /// min `4096`; default `None` = usage monitoring without a percentage bar).
     default_context_window: Option(Int),
+    /// Compaction tail retention target as a percentage of `context_window`
+    /// (`NEXUS_COMPACTION_KEEP_TAIL_PCT`, `0..40`, default `20`).
+    compaction_keep_tail_pct: Int,
+    /// `max_completion_tokens` ceiling for the cache-piggybacked compaction
+    /// summarization call (`NEXUS_COMPACTION_MAX_TOKENS`, min `512`, default
+    /// `4096`; bounded by `max(512, context_window / 4)` when a budget is set).
+    compaction_max_tokens: Int,
   )
 }
 
@@ -582,6 +589,20 @@ fn parse_env(
     min: min_context_window,
     max: max_context_window,
   ))
+  use compaction_keep_tail_pct <- result.try(optional_int_range(
+    get,
+    "NEXUS_COMPACTION_KEEP_TAIL_PCT",
+    20,
+    min: 0,
+    max: 40,
+  ))
+  use compaction_max_tokens <- result.try(optional_int_range(
+    get,
+    "NEXUS_COMPACTION_MAX_TOKENS",
+    4096,
+    min: 512,
+    max: max_context_window,
+  ))
   // The ASCII note rides the DEFAULT prompt only, and only while
   // codemode is enabled: an explicitly set NEXUS_SYSTEM_PROMPT is the
   // operator's own text and is never amended (enable codemode with a
@@ -642,6 +663,8 @@ fn parse_env(
     node_idle_days: node_idle_days,
     log_level: log_level,
     default_context_window: default_context_window,
+    compaction_keep_tail_pct: compaction_keep_tail_pct,
+    compaction_max_tokens: compaction_max_tokens,
   ))
 }
 
@@ -975,6 +998,22 @@ fn optional_min_int(
         <> int.to_string(value),
       )
     False -> Ok(value)
+  }
+}
+
+/// Optional integer env var with a default and inclusive `min..max` bounds.
+/// Blank or unset uses `default`.
+fn optional_int_range(
+  get: fn(String) -> Result(String, Nil),
+  name: String,
+  default: Int,
+  min min_value: Int,
+  max max_value: Int,
+) -> Result(Int, String) {
+  case optional_maybe_int_range(get, name, min: min_value, max: max_value) {
+    Ok(Some(value)) -> Ok(value)
+    Ok(None) -> Ok(default)
+    Error(reason) -> Error(reason)
   }
 }
 

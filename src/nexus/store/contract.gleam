@@ -45,6 +45,10 @@ pub fn cases() -> List(Case) {
     Case("metadata_guards_and_timestamps", case_metadata_guards_and_timestamps),
     Case("providers_and_bots", case_providers_and_bots),
     Case("nodes_and_pairing_grants", case_nodes_and_pairing_grants),
+    Case(
+      "compaction_atomic_persistence_and_cascade",
+      case_compaction_atomic_persistence_and_cascade,
+    ),
   ]
 }
 
@@ -1765,4 +1769,126 @@ fn case_nodes_and_pairing_grants(s: Store) -> Result(Nil, String) {
     s.list_node_grants(),
   ))
   expect_eq("all grants gone", grants_empty, [])
+}
+
+// ---------------------------------------------------------------------------
+// Case 8: Context compaction atomic persistence, ordering & cascade delete
+// ---------------------------------------------------------------------------
+
+fn case_compaction_atomic_persistence_and_cascade(
+  s: Store,
+) -> Result(Nil, String) {
+  use _ <- result.try(seed_base(s))
+
+  let summary =
+    store.StoredSummary(
+      ..make_summary("tc1", "p1", Some("b1"), None, test_epoch),
+      context_window: Some(32_768),
+    )
+  use _ <- result.try(expect_ok(
+    "insert thread tc1",
+    s.insert_thread(summary, "System prompt."),
+  ))
+
+  // Build two turns WITHOUT committing the second turn beforehand:
+  // `record_compaction` must atomically flush uncommitted messages up to the
+  // transcript length, insert the compaction row, and update
+  // `thread.last_context_tokens` in a single transaction.
+  let tr1 =
+    transcript.new("alias-1", "System prompt.")
+    |> transcript.append_user("first question")
+    |> transcript.stamp(test_epoch + 10)
+    |> transcript.append_assistant("first answer")
+    |> transcript.stamp(test_epoch + 11)
+  s.commit("tc1", tr1)
+
+  let tr2 =
+    tr1
+    |> transcript.append_user("second question")
+    |> transcript.stamp(test_epoch + 20)
+    |> transcript.append_assistant("second answer")
+    |> transcript.stamp(test_epoch + 21)
+
+  let cp1 =
+    transcript.Compaction(
+      cutoff_index: 3,
+      summary: "## Goal & Constraints\nKeep going.",
+      roster_snapshot: Some("Attached environments: workspace, laptop."),
+      focus: Some("retain file paths"),
+      trigger: transcript.ManualCompact,
+      before_tokens: Some(4200),
+      after_tokens: Some(900),
+      created_at: test_epoch + 30,
+    )
+  s.record_compaction("tc1", tr2, cp1)
+
+  // Uncommitted messages from tr2 were atomically flushed before the checkpoint.
+  use rows <- result.try(expect_ok("load_messages tc1", s.load_messages("tc1")))
+  use _ <- result.try(expect_eq("flushed 4 rows", list.length(rows), 4))
+  use stored <- result.try(expect_ok("get_thread tc1", s.get_thread("tc1")))
+  use _ <- result.try(expect_eq(
+    "message_count updated",
+    stored.summary.message_count,
+    transcript.length(tr2),
+  ))
+  use _ <- result.try(expect_eq(
+    "last_context_tokens updated",
+    stored.summary.last_context_tokens,
+    Some(900),
+  ))
+
+  // Second checkpoint with None optional fields + AutoCompact trigger.
+  let cp2 =
+    transcript.Compaction(
+      cutoff_index: 5,
+      summary: "## Goal & Constraints\nMerged summary.",
+      roster_snapshot: None,
+      focus: None,
+      trigger: transcript.AutoCompact,
+      before_tokens: None,
+      after_tokens: None,
+      created_at: test_epoch + 60,
+    )
+  s.record_compaction("tc1", tr2, cp2)
+
+  // After a None after_tokens checkpoint, last_context_tokens stays untouched.
+  use stored2 <- result.try(expect_ok(
+    "get_thread tc1 after cp2",
+    s.get_thread("tc1"),
+  ))
+  use _ <- result.try(expect_eq(
+    "last_context_tokens preserved on None",
+    stored2.summary.last_context_tokens,
+    Some(900),
+  ))
+
+  // load_compactions returns both checkpoints in ascending creation order.
+  use loaded <- result.try(expect_ok(
+    "load_compactions tc1",
+    s.load_compactions("tc1"),
+  ))
+  use _ <- result.try(expect_eq("two checkpoints loaded", loaded, [cp1, cp2]))
+
+  // Invalid cutoff_index (<= 0) fails the DB CHECK constraint and mock parity
+  // guard and rolls back cleanly without affecting stored rows or actor health.
+  let bad_cp = transcript.Compaction(..cp2, cutoff_index: 0)
+  s.record_compaction("tc1", tr2, bad_cp)
+  use loaded_after_err <- result.try(expect_ok(
+    "load_compactions after error",
+    s.load_compactions("tc1"),
+  ))
+  use _ <- result.try(
+    expect_eq("checkpoints unchanged after failed insert", loaded_after_err, [
+      cp1,
+      cp2,
+    ]),
+  )
+
+  // Deleting the thread cascades to thread_compaction.
+  use _ <- result.try(expect_ok("delete_thread tc1", s.delete_thread("tc1")))
+  use loaded_deleted <- result.try(expect_ok(
+    "load_compactions after delete",
+    s.load_compactions("tc1"),
+  ))
+  expect_eq("compactions cascaded", loaded_deleted, [])
 }

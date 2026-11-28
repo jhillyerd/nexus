@@ -1914,11 +1914,33 @@ pub fn thread_state_json(
     #("status", thread_status_json(inspect.status)),
     #("context_window", optional_int_json(inspect.usage.context_window)),
     #("usage", context_usage_json(inspect.usage)),
+    #("compacting", json.bool(inspect.compacting)),
+    #(
+      "compactions",
+      compactions_json(transcript.compactions(inspect.transcript)),
+    ),
     #("messages", transcript_messages_json(inspect.transcript)),
     #("live_turn", case inspect.live_turn {
       Some(live) -> live_turn_json(live)
       None -> json.null()
     }),
+  ])
+}
+
+fn compactions_json(checkpoints: List(transcript.Compaction)) -> Json {
+  json.array(checkpoints, compaction_json)
+}
+
+fn compaction_json(cp: transcript.Compaction) -> Json {
+  json.object([
+    #("cutoff_index", json.int(cp.cutoff_index)),
+    #("summary", json.string(cp.summary)),
+    #("roster_snapshot", optional_string_json(cp.roster_snapshot)),
+    #("focus", optional_string_json(cp.focus)),
+    #("trigger_kind", json.string(transcript.trigger_to_string(cp.trigger))),
+    #("before_tokens", optional_int_json(cp.before_tokens)),
+    #("after_tokens", optional_int_json(cp.after_tokens)),
+    #("created_at", json.int(cp.created_at)),
   ])
 }
 

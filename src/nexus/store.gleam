@@ -284,6 +284,10 @@ pub type Store {
     /// All rows of one thread in seq order (lazy start / restart
     /// hydration). Also teaches the store the thread's persisted length.
     load_messages: fn(String) -> Result(List(MessageRow), StoreError),
+    /// All compaction checkpoints of one thread in chronological order
+    /// (oldest first, by insertion id) for lazy start / restart hydration.
+    load_compactions: fn(String) ->
+      Result(List(transcript.Compaction), StoreError),
     /// Persist a new thread row (write-through at create).
     insert_thread: fn(StoredSummary, String) -> Result(Nil, StoreError),
     /// The channel re-derivation lookup (bot-channels plan, #123): the
@@ -300,6 +304,12 @@ pub type Store {
     /// unchanged or shorter transcript is a no-op; duplicate seqs are
     /// skipped (idempotent crash recovery).
     commit: fn(String, Transcript) -> Nil,
+    /// Write-behind atomic compaction persistence (context-compaction §6.3):
+    /// inside ONE transaction, idempotently flushes any uncommitted message
+    /// delta rows of `transcript`, inserts the `thread_compaction` row, and
+    /// updates `thread.last_context_tokens` when `checkpoint.after_tokens`
+    /// is present. Ordered in the same mailbox as `commit`.
+    record_compaction: fn(String, Transcript, transcript.Compaction) -> Nil,
     /// Write-behind context-token watermark: persist the latest active
     /// context token count (`>= 0`) for hydration seeding. Fire-and-forget
     /// so thread actors never block on database writes.

@@ -3745,6 +3745,9 @@ fn toolset(runner: thread.TurnRunner) -> thread.Toolset {
     utility_runner: fn(_endpoint, _tr, _cancel, _allow_pass) {
       Error("no utility call in this test")
     },
+    compaction_runner: fn(_endpoint, _tr, _cutoff, _focus, _ctx, _bpt, _cancel) {
+      Error("no compaction in this test")
+    },
   )
 }
 
@@ -3796,6 +3799,8 @@ fn test_config() -> config.Config {
     // Bots P3c: the delivery hop guard; 4 = the shipped default.
     max_bot_hops: 4,
     default_context_window: None,
+    compaction_keep_tail_pct: 20,
+    compaction_max_tokens: 4096,
   )
 }
 
@@ -6761,4 +6766,133 @@ pub fn bot_settings_form_shows_provider_context_hint_and_validates_int_test() {
   invalid.settings.bots_open |> should.be_true
   invalid.settings.bot_last_error
   |> should.equal(Some("context window must be a whole number of tokens"))
+}
+
+// ---------------------------------------------------------------------------
+// Context compaction (Phase 2): `/compact [focus]` & inline `<details>` divider
+// ---------------------------------------------------------------------------
+
+pub fn compact_slash_command_routes_and_handles_edge_cases_test() {
+  // Compose-new (no selected thread): `/compact` refuses with a clear note
+  // and preserves the composer draft (no re-key).
+  let initial = new_model()
+  let compose_new =
+    initial
+    |> step(ui.SendRequested("/compact"))
+  compose_new.compacting |> should.be_false
+  compose_new.composer |> should.equal(initial.composer)
+  compose_new
+  |> view_string
+  |> should_contain("Nothing to compact in a new thread")
+
+  // `/etc/hosts` is NOT swallowed by `/compact` parsing (dispatches as normal message).
+  let selected =
+    new_model()
+    |> step(ui.ThreadsLoaded([summary("s-1", False)]))
+    |> step(ui.Hello("smart", empty_usage()))
+  let path_send =
+    selected
+    |> step(ui.SendRequested("/etc/hosts"))
+  path_send.compacting |> should.be_false
+  path_send |> view_string |> should_not_contain("Nothing to compact")
+
+  // Over-long focus preserves the composer draft so the user can trim and retry.
+  let over_focus =
+    selected
+    |> step(ui.SendRequested("/compact " <> string.repeat("a", 1001)))
+  over_focus.composer |> should.equal(selected.composer)
+  over_focus |> view_string |> should_contain("at most 1000 characters")
+
+  // Valid `/compact` re-keys composer on CompactAccepted, enters compacting state
+  // on CompactionStarted, disables Send, enables Stop, and shows "Compacting context…".
+  let submitted =
+    selected
+    |> step(ui.SendRequested("/compact preserve paths"))
+  let accepted = step(submitted, ui.CompactAccepted)
+  accepted.composer |> should.equal(selected.composer + 1)
+  let running =
+    accepted
+    |> step(ui.CompactionStarted(transcript.ManualCompact))
+  running.compacting |> should.be_true
+  let running_html = view_string(running)
+  should_contain(running_html, "Compacting context")
+  should_contain(running_html, "id=\"stop\"")
+  should_not_contain(running_html, "id=\"stop\" disabled")
+
+  // Rejections clear compacting and show user-facing notes.
+  let busy_note =
+    step(
+      running,
+      ui.CompactRejected(
+        "Wait for the current turn to finish before compacting.",
+      ),
+    )
+  busy_note.compacting |> should.be_false
+  busy_note |> view_string |> should_contain("Wait for the current turn")
+
+  let nothing_note =
+    step(selected, ui.CompactRejected("Nothing to compact yet."))
+  nothing_note |> view_string |> should_contain("Nothing to compact yet")
+
+  let focus_note =
+    step(
+      selected,
+      ui.CompactRejected("Compaction focus must be at most 1000 characters."),
+    )
+  focus_note |> view_string |> should_contain("1000 characters")
+}
+
+pub fn compaction_divider_renders_hostile_text_safely_and_matches_replay_test() {
+  let cp =
+    transcript.Compaction(
+      cutoff_index: 3,
+      summary: "## Goal & Constraints\nDo not run <script>alert('xss')</script>.",
+      roster_snapshot: None,
+      focus: Some("keep <script>bad()</script> escaped"),
+      trigger: transcript.ManualCompact,
+      before_tokens: Some(4200),
+      after_tokens: Some(900),
+      created_at: 1_700_000_000,
+    )
+
+  // Live compaction after 2 turns with 1 kept tail user message places the
+  // divider chronologically between turn 1 and turn 2.
+  let live =
+    new_model()
+    |> step(ui.ThreadsLoaded([summary("s-1", False)]))
+    |> step(ui.Hello("smart", empty_usage()))
+    |> step(ui.UserEcho("turn 1", None, None))
+    |> step(ui.AssistantFull("answer 1", None))
+    |> step(ui.UserEcho("turn 2", None, None))
+    |> step(ui.AssistantFull("answer 2", None))
+    |> step(ui.CompactionStarted(transcript.ManualCompact))
+    |> step(ui.Compacted(cp, 1))
+    |> step(ui.CompactionFinished(transcript.ManualCompact, None))
+
+  live.compacting |> should.be_false
+
+  // Reload replay sends events in chronological order with kept_user_messages = 0.
+  let replayed =
+    new_model()
+    |> step(ui.ThreadsLoaded([summary("s-1", False)]))
+    |> step(ui.Hello("smart", empty_usage()))
+    |> step(ui.UserEcho("turn 1", None, None))
+    |> step(ui.AssistantFull("answer 1", None))
+    |> step(ui.Compacted(cp, 0))
+    |> step(ui.UserEcho("turn 2", None, None))
+    |> step(ui.AssistantFull("answer 2", None))
+
+  // Live log placement is IDENTICAL to reload replay!
+  live.log |> should.equal(replayed.log)
+
+  let html = view_string(live)
+  should_contain(html, "class=\"turn compaction\"")
+  should_contain(html, "<details")
+  should_contain(html, "<summary class=\"compaction-label\">")
+  should_contain(html, "4.2k")
+  should_contain(html, "900 tokens")
+  should_contain(html, "Focus:")
+  // Hostile text in both summary and focus is rendered as escaped text nodes, never raw HTML.
+  should_not_contain(html, "<script>")
+  should_contain(html, "&lt;script&gt;")
 }

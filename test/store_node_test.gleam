@@ -291,6 +291,8 @@ fn sweep_config(node_idle_days: Int) -> config.Config {
     log_level: log.Info,
     max_bot_hops: 4,
     default_context_window: None,
+    compaction_keep_tail_pct: 20,
+    compaction_max_tokens: 4096,
   )
 }
 

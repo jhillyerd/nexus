@@ -536,6 +536,10 @@ pub fn start(
       specs: specs,
       runner: thread.agent_runner(cfg.max_tool_iterations, specs),
       utility_runner: thread.utility_runner(specs, corpus),
+      compaction_runner: thread.compaction_runner(
+        specs,
+        cfg.compaction_max_tokens,
+      ),
     )
   do_start(
     cfg,
@@ -1059,6 +1063,10 @@ fn resolve_entries(
               utility_runner: thread.utility_runner(specs, fn() {
                 tag_corpus(registry)
               }),
+              compaction_runner: thread.compaction_runner(
+                specs,
+                state.cfg.compaction_max_tokens,
+              ),
             )
           Ok(#(
             State(
@@ -1333,6 +1341,7 @@ fn start_new_thread_bot(
               context_window: context_window,
               last_context_tokens: None,
               usage_hook: usage_hook_for(state.store, id),
+              compaction_hook: compaction_hook_for(state.store, id),
             )
           // The environment wrapper (environments plan Phase 1): the
           // SAME per-thread injection point as the delivery wrapper —
@@ -2315,6 +2324,14 @@ fn usage_hook_for(persistence: Store, id: String) -> fn(Int) -> Nil {
   fn(tokens) { persistence.set_last_context_tokens(id, tokens) }
 }
 
+/// Write-behind atomic compaction observer for one thread.
+fn compaction_hook_for(
+  persistence: Store,
+  id: String,
+) -> fn(Transcript, transcript.Compaction) -> Nil {
+  fn(tr, checkpoint) { persistence.record_compaction(id, tr, checkpoint) }
+}
+
 /// The utility apply seam for one thread — the injected `UtilityApply`.
 /// A closure over this actor's subject and the id (exactly like the
 /// commit hook), performing the `UpgradeAutoTitle` ask with the parsed
@@ -2350,8 +2367,36 @@ fn rebuild_transcript(
 ) -> Result(#(Transcript, List(String), Option(Int)), String) {
   use stored <- result.try(state.store.get_thread(id))
   use rows <- result.try(state.store.load_messages(id))
-  let transcript =
+  use compactions <- result.try(state.store.load_compactions(id))
+  let base_transcript =
     store.transcript_from_rows(stored.summary.model, stored.system_prompt, rows)
+  let total = transcript.length(base_transcript)
+  // Defensively validate stored compaction checkpoints against the hydrated
+  // transcript length (and monotonicity): inconsistent rows are logged and
+  // skipped rather than crashing hydration or producing invalid cutoffs.
+  let transcript =
+    list.fold(compactions, base_transcript, fn(acc, cp) {
+      let prev_cutoff = case transcript.latest_compaction(acc) {
+        Some(prev) -> prev.cutoff_index
+        None -> 0
+      }
+      case
+        cp.cutoff_index > 0
+        && cp.cutoff_index <= total
+        && cp.cutoff_index >= prev_cutoff
+      {
+        True -> transcript.apply_compaction(acc, cp)
+        False -> {
+          log.warn("registry", "ignoring inconsistent compaction checkpoint", [
+            log.str("thread_id", id),
+            log.int("cutoff_index", cp.cutoff_index),
+            log.int("transcript_length", total),
+            log.int("prev_cutoff", prev_cutoff),
+          ])
+          acc
+        }
+      }
+    })
   let roster = case roster_from_rows(rows) {
     option.Some(list_) -> list_
     // No roster row matched. A plain env-free thread seeds `[]`; an env
@@ -2510,6 +2555,7 @@ fn lazy_start(state: State, summary: StoredSummary) -> Resolved {
                   context_window: summary.context_window,
                   last_context_tokens: last_context_tokens,
                   usage_hook: usage_hook_for(state.store, summary.id),
+                  compaction_hook: compaction_hook_for(state.store, summary.id),
                 )
               let argument =
                 ChildArgument(
@@ -3870,6 +3916,17 @@ pub fn get(
   id: String,
 ) -> Result(Subject(thread.Msg), Nil) {
   actor.call(registry, 5000, fn(reply) { Get(id:, reply:) })
+}
+
+/// Dispatch manual context compaction (`/compact [focus]`) onto the resolved
+/// thread actor without blocking the registry actor.
+pub fn compact(
+  registry: Subject(Msg),
+  id: String,
+  focus: Option(String),
+) -> Result(thread.CompactResult, Nil) {
+  get(registry, id)
+  |> result.map(thread.compact(_, focus))
 }
 
 /// Whether the thread's frozen toolset includes environment tools

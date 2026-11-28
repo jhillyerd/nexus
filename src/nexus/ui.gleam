@@ -43,6 +43,7 @@ import lustre/event
 import lustre/server_component
 import nexus/bot.{type Bot}
 import nexus/bot_registry
+import nexus/compaction
 import nexus/env
 import nexus/node
 import nexus/provider.{type Provider}
@@ -53,6 +54,7 @@ import nexus/thread.{type ThreadEvent}
 import nexus/thread_create
 import nexus/thread_registry
 import nexus/timing
+import nexus/transcript
 import nexus/ui/markdown
 import nexus/ui_settings
 
@@ -133,6 +135,9 @@ pub type Line {
     status: ToolStatus,
     result: Option(String),
   )
+  /// An append-only compaction checkpoint divider rendered inline at its
+  /// chronological `cutoff_index` using Pico-native `<details>` / `<summary>`.
+  CompactionLine(checkpoint: transcript.Compaction)
   NoteLine(err: Bool, text: String)
 }
 
@@ -472,6 +477,9 @@ pub type Model {
     /// Phase 1): populated on `Join` and after each committed turn; reset
     /// on selection change or deselect.
     usage: Option(thread.ContextUsage),
+    /// True while a foreground manual `/compact` is running on the selected
+    /// thread: disables Send, enables Stop, and shows `"Compacting context…"`.
+    compacting: Bool,
   )
 }
 
@@ -542,6 +550,8 @@ pub type Msg {
   SendRequested(String)
   SendAccepted
   SendRejected(String)
+  CompactAccepted
+  CompactRejected(String)
   StopRequested
   Hello(model: String, usage: thread.ContextUsage)
   /// A committed user line. `at` is its display stamp — wall-clock epoch
@@ -577,6 +587,12 @@ pub type Msg {
   /// Phase 1): emitted after every turn (including failed turns, whose user
   /// message stays committed); Join delivers the same snapshot via `Hello.usage`.
   UsageUpdated(thread.ContextUsage)
+  /// Foreground compaction started on the selected thread.
+  CompactionStarted(transcript.CompactionTrigger)
+  /// A compaction checkpoint was installed (or replayed at `cutoff_index`).
+  Compacted(checkpoint: transcript.Compaction, kept_user_messages: Int)
+  /// Compaction finished (succeeded, cancelled, or failed).
+  CompactionFinished(transcript.CompactionTrigger, Option(String))
   // M3 tool events: translated 1:1 so the replay/live pipelines carry them;
   // rendering lands with the M3 UI workstream. No-ops in `update` for now.
   ToolCallDelta(
@@ -710,6 +726,11 @@ pub fn from_thread_event(event: thread.EventKind) -> Msg {
     thread.TurnFailed(reason, at) -> TurnFailed(reason, at)
     thread.MetaUpdated(title, tags) -> MetaUpdated(title, tags)
     thread.UsageUpdated(usage) -> UsageUpdated(usage)
+    thread.CompactionStarted(trigger) -> CompactionStarted(trigger)
+    thread.Compacted(checkpoint, kept_user_messages) ->
+      Compacted(checkpoint, kept_user_messages)
+    thread.CompactionFinished(trigger, error) ->
+      CompactionFinished(trigger, error)
     thread.ToolCallDelta(index, id, name, fragment) ->
       ToolCallDelta(index, id, name, fragment)
     thread.ToolCallAssembled(id, name, arguments, at) ->
@@ -798,6 +819,7 @@ pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
       grant_minting: False,
       env_error: None,
       usage: None,
+      compacting: False,
     )
   #(model, events_effect())
 }
@@ -1179,33 +1201,74 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
 
     SendRequested(text) -> {
       let text = string.trim(text)
-      case text, model.streaming, model.selected, model.create_pending {
-        // Empty text: nothing to send in either mode.
-        "", _, _, _ -> #(model, effect.none())
-        // The streaming guard: a turn is already in flight.
-        _, True, _, _ -> #(model, effect.none())
-        // The create guard (compose-new): the bot-sourced create is in
-        // flight; its `Created` reply will send the stashed draft.
-        _, _, _, True -> #(model, effect.none())
-        // A selected thread: the ordinary send.
-        text, False, Some(_), False -> #(model, send_effect(model, text))
-        // COMPOSE-NEW: the text starts the thread. The picked bot sources
-        // the create (bots-required — there is no provider+model shape);
-        // the draft is stashed so `Created` can send it into the fresh
-        // thread. The textarea is NOT re-keyed here: the visible draft
-        // and the stash stay the same text, and changing the bot picker
-        // meanwhile is just a model write — the draft survives every
-        // change of mind (requirement: type first, pick the bot second).
-        text, False, None, False ->
-          case model.create_bot {
-            Some(bot_id) -> #(
-              Model(..model, create_pending: True, pending_send: Some(text)),
-              create_from_bot_effect(model, bot_id),
-            )
-            // No bot to source the thread from: the picker is empty
-            // (no bots exist yet) and the composer is disabled — the
-            // defensive arm stays a no-op.
-            None -> #(model, effect.none())
+      case compaction.parse_command(text) {
+        Some(compaction.Compact(focus)) ->
+          case model.streaming || model.compacting || model.create_pending {
+            True -> #(model, effect.none())
+            False ->
+              case model.selected {
+                None -> #(
+                  Model(..model, log: [
+                    NoteLine(False, "Nothing to compact in a new thread"),
+                    ..model.log
+                  ]),
+                  effect.none(),
+                )
+                Some(thread_id) ->
+                  case compaction.validate_focus(focus) {
+                    Error(_) -> #(
+                      Model(..model, log: [
+                        NoteLine(
+                          True,
+                          "Compact instructions must be at most "
+                            <> int.to_string(compaction.max_focus_chars)
+                            <> " characters",
+                        ),
+                        ..model.log
+                      ]),
+                      effect.none(),
+                    )
+                    Ok(clean_focus) -> #(
+                      model,
+                      compact_effect(model, thread_id, clean_focus),
+                    )
+                  }
+              }
+          }
+        None ->
+          case
+            text,
+            model.streaming || model.compacting,
+            model.selected,
+            model.create_pending
+          {
+            // Empty text: nothing to send in either mode.
+            "", _, _, _ -> #(model, effect.none())
+            // The streaming/compacting guard: a turn or manual compact is in flight.
+            _, True, _, _ -> #(model, effect.none())
+            // The create guard (compose-new): the bot-sourced create is in
+            // flight; its `Created` reply will send the stashed draft.
+            _, _, _, True -> #(model, effect.none())
+            // A selected thread: the ordinary send.
+            text, False, Some(_), False -> #(model, send_effect(model, text))
+            // COMPOSE-NEW: the text starts the thread. The picked bot sources
+            // the create (bots-required — there is no provider+model shape);
+            // the draft is stashed so `Created` can send it into the fresh
+            // thread. The textarea is NOT re-keyed here: the visible draft
+            // and the stash stay the same text, and changing the bot picker
+            // meanwhile is just a model write — the draft survives every
+            // change of mind (requirement: type first, pick the bot second).
+            text, False, None, False ->
+              case model.create_bot {
+                Some(bot_id) -> #(
+                  Model(..model, create_pending: True, pending_send: Some(text)),
+                  create_from_bot_effect(model, bot_id),
+                )
+                // No bot to source the thread from: the picker is empty
+                // (no bots exist yet) and the composer is disabled — the
+                // defensive arm stays a no-op.
+                None -> #(model, effect.none())
+              }
           }
       }
     }
@@ -1224,6 +1287,39 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         other -> "send failed: " <> other
       }
       #(Model(..model, log: [NoteLine(True, note), ..model.log]), effect.none())
+    }
+
+    CompactAccepted -> #(
+      Model(..model, composer: model.composer + 1, compacting: True),
+      effect.none(),
+    )
+
+    CompactRejected(reason) -> {
+      let #(is_err, note) = case reason {
+        "busy" -> #(
+          True,
+          "a reply or compaction is already in progress — stop it first",
+        )
+        "nothing_to_compact" -> #(
+          False,
+          "Not enough conversation history to compact yet",
+        )
+        "focus_too_long" -> #(
+          True,
+          "Compact instructions must be at most "
+            <> int.to_string(compaction.max_focus_chars)
+            <> " characters",
+        )
+        "gone" -> #(True, "thread ended")
+        other -> #(True, "compact failed: " <> other)
+      }
+      #(
+        Model(..model, compacting: False, log: [
+          NoteLine(is_err, note),
+          ..model.log
+        ]),
+        effect.none(),
+      )
     }
 
     StopRequested -> #(model, stop_effect(model))
@@ -1355,6 +1451,44 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     MetaUpdated(_title, _tags) -> #(model, threads_effect(model))
 
     UsageUpdated(usage) -> #(Model(..model, usage: Some(usage)), effect.none())
+
+    CompactionStarted(trigger) ->
+      case trigger {
+        transcript.ManualCompact -> #(
+          Model(..model, compacting: True),
+          effect.none(),
+        )
+        _ -> #(model, effect.none())
+      }
+
+    Compacted(checkpoint, kept_user_messages) -> #(
+      Model(
+        ..model,
+        log: insert_compaction_line(model.log, checkpoint, kept_user_messages),
+      ),
+      effect.none(),
+    )
+
+    CompactionFinished(trigger, error) -> {
+      let model = case trigger {
+        transcript.ManualCompact -> Model(..model, compacting: False)
+        _ -> model
+      }
+      let model = case trigger, error {
+        transcript.ManualCompact, Some("cancelled") ->
+          Model(..model, log: [
+            NoteLine(False, "Compaction cancelled"),
+            ..model.log
+          ])
+        transcript.ManualCompact, Some(reason) ->
+          Model(..model, log: [
+            NoteLine(True, "Compaction failed: " <> reason),
+            ..model.log
+          ])
+        _, _ -> model
+      }
+      #(model, effect.none())
+    }
 
     // A tool call's arguments are streaming in fragments. Any assistant
     // text seen so far belongs *before* the call (the loop commits text at
@@ -2173,7 +2307,54 @@ fn deselect(model: Model, label: String) -> Model {
     grant_minted: None,
     env_error: None,
     usage: None,
+    compacting: False,
   )
+}
+
+/// Insert a `CompactionLine` into the newest-first `log` at its exact
+/// chronological `cutoff_index`. During `Join` replay, `kept_user_messages` is
+/// `0` and the line prepends at the replay cursor; on a live compaction with
+/// `k > 0` user messages kept verbatim after `cutoff_index`, walk past `k`
+/// `UserLine`s from the newest end and insert immediately after the `k`-th one
+/// (i.e. right before that user turn chronologically).
+fn insert_compaction_line(
+  log: List(Line),
+  checkpoint: transcript.Compaction,
+  kept_user_messages: Int,
+) -> List(Line) {
+  case kept_user_messages <= 0 {
+    True -> [CompactionLine(checkpoint), ..log]
+    False -> do_insert_compaction_line(log, checkpoint, kept_user_messages, [])
+  }
+}
+
+fn do_insert_compaction_line(
+  log: List(Line),
+  checkpoint: transcript.Compaction,
+  remaining_users: Int,
+  prefix: List(Line),
+) -> List(Line) {
+  case log {
+    [] -> list.reverse([CompactionLine(checkpoint), ..prefix])
+    [UserLine(..) as u, ..rest] ->
+      case remaining_users <= 1 {
+        True ->
+          list.append(list.reverse([u, ..prefix]), [
+            CompactionLine(checkpoint),
+            ..rest
+          ])
+        False ->
+          do_insert_compaction_line(rest, checkpoint, remaining_users - 1, [
+            u,
+            ..prefix
+          ])
+      }
+    [other, ..rest] ->
+      do_insert_compaction_line(rest, checkpoint, remaining_users, [
+        other,
+        ..prefix
+      ])
+  }
 }
 
 /// Apply the M2 refresh rules to the loaded thread list: drop a vanished
@@ -2336,6 +2517,10 @@ fn after_threads(model: Model, summaries: List(thread.ThreadSummary)) -> Model {
     usage: case ended || switched {
       True -> None
       False -> model.usage
+    },
+    compacting: case ended || switched {
+      True -> False
+      False -> model.compacting
     },
   )
 }
@@ -2647,6 +2832,7 @@ fn select_with_primary(
       grant_minted: None,
       env_error: None,
       usage: None,
+      compacting: False,
     )
   let primary = primary_effect(next, id)
   let eff = case model.selected {
@@ -2785,6 +2971,25 @@ fn stop_effect(model: Model) -> Effect(Msg) {
     case resolved {
       Ok(subject) -> thread.stop(subject)
       Error(_) -> Nil
+    }
+  })
+}
+
+fn compact_effect(
+  model: Model,
+  thread_id: String,
+  focus: Option(String),
+) -> Effect(Msg) {
+  let registry = model.registry
+  effect.from(fn(dispatch) {
+    case thread_registry.compact(registry, thread_id, focus) {
+      Ok(thread.Compacting) -> dispatch(CompactAccepted)
+      Ok(thread.CompactBusy) -> dispatch(CompactRejected("busy"))
+      Ok(thread.NothingToCompact) ->
+        dispatch(CompactRejected("nothing_to_compact"))
+      Ok(thread.FocusTooLong(_)) -> dispatch(CompactRejected("focus_too_long"))
+      Ok(thread.CompactRefused(reason)) -> dispatch(CompactRejected(reason))
+      Error(Nil) -> dispatch(CompactRejected("gone"))
     }
   })
 }
@@ -4286,9 +4491,18 @@ fn jump_latest() -> Element(Msg) {
 /// no loop is running; the "guard" phase is the terminal iteration state
 /// right before the turn-failed note lands.
 fn loop_chip(model: Model) -> Element(Msg) {
-  case model.loop {
-    None -> html.div([attr.id("loop-status"), attr.hidden(True)], [])
-    Some(LoopState(iteration, max, phase)) ->
+  case model.compacting, model.loop {
+    True, _ ->
+      html.div(
+        [
+          attr.id("loop-status"),
+          attr.class("loop-status compacting"),
+          attr.aria("label", "compaction status"),
+        ],
+        [html.text("Compacting context…")],
+      )
+    False, None -> html.div([attr.id("loop-status"), attr.hidden(True)], [])
+    False, Some(LoopState(iteration, max, phase)) ->
       html.div(
         [
           attr.id("loop-status"),
@@ -4334,11 +4548,12 @@ fn composer(model: Model, has_thread: Bool) -> Element(Msg) {
   // the update-level guard rejects duplicates, and the button stays
   // honest with it (the #88 rule, composer edition).
   let can_send = has_thread || model.create_bot != None
+  let busy = model.streaming || model.compacting
   // While a compose-new create is in flight BOTH controls stand down —
   // even if the user selects some other thread in the meantime
   // (`SendRequested` rejects every send until the create's reply lands,
   // and that reply selects the fresh thread itself).
-  let send_disabled = model.streaming || !can_send || model.create_pending
+  let send_disabled = busy || !can_send || model.create_pending
   keyed.element(
     "form",
     [attr.id("composer"), attr.action("#"), submit_requested()],
@@ -4377,8 +4592,8 @@ fn composer(model: Model, has_thread: Bool) -> Element(Msg) {
             [
               attr.id("stop"),
               attr.type_("button"),
-              attr.hidden(!model.streaming),
-              attr.disabled(!model.streaming),
+              attr.hidden(!busy),
+              attr.disabled(!busy),
               event.on_click(StopRequested),
             ],
             [html.text("Stop")],
@@ -4597,6 +4812,7 @@ fn render_line(
     AssistantLine(text, at) -> assistant_turn(md_cache, text, at)
     ReasoningLine(text) -> reasoning_block(text, False)
     ToolLine(..) -> tool_card(line)
+    CompactionLine(checkpoint) -> compaction_divider(checkpoint)
     NoteLine(err, text) ->
       html.div(
         [
@@ -4664,8 +4880,59 @@ fn take_chips(run: List(Line), rest: List(Line)) -> #(List(Line), List(Line)) {
 fn is_chip(line: Line) -> Bool {
   case line {
     ReasoningLine(_) | ToolLine(..) -> True
-    UserLine(_, _, _) | AssistantLine(_, _) | NoteLine(_, _) -> False
+    UserLine(_, _, _)
+    | AssistantLine(_, _)
+    | CompactionLine(_)
+    | NoteLine(_, _) -> False
   }
+}
+
+/// Summary line for a compaction divider: e.g.
+/// `"Context compacted (manual) · 98k → 11k tokens"`. Pure.
+pub fn compaction_summary_label(cp: transcript.Compaction) -> String {
+  let trigger = transcript.trigger_to_string(cp.trigger)
+  let delta = case cp.before_tokens, cp.after_tokens {
+    Some(before), Some(after) ->
+      " · "
+      <> format_tokens_compact(before)
+      <> " → "
+      <> format_tokens_compact(after)
+      <> " tokens"
+    _, Some(after) -> " · " <> format_tokens_compact(after) <> " tokens"
+    _, _ -> ""
+  }
+  "Context compacted (" <> trigger <> ")" <> delta
+}
+
+/// Render a compaction checkpoint inline at its chronological `cutoff_index`
+/// using Pico-native `<details>` / `<summary>` with inert Lustre text nodes
+/// (hostile-text-safe: both `summary` and optional `focus` stay escaped text).
+fn compaction_divider(cp: transcript.Compaction) -> Element(Msg) {
+  html.details(
+    [
+      attr.class("turn compaction"),
+      attr.attribute("data-cutoff-index", int.to_string(cp.cutoff_index)),
+      attr.attribute("data-trigger", transcript.trigger_to_string(cp.trigger)),
+    ],
+    [
+      html.summary([attr.class("compaction-label")], [
+        html.text(compaction_summary_label(cp)),
+        time_stamp(Some(cp.created_at)),
+      ]),
+      html.div([attr.class("compaction-body")], [
+        case cp.focus {
+          Some(note) if note != "" ->
+            html.p([attr.class("compaction-focus")], [
+              html.text("Focus: " <> note),
+            ])
+          _ -> element.none()
+        },
+        html.div([attr.class("compaction-summary")], [
+          html.text(cp.summary),
+        ]),
+      ]),
+    ],
+  )
 }
 
 fn chip_row(

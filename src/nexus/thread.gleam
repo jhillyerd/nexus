@@ -40,6 +40,7 @@ import gleam/result
 import gleam/string
 import glopenai/chat
 import glopenai/shared.{type CompletionUsage}
+import nexus/compaction
 import nexus/config.{type Config}
 import nexus/delivery
 import nexus/env.{type Environment}
@@ -168,6 +169,21 @@ pub type EventKind {
   /// in the transcript, so the broadcast reflects the updated estimate.
   /// Display/budget metadata only — never enters a request body.
   UsageUpdated(usage: ContextUsage)
+  /// Compaction started on this thread (Phase 2 manual `/compact`).
+  CompactionStarted(trigger: transcript.CompactionTrigger)
+  /// A compaction checkpoint was installed (or replayed at `cutoff_index` on
+  /// `Join`). `kept_user_messages` is the count of `UserMessage`s at indices
+  /// `>= checkpoint.cutoff_index` when broadcast live (0 during `Join` replay)
+  /// so live UI inserts the divider at the exact same chronological boundary
+  /// as reload replay.
+  Compacted(checkpoint: transcript.Compaction, kept_user_messages: Int)
+  /// Compaction finished (succeeded, cancelled, or failed). Clears any
+  /// foreground `"Compacting context…"` state; `error` is `Some` on cancel or
+  /// failure.
+  CompactionFinished(
+    trigger: transcript.CompactionTrigger,
+    error: Option(String),
+  )
 }
 
 /// How `ContextUsage.tokens` was produced.
@@ -384,10 +400,25 @@ pub type UtilityRunner =
   fn(openai.Endpoint, Transcript, Subject(Nil), Bool) ->
     Result(utility.Verdict, String)
 
+/// The compaction side-call seam (context-compaction plan §5.3): ONE blocking
+/// cache-piggybacked summarization stream over the active prefix up to
+/// `cutoff_index`. Returns `Ok(summary)` or `Error(reason)`. `cancel` must be
+/// owned by the calling worker process.
+pub type CompactionRunner =
+  fn(
+    openai.Endpoint,
+    Transcript,
+    Int,
+    Option(String),
+    Option(Int),
+    Float,
+    Subject(Nil),
+  ) -> Result(String, String)
+
 /// One frozen toolset bundle (bots plan P2 prep, #76): the resolved tool
-/// names, the specs built from them, and the turn + utility runners built
-/// over THOSE specs. One value per toolset, so a thread's turn requests
-/// and its utility side-calls ride one identical `tools` / `tool_choice`
+/// names, the specs built from them, and the turn + utility + compaction
+/// runners built over THOSE specs. One value per toolset, so a thread's turn
+/// requests and its side-calls ride one identical `tools` / `tool_choice`
 /// envelope by construction (KV-cache contract) — the property the boot
 /// path always had (`agent_runner` + `utility_runner` over the same
 /// `specs`), preserved per toolset. The registry caches bundles keyed by
@@ -403,6 +434,7 @@ pub type Toolset {
     specs: List(tools.ToolSpec),
     runner: TurnRunner,
     utility_runner: UtilityRunner,
+    compaction_runner: CompactionRunner,
   )
 }
 
@@ -464,6 +496,30 @@ pub fn utility_runner(
   }
 }
 
+/// The real compaction runner (context-compaction plan §5.3), built ONCE per
+/// toolset bundle beside `agent_runner` and `utility_runner`: closes over the
+/// identical frozen envelope (`loop.frozen_options`) so the only per-call
+/// delta is generation-side `max_completion_tokens`.
+pub fn compaction_runner(
+  specs: List(tools.ToolSpec),
+  max_tokens: Int,
+) -> CompactionRunner {
+  let base = loop.frozen_options(specs)
+  fn(endpoint, tr, cutoff_index, focus, context_window, bytes_per_token, cancel) {
+    compaction.run(
+      endpoint,
+      tr,
+      cutoff_index,
+      focus,
+      base,
+      max_tokens,
+      context_window,
+      bytes_per_token,
+      cancel,
+    )
+  }
+}
+
 pub type SendResult {
   Sent
   Busy
@@ -473,6 +529,20 @@ pub type SendResult {
   /// to the channel's own Send surface). The reason is display text for
   /// the UI/web; it never enters any transcript.
   Refused(String)
+}
+
+/// Reply payload for manual `Compact(focus, reply)`.
+pub type CompactResult {
+  /// Foreground manual compaction worker spawned.
+  Compacting
+  /// A turn or compaction is already in flight.
+  CompactBusy
+  /// No valid compaction cut-point exists past the active start.
+  NothingToCompact
+  /// `/compact <focus>` exceeded `compaction.max_focus_chars`.
+  FocusTooLong(max_chars: Int)
+  /// Refused (e.g. archived channel).
+  CompactRefused(reason: String)
 }
 
 /// Everything needed to construct one thread actor. The starting
@@ -568,6 +638,9 @@ pub type ThreadSpec {
     /// Write-behind observer for `last_context_tokens` updates;
     /// `fn(_) { Nil }` when nobody persists.
     usage_hook: fn(Int) -> Nil,
+    /// Write-behind atomic compaction observer (`store.record_compaction`);
+    /// `fn(_, _) { Nil }` when nobody persists.
+    compaction_hook: fn(Transcript, transcript.Compaction) -> Nil,
   )
 }
 
@@ -700,6 +773,7 @@ pub type ThreadInspect {
     transcript: Transcript,
     live_turn: Option(LiveTurn),
     usage: ContextUsage,
+    compacting: Bool,
   )
 }
 
@@ -759,8 +833,10 @@ pub type Msg {
     depth: Int,
     reply: Subject(SendResult),
   )
-  /// Cancel the in-flight turn, if any.
+  /// Cancel the in-flight turn or foreground manual compaction, if any.
   Stop
+  /// Request foreground manual context compaction (`/compact [focus]`).
+  Compact(focus: Option(String), reply: Subject(CompactResult))
   /// Cancel the in-flight turn (if any) and reply with the active turn
   /// worker's PID so thread deletion can wait for worker exit before
   /// removing workspace directories and dropping tombstone rows.
@@ -821,6 +897,15 @@ pub type Msg {
   UtilityStart
   UtilityStarted(worker: Pid, cancel: Subject(Nil))
   UtilityDone(worker: Pid, result: UtilityResult)
+  /// Compaction plumbing (internal, context-compaction plan §6.1).
+  CompactStarted(worker: Pid, cancel: Subject(Nil))
+  CompactDone(
+    worker: Pid,
+    cutoff_index: Int,
+    focus: Option(String),
+    before_tokens: Int,
+    result: Result(String, String),
+  )
   /// Monitor plumbing: a monitored process went down.
   WorkerDown(worker: Pid)
   /// Selector plumbing for non-process monitors; always ignored.
@@ -904,6 +989,29 @@ type UtilityState {
     monitor: Monitor,
     cancel: Subject(Nil),
     cancelled: Bool,
+  )
+}
+
+/// Compaction worker lifecycle (context-compaction plan §6.1). Mirrors
+/// `UtilityState` with the deferred-cancel handshake during `CompactStarting`
+/// so neither manual `Stop` nor future Send-raced auto-compaction can miss
+/// the spawn → handshake window.
+type CompactionState {
+  CompactIdle
+  CompactStarting(
+    worker: Pid,
+    monitor: Monitor,
+    trigger: transcript.CompactionTrigger,
+    cancelled: Bool,
+    base_len: Int,
+  )
+  CompactRunning(
+    worker: Pid,
+    monitor: Monitor,
+    cancel: Subject(Nil),
+    trigger: transcript.CompactionTrigger,
+    cancelled: Bool,
+    base_len: Int,
   )
 }
 
@@ -1019,6 +1127,13 @@ type State {
     /// Write-behind observer for `last_context_tokens` updates;
     /// `fn(_) { Nil }` when nobody persists.
     usage_hook: fn(Int) -> Nil,
+    /// Write-behind atomic compaction observer (`store.record_compaction`);
+    /// `fn(_, _) { Nil }` when nobody persists.
+    compaction_hook: fn(Transcript, transcript.Compaction) -> Nil,
+    /// Compaction worker state (context-compaction plan §6.1).
+    compaction: CompactionState,
+    /// Cache-piggybacked compaction runner from the thread's frozen `Toolset`.
+    compaction_runner: CompactionRunner,
   )
 }
 
@@ -1087,6 +1202,7 @@ fn start_builder(spec: ThreadSpec) {
     context_window: context_window,
     last_context_tokens: last_context_tokens,
     usage_hook: usage_hook,
+    compaction_hook: compaction_hook,
   ) = spec
   let base_opts = loop.frozen_options(toolset.specs)
   let usage =
@@ -1107,6 +1223,9 @@ fn start_builder(spec: ThreadSpec) {
       // from ONE toolset value, so both ride the same specs.
       runner: toolset.runner,
       utility_runner: toolset.utility_runner,
+      compaction_runner: toolset.compaction_runner,
+      compaction: CompactIdle,
+      compaction_hook: compaction_hook,
       // The starting transcript is the registry's, verbatim — fresh
       // threads get `transcript.new(model, prompt)` built at create,
       // hydrated ones a store-rebuilt twin of the same construction
@@ -1210,9 +1329,19 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
             _ -> names
           }
         })
-      replay
-      |> transcript.messages
+      let replay_msgs = transcript.messages(replay)
+      let total_replay = list.length(replay_msgs)
+      let replay_compactions = transcript.compactions(replay)
+      replay_msgs
       |> list.index_fold(Nil, fn(_, message, index) {
+        // Interleave compaction checkpoints at their exact chronological
+        // `cutoff_index` (just before `messages[cutoff_index]`).
+        list.each(replay_compactions, fn(cp) {
+          case cp.cutoff_index == index {
+            True -> deliver(Compacted(cp, 0))
+            False -> Nil
+          }
+        })
         case message {
           chat.UserMessage(content: chat.UserTextContent(text), ..) ->
             deliver(UserEcho(
@@ -1272,6 +1401,20 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
         }
         Nil
       })
+      // Checkpoints whose cutoff_index == total_replay (compacted to the end)
+      // replay after the last message.
+      list.each(replay_compactions, fn(cp) {
+        case cp.cutoff_index >= total_replay {
+          True -> deliver(Compacted(cp, 0))
+          False -> Nil
+        }
+      })
+      // If a foreground manual compaction is in flight, inform the joining
+      // subscriber so reload / second tab shows "Compacting context…".
+      case is_manual_compacting(state.compaction) {
+        True -> deliver(CompactionStarted(transcript.ManualCompact))
+        False -> Nil
+      }
       // M3: the UI component keeps one long-lived subscription across
       // reconnects, so a re-Join must not duplicate the fan-out entry —
       // it REFRESHES the visit generation instead (the stale-delivery
@@ -1349,21 +1492,41 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       actor.continue(State(..state, archived: archived))
     }
 
-    Stop ->
-      case state.turn {
-        Idle -> actor.continue(state)
-        Starting(_worker, _monitor, True, _started_us) -> actor.continue(state)
+    Stop -> {
+      let state = case state.turn {
+        Idle -> state
+        Starting(_worker, _monitor, True, _started_us) -> state
         Starting(worker, monitor, False, started_us) ->
-          actor.continue(
-            State(..state, turn: Starting(worker, monitor, True, started_us)),
-          )
+          State(..state, turn: Starting(worker, monitor, True, started_us))
         Streaming(_, _, cancel, _, _, _, _) -> {
           process.send(cancel, Nil)
-          actor.continue(state)
+          state
         }
       }
+      let state = cancel_manual_compaction(state)
+      actor.continue(state)
+    }
 
-    CancelTurn(reply) ->
+    Compact(focus, reply) -> handle_manual_compact(state, focus, reply)
+
+    CancelTurn(reply) -> {
+      // Deletion kills this actor right after replying, so a deferred
+      // `CompactStarting` cancel handshake would never complete. Kill any
+      // compaction worker directly so doomed provider calls stop immediately.
+      let state = case state.compaction {
+        CompactIdle -> state
+        CompactStarting(worker, monitor, _, _, _) -> {
+          process.demonitor_process(monitor)
+          process.kill(worker)
+          State(..state, compaction: CompactIdle)
+        }
+        CompactRunning(worker, monitor, cancel, _, _, _) -> {
+          process.send(cancel, Nil)
+          process.demonitor_process(monitor)
+          process.kill(worker)
+          State(..state, compaction: CompactIdle)
+        }
+      }
       case state.turn {
         Idle -> {
           process.send(reply, None)
@@ -1381,6 +1544,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           actor.continue(state)
         }
       }
+    }
 
     AttachTarget(name, exec, reply) -> {
       handle_roster_change(state, RosterAttach(name), exec, reply)
@@ -1413,6 +1577,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           transcript: state.transcript,
           live_turn: state.turn_view,
           usage: state.usage,
+          compacting: is_manual_compacting(state.compaction),
         ),
       )
       actor.continue(state)
@@ -1720,12 +1885,13 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       // the whole turn.
       case
         state.turn,
+        state.compaction,
         state.utility,
         state.utility_attempted,
         state.cfg.utility_enabled,
         transcript.length(state.transcript) >= 3
       {
-        Idle, UtilityIdle, False, True, True -> {
+        Idle, CompactIdle, UtilityIdle, False, True, True -> {
           // Unlinked worker (mirror of the turn worker): holds the
           // committed transcript snapshot — an immutable value, and the
           // branch (Y + reply B) never enters the thread's transcript,
@@ -1780,12 +1946,13 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
             ),
           )
         }
-        _, UtilityIdle, False, True, True ->
+        _, _, UtilityIdle, False, True, True ->
           actor.continue(State(..state, utility_pending: True))
         // Genuinely terminal (attempt in flight, flag consumed, feature
         // off): drop, and with it any owed trigger that can no longer
         // matter.
-        _, _, _, _, _ -> actor.continue(State(..state, utility_pending: False))
+        _, _, _, _, _, _ ->
+          actor.continue(State(..state, utility_pending: False))
       }
 
     UtilityStarted(worker, cancel) ->
@@ -1813,6 +1980,66 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           finish_utility(state, monitor, cancelled, result)
         UtilityRunning(pid, monitor, _, cancelled) if pid == worker ->
           finish_utility(state, monitor, cancelled, result)
+        _ -> actor.continue(state)
+      }
+
+    CompactStarted(worker, cancel) ->
+      case state.compaction {
+        CompactStarting(pid, monitor, trigger, cancelled, base_len)
+          if pid == worker
+        -> {
+          // Stop raced the spawn → handshake window: signal cancel at once.
+          case cancelled {
+            True -> process.send(cancel, Nil)
+            False -> Nil
+          }
+          actor.continue(
+            State(
+              ..state,
+              compaction: CompactRunning(
+                worker,
+                monitor,
+                cancel,
+                trigger,
+                cancelled,
+                base_len,
+              ),
+            ),
+          )
+        }
+        _ -> actor.continue(state)
+      }
+
+    CompactDone(worker, cutoff_index, focus, before_tokens, result) ->
+      case state.compaction {
+        CompactStarting(pid, monitor, trigger, cancelled, base_len)
+          if pid == worker
+        ->
+          finish_compaction(
+            state,
+            monitor,
+            trigger,
+            cancelled,
+            base_len,
+            cutoff_index,
+            focus,
+            before_tokens,
+            result,
+          )
+        CompactRunning(pid, monitor, _, trigger, cancelled, base_len)
+          if pid == worker
+        ->
+          finish_compaction(
+            state,
+            monitor,
+            trigger,
+            cancelled,
+            base_len,
+            cutoff_index,
+            focus,
+            before_tokens,
+            result,
+          )
         _ -> actor.continue(state)
       }
 
@@ -1873,15 +2100,30 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       // as owed right here: the slot is idle again, and waiting for the
       // next turn-commit point would strand the retry when no further turn
       // ever commits.
-      case state.utility {
-        UtilityStarting(pid, _, _)
-          | UtilityRunning(pid, _, _, _)
+      case state.utility, state.compaction {
+        UtilityStarting(pid, _, _), _
+        | UtilityRunning(pid, _, _, _), _
           if pid == worker
         -> {
           let state = State(..state, utility: UtilityIdle)
           actor.continue(arm_utility(state, False))
         }
-        _ ->
+        _, CompactStarting(pid, _, trigger, cancelled, _)
+        | _, CompactRunning(pid, _, _, trigger, cancelled, _)
+          if pid == worker
+        -> {
+          let reason = case cancelled {
+            True -> "cancelled"
+            False -> "compaction worker exited unexpectedly"
+          }
+          emit(state, CompactionFinished(trigger, Some(reason)))
+          let state =
+            State(..state, compaction: CompactIdle)
+            |> drain_pending_roster
+            |> arm_utility(False)
+          actor.continue(state)
+        }
+        _, _ ->
           case is_current {
             False -> actor.continue(state)
             True -> {
@@ -1949,85 +2191,95 @@ fn start_send_turn(
   depth: Int,
   reply: Subject(SendResult),
 ) -> actor.Next(State, Msg) {
-  // A utility side-call in flight never blocks a send: cancel it and
-  // proceed normally — the thread must never report `Busy` because of
-  // a side call (required fairness on serialized backends: the side
-  // call would otherwise queue the user's turn behind it). The
-  // cancelled attempt does not consume `utility_attempted`; the next
-  // turn-commit point re-arms the debounce.
-  let state = cancel_utility(state)
-  case state.turn {
-    Idle -> {
-      // One stamp for the append AND the echo broadcast, so the
-      // sender's bubble and every other tab's (and a reload's replay)
-      // render the same wall-clock age for the same message. The
-      // origin mark rides immediately after (same call-after-append
-      // rule): display-only provenance, never a request byte. An
-      // authored send must mark BEFORE the mirror is built from `tr`,
-      // so a mid-turn join replays the author like the live echo.
-      let stamped = timing.wall_now_s()
-      let tr =
-        state.transcript
-        |> transcript.append_user(text)
-        |> transcript.mark_origin(author, depth)
-        |> transcript.stamp(stamped)
-      // The echo's author is READ BACK from the sidecar the mark just
-      // populated — the same read side every replay uses — so live and
-      // persisted display metadata agree by construction: an author
-      // mark_origin dropped (e.g. Some("")) is absent here too, never
-      // Some("") live but None on replay. One source, one shape.
-      emit(
-        state,
-        UserEcho(
-          text,
-          Some(stamped),
-          transcript.origin_at(tr, transcript.length(tr) - 1)
-            |> option.map(fn(origin) { origin.author }),
-        ),
-      )
-      let self = state.self
-      let runner = state.runner
-      let endpoint = state.endpoint
-      let worker =
-        process.spawn_unlinked(fn() {
-          let cancel = process.new_subject()
-          let pid = process.self()
-          process.send(self, TurnStarted(pid, cancel))
-          let on_event = fn(event) {
-            process.send(self, WorkerEvent(pid, event))
-          }
-          // The runner is the registry-built bundle's turn fn —
-          // wrapped per thread with the delivery identity on bot
-          // threads (bots P3c) and the environment handle on
-          // env-carrying threads (environments Phase 1), both of
-          // which ignore these arguments and build their own
-          // contexts from the thread's frozen values.
-          let outcome = runner(endpoint, tr, cancel, None, None, on_event)
-          process.send(self, WorkerDone(pid, outcome))
-        })
-      let monitor = process.monitor(worker)
-      process.send(reply, Sent)
-      // Write-behind: hand the committed transcript to the store's
-      // lane (a plain send — never blocks the actor).
-      let _ = state.commit_hook(tr)
-      actor.continue(
-        State(
-          ..state,
-          transcript: tr,
-          turn: Starting(worker, monitor, False, timing.now_us()),
-          // The mirror starts from the send-time transcript (user
-          // message included): a mid-turn join replays it while the
-          // worker streams the reply.
-          turn_view: Some(LiveTurn(tr, "", "")),
-          // The user message is committed the moment it is appended
-          // (even a failed turn keeps it), so activity starts here.
-          last_commit_s: timing.wall_now_s(),
-        ),
-      )
-    }
-    Streaming(..) | Starting(..) -> {
+  // Foreground manual compaction blocks Send with Busy: the user explicitly
+  // asked to compact before continuing (context-compaction plan §6.2).
+  case is_manual_compacting(state.compaction) {
+    True -> {
       process.send(reply, Busy)
       actor.continue(state)
+    }
+    False -> {
+      // A utility side-call in flight never blocks a send: cancel it and
+      // proceed normally — the thread must never report `Busy` because of
+      // a side call (required fairness on serialized backends: the side
+      // call would otherwise queue the user's turn behind it). The
+      // cancelled attempt does not consume `utility_attempted`; the next
+      // turn-commit point re-arms the debounce.
+      let state = cancel_utility(state)
+      case state.turn {
+        Idle -> {
+          // One stamp for the append AND the echo broadcast, so the
+          // sender's bubble and every other tab's (and a reload's replay)
+          // render the same wall-clock age for the same message. The
+          // origin mark rides immediately after (same call-after-append
+          // rule): display-only provenance, never a request byte. An
+          // authored send must mark BEFORE the mirror is built from `tr`,
+          // so a mid-turn join replays the author like the live echo.
+          let stamped = timing.wall_now_s()
+          let tr =
+            state.transcript
+            |> transcript.append_user(text)
+            |> transcript.mark_origin(author, depth)
+            |> transcript.stamp(stamped)
+          // The echo's author is READ BACK from the sidecar the mark just
+          // populated — the same read side every replay uses — so live and
+          // persisted display metadata agree by construction: an author
+          // mark_origin dropped (e.g. Some("")) is absent here too, never
+          // Some("") live but None on replay. One source, one shape.
+          emit(
+            state,
+            UserEcho(
+              text,
+              Some(stamped),
+              transcript.origin_at(tr, transcript.length(tr) - 1)
+                |> option.map(fn(origin) { origin.author }),
+            ),
+          )
+          let self = state.self
+          let runner = state.runner
+          let endpoint = state.endpoint
+          let worker =
+            process.spawn_unlinked(fn() {
+              let cancel = process.new_subject()
+              let pid = process.self()
+              process.send(self, TurnStarted(pid, cancel))
+              let on_event = fn(event) {
+                process.send(self, WorkerEvent(pid, event))
+              }
+              // The runner is the registry-built bundle's turn fn —
+              // wrapped per thread with the delivery identity on bot
+              // threads (bots P3c) and the environment handle on
+              // env-carrying threads (environments Phase 1), both of
+              // which ignore these arguments and build their own
+              // contexts from the thread's frozen values.
+              let outcome = runner(endpoint, tr, cancel, None, None, on_event)
+              process.send(self, WorkerDone(pid, outcome))
+            })
+          let monitor = process.monitor(worker)
+          process.send(reply, Sent)
+          // Write-behind: hand the committed transcript to the store's
+          // lane (a plain send — never blocks the actor).
+          let _ = state.commit_hook(tr)
+          actor.continue(
+            State(
+              ..state,
+              transcript: tr,
+              turn: Starting(worker, monitor, False, timing.now_us()),
+              // The mirror starts from the send-time transcript (user
+              // message included): a mid-turn join replays it while the
+              // worker streams the reply.
+              turn_view: Some(LiveTurn(tr, "", "")),
+              // The user message is committed the moment it is appended
+              // (even a failed turn keeps it), so activity starts here.
+              last_commit_s: timing.wall_now_s(),
+            ),
+          )
+        }
+        Streaming(..) | Starting(..) -> {
+          process.send(reply, Busy)
+          actor.continue(state)
+        }
+      }
     }
   }
 }
@@ -2261,9 +2513,15 @@ fn accept_fresh_roster_change(
           }
         RosterDetach(name) -> drop_exec(state, name)
       }
-      case state.turn {
-        Idle -> #(apply_roster_change(state, change, new_roster), Ok(Nil))
-        Starting(..) | Streaming(..) -> #(
+      // Queue roster lines behind both an in-flight turn AND foreground
+      // manual compaction so `roster_snapshot` freezes the pre-queue roster
+      // at `cutoff_index` and queued changes drain strictly after install.
+      case state.turn, is_manual_compacting(state.compaction) {
+        Idle, False -> #(
+          apply_roster_change(state, change, new_roster),
+          Ok(Nil),
+        )
+        _, _ -> #(
           State(
             ..state,
             pending_roster: list.append(state.pending_roster, [change]),
@@ -2609,6 +2867,302 @@ fn usage_cached(usage: Option(CompletionUsage)) -> Option(Int) {
 /// Request/response helpers over the actor's subject.
 pub fn send_message(thread: Subject(Msg), text: String) -> SendResult {
   actor.call(thread, 5000, fn(reply) { Send(text, None, 0, reply) })
+}
+
+/// Request foreground manual compaction (`/compact [focus]`) on a thread.
+pub fn compact(thread: Subject(Msg), focus: Option(String)) -> CompactResult {
+  actor.call(thread, 5000, fn(reply) { Compact(focus, reply) })
+}
+
+// ---------------------------------------------------------------------------
+// Foreground manual compaction (context-compaction plan §6.1–§6.3)
+// ---------------------------------------------------------------------------
+
+fn is_manual_compacting(compaction_state: CompactionState) -> Bool {
+  case compaction_state {
+    CompactStarting(trigger: transcript.ManualCompact, ..)
+    | CompactRunning(trigger: transcript.ManualCompact, ..) -> True
+    _ -> False
+  }
+}
+
+fn cancel_manual_compaction(state: State) -> State {
+  case state.compaction {
+    CompactStarting(worker, monitor, transcript.ManualCompact, False, base_len) ->
+      State(
+        ..state,
+        compaction: CompactStarting(
+          worker,
+          monitor,
+          transcript.ManualCompact,
+          True,
+          base_len,
+        ),
+      )
+    CompactRunning(
+      worker,
+      monitor,
+      cancel,
+      transcript.ManualCompact,
+      False,
+      base_len,
+    ) -> {
+      process.send(cancel, Nil)
+      State(
+        ..state,
+        compaction: CompactRunning(
+          worker,
+          monitor,
+          cancel,
+          transcript.ManualCompact,
+          True,
+          base_len,
+        ),
+      )
+    }
+    _ -> state
+  }
+}
+
+fn handle_manual_compact(
+  state: State,
+  focus: Option(String),
+  reply: Subject(CompactResult),
+) -> actor.Next(State, Msg) {
+  case state.archived && option.is_some(state.parent_thread_id) {
+    True -> {
+      process.send(reply, CompactRefused("thread is archived"))
+      actor.continue(state)
+    }
+    False ->
+      case state.turn, state.compaction {
+        Idle, CompactIdle ->
+          case compaction.validate_focus(focus) {
+            Error(max_chars) -> {
+              process.send(reply, FocusTooLong(max_chars))
+              actor.continue(state)
+            }
+            Ok(clean_focus) -> {
+              let keep_tail =
+                compaction.keep_tail_tokens(
+                  state.cfg.compaction_keep_tail_pct,
+                  state.usage.context_window,
+                )
+              case
+                compaction.pick_cutoff(
+                  state.transcript,
+                  keep_tail,
+                  state.usage.context_window,
+                  state.usage.bytes_per_token,
+                )
+              {
+                Error(compaction.NothingToCompact) -> {
+                  process.send(reply, NothingToCompact)
+                  actor.continue(state)
+                }
+                Ok(cutoff_index) -> {
+                  // Cancel any in-flight utility side-call first so we never
+                  // contend on single-slot (`-np 1`) backends; utility's
+                  // cancelled-does-not-consume rule re-arms it later.
+                  let state = cancel_utility(state)
+                  let before_tokens = case state.usage.tokens > 0 {
+                    True -> state.usage.tokens
+                    False ->
+                      estimate_tokens_from_bytes(
+                        string.byte_size(transcript.request_body(
+                          state.transcript,
+                          state.base_opts,
+                        )),
+                        state.usage.bytes_per_token,
+                      )
+                  }
+                  let snapshot = state.transcript
+                  let base_len = transcript.length(snapshot)
+                  let self = state.self
+                  let endpoint = state.endpoint
+                  let runner = state.compaction_runner
+                  let context_window = state.usage.context_window
+                  let bytes_per_token = state.usage.bytes_per_token
+                  let worker =
+                    process.spawn_unlinked(fn() {
+                      let cancel = process.new_subject()
+                      let pid = process.self()
+                      process.send(self, CompactStarted(pid, cancel))
+                      let result =
+                        runner(
+                          endpoint,
+                          snapshot,
+                          cutoff_index,
+                          clean_focus,
+                          context_window,
+                          bytes_per_token,
+                          cancel,
+                        )
+                      process.send(
+                        self,
+                        CompactDone(
+                          pid,
+                          cutoff_index,
+                          clean_focus,
+                          before_tokens,
+                          result,
+                        ),
+                      )
+                    })
+                  let monitor = process.monitor(worker)
+                  emit(state, CompactionStarted(transcript.ManualCompact))
+                  process.send(reply, Compacting)
+                  actor.continue(
+                    State(
+                      ..state,
+                      compaction: CompactStarting(
+                        worker,
+                        monitor,
+                        transcript.ManualCompact,
+                        False,
+                        base_len,
+                      ),
+                    ),
+                  )
+                }
+              }
+            }
+          }
+        _, _ -> {
+          process.send(reply, CompactBusy)
+          actor.continue(state)
+        }
+      }
+  }
+}
+
+fn finish_compaction(
+  state: State,
+  monitor: Monitor,
+  trigger: transcript.CompactionTrigger,
+  cancelled: Bool,
+  base_len: Int,
+  cutoff_index: Int,
+  focus: Option(String),
+  before_tokens: Int,
+  result: Result(String, String),
+) -> actor.Next(State, Msg) {
+  process.demonitor_process(monitor)
+  let install_ok =
+    state.turn == Idle
+    && !cancelled
+    && transcript.length(state.transcript) == base_len
+  case install_ok, result {
+    True, Ok(summary) -> {
+      let roster_snapshot = case
+        state.roster != [] && !has_roster_from(state.transcript, cutoff_index)
+      {
+        True -> Some(env.roster_attach_text("", state.roster))
+        False -> None
+      }
+      let now_s = timing.wall_now_s()
+      let preliminary =
+        transcript.Compaction(
+          cutoff_index: cutoff_index,
+          summary: summary,
+          roster_snapshot: roster_snapshot,
+          focus: focus,
+          trigger: trigger,
+          before_tokens: Some(before_tokens),
+          after_tokens: None,
+          created_at: now_s,
+        )
+      let after_tokens =
+        estimate_tokens_from_bytes(
+          string.byte_size(transcript.request_body(
+            transcript.apply_compaction(state.transcript, preliminary),
+            state.base_opts,
+          )),
+          state.usage.bytes_per_token,
+        )
+      let checkpoint =
+        transcript.Compaction(..preliminary, after_tokens: Some(after_tokens))
+      let tr = transcript.apply_compaction(state.transcript, checkpoint)
+      let _ = state.compaction_hook(tr, checkpoint)
+      let next_usage =
+        ContextUsage(
+          ..state.usage,
+          tokens: after_tokens,
+          source: Estimated,
+          last_prompt_tokens: None,
+          last_cached_tokens: None,
+        )
+      let kept_users = count_user_messages_from(tr, cutoff_index)
+      emit(state, Compacted(checkpoint, kept_users))
+      emit(state, UsageUpdated(next_usage))
+      emit(state, CompactionFinished(trigger, None))
+      let next_state =
+        State(
+          ..state,
+          transcript: tr,
+          compaction: CompactIdle,
+          usage: next_usage,
+        )
+        |> drain_pending_roster
+        |> arm_utility(False)
+      actor.continue(next_state)
+    }
+    False, _ -> {
+      let err = case cancelled {
+        True -> "cancelled"
+        False -> "compaction discarded because transcript changed"
+      }
+      emit(state, CompactionFinished(trigger, Some(err)))
+      let next_state =
+        State(..state, compaction: CompactIdle)
+        |> drain_pending_roster
+        |> arm_utility(False)
+      actor.continue(next_state)
+    }
+    True, Error(reason) -> {
+      emit(state, CompactionFinished(trigger, Some(reason)))
+      let next_state =
+        State(..state, compaction: CompactIdle)
+        |> drain_pending_roster
+        |> arm_utility(False)
+      actor.continue(next_state)
+    }
+  }
+}
+
+/// True when `tr` already carries a system-authored roster row at or after
+/// `cutoff_index` (so the kept tail preserves the live roster verbatim).
+fn has_roster_from(tr: Transcript, cutoff_index: Int) -> Bool {
+  tr
+  |> transcript.messages
+  |> list.drop(cutoff_index)
+  |> list.index_fold(False, fn(found, msg, offset) {
+    case found {
+      True -> True
+      False ->
+        case msg, transcript.origin_at(tr, cutoff_index + offset) {
+          chat.UserMessage(content: chat.UserTextContent(text), ..),
+            Some(transcript.Origin("system", _))
+          -> string.starts_with(text, env.roster_prefix)
+          _, _ -> False
+        }
+    }
+  })
+}
+
+/// Count `chat.UserMessage` rows at chronological indices `>= cutoff_index`
+/// so live subscribers place the compaction divider at the exact same
+/// chronological position as `Join` replay.
+fn count_user_messages_from(tr: Transcript, cutoff_index: Int) -> Int {
+  tr
+  |> transcript.messages
+  |> list.drop(cutoff_index)
+  |> list.fold(0, fn(count, msg) {
+    case msg {
+      chat.UserMessage(..) -> count + 1
+      _ -> count
+    }
+  })
 }
 
 pub fn stop(thread: Subject(Msg)) -> Nil {

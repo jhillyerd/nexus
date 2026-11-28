@@ -29,6 +29,7 @@ import nexus/transcript.{type Transcript}
 pub type Event {
   EvInsertThread(id: String)
   EvCommit(id: String, messages: Int)
+  EvRecordCompaction(id: String, cutoff_index: Int)
   EvSetLastContextTokens(id: String, tokens: Int)
   EvSetTitle(id: String, title: String)
   EvAutoTitle(id: String, title: String)
@@ -65,6 +66,10 @@ pub type MockMsg {
     id: String,
     reply: Subject(Result(List(store.MessageRow), String)),
   )
+  LoadCompactions(
+    id: String,
+    reply: Subject(Result(List(transcript.Compaction), String)),
+  )
   InsertThread(
     summary: StoredSummary,
     system_prompt: String,
@@ -83,6 +88,13 @@ pub type MockMsg {
   /// replay path — applying the same (or an older) transcript again is a
   /// no-op apart from the recency bump.
   Commit(id: String, transcript: Transcript)
+  /// Write-behind atomic compaction persistence: mirrors `persist`'s single
+  /// transaction (flush delta + insert compaction + update last_context_tokens).
+  RecordCompaction(
+    id: String,
+    transcript: Transcript,
+    checkpoint: transcript.Compaction,
+  )
   /// Write-behind context usage update: fire-and-forget.
   SetLastContextTokens(id: String, tokens: Int)
   SetTitle(id: String, title: String, reply: Subject(Result(Nil, String)))
@@ -183,6 +195,8 @@ type Stored {
     system_prompt: String,
     /// Rows in seq order (seq = index).
     rows: List(store.MessageRow),
+    /// Compaction checkpoints in chronological insertion order (oldest first).
+    compactions: List(transcript.Compaction),
     /// Persisted chronological transcript length INCLUDING the system
     /// prompt — the write-behind watermark. Message count, not row count:
     /// an assistant message with N tool calls is one message but N rows
@@ -307,6 +321,9 @@ pub fn seam(mock: Subject(MockMsg)) -> Store {
     list_summaries: fn() { call(mock, 5000, ListSummaries) },
     get_thread: fn(id) { call(mock, 5000, fn(r) { GetThread(id, r) }) },
     load_messages: fn(id) { call(mock, 5000, fn(r) { LoadMessages(id, r) }) },
+    load_compactions: fn(id) {
+      call(mock, 5000, fn(r) { LoadCompactions(id, r) })
+    },
     insert_thread: fn(summary, system_prompt) {
       call(mock, 5000, fn(r) { InsertThread(summary, system_prompt, r) })
     },
@@ -314,6 +331,9 @@ pub fn seam(mock: Subject(MockMsg)) -> Store {
       call(mock, 5000, fn(r) { FindChannel(parent_thread_id, bot_id, r) })
     },
     commit: fn(id, transcript) { process.send(mock, Commit(id, transcript)) },
+    record_compaction: fn(id, transcript, checkpoint) {
+      process.send(mock, RecordCompaction(id, transcript, checkpoint))
+    },
     set_last_context_tokens: fn(id, tokens) {
       process.send(mock, SetLastContextTokens(id, tokens))
     },
@@ -521,6 +541,18 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
       case dict.get(state.threads, id) {
         Ok(stored) -> {
           process.send(reply, Ok(stored.rows))
+          actor.continue(state)
+        }
+        Error(_) -> {
+          process.send(reply, Ok([]))
+          actor.continue(state)
+        }
+      }
+
+    LoadCompactions(id, reply) ->
+      case dict.get(state.threads, id) {
+        Ok(stored) -> {
+          process.send(reply, Ok(stored.compactions))
           actor.continue(state)
         }
         Error(_) -> {
@@ -743,6 +775,7 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
                                 ]
                                 option.None -> []
                               },
+                              [],
                               summary.message_count,
                             ),
                           ),
@@ -807,6 +840,75 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
             }
           }
         }
+      }
+      actor.continue(State(..state, threads: threads, events: events))
+    }
+
+    RecordCompaction(id, tr, checkpoint) -> {
+      let events = [
+        EvRecordCompaction(id, checkpoint.cutoff_index),
+        ..state.events
+      ]
+      let threads = case
+        dict.get(state.threads, id),
+        checkpoint.cutoff_index > 0
+      {
+        Ok(stored), True -> {
+          let already = stored.messages
+          let #(next_rows, next_messages, next_active) = case
+            store.has_delta(tr, already)
+          {
+            False -> #(stored.rows, already, stored.summary.last_active_at)
+            True -> #(
+              list.append(stored.rows, store.transcript_rows(tr, already)),
+              transcript.length(tr),
+              timing.wall_now_s(),
+            )
+          }
+          // Mirror SQL nullif('', '') and < 0 -> NULL sentinels so mock and
+          // Postgres return identical normalized rows.
+          let stored_cp =
+            transcript.Compaction(
+              ..checkpoint,
+              roster_snapshot: case checkpoint.roster_snapshot {
+                Some("") -> None
+                other -> other
+              },
+              focus: case checkpoint.focus {
+                Some("") -> None
+                other -> other
+              },
+              before_tokens: case checkpoint.before_tokens {
+                Some(n) if n < 0 -> None
+                other -> other
+              },
+              after_tokens: case checkpoint.after_tokens {
+                Some(n) if n < 0 -> None
+                other -> other
+              },
+            )
+          let next_tokens = case stored_cp.after_tokens {
+            Some(n) -> Some(int.max(0, n))
+            None -> stored.summary.last_context_tokens
+          }
+          dict.insert(
+            state.threads,
+            id,
+            Stored(
+              ..stored,
+              rows: next_rows,
+              compactions: list.append(stored.compactions, [stored_cp]),
+              messages: next_messages,
+              summary: store.StoredSummary(
+                ..stored.summary,
+                last_active_at: next_active,
+                message_count: next_messages,
+                last_context_tokens: next_tokens,
+              ),
+            ),
+          )
+        }
+        _, _ -> state.threads
       }
       actor.continue(State(..state, threads: threads, events: events))
     }

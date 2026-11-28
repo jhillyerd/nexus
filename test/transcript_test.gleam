@@ -427,3 +427,126 @@ pub fn without_trailing_assistant_strips_only_trailing_assistant_test() {
     transcript.default_options(),
   ))
 }
+
+// ---------------------------------------------------------------------------
+// Context compaction (Phase 2): sidecar checkpoint & active-window projection
+// ---------------------------------------------------------------------------
+
+pub fn compaction_sidecar_preserves_messages_and_projects_window_test() {
+  let base =
+    transcript.new("m", "system prompt")
+    |> transcript.append_user("turn 1 user")
+    |> transcript.append_assistant("turn 1 assistant")
+    |> transcript.append_user("turn 2 user")
+    |> transcript.append_assistant("turn 2 assistant")
+  let cp =
+    transcript.Compaction(
+      cutoff_index: 3,
+      summary: "## Goal & Constraints\nCarry on.",
+      roster_snapshot: Some("Attached environments: workspace, box-a."),
+      focus: Some("keep paths"),
+      trigger: transcript.ManualCompact,
+      before_tokens: Some(3000),
+      after_tokens: Some(450),
+      created_at: 1_700_000_000,
+    )
+  let compacted = transcript.apply_compaction(base, cp)
+
+  // Raw history (`messages` and `length`) is structurally untouched for
+  // write-behind watermarks and full UI scrollback.
+  transcript.length(compacted) |> should.equal(transcript.length(base))
+  transcript.messages(compacted) |> should.equal(transcript.messages(base))
+  transcript.active_start(compacted) |> should.equal(3)
+  transcript.latest_compaction(compacted) |> should.equal(Some(cp))
+  transcript.compactions(compacted) |> should.equal([cp])
+
+  // Projected request messages: [system, checkpoint_user, checkpoint_ack, turn2_user, turn2_assistant].
+  let projected = transcript.request_messages(compacted)
+  list.length(projected) |> should.equal(5)
+  let expected_user = transcript.compaction_user_content(cp)
+  should.be_true(string.starts_with(
+    expected_user,
+    transcript.compaction_user_prefix,
+  ))
+  should.be_true(string.contains(
+    expected_user,
+    "Attached environments: workspace, box-a.",
+  ))
+  should.equal(projected, [
+    chat.system_message("system prompt"),
+    chat.user_message(expected_user),
+    chat.assistant_message(transcript.compaction_ack_text),
+    chat.user_message("turn 2 user"),
+    chat.assistant_message("turn 2 assistant"),
+  ])
+
+  // Re-applying the same checkpoint after rebuilding produces byte-identical requests.
+  let rebuilt =
+    transcript.new("m", "system prompt")
+    |> transcript.append_user("turn 1 user")
+    |> transcript.append_assistant("turn 1 assistant")
+    |> transcript.append_user("turn 2 user")
+    |> transcript.append_assistant("turn 2 assistant")
+    |> transcript.apply_compaction(cp)
+  transcript.request_body(rebuilt, stream_opts())
+  |> should.equal(transcript.request_body(compacted, stream_opts()))
+}
+
+pub fn slice_active_keeps_prefix_and_prior_checkpoints_test() {
+  let base =
+    transcript.new("m", "sys")
+    |> transcript.append_user("u1")
+    |> transcript.append_assistant("a1")
+    |> transcript.append_user("u2")
+    |> transcript.append_assistant("a2")
+    |> transcript.append_user("u3")
+    |> transcript.append_assistant("a3")
+  let cp1 =
+    transcript.Compaction(
+      cutoff_index: 3,
+      summary: "Summary 1",
+      roster_snapshot: None,
+      focus: None,
+      trigger: transcript.ManualCompact,
+      before_tokens: None,
+      after_tokens: None,
+      created_at: 1000,
+    )
+  let with_cp1 = transcript.apply_compaction(base, cp1)
+  // Slicing at cutoff 5 keeps cp1 (cutoff 3 <= 5) and projects [sys, cp1_user, cp1_ack, u2, a2].
+  let sliced = transcript.slice_active(with_cp1, 5)
+  transcript.request_messages(sliced)
+  |> should.equal([
+    chat.system_message("sys"),
+    chat.user_message(transcript.compaction_user_content(cp1)),
+    chat.assistant_message(transcript.compaction_ack_text),
+    chat.user_message("u2"),
+    chat.assistant_message("a2"),
+  ])
+
+  // Slicing before cp1 drops cp1 cleanly.
+  let earlier = transcript.slice_active(with_cp1, 3)
+  transcript.latest_compaction(earlier) |> should.equal(Some(cp1))
+  let pre_cp1 = transcript.slice_active(with_cp1, 2)
+  transcript.latest_compaction(pre_cp1) |> should.equal(None)
+}
+
+pub fn without_trailing_assistant_does_not_strip_across_compaction_cutoff_test() {
+  let tr =
+    transcript.new("m", "sys")
+    |> transcript.append_user("u1")
+    |> transcript.append_assistant("a1")
+    |> transcript.apply_compaction(transcript.Compaction(
+      cutoff_index: 3,
+      summary: "Summary 1",
+      roster_snapshot: None,
+      focus: None,
+      trigger: transcript.ManualCompact,
+      before_tokens: None,
+      after_tokens: None,
+      created_at: 1000,
+    ))
+  // All messages are compacted (length == active_start == 3): must not strip a1.
+  let unchanged = transcript.without_trailing_assistant(tr)
+  transcript.length(unchanged) |> should.equal(3)
+}

@@ -84,6 +84,8 @@ fn test_config() -> config.Config {
     // Bots P3c: the delivery hop guard; 4 = the shipped default.
     max_bot_hops: 4,
     default_context_window: None,
+    compaction_keep_tail_pct: 20,
+    compaction_max_tokens: 4096,
   )
 }
 
@@ -394,6 +396,9 @@ fn toolset(
     specs: specs,
     runner: runner,
     utility_runner: utility_runner,
+    compaction_runner: fn(_endpoint, _tr, _cutoff, _focus, _ctx, _bpt, _cancel) {
+      Error("no compaction in this test")
+    },
   )
 }
 
@@ -416,6 +421,7 @@ fn start_with(runner: thread.TurnRunner) -> process.Subject(thread.Msg) {
       context_window: None,
       last_context_tokens: None,
       usage_hook: fn(_) { Nil },
+      compaction_hook: fn(_, _) { Nil },
     ))
   started.data
 }
@@ -444,6 +450,7 @@ fn start_with_env(runner: thread.TurnRunner) -> process.Subject(thread.Msg) {
         context_window: None,
         last_context_tokens: None,
         usage_hook: fn(_) { Nil },
+        compaction_hook: fn(_, _) { Nil },
       ),
     )
   started.data
@@ -720,6 +727,7 @@ pub fn selected_alias_is_frozen_test() {
       context_window: None,
       last_context_tokens: None,
       usage_hook: fn(_) { Nil },
+      compaction_hook: fn(_, _) { Nil },
     )
   let assert Ok(started) = thread.start_with_spec(spec)
   let sess = started.data
@@ -765,6 +773,7 @@ pub fn runner_receives_frozen_endpoint_test() {
       context_window: None,
       last_context_tokens: None,
       usage_hook: fn(_) { Nil },
+      compaction_hook: fn(_, _) { Nil },
     )
   let assert Ok(started) = thread.start_with_spec(spec)
   let sess = started.data
@@ -1595,6 +1604,7 @@ fn start_with_utility(
         context_window: None,
         last_context_tokens: None,
         usage_hook: fn(_) { Nil },
+        compaction_hook: fn(_, _) { Nil },
       ),
     )
   started.data
@@ -2836,6 +2846,7 @@ pub fn thread_actor_tracks_measured_usage_stop_guard_and_usage_hook_test() {
         context_window: Some(32_768),
         last_context_tokens: None,
         usage_hook: fn(tokens) { process.send(hooked, tokens) },
+        compaction_hook: fn(_, _) { Nil },
       ),
     )
   let sess = started.data
@@ -2895,6 +2906,7 @@ pub fn thread_actor_tracks_measured_usage_stop_guard_and_usage_hook_test() {
         context_window: Some(65_536),
         last_context_tokens: None,
         usage_hook: fn(_) { Nil },
+        compaction_hook: fn(_, _) { Nil },
       ),
     )
   let gsess = started_g.data
@@ -2909,4 +2921,389 @@ pub fn thread_actor_tracks_measured_usage_stop_guard_and_usage_hook_test() {
     expect_event(gsub)
   guard_u.tokens |> should.equal(425)
   guard_u.source |> should.equal(thread.Measured)
+}
+
+// ---------------------------------------------------------------------------
+// Context compaction (Phase 2): foreground manual `/compact [focus]`
+// ---------------------------------------------------------------------------
+
+fn start_compaction_thread(
+  cfg: config.Config,
+  turn_runner: thread.TurnRunner,
+  utility_runner: thread.UtilityRunner,
+  compaction_runner: thread.CompactionRunner,
+  roster: List(String),
+  names: List(String),
+  parent_thread_id: option.Option(String),
+  archived: Bool,
+  context_window: option.Option(Int),
+  compaction_hook: fn(transcript.Transcript, transcript.Compaction) -> Nil,
+) -> process.Subject(thread.Msg) {
+  let specs = tools.default(cfg)
+  let bundle =
+    thread.Toolset(
+      names: names,
+      specs: specs,
+      runner: turn_runner,
+      utility_runner: utility_runner,
+      compaction_runner: compaction_runner,
+    )
+  let tr0 = case roster {
+    [] -> transcript.new("test-alias", "sys")
+    _ ->
+      transcript.new("test-alias", "sys")
+      |> transcript.append_user(
+        "Attached environments: " <> string.join(roster, ", ") <> ".",
+      )
+      |> transcript.mark_origin(Some("system"), 0)
+  }
+  let assert Ok(started) =
+    thread.start_with_spec(thread.ThreadSpec(
+      id: "s-compact",
+      cfg: cfg,
+      endpoint: test_endpoint(),
+      toolset: bundle,
+      commit_hook: fn(_) { Nil },
+      transcript: tr0,
+      hydrated: False,
+      roster: roster,
+      utility_apply: no_utility_apply,
+      parent_thread_id: parent_thread_id,
+      archived: archived,
+      context_window: context_window,
+      last_context_tokens: None,
+      usage_hook: fn(_) { Nil },
+      compaction_hook: compaction_hook,
+    ))
+  started.data
+}
+
+pub fn manual_compact_lifecycle_busy_refusal_and_replay_test() {
+  let gate_req = process.new_subject()
+  let hooked = process.new_subject()
+  let seen_turn_tr = process.new_subject()
+  let turn_runner = fn(_ep, tr, _cancel, _del, _env, _on_ev) {
+    process.send(seen_turn_tr, tr)
+    thread.StreamDone(
+      stats(),
+      transcript.append_assistant(tr, "reply")
+        |> transcript.stamp(timing.wall_now_s()),
+    )
+  }
+  let compact_runner = fn(_ep, _tr, cutoff, focus, _ctx, _bpt, _cancel) {
+    let gate = process.new_subject()
+    process.send(gate_req, #(cutoff, focus, gate))
+    let assert Ok(_) = process.receive(gate, 5000)
+    Ok("## Goal & Constraints\nCompacted summary text.")
+  }
+  // keep_tail_pct: 20 with context_window: Some(8192) -> keep_tail_tokens = 2000.
+  let cfg = config.Config(..test_config(), compaction_keep_tail_pct: 20)
+  let sess =
+    start_compaction_thread(
+      cfg,
+      turn_runner,
+      no_utility_runner,
+      compact_runner,
+      [],
+      [],
+      None,
+      False,
+      Some(8192),
+      fn(tr, cp) { process.send(hooked, #(tr, cp)) },
+    )
+  let sub = join(sess)
+  let _ = expect_event(sub)
+
+  // Turn 1 (large) and Turn 2 (small): cutoff must land at 3, keeping Turn 2.
+  should.equal(thread.send_message(sess, string.repeat("a", 6000)), thread.Sent)
+  drain_until_turn_done(sub)
+  let assert Ok(_) = process.receive(seen_turn_tr, 2000)
+
+  should.equal(thread.send_message(sess, "keep me"), thread.Sent)
+  drain_until_turn_done(sub)
+  let assert Ok(_) = process.receive(seen_turn_tr, 2000)
+
+  // Start manual compact with focus.
+  thread.compact(sess, Some("keep API names"))
+  |> should.equal(thread.Compacting)
+
+  let assert thread.ThreadEvent(
+    _,
+    1,
+    thread.CompactionStarted(transcript.ManualCompact),
+  ) = expect_event(sub)
+
+  let assert Ok(#(got_cutoff, got_focus, gate)) =
+    process.receive(gate_req, 5000)
+  got_cutoff |> should.equal(3)
+  got_focus |> should.equal(Some("keep API names"))
+
+  // While compacting: inspect.compacting is True, Send and Compact return Busy.
+  thread.inspect(sess).compacting |> should.be_true
+  thread.send_message(sess, "blocked") |> should.equal(thread.Busy)
+  thread.compact(sess, None) |> should.equal(thread.CompactBusy)
+
+  // Release compaction worker.
+  process.send(gate, Nil)
+
+  let assert thread.ThreadEvent(_, 1, thread.Compacted(cp, kept_users)) =
+    expect_event(sub)
+  cp.cutoff_index |> should.equal(3)
+  cp.summary |> should.equal("## Goal & Constraints\nCompacted summary text.")
+  cp.focus |> should.equal(Some("keep API names"))
+  cp.trigger |> should.equal(transcript.ManualCompact)
+  kept_users |> should.equal(1)
+
+  let assert thread.ThreadEvent(_, 1, thread.UsageUpdated(_)) =
+    expect_event(sub)
+  let assert thread.ThreadEvent(
+    _,
+    1,
+    thread.CompactionFinished(transcript.ManualCompact, None),
+  ) = expect_event(sub)
+  thread.inspect(sess).compacting |> should.be_false
+
+  let assert Ok(#(hook_tr, hook_cp)) = process.receive(hooked, 2000)
+  hook_cp |> should.equal(cp)
+  transcript.latest_compaction(hook_tr) |> should.equal(Some(cp))
+
+  // Next Send passes the compacted transcript (active window starts with checkpoint).
+  should.equal(thread.send_message(sess, "after compact"), thread.Sent)
+  let assert Ok(next_tr) = process.receive(seen_turn_tr, 2000)
+  // [system, checkpoint_user, checkpoint_ack, "keep me", "reply", "after compact"]
+  list.length(transcript.request_messages(next_tr)) |> should.equal(6)
+  drain_until_turn_done(sub)
+
+  // Fresh Join replays Compacted(cp, 0) interleaved at cutoff_index 3!
+  let sub2 = join(sess)
+  let assert thread.ThreadEvent(_, 1, thread.Hello(_, _, _, _)) =
+    expect_event(sub2)
+  let assert thread.ThreadEvent(_, 1, thread.UserEcho(_, _, _)) =
+    expect_event(sub2)
+  let assert thread.ThreadEvent(_, 1, thread.AssistantFull(_, _)) =
+    expect_event(sub2)
+  let assert thread.ThreadEvent(_, 1, thread.Compacted(replayed_cp, 0)) =
+    expect_event(sub2)
+  replayed_cp |> should.equal(cp)
+  let assert thread.ThreadEvent(_, 1, thread.UserEcho("keep me", _, _)) =
+    expect_event(sub2)
+}
+
+pub fn manual_compact_validation_and_archived_channel_test() {
+  let no_compact = fn(_ep, _tr, _cut, _focus, _ctx, _bpt, _cancel) {
+    Error("should not run")
+  }
+  let sess =
+    start_compaction_thread(
+      test_config(),
+      happy_runner,
+      no_utility_runner,
+      no_compact,
+      [],
+      [],
+      None,
+      False,
+      Some(32_768),
+      fn(_, _) { Nil },
+    )
+  // Empty thread -> NothingToCompact.
+  thread.compact(sess, None) |> should.equal(thread.NothingToCompact)
+
+  // Focus > 1000 chars -> FocusTooLong(1000).
+  thread.compact(sess, Some(string.repeat("x", 1001)))
+  |> should.equal(thread.FocusTooLong(1000))
+
+  // Archived channel refuses manual compaction.
+  let archived_channel =
+    start_compaction_thread(
+      test_config(),
+      happy_runner,
+      no_utility_runner,
+      no_compact,
+      [],
+      [],
+      Some("parent-1"),
+      True,
+      Some(32_768),
+      fn(_, _) { Nil },
+    )
+  let assert thread.CompactRefused(_) = thread.compact(archived_channel, None)
+  Nil
+}
+
+pub fn manual_compact_stop_cancels_cleanly_test() {
+  let cancel_seen = process.new_subject()
+  let compact_runner = fn(_ep, _tr, _cut, _focus, _ctx, _bpt, cancel) {
+    // Wait for Stop's cancel signal.
+    case process.receive(cancel, 5000) {
+      Ok(Nil) -> {
+        process.send(cancel_seen, True)
+        Error("cancelled")
+      }
+      Error(Nil) -> Ok("should not finish")
+    }
+  }
+  let cfg = config.Config(..test_config(), compaction_keep_tail_pct: 0)
+  let sess =
+    start_compaction_thread(
+      cfg,
+      happy_runner,
+      no_utility_runner,
+      compact_runner,
+      [],
+      [],
+      None,
+      False,
+      Some(32_768),
+      fn(_, _) { Nil },
+    )
+  let sub = join(sess)
+  let _ = expect_event(sub)
+
+  should.equal(thread.send_message(sess, "hello"), thread.Sent)
+  drain_until_turn_done(sub)
+
+  thread.compact(sess, None) |> should.equal(thread.Compacting)
+  let assert thread.ThreadEvent(
+    _,
+    1,
+    thread.CompactionStarted(transcript.ManualCompact),
+  ) = expect_event(sub)
+
+  // Stop cancels the in-flight manual compaction.
+  thread.stop(sess)
+  process.receive(cancel_seen, 5000) |> should.equal(Ok(True))
+  let assert thread.ThreadEvent(
+    _,
+    1,
+    thread.CompactionFinished(transcript.ManualCompact, Some("cancelled")),
+  ) = expect_event(sub)
+  thread.inspect(sess).compacting |> should.be_false
+  transcript.compactions(thread.snapshot(sess)) |> should.equal([])
+}
+
+pub fn manual_compact_cancels_utility_and_queues_pending_roster_test() {
+  let util_cancelled = process.new_subject()
+  let util_started = process.new_subject()
+  let compact_gate = process.new_subject()
+  let util_runner = fn(_ep, _tr, cancel, _allow_pass) {
+    process.send(util_started, Nil)
+    case process.receive(cancel, 5000) {
+      Ok(Nil) -> {
+        process.send(util_cancelled, True)
+        Error("cancelled")
+      }
+      Error(Nil) -> Error("timeout")
+    }
+  }
+  let compact_runner = fn(_ep, _tr, _cut, _focus, _ctx, _bpt, _cancel) {
+    let gate = process.new_subject()
+    process.send(compact_gate, gate)
+    let assert Ok(_) = process.receive(gate, 5000)
+    Ok("## Goal & Constraints\nEnv summary.")
+  }
+  let cfg =
+    config.Config(
+      ..test_config(),
+      utility_enabled: True,
+      utility_delay_ms: 0,
+      compaction_keep_tail_pct: 0,
+    )
+  let sess =
+    start_compaction_thread(
+      cfg,
+      happy_runner,
+      util_runner,
+      compact_runner,
+      ["workspace"],
+      ["bash"],
+      None,
+      False,
+      Some(32_768),
+      fn(_, _) { Nil },
+    )
+  let sub = join(sess)
+  let _ = expect_event(sub)
+  // Drain replayed initial roster echo.
+  let _ = expect_event(sub)
+
+  // First turn triggers utility side-call (delay=0).
+  should.equal(thread.send_message(sess, "hello"), thread.Sent)
+  drain_until_turn_done(sub)
+  let assert Ok(Nil) = process.receive(util_started, 5000)
+
+  // Trigger manual compact while utility is running -> utility must be cancelled!
+  thread.compact(sess, None) |> should.equal(thread.Compacting)
+  process.receive(util_cancelled, 5000) |> should.equal(Ok(True))
+  let assert thread.ThreadEvent(
+    _,
+    1,
+    thread.CompactionStarted(transcript.ManualCompact),
+  ) = expect_event(sub)
+  let assert Ok(gate) = process.receive(compact_gate, 5000)
+
+  // Attach a new environment while manual compact is running -> roster line
+  // must queue behind compaction and drain AFTER the checkpoint installs!
+  let attach_reply = process.new_subject()
+  process.send(sess, thread.AttachTarget("laptop", None, attach_reply))
+  process.receive(attach_reply, 2000) |> should.equal(Ok(Ok(Nil)))
+
+  // Release compaction.
+  process.send(gate, Nil)
+
+  let assert thread.ThreadEvent(_, 1, thread.Compacted(cp, _)) =
+    expect_event(sub)
+  // Frozen roster_snapshot carries pre-queue roster ["workspace"], NOT laptop.
+  cp.roster_snapshot |> should.equal(Some("attached targets: workspace."))
+  let assert thread.ThreadEvent(_, 1, thread.UsageUpdated(_)) =
+    expect_event(sub)
+  let assert thread.ThreadEvent(
+    _,
+    1,
+    thread.CompactionFinished(transcript.ManualCompact, None),
+  ) = expect_event(sub)
+  // Queued roster change drains immediately after install!
+  let assert thread.ThreadEvent(
+    _,
+    1,
+    thread.UserEcho(roster_line, _, Some("system")),
+  ) = expect_event(sub)
+  should.be_true(string.contains(roster_line, "laptop"))
+
+  // Verify the drained roster line landed strictly AFTER cutoff_index!
+  let final_tr = thread.snapshot(sess)
+  should.be_true(transcript.length(final_tr) > cp.cutoff_index)
+}
+
+pub fn manual_compact_stale_completion_guard_test() {
+  let no_compact = fn(_ep, _tr, _cut, _focus, _ctx, _bpt, _cancel) {
+    Error("unused")
+  }
+  let sess =
+    start_compaction_thread(
+      test_config(),
+      happy_runner,
+      no_utility_runner,
+      no_compact,
+      [],
+      [],
+      None,
+      False,
+      Some(32_768),
+      fn(_, _) { Nil },
+    )
+  // Send a forged stale CompactDone while idle -> safely ignored.
+  process.send(
+    sess,
+    thread.CompactDone(
+      worker: process.self(),
+      cutoff_index: 1,
+      focus: None,
+      before_tokens: 100,
+      result: Ok("forged summary"),
+    ),
+  )
+  // Actor stays healthy and transcript has no checkpoints.
+  transcript.compactions(thread.snapshot(sess)) |> should.equal([])
+  thread.inspect(sess).compacting |> should.be_false
 }

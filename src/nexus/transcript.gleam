@@ -9,9 +9,11 @@
 //// JSON encoding is field-order-stable and omits absent optional fields.
 
 import gleam/dict.{type Dict}
+import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/string
 import glopenai/chat.{type ChatMessage}
 import glopenai/shared
 
@@ -83,7 +85,90 @@ pub opaque type Transcript {
     /// badges survive a reload. Bot text renders as ordinary user
     /// content — hostile text rules apply, never a request byte.
     origins: Dict(Int, Origin),
+    /// Append-only compaction checkpoints, stored newest-first in a sidecar
+    /// beside `messages` — NEVER spliced into `messages`. `messages`,
+    /// `length`, `store.transcript_delta`, `thread.message_count`, and full
+    /// UI scrollback stay completely untouched; `request_messages` and
+    /// `slice_active` project the active request window from the latest
+    /// checkpoint's `cutoff_index`.
+    compactions: List(Compaction),
   )
+}
+
+/// What initiated a compaction checkpoint (`thread_compaction.trigger_kind`).
+pub type CompactionTrigger {
+  AutoCompact
+  ManualCompact
+  OverflowCompact
+}
+
+/// Encode a `CompactionTrigger` to its SQL / JSON wire string.
+pub fn trigger_to_string(trigger: CompactionTrigger) -> String {
+  case trigger {
+    AutoCompact -> "auto"
+    ManualCompact -> "manual"
+    OverflowCompact -> "overflow"
+  }
+}
+
+/// Decode a SQL / JSON wire string into a `CompactionTrigger`.
+pub fn trigger_from_string(raw: String) -> Result(CompactionTrigger, Nil) {
+  case raw {
+    "auto" -> Ok(AutoCompact)
+    "manual" -> Ok(ManualCompact)
+    "overflow" -> Ok(OverflowCompact)
+    _ -> Error(Nil)
+  }
+}
+
+/// One append-only compaction checkpoint (`thread_compaction`).
+/// `cutoff_index` addresses the 0-based chronological `Transcript` message
+/// space (0 = system prompt, 1 = first conversation message) and is the
+/// index of the first message KEPT verbatim after the checkpoint (or equal
+/// to `length(tr)` when compacting to the end).
+///
+/// `summary` and `roster_snapshot` are frozen verbatim at compaction time
+/// and enter `request_messages` through constant framing strings so
+/// hydration after a restart re-encodes byte-identically (KV-cache contract).
+/// `focus`, `trigger`, `before_tokens`, `after_tokens`, and `created_at` are
+/// display/audit metadata only and never enter request bytes.
+pub type Compaction {
+  Compaction(
+    cutoff_index: Int,
+    summary: String,
+    roster_snapshot: Option(String),
+    focus: Option(String),
+    trigger: CompactionTrigger,
+    before_tokens: Option(Int),
+    after_tokens: Option(Int),
+    created_at: Int,
+  )
+}
+
+/// Constant framing prefix for the synthetic `user` boundary message emitted
+/// by `request_messages` when a compaction checkpoint is active. Kept
+/// constant so post-restart hydration re-encodes byte-identically.
+pub const compaction_user_prefix = "[Earlier conversation compacted]\n\n"
+
+/// Constant synthetic `assistant` acknowledgement paired immediately after
+/// the compaction `user` message to guarantee strict `user`/`assistant` role
+/// alternation on local Jinja chat templates (Mistral, Gemma, llama.cpp).
+pub const compaction_ack_text =
+  "Understood. I will continue using the compacted context above."
+
+/// Build the exact content of the synthetic `user` compaction boundary
+/// message: constant prefix + verbatim summary (+ frozen live roster line
+/// when `roster_snapshot` is present).
+pub fn compaction_user_content(checkpoint: Compaction) -> String {
+  let base = compaction_user_prefix <> checkpoint.summary
+  case checkpoint.roster_snapshot {
+    Some(roster) ->
+      case string.trim(roster) {
+        "" -> base
+        _ -> base <> "\n\n" <> roster
+      }
+    None -> base
+  }
 }
 
 /// One bot-authored user message's display provenance (bots P3b): the
@@ -104,6 +189,7 @@ pub fn new(model: String, system: String) -> Transcript {
     tool_results: dict.new(),
     timestamps: dict.new(),
     origins: dict.new(),
+    compactions: [],
   )
 }
 
@@ -355,16 +441,99 @@ fn attach_reasoning(
   }
 }
 
-/// Drop a trailing plain assistant text reply (no tool calls), if present.
+/// Append a compaction checkpoint to the sidecar list without modifying
+/// `messages`. Preserves `length(tr)`, `messages(tr)`, `store.transcript_delta`
+/// `seq`, `thread.message_count`, and full UI scrollback.
+pub fn apply_compaction(
+  transcript: Transcript,
+  checkpoint: Compaction,
+) -> Transcript {
+  Transcript(..transcript, compactions: [checkpoint, ..transcript.compactions])
+}
+
+/// All compaction checkpoints in chronological order (oldest first).
+pub fn compactions(transcript: Transcript) -> List(Compaction) {
+  list.reverse(transcript.compactions)
+}
+
+/// The most recently installed compaction checkpoint, if any.
+pub fn latest_compaction(transcript: Transcript) -> Option(Compaction) {
+  case transcript.compactions {
+    [latest, ..] -> Some(latest)
+    [] -> None
+  }
+}
+
+/// Chronological index of the first active conversation message kept
+/// verbatim: `1` (right after the system prompt at index `0`) when no
+/// compaction has been applied, or `latest.cutoff_index` when compacted.
+pub fn active_start(transcript: Transcript) -> Int {
+  case transcript.compactions {
+    [latest, ..] -> latest.cutoff_index
+    [] -> 1
+  }
+}
+
+/// Project the active request message list from the transcript:
+/// - With no compaction checkpoint: all chronological `messages(transcript)`.
+/// - With a latest checkpoint: `[system, checkpoint_user, checkpoint_ack,
+///   ...messages[cutoff_index..]]` using constant framing strings so
+///   post-restart hydration re-encodes byte-identically.
+pub fn request_messages(transcript: Transcript) -> List(ChatMessage) {
+  let chronological = messages(transcript)
+  case transcript.compactions {
+    [] -> chronological
+    [latest, ..] ->
+      case chronological {
+        [] -> []
+        [system, ..] -> {
+          let tail = list.drop(chronological, latest.cutoff_index)
+          [
+            system,
+            chat.user_message(compaction_user_content(latest)),
+            chat.assistant_message(compaction_ack_text),
+            ..tail
+          ]
+        }
+      }
+  }
+}
+
+/// Return a throwaway transcript representing the exact active prefix up to
+/// `cutoff_index` (excluding messages at indices `>= cutoff_index`).
+/// Encoding `append_user(slice_active(tr, cutoff_index), instruction)` shares
+/// the exact byte prefix of the last turn's request up to `cutoff_index` —
+/// including any prior compaction boundary — for cache-piggybacked
+/// summarization.
+pub fn slice_active(transcript: Transcript, cutoff_index: Int) -> Transcript {
+  let total = list.length(transcript.messages)
+  let limit = int.clamp(cutoff_index, min: 1, max: int.max(1, total))
+  let kept_chronological = list.take(messages(transcript), limit)
+  Transcript(
+    model: transcript.model,
+    messages: list.reverse(kept_chronological),
+    reasoning: dict.filter(transcript.reasoning, fn(i, _) { i < limit }),
+    tool_results: dict.filter(transcript.tool_results, fn(i, _) { i < limit }),
+    timestamps: dict.filter(transcript.timestamps, fn(i, _) { i < limit }),
+    origins: dict.filter(transcript.origins, fn(i, _) { i < limit }),
+    compactions: list.filter(transcript.compactions, fn(cp) {
+      cp.cutoff_index <= limit
+    }),
+  )
+}
+
+/// Drop a trailing plain assistant text reply (no tool calls), if present
+/// past the active compaction boundary.
 /// Used solely to calibrate the byte-to-token ratio against the server's
 /// `usage.prompt_tokens` (which measured the prompt BEFORE the final
 /// assistant reply was appended, and never includes reasoning tokens).
 /// Never mutates a live transcript or alters any request sent to a model.
 pub fn without_trailing_assistant(transcript: Transcript) -> Transcript {
-  case transcript.messages {
-    [chat.AssistantMessage(tool_calls: None, ..), ..rest] ->
+  let start = active_start(transcript)
+  case list.length(transcript.messages) > start, transcript.messages {
+    True, [chat.AssistantMessage(tool_calls: None, ..), ..rest] ->
       Transcript(..transcript, messages: rest)
-    _ -> transcript
+    _, _ -> transcript
   }
 }
 
@@ -377,7 +546,7 @@ pub fn to_request(
   let req =
     chat.new_create_request(
       model: transcript.model,
-      messages: messages(transcript),
+      messages: request_messages(transcript),
     )
   let req = case opts.stream {
     True ->
