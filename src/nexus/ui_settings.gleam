@@ -135,6 +135,12 @@ pub type State {
     bot_tools: ToolCatalogState,
     bot_tools_picked: List(String),
     bot_tools_custom: Bool,
+    /// Armed while a newly opened bot inline editor is waiting for its
+    /// post-open `BotsLoaded` refresh to reconcile `bot_tools_picked`,
+    /// `bot_tools_custom`, and `bot_alias_provider` against the latest
+    /// stored bot row. Cleared by `sync_edited_bot`, by any user edit to
+    /// those controls, or when the editor closes.
+    bot_edit_sync_pending: Bool,
     /// Which tab the page's left rail shows. Both sections stay in the
     /// DOM (the inactive one `hidden`, like the forms) so uncontrolled
     /// form state survives tab switches; this only picks the visible one.
@@ -296,8 +302,58 @@ pub fn init() -> State {
     bot_tools: ToolCatalogIdle,
     bot_tools_picked: [],
     bot_tools_custom: False,
+    bot_edit_sync_pending: False,
     tab: ProvidersTab,
   )
+}
+
+/// Reconcile an open bot editor's derived state (tool-picker ticks,
+/// Custom switch, and combobox provider scope) when the post-open
+/// `BotsLoaded` refresh lands. Only runs while `bot_edit_sync_pending`
+/// is armed (cleared on the first user edit to those controls, on
+/// editor close, and once this sync lands), so a late refresh can never
+/// overwrite the user's own clicks. If the edited bot was deleted in
+/// another session, the editor closes cleanly.
+pub fn sync_edited_bot(
+  state: State,
+  bots: List(Bot),
+  providers: Subject(provider_registry.Msg),
+  models_timeout_ms: Int,
+) -> #(State, Effect(Msg)) {
+  case state.bot_edit_sync_pending, state.bot_edit {
+    True, Some(id) ->
+      case list.find(bots, fn(b) { b.id == id }) {
+        Ok(b) -> {
+          let next =
+            State(
+              ..state,
+              bot_tools_picked: option.unwrap(b.tools, []),
+              bot_tools_custom: option.is_some(b.tools),
+              bot_edit_sync_pending: False,
+            )
+          case state.bot_alias_provider == Some(b.provider_id) {
+            True -> #(next, effect.none())
+            False ->
+              scope_bot_form(
+                next,
+                Some(b.provider_id),
+                providers,
+                models_timeout_ms,
+              )
+          }
+        }
+        Error(_) -> #(
+          State(
+            ..state,
+            bot_edit: None,
+            bot_alias_provider: None,
+            bot_edit_sync_pending: False,
+          ),
+          effect.none(),
+        )
+      }
+    _, _ -> #(state, effect.none())
+  }
 }
 
 /// The sub-update. `providers`/`bots` are the registry subjects for this
@@ -336,13 +392,16 @@ pub fn update(
         confirm: None,
         bots_open: False,
         bot_edit: None,
+        bot_edit_sync_pending: False,
         bot_confirm: None,
         // The combobox slot goes with the forms; the per-provider
         // alias cache survives (still valid for the next open).
         bot_alias_provider: None,
       ),
       effect.none(),
-      [],
+      // Refresh both lists on tab switch so another session's new
+      // providers or bots appear without a page reload.
+      [ProvidersChanged, BotsChanged],
     )
 
     AddToggled -> #(
@@ -355,6 +414,7 @@ pub fn update(
         // Bots section's open form/editor/confirm too.
         bots_open: False,
         bot_edit: None,
+        bot_edit_sync_pending: False,
         bot_confirm: None,
       ),
       effect.none(),
@@ -379,6 +439,7 @@ pub fn update(
         confirm: None,
         bots_open: False,
         bot_edit: None,
+        bot_edit_sync_pending: False,
         bot_confirm: None,
       ),
       effect.none(),
@@ -405,6 +466,7 @@ pub fn update(
         open: False,
         bots_open: False,
         bot_edit: None,
+        bot_edit_sync_pending: False,
         bot_confirm: None,
       ),
       effect.none(),
@@ -482,6 +544,7 @@ pub fn update(
             ..state,
             bots_open: opening,
             bot_edit: None,
+            bot_edit_sync_pending: False,
             bot_confirm: None,
             // One form section-wide, like the provider forms: opening
             // one closes the other section's open form/editor/confirm.
@@ -507,7 +570,11 @@ pub fn update(
           )
         False -> #(state, effect.none())
       }
-      #(state, effect.batch([fetch, tools_fetch]), [])
+      let signals = case opening {
+        True -> [ProvidersChanged, BotsChanged]
+        False -> []
+      }
+      #(state, effect.batch([fetch, tools_fetch]), signals)
     }
 
     // The open bot form's provider select changed (add or edit — the
@@ -523,7 +590,12 @@ pub fn update(
 
     BotEditProviderPicked(_bot_id, provider_id) -> {
       let #(state, fetch) =
-        scope_bot_form(state, Some(provider_id), providers, models_timeout_ms)
+        scope_bot_form(
+          State(..state, bot_edit_sync_pending: False),
+          Some(provider_id),
+          providers,
+          models_timeout_ms,
+        )
       #(state, fetch, [])
     }
 
@@ -571,6 +643,7 @@ pub fn update(
           State(
             ..state,
             bot_edit: toggle_open(state.bot_edit, id),
+            bot_edit_sync_pending: opening,
             bots_open: False,
             bot_confirm: None,
             // One form section-wide, like the provider forms: opening
@@ -598,7 +671,11 @@ pub fn update(
           )
         False -> #(state, effect.none())
       }
-      #(state, effect.batch([fetch, tools_fetch]), [])
+      let signals = case opening {
+        True -> [ProvidersChanged, BotsChanged]
+        False -> []
+      }
+      #(state, effect.batch([fetch, tools_fetch]), signals)
     }
 
     BotEditSubmitted(
@@ -616,7 +693,7 @@ pub fn update(
       // P2).
       let tools = form_toolset(state, tools_text)
       #(
-        State(..state, bot_edit: None),
+        State(..state, bot_edit: None, bot_edit_sync_pending: False),
         update_bot_effect(
           bots,
           id,
@@ -642,6 +719,7 @@ pub fn update(
         ..state,
         bot_confirm: Some(id),
         bot_edit: None,
+        bot_edit_sync_pending: False,
         bots_open: False,
         // One form section-wide: the provider section's form/editor/
         // confirm stand down with the bots section's own.
@@ -715,7 +793,11 @@ pub fn update(
       // toolset is the DEFAULT set regardless of any ticks), ON unfolds
       // the checkboxes (an empty selection saves as chat-only).
       #(
-        State(..state, bot_tools_custom: !state.bot_tools_custom),
+        State(
+          ..state,
+          bot_tools_custom: !state.bot_tools_custom,
+          bot_edit_sync_pending: False,
+        ),
         effect.none(),
         [],
       )
@@ -731,6 +813,7 @@ pub fn update(
             bot_tools_picked: list.filter(state.bot_tools_picked, fn(picked) {
               picked != name
             }),
+            bot_edit_sync_pending: False,
           ),
           effect.none(),
           [],
@@ -739,6 +822,7 @@ pub fn update(
           State(
             ..state,
             bot_tools_picked: list.append(state.bot_tools_picked, [name]),
+            bot_edit_sync_pending: False,
           ),
           effect.none(),
           [],
@@ -751,14 +835,18 @@ pub fn update(
       // list anyway).
       case state.bot_tools {
         ToolCatalogOk(bot_registry.ToolCatalog(names, _)) -> #(
-          State(..state, bot_tools_picked: names),
+          State(..state, bot_tools_picked: names, bot_edit_sync_pending: False),
           effect.none(),
           [],
         )
         _ -> #(state, effect.none(), [])
       }
 
-    BotToolsNone -> #(State(..state, bot_tools_picked: []), effect.none(), [])
+    BotToolsNone -> #(
+      State(..state, bot_tools_picked: [], bot_edit_sync_pending: False),
+      effect.none(),
+      [],
+    )
 
     BotToolsLoaded(catalog) ->
       // Settles the one picker slot (add and edit are mutually
