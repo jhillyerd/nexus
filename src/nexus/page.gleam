@@ -845,6 +845,7 @@ fn combobox_js() -> String {
   <> "    }\n"
   <> "  });\n"
   <> "  document.addEventListener('input', function (e) {\n"
+  <> "    if (!e.isTrusted) return;\n"
   <> "    var t = target(e);\n"
   <> "    if (t.classList && t.classList.contains('combo')) {\n"
   <> "      var w = wrapOf(t);\n"
@@ -867,9 +868,13 @@ fn combobox_js() -> String {
   <> "      field.value = opt.getAttribute('data-value');\n"
   <> "      // A pick is an explicit choice: keep the list closed even\n"
   <> "      // though focus stays in the field (the re-render observer\n"
-  <> "      // respects this; focus or typing clears it).\n"
+  <> "      // respects this; focus or typing clears it). Dispatch an input\n"
+  <> "      // event so Lustre updates the server-side model draft (and\n"
+  <> "      // context-window hint); the isTrusted guard above keeps our\n"
+  <> "      // own listener from re-opening the dropdown.\n"
   <> "      suppressed.add(w);\n"
   <> "      setOpen(w, false);\n"
+  <> "      field.dispatchEvent(new Event('input', { bubbles: true, composed: true }));\n"
   <> "      field.focus();\n"
   <> "      return;\n"
   <> "    }\n"
@@ -1028,6 +1033,17 @@ header h1 { font-size: 1.05rem; margin: 0; }
 /* ui-polish F8: the connection state is one labelled group — dot + text
    twin — pushed right as a unit (the auto margin used to sit on the dot). */
 .conn { margin-left: auto; display: inline-flex; align-items: baseline; gap: .4rem; }
+/* Context-usage pill (context-compaction Phase 1): quiet muted pill beside
+   the info button, shifting to an amber warning tint at >= 80% of the
+   thread's configured context window. */
+#app #context-usage.usage-pill { font-size: .74rem; padding: .15rem .5rem;
+  border-radius: 999px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  border: 1px solid color-mix(in srgb, currentColor 20%, transparent);
+  background: color-mix(in srgb, currentColor 5%, transparent); opacity: .78;
+  white-space: nowrap; }
+#app #context-usage.usage-pill.warn { opacity: 1; color: #b8860b;
+  border-color: color-mix(in srgb, #b8860b 55%, transparent);
+  background: color-mix(in srgb, #b8860b 12%, transparent); }
 .dot { font-size: 1.2rem; }
 .dot.live { color: #2e9e5b; }
 .dot.off { color: #c0392b; }
@@ -1208,7 +1224,8 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
    input's border. Zero those so the flex gap rules the rhythm (the
    hint keeps Pico's width:100% block). */
 #app .provider-form button { margin: 0; }
-#app .provider-form .combo-wrap + small { display: block; margin: 0; }
+#app .provider-form .combo-wrap + small,
+#app .provider-form small.context-window-hint { display: block; margin: 0; }
 .provider-form-buttons { display: flex; gap: .3rem; }
 #app .provider-form-buttons button { font-size: .75rem; padding: .25rem .6rem; }
 /* The bot forms' tool picker (issue #121): a Pico fieldset holding a

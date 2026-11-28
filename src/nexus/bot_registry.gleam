@@ -88,6 +88,8 @@ pub type RegistryError {
   /// reason is the structural text or the catalog checker's ("unknown
   /// tool name: …").
   InvalidTools(reason: String)
+  /// A submitted context window was below `bot.min_context_window` (4096).
+  InvalidContextWindow
   /// The store refused or failed; carries the seam's sanitized text.
   StoreFailed(String)
 }
@@ -101,6 +103,7 @@ pub fn describe(error: RegistryError) -> String {
     InvalidModel -> bot.describe(bot.InvalidModel)
     DuplicateName -> "bot name already exists (names are case-insensitive)"
     InvalidTools(reason) -> reason
+    InvalidContextWindow -> bot.describe(bot.InvalidContextWindow)
     StoreFailed(reason) -> reason
   }
 }
@@ -398,7 +401,12 @@ fn create_row(
     bot.validate_model(params.model) |> result.replace_error(InvalidModel),
   )
   use tools <- result.try(validate_tools(state, params.tools))
-  let params = bot.BotParams(..params, tools: tools)
+  use context_window <- result.try(
+    bot.validate_context_window(params.context_window)
+    |> result.replace_error(InvalidContextWindow),
+  )
+  let params =
+    bot.BotParams(..params, tools: tools, context_window: context_window)
   // Uniqueness pre-check against loaded state (the schema's UNIQUE is
   // the cross-instance backstop, surfaced as StoreFailed).
   case name_taken(state.rows, id, name) {
@@ -421,6 +429,16 @@ fn update_row(
     Some(tools) -> {
       use tools <- result.try(validate_tools(state, tools))
       Ok(bot.BotUpdate(..patch, tools: Some(tools)))
+    }
+    None -> Ok(patch)
+  })
+  use patch <- result.try(case patch.context_window {
+    Some(window) -> {
+      use window <- result.try(
+        bot.validate_context_window(window)
+        |> result.replace_error(InvalidContextWindow),
+      )
+      Ok(bot.BotUpdate(..patch, context_window: Some(window)))
     }
     None -> Ok(patch)
   })

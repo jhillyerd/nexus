@@ -96,8 +96,12 @@ pub type LoopEvent {
 
 pub type LoopOutcome {
   LoopDone(stats: openai.StreamStats, tr: Transcript)
-  LoopStopped(tr: Transcript)
-  LoopGuardHit(max_iterations: Int, tr: Transcript)
+  LoopStopped(tr: Transcript, usage: Option(shared.CompletionUsage))
+  LoopGuardHit(
+    max_iterations: Int,
+    tr: Transcript,
+    usage: Option(shared.CompletionUsage),
+  )
   LoopFailed(reason: String)
 }
 
@@ -128,6 +132,7 @@ pub fn frozen_options(specs: List(ToolSpec)) -> Options {
   transcript.Options(
     ..transcript.default_options(),
     stream: True,
+    include_usage: True,
     tools: tools.schemas(specs),
     tool_choice: case specs {
       [] -> None
@@ -196,7 +201,7 @@ fn iterate(
   environment,
   on_event,
   iteration,
-  stats,
+  stats: StatsAcc,
 ) -> LoopOutcome {
   on_event(LoopStatus(iteration, max_iterations, "request"))
   let opts = frozen_options(specs)
@@ -214,7 +219,7 @@ fn iterate(
     openai.Cancelled -> {
       // Commit whatever partial output arrived, exactly like a plain stop.
       let tr2 = append_iteration_output(tr, partial_text)
-      LoopStopped(tr2)
+      LoopStopped(tr2, stats.usage)
     }
     openai.Completed(iteration_stats) -> {
       let stats = fold_stats(stats, iteration_stats)
@@ -231,7 +236,7 @@ fn iterate(
               // (its results would dangle) and the calls are not run.
               on_event(LoopStatus(iteration, max_iterations, "guard"))
               let tr2 = append_iteration_output(tr, partial_text)
-              LoopGuardHit(max_iterations, tr2)
+              LoopGuardHit(max_iterations, tr2, stats.usage)
             }
             False -> {
               on_event(LoopStatus(iteration, max_iterations, "tools"))
@@ -252,7 +257,7 @@ fn iterate(
                 // the stream would open one more model request before its
                 // cancel select fires (stream_request starts Hackney
                 // first), so the stop is honoured before any of that.
-                ExecRoundStopped(tr3) -> LoopStopped(tr3)
+                ExecRoundStopped(tr3) -> LoopStopped(tr3, stats.usage)
                 ExecRoundDone(tr3) ->
                   iterate(
                     specs,

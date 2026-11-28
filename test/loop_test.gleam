@@ -202,7 +202,7 @@ pub fn guard_trips_after_max_iterations_test() {
   let stream = sequence_stream([round, round])
   let #(outcome, events) =
     run_recording([echo_tool()], 2, stream, tr_with_user())
-  let assert loop.LoopGuardHit(max, tr) = outcome
+  let assert loop.LoopGuardHit(max, tr, _) = outcome
   max |> should.equal(2)
   // Two model calls happened (iterations 1 and 2); the third was refused.
   should.be_true(list.contains(events, loop.LoopStatus(1, 2, "request")))
@@ -222,7 +222,7 @@ pub fn cancelled_commits_partial_text_test() {
       ]),
       tr_with_user(),
     )
-  let assert loop.LoopStopped(tr) = outcome
+  let assert loop.LoopStopped(tr, _) = outcome
   // system + user + partial assistant text
   transcript.length(tr) |> should.equal(3)
 }
@@ -393,7 +393,9 @@ pub fn reasoning_attaches_to_tool_call_message_test() {
   case outcome {
     // The script repeats its only round, so the loop keeps issuing the
     // call until the guard trips; every round carries the reasoning.
-    loop.LoopGuardHit(_, tr) | loop.LoopDone(_, tr) | loop.LoopStopped(tr) ->
+    loop.LoopGuardHit(_, tr, _)
+    | loop.LoopDone(_, tr)
+    | loop.LoopStopped(tr, _) ->
       transcript.reasoning_at(tr, 2) |> should.equal(Some("need the echo tool"))
     loop.LoopFailed(reason) -> panic as { "unexpected LoopFailed: " <> reason }
   }
@@ -410,7 +412,7 @@ pub fn reasoning_only_stop_commits_nothing_test() {
       tr_with_user(),
     )
   case outcome {
-    loop.LoopStopped(tr) -> {
+    loop.LoopStopped(tr, _) -> {
       // No empty assistant message, no reasoning entry: request bytes for
       // a retry stay identical to the pre-send transcript.
       transcript.length(tr) |> should.equal(2)
@@ -479,7 +481,7 @@ pub fn stop_mid_round_skips_remaining_calls_test() {
       fn(event) { process.send(events, event) },
     )
   let received = drain(events, [])
-  let assert loop.LoopStopped(tr) = outcome
+  let assert loop.LoopStopped(tr, _) = outcome
   // The first tool ran and committed its result...
   should.be_true(list.contains(
     received,
@@ -561,7 +563,7 @@ pub fn stop_consumed_mid_script_by_codemode_skips_rest_test() {
       fn(event) { process.send(events, event) },
     )
   let received = drain(events, [])
-  let assert loop.LoopStopped(tr) = outcome
+  let assert loop.LoopStopped(tr, _) = outcome
   // The codemode call itself ran and failed; both later calls were
   // assembled but answered with the synthetic cancelled result.
   should.be_true(list.contains(

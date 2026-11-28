@@ -11,6 +11,7 @@ select
   system_prompt,
   tools,
   allow_inbound,
+  context_window,
   extract(epoch from created_at)::int8 as created_s,
   extract(epoch from updated_at)::int8 as updated_s
 from bot

@@ -124,6 +124,7 @@ fn make_bot(id: String, name: String, provider_id: String) -> store.StoredBot {
     system_prompt: Some("prompt for " <> name),
     tools: None,
     allow_inbound: True,
+    context_window: None,
     created_at: test_epoch,
     updated_at: test_epoch,
   )
@@ -168,6 +169,8 @@ fn make_summary(
     roster: None,
     last_active_at: created_at,
     message_count: 1,
+    context_window: None,
+    last_context_tokens: None,
   )
 }
 
@@ -460,6 +463,8 @@ fn case_atomic_creation_roster_and_watermarks(s: Store) -> Result(Nil, String) {
       roster: Some(#(roster_text, test_epoch + 1)),
       last_active_at: test_epoch + 999,
       message_count: 2,
+      context_window: Some(32_768),
+      last_context_tokens: None,
     )
 
   use _ <- result.try(expect_ok(
@@ -1438,13 +1443,70 @@ fn case_providers_and_bots(s: Store) -> Result(Nil, String) {
   ))
   use _ <- result.try(expect_eq("b1 tools None", got_b1_def.tools, None))
 
+  // Bot context_window roundtrip (set -> clear -> CHECK violation < 4096).
+  use _ <- result.try(expect_ok(
+    "update b1 context_window 65536",
+    s.update_bot(bot.Bot(..got_b1_def, context_window: Some(65_536))),
+  ))
+  use got_b1_cw <- result.try(expect_ok(
+    "get b1 context_window",
+    s.get_bot("b1"),
+  ))
+  use _ <- result.try(expect_eq(
+    "b1 context_window 65536",
+    got_b1_cw.context_window,
+    Some(65_536),
+  ))
+  use _ <- result.try(expect_err(
+    "update b1 context_window below 4096 rejected",
+    s.update_bot(bot.Bot(..got_b1_cw, context_window: Some(4095))),
+  ))
+  use _ <- result.try(expect_ok(
+    "update b1 context_window cleared",
+    s.update_bot(bot.Bot(..got_b1_cw, context_window: None)),
+  ))
+  use got_b1_cw_none <- result.try(expect_ok(
+    "get b1 context_window cleared",
+    s.get_bot("b1"),
+  ))
+  use _ <- result.try(expect_eq(
+    "b1 context_window None",
+    got_b1_cw_none.context_window,
+    None,
+  ))
+
   // Provider delete guard: blocked by bot AND by thread; counts match.
   use _ <- result.try(expect_ok(
     "insert thread pinning p1",
     s.insert_thread(
-      make_summary("t1", "p1", Some("b1"), None, test_epoch),
+      store.StoredSummary(
+        ..make_summary("t1", "p1", Some("b1"), None, test_epoch),
+        context_window: Some(32_768),
+      ),
       "sys",
     ),
+  ))
+  use _ <- result.try(expect_err(
+    "insert thread context_window below 4096 rejected",
+    s.insert_thread(
+      store.StoredSummary(
+        ..make_summary("t1-bad", "p1", Some("b1"), None, test_epoch),
+        context_window: Some(2048),
+      ),
+      "sys",
+    ),
+  ))
+  let _ = s.set_last_context_tokens("t1", 12_345)
+  use got_t1 <- result.try(expect_ok("get thread t1", s.get_thread("t1")))
+  use _ <- result.try(expect_eq(
+    "t1 context_window preserved",
+    got_t1.summary.context_window,
+    Some(32_768),
+  ))
+  use _ <- result.try(expect_eq(
+    "t1 last_context_tokens persisted",
+    got_t1.summary.last_context_tokens,
+    Some(12_345),
   ))
   use tc <- result.try(expect_ok(
     "count_threads_for_provider",

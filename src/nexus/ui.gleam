@@ -468,6 +468,10 @@ pub type Model {
     /// revoke). Cleared by the next successful load and on selection
     /// change; display-only, never a chat-log line.
     env_error: Option(String),
+    /// Current context usage for the selected thread (context-compaction
+    /// Phase 1): populated on `Join` and after each committed turn; reset
+    /// on selection change or deselect.
+    usage: Option(thread.ContextUsage),
   )
 }
 
@@ -539,7 +543,7 @@ pub type Msg {
   SendAccepted
   SendRejected(String)
   StopRequested
-  Hello(model: String)
+  Hello(model: String, usage: thread.ContextUsage)
   /// A committed user line. `at` is its display stamp — wall-clock epoch
   /// seconds from the thread's echo (live and replay carry the same
   /// value); None = unstamped history, rendered without a time. `author`
@@ -569,6 +573,9 @@ pub type Msg {
   /// EVERY connected tab's sidebar updates — not just the client that
   /// happens to be mid-turn.
   MetaUpdated(title: Option(String), tags: List(String))
+  /// Context-usage update from the selected thread actor (context-compaction
+  /// Phase 1): emitted on Join and after every committed turn.
+  UsageUpdated(thread.ContextUsage)
   // M3 tool events: translated 1:1 so the replay/live pipelines carry them;
   // rendering lands with the M3 UI workstream. No-ops in `update` for now.
   ToolCallDelta(
@@ -691,7 +698,7 @@ pub type Msg {
 /// this function sees only the payload.
 pub fn from_thread_event(event: thread.EventKind) -> Msg {
   case event {
-    thread.Hello(model, _messages, _metrics) -> Hello(model)
+    thread.Hello(model, _messages, _metrics, usage) -> Hello(model, usage)
     thread.UserEcho(text, at, author) -> UserEcho(text, at, author)
     thread.AssistantFull(text, at) -> AssistantFull(text, at)
     thread.ReasoningFull(text) -> ReasoningFull(text)
@@ -701,6 +708,7 @@ pub fn from_thread_event(event: thread.EventKind) -> Msg {
     thread.TurnStopped(_chars, at) -> TurnStopped(at)
     thread.TurnFailed(reason, at) -> TurnFailed(reason, at)
     thread.MetaUpdated(title, tags) -> MetaUpdated(title, tags)
+    thread.UsageUpdated(usage) -> UsageUpdated(usage)
     thread.ToolCallDelta(index, id, name, fragment) ->
       ToolCallDelta(index, id, name, fragment)
     thread.ToolCallAssembled(id, name, arguments, at) ->
@@ -788,6 +796,7 @@ pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
       grant_minted: None,
       grant_minting: False,
       env_error: None,
+      usage: None,
     )
   #(model, events_effect())
 }
@@ -1218,10 +1227,11 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
 
     StopRequested -> #(model, stop_effect(model))
 
-    Hello(name) -> #(
+    Hello(name, usage) -> #(
       Model(
         ..model,
         model_label: name,
+        usage: Some(usage),
         streaming: model.streaming
           || case model.selected {
             Some(id) ->
@@ -1342,6 +1352,8 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     // every subscribed tab's sidebar re-renders with the new title. Titles
     // render as text nodes, so hostile model output stays inert.
     MetaUpdated(_title, _tags) -> #(model, threads_effect(model))
+
+    UsageUpdated(usage) -> #(Model(..model, usage: Some(usage)), effect.none())
 
     // A tool call's arguments are streaming in fragments. Any assistant
     // text seen so far belongs *before* the call (the loop commits text at
@@ -1850,6 +1862,7 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               env_grants: [],
               grant_minted: None,
               env_error: None,
+              usage: None,
             )
           // The outer match guarantees a selection (the pane belongs
           // to one), so the leave always fires and the batches build
@@ -2158,6 +2171,7 @@ fn deselect(model: Model, label: String) -> Model {
     env_grants: [],
     grant_minted: None,
     env_error: None,
+    usage: None,
   )
 }
 
@@ -2317,6 +2331,10 @@ fn after_threads(model: Model, summaries: List(thread.ThreadSummary)) -> Model {
     env_error: case ended || switched {
       True -> None
       False -> model.env_error
+    },
+    usage: case ended || switched {
+      True -> None
+      False -> model.usage
     },
   )
 }
@@ -2627,6 +2645,7 @@ fn select_with_primary(
       env_grants: [],
       grant_minted: None,
       env_error: None,
+      usage: None,
     )
   let primary = primary_effect(next, id)
   let eff = case model.selected {
@@ -3006,6 +3025,7 @@ pub fn view(model: Model) -> Element(Msg) {
         _, _ -> element.none()
       },
       info_button(model),
+      usage_pill(model),
       // The connection state is a labelled group, not a bare dot
       // (ui-polish F8): the dot plus a text twin, so the state stays
       // legible without color. The label flips with the dot via the
@@ -3135,6 +3155,132 @@ fn info_button(model: Model) -> Element(Msg) {
         ],
       )
     _, _ -> element.none()
+  }
+}
+
+/// Format a token count compactly for the header usage pill:
+/// `850` → `"850"`, `1500` → `"1.5k"`, `42180` → `"42k"`, `128000` → `"128k"`,
+/// `1000000` → `"1M"`, `1500000` → `"1.5M"`. Pure.
+pub fn format_tokens_compact(n: Int) -> String {
+  let n = int.max(0, n)
+  case n {
+    _ if n < 1000 -> int.to_string(n)
+    _ if n < 9950 -> {
+      let tenths = { n + 50 } / 100
+      let whole = tenths / 10
+      let rem = tenths % 10
+      case rem {
+        0 -> int.to_string(whole) <> "k"
+        _ -> int.to_string(whole) <> "." <> int.to_string(rem) <> "k"
+      }
+    }
+    _ if n < 999_500 -> int.to_string({ n + 500 } / 1000) <> "k"
+    _ -> {
+      let tenths_m = { n + 50_000 } / 100_000
+      let whole = tenths_m / 10
+      let rem = tenths_m % 10
+      case rem {
+        0 -> int.to_string(whole) <> "M"
+        _ -> int.to_string(whole) <> "." <> int.to_string(rem) <> "M"
+      }
+    }
+  }
+}
+
+/// Primary label for the context-usage pill: `"42k / 128k (33%)"` when a
+/// context window is configured, `"42k tok"` when unconfigured, prefixed
+/// with `"~"` when estimated. Pure.
+pub fn usage_pill_label(usage: thread.ContextUsage) -> String {
+  let prefix = case usage.source {
+    thread.Measured -> ""
+    thread.Estimated -> "~"
+  }
+  case usage.context_window {
+    Some(limit) if limit > 0 -> {
+      let pct = { usage.tokens * 100 } / limit
+      prefix
+      <> format_tokens_compact(usage.tokens)
+      <> " / "
+      <> format_tokens_compact(limit)
+      <> " ("
+      <> int.to_string(pct)
+      <> "%)"
+    }
+    _ -> prefix <> format_tokens_compact(usage.tokens) <> " tok"
+  }
+}
+
+/// True when the thread is at or above 80% of its configured context window.
+pub fn usage_pill_warn(usage: thread.ContextUsage) -> Bool {
+  case usage.context_window {
+    Some(limit) if limit > 0 -> usage.tokens * 100 >= limit * 80
+    _ -> False
+  }
+}
+
+/// Detailed hover tooltip for the context-usage pill: exact comma-formatted
+/// token count (and budget when configured), plus the last turn's prompt
+/// and prompt-cache hit breakdown when reported by the provider. Pure.
+pub fn usage_pill_tooltip(usage: thread.ContextUsage) -> String {
+  let prefix = case usage.source {
+    thread.Measured -> ""
+    thread.Estimated -> "~"
+  }
+  let base = case usage.context_window {
+    Some(limit) if limit > 0 ->
+      prefix
+      <> ui_settings.format_int_commas(usage.tokens)
+      <> " / "
+      <> ui_settings.format_int_commas(limit)
+      <> " tokens"
+    _ -> prefix <> ui_settings.format_int_commas(usage.tokens) <> " tokens"
+  }
+  let source_note = case usage.source {
+    thread.Measured -> ""
+    thread.Estimated -> " (estimated)"
+  }
+  let cache_note = case usage.last_prompt_tokens {
+    Some(prompt) if prompt > 0 ->
+      case usage.last_cached_tokens {
+        Some(cached) -> {
+          let hit = { cached * 100 } / prompt
+          "\nPrompt: "
+          <> ui_settings.format_int_commas(prompt)
+          <> " · Cached: "
+          <> ui_settings.format_int_commas(cached)
+          <> " ("
+          <> int.to_string(hit)
+          <> "%)"
+        }
+        None -> "\nPrompt: " <> ui_settings.format_int_commas(prompt)
+      }
+    _ -> ""
+  }
+  base <> source_note <> cache_note
+}
+
+/// Quiet context-usage pill in the header beside `info_button` (context-
+/// compaction Phase 1): hidden when no thread is open, in Settings, or on a
+/// brand-new unconfigured thread with zero tokens.
+fn usage_pill(model: Model) -> Element(Msg) {
+  case model.view, model.selected, model.usage {
+    ChatView, Some(_), Some(usage) ->
+      case usage.tokens > 0 || option.is_some(usage.context_window) {
+        False -> element.none()
+        True ->
+          html.span(
+            [
+              attr.id("context-usage"),
+              attr.class(case usage_pill_warn(usage) {
+                True -> "usage-pill warn"
+                False -> "usage-pill"
+              }),
+              attr.title(usage_pill_tooltip(usage)),
+            ],
+            [html.text(usage_pill_label(usage))],
+          )
+      }
+    _, _, _ -> element.none()
   }
 }
 

@@ -82,6 +82,7 @@ fn test_config() -> config.Config {
     log_level: log.Info,
     // Bots P3c: the delivery hop guard; 4 = the shipped default.
     max_bot_hops: 4,
+    default_context_window: None,
   )
 }
 
@@ -227,6 +228,7 @@ fn new_thread(provider_id: String, model: String) -> thread_registry.NewThread {
     bot_id: "b-fixture",
     parent_thread_id: None,
     title: "",
+    context_window: None,
   )
 }
 
@@ -670,7 +672,7 @@ fn blocking_runner(
     process.new_selector()
     |> process.select_map(cancel, fn(_) { Nil })
   let _ = process.selector_receive(selector, 5000)
-  thread.StreamStopped(tr)
+  thread.StreamStopped(tr, None)
 }
 
 // ---------------------------------------------------------------------------
@@ -711,6 +713,8 @@ fn seed_with_tags(seam: store.Store, id: String, tags: List(String)) -> Nil {
         workspaces: None,
         roster: None,
         message_count: 3,
+        context_window: None,
+        last_context_tokens: None,
       ),
       "test system prompt",
     )
@@ -1065,6 +1069,8 @@ fn seed_at(
         workspaces: None,
         roster: None,
         message_count: message_count,
+        context_window: None,
+        last_context_tokens: None,
       ),
       "test system prompt",
     )
@@ -1095,6 +1101,8 @@ fn seed_env(seam: store.Store, id: String, message_count: Int) -> Nil {
         roster: None,
         last_active_at: 1_700_000_000,
         message_count: message_count,
+        context_window: None,
+        last_context_tokens: None,
       ),
       "test system prompt",
     )
@@ -1132,6 +1140,8 @@ fn seed_channel(seam: store.Store, id: String, parent: String) -> Nil {
         roster: None,
         last_active_at: 1_700_000_060,
         message_count: 3,
+        context_window: None,
+        last_context_tokens: None,
       ),
       "test system prompt",
     )
@@ -1424,6 +1434,7 @@ fn seed_bot_with_tools(
     allow_inbound: True,
     created_at: 1_700_000_000,
     updated_at: 1_700_000_000,
+    context_window: None,
   ))
 }
 
@@ -1452,6 +1463,8 @@ fn stored_with_toolset(id: String, names: List(String)) -> store.StoredSummary {
     roster: None,
     last_active_at: timing.wall_now_s(),
     message_count: 1,
+    context_window: None,
+    last_context_tokens: None,
   )
 }
 
@@ -1525,6 +1538,7 @@ pub fn create_from_bot_freezes_columns_and_provenance_test() {
         bot_id: "b1",
         parent_thread_id: None,
         title: "",
+        context_window: None,
       ),
       toolset(happy_runner),
     )
@@ -1568,6 +1582,7 @@ pub fn create_from_null_prompt_bot_freezes_config_default_test() {
         bot_id: "b2",
         parent_thread_id: None,
         title: "",
+        context_window: None,
       ),
       toolset(happy_runner),
     )
@@ -1601,6 +1616,7 @@ pub fn toolset_snapshot_persisted_at_creation_test() {
         bot_id: "b-fixture",
         parent_thread_id: None,
         title: "",
+        context_window: None,
       ),
     )
   let assert Ok(stored) = seam.get_thread(explicit.id)
@@ -1640,6 +1656,7 @@ pub fn chat_only_toolset_create_test() {
         bot_id: "b-fixture",
         parent_thread_id: None,
         title: "",
+        context_window: None,
       ),
     )
   let assert Ok(stored) = seam.get_thread(summary.id)
@@ -1658,6 +1675,7 @@ pub fn chat_only_toolset_create_test() {
         bot_id: "b-fixture",
         parent_thread_id: None,
         title: "",
+        context_window: None,
       ),
     )
   let assert Ok(second_stored) = seam.get_thread(second.id)
@@ -1680,6 +1698,7 @@ pub fn unknown_toolset_create_refused_test() {
       bot_id: "b-fixture",
       parent_thread_id: None,
       title: "",
+      context_window: None,
     ),
   )
   |> should.equal(
@@ -1737,6 +1756,7 @@ pub fn plugin_toolset_create_resolves_through_provider_table_test() {
         bot_id: "b-fixture",
         parent_thread_id: None,
         title: "",
+        context_window: None,
       ),
     )
   let assert Ok(stored) = seam.get_thread(summary.id)
@@ -1756,6 +1776,7 @@ pub fn plugin_toolset_create_resolves_through_provider_table_test() {
       bot_id: "b-fixture",
       parent_thread_id: None,
       title: "",
+      context_window: None,
     ),
   )
   // Plugin-api Phase 2: a QUALIFIED name whose server half is not a
@@ -1787,6 +1808,7 @@ pub fn create_from_bot_toolset_snapshot_test() {
         bot_id: "b-tools",
         parent_thread_id: None,
         title: "",
+        context_window: None,
       ),
     )
   let assert Ok(stored) = seam.get_thread(summary.id)
@@ -1811,6 +1833,7 @@ pub fn create_from_bot_toolset_snapshot_test() {
         bot_id: "b-default",
         parent_thread_id: None,
         title: "",
+        context_window: None,
       ),
     )
   let assert Ok(stored) = seam.get_thread(from_default_bot.id)
@@ -1837,6 +1860,7 @@ pub fn create_from_bot_toolset_snapshot_test() {
       bot_id: "  ",
       parent_thread_id: None,
       title: "",
+      context_window: None,
     ),
   )
   |> should.equal(Error(thread_registry.BotRequired))
@@ -1903,6 +1927,7 @@ pub fn create_from_bot_orchestration_carries_bot_toolset_test() {
         model: "alpha",
         system_prompt: None,
         tools: Some(["http_fetch"]),
+        context_window: None,
       ),
     )
   let assert Ok(summary) =
@@ -1922,6 +1947,7 @@ pub fn create_from_bot_orchestration_carries_bot_toolset_test() {
         model: "alpha",
         system_prompt: None,
         tools: Some([]),
+        context_window: None,
       ),
     )
   let assert Ok(chat_summary) =
@@ -2114,6 +2140,8 @@ pub fn dormant_summary_carries_bot_provenance_test() {
         workspaces: None,
         roster: None,
         message_count: 3,
+        context_window: None,
+        last_context_tokens: None,
       ),
       "frozen",
     )
@@ -2227,6 +2255,8 @@ pub fn bot_delete_scrubs_cached_provenance_test() {
           workspaces: None,
           roster: None,
           message_count: 3,
+          context_window: None,
+          last_context_tokens: None,
         ),
         "frozen",
       )
@@ -2252,6 +2282,7 @@ pub fn bot_delete_scrubs_cached_provenance_test() {
         bot_id: "b1",
         parent_thread_id: None,
         title: "",
+        context_window: None,
       ),
       toolset(happy_runner),
     )
@@ -2317,6 +2348,7 @@ pub fn unpersisted_create_carries_no_provenance_test() {
         bot_id: "b1",
         parent_thread_id: None,
         title: "",
+        context_window: None,
       ),
       toolset(happy_runner),
     )
@@ -2406,6 +2438,8 @@ pub fn env_capable_dormant_thread_test() {
         )),
         last_active_at: timing.wall_now_s(),
         message_count: 1,
+        context_window: None,
+        last_context_tokens: None,
       ),
       "prompt",
     )
@@ -2422,6 +2456,8 @@ pub fn env_capable_dormant_thread_test() {
         roster: None,
         last_active_at: timing.wall_now_s(),
         message_count: 1,
+        context_window: None,
+        last_context_tokens: None,
       ),
       "prompt",
     )
@@ -2607,6 +2643,8 @@ pub fn env_toolset_hydrates_from_persisted_root_test() {
         )),
         last_active_at: timing.wall_now_s(),
         message_count: 1,
+        context_window: None,
+        last_context_tokens: None,
       ),
       "prompt",
     )
@@ -2660,6 +2698,8 @@ pub fn env_toolset_hydrate_injects_workspace_and_tmp_rel_paths_test() {
         )),
         last_active_at: timing.wall_now_s(),
         message_count: 1,
+        context_window: None,
+        last_context_tokens: None,
       ),
       "prompt",
     )
@@ -2744,6 +2784,8 @@ pub fn env_roster_legacy_row_falls_back_to_workspace_test() {
         roster: Some(#(legacy_text, 1_700_000_000)),
         last_active_at: timing.wall_now_s(),
         message_count: 1,
+        context_window: None,
+        last_context_tokens: None,
       ),
       "prompt",
     )
@@ -2822,6 +2864,8 @@ pub fn env_roster_rehydrates_from_persisted_attach_row_test() {
         )),
         last_active_at: timing.wall_now_s(),
         message_count: 1,
+        context_window: None,
+        last_context_tokens: None,
       ),
       "prompt",
     )

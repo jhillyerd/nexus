@@ -13,9 +13,11 @@
 //// same way `thread.ThreadMeta` is (issue #75's one-type rule).
 //// Everything bot-sourced is hostile text under the UI contract.
 
+import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/string
+import nexus/config
 
 /// A bot profile — the stored row AND the public shape (no secrets, so
 /// no masked twin; see the module docs). `system_prompt: None` is the
@@ -57,12 +59,21 @@ pub type Bot {
     /// rule); the wire shape and Settings toggle already display and
     /// patch it. Create always opens the gate; PATCH moves it.
     allow_inbound: Bool,
+    /// Optional context-window budget in tokens (`>= 4096`), copied onto
+    /// new threads at creation (`thread.context_window`, with
+    /// `NEXUS_DEFAULT_CONTEXT_WINDOW` fallback when `None`). Display/budget
+    /// metadata only — never enters request bytes.
+    context_window: Option(Int),
     /// Epoch seconds.
     created_at: Int,
     /// Epoch seconds; bumped on update.
     updated_at: Int,
   )
 }
+
+/// Minimum valid context window in tokens (re-exported from
+/// `config.min_context_window`; matches the Postgres CHECK constraint).
+pub const min_context_window = config.min_context_window
 
 /// Create input: the add-form / POST body fields. A blank
 /// `system_prompt` (after trimming) means the default — there is no
@@ -77,6 +88,8 @@ pub type BotParams {
     /// Same three-state semantics as `Bot.tools`; normalized by
     /// `validate_tools` (trimmed, blank entries dropped, deduplicated).
     tools: Option(List(String)),
+    /// Optional context window in tokens (`>= 4096`).
+    context_window: Option(Int),
   )
 }
 
@@ -111,6 +124,10 @@ pub type BotUpdate {
     tools: Option(Option(List(String))),
     /// Present flips the inbound gate (bots plan P3a); absent keeps.
     allow_inbound: Option(Bool),
+    /// Three-state (same pattern as `tools`): `None` keeps the stored
+    /// budget; `Some(None)` clears it to `None`; `Some(Some(n))` replaces
+    /// with `n` (validated `>= min_context_window`).
+    context_window: Option(Option(Int)),
   )
 }
 
@@ -131,6 +148,8 @@ pub type BotError {
   /// refused by the registry's catalog check, not here: this module has
   /// no catalog access (it stays pure domain).
   InvalidTools
+  /// A submitted context window below `min_context_window` (4096).
+  InvalidContextWindow
 }
 
 /// Fixed human-readable error text.
@@ -143,6 +162,10 @@ pub fn describe(error: BotError) -> String {
     InvalidModel -> "bot model must be non-empty after trimming"
     InvalidTools ->
       "bot tools must contain at least one non-blank name when set"
+    InvalidContextWindow ->
+      "context window must be at least "
+      <> int.to_string(min_context_window)
+      <> " tokens when set"
   }
 }
 
@@ -211,6 +234,18 @@ pub fn normalize_tools(
   }
 }
 
+/// Validate an optional context window budget: `None` passes through;
+/// `Some(n)` must be `>= min_context_window` (4096).
+pub fn validate_context_window(
+  window: Option(Int),
+) -> Result(Option(Int), BotError) {
+  case window {
+    None -> Ok(None)
+    Some(n) if n >= min_context_window -> Ok(Some(n))
+    Some(_) -> Error(InvalidContextWindow)
+  }
+}
+
 /// Build a fresh row from validated params (id and stamps are the
 /// registry's — it mints the id and owns the clock; the toolset is
 /// normalized + catalog-checked before this runs).
@@ -232,6 +267,7 @@ pub fn to_row(
     // The gate starts open (the column's DEFAULT true; there is no
     // create-time override — PATCH is the only way to close it).
     allow_inbound: True,
+    context_window: params.context_window,
     created_at: now,
     updated_at: now,
   )
@@ -268,6 +304,10 @@ pub fn apply_update(row: Bot, update: BotUpdate, now: Int) -> Bot {
       Some(allow) -> allow
       None -> row.allow_inbound
     },
+    context_window: case update.context_window {
+      Some(window) -> window
+      None -> row.context_window
+    },
     updated_at: now,
   )
 }
@@ -295,4 +335,5 @@ pub fn empty_update(update: BotUpdate) -> Bool {
   && option.is_none(update.system_prompt)
   && option.is_none(update.tools)
   && option.is_none(update.allow_inbound)
+  && option.is_none(update.context_window)
 }

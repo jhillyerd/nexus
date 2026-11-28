@@ -665,6 +665,7 @@ pub type GetBotRow {
     system_prompt: Option(String),
     tools: Option(List(String)),
     allow_inbound: Bool,
+    context_window: Option(Int),
     created_s: Int,
     updated_s: Int,
   )
@@ -691,8 +692,9 @@ pub fn get_bot(
     use system_prompt <- decode.field(5, decode.optional(decode.string))
     use tools <- decode.field(6, decode.optional(decode.list(decode.string)))
     use allow_inbound <- decode.field(7, decode.bool)
-    use created_s <- decode.field(8, decode.int)
-    use updated_s <- decode.field(9, decode.int)
+    use context_window <- decode.field(8, decode.optional(decode.int))
+    use created_s <- decode.field(9, decode.int)
+    use updated_s <- decode.field(10, decode.int)
     decode.success(GetBotRow(
       id:,
       name:,
@@ -702,6 +704,7 @@ pub fn get_bot(
       system_prompt:,
       tools:,
       allow_inbound:,
+      context_window:,
       created_s:,
       updated_s:,
     ))
@@ -720,6 +723,7 @@ select
   system_prompt,
   tools,
   allow_inbound,
+  context_window,
   extract(epoch from created_at)::int8 as created_s,
   extract(epoch from updated_at)::int8 as updated_s
 from bot
@@ -834,6 +838,8 @@ pub type GetThreadRow {
     tmp_workspace_id: Option(String),
     tmp_rel_path: String,
     parent_thread_id: Option(String),
+    context_window: Option(Int),
+    last_context_tokens: Option(Int),
     created_s: Int,
     last_active_s: Int,
     message_count: Int,
@@ -877,9 +883,11 @@ pub fn get_thread(
     use tmp_workspace_id <- decode.field(16, decode.optional(decode.string))
     use tmp_rel_path <- decode.field(17, decode.string)
     use parent_thread_id <- decode.field(18, decode.optional(decode.string))
-    use created_s <- decode.field(19, decode.int)
-    use last_active_s <- decode.field(20, decode.int)
-    use message_count <- decode.field(21, decode.int)
+    use context_window <- decode.field(19, decode.optional(decode.int))
+    use last_context_tokens <- decode.field(20, decode.optional(decode.int))
+    use created_s <- decode.field(21, decode.int)
+    use last_active_s <- decode.field(22, decode.int)
+    use message_count <- decode.field(23, decode.int)
     decode.success(GetThreadRow(
       id:,
       provider_id:,
@@ -900,6 +908,8 @@ pub fn get_thread(
       tmp_workspace_id:,
       tmp_rel_path:,
       parent_thread_id:,
+      context_window:,
+      last_context_tokens:,
       created_s:,
       last_active_s:,
       message_count:,
@@ -937,6 +947,8 @@ select
   thread.tmp_workspace_id,
   coalesce(tw.rel_path, '') as tmp_rel_path,
   thread.parent_thread_id,
+  thread.context_window,
+  thread.last_context_tokens,
   extract(epoch from thread.created_at)::int8 as created_s,
   extract(epoch from thread.last_active_at)::int8 as last_active_s,
   thread.message_count
@@ -1034,6 +1046,8 @@ where thread_id = $1 and name = $2
 /// `allow_inbound` (bots plan P3a) is the row's gate verbatim — creates
 /// always carry true (bot.to_row), but the seam writes full rows, so the
 /// column is a parameter like every other.
+/// `context_window` ($11): optional token budget (>= 4096); the 0 sentinel
+/// inserts NULL (unconfigured).
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
@@ -1050,6 +1064,7 @@ pub fn insert_bot(
   arg_8: Bool,
   arg_9: Float,
   arg_10: Bool,
+  arg_11: Int,
 ) -> Result(pog.Returned(Nil), pog.QueryError) {
   let decoder = decode.map(decode.dynamic, fn(_) { Nil })
 
@@ -1066,8 +1081,10 @@ pub fn insert_bot(
 -- `allow_inbound` (bots plan P3a) is the row's gate verbatim — creates
 -- always carry true (bot.to_row), but the seam writes full rows, so the
 -- column is a parameter like every other.
-insert into bot (id, name, description, provider_id, model, system_prompt, tools, allow_inbound, created_at, updated_at)
-values ($1, $2, $3, $4, $5, nullif($6, ''), case when $8::boolean then null else $7::text[] end, $10::boolean, to_timestamp($9), to_timestamp($9))
+-- `context_window` ($11): optional token budget (>= 4096); the 0 sentinel
+-- inserts NULL (unconfigured).
+insert into bot (id, name, description, provider_id, model, system_prompt, tools, allow_inbound, context_window, created_at, updated_at)
+values ($1, $2, $3, $4, $5, nullif($6, ''), case when $8::boolean then null else $7::text[] end, $10::boolean, nullif($11::int, 0), to_timestamp($9), to_timestamp($9))
 "
   |> pog.query
   |> pog.parameter(pog.text(arg_1))
@@ -1080,6 +1097,7 @@ values ($1, $2, $3, $4, $5, nullif($6, ''), case when $8::boolean then null else
   |> pog.parameter(pog.bool(arg_8))
   |> pog.parameter(pog.float(arg_9))
   |> pog.parameter(pog.bool(arg_10))
+  |> pog.parameter(pog.int(arg_11))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }
@@ -1238,6 +1256,9 @@ values ($1, $2, $3, nullif($4, ''::bytea), $5, $6, $7, to_timestamp($8), to_time
 /// and tmp_rel_path ($20) persist the thread's managed workspace rows
 /// atomically with the thread row ('' sentinels insert NULL / skip workspace
 /// rows).
+/// context_window ($21) freezes the thread's optional token budget (>= 4096;
+/// 0 sentinel inserts NULL). last_context_tokens ($22) seeds any known token
+/// count (>= 0; -1 sentinel inserts NULL).
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
@@ -1264,6 +1285,8 @@ pub fn insert_thread(
   arg_18: String,
   arg_19: String,
   arg_20: String,
+  arg_21: Int,
+  arg_22: Int,
 ) -> Result(pog.Returned(Nil), pog.QueryError) {
   let decoder = decode.map(decode.dynamic, fn(_) { Nil })
 
@@ -1292,9 +1315,12 @@ pub fn insert_thread(
 -- and tmp_rel_path ($20) persist the thread's managed workspace rows
 -- atomically with the thread row ('' sentinels insert NULL / skip workspace
 -- rows).
+-- context_window ($21) freezes the thread's optional token budget (>= 4096;
+-- 0 sentinel inserts NULL). last_context_tokens ($22) seeds any known token
+-- count (>= 0; -1 sentinel inserts NULL).
 with new_thread as (
-  insert into thread (id, provider_id, title, title_source, model, system_prompt, pinned, tags, tags_manual, created_at, last_active_at, message_count, bot_id, workspace_root, parent_thread_id, workspace_id, tmp_workspace_id)
-  values ($1, $2, $3, $4, $5, $6, $7, $8, '{}', to_timestamp($9), to_timestamp($9), $10, nullif($11, ''), nullif($13, ''), nullif($16, ''), nullif($17, ''), nullif($18, ''))
+  insert into thread (id, provider_id, title, title_source, model, system_prompt, pinned, tags, tags_manual, created_at, last_active_at, message_count, bot_id, workspace_root, parent_thread_id, workspace_id, tmp_workspace_id, context_window, last_context_tokens)
+  values ($1, $2, $3, $4, $5, $6, $7, $8, '{}', to_timestamp($9), to_timestamp($9), $10, nullif($11, ''), nullif($13, ''), nullif($16, ''), nullif($17, ''), nullif($18, ''), nullif($21::int, 0), nullif($22::int, -1))
   returning id
 ),
 ws_main as (
@@ -1365,6 +1391,8 @@ on conflict (thread_id, seq) do nothing
   |> pog.parameter(pog.text(arg_18))
   |> pog.parameter(pog.text(arg_19))
   |> pog.parameter(pog.text(arg_20))
+  |> pog.parameter(pog.int(arg_21))
+  |> pog.parameter(pog.int(arg_22))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }
@@ -1438,6 +1466,7 @@ pub type ListBotsRow {
     system_prompt: Option(String),
     tools: Option(List(String)),
     allow_inbound: Bool,
+    context_window: Option(Int),
     created_s: Int,
     updated_s: Int,
   )
@@ -1464,8 +1493,9 @@ pub fn list_bots(
     use system_prompt <- decode.field(5, decode.optional(decode.string))
     use tools <- decode.field(6, decode.optional(decode.list(decode.string)))
     use allow_inbound <- decode.field(7, decode.bool)
-    use created_s <- decode.field(8, decode.int)
-    use updated_s <- decode.field(9, decode.int)
+    use context_window <- decode.field(8, decode.optional(decode.int))
+    use created_s <- decode.field(9, decode.int)
+    use updated_s <- decode.field(10, decode.int)
     decode.success(ListBotsRow(
       id:,
       name:,
@@ -1475,6 +1505,7 @@ pub fn list_bots(
       system_prompt:,
       tools:,
       allow_inbound:,
+      context_window:,
       created_s:,
       updated_s:,
     ))
@@ -1494,6 +1525,7 @@ select
   system_prompt,
   tools,
   allow_inbound,
+  context_window,
   extract(epoch from created_at)::int8 as created_s,
   extract(epoch from updated_at)::int8 as updated_s
 from bot
@@ -1779,6 +1811,8 @@ pub type ListSummariesRow {
     tmp_workspace_id: Option(String),
     tmp_rel_path: String,
     parent_thread_id: Option(String),
+    context_window: Option(Int),
+    last_context_tokens: Option(Int),
     created_s: Int,
     last_active_s: Int,
     message_count: Int,
@@ -1818,9 +1852,11 @@ pub fn list_summaries(
     use tmp_workspace_id <- decode.field(15, decode.optional(decode.string))
     use tmp_rel_path <- decode.field(16, decode.string)
     use parent_thread_id <- decode.field(17, decode.optional(decode.string))
-    use created_s <- decode.field(18, decode.int)
-    use last_active_s <- decode.field(19, decode.int)
-    use message_count <- decode.field(20, decode.int)
+    use context_window <- decode.field(18, decode.optional(decode.int))
+    use last_context_tokens <- decode.field(19, decode.optional(decode.int))
+    use created_s <- decode.field(20, decode.int)
+    use last_active_s <- decode.field(21, decode.int)
+    use message_count <- decode.field(22, decode.int)
     decode.success(ListSummariesRow(
       id:,
       provider_id:,
@@ -1840,6 +1876,8 @@ pub fn list_summaries(
       tmp_workspace_id:,
       tmp_rel_path:,
       parent_thread_id:,
+      context_window:,
+      last_context_tokens:,
       created_s:,
       last_active_s:,
       message_count:,
@@ -1874,6 +1912,8 @@ select
   thread.tmp_workspace_id,
   coalesce(tw.rel_path, '') as tmp_rel_path,
   thread.parent_thread_id,
+  thread.context_window,
+  thread.last_context_tokens,
   extract(epoch from thread.created_at)::int8 as created_s,
   extract(epoch from thread.last_active_at)::int8 as last_active_s,
   thread.message_count
@@ -2114,6 +2154,34 @@ from subtree
 order by id
 "
   |> pog.query
+  |> pog.parameter(pog.text(id))
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
+/// Persist the latest context token count (measured or estimated) for a
+/// thread so the UI usage pill seeds immediately after restart/hydration.
+/// Display/budget metadata only — never enters request bytes.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn set_last_context_tokens(
+  db: pog.Connection,
+  arg_1: Int,
+  id: String,
+) -> Result(pog.Returned(Nil), pog.QueryError) {
+  let decoder = decode.map(decode.dynamic, fn(_) { Nil })
+
+  "-- Persist the latest context token count (measured or estimated) for a
+-- thread so the UI usage pill seeds immediately after restart/hydration.
+-- Display/budget metadata only — never enters request bytes.
+update thread
+set last_context_tokens = $1::int
+where id = $2
+"
+  |> pog.query
+  |> pog.parameter(pog.int(arg_1))
   |> pog.parameter(pog.text(id))
   |> pog.returning(decoder)
   |> pog.execute(db)
@@ -2410,6 +2478,8 @@ where id in (select id from tree)
 /// the same two-parameter scheme as the insert: $7 is the explicit list
 /// ('{}' = chat-only), $8 the is-default flag (true = NULL = the current
 /// default set). `allow_inbound` (bots plan P3a) is the merged row's gate.
+/// `context_window` ($10): optional token budget (>= 4096); 0 sentinel
+/// clears to NULL.
 /// `updated_at` is server-side now(), like the provider/thread metadata
 /// writes.
 ///
@@ -2427,6 +2497,7 @@ pub fn update_bot(
   arg_7: List(String),
   arg_8: Bool,
   arg_9: Bool,
+  arg_10: Int,
 ) -> Result(pog.Returned(Nil), pog.QueryError) {
   let decoder = decode.map(decode.dynamic, fn(_) { Nil })
 
@@ -2436,6 +2507,8 @@ pub fn update_bot(
 -- the same two-parameter scheme as the insert: $7 is the explicit list
 -- ('{}' = chat-only), $8 the is-default flag (true = NULL = the current
 -- default set). `allow_inbound` (bots plan P3a) is the merged row's gate.
+-- `context_window` ($10): optional token budget (>= 4096); 0 sentinel
+-- clears to NULL.
 -- `updated_at` is server-side now(), like the provider/thread metadata
 -- writes.
 update bot set
@@ -2446,6 +2519,7 @@ update bot set
   system_prompt = nullif($6, ''),
   tools = case when $8::boolean then null else $7::text[] end,
   allow_inbound = $9::boolean,
+  context_window = nullif($10::int, 0),
   updated_at = now()
 where id = $1
 "
@@ -2459,6 +2533,7 @@ where id = $1
   |> pog.parameter(pog.array(fn(value) { pog.text(value) }, arg_7))
   |> pog.parameter(pog.bool(arg_8))
   |> pog.parameter(pog.bool(arg_9))
+  |> pog.parameter(pog.int(arg_10))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }

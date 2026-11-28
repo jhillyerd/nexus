@@ -73,6 +73,7 @@ fn test_config() {
     log_level: log.Info,
     // Bots P3c: the delivery hop guard; 4 = the shipped default.
     max_bot_hops: 4,
+    default_context_window: None,
   )
 }
 
@@ -84,6 +85,7 @@ fn params(name: String) -> bot.BotParams {
     model: "alias-1",
     system_prompt: None,
     tools: None,
+    context_window: None,
   )
 }
 
@@ -151,6 +153,7 @@ pub fn boot_loads_and_mints_past_stored_ids_test() {
       allow_inbound: True,
       created_at: 1_700_000_000,
       updated_at: 1_700_000_000,
+      context_window: None,
     ))
   let registry = start_registry(seam)
 
@@ -188,6 +191,7 @@ pub fn mint_reseeds_past_rows_minted_elsewhere_test() {
       allow_inbound: True,
       created_at: 1_700_000_000,
       updated_at: 1_700_000_000,
+      context_window: None,
     ))
   // The mint re-seeds past it instead of colliding on b1.
   let assert Ok(created) = bot_registry.create_bot(registry, params("fresh"))
@@ -223,6 +227,7 @@ pub fn crud_round_trip_test() {
         model: " alias-2 ",
         system_prompt: Some("  "),
         tools: None,
+        context_window: None,
       ),
     )
   should.equal(created.name, "Researcher")
@@ -252,6 +257,7 @@ pub fn crud_round_trip_test() {
         system_prompt: Some("be terse"),
         tools: None,
         allow_inbound: None,
+        context_window: None,
       ),
     )
   should.equal(updated.name, "Researcher")
@@ -271,6 +277,7 @@ pub fn crud_round_trip_test() {
         system_prompt: Some(""),
         tools: None,
         allow_inbound: None,
+        context_window: None,
       ),
     )
   should.equal(cleared.system_prompt, None)
@@ -313,6 +320,7 @@ pub fn allow_inbound_patch_round_trip_test() {
         system_prompt: None,
         tools: None,
         allow_inbound: Some(False),
+        context_window: None,
       ),
     )
   should.be_false(closed.allow_inbound)
@@ -335,6 +343,7 @@ pub fn allow_inbound_patch_round_trip_test() {
         system_prompt: None,
         tools: None,
         allow_inbound: None,
+        context_window: None,
       ),
     )
   should.equal(untouched.description, "described")
@@ -355,6 +364,7 @@ pub fn allow_inbound_patch_round_trip_test() {
         system_prompt: None,
         tools: None,
         allow_inbound: Some(True),
+        context_window: None,
       ),
     )
   should.be_true(opened.allow_inbound)
@@ -391,6 +401,7 @@ pub fn duplicate_name_pre_check_test() {
       system_prompt: None,
       tools: None,
       allow_inbound: None,
+      context_window: None,
     ),
   )
   |> should.equal(Error(bot_registry.DuplicateName))
@@ -405,6 +416,7 @@ pub fn duplicate_name_pre_check_test() {
       system_prompt: None,
       tools: None,
       allow_inbound: None,
+      context_window: None,
     ),
   )
   |> should.equal(Error(bot_registry.DuplicateName))
@@ -423,6 +435,7 @@ pub fn duplicate_name_pre_check_test() {
         system_prompt: None,
         tools: None,
         allow_inbound: None,
+        context_window: None,
       ),
     )
 }
@@ -443,6 +456,7 @@ pub fn unknown_id_update_delete_refused_test() {
       system_prompt: None,
       tools: None,
       allow_inbound: None,
+      context_window: None,
     ),
   )
   |> should.equal(Error(bot_registry.Unknown))
@@ -491,6 +505,7 @@ pub fn invalid_name_and_model_refused_test() {
         system_prompt: None,
         tools: None,
         allow_inbound: None,
+        context_window: None,
       ),
     )
   should.equal(kept.name, "ok")
@@ -670,6 +685,7 @@ pub fn unknown_tool_name_refused_test() {
       system_prompt: None,
       tools: Some(Some(["web_search", "ghost"])),
       allow_inbound: None,
+      context_window: None,
     ),
   )
   |> should.equal(Error(bot_registry.InvalidTools("unknown tool name: ghost")))
@@ -743,6 +759,7 @@ pub fn toolset_normalization_test() {
         system_prompt: None,
         tools: Some(Some(["web_search"])),
         allow_inbound: None,
+        context_window: None,
       ),
     )
   should.equal(replaced.tools, Some(["web_search"]))
@@ -759,6 +776,7 @@ pub fn toolset_normalization_test() {
         system_prompt: None,
         tools: Some(None),
         allow_inbound: None,
+        context_window: None,
       ),
     )
   should.equal(cleared.tools, None)
@@ -775,6 +793,7 @@ pub fn toolset_normalization_test() {
         system_prompt: None,
         tools: None,
         allow_inbound: None,
+        context_window: None,
       ),
     )
   should.equal(kept.tools, None)
@@ -815,4 +834,102 @@ pub fn boot_tool_validation_env_gate_test() {
   // Plain names keep the loud unknown refusal either way.
   boot.bot_validate_tools(with_root, dict.new(), dict.new())(["nope"])
   |> should.equal(Error("unknown tool name: nope"))
+}
+
+// ---------------------------------------------------------------------------
+// Context window validation & three-state PATCH (context-compaction Phase 1)
+// ---------------------------------------------------------------------------
+
+pub fn context_window_create_update_clear_and_reject_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  store_mock.ensure_fixture_provider(seam)
+  let registry = start_registry(seam)
+
+  // Rejects values below bot.min_context_window (4096).
+  bot_registry.create_bot(
+    registry,
+    bot.BotParams(..params("too-small"), context_window: Some(4095)),
+  )
+  |> should.equal(Error(bot_registry.InvalidContextWindow))
+
+  // Accepts >= 4096.
+  let assert Ok(created) =
+    bot_registry.create_bot(
+      registry,
+      bot.BotParams(..params("budgeted"), context_window: Some(32_768)),
+    )
+  created.context_window |> should.equal(Some(32_768))
+
+  // PATCH absent keeps the stored value.
+  let assert Ok(kept) =
+    bot_registry.update_bot(
+      registry,
+      created.id,
+      bot.BotUpdate(
+        name: None,
+        description: Some("updated"),
+        provider_id: None,
+        model: None,
+        system_prompt: None,
+        tools: None,
+        allow_inbound: None,
+        context_window: None,
+      ),
+    )
+  kept.context_window |> should.equal(Some(32_768))
+
+  // PATCH below floor refuses without mutating.
+  bot_registry.update_bot(
+    registry,
+    created.id,
+    bot.BotUpdate(
+      name: None,
+      description: None,
+      provider_id: None,
+      model: None,
+      system_prompt: None,
+      tools: None,
+      allow_inbound: None,
+      context_window: Some(Some(1024)),
+    ),
+  )
+  |> should.equal(Error(bot_registry.InvalidContextWindow))
+  let assert Ok(unchanged) = bot_registry.get_bot(registry, created.id)
+  unchanged.context_window |> should.equal(Some(32_768))
+
+  // PATCH Some(Some(n)) replaces, Some(None) clears back to None.
+  let assert Ok(replaced) =
+    bot_registry.update_bot(
+      registry,
+      created.id,
+      bot.BotUpdate(
+        name: None,
+        description: None,
+        provider_id: None,
+        model: None,
+        system_prompt: None,
+        tools: None,
+        allow_inbound: None,
+        context_window: Some(Some(131_072)),
+      ),
+    )
+  replaced.context_window |> should.equal(Some(131_072))
+
+  let assert Ok(cleared) =
+    bot_registry.update_bot(
+      registry,
+      created.id,
+      bot.BotUpdate(
+        name: None,
+        description: None,
+        provider_id: None,
+        model: None,
+        system_prompt: None,
+        tools: None,
+        allow_inbound: None,
+        context_window: Some(None),
+      ),
+    )
+  cleared.context_window |> should.equal(None)
 }

@@ -144,6 +144,12 @@ pub type StoredSummary {
     last_active_at: Int,
     /// Includes the system prompt (Phase 1 semantics).
     message_count: Int,
+    /// Frozen context-window budget in tokens (`None` = unconfigured).
+    /// Display/budget metadata only — never enters request bytes.
+    context_window: Option(Int),
+    /// Latest known active context token count persisted at turn commit,
+    /// used to seed the UI usage pill on hydration before the next turn.
+    last_context_tokens: Option(Int),
   )
 }
 
@@ -293,6 +299,10 @@ pub type Store {
     /// unchanged or shorter transcript is a no-op; duplicate seqs are
     /// skipped (idempotent crash recovery).
     commit: fn(String, Transcript) -> Nil,
+    /// Write-behind context-token watermark: persist the latest active
+    /// context token count (`>= 0`) for hydration seeding. Fire-and-forget
+    /// so thread actors never block on database writes.
+    set_last_context_tokens: fn(String, Int) -> Nil,
     /// Metadata write-through (mirrors the registry's setters).
     set_title: fn(String, String) -> Result(Nil, StoreError),
     /// Guarded like the registry: applies only while the stored title is

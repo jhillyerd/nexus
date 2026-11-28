@@ -134,6 +134,7 @@ pub fn create_thread_from_bot(
               // `bot_message` delivery).
               parent_thread_id: option.None,
               title: "",
+              context_window: bot.context_window,
             ),
           )
           |> result.map_error(CreateFailed)

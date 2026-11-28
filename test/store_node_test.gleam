@@ -46,6 +46,8 @@ fn seed_thread(seam: store.Store, id: String) -> Nil {
         workspaces: None,
         roster: None,
         message_count: 1,
+        context_window: None,
+        last_context_tokens: None,
       ),
       "sys",
     )
@@ -288,6 +290,7 @@ fn sweep_config(node_idle_days: Int) -> config.Config {
     node_idle_days: node_idle_days,
     log_level: log.Info,
     max_bot_hops: 4,
+    default_context_window: None,
   )
 }
 

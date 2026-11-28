@@ -209,12 +209,7 @@ fn loop_options() -> Options {
   // `web_fetch` replaces `http_fetch` in `tools.default_names`.
   let assert Ok(specs) =
     tools.by_names(smoke_config(), ["http_fetch", "web_search"])
-  transcript.Options(
-    ..transcript.default_options(),
-    stream: True,
-    tools: specs |> tools.schemas,
-    tool_choice: Some(chat.ToolChoiceModeChoice(chat.ToolChoiceAuto)),
-  )
+  loop.frozen_options(specs)
 }
 
 // ---------------------------------------------------------------------------
@@ -365,6 +360,7 @@ fn new_thread(provider_id: String, model: String) -> thread_registry.NewThread {
     bot_id: "b-fixture",
     parent_thread_id: None,
     title: "",
+    context_window: None,
   )
 }
 

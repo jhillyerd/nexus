@@ -24,6 +24,7 @@ fn row(id: String, name: String) -> store.StoredBot {
     allow_inbound: True,
     created_at: 1_700_000_000,
     updated_at: 1_700_000_000,
+    context_window: None,
   )
 }
 
@@ -50,6 +51,8 @@ fn summary(id: String, bot_id: option.Option(String)) -> store.StoredSummary {
     workspaces: None,
     roster: None,
     message_count: 1,
+    context_window: None,
+    last_context_tokens: None,
   )
 }
 

@@ -534,7 +534,26 @@ pub type BotCreateFields {
     model: String,
     system_prompt: Option(String),
     tools: Option(List(String)),
+    context_window: Option(Int),
   )
+}
+
+/// Decode a `context_window` JSON value: an integer sets the value; `null`
+/// or a blank string clears/unsets it; any other value (including non-blank
+/// strings or booleans) fails decoding with 400.
+fn context_window_value_decoder() -> decode.Decoder(Option(Int)) {
+  decode.optional(
+    decode.one_of(decode.map(decode.int, Some), [
+      decode.string
+      |> decode.then(fn(raw) {
+        case string.trim(raw) {
+          "" -> decode.success(None)
+          _ -> decode.failure(None, "Int or blank string")
+        }
+      }),
+    ]),
+  )
+  |> decode.map(option.flatten)
 }
 
 pub fn bot_create_fields_decoder() -> decode.Decoder(BotCreateFields) {
@@ -554,6 +573,11 @@ pub fn bot_create_fields_decoder() -> decode.Decoder(BotCreateFields) {
     None,
     decode.optional(decode.list(decode.string)),
   )
+  use context_window <- decode.optional_field(
+    "context_window",
+    None,
+    context_window_value_decoder(),
+  )
   decode.success(BotCreateFields(
     name: name,
     description: description,
@@ -561,6 +585,7 @@ pub fn bot_create_fields_decoder() -> decode.Decoder(BotCreateFields) {
     model: model,
     system_prompt: system_prompt,
     tools: tools,
+    context_window: context_window,
   ))
 }
 
@@ -587,10 +612,10 @@ fn read_bot_create(
 /// keeps the stored value (normalized away here), while a present
 /// `description`/`system_prompt` always replaces (blank CLEARS — back
 /// to "" and back to the default prompt), so absent-vs-blank must stay
-/// distinguishable for exactly those two fields. `tools` is three-state
-/// (bots plan P2): absent keeps, null clears back to the default set,
-/// an array replaces — hence the nested Option, passed through to the
-/// registry verbatim.
+/// distinguishable for exactly those two fields. `tools` and
+/// `context_window` are three-state: absent keeps, null (or blank string
+/// for `context_window`) clears back to the default, a value replaces —
+/// hence the nested Option, passed through to the registry verbatim.
 pub type BotPatchFields {
   BotPatchFields(
     name: Option(String),
@@ -601,6 +626,9 @@ pub type BotPatchFields {
     tools: Option(Option(List(String))),
     /// The inbound gate (bots plan P3a): present flips it, absent keeps.
     allow_inbound: Option(Bool),
+    /// Context-window budget in tokens: absent keeps, null/blank clears,
+    /// integer replaces.
+    context_window: Option(Option(Int)),
   )
 }
 
@@ -653,6 +681,11 @@ pub fn bot_patch_fields_decoder() -> decode.Decoder(BotPatchFields) {
     // present true/false replaces it.
     decode.optional(decode.bool),
   )
+  use context_window <- decode.optional_field(
+    "context_window",
+    None,
+    context_window_value_decoder() |> decode.map(Some),
+  )
   decode.success(BotPatchFields(
     name: blank_as_none(name),
     description: description,
@@ -661,6 +694,7 @@ pub fn bot_patch_fields_decoder() -> decode.Decoder(BotPatchFields) {
     system_prompt: system_prompt,
     tools: tools,
     allow_inbound: allow_inbound,
+    context_window: context_window,
   ))
 }
 
@@ -953,6 +987,7 @@ fn create_bot_response(
                 model: fields.model,
                 system_prompt: fields.system_prompt,
                 tools: fields.tools,
+                context_window: fields.context_window,
               ),
             )
           {
@@ -984,6 +1019,7 @@ fn patch_bot_response(
           system_prompt: fields.system_prompt,
           tools: fields.tools,
           allow_inbound: fields.allow_inbound,
+          context_window: fields.context_window,
         )
       case bot.empty_update(patch) {
         True -> json_response(400, err_json("empty patch"))
@@ -1088,6 +1124,7 @@ pub fn bot_error_fields(error: bot_registry.RegistryError) -> #(Int, String) {
     bot_registry.ReservedName -> 400
     bot_registry.InvalidModel -> 400
     bot_registry.InvalidTools(_) -> 400
+    bot_registry.InvalidContextWindow -> 400
     bot_registry.DuplicateName -> 409
     bot_registry.StoreFailed(_) -> 502
   }
@@ -1774,6 +1811,7 @@ pub fn bot_json(b: bot.Bot) -> Json {
     // The inbound gate (bots plan P3a): false blocks other bots from
     // delivering into this bot's threads (the P3c guard will enforce it).
     #("allow_inbound", json.bool(b.allow_inbound)),
+    #("context_window", optional_int_json(b.context_window)),
     #("created_at", json.int(b.created_at)),
     #("created_at_rfc3339", json.string(timing.wall_to_rfc3339(b.created_at))),
     #("updated_at", json.int(b.updated_at)),
@@ -1872,11 +1910,30 @@ pub fn thread_state_json(
   json.object([
     #("summary", thread_summary_json(summary)),
     #("status", thread_status_json(inspect.status)),
+    #("context_window", optional_int_json(inspect.usage.context_window)),
+    #("usage", context_usage_json(inspect.usage)),
     #("messages", transcript_messages_json(inspect.transcript)),
     #("live_turn", case inspect.live_turn {
       Some(live) -> live_turn_json(live)
       None -> json.null()
     }),
+  ])
+}
+
+fn context_usage_json(usage: thread.ContextUsage) -> Json {
+  json.object([
+    #("tokens", json.int(usage.tokens)),
+    #(
+      "source",
+      json.string(case usage.source {
+        thread.Measured -> "measured"
+        thread.Estimated -> "estimated"
+      }),
+    ),
+    #("context_window", optional_int_json(usage.context_window)),
+    #("last_prompt_tokens", optional_int_json(usage.last_prompt_tokens)),
+    #("last_cached_tokens", optional_int_json(usage.last_cached_tokens)),
+    #("bytes_per_token", json.float(usage.bytes_per_token)),
   ])
 }
 

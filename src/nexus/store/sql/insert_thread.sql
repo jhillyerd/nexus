@@ -23,9 +23,12 @@
 -- and tmp_rel_path ($20) persist the thread's managed workspace rows
 -- atomically with the thread row ('' sentinels insert NULL / skip workspace
 -- rows).
+-- context_window ($21) freezes the thread's optional token budget (>= 4096;
+-- 0 sentinel inserts NULL). last_context_tokens ($22) seeds any known token
+-- count (>= 0; -1 sentinel inserts NULL).
 with new_thread as (
-  insert into thread (id, provider_id, title, title_source, model, system_prompt, pinned, tags, tags_manual, created_at, last_active_at, message_count, bot_id, workspace_root, parent_thread_id, workspace_id, tmp_workspace_id)
-  values ($1, $2, $3, $4, $5, $6, $7, $8, '{}', to_timestamp($9), to_timestamp($9), $10, nullif($11, ''), nullif($13, ''), nullif($16, ''), nullif($17, ''), nullif($18, ''))
+  insert into thread (id, provider_id, title, title_source, model, system_prompt, pinned, tags, tags_manual, created_at, last_active_at, message_count, bot_id, workspace_root, parent_thread_id, workspace_id, tmp_workspace_id, context_window, last_context_tokens)
+  values ($1, $2, $3, $4, $5, $6, $7, $8, '{}', to_timestamp($9), to_timestamp($9), $10, nullif($11, ''), nullif($13, ''), nullif($16, ''), nullif($17, ''), nullif($18, ''), nullif($21::int, 0), nullif($22::int, -1))
   returning id
 ),
 ws_main as (

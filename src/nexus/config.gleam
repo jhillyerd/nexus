@@ -190,6 +190,10 @@ pub type Config {
     /// Minimum server log level (`NEXUS_LOG_LEVEL`: `debug`, `info`,
     /// `warn`/`warning`, `error`; default `info`).
     log_level: log.Level,
+    /// Optional fallback context window (tokens) for threads created from
+    /// bots that leave `bot.context_window` unset (`NEXUS_DEFAULT_CONTEXT_WINDOW`,
+    /// min `4096`; default `None` = usage monitoring without a percentage bar).
+    default_context_window: Option(Int),
   )
 }
 
@@ -291,6 +295,12 @@ fn optional_port(
 /// and a plugin's `timeout_ms` override (validated in `nexus/plugin`) —
 /// ONE definition so the two rules cannot drift apart.
 pub const plugin_timeout_floor_ms = 100
+
+/// Minimum valid context window in tokens for `NEXUS_DEFAULT_CONTEXT_WINDOW`.
+/// `bot.min_context_window` re-exports this constant so both code paths stay
+/// in lockstep (also mirrored by the Postgres `CHECK (context_window >= 4096)`
+/// constraints in migration `0003_context_monitoring.sql`).
+pub const min_context_window = 4096
 
 /// Which remediation applies to a config error. Attached AT CONSTRUCTION
 /// (the key step and the workspace-sandbox rules), never re-derived from
@@ -561,6 +571,11 @@ fn parse_env(
     7,
   ))
   use log_level <- result.try(optional_log_level(get, "NEXUS_LOG_LEVEL"))
+  use default_context_window <- result.try(optional_maybe_min_int(
+    get,
+    "NEXUS_DEFAULT_CONTEXT_WINDOW",
+    min: min_context_window,
+  ))
   // The ASCII note rides the DEFAULT prompt only, and only while
   // codemode is enabled: an explicitly set NEXUS_SYSTEM_PROMPT is the
   // operator's own text and is never amended (enable codemode with a
@@ -620,6 +635,7 @@ fn parse_env(
     env_max_output_bytes: env_max_output_bytes,
     node_idle_days: node_idle_days,
     log_level: log_level,
+    default_context_window: default_context_window,
   ))
 }
 
@@ -941,18 +957,36 @@ fn optional_min_int(
   default: Int,
   min min_value: Int,
 ) -> Result(Int, String) {
-  use value <- result.try(optional_int(get, name, default))
-  case value < min_value {
-    True ->
-      Error(
-        "environment variable "
-        <> name
-        <> " must be >= "
-        <> int.to_string(min_value)
-        <> ": "
-        <> int.to_string(value),
-      )
-    False -> Ok(value)
+  use value <- result.try(optional_maybe_min_int(get, name, min: min_value))
+  Ok(option.unwrap(value, default))
+}
+
+/// Optional integer env var with a floor: unset or blank returns `Ok(None)`;
+/// a present value must parse as an integer `>= min_value`.
+fn optional_maybe_min_int(
+  get: fn(String) -> Result(String, Nil),
+  name: String,
+  min min_value: Int,
+) -> Result(Option(Int), String) {
+  case optional_string(get, name) {
+    None -> Ok(None)
+    Some(raw) ->
+      case int.parse(raw) {
+        Error(_) ->
+          Error(
+            "environment variable " <> name <> " is not an integer: " <> raw,
+          )
+        Ok(value) if value < min_value ->
+          Error(
+            "environment variable "
+            <> name
+            <> " must be >= "
+            <> int.to_string(min_value)
+            <> ": "
+            <> int.to_string(value),
+          )
+        Ok(value) -> Ok(Some(value))
+      }
   }
 }
 

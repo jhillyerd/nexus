@@ -4,6 +4,8 @@
 -- the same two-parameter scheme as the insert: $7 is the explicit list
 -- ('{}' = chat-only), $8 the is-default flag (true = NULL = the current
 -- default set). `allow_inbound` (bots plan P3a) is the merged row's gate.
+-- `context_window` ($10): optional token budget (>= 4096); 0 sentinel
+-- clears to NULL.
 -- `updated_at` is server-side now(), like the provider/thread metadata
 -- writes.
 update bot set
@@ -14,5 +16,6 @@ update bot set
   system_prompt = nullif($6, ''),
   tools = case when $8::boolean then null else $7::text[] end,
   allow_inbound = $9::boolean,
+  context_window = nullif($10::int, 0),
   updated_at = now()
 where id = $1

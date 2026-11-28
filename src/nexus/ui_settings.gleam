@@ -25,6 +25,7 @@
 import gleam/dict.{type Dict}
 import gleam/dynamic/decode
 import gleam/erlang/process.{type Subject}
+import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
@@ -38,6 +39,7 @@ import lustre/event
 import lustre/server_component
 import nexus/bot.{type Bot}
 import nexus/bot_registry
+import nexus/openai
 import nexus/provider.{type Provider}
 import nexus/provider_registry
 import nexus/rescue
@@ -71,7 +73,7 @@ pub type ModelsState {
 /// list.
 pub type AliasState {
   AliasLoading
-  AliasOk(aliases: List(String))
+  AliasOk(models: List(openai.ModelInfo))
   AliasFailed
 }
 
@@ -121,6 +123,10 @@ pub type State {
     /// Per-provider cache of live model lists fetched for the bot
     /// forms' combobox (see `AliasState`).
     bot_aliases: Dict(String, AliasState),
+    /// Current model alias text in the open bot form (add or inline edit).
+    /// Drives the non-binding provider context-length hint when the scoped
+    /// provider's `/v1/models` response reported a context length for it.
+    bot_model_draft: String,
     /// The tool picker (issue #121): the pinnable catalog, fetched on
     /// the first bot-form open (add or edit — they are mutually
     /// exclusive, so one slot serves whichever is open), the currently
@@ -192,11 +198,16 @@ pub type Msg {
   /// The edit form's provider select changed (same rule; the bot id
   /// rides so the pick is unambiguous per row).
   BotEditProviderPicked(bot_id: String, provider_id: String)
+  /// The open bot form's model input changed (typing or combobox pick):
+  /// updates `bot_model_draft` so the provider context-length helper text
+  /// tracks the chosen model.
+  BotModelChanged(model: String)
   /// The add-bot form submitted. `system_prompt` blank = the global
   /// default (resolved when a thread is created from the bot).
   /// `tools` is the raw free-text field (only rendered in the degraded
   /// picker mode); the toolset itself follows the Custom switch
-  /// (parsing happens in the effect).
+  /// (parsing happens in the effect). `context_window` is the raw
+  /// numeric input string (blank = unconfigured / server default).
   BotSubmitted(
     name: String,
     description: String,
@@ -204,18 +215,26 @@ pub type Msg {
     model: String,
     system_prompt: String,
     tools: String,
+    context_window: String,
   )
   /// Toggling open carries the bot's provider (the select's
-  /// preselected value) for the same combobox scoping, and its stored
-  /// toolset to seed the tool picker's ticks (issue #121); closing
-  /// ignores both.
-  BotEditToggled(id: String, provider_id: String, tools: Option(List(String)))
+  /// preselected value) for the same combobox scoping, its current
+  /// model alias (for the provider context-length helper), and its
+  /// stored toolset to seed the tool picker's ticks (issue #121);
+  /// closing ignores them.
+  BotEditToggled(
+    id: String,
+    provider_id: String,
+    model: String,
+    tools: Option(List(String)),
+  )
   /// The edit form submitted: blank name/model/provider keep the stored
   /// values; a blank system prompt CLEARS back to the default (a real
   /// change — the two field classes in `bot.BotUpdate`). The tools field
   /// rides only for the degraded picker mode; the toolset always
   /// replaces, following the Custom switch — untouched resubmits the
-  /// stored state verbatim (bots plan P2).
+  /// stored state verbatim (bots plan P2). A blank `context_window`
+  /// clears back to the server default.
   BotEditSubmitted(
     id: String,
     name: String,
@@ -224,6 +243,7 @@ pub type Msg {
     model: String,
     system_prompt: String,
     tools: String,
+    context_window: String,
   )
   /// The row's inbound gate toggled (bots plan P3a): `allow` is the NEW
   /// value. A one-field PATCH — nothing else on the row moves.
@@ -245,7 +265,7 @@ pub type Msg {
   BotMutateFailed(reason: String)
   /// A bot form's live model list landed (dispatched by the combobox
   /// fetch effect).
-  BotAliasesLoaded(provider_id: String, aliases: List(String))
+  BotAliasesLoaded(provider_id: String, models: List(openai.ModelInfo))
   /// The fetch failed (the combobox's note is static, so no reason
   /// rides).
   BotAliasesFailed(provider_id: String)
@@ -299,6 +319,7 @@ pub fn init() -> State {
     bot_last_error: None,
     bot_alias_provider: None,
     bot_aliases: dict.new(),
+    bot_model_draft: "",
     bot_tools: ToolCatalogIdle,
     bot_tools_picked: [],
     bot_tools_custom: False,
@@ -327,6 +348,7 @@ pub fn sync_edited_bot(
           let next =
             State(
               ..state,
+              bot_model_draft: b.model,
               bot_tools_picked: option.unwrap(b.tools, []),
               bot_tools_custom: option.is_some(b.tools),
               bot_edit_sync_pending: False,
@@ -347,6 +369,7 @@ pub fn sync_edited_bot(
             ..state,
             bot_edit: None,
             bot_alias_provider: None,
+            bot_model_draft: "",
             bot_edit_sync_pending: False,
           ),
           effect.none(),
@@ -397,6 +420,7 @@ pub fn update(
         // The combobox slot goes with the forms; the per-provider
         // alias cache survives (still valid for the next open).
         bot_alias_provider: None,
+        bot_model_draft: "",
       ),
       effect.none(),
       // Refresh both lists on tab switch so another session's new
@@ -546,6 +570,7 @@ pub fn update(
             bot_edit: None,
             bot_edit_sync_pending: False,
             bot_confirm: None,
+            bot_model_draft: "",
             // One form section-wide, like the provider forms: opening
             // one closes the other section's open form/editor/confirm.
             open: False,
@@ -599,6 +624,12 @@ pub fn update(
       #(state, fetch, [])
     }
 
+    BotModelChanged(model) -> #(
+      State(..state, bot_model_draft: model, bot_edit_sync_pending: False),
+      effect.none(),
+      [],
+    )
+
     BotSubmitted(
       name,
       description,
@@ -606,31 +637,41 @@ pub fn update(
       model,
       system_prompt,
       tools_text,
-    ) -> {
-      // The toolset's channel is the Custom switch (issue #121): OFF
-      // saves the default set; ON the ticks (or, degraded, the text
-      // field) are the toolset, empty = chat-only.
-      let tools = form_toolset(state, tools_text)
-      #(
-        State(..state, bots_open: False),
-        create_bot_effect(
-          bots,
-          name,
-          description,
-          provider_id,
-          model,
-          system_prompt,
-          tools,
-        ),
-        [],
-      )
-    }
+      context_window_text,
+    ) ->
+      case parse_context_window_field(context_window_text) {
+        Error(reason) -> #(
+          State(..state, bot_last_error: Some(reason)),
+          effect.none(),
+          [OpFailed("bot operation failed: " <> reason)],
+        )
+        Ok(context_window) -> {
+          // The toolset's channel is the Custom switch (issue #121): OFF
+          // saves the default set; ON the ticks (or, degraded, the text
+          // field) are the toolset, empty = chat-only.
+          let tools = form_toolset(state, tools_text)
+          #(
+            State(..state, bots_open: False, bot_model_draft: ""),
+            create_bot_effect(
+              bots,
+              name,
+              description,
+              provider_id,
+              model,
+              system_prompt,
+              tools,
+              context_window,
+            ),
+            [],
+          )
+        }
+      }
 
     BotCreated(_bot) -> #(State(..state, bot_last_error: None), effect.none(), [
       BotsChanged,
     ])
 
-    BotEditToggled(id, provider_id, tools) -> {
+    BotEditToggled(id, provider_id, model, tools) -> {
       // Opening scopes the model combobox to the bot's own provider
       // (the select's preselected value), seeds the picker from the
       // bot's stored toolset — switch ON for any explicit set (a
@@ -644,6 +685,10 @@ pub fn update(
             ..state,
             bot_edit: toggle_open(state.bot_edit, id),
             bot_edit_sync_pending: opening,
+            bot_model_draft: case opening {
+              True -> model
+              False -> ""
+            },
             bots_open: False,
             bot_confirm: None,
             // One form section-wide, like the provider forms: opening
@@ -686,27 +731,42 @@ pub fn update(
       model,
       system_prompt,
       tools_text,
-    ) -> {
-      // The toolset's channel is the Custom switch (see
-      // `BotSubmitted`): the ticks are always seeded on open, so an
-      // untouched form resubmits the stored state verbatim (bots plan
-      // P2).
-      let tools = form_toolset(state, tools_text)
-      #(
-        State(..state, bot_edit: None, bot_edit_sync_pending: False),
-        update_bot_effect(
-          bots,
-          id,
-          name,
-          description,
-          provider_id,
-          model,
-          system_prompt,
-          tools,
-        ),
-        [],
-      )
-    }
+      context_window_text,
+    ) ->
+      case parse_context_window_field(context_window_text) {
+        Error(reason) -> #(
+          State(..state, bot_last_error: Some(reason)),
+          effect.none(),
+          [OpFailed("bot operation failed: " <> reason)],
+        )
+        Ok(context_window) -> {
+          // The toolset's channel is the Custom switch (see
+          // `BotSubmitted`): the ticks are always seeded on open, so an
+          // untouched form resubmits the stored state verbatim (bots plan
+          // P2).
+          let tools = form_toolset(state, tools_text)
+          #(
+            State(
+              ..state,
+              bot_edit: None,
+              bot_edit_sync_pending: False,
+              bot_model_draft: "",
+            ),
+            update_bot_effect(
+              bots,
+              id,
+              name,
+              description,
+              provider_id,
+              model,
+              system_prompt,
+              tools,
+              context_window,
+            ),
+            [],
+          )
+        }
+      }
 
     BotInboundToggled(id, allow) -> #(
       state,
@@ -1121,6 +1181,15 @@ fn bot_row(
           Some(names) -> "tools: " <> string.join(names, ", ")
         }),
       ]),
+      case b.context_window {
+        Some(window) ->
+          html.span([attr.class("provider-sub muted")], [
+            html.text(
+              "context window: " <> format_int_commas(window) <> " tokens",
+            ),
+          ])
+        None -> element.none()
+      },
     ]),
     html.div([attr.class("row-controls")], [
       // The inbound gate toggle (bots plan P3a): the button names the
@@ -1139,7 +1208,7 @@ fn bot_row(
       control(
         "Edit",
         "Edit this bot",
-        BotEditToggled(id, b.provider_id, b.tools),
+        BotEditToggled(id, b.provider_id, b.model, b.tools),
       ),
       control("Delete", "Delete this bot forever", BotDeleteRequested(id)),
     ]),
@@ -1200,6 +1269,7 @@ fn bot_row(
             attr.attribute("autocomplete", "off"),
             attr.placeholder("Model alias"),
             attr.aria("label", "Model alias for " <> b.name),
+            bot_model_changed(),
           ]),
           bot_model_suggestions(state, state.bot_edit == Some(id)),
         ]),
@@ -1208,6 +1278,23 @@ fn bot_row(
           state.bot_edit == Some(id),
           combobox_provider_name(provider_list, state.bot_alias_provider),
         ),
+        html.label([attr.for("bot-context-window-" <> id)], [
+          html.text("Context window (tokens, optional)"),
+        ]),
+        html.input([
+          attr.id("bot-context-window-" <> id),
+          attr.type_("number"),
+          attr.name("context_window"),
+          attr.value(case b.context_window {
+            Some(window) -> int.to_string(window)
+            None -> ""
+          }),
+          attr.attribute("min", int.to_string(bot.min_context_window)),
+          attr.attribute("step", "1"),
+          attr.placeholder("e.g. 131072 (blank = server default)"),
+          attr.aria("label", "Context window in tokens for " <> b.name),
+        ]),
+        bot_context_window_hint(state, state.bot_edit == Some(id)),
         html.textarea(
           [
             attr.name("system_prompt"),
@@ -1230,7 +1317,7 @@ fn bot_row(
           html.button(
             [
               attr.type_("button"),
-              event.on_click(BotEditToggled(id, b.provider_id, b.tools)),
+              event.on_click(BotEditToggled(id, b.provider_id, b.model, b.tools)),
             ],
             [html.text("Cancel")],
           ),
@@ -1323,6 +1410,7 @@ fn add_bot_form(state: State, provider_list: List(Provider)) -> Element(Msg) {
           attr.attribute("autocomplete", "off"),
           attr.placeholder("Model alias"),
           attr.aria("label", "New bot model alias"),
+          bot_model_changed(),
         ]),
         bot_model_suggestions(state, state.bots_open),
       ]),
@@ -1331,6 +1419,19 @@ fn add_bot_form(state: State, provider_list: List(Provider)) -> Element(Msg) {
         state.bots_open,
         combobox_provider_name(provider_list, state.bot_alias_provider),
       ),
+      html.label([attr.for("add-bot-context-window")], [
+        html.text("Context window (tokens, optional)"),
+      ]),
+      html.input([
+        attr.id("add-bot-context-window"),
+        attr.type_("number"),
+        attr.name("context_window"),
+        attr.attribute("min", int.to_string(bot.min_context_window)),
+        attr.attribute("step", "1"),
+        attr.placeholder("e.g. 131072 (blank = server default)"),
+        attr.aria("label", "New bot context window in tokens"),
+      ]),
+      bot_context_window_hint(state, state.bots_open),
       html.textarea(
         [
           attr.name("system_prompt"),
@@ -1909,8 +2010,10 @@ fn bot_aliases_effect(
 ) -> Effect(Msg) {
   effect.from(fn(dispatch) {
     process.spawn_unlinked(fn() {
-      case provider_registry.list_models(providers, id, models_timeout_ms) {
-        Ok(aliases) -> dispatch(BotAliasesLoaded(id, aliases))
+      case
+        provider_registry.list_model_infos(providers, id, models_timeout_ms)
+      {
+        Ok(models) -> dispatch(BotAliasesLoaded(id, models))
         Error(_) -> dispatch(BotAliasesFailed(id))
       }
     })
@@ -1981,6 +2084,7 @@ fn create_bot_effect(
   model: String,
   system_prompt: String,
   tools: Option(List(String)),
+  context_window: Option(Int),
 ) -> Effect(Msg) {
   let params =
     bot.BotParams(
@@ -1993,6 +2097,7 @@ fn create_bot_effect(
         prompt -> Some(prompt)
       },
       tools: tools,
+      context_window: context_window,
     )
   effect.from(fn(dispatch) {
     case bot_registry.create_bot(bots, params) {
@@ -2016,6 +2121,7 @@ fn update_bot_effect(
   model: String,
   system_prompt: String,
   tools: Option(List(String)),
+  context_window: Option(Int),
 ) -> Effect(Msg) {
   let patch =
     bot.BotUpdate(
@@ -2032,6 +2138,9 @@ fn update_bot_effect(
       // The gate has no form field (bots plan P3a): the row's toggle
       // patches it on its own.
       allow_inbound: None,
+      // Context window always replaces from the form field (blank = clear
+      // back to server default, integer = set).
+      context_window: Some(context_window),
     )
   effect.from(fn(dispatch) {
     case bot_registry.update_bot(bots, id, patch) {
@@ -2058,6 +2167,7 @@ fn set_bot_inbound_effect(
       system_prompt: None,
       tools: None,
       allow_inbound: Some(allow),
+      context_window: None,
     )
   effect.from(fn(dispatch) {
     case bot_registry.update_bot(bots, id, patch) {
@@ -2065,6 +2175,41 @@ fn set_bot_inbound_effect(
       Error(error) -> dispatch(BotMutateFailed(bot_registry.describe(error)))
     }
   })
+}
+
+/// Parse the bot form's optional `context_window` numeric field: blank
+/// clears/unsets (`Ok(None)`), an integer passes through (`Ok(Some(n))`,
+/// where the registry enforces `>= bot.min_context_window`), and anything
+/// else fails with a clear message before calling the registry.
+pub fn parse_context_window_field(raw: String) -> Result(Option(Int), String) {
+  case string.trim(raw) {
+    "" -> Ok(None)
+    trimmed ->
+      case int.parse(trimmed) {
+        Ok(n) -> Ok(Some(n))
+        Error(_) -> Error("context window must be a whole number of tokens")
+      }
+  }
+}
+
+/// Format an integer with thousands commas (e.g. `131072` → `"131,072"`).
+/// Shared with `nexus/ui` for usage tooltips.
+pub fn format_int_commas(n: Int) -> String {
+  case n < 0 {
+    True -> "-" <> format_positive_commas(-n)
+    False -> format_positive_commas(n)
+  }
+}
+
+fn format_positive_commas(n: Int) -> String {
+  let digits = int.to_string(n)
+  digits
+  |> string.to_graphemes
+  |> list.reverse
+  |> list.sized_chunk(3)
+  |> list.map(fn(chunk) { chunk |> list.reverse |> string.concat })
+  |> list.reverse
+  |> string.join(",")
 }
 
 /// The degraded free-text field → an explicit name list (trimmed,
@@ -2251,22 +2396,22 @@ fn bot_model_suggestions(state: State, open: Bool) -> Element(Msg) {
         None -> element.none()
         Some(id) ->
           case dict.get(state.bot_aliases, id) {
-            Ok(AliasOk(aliases)) ->
+            Ok(AliasOk(models)) ->
               html.div(
                 [
                   attr.class("combo-list"),
                   attr.attribute("aria-hidden", "true"),
                   attr.aria("label", "Model alias suggestions"),
                 ],
-                list.map(aliases, fn(alias) {
+                list.map(models, fn(model) {
                   html.button(
                     [
                       attr.type_("button"),
                       attr.class("combo-opt"),
                       attr.attribute("tabindex", "-1"),
-                      attr.data("value", alias),
+                      attr.data("value", model.id),
                     ],
-                    [html.text(alias)],
+                    [html.text(model.id)],
                   )
                 }),
               )
@@ -2274,6 +2419,42 @@ fn bot_model_suggestions(state: State, open: Bool) -> Element(Msg) {
           }
       }
   }
+}
+
+/// Best-effort non-binding context-length helper text under the bot
+/// form's `context_window` input: when the scoped provider's `/v1/models`
+/// list reported a context length for the currently typed/picked model
+/// alias, show `"Provider reports X tokens"`. Renders nothing when no
+/// hint is available (never blocks save or thread creation).
+fn bot_context_window_hint(state: State, open: Bool) -> Element(Msg) {
+  case open, state.bot_alias_provider, string.trim(state.bot_model_draft) {
+    True, Some(id), model_id if model_id != "" ->
+      case dict.get(state.bot_aliases, id) {
+        Ok(AliasOk(models)) ->
+          case list.find(models, fn(m) { m.id == model_id }) {
+            Ok(openai.ModelInfo(_, Some(length))) ->
+              html.small([attr.class("muted context-window-hint")], [
+                html.text(
+                  "Provider reports " <> format_int_commas(length) <> " tokens",
+                ),
+              ])
+            _ -> element.none()
+          }
+        _ -> element.none()
+      }
+    _, _, _ -> element.none()
+  }
+}
+
+/// The open bot form's model input change handler: tracks `bot_model_draft`
+/// so `bot_context_window_hint` updates live while typing or picking from
+/// the combobox.
+fn bot_model_changed() -> attr.Attribute(Msg) {
+  let decoder =
+    decode.at(["target", "value"], decode.string)
+    |> decode.map(BotModelChanged)
+  event.on("input", decoder)
+  |> server_component.include(["target.value"])
 }
 
 /// The open bot form's model-combobox hint: names the source of the
@@ -2366,9 +2547,17 @@ fn bot_submitted() -> attr.Attribute(Msg) {
       form_field(entries, "provider"),
       form_field(entries, "model"),
       form_field(entries, "system_prompt"),
-      form_field(entries, "tools")
+      form_field(entries, "tools"),
+      form_field(entries, "context_window")
     {
-      Ok(name), description, Ok(provider_id), Ok(model), prompt, tools ->
+      Ok(name),
+        description,
+        Ok(provider_id),
+        Ok(model),
+        prompt,
+        tools,
+        context_window
+      ->
         BotSubmitted(
           name,
           result.unwrap(description, ""),
@@ -2376,8 +2565,9 @@ fn bot_submitted() -> attr.Attribute(Msg) {
           model,
           result.unwrap(prompt, ""),
           result.unwrap(tools, ""),
+          result.unwrap(context_window, ""),
         )
-      _, _, _, _, _, _ -> Ignored
+      _, _, _, _, _, _, _ -> Ignored
     }
   })
   |> server_component.include(["detail.formData"])
@@ -2393,9 +2583,17 @@ fn bot_edit_submitted(id: String) -> attr.Attribute(Msg) {
       form_field(entries, "provider"),
       form_field(entries, "model"),
       form_field(entries, "system_prompt"),
-      form_field(entries, "tools")
+      form_field(entries, "tools"),
+      form_field(entries, "context_window")
     {
-      Ok(name), description, provider_id, Ok(model), prompt, tools ->
+      Ok(name),
+        description,
+        provider_id,
+        Ok(model),
+        prompt,
+        tools,
+        context_window
+      ->
         BotEditSubmitted(
           id,
           name,
@@ -2404,8 +2602,9 @@ fn bot_edit_submitted(id: String) -> attr.Attribute(Msg) {
           model,
           result.unwrap(prompt, ""),
           result.unwrap(tools, ""),
+          result.unwrap(context_window, ""),
         )
-      _, _, _, _, _, _ -> Ignored
+      _, _, _, _, _, _, _ -> Ignored
     }
   })
   |> server_component.include(["detail.formData"])

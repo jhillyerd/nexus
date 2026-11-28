@@ -20,6 +20,7 @@
 
 import gleam/bit_array
 import gleam/bytes_tree
+import gleam/dict
 import gleam/dynamic/decode
 import gleam/erlang/process.{type Subject}
 import gleam/http.{type Method}
@@ -111,9 +112,27 @@ pub type Endpoint {
   )
 }
 
+/// One entry from `GET /v1/models`: the effective model id (Bifrost alias
+/// when present, otherwise `id`) plus a best-effort context-length hint
+/// parsed from common OpenAI-compatible extensions (`max_model_len`,
+/// `context_length`, `meta.n_ctx_train`). Display hint only — never
+/// auto-applied as a thread budget.
+pub type ModelInfo {
+  ModelInfo(id: String, context_length: Option(Int))
+}
+
 /// Buffered `GET /v1/models` — doubles as preflight (validates URL + auth
 /// with a real status code) and as the Bifrost sanity check.
 pub fn list_models(endpoint: Endpoint) -> Result(List(String), StreamError) {
+  list_model_infos(endpoint)
+  |> result.map(fn(infos) { list.map(infos, fn(info) { info.id }) })
+}
+
+/// Buffered `GET /v1/models` returning each model's id plus any optional
+/// context-length hint reported by the endpoint.
+pub fn list_model_infos(
+  endpoint: Endpoint,
+) -> Result(List(ModelInfo), StreamError) {
   use <- ensure_boot()
   let req =
     model.list_request(to_openai_config(endpoint))
@@ -122,34 +141,124 @@ pub fn list_models(endpoint: Endpoint) -> Result(List(String), StreamError) {
     hackney.send(req) |> result.map_error(fn(e) { Transport(send_error(e)) }),
   )
   case response.status {
-    200 ->
-      // Bifrost finding (live, spike A preflight): its /v1/models omits the
-      // per-entry `object` field real OpenAI sends, and glopenai 1.0.0's
-      // `model.list_response` decoder requires it — decode the Bifrost alias (falling back to id) here.
-      case json.parse(response.body, using: model_ids_decoder()) {
-        Ok(ids) -> Ok(list.unique(ids))
-        Error(errors) -> Error(Decode(string.inspect(errors)))
-      }
+    200 -> decode_model_infos(response.body)
     status -> Error(Non200(status, snippet(response.body)))
   }
 }
 
-fn model_ids_decoder() -> decode.Decoder(List(String)) {
-  use data <- decode.field("data", decode.list(id_decoder()))
+/// Pure decoder for `/v1/models` responses (offline-testable). Tolerates
+/// missing, null, non-positive, or wrong-typed context-length fields so
+/// provider quirks never fail model listing.
+pub fn decode_model_infos(
+  body: String,
+) -> Result(List(ModelInfo), StreamError) {
+  // Bifrost finding (live, spike A preflight): its /v1/models omits the
+  // per-entry `object` field real OpenAI sends, and glopenai 1.0.0's
+  // `model.list_response` decoder requires it — decode the Bifrost alias
+  // (falling back to id) plus optional context-length hints here.
+  case json.parse(body, using: model_infos_decoder()) {
+    Ok(infos) -> Ok(dedupe_model_infos(infos))
+    Error(errors) -> Error(Decode(string.inspect(errors)))
+  }
+}
+
+/// Deduplicate models by `id` in linear time while preserving first-seen order.
+/// When duplicate entries carry hints, the first non-None hint wins (a later
+/// duplicate only fills in `None`).
+fn dedupe_model_infos(infos: List(ModelInfo)) -> List(ModelInfo) {
+  let merged =
+    list.fold(infos, dict.new(), fn(acc, info) {
+      case dict.get(acc, info.id) {
+        Ok(ModelInfo(id: id, context_length: existing_len)) ->
+          dict.insert(
+            acc,
+            id,
+            ModelInfo(
+              id: id,
+              context_length: option.or(existing_len, info.context_length),
+            ),
+          )
+        Error(_) -> dict.insert(acc, info.id, info)
+      }
+    })
+  let #(rev_out, _) =
+    list.fold(infos, #([], dict.new()), fn(state, info) {
+      let #(out, seen) = state
+      case dict.has_key(seen, info.id) {
+        True -> state
+        False ->
+          case dict.get(merged, info.id) {
+            Ok(m) -> #([m, ..out], dict.insert(seen, info.id, Nil))
+            Error(_) -> state
+          }
+      }
+    })
+  list.reverse(rev_out)
+}
+
+fn model_infos_decoder() -> decode.Decoder(List(ModelInfo)) {
+  use data <- decode.field("data", decode.list(model_info_decoder()))
   decode.success(data)
 }
 
-fn id_decoder() -> decode.Decoder(String) {
+fn model_info_decoder() -> decode.Decoder(ModelInfo) {
   use id <- decode.field("id", decode.string)
   use alias <- decode.optional_field(
     "alias",
     None,
     decode.optional(decode.string),
   )
-  case alias {
-    Some(name) -> decode.success(name)
-    None -> decode.success(id)
+  use max_model_len <- decode.optional_field(
+    "max_model_len",
+    None,
+    tolerant_positive_int_decoder(),
+  )
+  use context_length <- decode.optional_field(
+    "context_length",
+    None,
+    tolerant_positive_int_decoder(),
+  )
+  use meta_n_ctx_train <- decode.optional_field(
+    "meta",
+    None,
+    tolerant_meta_n_ctx_train_decoder(),
+  )
+  let effective_id = case alias {
+    Some(name) -> name
+    None -> id
   }
+  let ctx =
+    max_model_len
+    |> option.or(context_length)
+    |> option.or(meta_n_ctx_train)
+  decode.success(ModelInfo(id: effective_id, context_length: ctx))
+}
+
+fn tolerant_positive_int_decoder() -> decode.Decoder(Option(Int)) {
+  decode.one_of(
+    decode.int
+      |> decode.map(fn(n) {
+        case n > 0 {
+          True -> Some(n)
+          False -> None
+        }
+      }),
+    or: [decode.success(None)],
+  )
+}
+
+fn tolerant_meta_n_ctx_train_decoder() -> decode.Decoder(Option(Int)) {
+  decode.one_of(
+    {
+      use n <- decode.optional_field(
+        "n_ctx_train",
+        None,
+        tolerant_positive_int_decoder(),
+      )
+      decode.success(n)
+    },
+    or: [decode.success(None)],
+  )
 }
 
 /// Stream a chat completion for `transcript`, forwarding typed events to
@@ -204,8 +313,9 @@ pub fn stream_with_cancel(
       let req =
         chat.create_request(
           to_openai_config(endpoint),
-          transcript.to_request(transcript, opts),
+          chat.new_create_request("", []),
         )
+        |> request.set_body(transcript.request_body(transcript, opts))
         |> drop_empty_bearer(endpoint)
       stream_request(endpoint, req, on_event, cancel)
     }

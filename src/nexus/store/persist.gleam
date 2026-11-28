@@ -68,6 +68,8 @@ pub type Msg {
   )
   /// Write-behind turn commit (fire-and-forget, ordered by arrival).
   Commit(id: String, transcript: Transcript)
+  /// Write-behind context-token watermark update (fire-and-forget).
+  SetLastContextTokens(id: String, tokens: Int)
   SetTitle(id: String, title: String, reply: Subject(Result(Nil, String)))
   AutoTitle(id: String, title: String, reply: Subject(Result(Bool, String)))
   AutoMetaUpgrade(
@@ -255,6 +257,9 @@ pub fn seam(store_actor: Subject(Msg)) -> store.Store {
     },
     commit: fn(id, transcript) {
       process.send(store_actor, Commit(id, transcript))
+    },
+    set_last_context_tokens: fn(id, tokens) {
+      process.send(store_actor, SetLastContextTokens(id, tokens))
     },
     set_title: fn(id, title) {
       actor.call(store_actor, call_timeout_ms, fn(reply) {
@@ -492,6 +497,8 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
                       // The column already counts the system prompt
                       // (Phase 1 semantics).
                       message_count: row.message_count,
+                      context_window: row.context_window,
+                      last_context_tokens: row.last_context_tokens,
                     ),
                     system_prompt: row.system_prompt,
                   ))
@@ -598,6 +605,9 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
             Some(ws) -> option.unwrap(ws.tmp_rel_path, "")
             None -> ""
           },
+          // Context monitoring (Phase 1, $21..$22): 0 / -1 sentinels insert NULL.
+          option.unwrap(summary.context_window, 0),
+          option.unwrap(summary.last_context_tokens, -1),
         )
         |> result.map(fn(_) { Nil })
         |> result.map_error(query_error)
@@ -645,6 +655,15 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
     }
 
     Commit(id, tr) -> handle_commit(state, id, tr)
+
+    SetLastContextTokens(id, tokens) -> {
+      case sql.set_last_context_tokens(state.db, int.max(0, tokens), id) {
+        Ok(_) -> Nil
+        Error(error) ->
+          log_store_error("set_last_context_tokens " <> id, query_error(error))
+      }
+      actor.continue(state)
+    }
 
     SetTitle(id, title, reply) -> {
       process.send(reply, update(sql.set_title(state.db, title, id)))
@@ -893,6 +912,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
               row.system_prompt,
               row.tools,
               row.allow_inbound,
+              row.context_window,
               row.created_s,
               row.updated_s,
             )
@@ -921,6 +941,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
                 row.system_prompt,
                 row.tools,
                 row.allow_inbound,
+                row.context_window,
                 row.created_s,
                 row.updated_s,
               ))
@@ -952,6 +973,8 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           // The inbound gate (bots plan P3a): the row's value verbatim
           // (creates always carry true; the seam writes full rows).
           bot.allow_inbound,
+          // Context window ($11): 0 sentinel inserts NULL.
+          option.unwrap(bot.context_window, 0),
         )
         |> result.map(fn(_) { Nil })
         |> result.map_error(query_error)
@@ -976,6 +999,8 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           option.is_none(bot.tools),
           // The merged row's inbound gate (bots plan P3a).
           bot.allow_inbound,
+          // Context window ($10): 0 sentinel clears to NULL.
+          option.unwrap(bot.context_window, 0),
         )
         |> result.map(fn(_) { Nil })
         |> result.map_error(query_error)
@@ -1442,6 +1467,8 @@ fn stored_summary_from_row(
         // The column already counts the system prompt (Phase 1
         // semantics).
         message_count: row.message_count,
+        context_window: row.context_window,
+        last_context_tokens: row.last_context_tokens,
       ))
   }
 }
@@ -1457,6 +1484,7 @@ fn bot_from_row(
   system_prompt: option.Option(String),
   tools: option.Option(List(String)),
   allow_inbound: Bool,
+  context_window: option.Option(Int),
   created_s: Int,
   updated_s: Int,
 ) -> store.StoredBot {
@@ -1472,6 +1500,7 @@ fn bot_from_row(
     tools: tools,
     // The inbound gate (bots plan P3a).
     allow_inbound: allow_inbound,
+    context_window: context_window,
     created_at: created_s,
     updated_at: updated_s,
   )
