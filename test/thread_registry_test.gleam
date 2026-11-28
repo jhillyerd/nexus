@@ -83,6 +83,8 @@ fn test_config() -> config.Config {
     // Bots P3c: the delivery hop guard; 4 = the shipped default.
     max_bot_hops: 4,
     default_context_window: None,
+    compaction_keep_tail_pct: 20,
+    compaction_max_tokens: 4096,
   )
 }
 
@@ -244,6 +246,9 @@ fn toolset(runner: thread.TurnRunner) -> thread.Toolset {
     runner: runner,
     utility_runner: fn(_endpoint, _tr, _cancel, _allow_pass) {
       Error("no utility call in this test")
+    },
+    compaction_runner: fn(_endpoint, _tr, _cutoff, _focus, _ctx, _bpt, _cancel) {
+      Error("no compaction in this test")
     },
   )
 }
@@ -2091,6 +2096,17 @@ pub fn create_with_toolset_carries_the_whole_bundle_test() {
         process.send(ping, Nil)
         Error("asserted by the ping, not the verdict")
       },
+      compaction_runner: fn(
+        _endpoint,
+        _tr,
+        _cutoff,
+        _focus,
+        _ctx,
+        _bpt,
+        _cancel,
+      ) {
+        Error("no compaction in this test")
+      },
     )
   let assert Ok(summary) =
     thread_registry.create_with_toolset(
@@ -2545,6 +2561,17 @@ pub fn env_toolset_runner_receives_environment_handle_test() {
       utility_runner: fn(_endpoint, _tr, _cancel, _allow_pass) {
         Error("no utility call in this test")
       },
+      compaction_runner: fn(
+        _endpoint,
+        _tr,
+        _cutoff,
+        _focus,
+        _ctx,
+        _bpt,
+        _cancel,
+      ) {
+        Error("no compaction in this test")
+      },
     )
   let assert Ok(summary) =
     thread_registry.create_with_toolset(
@@ -2588,6 +2615,17 @@ pub fn env_roster_row_persists_with_first_commit_test() {
       },
       utility_runner: fn(_endpoint, _tr, _cancel, _allow_pass) {
         Error("no utility call in this test")
+      },
+      compaction_runner: fn(
+        _endpoint,
+        _tr,
+        _cutoff,
+        _focus,
+        _ctx,
+        _bpt,
+        _cancel,
+      ) {
+        Error("no compaction in this test")
       },
     )
   let assert Ok(summary) =
@@ -2714,6 +2752,17 @@ pub fn env_toolset_hydrate_injects_workspace_and_tmp_rel_paths_test() {
       },
       utility_runner: fn(_endpoint, _tr, _cancel, _allow_pass) {
         Error("no utility call in this test")
+      },
+      compaction_runner: fn(
+        _endpoint,
+        _tr,
+        _cutoff,
+        _focus,
+        _ctx,
+        _bpt,
+        _cancel,
+      ) {
+        Error("no compaction in this test")
       },
     )
   let factory_name = process.new_name("nexus_test_factory")
@@ -3068,6 +3117,7 @@ pub fn codemode_survives_many_prior_threads_without_heap_blowup_test() {
       specs: specs,
       runner: runner,
       utility_runner: fn(_, _, _, _) { Error("unused") },
+      compaction_runner: fn(_, _, _, _, _, _, _) { Error("unused") },
     )
   let assert Ok(summary) =
     thread_registry.create_with_toolset(

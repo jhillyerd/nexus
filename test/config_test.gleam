@@ -56,6 +56,8 @@ fn set_all(pairs: List(#(String, String))) -> Nil {
   envoy.unset("NEXUS_WEB_FETCH_MAX_CHARS")
   envoy.unset("NEXUS_WEB_FETCH_CACHE_TTL_MS")
   envoy.unset("NEXUS_DEFAULT_CONTEXT_WINDOW")
+  envoy.unset("NEXUS_COMPACTION_KEEP_TAIL_PCT")
+  envoy.unset("NEXUS_COMPACTION_MAX_TOKENS")
   list.each(pairs, fn(pair) { envoy.set(pair.0, pair.1) })
 }
 
@@ -938,4 +940,97 @@ pub fn default_context_window_unset_blank_valid_and_rejected_test() {
   ])
   let assert Error(blank_existing) = config.load()
   should.be_true(string.contains(blank_existing.message, "NEXUS_ENV_TIMEOUT_MS"))
+}
+
+// ---------------------------------------------------------------------------
+// Context compaction (Phase 2): KEEP_TAIL_PCT & MAX_TOKENS
+// ---------------------------------------------------------------------------
+
+pub fn compaction_knobs_defaults_overrides_and_bounds_test() {
+  set_all([#("NEXUS_ENCRYPTION_KEY", key_b64)])
+  let assert Ok(defaults) = config.load()
+  defaults.compaction_keep_tail_pct |> should.equal(20)
+  defaults.compaction_max_tokens |> should.equal(4096)
+
+  // Blank falls back to default cleanly.
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_COMPACTION_KEEP_TAIL_PCT", "  "),
+    #("NEXUS_COMPACTION_MAX_TOKENS", ""),
+  ])
+  let assert Ok(blank) = config.load()
+  blank.compaction_keep_tail_pct |> should.equal(20)
+  blank.compaction_max_tokens |> should.equal(4096)
+
+  // Valid boundary overrides.
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_COMPACTION_KEEP_TAIL_PCT", "0"),
+    #("NEXUS_COMPACTION_MAX_TOKENS", "512"),
+  ])
+  let assert Ok(lo) = config.load()
+  lo.compaction_keep_tail_pct |> should.equal(0)
+  lo.compaction_max_tokens |> should.equal(512)
+
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_COMPACTION_KEEP_TAIL_PCT", "40"),
+    #("NEXUS_COMPACTION_MAX_TOKENS", "8192"),
+  ])
+  let assert Ok(hi) = config.load()
+  hi.compaction_keep_tail_pct |> should.equal(40)
+  hi.compaction_max_tokens |> should.equal(8192)
+
+  // Out-of-range values fail boot loudly.
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_COMPACTION_KEEP_TAIL_PCT", "41"),
+  ])
+  let assert Error(pct_high) = config.load()
+  should.be_true(string.contains(
+    pct_high.message,
+    "NEXUS_COMPACTION_KEEP_TAIL_PCT",
+  ))
+
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_COMPACTION_KEEP_TAIL_PCT", "-1"),
+  ])
+  should.be_error(config.load())
+
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_COMPACTION_KEEP_TAIL_PCT", "abc"),
+  ])
+  let assert Error(pct_bad) = config.load()
+  should.be_true(string.contains(
+    pct_bad.message,
+    "NEXUS_COMPACTION_KEEP_TAIL_PCT",
+  ))
+  should.be_true(string.contains(pct_bad.message, "is not an integer"))
+
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_COMPACTION_MAX_TOKENS", "511"),
+  ])
+  let assert Error(max_low) = config.load()
+  should.be_true(string.contains(max_low.message, "NEXUS_COMPACTION_MAX_TOKENS"))
+
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_COMPACTION_MAX_TOKENS", "2147483648"),
+  ])
+  let assert Error(max_high) = config.load()
+  should.be_true(string.contains(
+    max_high.message,
+    "NEXUS_COMPACTION_MAX_TOKENS",
+  ))
+  should.be_true(string.contains(max_high.message, "<= 2147483647"))
+
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_COMPACTION_MAX_TOKENS", "4k"),
+  ])
+  let assert Error(max_bad) = config.load()
+  should.be_true(string.contains(max_bad.message, "is not an integer"))
 }

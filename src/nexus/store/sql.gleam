@@ -1102,6 +1102,68 @@ values ($1, $2, $3, $4, $5, nullif($6, ''), case when $8::boolean then null else
   |> pog.execute(db)
 }
 
+/// Append one immutable compaction checkpoint for a thread.
+/// roster_snapshot and focus use the '' -> NULL sentinel (squirrel has no
+/// nullable parameters); before_tokens and after_tokens use the -1 -> NULL
+/// sentinel (matching insert_thread.sql's last_context_tokens convention).
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn insert_compaction(
+  db: pog.Connection,
+  arg_1: String,
+  arg_2: Int,
+  arg_3: String,
+  arg_4: String,
+  arg_5: String,
+  arg_6: String,
+  arg_7: Int,
+  arg_8: Int,
+  arg_9: Int,
+) -> Result(pog.Returned(Nil), pog.QueryError) {
+  let decoder = decode.map(decode.dynamic, fn(_) { Nil })
+
+  "-- Append one immutable compaction checkpoint for a thread.
+-- roster_snapshot and focus use the '' -> NULL sentinel (squirrel has no
+-- nullable parameters); before_tokens and after_tokens use the -1 -> NULL
+-- sentinel (matching insert_thread.sql's last_context_tokens convention).
+insert into thread_compaction (
+  thread_id,
+  cutoff_index,
+  summary,
+  roster_snapshot,
+  focus,
+  trigger_kind,
+  before_tokens,
+  after_tokens,
+  created_at
+) values (
+  $1,
+  $2::int,
+  $3,
+  nullif($4, ''::text),
+  nullif($5, ''::text),
+  $6,
+  case when $7::int < 0 then null else $7::int end,
+  case when $8::int < 0 then null else $8::int end,
+  to_timestamp($9::bigint)
+)
+"
+  |> pog.query
+  |> pog.parameter(pog.text(arg_1))
+  |> pog.parameter(pog.int(arg_2))
+  |> pog.parameter(pog.text(arg_3))
+  |> pog.parameter(pog.text(arg_4))
+  |> pog.parameter(pog.text(arg_5))
+  |> pog.parameter(pog.text(arg_6))
+  |> pog.parameter(pog.int(arg_7))
+  |> pog.parameter(pog.int(arg_8))
+  |> pog.parameter(pog.int(arg_9))
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
 /// A new node row (environments plan Phase 2b): the remote paired-TUI
 /// node entity. Per-thread names: the row is bound to its thread — the
 /// roster it serves — and (thread_id, name) is the node identity
@@ -1923,6 +1985,83 @@ left join workspace tw on tw.id = thread.tmp_workspace_id
 order by thread.id
 "
   |> pog.query
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
+/// A row you get from running the `load_compactions` query
+/// defined in `./src/nexus/store/sql/load_compactions.sql`.
+///
+/// > 🐿️ This type definition was generated automatically using v4.7.0 of the
+/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub type LoadCompactionsRow {
+  LoadCompactionsRow(
+    id: Int,
+    cutoff_index: Int,
+    summary: String,
+    roster_snapshot: Option(String),
+    focus: Option(String),
+    trigger_kind: String,
+    before_tokens: Option(Int),
+    after_tokens: Option(Int),
+    created_s: Int,
+  )
+}
+
+/// All compaction checkpoints for one thread in chronological order (oldest
+/// first, by insertion id) so hydration replays them through
+/// `transcript.apply_compaction` in exact order.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn load_compactions(
+  db: pog.Connection,
+  thread_id: String,
+) -> Result(pog.Returned(LoadCompactionsRow), pog.QueryError) {
+  let decoder = {
+    use id <- decode.field(0, decode.int)
+    use cutoff_index <- decode.field(1, decode.int)
+    use summary <- decode.field(2, decode.string)
+    use roster_snapshot <- decode.field(3, decode.optional(decode.string))
+    use focus <- decode.field(4, decode.optional(decode.string))
+    use trigger_kind <- decode.field(5, decode.string)
+    use before_tokens <- decode.field(6, decode.optional(decode.int))
+    use after_tokens <- decode.field(7, decode.optional(decode.int))
+    use created_s <- decode.field(8, decode.int)
+    decode.success(LoadCompactionsRow(
+      id:,
+      cutoff_index:,
+      summary:,
+      roster_snapshot:,
+      focus:,
+      trigger_kind:,
+      before_tokens:,
+      after_tokens:,
+      created_s:,
+    ))
+  }
+
+  "-- All compaction checkpoints for one thread in chronological order (oldest
+-- first, by insertion id) so hydration replays them through
+-- `transcript.apply_compaction` in exact order.
+select
+  id,
+  cutoff_index,
+  summary,
+  roster_snapshot,
+  focus,
+  trigger_kind,
+  before_tokens,
+  after_tokens,
+  extract(epoch from created_at)::int8 as created_s
+from thread_compaction
+where thread_id = $1
+order by id asc
+"
+  |> pog.query
+  |> pog.parameter(pog.text(thread_id))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }

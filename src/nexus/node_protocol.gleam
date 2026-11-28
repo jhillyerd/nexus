@@ -175,8 +175,12 @@ fn text_part_decoder() -> decode.Decoder(String) {
 pub fn event_frame(event: thread.ThreadEvent) -> Result(String, Nil) {
   let thread.ThreadEvent(thread_id: _id, visit: _, kind: kind) = event
   let projected = case kind {
-    // Context usage has no v1 TUI projection yet (matching Hello's metrics).
-    thread.UsageUpdated(_) -> Error(Nil)
+    // Context usage and compaction events have no v1 TUI projection yet
+    // (matching Hello's metrics).
+    thread.UsageUpdated(_)
+    | thread.CompactionStarted(_)
+    | thread.Compacted(_, _)
+    | thread.CompactionFinished(_, _) -> Error(Nil)
     thread.Hello(model, messages, _metrics, _usage) ->
       // Metrics and usage have no v1 projection (the TUI's per-turn numbers
       // ride `turn_done.stats`); additive growth can add them later.

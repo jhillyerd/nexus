@@ -167,6 +167,7 @@ pub fn thread_state_json_test() {
         last_cached_tokens: Some(3900),
         bytes_per_token: 3.75,
       ),
+      compacting: False,
     )
   let data =
     json.to_string(web.thread_state_json(
@@ -174,7 +175,7 @@ pub fn thread_state_json_test() {
       inspect,
     ))
 
-  // Shape: summary passthrough + status + usage + committed transcript + idle.
+  // Shape: summary passthrough + status + usage + compacting + compactions + committed transcript + idle.
   should.be_true(string.contains(data, "\"summary\":{\"id\":\"s-2\""))
   should.be_true(string.contains(data, "\"status\":{\"model\":\"alias-x\""))
   should.be_true(string.contains(data, "\"context_window\":65536"))
@@ -182,6 +183,8 @@ pub fn thread_state_json_test() {
   should.be_true(string.contains(data, "\"source\":\"measured\""))
   should.be_true(string.contains(data, "\"last_prompt_tokens\":4100"))
   should.be_true(string.contains(data, "\"last_cached_tokens\":3900"))
+  should.be_true(string.contains(data, "\"compacting\":false"))
+  should.be_true(string.contains(data, "\"compactions\":[]"))
   should.be_true(string.contains(data, "\"message_count\":5"))
   should.be_true(string.contains(data, "\"last_commit_at\":2000"))
   should.be_true(string.contains(data, "\"live_turn\":null"))
@@ -241,6 +244,37 @@ pub fn thread_state_json_test() {
     live_data,
     "\"pending_reasoning\":\"still thinking\"",
   ))
+
+  // Compaction checkpoints & compacting flag are exposed on the state dump.
+  let cp =
+    transcript.Compaction(
+      cutoff_index: 3,
+      summary: "Compacted summary",
+      roster_snapshot: Some("Attached environments: workspace."),
+      focus: Some("focus note"),
+      trigger: transcript.ManualCompact,
+      before_tokens: Some(4200),
+      after_tokens: Some(900),
+      created_at: 2100,
+    )
+  let compacted_data =
+    web.thread_state_json(
+      summary_with_archived("s-2", False),
+      thread.ThreadInspect(
+        ..inspect,
+        transcript: transcript.apply_compaction(t, cp),
+        compacting: True,
+      ),
+    )
+    |> json.to_string
+  should.be_true(string.contains(compacted_data, "\"compacting\":true"))
+  should.be_true(string.contains(
+    compacted_data,
+    "\"compactions\":[{\"cutoff_index\":3,\"summary\":\"Compacted summary\"",
+  ))
+  should.be_true(string.contains(compacted_data, "\"trigger_kind\":\"manual\""))
+  should.be_true(string.contains(compacted_data, "\"before_tokens\":4200"))
+  should.be_true(string.contains(compacted_data, "\"after_tokens\":900"))
 }
 
 pub fn state_dump_unreachable_message_shapes_test() {

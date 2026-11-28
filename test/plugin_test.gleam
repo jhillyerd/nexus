@@ -75,6 +75,8 @@ fn test_config() -> config.Config {
     node_idle_days: 7,
     log_level: log.Info,
     default_context_window: None,
+    compaction_keep_tail_pct: 20,
+    compaction_max_tokens: 4096,
   )
 }
 

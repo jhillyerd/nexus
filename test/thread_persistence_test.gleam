@@ -78,6 +78,8 @@ fn test_config() -> config.Config {
     // Bots P3c: the delivery hop guard; 4 = the shipped default.
     max_bot_hops: 4,
     default_context_window: None,
+    compaction_keep_tail_pct: 20,
+    compaction_max_tokens: 4096,
   )
 }
 
@@ -376,6 +378,9 @@ fn toolset(runner: thread.TurnRunner) -> thread.Toolset {
     runner: runner,
     utility_runner: fn(_endpoint, _tr, _cancel, _allow_pass) {
       Error("no utility call in this test")
+    },
+    compaction_runner: fn(_endpoint, _tr, _cutoff, _focus, _ctx, _bpt, _cancel) {
+      Error("no compaction in this test")
     },
   )
 }
@@ -1511,4 +1516,190 @@ pub fn context_window_freezes_and_last_context_tokens_hydrates_test() {
   hydrated_usage.context_window |> should.equal(Some(32_768))
   hydrated_usage.tokens |> should.equal(live_tokens)
   hydrated_usage.source |> should.equal(thread.Estimated)
+}
+
+// ---------------------------------------------------------------------------
+// Context compaction (Phase 2): atomic persistence & byte-identical hydration
+// ---------------------------------------------------------------------------
+
+pub fn compaction_persists_atomically_and_rehydrates_byte_identically_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  store_mock.ensure_fixture_provider(seam)
+  store_mock.ensure_fixture_bot(seam)
+
+  let cfg = config.Config(..test_config(), compaction_keep_tail_pct: 0)
+  let factory_name = process.new_name("nexus_cp_factory")
+  let assert Ok(factory) =
+    factory_supervisor.start(thread_registry.factory_builder(factory_name))
+  let bots_name = process.new_name("nexus_cp_bots")
+  let assert Ok(started_bots) =
+    bot_registry.start(seam, bots_name, fn(names) { Ok(names) }, fn() {
+      bot_registry.ToolCatalog([], [])
+    })
+  let specs = tools.default(cfg)
+  let cp_bundle =
+    thread.Toolset(
+      names: list.map(specs, tools.tool_name),
+      specs: specs,
+      runner: happy_runner,
+      utility_runner: fn(_ep, _tr, _cancel, _allow) { Error("unused") },
+      compaction_runner: fn(_ep, _tr, _cut, _focus, _ctx, _bpt, _cancel) {
+        Ok("## Goal & Constraints\nPersisted compaction summary.")
+      },
+    )
+  let assert Ok(started) =
+    thread_registry.start_with_toolset(
+      cfg,
+      factory_supervisor.get_by_name(factory_name),
+      process.new_name("nexus_cp_registry"),
+      seam,
+      cp_bundle,
+      fn() { [] },
+      fixture_resolver(),
+      bots_name,
+      dict.new(),
+      dict.new(),
+    )
+  let registry = started.data
+
+  let assert Ok(summary) =
+    thread_registry.create_with_toolset(
+      registry,
+      thread_registry.NewThread(
+        provider_id: store_mock.fixture_provider_id,
+        model: "alias-1",
+        system_prompt: Some("Frozen sys"),
+        toolset: None,
+        bot_id: store_mock.fixture_bot_id,
+        parent_thread_id: None,
+        title: "",
+        context_window: Some(32_768),
+      ),
+      cp_bundle,
+    )
+  let assert Ok(sess) = thread_registry.get(registry, summary.id)
+  let sub = process.new_subject()
+  process.send(sess, thread.Join(sub, 1))
+  let _ = process.receive(sub, 2000)
+
+  should.equal(thread.send_message(sess, "hello world"), thread.Sent)
+  store_mock.await_commits(mock, 2)
+
+  // Compact via thread_registry.compact.
+  thread_registry.compact(registry, summary.id, Some("keep details"))
+  |> should.equal(Ok(thread.Compacting))
+
+  // Wait until CompactionFinished arrives on subscriber.
+  let rec = fn() {
+    let assert Ok(ev) = process.receive(sub, 5000)
+    ev
+  }
+  // Drain remaining turn events + compaction events until CompactionFinished.
+  wait_for_compaction_finished(rec, 20)
+
+  let live_tr = thread.snapshot(sess)
+  let live_body = transcript.request_body(live_tr, transcript.default_options())
+  let live_tokens = thread.inspect(sess).usage.tokens
+
+  // Store persisted the checkpoint AND updated last_context_tokens.
+  let assert Ok([stored_cp]) = seam.load_compactions(summary.id)
+  stored_cp.summary
+  |> should.equal("## Goal & Constraints\nPersisted compaction summary.")
+  stored_cp.focus |> should.equal(Some("keep details"))
+  stored_cp.after_tokens |> should.equal(Some(live_tokens))
+  let assert Ok(stored_row) = seam.get_thread(summary.id)
+  stored_row.summary.last_context_tokens |> should.equal(Some(live_tokens))
+
+  // Restart into a brand-new registry and hydrate from store.
+  process.unlink(started.pid)
+  process.unlink(factory.pid)
+  process.unlink(started_bots.pid)
+  process.kill(started.pid)
+  process.kill(factory.pid)
+  process.kill(started_bots.pid)
+
+  let booted2 = boot(store_mock.seam(mock))
+  let assert Ok(rehydrated) = thread_registry.get(booted2.registry, summary.id)
+  let hydrated_tr = thread.snapshot(rehydrated)
+  // Hydrated request JSON is byte-identical to pre-restart live request JSON.
+  transcript.request_body(hydrated_tr, transcript.default_options())
+  |> should.equal(live_body)
+  transcript.compactions(hydrated_tr) |> should.equal([stored_cp])
+}
+
+fn wait_for_compaction_finished(
+  next: fn() -> thread.ThreadEvent,
+  budget: Int,
+) -> Nil {
+  case budget <= 0 {
+    True -> panic as "timed out waiting for CompactionFinished"
+    False ->
+      case next() {
+        thread.ThreadEvent(_, _, thread.CompactionFinished(_, None)) -> Nil
+        thread.ThreadEvent(_, _, thread.CompactionFinished(_, Some(err))) ->
+          panic as { "compaction failed unexpectedly: " <> err }
+        _ -> wait_for_compaction_finished(next, budget - 1)
+      }
+  }
+}
+
+pub fn hydration_skips_out_of_bounds_compaction_checkpoint_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  store_mock.ensure_fixture_provider(seam)
+  store_mock.ensure_fixture_bot(seam)
+
+  let tr =
+    transcript.new("alias-1", "sys")
+    |> transcript.append_user("hi")
+    |> transcript.append_assistant("hello")
+  let assert Ok(Nil) =
+    seam.insert_thread(
+      store.StoredSummary(
+        id: "t-bad-cp",
+        provider_id: store_mock.fixture_provider_id,
+        model: "alias-1",
+        meta: thread.ThreadMeta(
+          title: "",
+          title_source: thread.AutoTitle,
+          pinned: False,
+          tags: [],
+          tags_manual: [],
+          tags_source: thread.AutoTags,
+          archived: False,
+          bot_id: Some(store_mock.fixture_bot_id),
+          parent_thread_id: None,
+          created_at: 1000,
+        ),
+        toolset: [],
+        workspace_root: None,
+        workspaces: None,
+        roster: None,
+        last_active_at: 1000,
+        message_count: 1,
+        context_window: None,
+        last_context_tokens: None,
+      ),
+      "sys",
+    )
+  // Inject a checkpoint whose cutoff_index (99) exceeds transcript.length(tr) (3).
+  let bad_cp =
+    transcript.Compaction(
+      cutoff_index: 99,
+      summary: "corrupt cutoff",
+      roster_snapshot: None,
+      focus: None,
+      trigger: transcript.ManualCompact,
+      before_tokens: None,
+      after_tokens: None,
+      created_at: 1001,
+    )
+  seam.record_compaction("t-bad-cp", tr, bad_cp)
+
+  let booted = boot(seam)
+  let assert Ok(sess) = thread_registry.get(booted.registry, "t-bad-cp")
+  // Invalid checkpoint is defensively skipped; thread hydrates cleanly.
+  transcript.compactions(thread.snapshot(sess)) |> should.equal([])
+  transcript.length(thread.snapshot(sess)) |> should.equal(3)
 }

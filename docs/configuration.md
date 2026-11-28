@@ -51,6 +51,8 @@ DATABASE_URL=postgres://nexus@127.0.0.1:5433/nexus
 | `NEXUS_MAX_TOOL_ITERATIONS` | `32` | Max model round-trips per user turn before the loop guard trips. |
 | `NEXUS_MAX_BOT_HOPS` | `4` | Max hops in an inter-bot delivery chain (`>= 0`). |
 | `NEXUS_DEFAULT_CONTEXT_WINDOW` | unset | Optional fallback context window in tokens (`4096..2147483647`) frozen onto threads whose bot leaves `context_window` unset. Blank is treated as unset (usage monitoring stays active without a percentage budget). |
+| `NEXUS_COMPACTION_KEEP_TAIL_PCT` | `20` | Target share (`0..40`%) of a thread's `context_window` to keep verbatim after the compaction cut point, clamped to `2000..16000` tokens; threads without a `context_window` use a fixed `4000`-token tail (`0` keeps no tail). |
+| `NEXUS_COMPACTION_MAX_TOKENS` | `4096` | `max_completion_tokens` ceiling (`512..2147483647`) for the cache-piggybacked compaction summarization call (further capped to `max(512, context_window / 4)` when a thread has a context budget). |
 
 ## Web fetch & search
 

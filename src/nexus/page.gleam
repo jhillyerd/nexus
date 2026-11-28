@@ -1296,6 +1296,21 @@ aside h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; 
   border: none; padding: .1rem 0; font-size: .72rem; opacity: .7;
   text-align: center; }
 #app .turn.status time { font-size: .72rem; }
+/* Context compaction divider (context-compaction Phase 2): Pico-native
+   <details>/<summary> rendered inline at its chronological cutoff_index,
+   centered as a quiet hairline divider with expandable verbatim summary. */
+details.turn.compaction { margin: 0; align-self: center; width: 100%; max-width: 46rem;
+  padding: .25rem .7rem; border-radius: 10px; font-size: .8rem;
+  border: 1px dashed color-mix(in srgb, currentColor 24%, transparent);
+  background: color-mix(in srgb, currentColor 3%, transparent); }
+details.turn.compaction > summary { cursor: pointer; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: .72rem; opacity: .78; margin: 0; white-space: normal; }
+#app details.turn.compaction > summary time.ts { display: inline; margin-top: 0; margin-left: .45rem; }
+details.turn.compaction .compaction-body { padding: .4rem 0 .15rem; }
+details.turn.compaction .compaction-focus { margin: 0 0 .35rem; font-size: .75rem; opacity: .75;
+  white-space: pre-wrap; overflow-wrap: anywhere; }
+details.turn.compaction .compaction-summary { white-space: pre-wrap; overflow-wrap: anywhere;
+  font-size: .82rem; max-height: 45vh; overflow-y: auto; }
 /* Inbound bot message chip (issue #122, nexus/ui bot_turn): a
    bot-delivered user line folds up like a thinking chip instead of
    reading as the user's own bubble — collapsed, the summary names the
@@ -1562,6 +1577,7 @@ details.turn.reasoning.live > summary { color: color-mix(in srgb, currentColor 8
   border-top: 1px dashed color-mix(in srgb, currentColor 15%, transparent); opacity: .75; }
 #loop-status[hidden] { display: none; }
 #loop-status.guard { color: #c0392b; opacity: 1; }
+#loop-status.compacting { color: var(--pico-primary); opacity: 1; }
 .note { align-self: center; font-size: .75rem; opacity: .55; max-width: 46rem; }
 .note.err { opacity: .85; color: #c0392b; }
 #composer { display: flex; gap: .5rem; padding: .75rem; border-top: 1px solid

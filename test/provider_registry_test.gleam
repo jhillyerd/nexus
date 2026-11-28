@@ -75,6 +75,8 @@ fn test_config() -> config.Config {
     // Bots P3c: the delivery hop guard; 4 = the shipped default.
     max_bot_hops: 4,
     default_context_window: None,
+    compaction_keep_tail_pct: 20,
+    compaction_max_tokens: 4096,
   )
 }
 

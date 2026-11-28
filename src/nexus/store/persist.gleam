@@ -52,6 +52,10 @@ pub type Msg {
     id: String,
     reply: Subject(Result(List(store.MessageRow), String)),
   )
+  LoadCompactions(
+    id: String,
+    reply: Subject(Result(List(transcript.Compaction), String)),
+  )
   InsertThread(
     summary: store.StoredSummary,
     system_prompt: String,
@@ -68,6 +72,13 @@ pub type Msg {
   )
   /// Write-behind turn commit (fire-and-forget, ordered by arrival).
   Commit(id: String, transcript: Transcript)
+  /// Write-behind atomic compaction persistence (fire-and-forget, ordered
+  /// in the same mailbox as Commit; executes inside one `pog.transaction`).
+  RecordCompaction(
+    id: String,
+    transcript: Transcript,
+    checkpoint: transcript.Compaction,
+  )
   /// Write-behind context-token watermark update (fire-and-forget).
   SetLastContextTokens(id: String, tokens: Int)
   SetTitle(id: String, title: String, reply: Subject(Result(Nil, String)))
@@ -245,6 +256,11 @@ pub fn seam(store_actor: Subject(Msg)) -> store.Store {
         LoadMessages(id, reply)
       })
     },
+    load_compactions: fn(id) {
+      actor.call(store_actor, call_timeout_ms, fn(reply) {
+        LoadCompactions(id, reply)
+      })
+    },
     insert_thread: fn(summary, system_prompt) {
       actor.call(store_actor, call_timeout_ms, fn(reply) {
         InsertThread(summary, system_prompt, reply)
@@ -257,6 +273,9 @@ pub fn seam(store_actor: Subject(Msg)) -> store.Store {
     },
     commit: fn(id, transcript) {
       process.send(store_actor, Commit(id, transcript))
+    },
+    record_compaction: fn(id, transcript, checkpoint) {
+      process.send(store_actor, RecordCompaction(id, transcript, checkpoint))
     },
     set_last_context_tokens: fn(id, tokens) {
       process.send(store_actor, SetLastContextTokens(id, tokens))
@@ -548,6 +567,38 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       }
     }
 
+    LoadCompactions(id, reply) -> {
+      let result =
+        sql.load_compactions(state.db, id)
+        |> result.map_error(query_error)
+        |> result.try(fn(returned) {
+          list.try_map(returned.rows, fn(row) {
+            case transcript.trigger_from_string(row.trigger_kind) {
+              Ok(trigger) ->
+                Ok(transcript.Compaction(
+                  cutoff_index: row.cutoff_index,
+                  summary: row.summary,
+                  roster_snapshot: row.roster_snapshot,
+                  focus: row.focus,
+                  trigger: trigger,
+                  before_tokens: row.before_tokens,
+                  after_tokens: row.after_tokens,
+                  created_at: row.created_s,
+                ))
+              Error(Nil) ->
+                Error(
+                  "compaction row for thread "
+                  <> id
+                  <> " has unknown trigger_kind: "
+                  <> row.trigger_kind,
+                )
+            }
+          })
+        })
+      process.send(reply, result)
+      actor.continue(state)
+    }
+
     InsertThread(summary, system_prompt, reply) -> {
       let result =
         sql.insert_thread(
@@ -655,6 +706,9 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
     }
 
     Commit(id, tr) -> handle_commit(state, id, tr)
+
+    RecordCompaction(id, tr, checkpoint) ->
+      handle_record_compaction(state, id, tr, checkpoint)
 
     SetLastContextTokens(id, tokens) -> {
       case sql.set_last_context_tokens(state.db, int.max(0, tokens), id) {
@@ -1273,6 +1327,91 @@ fn handle_commit(
               actor.continue(state)
             }
           }
+        }
+      }
+    }
+  }
+}
+
+/// Atomic compaction persistence (context-compaction plan §6.3): runs inside
+/// ONE `pog.transaction` that idempotently flushes any uncommitted
+/// `thread_message` delta rows up to `tr`, inserts the `thread_compaction`
+/// row, and updates `thread.last_context_tokens` when `after_tokens` is set.
+/// If any step fails, the entire transaction rolls back and `state.persisted`
+/// stays untouched.
+fn handle_record_compaction(
+  state: State,
+  id: String,
+  tr: Transcript,
+  checkpoint: transcript.Compaction,
+) -> actor.Next(State, Msg) {
+  case ensure_persisted(state, id) {
+    #(next_state, Dropped) | #(next_state, Pending) ->
+      actor.continue(next_state)
+    #(state, Known(already)) -> {
+      let total = transcript.length(tr)
+      let outcome =
+        pog.transaction(state.db, fn(tx) {
+          use Nil <- result.try(case store.has_delta(tr, already) {
+            False -> Ok(Nil)
+            True -> {
+              let #(base_seq, rows) = store.transcript_delta(tr, already)
+              use Nil <- result.try(
+                list.index_fold(rows, Ok(Nil), fn(acc, row, index) {
+                  case acc {
+                    Error(error) -> Error(error)
+                    Ok(_) ->
+                      append_row(tx, id, base_seq + index, row)
+                      |> result.map(fn(_) { Nil })
+                      |> result.map_error(query_error)
+                  }
+                }),
+              )
+              sql.bump_activity(tx, total, id)
+              |> result.map(fn(_) { Nil })
+              |> result.map_error(query_error)
+            }
+          })
+          use Nil <- result.try(
+            sql.insert_compaction(
+              tx,
+              id,
+              checkpoint.cutoff_index,
+              checkpoint.summary,
+              option.unwrap(checkpoint.roster_snapshot, ""),
+              option.unwrap(checkpoint.focus, ""),
+              transcript.trigger_to_string(checkpoint.trigger),
+              option.unwrap(checkpoint.before_tokens, -1),
+              option.unwrap(checkpoint.after_tokens, -1),
+              checkpoint.created_at,
+            )
+            |> result.map(fn(_) { Nil })
+            |> result.map_error(query_error),
+          )
+          case checkpoint.after_tokens {
+            Some(after_tokens) if after_tokens >= 0 ->
+              sql.set_last_context_tokens(tx, after_tokens, id)
+              |> result.map(fn(_) { Nil })
+              |> result.map_error(query_error)
+            _ -> Ok(Nil)
+          }
+        })
+        |> result.map_error(transaction_error)
+      case outcome {
+        Ok(_) ->
+          actor.continue(
+            State(
+              ..state,
+              persisted: dict.insert(
+                state.persisted,
+                id,
+                int.max(already, total),
+              ),
+            ),
+          )
+        Error(error) -> {
+          log_store_error("record_compaction " <> id, error)
+          actor.continue(state)
         }
       }
     }

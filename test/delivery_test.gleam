@@ -86,6 +86,8 @@ fn test_config() -> Config {
     log_level: log.Info,
     max_bot_hops: 4,
     default_context_window: None,
+    compaction_keep_tail_pct: 20,
+    compaction_max_tokens: 4096,
   )
 }
 
@@ -207,6 +209,17 @@ fn create_bot_thread(
       runner: runner,
       utility_runner: fn(_endpoint, _tr, _cancel, _allow_pass) {
         Error("no utility call in this test")
+      },
+      compaction_runner: fn(
+        _endpoint,
+        _tr,
+        _cutoff,
+        _focus,
+        _ctx,
+        _bpt,
+        _cancel,
+      ) {
+        Error("no compaction in this test")
       },
     )
   let assert Ok(summary) =
@@ -332,6 +345,17 @@ fn create_parent_thread(
         },
         utility_runner: fn(_endpoint, _tr, _cancel, _allow_pass) {
           Error("no utility call in this test")
+        },
+        compaction_runner: fn(
+          _endpoint,
+          _tr,
+          _cutoff,
+          _focus,
+          _ctx,
+          _bpt,
+          _cancel,
+        ) {
+          Error("no compaction in this test")
         },
       ),
     )
@@ -705,6 +729,17 @@ pub fn deliver_hint_only_when_tool_present_test() {
         utility_runner: fn(_endpoint, _tr, _cancel, _allow_pass) {
           Error("no utility call in this test")
         },
+        compaction_runner: fn(
+          _endpoint,
+          _tr,
+          _cutoff,
+          _focus,
+          _ctx,
+          _bpt,
+          _cancel,
+        ) {
+          Error("no compaction in this test")
+        },
       ),
     )
 
@@ -842,6 +877,17 @@ pub fn deliver_by_thread_id_direct_test() {
         runner: blocking_runner(),
         utility_runner: fn(_endpoint, _tr, _cancel, _allow_pass) {
           Error("no utility call in this test")
+        },
+        compaction_runner: fn(
+          _endpoint,
+          _tr,
+          _cutoff,
+          _focus,
+          _ctx,
+          _bpt,
+          _cancel,
+        ) {
+          Error("no compaction in this test")
         },
       ),
     )

@@ -13,6 +13,7 @@ import gleeunit/should
 import nexus/node_protocol
 import nexus/openai
 import nexus/thread
+import nexus/transcript
 
 // ---------------------------------------------------------------------------
 // Client → server decode
@@ -161,6 +162,32 @@ pub fn event_usage_updated_unprojected_test() {
       last_cached_tokens: None,
       bytes_per_token: thread.default_bytes_per_token,
     )),
+  ))
+  |> should.equal(Error(Nil))
+}
+
+pub fn event_compaction_events_unprojected_test() {
+  let cp =
+    transcript.Compaction(
+      cutoff_index: 3,
+      summary: "summary",
+      roster_snapshot: None,
+      focus: None,
+      trigger: transcript.ManualCompact,
+      before_tokens: Some(4000),
+      after_tokens: Some(800),
+      created_at: 1000,
+    )
+  node_protocol.event_frame(event(
+    "t1",
+    thread.CompactionStarted(transcript.ManualCompact),
+  ))
+  |> should.equal(Error(Nil))
+  node_protocol.event_frame(event("t1", thread.Compacted(cp, 0)))
+  |> should.equal(Error(Nil))
+  node_protocol.event_frame(event(
+    "t1",
+    thread.CompactionFinished(transcript.ManualCompact, None),
   ))
   |> should.equal(Error(Nil))
 }
