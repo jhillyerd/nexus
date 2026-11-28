@@ -303,6 +303,12 @@ pub type Model {
     /// the vanished-selection reselect keep working unchanged.
     suppress_autoselect: Bool,
     threads: List(thread.ThreadSummary),
+    /// Monotonic generation for `ThreadsRefreshed` replies, bumped on
+    /// `Created`: a thread-list refresh captured before the unlinked
+    /// create worker's `Created` reply landed carries an older generation
+    /// and is dropped + re-fetched rather than overwriting `threads` and
+    /// deselecting the just-created thread.
+    threads_gen: Int,
     selected: Option(String),
     /// Monotonic per-connection visit generation, bumped on every thread
     /// join (`GotEvents`, `Select`, the `ThreadsLoaded` auto-switch) and
@@ -508,6 +514,11 @@ pub type Msg {
   /// and folds the returned signals back into this model.
   Settings(ui_settings.Msg)
   ThreadsLoaded(List(thread.ThreadSummary))
+  /// Stamped thread-list refresh dispatched by `load_threads_asks`. Carries
+  /// the `threads_gen` captured when the effect ran; a reply older than
+  /// `model.threads_gen` (predating a `Created`) is discarded and re-fetched
+  /// so a stale snapshot cannot drop or deselect a newly created thread.
+  ThreadsRefreshed(gen: Int, summaries: List(thread.ThreadSummary))
   ThreadsFailed(String)
   Select(String)
   /// The sidebar's New button: enters compose-new mode (deselect — the
@@ -727,6 +738,7 @@ pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
       providers_enabled_last: False,
       suppress_autoselect: False,
       threads: [],
+      threads_gen: 0,
       // A reload re-opens the client's last-selected thread: the page
       // shell persists it and supplies it on the /ws route. If it has since
       // vanished, `after_threads` drops it and the auto-selection rules
@@ -938,26 +950,44 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         bot_id -> #(Model(..model, create_bot: Some(bot_id)), effect.none())
       }
 
-    SettingsToggled -> #(
+    SettingsToggled -> {
       // Manual toggle, both directions: it also latches `settings_manual`,
       // which stops the first-run auto-open rule from re-opening the
       // settings page on every empty-list refresh. The info pane closes:
       // it is chat-context display state (like `pop`), and re-opening is
       // one click away on the way back.
-      Model(
-        ..model,
-        view: case model.view {
-          ChatView -> SettingsView
-          SettingsView -> ChatView
-        },
-        settings_manual: True,
-        pane_open: False,
-        // Settings closes the pane: the mint display retires with it
-        // (the same "shown once" rule the toggle close carries).
-        grant_minted: None,
-      ),
-      effect.none(),
-    )
+      //
+      // Re-ask on every view transition (the PaneToggled freshness rule):
+      // another session can create providers, bots, or threads while this
+      // connection sits in Settings or Chat, so entering Settings reloads
+      // providers + bots and returning to Chat reloads providers + bots +
+      // threads (sidebar, compose-new bot picker, and active selection).
+      let next_view = case model.view {
+        ChatView -> SettingsView
+        SettingsView -> ChatView
+      }
+      let next =
+        Model(
+          ..model,
+          view: next_view,
+          settings_manual: True,
+          pane_open: False,
+          // Settings closes the pane: the mint display retires with it
+          // (the same "shown once" rule the toggle close carries).
+          grant_minted: None,
+        )
+      let eff = case next_view {
+        SettingsView ->
+          effect.batch([providers_effect(next), bots_effect(next)])
+        ChatView ->
+          effect.batch([
+            providers_effect(next),
+            bots_effect(next),
+            threads_effect(next),
+          ])
+      }
+      #(next, eff)
+    }
 
     Settings(msg) -> {
       // The lifted Settings sub-component: delegate, then fold its
@@ -1011,85 +1041,13 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       #(model, effect.batch([effect.map(inner_eff, Settings), ..signal_effs]))
     }
 
-    ThreadsLoaded(summaries) -> {
-      let next = after_threads(model, summaries)
-      // A fresh per-client model can see Hello (replay) before the
-      // summaries land: Hello then found an empty thread list and
-      // reported `streaming: False`. Reconcile from the authoritative
-      // summary when the selection is unchanged, so the composer shows
-      // the true busy state instead of accepting a send that the thread
-      // will reject with "busy".
-      let next = case next.selected, model.selected {
-        Some(id), Some(previous) if id == previous ->
-          case list.find(summaries, fn(s) { s.id == id }) {
-            Ok(summary) -> Model(..next, streaming: summary.streaming)
-            Error(_) -> next
-          }
-        _, _ -> next
+    ThreadsLoaded(summaries) -> apply_threads_loaded(model, summaries)
+
+    ThreadsRefreshed(gen, summaries) ->
+      case gen < model.threads_gen {
+        True -> #(model, threads_effect(model))
+        False -> apply_threads_loaded(model, summaries)
       }
-      // The selection changed under us (boot auto-selection, or the
-      // previous one vanished): a NEW visit — bump the generation so any
-      // stale deliveries cannot ride along. A vanished thread fails the
-      // registry lookup harmlessly. The bump lands on the RETURNED model:
-      // the join fires carrying `next.visit`, and a delivery only applies
-      // when the model's generation matches — a bump that lives only in
-      // the effect leaves the model one generation behind, deaf to the
-      // whole replay (the blank-chat-on-boot regression from #58).
-      let #(next, eff) = case next.selected, model.selected {
-        Some(id), Some(prev) if prev == id -> #(next, effect.none())
-        Some(id), Some(prev) -> {
-          let next =
-            Model(
-              ..next,
-              visit: next.visit + 1,
-              // The new selection's resolution is in flight (batched
-              // below) — hold it against any further queued refresh,
-              // but only when it is absent from this list (only a
-              // channel can be): an in-list selection is known-ordinary
-              // and keeps today's vanish-on-refresh semantics.
-              channel_pending: case list.any(summaries, fn(s) { s.id == id }) {
-                True -> None
-                False -> Some(id)
-              },
-            )
-          #(
-            next,
-            effect.batch([
-              leave_effect(next, prev),
-              join_effect(next, id),
-              // The pane's asks captured the OLD selection (or none —
-              // the boot auto-selection): fetch the new one's rows and
-              // context here, or a thread with channels selected by the
-              // auto-selection never sees its badge until an unrelated
-              // refresh lands (the flaky-badge e2e finding).
-              channels_effect(next),
-              resolve_effect(next),
-            ]),
-          )
-        }
-        Some(id), None -> {
-          let next =
-            Model(
-              ..next,
-              visit: next.visit + 1,
-              channel_pending: case list.any(summaries, fn(s) { s.id == id }) {
-                True -> None
-                False -> Some(id)
-              },
-            )
-          #(
-            next,
-            effect.batch([
-              join_effect(next, id),
-              channels_effect(next),
-              resolve_effect(next),
-            ]),
-          )
-        }
-        None, _ -> #(next, effect.none())
-      }
-      #(next, eff)
-    }
 
     ThreadsFailed(reason) -> #(
       Model(..model, log: [
@@ -1113,26 +1071,53 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       // composer. The button can be clicked BEFORE the first thread list
       // arrives (the sidebar renders immediately on a fresh connection):
       // the deliberate mark must land then too, or the arriving list
-      // auto-selects right over the compose-new state.
+      // auto-selects right over the compose-new state. Re-ask for fresh
+      // providers, bots, and threads so the compose-new bot picker and
+      // sidebar reflect any additions from another session.
       case model.selected {
         Some(current) -> {
           let next = deselect(model, "new thread")
-          #(next, leave_effect(model, current))
+          #(
+            next,
+            effect.batch([
+              leave_effect(model, current),
+              providers_effect(next),
+              bots_effect(next),
+              threads_effect(next),
+            ]),
+          )
         }
         // Already composing (or boot with an unloaded list): re-arm the
         // deliberate mark so the arriving list cannot auto-select over
         // the compose-new state.
-        None -> #(Model(..model, suppress_autoselect: True), effect.none())
+        None -> {
+          let next = Model(..model, suppress_autoselect: True)
+          #(
+            next,
+            effect.batch([
+              providers_effect(next),
+              bots_effect(next),
+              threads_effect(next),
+            ]),
+          )
+        }
       }
 
     Created(summary) -> {
       // The worker's success reply (#88): the guard opens again before
       // anything else — a later create must be able to proceed — then
-      // add the row and select the new thread.
+      // bump `threads_gen` (invalidating any in-flight refresh captured
+      // before this creation), add the row (deduplicating against a
+      // concurrent refresh that already listed it), and select the new
+      // thread.
       let model =
         Model(
           ..model,
-          threads: [summary, ..model.threads],
+          threads: [
+            summary,
+            ..list.filter(model.threads, fn(t) { t.id != summary.id })
+          ],
+          threads_gen: model.threads_gen + 1,
           create_pending: False,
         )
       // COMPOSE-NEW: the stashed draft is the fresh thread's first
@@ -2364,10 +2349,96 @@ fn bots_effect(model: Model) -> Effect(Msg) {
 // Thread / registry effects
 // ---------------------------------------------------------------------------
 
+fn apply_threads_loaded(
+  model: Model,
+  summaries: List(thread.ThreadSummary),
+) -> #(Model, Effect(Msg)) {
+  let next = after_threads(model, summaries)
+  // A fresh per-client model can see Hello (replay) before the
+  // summaries land: Hello then found an empty thread list and
+  // reported `streaming: False`. Reconcile from the authoritative
+  // summary when the selection is unchanged, so the composer shows
+  // the true busy state instead of accepting a send that the thread
+  // will reject with "busy".
+  let next = case next.selected, model.selected {
+    Some(id), Some(previous) if id == previous ->
+      case list.find(summaries, fn(s) { s.id == id }) {
+        Ok(summary) -> Model(..next, streaming: summary.streaming)
+        Error(_) -> next
+      }
+    _, _ -> next
+  }
+  // The selection changed under us (boot auto-selection, or the
+  // previous one vanished): a NEW visit — bump the generation so any
+  // stale deliveries cannot ride along. A vanished thread fails the
+  // registry lookup harmlessly. The bump lands on the RETURNED model:
+  // the join fires carrying `next.visit`, and a delivery only applies
+  // when the model's generation matches — a bump that lives only in
+  // the effect leaves the model one generation behind, deaf to the
+  // whole replay (the blank-chat-on-boot regression from #58).
+  let #(next, eff) = case next.selected, model.selected {
+    Some(id), Some(prev) if prev == id -> #(next, effect.none())
+    Some(id), Some(prev) -> {
+      let next =
+        Model(
+          ..next,
+          visit: next.visit + 1,
+          // The new selection's resolution is in flight (batched
+          // below) — hold it against any further queued refresh,
+          // but only when it is absent from this list (only a
+          // channel can be): an in-list selection is known-ordinary
+          // and keeps today's vanish-on-refresh semantics.
+          channel_pending: case list.any(summaries, fn(s) { s.id == id }) {
+            True -> None
+            False -> Some(id)
+          },
+        )
+      #(
+        next,
+        effect.batch([
+          leave_effect(next, prev),
+          join_effect(next, id),
+          // The pane's asks captured the OLD selection (or none —
+          // the boot auto-selection): fetch the new one's rows and
+          // context here, or a thread with channels selected by the
+          // auto-selection never sees its badge until an unrelated
+          // refresh lands (the flaky-badge e2e finding).
+          channels_effect(next),
+          resolve_effect(next),
+        ]),
+      )
+    }
+    Some(id), None -> {
+      let next =
+        Model(
+          ..next,
+          visit: next.visit + 1,
+          channel_pending: case list.any(summaries, fn(s) { s.id == id }) {
+            True -> None
+            False -> Some(id)
+          },
+        )
+      #(
+        next,
+        effect.batch([
+          join_effect(next, id),
+          channels_effect(next),
+          resolve_effect(next),
+        ]),
+      )
+    }
+    None, _ -> #(next, effect.none())
+  }
+  #(next, eff)
+}
+
 fn threads_effect(model: Model) -> Effect(Msg) {
   let registry = model.registry
   let selected = model.selected
-  effect.from(fn(dispatch) { load_threads_asks(registry, selected, dispatch) })
+  let gen = model.threads_gen
+  effect.from(fn(dispatch) {
+    load_threads_asks(registry, selected, gen, dispatch)
+  })
 }
 
 /// The body of a thread-list refresh, shared by `threads_effect` (the
@@ -2379,10 +2450,13 @@ fn threads_effect(model: Model) -> Effect(Msg) {
 /// selection validity), and the rows keep the badge honest across the
 /// mutation — deleting a viewed channel's parent, or archiving it, must
 /// not leave the selection or the rows stale. The stamped ids drop
-/// replies for a selection that changed while the asks ran.
+/// replies for a selection that changed while the asks ran, and `gen`
+/// drops a pre-`Created` snapshot so a newly created thread cannot be
+/// deselected by an older refresh.
 fn load_threads_asks(
   registry: process.Subject(thread_registry.Msg),
   selected: Option(String),
+  gen: Int,
   dispatch: fn(Msg) -> Nil,
 ) -> Nil {
   case selected {
@@ -2390,7 +2464,7 @@ fn load_threads_asks(
       dispatch(ChannelResolved(id, thread_registry.channel_of(registry, id)))
     None -> Nil
   }
-  dispatch(ThreadsLoaded(thread_registry.list_threads(registry)))
+  dispatch(ThreadsRefreshed(gen, thread_registry.list_threads(registry)))
   case selected {
     Some(id) ->
       dispatch(ChannelsLoaded(id, thread_registry.channels(registry, id)))
@@ -2579,6 +2653,7 @@ fn join_and_send_effect(model: Model, id: String, text: String) -> Effect(Msg) {
   let registry = model.registry
   let visit = model.visit
   let events = model.events
+  let gen = model.threads_gen
   effect.from(fn(dispatch) {
     case thread_registry.get(registry, id) {
       Ok(subject) -> {
@@ -2586,7 +2661,7 @@ fn join_and_send_effect(model: Model, id: String, text: String) -> Effect(Msg) {
           Some(ev) -> process.send(subject, thread.Join(ev, visit))
           None -> Nil
         }
-        send_into_subject(registry, Some(id), subject, text, dispatch)
+        send_into_subject(registry, Some(id), gen, subject, text, dispatch)
       }
       Error(_) -> dispatch(SendRejected("gone"))
     }
@@ -2596,13 +2671,15 @@ fn join_and_send_effect(model: Model, id: String, text: String) -> Effect(Msg) {
 fn send_effect(model: Model, text: String) -> Effect(Msg) {
   let registry = model.registry
   let id = model.selected
+  let gen = model.threads_gen
   effect.from(fn(dispatch) {
     let resolved = case id {
       Some(thread_id) -> thread_registry.get(registry, thread_id)
       None -> Error(Nil)
     }
     case resolved {
-      Ok(subject) -> send_into_subject(registry, id, subject, text, dispatch)
+      Ok(subject) ->
+        send_into_subject(registry, id, gen, subject, text, dispatch)
       Error(_) -> dispatch(SendRejected("gone"))
     }
   })
@@ -2611,6 +2688,7 @@ fn send_effect(model: Model, text: String) -> Effect(Msg) {
 fn send_into_subject(
   registry: Subject(thread_registry.Msg),
   id: Option(String),
+  gen: Int,
   subject: Subject(thread.Msg),
   text: String,
   dispatch: fn(Msg) -> Nil,
@@ -2650,7 +2728,7 @@ fn send_into_subject(
       // ride along (the shared refresh shape): a send into a
       // parent is what CREATES channels — the relay — so the
       // badge must move on this refresh, not a later one.
-      load_threads_asks(registry, id, dispatch)
+      load_threads_asks(registry, id, gen, dispatch)
       dispatch(SendAccepted)
     }
     thread.Busy -> dispatch(SendRejected("busy"))
@@ -2848,6 +2926,7 @@ fn mutate_effect(
 ) -> Effect(Msg) {
   let registry = model.registry
   let selected = model.selected
+  let gen = model.threads_gen
   effect.from(fn(dispatch) {
     case run(registry) {
       // The SAME refresh shape as threads_effect (see
@@ -2857,7 +2936,7 @@ fn mutate_effect(
       // refresh the pane rows, or a deleted channel stayed selected on
       // the cached context's word until some unrelated refresh
       // (the cubic PR review finding).
-      True -> load_threads_asks(registry, selected, dispatch)
+      True -> load_threads_asks(registry, selected, gen, dispatch)
       False -> dispatch(ThreadOpFailed("thread is gone"))
     }
   })

@@ -342,7 +342,9 @@ pub fn update(
         bot_alias_provider: None,
       ),
       effect.none(),
-      [],
+      // Refresh both lists on tab switch so another session's new
+      // providers or bots appear without a page reload.
+      [ProvidersChanged, BotsChanged],
     )
 
     AddToggled -> #(
@@ -507,7 +509,11 @@ pub fn update(
           )
         False -> #(state, effect.none())
       }
-      #(state, effect.batch([fetch, tools_fetch]), [])
+      let signals = case opening {
+        True -> [ProvidersChanged, BotsChanged]
+        False -> []
+      }
+      #(state, effect.batch([fetch, tools_fetch]), signals)
     }
 
     // The open bot form's provider select changed (add or edit — the
@@ -598,7 +604,11 @@ pub fn update(
           )
         False -> #(state, effect.none())
       }
-      #(state, effect.batch([fetch, tools_fetch]), [])
+      let signals = case opening {
+        True -> [ProvidersChanged, BotsChanged]
+        False -> []
+      }
+      #(state, effect.batch([fetch, tools_fetch]), signals)
     }
 
     BotEditSubmitted(

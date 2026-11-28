@@ -6157,3 +6157,328 @@ pub fn pane_toggle_aria_tracks_open_state_test() {
   should_contain(open_html, "aria-expanded=\"true\"")
   should_contain(open_html, "Thread info")
 }
+
+// ---------------------------------------------------------------------------
+// Multi-session settings sync
+// ---------------------------------------------------------------------------
+
+/// Regression: two live sessions sharing one server. Session A stays on
+/// Settings after adding a provider; Session B adds a bot for that provider
+/// and starts a chat with it; when Session A exits Settings, the sidebar
+/// must reflect the new thread (and bot provenance) instead of staying
+/// empty.
+pub fn settings_exit_syncs_threads_and_bots_from_other_session_test() {
+  let #(registry, providers, bots) =
+    start_offline_registries_with_resolver(
+      fn(_) { Ok(Nil) },
+      fn(_endpoint) { Error(openai.Transport("offline test")) },
+      dead_resolver(),
+    )
+  let #(session_a, client_a) = boot_create_runtime(registry, providers, bots)
+  let #(session_b, client_b) = boot_create_runtime(registry, providers, bots)
+
+  let _ = collect_until_quiet(client_a, 10, 10, "")
+  let _ = collect_until_quiet(client_b, 10, 10, "")
+
+  // Session A opens Settings and adds a new provider.
+  lustre.send(to: session_a, message: lustre.dispatch(ui.SettingsToggled))
+  let _ = wait_for_patch(client_a, "Back to chat", 20)
+  lustre.send(
+    to: session_a,
+    message: lustre.dispatch(
+      ui.Settings(ui_settings.Submitted(
+        "second-prov",
+        "http://127.0.0.1:9999/v1",
+        "",
+      )),
+    ),
+  )
+  let _ = wait_for_patch(client_a, "second-prov", 40)
+
+  let assert Ok(all_providers) = provider_registry.list_providers(providers)
+  let assert Ok(second_prov) =
+    list.find(all_providers, fn(p) { p.name == "second-prov" })
+
+  // Session B opens Settings -> Bots tab and adds a bot for that provider.
+  lustre.send(to: session_b, message: lustre.dispatch(ui.SettingsToggled))
+  lustre.send(
+    to: session_b,
+    message: lustre.dispatch(
+      ui.Settings(ui_settings.TabSelected(ui_settings.BotsTab)),
+    ),
+  )
+  lustre.send(
+    to: session_b,
+    message: lustre.dispatch(
+      ui.Settings(ui_settings.BotSubmitted(
+        "SessionB Bot",
+        "",
+        second_prov.id,
+        "smart",
+        "",
+        "",
+      )),
+    ),
+  )
+  let _ = wait_for_patch(client_b, "SessionB Bot", 40)
+
+  let assert Ok(all_bots) = bot_registry.list_bots(bots)
+  let assert Ok(new_bot) =
+    list.find(all_bots, fn(b) { b.name == "SessionB Bot" })
+
+  // Session B exits Settings and starts a chat with the new bot.
+  lustre.send(to: session_b, message: lustre.dispatch(ui.SettingsToggled))
+  lustre.send(
+    to: session_b,
+    message: lustre.dispatch(ui.CreateBotChanged(new_bot.id)),
+  )
+  lustre.send(
+    to: session_b,
+    message: lustre.dispatch(ui.SendRequested("hello from session b")),
+  )
+  let _ = wait_for_thread_count(registry, 1, 40)
+  let _ = wait_for_patch(client_b, "hello from session b", 40)
+
+  // Session A exits Settings: the chat list must refresh and show Session B's
+  // thread (plus its bot name in the subtitle).
+  let _ = collect_until_quiet(client_a, 5, 5, "")
+  lustre.send(to: session_a, message: lustre.dispatch(ui.SettingsToggled))
+  let after_exit = collect_until_quiet(client_a, 20, 10, "")
+  should_contain(after_exit, "hello from session b")
+  should_contain(after_exit, "SessionB Bot")
+}
+
+/// Entering Settings and switching Settings tabs both refresh providers and
+/// bots so additions from another session appear without a page reload.
+pub fn settings_enter_and_tab_switch_sync_other_session_changes_test() {
+  let #(registry, providers, bots) =
+    start_offline_registries(fn(_) { Ok(Nil) }, fn(_endpoint) {
+      Error(openai.Transport("offline test"))
+    })
+  let #(session_a, client_a) = boot_create_runtime(registry, providers, bots)
+  let _ = collect_until_quiet(client_a, 10, 10, "")
+
+  // Another session adds a provider while Session A is in ChatView.
+  let assert Ok(added_prov) =
+    provider_registry.create(
+      providers,
+      provider.ProviderParams(
+        name: "later-prov",
+        base_url: "http://127.0.0.1:9999/v1",
+        api_key: None,
+      ),
+    )
+
+  // Opening Settings must pick up the new provider.
+  lustre.send(to: session_a, message: lustre.dispatch(ui.SettingsToggled))
+  let _ = wait_for_patch(client_a, "later-prov", 40)
+
+  // Another session adds a bot while Session A sits on the Providers tab.
+  let assert Ok(_) =
+    bot_registry.create_bot(
+      bots,
+      bot.BotParams(
+        name: "TabSwitch Bot",
+        description: "",
+        provider_id: added_prov.id,
+        model: "smart",
+        system_prompt: None,
+        tools: None,
+      ),
+    )
+
+  // Switching to the Bots tab must pick up the new bot.
+  lustre.send(
+    to: session_a,
+    message: lustre.dispatch(
+      ui.Settings(ui_settings.TabSelected(ui_settings.BotsTab)),
+    ),
+  )
+  let _ = wait_for_patch(client_a, "TabSwitch Bot", 40)
+}
+
+/// Fresh-database first-run scenario: Session A auto-opens Settings, adds
+/// the first provider (staying on Settings per #187), Session B adds a bot
+/// for that provider and starts a chat, then Session A exits Settings and
+/// sees the new chat and bot immediately.
+pub fn first_run_settings_exit_syncs_other_session_chat_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  let assert Ok(started_providers) =
+    provider_registry.start_with_model_fetcher(
+      test_config(),
+      seam,
+      process.new_name("nexus_ui_first_prov_providers"),
+      fn(_endpoint) { Error(openai.Transport("offline test")) },
+    )
+  let bots_name = process.new_name("nexus_ui_first_prov_bots")
+  let assert Ok(started_bots) =
+    bot_registry.start(seam, bots_name, fn(names) { Ok(names) }, fn() {
+      bot_registry.ToolCatalog([], [])
+    })
+  let factory_name = process.new_name("nexus_ui_first_prov_factory")
+  let assert Ok(_factory) =
+    factory_supervisor.start(thread_registry.factory_builder(factory_name))
+  let assert Ok(started_registry) =
+    thread_registry.start_with_toolset(
+      test_config(),
+      factory_supervisor.get_by_name(factory_name),
+      process.new_name("nexus_ui_first_prov_registry"),
+      seam,
+      toolset(unused_turn_runner),
+      fn() { [] },
+      dead_resolver(),
+      bots_name,
+      dict.new(),
+      dict.new(),
+    )
+  let registry = started_registry.data
+  let providers = started_providers.data
+  let bots = started_bots.data
+
+  // Session A connects to a fresh empty database -> auto-opens Settings.
+  let #(session_a, client_a) = boot_create_runtime(registry, providers, bots)
+  let _ = wait_for_patch(client_a, "No providers yet.", 40)
+
+  // Session A adds the first provider and remains on Settings.
+  lustre.send(
+    to: session_a,
+    message: lustre.dispatch(
+      ui.Settings(ui_settings.Submitted(
+        "first-prov",
+        "http://127.0.0.1:9999/v1",
+        "",
+      )),
+    ),
+  )
+  let _ = wait_for_patch(client_a, "first-prov", 40)
+  let assert Ok([first_prov]) = provider_registry.list_providers(providers)
+
+  // Session B adds a bot for that provider and starts a chat.
+  let assert Ok(other_bot) =
+    bot_registry.create_bot(
+      bots,
+      bot.BotParams(
+        name: "Other Bot",
+        description: "",
+        provider_id: first_prov.id,
+        model: "smart",
+        system_prompt: None,
+        tools: None,
+      ),
+    )
+  let assert Ok(_) =
+    thread_registry.create(
+      registry,
+      thread_registry.NewThread(
+        provider_id: first_prov.id,
+        model: "smart",
+        system_prompt: None,
+        bot_id: other_bot.id,
+        toolset: None,
+        parent_thread_id: None,
+        title: "created while away",
+      ),
+    )
+
+  // Session A exits Settings and must see the chat list and bot immediately.
+  let _ = collect_until_quiet(client_a, 5, 5, "")
+  lustre.send(to: session_a, message: lustre.dispatch(ui.SettingsToggled))
+  let seen = collect_until_quiet(client_a, 20, 10, "")
+  should_contain(seen, "created while away")
+  should_contain(seen, "Other Bot")
+}
+
+/// If a refresh already listed the fresh thread before the create worker's
+/// `Created` reply lands, `Created` deduplicates instead of duplicating the
+/// row in the sidebar.
+pub fn created_deduplicates_already_listed_thread_test() {
+  let s = summary("s-1", False)
+  let model =
+    new_model()
+    |> step(ui.ThreadsLoaded([s]))
+    |> step(ui.Created(s))
+  list.length(model.threads) |> should.equal(1)
+}
+
+/// A stale `ThreadsRefreshed` snapshot captured BEFORE `Created` (older
+/// `threads_gen`) must not drop or deselect the just-created thread; a
+/// post-create refresh carrying the current generation applies normally.
+pub fn stale_threads_refresh_after_created_keeps_new_thread_test() {
+  let old = summary("s-old", False)
+  let fresh = summary("s-new", False)
+  let model =
+    new_model()
+    |> step(ui.ThreadsLoaded([old]))
+    |> step(ui.NewThreadToggled)
+    |> step(ui.Created(fresh))
+    |> step(ui.UserEcho("draft", None, None))
+  let post_gen = model.threads_gen
+  should.be_true(post_gen > 0)
+  model.selected |> should.equal(Some("s-new"))
+
+  // Stale snapshot predating `Created`: dropped, selection and log stay.
+  let after_stale = step(model, ui.ThreadsRefreshed(post_gen - 1, [old]))
+  after_stale.selected |> should.equal(Some("s-new"))
+  list.any(after_stale.threads, fn(t) { t.id == "s-new" }) |> should.be_true
+  list.length(after_stale.log) |> should.equal(1)
+
+  // Current-generation snapshot (e.g. after external delete): applies.
+  let after_current = step(after_stale, ui.ThreadsRefreshed(post_gen, [old]))
+  after_current.selected |> should.equal(Some("s-old"))
+  list.any(after_current.threads, fn(t) { t.id == "s-new" }) |> should.be_false
+}
+
+/// Opening the bot inline editor refreshes `bot_list` so edits made in
+/// another session while this session sat on the Bots tab appear in the
+/// editor instead of stale prefilled values.
+pub fn bot_edit_toggle_refreshes_bots_from_other_session_test() {
+  let #(registry, providers, bots) =
+    start_offline_registries(fn(_) { Ok(Nil) }, fn(_endpoint) {
+      Error(openai.Transport("offline test"))
+    })
+  let #(session_a, client_a) = boot_create_runtime(registry, providers, bots)
+  let _ = collect_until_quiet(client_a, 10, 10, "")
+
+  // Session A opens Settings -> Bots tab.
+  lustre.send(to: session_a, message: lustre.dispatch(ui.SettingsToggled))
+  lustre.send(
+    to: session_a,
+    message: lustre.dispatch(
+      ui.Settings(ui_settings.TabSelected(ui_settings.BotsTab)),
+    ),
+  )
+  let _ = collect_until_quiet(client_a, 10, 10, "")
+
+  // Another session renames and re-models the fixture bot while Session A
+  // sits on the Bots tab.
+  let assert Ok(_) =
+    bot_registry.update_bot(
+      bots,
+      store_mock.fixture_bot_id,
+      bot.BotUpdate(
+        name: Some("Renamed Elsewhere"),
+        description: None,
+        provider_id: None,
+        model: Some("fast-updated"),
+        system_prompt: None,
+        tools: None,
+        allow_inbound: None,
+      ),
+    )
+
+  // Session A clicks Edit on the bot: opening the editor must reload bots.
+  lustre.send(
+    to: session_a,
+    message: lustre.dispatch(
+      ui.Settings(ui_settings.BotEditToggled(
+        store_mock.fixture_bot_id,
+        store_mock.fixture_provider_id,
+        None,
+      )),
+    ),
+  )
+  let seen = collect_until_quiet(client_a, 20, 10, "")
+  should_contain(seen, "Renamed Elsewhere")
+  should_contain(seen, "fast-updated")
+}
