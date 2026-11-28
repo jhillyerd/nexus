@@ -62,9 +62,10 @@ When a compaction runs on a thread with active messages `[system, m1..m50, m51..
 
 1. **Summarization call (cache-piggybacked):**
    Send `[system, m1..m50, compaction_instruction]` using the thread's exact frozen envelope (`loop.frozen_options(specs)`) with only one generation-side delta: `max_completion_tokens`.
-   - `system + m1..m50` is a **strict prefix** of the previously cached `system + m1..m55`:
-     - **vLLM / SGLang / Hosted OpenAI:** 100% block/radix hit on `system + m1..m50`.
-     - **llama.cpp / Ollama:** truncates only `m51..m55` from the slot and reuses `system + m1..m50` verbatim.
+   - `system + m1..m50` is a **strict prefix** of the previously cached `system + m1..m55`, enabling **best-effort** prefix reuse when the prefix is still resident:
+     - **vLLM / SGLang / Hosted OpenAI:** reuses the shared token prefix when resident; actual hit length depends on backend granularity (e.g. vLLM full block boundaries), cache eviction, and TTL.
+     - **llama.cpp / Ollama:** truncates only `m51..m55` from the matching slot and reuses the shared `system + m1..m50` prefix when still resident (subject to slot selection / `keep_alive`).
+   - Reuse is verified via `usage.prompt_tokens_details.cached_tokens` (or backend metrics), never assumed.
    - Because `m51..m55` are excluded from the summary request, the model summarizes only what is actually being dropped and cannot contradict or duplicate the kept tail.
    - No second model is needed.
 2. **Checkpoint install:**
@@ -201,11 +202,13 @@ Pure module (mirrors `nexus/utility.gleam` — zero actor imports, fully offline
 **Auto-trigger condition:**
 Given `context_window = Some(limit)`:
 ```
-reserve = min(cfg.compaction_max_tokens + 1024, limit / 3)
-trigger_at = min(limit * cfg.compaction_threshold_pct / 100, limit - reserve)
-should_auto_compact = usage.tokens >= trigger_at
+summary_max_tokens   = min(cfg.compaction_max_tokens, max(512, limit / 4))
+instruction_headroom = 512   // base compaction prompt + framing + capped focus
+reserve              = summary_max_tokens + instruction_headroom
+trigger_at           = min(limit * cfg.compaction_threshold_pct / 100, limit - reserve)
+should_auto_compact  = reserve < limit && trigger_at > 0 && usage.tokens >= trigger_at
 ```
-The `limit - reserve` ceiling ensures we always trigger while the piggybacked summarization prompt + completion still fit inside `limit`.
+Bounding `summary_max_tokens` to at most `limit / 4` (with a 512-token floor) and basing `reserve` directly on `summary_max_tokens + instruction_headroom` ensures the piggybacked summarization prompt and its `max_completion_tokens` always fit inside `limit` — even at the minimum `4096`-token window (`summary_max_tokens = 1024`, `reserve = 1536`, `trigger_at = 2560`). When `reserve >= limit` (impossible under the `4096` floor, defensive guard), auto-compaction stays disabled rather than firing a request that cannot fit.
 
 *Known behavior when `context_window` is `None`:* if neither the bot nor `NEXUS_DEFAULT_CONTEXT_WINDOW` sets a budget, auto-compaction never arms — those threads rely on manual `/compact` and Phase 3's reactive overflow recovery. Live `/v1/models` context-length hints from Phase 1 remain non-binding UI aids and never feed this trigger.
 
@@ -229,15 +232,15 @@ Given the active message slice `[start_index .. total_len)` and a `keep_tail_tok
     - **Current State & Key Details** (file paths, commands, symbols, identifiers, URLs, error outputs still relevant)
     - **Open Questions & Next Steps**
   - When a prior compaction already sits at the start of the active prefix, explicitly instructs the model to **merge and update** the earlier summary rather than nesting summaries.
-  - When `focus` is `Some(note)` (from `/compact <note>`), appends `"Preserve detail especially regarding: " <> note`.
-- **`options(base)`**:
-  `transcript.Options(..base, max_completion_tokens: Some(cfg.compaction_max_tokens))` — `base` is `loop.frozen_options(specs)`.
+  - When `focus` is `Some(note)` (from `/compact <note>`), validate length **before** starting compaction (`max_focus_chars = 1000`, ~250 tokens — fits safely inside the 512-token `instruction_headroom`; reject longer notes loudly with `FocusTooLong`), then append `"Preserve detail especially regarding: " <> note`.
+- **`options(base, context_window)`**:
+  `transcript.Options(..base, max_completion_tokens: Some(summary_max_tokens))` where `base` is `loop.frozen_options(specs)` and `summary_max_tokens = case context_window { Some(limit) -> min(cfg.compaction_max_tokens, max(512, limit / 4)), None -> cfg.compaction_max_tokens }`.
 - **`run(...)`**:
   Same blocking single-stream runner shape as `utility.run`:
   - Accumulates `TokenDelta`s (ignoring `ReasoningDelta` so CoT never leaks into the stored summary!).
   - Fails on any `ToolCallDelta`, cancellation, transport error, or blank/too-short summary.
   - Strips wrapping outer markdown fences if the model fenced the whole summary.
-  - Caps stored summary length defensively (e.g. `max_summary_chars = 32_000`) so a runaway reply can never create a summary larger than the context it replaced.
+  - Bounds stored summary size against the thread's token budget (not just a global character cap): cap to at most `summary_max_tokens` (converted via the thread's calibrated `bytes_per_token`, with a defensive `32_000`-char global ceiling when `context_window` is `None`), and fail an `AutoCompact`/`OverflowCompact` attempt whose estimated post-compaction `after_tokens >= before_tokens` so a runaway summary can never leave the active window larger than before.
 
 ---
 
@@ -292,16 +295,16 @@ Additional fields on `thread.State`:
 | **`Send` arrives mid-compaction** | **Cancels immediately** (`process.send(cancel, Nil)` when `CompactRunning`, or flips `cancelled: True` when `CompactStarting` so `CompactStarted` signals `cancel` on arrival), proceeds with `Send` (never returns `Busy`), re-evaluates after the new turn commits | Returns **`Busy`** — user explicitly asked to compact before continuing |
 | **`Stop` button** | Not shown (or no-op; invisible side-call) | Cancels the manual compaction cleanly (including during `CompactStarting` via the deferred-cancel handshake), emits `CompactionFinished(ManualCompact, Some("cancelled"))` / status reset |
 | **Utility title/tags interaction** | Never runs concurrently with `utility` and never blocks the actor: if `utility` is active when auto-compaction wants to fire, record `compaction_pending = True` and deliver it in `finish_utility`; symmetrically, if `AutoCompact` is active when `arm_utility` runs, set `utility_pending = True` and re-arm in `finish_compaction` | Cancels `utility` if somehow running (utility's cancelled-does-not-consume rule re-arms it later) |
-| **Stale completion guard** | Installs **only** when `turn == Idle && not cancelled && transcript.length(state.transcript) == base_len`; otherwise discards cleanly | Same guard |
-| **Roster change arrives mid-compaction** | If a node attaches/detaches mid-compaction, `roster_snapshot` uses `state.roster` at `cutoff_index` (or if `pending_roster` / live roster changed `base_len`, stale guard discards and re-arms cleanly) | Queue `pending_roster` behind foreground manual compaction just like behind a turn, draining right after install so the new roster line lands *after* the compaction checkpoint |
+| **Stale completion guard** | Installs **only** when `turn == Idle && not cancelled && transcript.length(state.transcript) == base_len && state.pending_roster == []`; otherwise discards cleanly (and re-arms if still over threshold) | Installs **only** when `turn == Idle && not cancelled && transcript.length(state.transcript) == base_len`; then immediately drains any `pending_roster` queued during the foreground compact |
+| **Roster change arrives mid-compaction** | While `turn == Idle`, a live attach/detach appends its roster row immediately (bumping `transcript.length` past `base_len`, so the stale guard discards and re-arms); requiring `state.pending_roster == []` also prevents installing behind any queued roster change | Queue `pending_roster` behind foreground manual compaction just like behind a turn: `roster_snapshot` freezes the pre-queue `state.roster` at `cutoff_index`, the checkpoint installs at `base_len`, and `drain_pending_roster` immediately appends the queued roster line(s) *after* the compaction checkpoint |
 
 ### 6.3 Persistence ordering
 
 On compaction install:
 1. Build the `transcript.Compaction(cutoff_index, summary, roster_snapshot, focus, trigger, before_tokens, after_tokens, created_at)` value.
 2. Install onto `state.transcript` via `transcript.apply_compaction(state.transcript, checkpoint)` — checkpoints are stored in a **sidecar list beside `messages`**, **never** spliced into `messages`: `store.transcript_delta` maps transcript positions directly to `thread_message.seq` (`base_seq + index`), so splicing synthetic framing rows into `messages` would corrupt `seq`, `thread.message_count`, `persist.gleam`'s watermark, and hydration byte-identity. The synthetic `user`/`assistant` checkpoint pair exists solely inside the `request_messages` / `slice_active` encode-time projections.
-3. Send `RecordCompaction(thread_id, checkpoint)` through the thread's injected persistence hook into `nexus/store/persist`'s ordered actor mailbox (the same mailbox that processes `Commit(thread_id, tr)`). Because `Commit` for `base_len` was already sent before the compaction worker spawned, `thread_message` rows up to `cutoff_index` are guaranteed persisted before `thread_compaction` inserts.
-4. Update `state.usage` (`tokens = after_tokens`, `source = Estimated`) and persist `last_context_tokens`.
+3. Persist atomically via `RecordCompaction(thread_id, state.transcript, checkpoint)` on `nexus/store/persist`: inside **one `pog.transaction`**, `persist` idempotently flushes any uncommitted `thread_message` delta rows up to `base_len` (reusing `on conflict (thread_id, seq) do nothing` and advancing `message_count` / `persisted`), inserts the `thread_compaction` row, and updates `thread.last_context_tokens`. Mailbox ordering alone is **not** relied on for durability — if an earlier write-behind `Commit` failed or the process crashes mid-flight, the transaction either commits both the referenced messages and the checkpoint together or rolls back cleanly. Defensively, hydration also validates `cutoff_index <= transcript.length(tr)` and ignores/logs any inconsistent checkpoint.
+4. Update `state.usage` (`tokens = after_tokens`, `source = Estimated`).
 5. Emit `Compacted(...)` + `UsageUpdated(usage)` events to all subscribed UI tabs.
 
 ### 6.4 Reactive overflow recovery (Phase 3)
@@ -337,7 +340,7 @@ Strict matching rule so normal messages starting with `/` (like `/etc/hosts` or 
 When `Compact(focus)` is parsed in `ui.gleam`:
 - Requires an active selected thread (if on compose-new with no thread yet, show a subtle inline notice *"Nothing to compact in a new thread"*).
 - Clears the composer input, dispatches `thread_registry.compact(thread_id, focus)` via an effect.
-- On `Busy`: shows standard busy notice; on `NothingToCompact`: shows subtle notice (*"Not enough conversation history to compact yet"*); on `Started`: enters `"Compacting context…"` state with Stop enabled.
+- On `Busy`: shows standard busy notice; on `NothingToCompact`: shows subtle notice (*"Not enough conversation history to compact yet"*); on `FocusTooLong(max)`: shows inline notice (*"Compact instructions must be at most 1,000 characters"*); on `Started`: enters `"Compacting context…"` state with Stop enabled.
 
 ### 7.2 Context usage indicator (`src/nexus/ui.gleam`)
 
