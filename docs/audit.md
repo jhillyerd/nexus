@@ -13,8 +13,9 @@ export NEXUS_AUDIT_MODEL=qwen3:8b
 
 gleam run -m audit/ttft
 
-# Print CSV header and rows after progress lines:
-gleam run -m audit/ttft -- --csv
+# Pure CSV on stdout (header + rows); progress, retry, and error lines go
+# to stderr, so the output can be piped straight into a file:
+gleam run -m audit/ttft -- --csv > ttft.csv
 ```
 
 ## Configuration

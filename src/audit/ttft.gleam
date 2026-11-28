@@ -25,6 +25,25 @@ import nexus/transcript
 
 const stream_attempts = 3
 
+/// Where progress, retry, and error lines go. Report mode writes them to
+/// stdout; CSV mode redirects them to stderr so stdout carries only the
+/// header and rows and can be piped straight into a file.
+type Progress {
+  Progress(line: fn(String) -> Nil)
+}
+
+fn stdout_progress() -> Progress {
+  Progress(line: io.println)
+}
+
+fn stderr_progress() -> Progress {
+  Progress(line: io.println_error)
+}
+
+fn report(progress: Progress, line: String) -> Nil {
+  progress.line(line)
+}
+
 @external(erlang, "nexus_audit_ffi", "halt")
 fn halt(code: Int) -> a
 
@@ -57,37 +76,50 @@ fn stream_with_retries(
   ep: openai.Endpoint,
   requested: transcript.Transcript,
   attempt: Int,
+  progress: Progress,
 ) -> Result(openai.StreamStats, openai.StreamError) {
   let outcome = openai.stream(ep, requested, options(), fn(_) { Nil })
   case outcome, attempt < stream_attempts {
     Ok(stats), _ -> Ok(stats)
     Error(openai.Transport(reason)), True -> {
-      io.println(
+      report(
+        progress,
         "retryable_transport_error=true attempt="
-        <> int.to_string(attempt)
-        <> " reason="
-        <> reason,
+          <> int.to_string(attempt)
+          <> " reason="
+          <> reason,
       )
-      stream_with_retries(ep, requested, attempt + 1)
+      stream_with_retries(ep, requested, attempt + 1, progress)
     }
     Error(error), _ -> Error(error)
   }
 }
 
-fn report_invalid_results(cfg: AuditConfig, results: List(TurnResult)) -> Nil {
+fn report_invalid_results(
+  progress: Progress,
+  cfg: AuditConfig,
+  results: List(TurnResult),
+) -> Nil {
   let expected = cfg.turns * cfg.repeats
   let missing_ttft =
     list.filter(results, fn(result) { result.stats.ttft_ms == None })
   let without_tokens =
     list.filter(results, fn(result) { result.stats.token_deltas == 0 })
-  io.println("invalid_results=true")
-  io.println("result_count=" <> int.to_string(list.length(results)))
-  io.println("expected_count=" <> int.to_string(expected))
-  io.println("missing_ttft_count=" <> int.to_string(list.length(missing_ttft)))
-  io.println("zero_token_count=" <> int.to_string(list.length(without_tokens)))
-  io.println(
+  report(progress, "invalid_results=true")
+  report(progress, "result_count=" <> int.to_string(list.length(results)))
+  report(progress, "expected_count=" <> int.to_string(expected))
+  report(
+    progress,
+    "missing_ttft_count=" <> int.to_string(list.length(missing_ttft)),
+  )
+  report(
+    progress,
+    "zero_token_count=" <> int.to_string(list.length(without_tokens)),
+  )
+  report(
+    progress,
     "first_invalid="
-    <> case list.append(missing_ttft, without_tokens) {
+      <> case list.append(missing_ttft, without_tokens) {
       [] -> "none"
       [result, ..] ->
         "thread="
@@ -115,29 +147,26 @@ pub type Metrics {
 
 pub fn main() -> Nil {
   let csv_mode = list.contains(argv(), "--csv")
+  let progress = case csv_mode {
+    True -> stderr_progress()
+    False -> stdout_progress()
+  }
   case config.load() {
-    Error(message) ->
-      case csv_mode {
-        True -> halt(2)
-        False -> {
-          io.println("=== ttft audit ===")
-          io.println("config error: " <> message)
-          halt(2)
-        }
-      }
+    Error(message) -> {
+      report(progress, "=== ttft audit ===")
+      report(progress, "config error: " <> message)
+      halt(2)
+    }
     Ok(cfg) ->
       case cfg.turns < 20 || cfg.repeats < 1 {
-        True ->
-          case csv_mode {
-            True -> halt(2)
-            False -> {
-              io.println("=== ttft audit ===")
-              io.println(
-                "config error: NEXUS_AUDIT_TURNS must be >= 20 and NEXUS_AUDIT_REPEATS must be >= 1",
-              )
-              halt(2)
-            }
-          }
+        True -> {
+          report(progress, "=== ttft audit ===")
+          report(
+            progress,
+            "config error: NEXUS_AUDIT_TURNS must be >= 20 and NEXUS_AUDIT_REPEATS must be >= 1",
+          )
+          halt(2)
+        }
         False ->
           case csv_mode {
             True -> run_csv(cfg)
@@ -153,15 +182,15 @@ fn run_report(cfg: AuditConfig) -> Nil {
   io.println("model=" <> cfg.model)
   io.println("turns=" <> int.to_string(cfg.turns))
   io.println("repeats=" <> int.to_string(cfg.repeats))
-  let collected = collect_results(cfg)
+  let collected = collect_results(cfg, stdout_progress())
   case valid_results(cfg, collected) {
     False -> {
-      list.each(collected, report_turn)
-      report_invalid_results(cfg, collected)
+      report_turns(stdout_progress(), collected)
+      report_invalid_results(stdout_progress(), cfg, collected)
       halt(1)
     }
     True -> {
-      list.each(collected, report_turn)
+      report_turns(stdout_progress(), collected)
       case summarize(collected) {
         Ok(metrics) -> {
           report_metrics(metrics)
@@ -178,9 +207,13 @@ fn run_report(cfg: AuditConfig) -> Nil {
 }
 
 fn run_csv(cfg: AuditConfig) -> Nil {
-  let collected = collect_results(cfg)
+  let progress = stderr_progress()
+  let collected = collect_results(cfg, progress)
   case valid_results(cfg, collected) {
-    False -> halt(1)
+    False -> {
+      report_invalid_results(progress, cfg, collected)
+      halt(1)
+    }
     True -> {
       io.println(csv_header())
       list.each(collected, fn(turn) { io.println(csv_row(turn)) })
@@ -188,13 +221,17 @@ fn run_csv(cfg: AuditConfig) -> Nil {
   }
 }
 
-fn collect_results(cfg: AuditConfig) -> List(TurnResult) {
+fn collect_results(cfg: AuditConfig, progress: Progress) -> List(TurnResult) {
   int.range(1, cfg.repeats + 1, [], list.prepend)
   |> list.reverse
-  |> list.flat_map(fn(thread) { run_thread(cfg, thread) })
+  |> list.flat_map(fn(thread) { run_thread(cfg, thread, progress) })
 }
 
-fn run_thread(cfg: AuditConfig, thread: Int) -> List(TurnResult) {
+fn run_thread(
+  cfg: AuditConfig,
+  thread: Int,
+  progress: Progress,
+) -> List(TurnResult) {
   let ep = endpoint(cfg)
   let nonce = unique_integer()
   let initial = transcript.new(cfg.model, system_prompt(nonce))
@@ -205,16 +242,17 @@ fn run_thread(cfg: AuditConfig, thread: Int) -> List(TurnResult) {
     let requested = transcript.append_user(current, user_prompt(turn))
     let prompt_chars =
       string.length(transcript.request_body(requested, options()))
-    io.println(
+    report(
+      progress,
       "thread="
-      <> int.to_string(thread)
-      <> " turn="
-      <> int.to_string(turn)
-      <> " started",
+        <> int.to_string(thread)
+        <> " turn="
+        <> int.to_string(turn)
+        <> " started",
     )
     let outcome = case turn {
       1 -> openai.stream(ep, requested, options(), fn(_) { Nil })
-      _ -> stream_with_retries(ep, requested, 1)
+      _ -> stream_with_retries(ep, requested, 1, progress)
     }
     case outcome {
       Ok(stats) -> #(
@@ -222,24 +260,25 @@ fn run_thread(cfg: AuditConfig, thread: Int) -> List(TurnResult) {
         [TurnResult(thread, turn, stats, prompt_chars), ..results],
       )
       Error(openai.Non200(status, body)) -> {
-        io.println(
+        report(
+          progress,
           "thread="
-          <> int.to_string(thread)
-          <> " turn="
-          <> int.to_string(turn)
-          <> " error=non200 status="
-          <> int.to_string(status)
-          <> " body="
-          <> body,
+            <> int.to_string(thread)
+            <> " turn="
+            <> int.to_string(turn)
+            <> " error=non200 status="
+            <> int.to_string(status)
+            <> " body="
+            <> body,
         )
         #(requested, results)
       }
       Error(openai.Transport(reason)) -> {
-        report_stream_error(thread, turn, "transport", reason)
+        report_stream_error(progress, thread, turn, "transport", reason)
         #(requested, results)
       }
       Error(openai.Decode(reason)) -> {
-        report_stream_error(thread, turn, "decode", reason)
+        report_stream_error(progress, thread, turn, "decode", reason)
         #(requested, results)
       }
     }
@@ -248,16 +287,23 @@ fn run_thread(cfg: AuditConfig, thread: Int) -> List(TurnResult) {
   |> list.reverse
 }
 
-fn report_stream_error(thread: Int, turn: Int, kind: String, reason: String) {
-  io.println(
+fn report_stream_error(
+  progress: Progress,
+  thread: Int,
+  turn: Int,
+  kind: String,
+  reason: String,
+) {
+  report(
+    progress,
     "thread="
-    <> int.to_string(thread)
-    <> " turn="
-    <> int.to_string(turn)
-    <> " error="
-    <> kind
-    <> " reason="
-    <> reason,
+      <> int.to_string(thread)
+      <> " turn="
+      <> int.to_string(turn)
+      <> " error="
+      <> kind
+      <> " reason="
+      <> reason,
   )
 }
 
@@ -384,24 +430,29 @@ fn tokens_per_second(result: TurnResult) -> Float {
   }
 }
 
-fn report_turn(result: TurnResult) -> Nil {
-  io.println(
+fn report_turns(progress: Progress, results: List(TurnResult)) -> Nil {
+  list.each(results, fn(turn) { report_turn(progress, turn) })
+}
+
+fn report_turn(progress: Progress, result: TurnResult) -> Nil {
+  report(
+    progress,
     "thread="
-    <> int.to_string(result.thread)
-    <> " turn="
-    <> int.to_string(result.turn)
-    <> " ttft_ms="
-    <> int.to_string(option.unwrap(result.stats.ttft_ms, 0))
-    <> " duration_ms="
-    <> int.to_string(result.stats.duration_ms)
-    <> " token_deltas="
-    <> int.to_string(result.stats.token_deltas)
-    <> " events="
-    <> int.to_string(result.stats.events_parsed)
-    <> " saw_done="
-    <> bool_string(result.stats.saw_done)
-    <> " csv_row="
-    <> csv_row(result),
+      <> int.to_string(result.thread)
+      <> " turn="
+      <> int.to_string(result.turn)
+      <> " ttft_ms="
+      <> int.to_string(option.unwrap(result.stats.ttft_ms, 0))
+      <> " duration_ms="
+      <> int.to_string(result.stats.duration_ms)
+      <> " token_deltas="
+      <> int.to_string(result.stats.token_deltas)
+      <> " events="
+      <> int.to_string(result.stats.events_parsed)
+      <> " saw_done="
+      <> bool_string(result.stats.saw_done)
+      <> " csv_row="
+      <> csv_row(result),
   )
 }
 
