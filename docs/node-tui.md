@@ -25,7 +25,7 @@ Credentials are stored in `0600` JSON files under
 `{server, node, token, thread}` (the pairing code itself is never saved).
 
 - **Reconnecting:** relaunches reuse the stored token without re-pairing.
-- **Revoked or expired credentials:** if the server rejects the token
+- **Revoked or idle-swept credentials:** if the server rejects the token
   (`401`), the TUI exits with code `4`. Passing a pairing URL causes
   `bin/nexus-tui` to re-pair and retry once; without one it exits `4`.
 - **Multi-host / multi-thread:** one pairing URL can pair multiple hosts
@@ -42,11 +42,12 @@ half-typed lines and there is no input history.
 | Variable | Default | Meaning |
 |---|---|---|
 | `NEXUS_PAIR_URL` | unset | Env-var alternative to passing the pairing URL as an argument to `bin/nexus-tui`. |
+| `NEXUS_NODE_TOKEN` | unset | Node credential for the manual `gleam run -m nexus/tui` path (`bin/nexus-tui` supplies it from the state file). |
 | `NEXUS_NODE` | short hostname | Node name (unique per thread). |
 | `NEXUS_ROLE` | `env` | `env` (events + send + local workspace tools) or `viewer` (events + send only). |
 | `NEXUS_THREAD` | grant's thread | Override the thread to join, or disambiguate multiple stored credentials for the same node name. |
 | `NEXUS_URL` | stored server | Disambiguate when credentials exist for multiple servers under the same node name. |
-| `NEXUS_NODE_WORKSPACE` | `./node-workspace` | Local directory exposed by workspace tools in `env` role. |
+| `NEXUS_NODE_WORKSPACE` | `./node-workspace` (under repo root via `bin/nexus-tui`) | Local directory exposed by workspace tools in `env` role. Because `bin/nexus-tui` changes into the repo root before running `gleam`, relative paths resolve against the repo root there. |
 | `NEXUS_ENV_TIMEOUT_MS` | `60000` | Per-call wall-clock deadline in ms for local `bash` (`>= 1000`). |
 | `NEXUS_ENV_MAX_OUTPUT_BYTES` | `262144` | Byte cap on local `bash` output and file reads (`>= 1024`). |
 

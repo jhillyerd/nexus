@@ -66,8 +66,9 @@ system_prompt, tools)` tuple at creation.
   recently active (excludes child bot-channel threads)
 - `GET /threads?archived=1` — archived thread summaries only
 - `POST /threads` `{"bot":"<bot_id>"}` — create a thread from a bot
-  (`201`). Unknown bot → `400`. Supplying `provider`/`model` or
-  non-null `tools` returns `400`.
+  (`201`). Any request body without `bot`—or combining `bot` with
+  `provider`, `model`, or non-null `tools`—returns `400` (unknown bot
+  also returns `400`).
 - `PATCH /threads/<id>` `{"title"?,"pinned"?,"tags"?,"archived"?}` —
   update organizational metadata. Archiving clears `pinned`; pinning an
   archived thread without restoring it in the same patch returns `409`.
@@ -93,9 +94,12 @@ Node names are unique per thread.
   invalid/reserved name → `400`, unknown thread → `404`.
 - `POST /nodes/pair` `{"code":"…","name":"laptop","thread"?}` — redeem a
   web-minted 1-hour multi-use pairing code for a node credential and
-  effective thread ID (no UI token required). Invalid/reserved name →
-  `400`, unknown/expired/revoked code → `404`, duplicate name in that
-  thread → `409`.
+  effective thread ID (no UI token required). Name validation runs
+  before code lookup (`400` unconditionally for invalid/reserved names);
+  after a valid name, unknown/expired/revoked codes return a single
+  merged `404`. With a valid code, an unpinned grant with no `thread`
+  returns `400`, an unknown effective thread returns `404`, and a
+  duplicate name in that thread returns `409`.
 - `DELETE /nodes/<id>` — revoke a node token (`204`, idempotent; blocks
   future connections without killing a live one).
 - `GET /node/ws?node=<name>&token=<token>&thread=<id>&role=env|viewer` —

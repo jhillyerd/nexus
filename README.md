@@ -27,7 +27,8 @@ Create a local `.env` (untracked; loaded by `.envrc` and `bin/dev-server`):
 
 ```sh
 DATABASE_URL=postgres://nexus@127.0.0.1:5433/nexus
-NEXUS_ENCRYPTION_KEY=$(openssl rand -base64 32)
+# Generate a 32-byte key with `openssl rand -base64 32` and paste it here:
+NEXUS_ENCRYPTION_KEY=<base64-key>
 ```
 
 Start Postgres, run migrations, and launch the server:
@@ -85,8 +86,9 @@ Common environment variables to get running (see
 | `NEXUS_WORKSPACE_ROOT` | unset | Enables local workspace tools (`bash`, `read_file`, `write_file`, `list_dir`) under `<root>/<thread-id>`. |
 | `NEXUS_WORKSPACE_SANDBOX` | `none` | OS sandbox for local `bash`: `none`, `bwrap`, or `nono`. |
 
-`DATABASE_URL` is read by `nexus/store/migrate`, `nexus/dev_seed`, and
-`squirrel`; the server itself reads `NEXUS_PG_*`.
+`nexus/store/migrate` prefers `DATABASE_URL` (falling back to
+`NEXUS_PG_*`), `nexus/dev_seed` and `squirrel` read `DATABASE_URL`, and
+the server itself reads `NEXUS_PG_*`.
 
 ## Node TUI
 

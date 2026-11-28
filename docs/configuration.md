@@ -1,7 +1,9 @@
 # Configuration
 
-All server configuration is driven by environment variables and validated
-at boot (misconfiguration fails fast).
+All server configuration is driven by environment variables. Syntax and
+cross-field constraints are validated at boot (failing fast), while
+external runtime dependencies such as sandbox binaries are checked when
+used.
 
 ## Core & HTTP
 
@@ -34,8 +36,9 @@ Defaults match `docker-compose.yml`.
 | `NEXUS_PG_USER` | `nexus` | Database user. |
 | `NEXUS_PG_PASSWORD` | unset | Optional password; never logged or echoed. |
 
-CLI tools (`nexus/store/migrate`, `nexus/dev_seed`, and `squirrel`) read
-`DATABASE_URL` instead of `NEXUS_PG_*`, e.g.:
+`nexus/store/migrate` prefers `DATABASE_URL` and falls back to
+`NEXUS_PG_*` when unset; `nexus/dev_seed` and `squirrel` read
+`DATABASE_URL`, e.g.:
 
 ```sh
 DATABASE_URL=postgres://nexus@127.0.0.1:5433/nexus
@@ -53,7 +56,7 @@ DATABASE_URL=postgres://nexus@127.0.0.1:5433/nexus
 | Variable | Default | Meaning |
 |---|---|---|
 | `NEXUS_HTTP_FETCH_MAX_BYTES` | `20000` | `http_fetch` response body cap per call. |
-| `NEXUS_HTTP_FETCH_TIMEOUT_MS` | `15000` | Per-hop hard deadline in ms for `http_fetch` / `web_fetch` (connect, TLS, headers, and body). |
+| `NEXUS_HTTP_FETCH_TIMEOUT_MS` | `15000` | Per-hop connect/receive timeout input in ms for `http_fetch` / `web_fetch`; a derived hard deadline (`2 * timeout + 2000 ms`) bounds the full hop (connect, TLS, response headers, and body streaming). |
 | `NEXUS_HTTP_FETCH_ALLOW_PRIVATE` | `false` | Dev/test escape hatch allowing private/loopback targets in `http_fetch` / `web_fetch`. Keep `false` in production. |
 | `NEXUS_WEB_FETCH_MAX_RAW_BYTES` | `1048576` | `web_fetch` compressed wire byte cap before decompression (`> 0`). |
 | `NEXUS_WEB_FETCH_MAX_DECOMPRESSED_BYTES` | `8388608` | `web_fetch` decompressed byte cap for gzip/deflate responses (`> 0`). |
