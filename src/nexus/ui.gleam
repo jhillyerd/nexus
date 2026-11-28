@@ -961,7 +961,7 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
 
     Settings(msg) -> {
       // The lifted Settings sub-component: delegate, then fold its
-      // signals (picker re-aim / list reload / log note) into this
+      // signals (list reload / bot cleanup / log note) into this
       // model. The sub-effect rides along mapped back into `Settings`.
       let #(settings, inner_eff, signals) =
         ui_settings.update(
@@ -978,18 +978,6 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           fn(acc, signal) {
             let #(model, effs) = acc
             case signal {
-              ui_settings.ProviderCreated(_) -> {
-                // First-run flow: creating the FIRST provider returns
-                // the view to chat (the auto-opened settings page has
-                // served its purpose; a deliberate settings visit stays
-                // put). No picker re-aim — the composer's bot picker
-                // has no provider selection of its own.
-                let model = case model.provider_list {
-                  [] -> Model(..model, view: ChatView)
-                  _ -> model
-                }
-                #(model, effs)
-              }
               ui_settings.ProvidersChanged -> #(model, [
                 providers_effect(model),
                 ..effs

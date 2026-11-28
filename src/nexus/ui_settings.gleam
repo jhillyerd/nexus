@@ -14,9 +14,9 @@
 //// - this module owns the editor states (add form, inline edit,
 ////   two-step delete confirmation, per-row connection test) and the
 ////   CRUD effects against the provider registry;
-//// - results the parent must act on travel back as `Signal`s: a
-////   created provider re-aims the picker, every mutation asks for a
-////   list reload, and failures surface as notes in the chat log.
+//// - results the parent must act on travel back as `Signal`s: every
+////   mutation asks for a list reload, bot deletion scrubs the thread
+////   registry mirror, and failures surface as notes in the chat log.
 ////
 //// Like the rest of the UI, everything rendered here is a Lustre text
 //// node — provider names, base URLs, model aliases, and failure reasons
@@ -166,7 +166,7 @@ pub type Msg {
   /// and render ok (+ aliases) or the fixed failure reason.
   TestRequested(id: String)
   // ---- Registry replies (dispatched by this module's effects) ----
-  /// A provider was created (the parent re-aims the picker and reloads).
+  /// A provider was created (the parent reloads the provider list).
   Created(provider: Provider)
   /// An update/enable/delete landed (the parent reloads the list).
   Mutated
@@ -265,10 +265,6 @@ pub type Msg {
 /// are returned synchronously from `update`; the parent folds them into
 /// its own model/effects.
 pub type Signal {
-  /// A provider was created: the parent applies the first-run picker
-  /// re-aim, and (still in the auto-opened settings view) returns to
-  /// chat.
-  ProviderCreated(Provider)
   /// The masked list must be reloaded (a provider mutation landed).
   ProvidersChanged
   /// The bot list must be reloaded (a bot mutation landed).
@@ -371,8 +367,7 @@ pub fn update(
       [],
     )
 
-    Created(provider) -> #(State(..state, last_error: None), effect.none(), [
-      ProviderCreated(provider),
+    Created(_provider) -> #(State(..state, last_error: None), effect.none(), [
       ProvidersChanged,
     ])
 
