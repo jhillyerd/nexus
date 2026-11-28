@@ -602,9 +602,9 @@ gate: warm/cold TTFT median ratio ≤ 0.3.
 
 ## HTTP API and the debug dump
 
-The JSON routes are the scripting/e2e API (full list in the README's
-HTTP section; the browser UI uses none of them — it talks to the
-server component over `/ws`). One standing rule when touching them:
+The JSON routes are the scripting/e2e API (full list in `docs/api.md`;
+the browser UI uses none of them — it talks to the server component
+over `/ws`). One standing rule when touching them:
 
 - **`GET /threads/<id>/state` is a read-only debug side channel — never
   a UI data source.** It answers "what does the server believe this
