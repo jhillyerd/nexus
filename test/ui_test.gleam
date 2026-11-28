@@ -1997,23 +1997,17 @@ fn note_count(log: List(ui.Line)) -> Int {
   |> list.length
 }
 
-pub fn provider_created_returns_to_chat_on_first_provider_test() {
-  // The creation lands in the settings sub-component; the signal fold
-  // in ui.update returns the view to chat when the FIRST provider lands
-  // (the auto-opened settings page has served its purpose). There is no
-  // picker re-aim anymore — the composer's bot picker has no provider
-  // selection of its own. Start from the AUTO-OPENED settings view
-  // (first load empty) so the ChatView assertion is load-bearing.
+pub fn provider_created_stays_in_settings_test() {
+  // Adding a provider never exits Settings — including on the first-run
+  // auto-opened settings view (where the user still needs to add bots or
+  // more providers before returning to chat).
   let opened = new_model() |> step(ui.ProvidersLoaded([]))
   opened.view |> should.equal(ui.SettingsView)
   let model =
     opened
     |> step(ui.Settings(ui_settings.Created(prov("p3", "new", True, True))))
-  // The provider list itself reloads via the paired ProvidersChanged
-  // signal (the harness drops effects) — the fold's own verdict is the
-  // view flip.
-  model.view |> should.equal(ui.ChatView)
-  // A settings visit that was NOT the first-run auto-open stays put.
+  model.view |> should.equal(ui.SettingsView)
+  // A manually opened settings visit also stays put.
   let kept =
     new_model()
     |> step(ui.ProvidersLoaded([prov("p2", "ollama", True, False)]))
