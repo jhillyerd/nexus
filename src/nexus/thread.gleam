@@ -163,7 +163,9 @@ pub type EventKind {
   MetaUpdated(title: Option(String), tags: List(String))
   /// Latest active context usage snapshot (Phase 1 context monitoring):
   /// delivered to fresh subscribers via `Hello.usage` on `Join`, and
-  /// broadcast after every committed turn (before the terminal event).
+  /// broadcast after every turn (before the terminal event). Even when a
+  /// request fails, the user message committed in `start_send_turn` remains
+  /// in the transcript, so the broadcast reflects the updated estimate.
   /// Display/budget metadata only — never enters a request body.
   UsageUpdated(usage: ContextUsage)
 }
@@ -1655,29 +1657,29 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
             StreamErrored(_) -> False
             _ -> True
           }
-          // Write-behind at the turn commit point (after the actor state
-          // is decided, still in order with the Send-time hook). Broadcast
-          // UsageUpdated BEFORE the terminal event so subscribers see the
-          // updated context count when TurnDone/TurnStopped/TurnFailed lands
-          // and any post-turn events (queued roster lines, MetaUpdated)
-          // follow strictly after the terminal event.
-          let next_usage = case committed {
-            True -> {
-              let _ = state.commit_hook(tr)
-              let u =
-                update_usage(
-                  state.usage,
-                  tr,
-                  state.base_opts,
-                  turn_usage,
-                  exact_for_usage,
-                )
-              let _ = state.usage_hook(u.tokens)
-              emit(state, UsageUpdated(u))
-              u
-            }
-            False -> state.usage
+          let _ = case committed {
+            True -> state.commit_hook(tr)
+            False -> Nil
           }
+          // Even when the model request fails (`StreamErrored`), the user
+          // message appended in `start_send_turn` stays committed in `tr`
+          // (and Postgres) so retries preserve the prefix. Recomputing usage
+          // on every outcome (`turn_usage = None` on error → calibrated byte
+          // estimate) keeps the pill, `/state`, and `last_context_tokens`
+          // accurate across failed sends too. Broadcast UsageUpdated BEFORE
+          // the terminal event so subscribers see the updated context count
+          // when TurnDone/TurnStopped/TurnFailed lands and any post-turn
+          // events (queued roster lines, MetaUpdated) follow strictly after.
+          let next_usage =
+            update_usage(
+              state.usage,
+              tr,
+              state.base_opts,
+              turn_usage,
+              exact_for_usage,
+            )
+          let _ = state.usage_hook(next_usage.tokens)
+          emit(state, UsageUpdated(next_usage))
           emit(state, event)
           let state =
             State(
@@ -1883,6 +1885,19 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           case is_current {
             False -> actor.continue(state)
             True -> {
+              // The user message appended in `start_send_turn` remains
+              // committed in `state.transcript`; refresh the estimated usage
+              // so a worker crash never leaves the pill or `/state` stale.
+              let next_usage =
+                update_usage(
+                  state.usage,
+                  state.transcript,
+                  state.base_opts,
+                  None,
+                  False,
+                )
+              let _ = state.usage_hook(next_usage.tokens)
+              emit(state, UsageUpdated(next_usage))
               emit(state, TurnFailed("turn worker exited unexpectedly", None))
               actor.continue(
                 State(
@@ -1892,6 +1907,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
                   // mirrored, and the turn committed nothing — drop the
                   // mirror so the next turn's replay starts clean.
                   turn_view: None,
+                  usage: next_usage,
                   metrics: push_metric(
                     state.metrics,
                     MetricSample(

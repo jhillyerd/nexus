@@ -521,10 +521,10 @@ fn fold_stats(acc: StatsAcc, add: openai.StreamStats) -> StatsAcc {
     events_parsed: acc.events_parsed + add.events_parsed,
     decode_errors: acc.decode_errors + add.decode_errors,
     saw_done: acc.saw_done || add.saw_done,
-    usage: case add.usage {
-      Some(_) -> add.usage
-      None -> acc.usage
-    },
+    // Keep only the latest completed round's usage: retaining an earlier
+    // round's usage when a later round omits it would misreport stale tokens
+    // as exact for a larger post-tool transcript and skew byte calibration.
+    usage: add.usage,
   )
 }
 

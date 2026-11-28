@@ -8,6 +8,7 @@ import gleam/option.{None, Some}
 import gleam/string
 import gleeunit/should
 import glopenai/chat
+import glopenai/shared
 import nexus/loop
 import nexus/openai
 import nexus/tools.{type ToolSpec}
@@ -700,4 +701,37 @@ pub fn frozen_options_divergent_toolsets_diverge_test() {
     transcript.request_body(tr, loop.frozen_options([echo_tool()]))
   let chat_only = transcript.request_body(tr, loop.frozen_options([]))
   should.be_false(with_tools == chat_only)
+}
+
+/// If an earlier tool round reports usage and the final round omits it,
+/// `LoopDone` must carry `usage: None` rather than reusing the stale
+/// earlier-round count as if it measured the final post-tool transcript.
+pub fn final_round_without_usage_clears_earlier_round_usage_test() {
+  let round1_usage =
+    shared.CompletionUsage(
+      prompt_tokens: 1000,
+      completion_tokens: 10,
+      total_tokens: 1010,
+      prompt_tokens_details: None,
+      completion_tokens_details: None,
+    )
+  let round1 =
+    Round(
+      [call_delta("c1", "echo", "{}")],
+      openai.Completed(openai.StreamStats(..stats(), usage: Some(round1_usage))),
+    )
+  let round2 =
+    Round(
+      [openai.TokenDelta("done")],
+      openai.Completed(openai.StreamStats(..stats(), usage: None)),
+    )
+  let #(outcome, _events) =
+    run_recording(
+      [echo_tool()],
+      4,
+      sequence_stream([round1, round2]),
+      tr_with_user(),
+    )
+  let assert loop.LoopDone(final_stats, _tr) = outcome
+  final_stats.usage |> should.equal(None)
 }

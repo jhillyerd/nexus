@@ -580,6 +580,10 @@ pub fn failed_turn_commits_nothing_test() {
   should.equal(thread.send_message(sess, "will fail"), thread.Sent)
   expect_user_echo(sub, "will fail")
   expect_event(sub) |> should.equal(scoped(thread.Token("never committed")))
+  let assert thread.ThreadEvent(_, 1, thread.UsageUpdated(failed_u)) =
+    expect_event(sub)
+  should.be_true(failed_u.tokens > 0)
+  failed_u.source |> should.equal(thread.Estimated)
   let assert thread.ThreadEvent(_, 1, thread.TurnFailed(reason, _)) =
     expect_event(sub)
   should.be_true(string.contains(reason, "non200"))
@@ -588,11 +592,16 @@ pub fn failed_turn_commits_nothing_test() {
   // byte-identical prefix (cache-friendly).
   transcript.length(thread.snapshot(sess)) |> should.equal(2)
 
-  // And the thread is usable again afterwards.
+  // And the thread is usable again afterwards (and usage grows with the
+  // second retained user message).
   should.equal(thread.send_message(sess, "retry"), thread.Sent)
   expect_user_echo(sub, "retry")
   expect_event(sub) |> should.equal(scoped(thread.Token("never committed")))
-  let _ = expect_event(sub)
+  let assert thread.ThreadEvent(_, 1, thread.UsageUpdated(retry_u)) =
+    expect_event(sub)
+  should.be_true(retry_u.tokens >= failed_u.tokens)
+  let assert thread.ThreadEvent(_, 1, thread.TurnFailed(_, _)) =
+    expect_event(sub)
 }
 
 pub fn crashing_worker_does_not_kill_thread_test() {
@@ -602,6 +611,10 @@ pub fn crashing_worker_does_not_kill_thread_test() {
 
   should.equal(thread.send_message(sess, "boom"), thread.Sent)
   expect_user_echo(sub, "boom")
+  let assert thread.ThreadEvent(_, 1, thread.UsageUpdated(crashed_u)) =
+    expect_event(sub)
+  should.be_true(crashed_u.tokens > 0)
+  crashed_u.source |> should.equal(thread.Estimated)
   let assert thread.ThreadEvent(_, 1, thread.TurnFailed(reason, _)) =
     expect_event(sub)
   should.be_true(string.contains(reason, "worker"))
@@ -838,7 +851,10 @@ pub fn failed_turn_records_metric_test() {
   should.equal(thread.send_message(sess, "will fail"), thread.Sent)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
-  let _ = expect_event(sub)
+  let assert thread.ThreadEvent(_, 1, thread.UsageUpdated(_)) =
+    expect_event(sub)
+  let assert thread.ThreadEvent(_, 1, thread.TurnFailed(_, _)) =
+    expect_event(sub)
 
   let status = thread.describe(sess)
   status.metrics |> list.length |> should.equal(1)
@@ -1803,7 +1819,10 @@ pub fn utility_not_fired_on_failed_turn_test() {
   should.equal(thread.send_message(sess, "will fail"), thread.Sent)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
-  let _ = expect_event(sub)
+  let assert thread.ThreadEvent(_, 1, thread.UsageUpdated(_)) =
+    expect_event(sub)
+  let assert thread.ThreadEvent(_, 1, thread.TurnFailed(_, _)) =
+    expect_event(sub)
 
   expect_no_utility(events, 400)
   expect_no_event(sub, 400)
@@ -1941,6 +1960,8 @@ pub fn utility_rearms_when_followup_turn_fails_test() {
   let _ = expect_event(sub)
   let _ = expect_event(sub)
   let _ = expect_event(sub)
+  let assert thread.ThreadEvent(_, 1, thread.UsageUpdated(_)) =
+    expect_event(sub)
   let assert thread.ThreadEvent(_, 1, thread.TurnFailed(_, _)) =
     expect_event(sub)
 
@@ -2372,6 +2393,8 @@ pub fn queued_roster_drains_on_worker_down_test() {
   // THEN the queued attach drains and its roster row lands.
   let assert Ok(gate) = process.receive(gate_request, 5000)
   process.send(gate, Nil)
+  let assert thread.ThreadEvent(_, 1, thread.UsageUpdated(_)) =
+    expect_event(sub)
   let assert thread.ThreadEvent(_, 1, thread.TurnFailed(reason, _)) =
     expect_event(sub)
   should.be_true(string.contains(reason, "worker"))
