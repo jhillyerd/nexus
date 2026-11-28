@@ -6450,8 +6450,8 @@ pub fn bot_edit_toggle_refreshes_bots_from_other_session_test() {
   )
   let _ = collect_until_quiet(client_a, 10, 10, "")
 
-  // Another session renames and re-models the fixture bot while Session A
-  // sits on the Bots tab.
+  // Another session renames, re-models, and changes the toolset of the
+  // fixture bot while Session A sits on the Bots tab.
   let assert Ok(_) =
     bot_registry.update_bot(
       bots,
@@ -6462,12 +6462,14 @@ pub fn bot_edit_toggle_refreshes_bots_from_other_session_test() {
         provider_id: None,
         model: Some("fast-updated"),
         system_prompt: None,
-        tools: None,
+        tools: Some(Some(["codemode"])),
         allow_inbound: None,
       ),
     )
 
-  // Session A clicks Edit on the bot: opening the editor must reload bots.
+  // Session A clicks Edit on the bot with its stale row args (tools: None):
+  // opening the editor must reload bots AND reconcile tool-picker state so
+  // saving the untouched form preserves the remote toolset change.
   lustre.send(
     to: session_a,
     message: lustre.dispatch(
@@ -6481,4 +6483,64 @@ pub fn bot_edit_toggle_refreshes_bots_from_other_session_test() {
   let seen = collect_until_quiet(client_a, 20, 10, "")
   should_contain(seen, "Renamed Elsewhere")
   should_contain(seen, "fast-updated")
+
+  // Submit the edit form without touching tools: the remote toolset must
+  // survive instead of being reset back to None (default tools).
+  lustre.send(
+    to: session_a,
+    message: lustre.dispatch(
+      ui.Settings(ui_settings.BotEditSubmitted(
+        store_mock.fixture_bot_id,
+        "Renamed Elsewhere",
+        "",
+        store_mock.fixture_provider_id,
+        "fast-updated",
+        "",
+        "",
+      )),
+    ),
+  )
+  let _ = collect_until_quiet(client_a, 20, 10, "")
+  let assert Ok(saved) = bot_registry.get_bot(bots, store_mock.fixture_bot_id)
+  saved.tools |> should.equal(Some(["codemode"]))
+}
+
+/// Pure reconciliation checks for `sync_edited_bot`:
+/// 1. User tool-picker clicks disarm pending sync so a late `BotsLoaded`
+///    cannot overwrite local edits.
+/// 2. If the edited bot was deleted in another session, `BotsLoaded` closes
+///    the inline editor cleanly.
+pub fn bot_edit_sync_respects_local_edits_and_remote_delete_test() {
+  let remote_bot =
+    bot.Bot(
+      id: "b1",
+      name: "Bot",
+      description: "",
+      provider_id: "p1",
+      model: "smart",
+      system_prompt: None,
+      tools: Some(["codemode"]),
+      allow_inbound: True,
+      created_at: 0,
+      updated_at: 0,
+    )
+  // Opening arms sync, then user flips Custom ON and ticks `http_fetch`
+  // before `BotsLoaded` arrives -> local choice must win.
+  let edited =
+    new_model()
+    |> step(ui.Settings(ui_settings.BotEditToggled("b1", "p1", None)))
+    |> step(ui.Settings(ui_settings.BotToolsCustomToggled))
+    |> step(ui.Settings(ui_settings.BotToolToggled("http_fetch")))
+    |> step(ui.BotsLoaded([remote_bot]))
+  edited.settings.bot_tools_custom |> should.be_true
+  edited.settings.bot_tools_picked |> should.equal(["http_fetch"])
+
+  // Opening with a bot that was deleted elsewhere -> `BotsLoaded([])` closes
+  // the editor cleanly.
+  let vanished =
+    new_model()
+    |> step(ui.Settings(ui_settings.BotEditToggled("b1", "p1", None)))
+    |> step(ui.BotsLoaded([]))
+  vanished.settings.bot_edit |> should.equal(None)
+  vanished.settings.bot_alias_provider |> should.equal(None)
 }

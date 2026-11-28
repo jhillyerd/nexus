@@ -930,7 +930,22 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           }
         None -> first_bot_id(bots)
       }
-      #(Model(..model, bot_list: bots, create_bot: create_bot), effect.none())
+      let #(settings, settings_eff) =
+        ui_settings.sync_edited_bot(
+          model.settings,
+          bots,
+          model.providers,
+          model.models_timeout_ms,
+        )
+      #(
+        Model(
+          ..model,
+          bot_list: bots,
+          create_bot: create_bot,
+          settings: settings,
+        ),
+        effect.map(settings_eff, Settings),
+      )
     }
 
     BotsFailed(reason) -> #(
