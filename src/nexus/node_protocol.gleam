@@ -168,9 +168,10 @@ fn text_part_decoder() -> decode.Decoder(String) {
 // ---------------------------------------------------------------------------
 
 /// Project one fan-out event into its wire frame. Pure: the same event
-/// always encodes the same frame. The emitting-thread filter is the
-/// ADAPTER's (it knows which thread it serves); the codec encodes
-/// whatever it is given.
+/// always encodes the same frame. Returns `Error(Nil)` for event kinds with
+/// no v1 wire projection (such as `UsageUpdated`), which callers should skip.
+/// The emitting-thread filter is the ADAPTER's (it knows which thread it
+/// serves); the codec encodes whatever it is given.
 pub fn event_frame(event: thread.ThreadEvent) -> Result(String, Nil) {
   let thread.ThreadEvent(thread_id: _id, visit: _, kind: kind) = event
   let projected = case kind {

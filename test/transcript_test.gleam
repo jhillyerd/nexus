@@ -410,4 +410,20 @@ pub fn without_trailing_assistant_strips_only_trailing_assistant_test() {
   // When the tail is already a user message, it is a no-op.
   transcript.length(transcript.without_trailing_assistant(base))
   |> should.equal(2)
+
+  // A trailing assistant message carrying tool calls must not be stripped.
+  let with_tool_calls =
+    base
+    |> transcript.append_assistant_tool_calls(
+      text: Some("thinking"),
+      calls: [#("c1", "echo", "{}")],
+      reasoning: None,
+    )
+  let kept = transcript.without_trailing_assistant(with_tool_calls)
+  transcript.length(kept) |> should.equal(3)
+  transcript.request_body(kept, transcript.default_options())
+  |> should.equal(transcript.request_body(
+    with_tool_calls,
+    transcript.default_options(),
+  ))
 }

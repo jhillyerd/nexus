@@ -20,13 +20,12 @@
 //// registry), and updates are existence-checked in state because the
 //// SQL `update ... where id`'s empty match is a silent no-op by design.
 ////
-//// `ListModels` is the one network-touching message: it resolves the
-//// endpoint synchronously (state-only, fast) and then runs the live
-//// fetch in an unlinked process so a slow provider can never stall the
-//// actor — `Resolve` sits on the thread-create path. The fetch
-//// transport is injected at start (`openai.list_models` in
-//// production) so offline tests can hold a fetch and prove that
-//// guarantee.
+//// `ListModels` / `ListModelInfos` are the network-touching messages: they
+//// resolve the endpoint synchronously (state-only, fast) and then run the
+//// live fetch in an unlinked process so a slow provider can never stall the
+//// actor — `Resolve` sits on the thread-create path. The fetch transport is
+//// injected at start (`openai.list_model_infos` in production) so offline
+//// tests can hold a fetch and prove that guarantee.
 
 import gleam/dict.{type Dict}
 import gleam/erlang/process.{type Subject}

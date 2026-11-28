@@ -264,9 +264,10 @@ pub type StoredGrant =
 pub type StoreError =
   String
 
-/// The swappable seam. Every function is synchronous except `commit`,
-/// which must never block the caller (it rides the thread actor's commit
-/// path): implementations enqueue and persist write-behind, in order.
+/// The swappable seam. Every function is synchronous except `commit` and
+/// `set_last_context_tokens`, which must never block the caller (they ride
+/// the thread actor's commit path): implementations enqueue and persist
+/// write-behind, in order.
 pub type Store {
   Store(
     // All stored summaries plus the IDS of rows skipped as corrupt (a

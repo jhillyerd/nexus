@@ -6730,6 +6730,14 @@ pub fn bot_settings_form_shows_provider_context_hint_and_validates_int_test() {
   should_contain(html, "name=\"context_window\"")
   should_contain(html, "Provider reports 131,072 tokens")
 
+  // Switching tabs and reopening Add Bot preserves the hint for the still-mounted input.
+  let reopened =
+    model
+    |> step(ui.Settings(ui_settings.TabSelected(ui_settings.ProvidersTab)))
+    |> step(ui.Settings(ui_settings.TabSelected(ui_settings.BotsTab)))
+    |> step(ui.Settings(ui_settings.BotAddToggled(Some("p1"))))
+  reopened |> view_string |> should_contain("Provider reports 131,072 tokens")
+
   // Model with no reported context length hides the helper text.
   let no_hint =
     step(model, ui.Settings(ui_settings.BotModelChanged("plain")))

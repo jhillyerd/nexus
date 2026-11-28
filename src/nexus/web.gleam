@@ -520,12 +520,14 @@ pub fn parse_provider_patch_json(
 }
 
 /// The POST /bots body: `{"name":…, "provider":…, "model":…,
-/// "description":…?, "system_prompt":…?, "tools":…?}` — name/provider/
-/// model are required; a blank or absent `system_prompt` is the global
-/// default; `tools` absent or null is the default set (resolved at
-/// thread creation), `[]` is chat-only, a non-empty array is an explicit
-/// list (bots plan P2; the registry validates the names against the
-/// compiled catalog).
+/// "description":…?, "system_prompt":…?, "tools":…?,
+/// "context_window":…?}` — name/provider/model are required; a blank or
+/// absent `system_prompt` is the global default; `tools` absent or null is
+/// the default set (resolved at thread creation), `[]` is chat-only, a
+/// non-empty array is an explicit list (bots plan P2; the registry
+/// validates the names against the compiled catalog); `context_window`
+/// absent, null, or blank unsets the per-bot budget, while an integer sets
+/// it (validated `>= 4096` and within int32 range by the registry).
 pub type BotCreateFields {
   BotCreateFields(
     name: String,

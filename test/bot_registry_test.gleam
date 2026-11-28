@@ -846,14 +846,32 @@ pub fn context_window_create_update_clear_and_reject_test() {
   store_mock.ensure_fixture_provider(seam)
   let registry = start_registry(seam)
 
-  // Rejects values below bot.min_context_window (4096).
+  // Rejects values below bot.min_context_window (4096) or above int4 max.
   bot_registry.create_bot(
     registry,
     bot.BotParams(..params("too-small"), context_window: Some(4095)),
   )
   |> should.equal(Error(bot_registry.InvalidContextWindow))
+  bot_registry.create_bot(
+    registry,
+    bot.BotParams(
+      ..params("too-large"),
+      context_window: Some(bot.max_context_window + 1),
+    ),
+  )
+  |> should.equal(Error(bot_registry.InvalidContextWindow))
 
-  // Accepts >= 4096.
+  // Accepts the exact floor (4096) as well as larger budgets.
+  let assert Ok(at_floor) =
+    bot_registry.create_bot(
+      registry,
+      bot.BotParams(
+        ..params("at-floor"),
+        context_window: Some(bot.min_context_window),
+      ),
+    )
+  at_floor.context_window |> should.equal(Some(bot.min_context_window))
+
   let assert Ok(created) =
     bot_registry.create_bot(
       registry,

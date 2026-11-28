@@ -75,6 +75,10 @@ pub type Bot {
 /// `config.min_context_window`; matches the Postgres CHECK constraint).
 pub const min_context_window = config.min_context_window
 
+/// Maximum valid context window in tokens (re-exported from
+/// `config.max_context_window`; matches PostgreSQL `int4` range).
+pub const max_context_window = config.max_context_window
+
 /// Create input: the add-form / POST body fields. A blank
 /// `system_prompt` (after trimming) means the default — there is no
 /// distinct "empty explicit prompt" bot.
@@ -148,7 +152,7 @@ pub type BotError {
   /// refused by the registry's catalog check, not here: this module has
   /// no catalog access (it stays pure domain).
   InvalidTools
-  /// A submitted context window below `min_context_window` (4096).
+  /// A submitted context window outside `min_context_window..max_context_window`.
   InvalidContextWindow
 }
 
@@ -163,8 +167,10 @@ pub fn describe(error: BotError) -> String {
     InvalidTools ->
       "bot tools must contain at least one non-blank name when set"
     InvalidContextWindow ->
-      "context window must be at least "
+      "context window must be between "
       <> int.to_string(min_context_window)
+      <> " and "
+      <> int.to_string(max_context_window)
       <> " tokens when set"
   }
 }
@@ -235,13 +241,13 @@ pub fn normalize_tools(
 }
 
 /// Validate an optional context window budget: `None` passes through;
-/// `Some(n)` must be `>= min_context_window` (4096).
+/// `Some(n)` must lie in `min_context_window..max_context_window`.
 pub fn validate_context_window(
   window: Option(Int),
 ) -> Result(Option(Int), BotError) {
   case window {
     None -> Ok(None)
-    Some(n) if n >= min_context_window -> Ok(Some(n))
+    Some(n) if n >= min_context_window && n <= max_context_window -> Ok(Some(n))
     Some(_) -> Error(InvalidContextWindow)
   }
 }

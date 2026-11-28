@@ -574,7 +574,8 @@ pub type Msg {
   /// happens to be mid-turn.
   MetaUpdated(title: Option(String), tags: List(String))
   /// Context-usage update from the selected thread actor (context-compaction
-  /// Phase 1): emitted on Join and after every committed turn.
+  /// Phase 1): emitted after every committed turn; Join delivers the same
+  /// snapshot via `Hello.usage`.
   UsageUpdated(thread.ContextUsage)
   // M3 tool events: translated 1:1 so the replay/live pipelines carry them;
   // rendering lands with the M3 UI workstream. No-ops in `update` for now.

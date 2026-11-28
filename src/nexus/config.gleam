@@ -302,6 +302,11 @@ pub const plugin_timeout_floor_ms = 100
 /// constraints in migration `0003_context_monitoring.sql`).
 pub const min_context_window = 4096
 
+/// Maximum valid context window in tokens: PostgreSQL `int` (`int4`) upper
+/// bound so out-of-range values fail validation instead of failing at SQL
+/// write time. `bot.max_context_window` re-exports this constant.
+pub const max_context_window = 2_147_483_647
+
 /// Which remediation applies to a config error. Attached AT CONSTRUCTION
 /// (the key step and the workspace-sandbox rules), never re-derived from
 /// the message: error text is free-form and echoes operator-supplied
@@ -571,10 +576,11 @@ fn parse_env(
     7,
   ))
   use log_level <- result.try(optional_log_level(get, "NEXUS_LOG_LEVEL"))
-  use default_context_window <- result.try(optional_maybe_min_int(
+  use default_context_window <- result.try(optional_maybe_int_range(
     get,
     "NEXUS_DEFAULT_CONTEXT_WINDOW",
     min: min_context_window,
+    max: max_context_window,
   ))
   // The ASCII note rides the DEFAULT prompt only, and only while
   // codemode is enabled: an explicitly set NEXUS_SYSTEM_PROMPT is the
@@ -957,16 +963,28 @@ fn optional_min_int(
   default: Int,
   min min_value: Int,
 ) -> Result(Int, String) {
-  use value <- result.try(optional_maybe_min_int(get, name, min: min_value))
-  Ok(option.unwrap(value, default))
+  use value <- result.try(optional_int(get, name, default))
+  case value < min_value {
+    True ->
+      Error(
+        "environment variable "
+        <> name
+        <> " must be >= "
+        <> int.to_string(min_value)
+        <> ": "
+        <> int.to_string(value),
+      )
+    False -> Ok(value)
+  }
 }
 
-/// Optional integer env var with a floor: unset or blank returns `Ok(None)`;
-/// a present value must parse as an integer `>= min_value`.
-fn optional_maybe_min_int(
+/// Optional integer env var with inclusive bounds: unset or blank returns
+/// `Ok(None)`; a present value must parse as an integer in `min..max`.
+fn optional_maybe_int_range(
   get: fn(String) -> Result(String, Nil),
   name: String,
   min min_value: Int,
+  max max_value: Int,
 ) -> Result(Option(Int), String) {
   case optional_string(get, name) {
     None -> Ok(None)
@@ -982,6 +1000,15 @@ fn optional_maybe_min_int(
             <> name
             <> " must be >= "
             <> int.to_string(min_value)
+            <> ": "
+            <> int.to_string(value),
+          )
+        Ok(value) if value > max_value ->
+          Error(
+            "environment variable "
+            <> name
+            <> " must be <= "
+            <> int.to_string(max_value)
             <> ": "
             <> int.to_string(value),
           )
