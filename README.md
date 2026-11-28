@@ -517,6 +517,50 @@ endpoints), plus `NEXUS_AUDIT_TURNS` (20), `NEXUS_AUDIT_REPEATS` (5), and
 the stream timeouts `NEXUS_AUDIT_SSE_FIRST_RESPONSE_TIMEOUT_MS` (30000) /
 `NEXUS_AUDIT_STREAM_IDLE_TIMEOUT_MS` (120000).
 
+## NixOS deployment
+
+The flake exposes `packages.<system>.default` (`nexus` + `nexus-migrate`),
+`overlays.default`, `nixosModules.default`, and a Linux-only VM integration
+check (`checks.<linux-system>.nixos-service`, `x86_64-linux` / `aarch64-linux`).
+
+```nix
+{
+  inputs.nexus.url = "github:<owner>/nexus";
+
+  outputs = { nixpkgs, nexus, ... }: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        nexus.nixosModules.default
+        {
+          services.nexus-agent = {
+            enable = true;
+            # Quoted string paths so secrets never enter /nix/store
+            # (e.g. from sops-nix or agenix):
+            environmentFile = "/run/secrets/nexus.env"; # NEXUS_ENCRYPTION_KEY, NEXUS_UI_TOKEN, ...
+            database = {
+              createLocally = true;
+              passwordFile = "/run/secrets/nexus-pg-password";
+            };
+            workspace = {
+              enable = true;
+              sandbox = "bwrap"; # default; builds an immutable pkgs.buildEnv toolchain
+            };
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+With `database.createLocally = true` and `database.passwordFile` set, the
+unit syncs the password onto the local PostgreSQL role, loads it via
+systemd `LoadCredential` into `NEXUS_PG_PASSWORD`, runs `nexus-migrate` in
+`ExecStartPre`, and starts `nexus` on `127.0.0.1:8080` with `Delegate=cpu
+memory pids` (when `workspace.sandbox` is `bwrap` or `nono`) for per-command
+workspace cgroup caps. See [nix/module.nix](nix/module.nix) for all options.
+
 ## Architecture
 
 **Process model — actors, lifetimes, and communication — is mapped in

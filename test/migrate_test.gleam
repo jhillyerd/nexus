@@ -6,7 +6,10 @@
 
 import gleam/bit_array
 import gleam/crypto
+import gleam/dict
+import gleam/erlang/process
 import gleam/list
+import gleam/option.{None, Some}
 import gleam/string
 import gleeunit/should
 import nexus/store/migrate.{
@@ -391,4 +394,106 @@ pub fn load_migrations_ignores_non_sql_entries_and_rejects_bad_sql_names_test() 
 
   let _ = simplifile.delete(dir)
   Nil
+}
+
+fn env_lookup(
+  pairs: List(#(String, String)),
+) -> fn(String) -> Result(String, Nil) {
+  let table = dict.from_list(pairs)
+  fn(key) { dict.get(table, key) }
+}
+
+pub fn resolve_migrations_dir_defaults_and_overrides_test() {
+  migrate.resolve_migrations_dir(env_lookup([]))
+  |> should.equal("sql/migrations")
+
+  migrate.resolve_migrations_dir(env_lookup([#("NEXUS_MIGRATIONS_DIR", "  ")]))
+  |> should.equal("sql/migrations")
+
+  migrate.resolve_migrations_dir(
+    env_lookup([#("NEXUS_MIGRATIONS_DIR", "/nix/store/abc-nexus/share/sql")]),
+  )
+  |> should.equal("/nix/store/abc-nexus/share/sql")
+}
+
+pub fn pg_config_from_env_prefers_database_url_test() {
+  let pool = process.new_name("migrate_test_url")
+  let assert Ok(cfg) =
+    migrate.pg_config_from_env(
+      pool,
+      env_lookup([
+        #("DATABASE_URL", "postgres://alice:secret@db.internal:5432/prod"),
+        #("NEXUS_PG_HOST", "ignored-host"),
+      ]),
+    )
+  should.equal(cfg.host, "db.internal")
+  should.equal(cfg.port, 5432)
+  should.equal(cfg.database, "prod")
+  should.equal(cfg.user, "alice")
+  should.equal(cfg.password, Some("secret"))
+  should.equal(cfg.pool_size, 1)
+}
+
+pub fn pg_config_from_env_falls_back_to_nexus_pg_vars_test() {
+  let pool = process.new_name("migrate_test_pg")
+  let assert Ok(cfg) =
+    migrate.pg_config_from_env(
+      pool,
+      env_lookup([
+        #("NEXUS_PG_HOST", "127.0.0.1"),
+        #("NEXUS_PG_PORT", "5432"),
+        #("NEXUS_PG_DATABASE", "nexus_prod"),
+        #("NEXUS_PG_USER", "nexus_user"),
+        #("NEXUS_PG_PASSWORD", "s3cr3t"),
+      ]),
+    )
+  should.equal(cfg.host, "127.0.0.1")
+  should.equal(cfg.port, 5432)
+  should.equal(cfg.database, "nexus_prod")
+  should.equal(cfg.user, "nexus_user")
+  should.equal(cfg.password, Some("s3cr3t"))
+  should.equal(cfg.pool_size, 1)
+
+  // Defaults match config.gleam when only a subset of NEXUS_PG_* is set.
+  let assert Ok(partial) =
+    migrate.pg_config_from_env(pool, env_lookup([#("NEXUS_PG_PORT", "5432")]))
+  should.equal(partial.host, "127.0.0.1")
+  should.equal(partial.port, 5432)
+  should.equal(partial.database, "nexus")
+  should.equal(partial.user, "nexus")
+  should.equal(partial.password, None)
+
+  let assert Ok(host_only) =
+    migrate.pg_config_from_env(
+      pool,
+      env_lookup([#("NEXUS_PG_HOST", "db.local")]),
+    )
+  should.equal(host_only.host, "db.local")
+  should.equal(host_only.port, 5433)
+  should.equal(host_only.database, "nexus")
+  should.equal(host_only.user, "nexus")
+  should.equal(host_only.password, None)
+}
+
+pub fn pg_config_from_env_errors_when_unconfigured_or_invalid_test() {
+  let pool = process.new_name("migrate_test_err")
+  let assert Error(msg) = migrate.pg_config_from_env(pool, env_lookup([]))
+  should.be_true(string.contains(msg, "DATABASE_URL"))
+  should.be_true(string.contains(msg, "NEXUS_PG_"))
+
+  let assert Error(_) =
+    migrate.pg_config_from_env(
+      pool,
+      env_lookup([#("DATABASE_URL", "not-a-url")]),
+    )
+
+  let assert Error(bad_port) =
+    migrate.pg_config_from_env(
+      pool,
+      env_lookup([#("NEXUS_PG_PORT", "not-an-int")]),
+    )
+  should.be_true(string.contains(bad_port, "NEXUS_PG_PORT"))
+
+  let assert Error(_) =
+    migrate.pg_config_from_env(pool, env_lookup([#("NEXUS_PG_PORT", "0")]))
 }
