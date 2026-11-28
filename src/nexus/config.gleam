@@ -319,13 +319,13 @@ pub type ConfigError {
 pub fn hint(error: ConfigError) -> String {
   case error.hint {
     KeyHint ->
-      "required: NEXUS_ENCRYPTION_KEY (base64 of 32 bytes); see the README env table"
+      "required: NEXUS_ENCRYPTION_KEY (base64 of 32 bytes); see docs/configuration.md"
     WorkspaceSandboxHint ->
       "workspace sandboxing: NEXUS_WORKSPACE_SANDBOX selects the backend"
       <> " (none | bwrap | nono); nono requires NEXUS_WORKSPACE_STATE_DIR"
-      <> " outside NEXUS_WORKSPACE_ROOT; see the README env table"
+      <> " outside NEXUS_WORKSPACE_ROOT; see docs/configuration.md"
       <> " and docs/plans/workspace-sandbox.md"
-    GenericHint -> "see the README env table"
+    GenericHint -> "see docs/configuration.md"
   }
 }
 

@@ -838,7 +838,7 @@ pub fn hint_matches_the_error_test() {
   // under the substring matcher this replaced).
   should.equal(
     config.hint(config.ConfigError("anything", config.KeyHint)),
-    "required: NEXUS_ENCRYPTION_KEY (base64 of 32 bytes); see the README env table",
+    "required: NEXUS_ENCRYPTION_KEY (base64 of 32 bytes); see docs/configuration.md",
   )
   should.be_true(string.contains(
     config.hint(config.ConfigError("anything", config.WorkspaceSandboxHint)),
@@ -850,7 +850,7 @@ pub fn hint_matches_the_error_test() {
   ))
   should.equal(
     config.hint(config.ConfigError("anything", config.GenericHint)),
-    "see the README env table",
+    "see docs/configuration.md",
   )
 
   // The tags are attached at construction, end to end: the nono rule
