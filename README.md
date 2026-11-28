@@ -116,7 +116,7 @@ Linux VM check (`checks.<linux-system>.nixos-service`).
 
 ```nix
 {
-  inputs.nexus.url = "github:<owner>/nexus";
+  inputs.nexus.url = "github:jhillyerd/nexus";
 
   outputs = { nixpkgs, nexus, ... }: {
     nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
