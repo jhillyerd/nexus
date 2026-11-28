@@ -15,6 +15,7 @@ import gleam/otp/factory_supervisor
 import gleam/string
 import gleeunit/should
 import nexus/bot
+import nexus/bot_registry
 import nexus/config
 import nexus/log
 import nexus/loop
@@ -76,6 +77,7 @@ fn test_config() -> config.Config {
     log_level: log.Info,
     // Bots P3c: the delivery hop guard; 4 = the shipped default.
     max_bot_hops: 4,
+    default_context_window: None,
   )
 }
 
@@ -404,6 +406,7 @@ fn new_thread(provider_id: String, model: String) -> thread_registry.NewThread {
     bot_id: "b-fixture",
     parent_thread_id: None,
     title: "",
+    context_window: None,
   )
 }
 
@@ -476,6 +479,7 @@ pub fn channel_parent_link_round_trips_test() {
       allow_inbound: True,
       created_at: 1_700_000_000,
       updated_at: 1_700_000_000,
+      context_window: None,
     ))
   let parent = stored_summary("s1", None, None, "")
   let assert Ok(_) = seam.insert_thread(parent, "prompt")
@@ -530,6 +534,8 @@ fn stored_summary(
     roster: None,
     last_active_at: 1_700_000_000,
     message_count: 1,
+    context_window: None,
+    last_context_tokens: None,
   )
 }
 
@@ -745,6 +751,8 @@ fn stored(id: String) -> store.StoredSummary {
     workspaces: None,
     roster: None,
     message_count: 1,
+    context_window: None,
+    last_context_tokens: None,
   )
 }
 
@@ -1048,7 +1056,7 @@ pub fn authored_send_badge_survives_restart_test() {
   // (the human helper) keeps its None/0 shape; Send is the ONE path.
   let events = process.new_subject()
   process.send(record.subject, thread.Join(events, 1))
-  let assert Ok(thread.ThreadEvent(_, _, thread.Hello(_, _, _))) =
+  let assert Ok(thread.ThreadEvent(_, _, thread.Hello(_, _, _, _))) =
     process.receive(events, 2000)
   let assert thread.Sent =
     actor.call(record.subject, 5000, fn(reply) {
@@ -1078,7 +1086,7 @@ pub fn authored_send_badge_survives_restart_test() {
   // the post-reload badge equals the live one.
   let replay = process.new_subject()
   process.send(subject2, thread.Join(replay, 1))
-  let assert Ok(thread.ThreadEvent(_, _, thread.Hello(_, _, _))) =
+  let assert Ok(thread.ThreadEvent(_, _, thread.Hello(_, _, _, _))) =
     process.receive(replay, 2000)
   let assert Ok(thread.ThreadEvent(
     _,
@@ -1401,4 +1409,106 @@ pub fn upgrade_auto_title_merges_tags_and_survives_restart_test() {
     |> list.find(fn(summary) { summary.id == record.id })
   should.equal(summary.title, "Model Title")
   should.equal(summary.tags, ["login-bug", "auth"])
+}
+
+// ---------------------------------------------------------------------------
+// Context monitoring (Phase 1): freeze, default fallback, hydration seeding
+// ---------------------------------------------------------------------------
+
+pub fn context_window_freezes_and_last_context_tokens_hydrates_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  let cfg_with_default =
+    config.Config(..test_config(), default_context_window: Some(65_536))
+  store_mock.ensure_fixture_provider(seam)
+  store_mock.ensure_fixture_bot(seam)
+  let factory_name = process.new_name("nexus_ctx_factory")
+  let assert Ok(factory) =
+    factory_supervisor.start(thread_registry.factory_builder(factory_name))
+  let bots_name = process.new_name("nexus_ctx_bots")
+  let assert Ok(started_bots) =
+    bot_registry.start(seam, bots_name, fn(names) { Ok(names) }, fn() {
+      bot_registry.ToolCatalog([], [])
+    })
+  let assert Ok(started) =
+    thread_registry.start_with_toolset(
+      cfg_with_default,
+      factory_supervisor.get_by_name(factory_name),
+      process.new_name("nexus_ctx_registry"),
+      seam,
+      toolset(happy_runner),
+      fn() { [] },
+      fixture_resolver(),
+      bots_name,
+      dict.new(),
+      dict.new(),
+    )
+  let registry = started.data
+
+  // Thread without explicit context_window inherits NEXUS_DEFAULT_CONTEXT_WINDOW.
+  let assert Ok(defaulted) =
+    thread_registry.create_with_toolset(
+      registry,
+      thread_registry.NewThread(
+        provider_id: store_mock.fixture_provider_id,
+        model: "alias-1",
+        system_prompt: None,
+        toolset: None,
+        bot_id: store_mock.fixture_bot_id,
+        parent_thread_id: None,
+        title: "",
+        context_window: None,
+      ),
+      toolset(happy_runner),
+    )
+  let assert Ok(defaulted_subj) = thread_registry.get(registry, defaulted.id)
+  thread.inspect(defaulted_subj).usage.context_window
+  |> should.equal(Some(65_536))
+
+  // Thread with explicit context_window freezes its own cap over the server default.
+  let assert Ok(explicit) =
+    thread_registry.create_with_toolset(
+      registry,
+      thread_registry.NewThread(
+        provider_id: store_mock.fixture_provider_id,
+        model: "alias-1",
+        system_prompt: None,
+        toolset: None,
+        bot_id: store_mock.fixture_bot_id,
+        parent_thread_id: None,
+        title: "",
+        context_window: Some(32_768),
+      ),
+      toolset(happy_runner),
+    )
+  let assert Ok(explicit_subj) = thread_registry.get(registry, explicit.id)
+  thread.inspect(explicit_subj).usage.context_window
+  |> should.equal(Some(32_768))
+
+  // Commit a turn so last_context_tokens writes through to the store.
+  should.equal(thread.send_message(explicit_subj, "hello"), thread.Sent)
+  store_mock.await_commits(mock, 2)
+  let live_tokens = thread.inspect(explicit_subj).usage.tokens
+  should.be_true(live_tokens > 0)
+
+  // Verify the persisted row recorded both context_window and last_context_tokens.
+  let assert Ok(stored_row) = seam.get_thread(explicit.id)
+  stored_row.summary.context_window |> should.equal(Some(32_768))
+  stored_row.summary.last_context_tokens |> should.equal(Some(live_tokens))
+
+  // Simulate VM restart: unlink before killing so the test process stays alive,
+  // then hydrate from the store into a new registry with NO default.
+  process.unlink(started.pid)
+  process.unlink(factory.pid)
+  process.unlink(started_bots.pid)
+  process.kill(started.pid)
+  process.kill(factory.pid)
+  process.kill(started_bots.pid)
+
+  let booted2 = boot(store_mock.seam(mock))
+  let assert Ok(rehydrated) = thread_registry.get(booted2.registry, explicit.id)
+  let hydrated_usage = thread.inspect(rehydrated).usage
+  hydrated_usage.context_window |> should.equal(Some(32_768))
+  hydrated_usage.tokens |> should.equal(live_tokens)
+  hydrated_usage.source |> should.equal(thread.Estimated)
 }

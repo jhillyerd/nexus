@@ -118,6 +118,9 @@ pub type NewThread {
     /// the registry's guarded AutoTitle also refuses a non-empty title,
     /// which is the heuristic skip).
     title: String,
+    /// Optional context-window budget copied from the creating bot (`None`
+    /// falls back to `NEXUS_DEFAULT_CONTEXT_WINDOW` at freeze time).
+    context_window: Option(Int),
   )
 }
 
@@ -696,6 +699,8 @@ fn stored_summary_with_id(id: String) -> StoredSummary {
     roster: None,
     last_active_at: 0,
     message_count: 0,
+    context_window: None,
+    last_context_tokens: None,
   )
 }
 
@@ -1134,6 +1139,13 @@ fn start_new_thread_bot(
           // below, so create and hydration always agree byte-identically.
           let prompt =
             option.unwrap(requested.system_prompt, state.cfg.system_prompt)
+          // Freeze the thread's context-window budget at creation: the bot's
+          // explicit budget wins, falling back to NEXUS_DEFAULT_CONTEXT_WINDOW.
+          let context_window =
+            option.or(
+              requested.context_window,
+              state.cfg.default_context_window,
+            )
           // Environments plan Phase 1: the frozen workspace root. Any
           // env entry in the manifest freezes the config's RESOLVED
           // root onto the thread (the gate above proved it is `Some`
@@ -1249,6 +1261,8 @@ fn start_new_thread_bot(
                 // create reply, GET /threads, and the first persisted
                 // state agree (cubic PR review).
                 message_count: transcript.length(transcript),
+                context_window: context_window,
+                last_context_tokens: None,
               ),
               // The RESOLVED prompt — the exact bytes frozen into the
               // transcript above, never the config default an explicit
@@ -1316,6 +1330,9 @@ fn start_new_thread_bot(
                 _, _ -> None
               },
               archived: False,
+              context_window: context_window,
+              last_context_tokens: None,
+              usage_hook: usage_hook_for(state.store, id),
             )
           // The environment wrapper (environments plan Phase 1): the
           // SAME per-thread injection point as the delivery wrapper —
@@ -2206,7 +2223,7 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
           let spec = case record.persisted {
             True ->
               case rebuild_transcript(state, record.id) {
-                Ok(#(transcript, roster)) ->
+                Ok(#(transcript, roster, last_context_tokens)) ->
                   thread.ThreadSpec(
                     ..record.spec,
                     transcript: transcript,
@@ -2220,6 +2237,7 @@ fn handle_rest(state: State, msg: Msg) -> actor.Next(State, Msg) {
                     roster: roster,
                     hydrated: True,
                     archived: record.meta.archived,
+                    last_context_tokens: last_context_tokens,
                   )
                 Error(error) -> {
                   log_store_error("rehydrate " <> record.id, error)
@@ -2292,6 +2310,11 @@ fn commit_hook_for(persistence: Store, id: String) -> fn(Transcript) -> Nil {
   fn(transcript) { persistence.commit(id, transcript) }
 }
 
+/// Write-behind context-token watermark observer for one thread.
+fn usage_hook_for(persistence: Store, id: String) -> fn(Int) -> Nil {
+  fn(tokens) { persistence.set_last_context_tokens(id, tokens) }
+}
+
 /// The utility apply seam for one thread — the injected `UtilityApply`.
 /// A closure over this actor's subject and the id (exactly like the
 /// commit hook), performing the `UpgradeAutoTitle` ask with the parsed
@@ -2324,7 +2347,7 @@ fn utility_apply_for(
 fn rebuild_transcript(
   state: State,
   id: String,
-) -> Result(#(Transcript, List(String)), String) {
+) -> Result(#(Transcript, List(String), Option(Int)), String) {
   use stored <- result.try(state.store.get_thread(id))
   use rows <- result.try(state.store.load_messages(id))
   let transcript =
@@ -2343,7 +2366,7 @@ fn rebuild_transcript(
         option.None -> []
       }
   }
-  Ok(#(transcript, roster))
+  Ok(#(transcript, roster, stored.summary.last_context_tokens))
 }
 
 /// Re-derive the live attached-target roster from persisted rows
@@ -2460,7 +2483,7 @@ fn lazy_start(state: State, summary: StoredSummary) -> Resolved {
               log_store_error("lazy_start " <> summary.id, error)
               Missing
             }
-            Ok(#(transcript, roster)) -> {
+            Ok(#(transcript, roster, last_context_tokens)) -> {
               // The roster row persists AT INSERT (insert_thread's
               // roster CTE) and every attach/detach appends a fresh
               // one, so this rebuild — like the Down and retry paths —
@@ -2484,6 +2507,9 @@ fn lazy_start(state: State, summary: StoredSummary) -> Resolved {
                   // any notify on the new actor.
                   parent_thread_id: summary.meta.parent_thread_id,
                   archived: summary.meta.archived,
+                  context_window: summary.context_window,
+                  last_context_tokens: last_context_tokens,
+                  usage_hook: usage_hook_for(state.store, summary.id),
                 )
               let argument =
                 ChildArgument(
@@ -2537,7 +2563,7 @@ fn retry_rehydrate(state: State, record: Record) -> Resolved {
       log_store_error("retry_rehydrate " <> record.id, error)
       Missing
     }
-    Ok(#(transcript, roster)) -> {
+    Ok(#(transcript, roster, last_context_tokens)) -> {
       let spec =
         thread.ThreadSpec(
           ..record.spec,
@@ -2551,6 +2577,7 @@ fn retry_rehydrate(state: State, record: Record) -> Resolved {
           roster: roster,
           hydrated: True,
           archived: record.meta.archived,
+          last_context_tokens: last_context_tokens,
         )
       let argument = ChildArgument(spec: spec, name: record.name)
       case restart(state.factory, argument) {
@@ -3374,6 +3401,7 @@ fn create_dm(
       // creation, so no title economy (heuristic or model) ever runs on
       // it.
       title: bot.name,
+      context_window: bot.context_window,
     )
   case freeze_entries(state, effective_toolset(state, requested)) {
     Error(reason) -> #(

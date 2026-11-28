@@ -71,7 +71,23 @@ fn fake_loop(state: Fake, own: Subject(thread.Msg)) -> Nil {
       // The Join contract: Hello first, then a replay line.
       process.send(
         sub,
-        thread.ThreadEvent(state.id, visit, thread.Hello("fake-alias", 2, [])),
+        thread.ThreadEvent(
+          state.id,
+          visit,
+          thread.Hello(
+            "fake-alias",
+            2,
+            [],
+            thread.ContextUsage(
+              tokens: 0,
+              source: thread.Estimated,
+              context_window: None,
+              last_prompt_tokens: None,
+              last_cached_tokens: None,
+              bytes_per_token: thread.default_bytes_per_token,
+            ),
+          ),
+        ),
       )
       process.send(
         sub,
@@ -177,6 +193,7 @@ fn test_config() -> config.Config {
     node_idle_days: 7,
     log_level: log.Info,
     max_bot_hops: 4,
+    default_context_window: None,
   )
 }
 
@@ -643,7 +660,23 @@ fn named_fake_handle(
     thread.Join(sub, visit) -> {
       process.send(
         sub,
-        thread.ThreadEvent(thread_id, visit, thread.Hello("fake-alias", 2, [])),
+        thread.ThreadEvent(
+          thread_id,
+          visit,
+          thread.Hello(
+            "fake-alias",
+            2,
+            [],
+            thread.ContextUsage(
+              tokens: 0,
+              source: thread.Estimated,
+              context_window: None,
+              last_prompt_tokens: None,
+              last_cached_tokens: None,
+              bytes_per_token: thread.default_bytes_per_token,
+            ),
+          ),
+        ),
       )
       process.send(
         sub,

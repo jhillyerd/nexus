@@ -89,6 +89,7 @@ fn test_config() -> Config {
     log_level: log.Info,
     // Bots P3c: the delivery hop guard; 4 = the shipped default.
     max_bot_hops: 4,
+    default_context_window: None,
   )
 }
 
@@ -364,6 +365,7 @@ fn create(
         bot_id: "b-fixture",
         parent_thread_id: None,
         title: "",
+        context_window: None,
       ),
       toolset(happy_runner),
     )
@@ -1604,4 +1606,113 @@ pub fn node_grant_exchange_round_trip_test() {
   should.equal(list_status, 200)
   should.be_true(string.contains(listed, "laptop-a"))
   should.be_true(string.contains(listed, "laptop-b"))
+}
+
+// ---------------------------------------------------------------------------
+// Context monitoring (Phase 1): bot context_window HTTP routes & thread state
+// ---------------------------------------------------------------------------
+
+pub fn bot_context_window_http_routes_and_thread_state_usage_test() {
+  let #(_registry, port) = start_server()
+
+  // Rejects context_window below 4096 with 400.
+  let #(bad_status, bad_body) =
+    send_authorized(req(
+      port,
+      Post,
+      "/bots",
+      "{\"name\":\"Tiny\",\"provider\":\""
+        <> store_mock.fixture_provider_id
+        <> "\",\"model\":\"smart\",\"context_window\":1024}",
+    ))
+  should.equal(bad_status, 400)
+  should.be_true(string.contains(bad_body, "4096"))
+
+  // Rejects non-blank string context_window with 400.
+  let #(bad_type_status, _) =
+    send_authorized(req(
+      port,
+      Post,
+      "/bots",
+      "{\"name\":\"BadType\",\"provider\":\""
+        <> store_mock.fixture_provider_id
+        <> "\",\"model\":\"smart\",\"context_window\":\"32768\"}",
+    ))
+  should.equal(bad_type_status, 400)
+
+  // Creates bot with valid context_window.
+  let #(created_status, created_body) =
+    send_authorized(req(
+      port,
+      Post,
+      "/bots",
+      "{\"name\":\"BudgetBot\",\"provider\":\""
+        <> store_mock.fixture_provider_id
+        <> "\",\"model\":\"smart\",\"context_window\":65536}",
+    ))
+  should.equal(created_status, 201)
+  should.be_true(string.contains(created_body, "\"context_window\":65536"))
+  let assert Ok(bot_id) =
+    json.parse(created_body, decode.at(["id"], decode.string))
+
+  // Create thread from the bot: thread freezes context_window = 65536,
+  // exposed by GET /threads/<id>/state alongside `usage`.
+  let #(thread_status, thread_body) =
+    send_authorized(req(
+      port,
+      Post,
+      "/threads",
+      "{\"bot\":\"" <> bot_id <> "\"}",
+    ))
+  should.equal(thread_status, 201)
+  let assert Ok(thread_id) =
+    json.parse(thread_body, decode.at(["id"], decode.string))
+
+  let #(state_status, state_body) =
+    send_authorized(req(port, Get, "/threads/" <> thread_id <> "/state", ""))
+  should.equal(state_status, 200)
+  should.be_true(string.contains(state_body, "\"context_window\":65536"))
+  should.be_true(string.contains(state_body, "\"usage\":{\"tokens\":0"))
+  should.be_true(string.contains(state_body, "\"source\":\"estimated\""))
+
+  // PATCH bot: absent keeps 65536; blank string clears back to null; int updates.
+  let #(keep_status, keep_body) =
+    send_authorized(req(
+      port,
+      Patch,
+      "/bots/" <> bot_id,
+      "{\"description\":\"keeps window\"}",
+    ))
+  should.equal(keep_status, 200)
+  should.be_true(string.contains(keep_body, "\"context_window\":65536"))
+
+  let #(clear_status, clear_body) =
+    send_authorized(req(
+      port,
+      Patch,
+      "/bots/" <> bot_id,
+      "{\"context_window\":\"\"}",
+    ))
+  should.equal(clear_status, 200)
+  should.be_true(string.contains(clear_body, "\"context_window\":null"))
+
+  let #(set_status, set_body) =
+    send_authorized(req(
+      port,
+      Patch,
+      "/bots/" <> bot_id,
+      "{\"context_window\":131072}",
+    ))
+  should.equal(set_status, 200)
+  should.be_true(string.contains(set_body, "\"context_window\":131072"))
+
+  let #(null_status, null_body) =
+    send_authorized(req(
+      port,
+      Patch,
+      "/bots/" <> bot_id,
+      "{\"context_window\":null}",
+    ))
+  should.equal(null_status, 200)
+  should.be_true(string.contains(null_body, "\"context_window\":null"))
 }

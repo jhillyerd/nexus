@@ -366,3 +366,64 @@ pub fn last_text_stamp_none_without_stamped_assistant_text_test() {
   )
   |> should.equal(None)
 }
+
+// ---------------------------------------------------------------------------
+// Context monitoring (Phase 1): stream_options & without_trailing_assistant
+// ---------------------------------------------------------------------------
+
+pub fn stream_options_emitted_only_when_streaming_with_include_usage_test() {
+  let t = fixture_1_turn()
+  let default_body = transcript.request_body(t, transcript.default_options())
+  should.be_false(string.contains(default_body, "stream_options"))
+
+  let stream_only = transcript.request_body(t, stream_opts())
+  should.be_false(string.contains(stream_only, "stream_options"))
+
+  // include_usage without stream=True must not emit stream_options.
+  let non_stream_usage =
+    transcript.request_body(
+      t,
+      transcript.Options(..transcript.default_options(), include_usage: True),
+    )
+  should.be_false(string.contains(non_stream_usage, "stream_options"))
+
+  // stream=True + include_usage=True emits stream_options cleanly and deterministically.
+  let usage_opts = transcript.Options(..stream_opts(), include_usage: True)
+  let with_usage = transcript.request_body(t, usage_opts)
+  should.be_true(string.contains(
+    with_usage,
+    "\"stream\":true,\"stream_options\":{\"include_usage\":true}",
+  ))
+  transcript.request_body(t, usage_opts) |> should.equal(with_usage)
+}
+
+pub fn without_trailing_assistant_strips_only_trailing_assistant_test() {
+  let base =
+    transcript.new("m", "sys")
+    |> transcript.append_user("hello")
+  let with_reply = base |> transcript.append_assistant("world")
+  let stripped = transcript.without_trailing_assistant(with_reply)
+  transcript.length(stripped) |> should.equal(2)
+  transcript.request_body(stripped, transcript.default_options())
+  |> should.equal(transcript.request_body(base, transcript.default_options()))
+
+  // When the tail is already a user message, it is a no-op.
+  transcript.length(transcript.without_trailing_assistant(base))
+  |> should.equal(2)
+
+  // A trailing assistant message carrying tool calls must not be stripped.
+  let with_tool_calls =
+    base
+    |> transcript.append_assistant_tool_calls(
+      text: Some("thinking"),
+      calls: [#("c1", "echo", "{}")],
+      reasoning: None,
+    )
+  let kept = transcript.without_trailing_assistant(with_tool_calls)
+  transcript.length(kept) |> should.equal(3)
+  transcript.request_body(kept, transcript.default_options())
+  |> should.equal(transcript.request_body(
+    with_tool_calls,
+    transcript.default_options(),
+  ))
+}

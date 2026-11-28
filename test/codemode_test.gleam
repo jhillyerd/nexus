@@ -645,7 +645,7 @@ pub fn stop_during_script_stops_the_turn_test() {
   let outcome =
     loop.run([spec], 8, stream, tr, cancel, None, None, fn(_) { Nil })
   case outcome {
-    loop.LoopStopped(_) -> Nil
+    loop.LoopStopped(_, _) -> Nil
     loop.LoopFailed(reason) ->
       panic as { "expected LoopStopped, got LoopFailed: " <> reason }
     _ -> panic as "expected LoopStopped"

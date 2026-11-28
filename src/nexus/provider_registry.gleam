@@ -20,13 +20,12 @@
 //// registry), and updates are existence-checked in state because the
 //// SQL `update ... where id`'s empty match is a silent no-op by design.
 ////
-//// `ListModels` is the one network-touching message: it resolves the
-//// endpoint synchronously (state-only, fast) and then runs the live
-//// fetch in an unlinked process so a slow provider can never stall the
-//// actor — `Resolve` sits on the thread-create path. The fetch
-//// transport is injected at start (`openai.list_models` in
-//// production) so offline tests can hold a fetch and prove that
-//// guarantee.
+//// `ListModels` / `ListModelInfos` are the network-touching messages: they
+//// resolve the endpoint synchronously (state-only, fast) and then run the
+//// live fetch in an unlinked process so a slow provider can never stall the
+//// actor — `Resolve` sits on the thread-create path. The fetch transport is
+//// injected at start (`openai.list_model_infos` in production) so offline
+//// tests can hold a fetch and prove that guarantee.
 
 import gleam/dict.{type Dict}
 import gleam/erlang/process.{type Subject}
@@ -135,6 +134,12 @@ pub type Msg {
   /// Live model list from the provider's own `/v1/models`. Runs the
   /// fetch off the actor's message loop (see module docs).
   ListModels(id: String, reply: Subject(Result(List(String), RegistryError)))
+  /// Live model list with optional context-length hints from `/v1/models`.
+  /// Runs off the actor's message loop, identical to `ListModels`.
+  ListModelInfos(
+    id: String,
+    reply: Subject(Result(List(openai.ModelInfo), RegistryError)),
+  )
 }
 
 type State {
@@ -153,11 +158,11 @@ type State {
     /// ID minting only (`p<N>`), seeded past every stored id at boot.
     counter: Int,
     store: Store,
-    /// The live model-list transport. Injectable so the offline tests
-    /// can park a fetch mid-flight and assert the actor loop (and so
-    /// `Resolve`) never waits on it; production passes
-    /// `openai.list_models`.
-    fetch: fn(openai.Endpoint) -> Result(List(String), openai.StreamError),
+    /// The live model-list transport (with optional context-length hints).
+    /// Injectable so offline tests can park a fetch and assert the actor
+    /// loop never waits on it; production passes `openai.list_model_infos`.
+    fetch_infos: fn(openai.Endpoint) ->
+      Result(List(openai.ModelInfo), openai.StreamError),
   )
 }
 
@@ -171,18 +176,35 @@ pub fn start(
   persistence: Store,
   name: process.Name(Msg),
 ) -> actor.StartResult(Subject(Msg)) {
-  start_with_model_fetcher(cfg, persistence, name, openai.list_models)
+  start_with_model_info_fetcher(cfg, persistence, name, openai.list_model_infos)
 }
 
-/// Identical to `start`, with the model-list transport injected: the
-/// offline tests park a fetch to prove `ListModels` never blocks the
-/// actor loop (and therefore never `Resolve`). Production callers use
-/// `start`, which always passes `openai.list_models`.
+/// Identical to `start`, with a plain model-id fetcher injected: kept
+/// backward-compatible for existing tests (wraps each id with
+/// `context_length: None`).
 pub fn start_with_model_fetcher(
   cfg: Config,
   persistence: Store,
   name: process.Name(Msg),
   fetch: fn(openai.Endpoint) -> Result(List(String), openai.StreamError),
+) -> actor.StartResult(Subject(Msg)) {
+  start_with_model_info_fetcher(cfg, persistence, name, fn(endpoint) {
+    fetch(endpoint)
+    |> result.map(fn(ids) {
+      list.map(ids, fn(id) { openai.ModelInfo(id: id, context_length: None) })
+    })
+  })
+}
+
+/// Identical to `start`, with the `ModelInfo` transport injected: tests
+/// can supply context-length hints or park a fetch to prove `ListModels`
+/// and `ListModelInfos` never block the actor loop.
+pub fn start_with_model_info_fetcher(
+  cfg: Config,
+  persistence: Store,
+  name: process.Name(Msg),
+  fetch_infos: fn(openai.Endpoint) ->
+    Result(List(openai.ModelInfo), openai.StreamError),
 ) -> actor.StartResult(Subject(Msg)) {
   let builder =
     actor.new_with_initialiser(5000, fn(self) {
@@ -204,7 +226,7 @@ pub fn start_with_model_fetcher(
                     resolved: dict.new(),
                     counter: max_provider_counter(rows),
                     store: persistence,
-                    fetch: fetch,
+                    fetch_infos: fetch_infos,
                   ))
                   |> actor.returning(self)
                   |> actor.selecting(
@@ -483,39 +505,54 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
       }
 
     ListModels(id, reply) ->
-      // Resolve from state (fast), then fetch off-loop: a hanging
-      // provider must not stall Resolve on the thread-create path.
-      case dict.get(state.rows, id) {
-        Error(_) -> {
-          process.send(reply, Error(Unknown))
+      fetch_models(state, id, reply, fn(infos) {
+        list.map(infos, fn(info) { info.id })
+      })
+
+    ListModelInfos(id, reply) ->
+      fetch_models(state, id, reply, fn(infos) { infos })
+  }
+}
+
+/// Resolve from state (fast), then fetch off-loop: a hanging provider
+/// must not stall Resolve on the thread-create path.
+fn fetch_models(
+  state: State,
+  id: String,
+  reply: process.Subject(Result(a, RegistryError)),
+  transform: fn(List(openai.ModelInfo)) -> a,
+) -> actor.Next(State, Msg) {
+  case dict.get(state.rows, id) {
+    Error(_) -> {
+      process.send(reply, Error(Unknown))
+      actor.continue(state)
+    }
+    Ok(row) ->
+      case row.enabled, resolve_row(state, row) {
+        False, _ -> {
+          process.send(reply, Error(Disabled))
           actor.continue(state)
         }
-        Ok(row) ->
-          case row.enabled, resolve_row(state, row) {
-            False, _ -> {
-              process.send(reply, Error(Disabled))
-              actor.continue(state)
-            }
-            True, Error(_) -> {
-              process.send(reply, Error(DecryptFailed))
-              actor.continue(state)
-            }
-            True, Ok(resolved) -> {
-              let fetch = state.fetch
-              let endpoint = resolved.endpoint
-              process.spawn_unlinked(fn() {
-                // Runs in the caller-concurrency world, not the actor:
-                // up to the first-response timeout of slow time.
-                let outcome =
-                  fetch(endpoint)
-                  |> result.map_error(fn(error) {
-                    ModelsFailed(describe_stream_error(error))
-                  })
-                process.send(reply, outcome)
+        True, Error(_) -> {
+          process.send(reply, Error(DecryptFailed))
+          actor.continue(state)
+        }
+        True, Ok(resolved) -> {
+          let fetch = state.fetch_infos
+          let endpoint = resolved.endpoint
+          process.spawn_unlinked(fn() {
+            // Runs in the caller-concurrency world, not the actor:
+            // up to the first-response timeout of slow time.
+            let outcome =
+              fetch(endpoint)
+              |> result.map(transform)
+              |> result.map_error(fn(error) {
+                ModelsFailed(describe_stream_error(error))
               })
-              actor.continue(state)
-            }
-          }
+            process.send(reply, outcome)
+          })
+          actor.continue(state)
+        }
       }
   }
 }
@@ -773,4 +810,13 @@ pub fn list_models(
   timeout_ms: Int,
 ) -> Result(List(String), RegistryError) {
   actor.call(registry, timeout_ms, fn(reply) { ListModels(id, reply) })
+}
+
+/// Live model list with optional context-length hints for one provider.
+pub fn list_model_infos(
+  registry: Subject(Msg),
+  id: String,
+  timeout_ms: Int,
+) -> Result(List(openai.ModelInfo), RegistryError) {
+  actor.call(registry, timeout_ms, fn(reply) { ListModelInfos(id, reply) })
 }

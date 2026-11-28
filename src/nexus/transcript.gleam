@@ -21,6 +21,7 @@ import glopenai/shared
 pub type Options {
   Options(
     stream: Bool,
+    include_usage: Bool,
     tools: List(chat.ChatCompletionTool),
     tool_choice: Option(chat.ToolChoice),
     max_completion_tokens: Option(Int),
@@ -31,6 +32,7 @@ pub type Options {
 pub fn default_options() -> Options {
   Options(
     stream: False,
+    include_usage: False,
     tools: [],
     tool_choice: None,
     max_completion_tokens: None,
@@ -353,6 +355,19 @@ fn attach_reasoning(
   }
 }
 
+/// Drop a trailing plain assistant text reply (no tool calls), if present.
+/// Used solely to calibrate the byte-to-token ratio against the server's
+/// `usage.prompt_tokens` (which measured the prompt BEFORE the final
+/// assistant reply was appended, and never includes reasoning tokens).
+/// Never mutates a live transcript or alters any request sent to a model.
+pub fn without_trailing_assistant(transcript: Transcript) -> Transcript {
+  case transcript.messages {
+    [chat.AssistantMessage(tool_calls: None, ..), ..rest] ->
+      Transcript(..transcript, messages: rest)
+    _ -> transcript
+  }
+}
+
 /// Build the request value (pure). This is the one construction path; both
 /// `request_body` and the transport seam consume it.
 pub fn to_request(
@@ -365,7 +380,18 @@ pub fn to_request(
       messages: messages(transcript),
     )
   let req = case opts.stream {
-    True -> chat.with_stream(req, True)
+    True ->
+      chat.CreateChatCompletionRequest(
+        ..chat.with_stream(req, True),
+        stream_options: case opts.include_usage {
+          True ->
+            Some(chat.ChatCompletionStreamOptions(
+              include_usage: Some(True),
+              include_obfuscation: None,
+            ))
+          False -> None
+        },
+      )
     False -> req
   }
   let req = case opts.tools {

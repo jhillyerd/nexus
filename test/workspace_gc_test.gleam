@@ -74,6 +74,7 @@ fn test_config(root: String) -> config.Config {
     node_idle_days: 0,
     log_level: log.Info,
     max_bot_hops: 4,
+    default_context_window: None,
   )
 }
 
@@ -121,6 +122,8 @@ fn env_summary(
     )),
     last_active_at: last_active_at,
     message_count: message_count,
+    context_window: None,
+    last_context_tokens: None,
   )
 }
 
@@ -460,6 +463,7 @@ pub fn registry_create_tracks_workspaces_lazily_and_delete_cleans_disk_test() {
         toolset: Some(["bash"]),
         parent_thread_id: None,
         title: "",
+        context_window: None,
       ),
     )
 
@@ -573,6 +577,7 @@ pub fn delete_bot_tombstones_unreferenced_workspace_and_preserves_referenced_tes
       allow_inbound: True,
       created_at: now,
       updated_at: now,
+      context_window: None,
     )
   }
   let assert Ok(Nil) = seam.insert_bot(mk_bot("b-free", "FreeBot"))

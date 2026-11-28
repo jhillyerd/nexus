@@ -29,6 +29,8 @@ select
   thread.tmp_workspace_id,
   coalesce(tw.rel_path, '') as tmp_rel_path,
   thread.parent_thread_id,
+  thread.context_window,
+  thread.last_context_tokens,
   extract(epoch from thread.created_at)::int8 as created_s,
   extract(epoch from thread.last_active_at)::int8 as last_active_s,
   thread.message_count

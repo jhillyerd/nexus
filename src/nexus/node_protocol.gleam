@@ -168,84 +168,109 @@ fn text_part_decoder() -> decode.Decoder(String) {
 // ---------------------------------------------------------------------------
 
 /// Project one fan-out event into its wire frame. Pure: the same event
-/// always encodes the same frame. The emitting-thread filter is the
-/// ADAPTER's (it knows which thread it serves); the codec encodes
-/// whatever it is given.
+/// always encodes the same frame. Returns `Error(Nil)` for event kinds with
+/// no v1 wire projection (such as `UsageUpdated`), which callers should skip.
+/// The emitting-thread filter is the ADAPTER's (it knows which thread it
+/// serves); the codec encodes whatever it is given.
 pub fn event_frame(event: thread.ThreadEvent) -> Result(String, Nil) {
   let thread.ThreadEvent(thread_id: _id, visit: _, kind: kind) = event
-  let body = case kind {
-    thread.Hello(model, messages, _metrics) ->
-      // Metrics have no v1 projection (the TUI's per-turn numbers ride
-      // `turn_done.stats`); additive growth can add a metrics array.
-      object("hello", [
-        #("model", json.string(model)),
-        #("messages", json.int(messages)),
-      ])
+  let projected = case kind {
+    // Context usage has no v1 TUI projection yet (matching Hello's metrics).
+    thread.UsageUpdated(_) -> Error(Nil)
+    thread.Hello(model, messages, _metrics, _usage) ->
+      // Metrics and usage have no v1 projection (the TUI's per-turn numbers
+      // ride `turn_done.stats`); additive growth can add them later.
+      Ok(
+        object("hello", [
+          #("model", json.string(model)),
+          #("messages", json.int(messages)),
+        ]),
+      )
     thread.UserEcho(text, at, author) ->
-      object("user", [
-        #("text", json.string(text)),
-        #("at", optional_int(at)),
-        #("author", optional_string(author)),
-      ])
+      Ok(
+        object("user", [
+          #("text", json.string(text)),
+          #("at", optional_int(at)),
+          #("author", optional_string(author)),
+        ]),
+      )
     thread.AssistantFull(text, at) ->
-      object("assistant", [
-        #("text", json.string(text)),
-        #("at", optional_int(at)),
-      ])
+      Ok(
+        object("assistant", [
+          #("text", json.string(text)),
+          #("at", optional_int(at)),
+        ]),
+      )
     thread.ReasoningFull(text) ->
-      object("reasoning_full", [#("text", json.string(text))])
-    thread.Token(text) -> object("token", [#("text", json.string(text))])
+      Ok(object("reasoning_full", [#("text", json.string(text))]))
+    thread.Token(text) -> Ok(object("token", [#("text", json.string(text))]))
     thread.Reasoning(text) ->
-      object("reasoning", [#("text", json.string(text))])
+      Ok(object("reasoning", [#("text", json.string(text))]))
     thread.TurnDone(stats, at) ->
-      object("turn_done", [
-        #("at", optional_int(at)),
-        #("stats", stats_json(stats)),
-      ])
+      Ok(
+        object("turn_done", [
+          #("at", optional_int(at)),
+          #("stats", stats_json(stats)),
+        ]),
+      )
     thread.TurnStopped(chars, at) ->
-      object("turn_stopped", [
-        #("chars", json.int(chars)),
-        #("at", optional_int(at)),
-      ])
+      Ok(
+        object("turn_stopped", [
+          #("chars", json.int(chars)),
+          #("at", optional_int(at)),
+        ]),
+      )
     thread.TurnFailed(reason, at) ->
-      object("turn_failed", [
-        #("reason", json.string(reason)),
-        #("at", optional_int(at)),
-      ])
+      Ok(
+        object("turn_failed", [
+          #("reason", json.string(reason)),
+          #("at", optional_int(at)),
+        ]),
+      )
     thread.ToolCallDelta(index, id, name, fragment) ->
-      object("tool_call_delta", [
-        #("index", json.int(index)),
-        #("id", optional_string(id)),
-        #("name", optional_string(name)),
-        #("fragment", json.string(fragment)),
-      ])
+      Ok(
+        object("tool_call_delta", [
+          #("index", json.int(index)),
+          #("id", optional_string(id)),
+          #("name", optional_string(name)),
+          #("fragment", json.string(fragment)),
+        ]),
+      )
     thread.ToolCallAssembled(call_id, name, arguments, at) ->
-      object("tool_call", [
-        #("id", json.string(call_id)),
-        #("name", json.string(name)),
-        #("arguments", json.string(arguments)),
-        #("at", optional_int(at)),
-      ])
+      Ok(
+        object("tool_call", [
+          #("id", json.string(call_id)),
+          #("name", json.string(name)),
+          #("arguments", json.string(arguments)),
+          #("at", optional_int(at)),
+        ]),
+      )
     thread.ToolResult(call_id, name, ok, content) ->
-      object("tool_result", [
-        #("call_id", json.string(call_id)),
-        #("name", json.string(name)),
-        #("ok", json.bool(ok)),
-        #("content", json.string(content)),
-      ])
+      Ok(
+        object("tool_result", [
+          #("call_id", json.string(call_id)),
+          #("name", json.string(name)),
+          #("ok", json.bool(ok)),
+          #("content", json.string(content)),
+        ]),
+      )
     thread.LoopStatus(iteration, max_iterations, phase) ->
-      object("loop_status", [
-        #("iteration", json.int(iteration)),
-        #("max", json.int(max_iterations)),
-        #("phase", json.string(phase)),
-      ])
+      Ok(
+        object("loop_status", [
+          #("iteration", json.int(iteration)),
+          #("max", json.int(max_iterations)),
+          #("phase", json.string(phase)),
+        ]),
+      )
     thread.MetaUpdated(title, tags) ->
-      object("meta", [
-        #("title", optional_string(title)),
-        #("tags", json.array(tags, json.string)),
-      ])
+      Ok(
+        object("meta", [
+          #("title", optional_string(title)),
+          #("tags", json.array(tags, json.string)),
+        ]),
+      )
   }
-  Ok(json.to_string(body))
+  result.map(projected, json.to_string)
 }
 
 /// The turn metrics a TUI renders per turn — the same numbers the web

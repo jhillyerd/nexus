@@ -150,8 +150,38 @@ pub fn valid_arguments_test() {
 // Event plane encode
 // ---------------------------------------------------------------------------
 
+pub fn event_usage_updated_unprojected_test() {
+  node_protocol.event_frame(event(
+    "t1",
+    thread.UsageUpdated(thread.ContextUsage(
+      tokens: 0,
+      source: thread.Estimated,
+      context_window: None,
+      last_prompt_tokens: None,
+      last_cached_tokens: None,
+      bytes_per_token: thread.default_bytes_per_token,
+    )),
+  ))
+  |> should.equal(Error(Nil))
+}
+
 pub fn event_hello_test() {
-  node_protocol.event_frame(event("t1", thread.Hello("smart", 4, [])))
+  node_protocol.event_frame(event(
+    "t1",
+    thread.Hello(
+      "smart",
+      4,
+      [],
+      thread.ContextUsage(
+        tokens: 0,
+        source: thread.Estimated,
+        context_window: None,
+        last_prompt_tokens: None,
+        last_cached_tokens: None,
+        bytes_per_token: thread.default_bytes_per_token,
+      ),
+    ),
+  ))
   |> should.equal(Ok(
     "{\"v\":1,\"type\":\"hello\",\"model\":\"smart\",\"messages\":4}",
   ))

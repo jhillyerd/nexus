@@ -31,6 +31,7 @@
 
 import gleam/dict
 import gleam/erlang/process.{type Monitor, type Pid, type Subject}
+import gleam/float
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -85,7 +86,12 @@ pub type ThreadEvent {
 /// stamped with the emitting thread's id.
 pub type EventKind {
   /// Sent once to a fresh subscriber after `Join` (before any replay).
-  Hello(model: String, messages: Int, metrics: List(MetricSample))
+  Hello(
+    model: String,
+    messages: Int,
+    metrics: List(MetricSample),
+    usage: ContextUsage,
+  )
   /// A user turn, echoed so every tab sees it. Also used for history replay.
   /// `at` is the message's display stamp — wall-clock epoch seconds from
   /// the transcript's timestamp sidecar (None for unstamped history) —
@@ -155,6 +161,172 @@ pub type EventKind {
   /// (the registry mutations of the acting client refresh via their own
   /// reply path). Display metadata; never enters a request body.
   MetaUpdated(title: Option(String), tags: List(String))
+  /// Latest active context usage snapshot (Phase 1 context monitoring):
+  /// delivered to fresh subscribers via `Hello.usage` on `Join`, and
+  /// broadcast after every turn (before the terminal event). Even when a
+  /// request fails, the user message committed in `start_send_turn` remains
+  /// in the transcript, so the broadcast reflects the updated estimate.
+  /// Display/budget metadata only — never enters a request body.
+  UsageUpdated(usage: ContextUsage)
+}
+
+/// How `ContextUsage.tokens` was produced.
+pub type TokenSource {
+  /// Derived from server-reported `usage.prompt_tokens + completion_tokens`.
+  Measured
+  /// Estimated from serialized request bytes (calibrated if any measured
+  /// sample was seen) or seeded from persisted `last_context_tokens`.
+  Estimated
+}
+
+/// Per-thread context occupancy and budget snapshot tracked by the actor.
+/// Display/budget state only — never encoded into requests.
+pub type ContextUsage {
+  ContextUsage(
+    /// Current active context size in tokens (measured or estimated).
+    tokens: Int,
+    source: TokenSource,
+    /// Configured budget frozen on the thread (`None` = unconfigured).
+    context_window: Option(Int),
+    /// Last turn's `prompt_tokens` from backend `usage` (for tooltip).
+    last_prompt_tokens: Option(Int),
+    /// Last turn's `cached_tokens` from backend `usage` (for cache-hit tooltip).
+    last_cached_tokens: Option(Int),
+    /// Calibrated bytes-per-token ratio (default 4.0, clamped to 2.0..6.0).
+    bytes_per_token: Float,
+  )
+}
+
+pub const default_bytes_per_token = 4.0
+
+pub const min_bytes_per_token = 2.0
+
+pub const max_bytes_per_token = 6.0
+
+/// Clamp a measured bytes-per-token ratio into `[2.0, 6.0]`.
+pub fn clamp_bytes_per_token(ratio: Float) -> Float {
+  ratio
+  |> float.max(min_bytes_per_token)
+  |> float.min(max_bytes_per_token)
+}
+
+/// Estimate tokens from serialized request byte length using a clamped
+/// bytes-per-token ratio (ceiling so non-empty requests never round to 0).
+pub fn estimate_tokens_from_bytes(bytes: Int, bytes_per_token: Float) -> Int {
+  case bytes <= 0 {
+    True -> 0
+    False ->
+      int.to_float(bytes) /. clamp_bytes_per_token(bytes_per_token)
+      |> float.ceiling
+      |> float.truncate
+  }
+}
+
+/// Seed `ContextUsage` at actor start (fresh create or hydration).
+pub fn initial_usage(
+  tr: Transcript,
+  base_opts: transcript.Options,
+  context_window: Option(Int),
+  last_context_tokens: Option(Int),
+  hydrated: Bool,
+) -> ContextUsage {
+  let tokens = case last_context_tokens {
+    Some(n) -> int.max(0, n)
+    None ->
+      case hydrated && transcript.length(tr) > 1 {
+        True ->
+          estimate_tokens_from_bytes(
+            string.byte_size(transcript.request_body(tr, base_opts)),
+            default_bytes_per_token,
+          )
+        False -> 0
+      }
+  }
+  ContextUsage(
+    tokens: tokens,
+    source: Estimated,
+    context_window: context_window,
+    last_prompt_tokens: None,
+    last_cached_tokens: None,
+    bytes_per_token: default_bytes_per_token,
+  )
+}
+
+/// Update `ContextUsage` after a committed turn. When `usage` is present and
+/// `exact_for_usage` is True (`StreamDone` / `StreamGuard`, where `usage` came
+/// from the final model request), calibrates `bytes_per_token` from
+/// `without_trailing_assistant(tr)` bytes divided by `usage.prompt_tokens`
+/// (clamped to `2.0..6.0`) and reports `prompt_tokens + completion_tokens` as
+/// `Measured`. When `exact_for_usage` is False (`StreamStopped`, where extra
+/// tool results or partial text may follow the last completed round's usage),
+/// preserves `bytes_per_token` and uses the larger of the measured total and
+/// the calibrated byte estimate. When `usage` is absent, falls back to the
+/// calibrated byte estimate (`Estimated`).
+pub fn update_usage(
+  prev: ContextUsage,
+  tr: Transcript,
+  base_opts: transcript.Options,
+  usage: Option(CompletionUsage),
+  exact_for_usage: Bool,
+) -> ContextUsage {
+  case usage {
+    Some(u) -> {
+      let next_bpt = case exact_for_usage && u.prompt_tokens > 0 {
+        True -> {
+          let prompt_bytes =
+            tr
+            |> transcript.without_trailing_assistant
+            |> transcript.request_body(base_opts)
+            |> string.byte_size
+          case prompt_bytes > 0 {
+            True ->
+              clamp_bytes_per_token(
+                int.to_float(prompt_bytes) /. int.to_float(u.prompt_tokens),
+              )
+            False -> prev.bytes_per_token
+          }
+        }
+        False -> prev.bytes_per_token
+      }
+      let measured_total = int.max(0, u.prompt_tokens + u.completion_tokens)
+      let #(tokens, source) = case exact_for_usage {
+        True -> #(measured_total, Measured)
+        False -> {
+          let est =
+            estimate_tokens_from_bytes(
+              string.byte_size(transcript.request_body(tr, base_opts)),
+              next_bpt,
+            )
+          case est > measured_total {
+            True -> #(est, Estimated)
+            False -> #(measured_total, Measured)
+          }
+        }
+      }
+      ContextUsage(
+        tokens: tokens,
+        source: source,
+        context_window: prev.context_window,
+        last_prompt_tokens: Some(u.prompt_tokens),
+        last_cached_tokens: usage_cached(Some(u)),
+        bytes_per_token: next_bpt,
+      )
+    }
+    None -> {
+      let est =
+        estimate_tokens_from_bytes(
+          string.byte_size(transcript.request_body(tr, base_opts)),
+          prev.bytes_per_token,
+        )
+      ContextUsage(
+        ..prev,
+        tokens: est,
+        source: Estimated,
+        last_prompt_tokens: None,
+        last_cached_tokens: None,
+      )
+    }
+  }
 }
 
 /// What a turn runner reports when its blocking stream returns. The
@@ -166,8 +338,12 @@ pub type EventKind {
 /// byte-identical prefix.
 pub type TurnOutcome {
   StreamDone(stats: openai.StreamStats, transcript: Transcript)
-  StreamStopped(transcript: Transcript)
-  StreamGuard(max_iterations: Int, transcript: Transcript)
+  StreamStopped(transcript: Transcript, usage: Option(CompletionUsage))
+  StreamGuard(
+    max_iterations: Int,
+    transcript: Transcript,
+    usage: Option(CompletionUsage),
+  )
   StreamErrored(reason: String)
 }
 
@@ -383,6 +559,15 @@ pub type ThreadSpec {
     /// `SetArchived` message from the registry's cascade; this is only
     /// the value at actor birth, never a request byte.
     archived: Bool,
+    /// Frozen context-window budget in tokens (`None` = unconfigured).
+    /// Display/budget metadata only — never enters request bytes.
+    context_window: Option(Int),
+    /// Persisted context token count seeded at hydration (`None` on fresh
+    /// threads or legacy rows).
+    last_context_tokens: Option(Int),
+    /// Write-behind observer for `last_context_tokens` updates;
+    /// `fn(_) { Nil }` when nobody persists.
+    usage_hook: fn(Int) -> Nil,
   )
 }
 
@@ -514,6 +699,7 @@ pub type ThreadInspect {
     status: ThreadStatus,
     transcript: Transcript,
     live_turn: Option(LiveTurn),
+    usage: ContextUsage,
   )
 }
 
@@ -822,6 +1008,17 @@ type State {
     /// keeps it true uniformly) but refuse nothing — their human Send
     /// behavior is unchanged.
     archived: Bool,
+    /// Frozen request options derived once from `toolset.specs` at actor
+    /// start (`loop.frozen_options`). Used to serialize the transcript
+    /// through the single encode path (`transcript.request_body`) for
+    /// bytes-per-token calibration and fallback estimation.
+    base_opts: transcript.Options,
+    /// Current context usage (display/budget metadata — never enters
+    /// request bytes).
+    usage: ContextUsage,
+    /// Write-behind observer for `last_context_tokens` updates;
+    /// `fn(_) { Nil }` when nobody persists.
+    usage_hook: fn(Int) -> Nil,
   )
 }
 
@@ -852,8 +1049,8 @@ pub fn agent_runner(
       )
     {
       loop.LoopDone(stats, tr) -> StreamDone(stats, tr)
-      loop.LoopStopped(tr) -> StreamStopped(tr)
-      loop.LoopGuardHit(max, tr) -> StreamGuard(max, tr)
+      loop.LoopStopped(tr, usage) -> StreamStopped(tr, usage)
+      loop.LoopGuardHit(max, tr, usage) -> StreamGuard(max, tr, usage)
       loop.LoopFailed(reason) -> StreamErrored(reason)
     }
   }
@@ -887,7 +1084,19 @@ fn start_builder(spec: ThreadSpec) {
     utility_apply: utility_apply,
     parent_thread_id: parent_thread_id,
     archived: archived,
+    context_window: context_window,
+    last_context_tokens: last_context_tokens,
+    usage_hook: usage_hook,
   ) = spec
+  let base_opts = loop.frozen_options(toolset.specs)
+  let usage =
+    initial_usage(
+      transcript,
+      base_opts,
+      context_window,
+      last_context_tokens,
+      hydrated,
+    )
   actor.new_with_initialiser(1000, fn(self) {
     actor.initialised(State(
       id: id,
@@ -927,6 +1136,9 @@ fn start_builder(spec: ThreadSpec) {
       // — a hydrated channel is born archived from its stored row).
       parent_thread_id: parent_thread_id,
       archived: archived,
+      base_opts: base_opts,
+      usage: usage,
+      usage_hook: usage_hook,
       commit_hook: commit_hook,
       // Roster seed (environments plan Phase 2a/2b): the registry
       // derives it — fresh env threads seed `["workspace"]`, hydrated
@@ -967,6 +1179,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
         transcript.model(state.transcript),
         transcript.length(state.transcript),
         state.metrics,
+        state.usage,
       ))
       // Replay existing history so a fresh page load / reconnect sees the
       // thread (system prompt stays server-side, per the cache contract).
@@ -1199,6 +1412,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           status: current_status(state),
           transcript: state.transcript,
           live_turn: state.turn_view,
+          usage: state.usage,
         ),
       )
       actor.continue(state)
@@ -1435,24 +1649,38 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
               process.demonitor_process(monitor)
             Idle -> Nil
           }
-          let #(tr, event, sample) =
+          let #(tr, event, sample, turn_usage, exact_for_usage) =
             finish_outcome(state.turn, state.transcript, outcome)
-          emit(state, event)
           // Done/stopped/guard outcomes install the worker's extended
           // transcript (a commit); only a pure error leaves it untouched.
           let committed = case outcome {
             StreamErrored(_) -> False
             _ -> True
           }
-          // Write-behind at the turn commit point (after the actor state
-          // is decided, still in order with the Send-time hook).
-          case committed {
-            True -> {
-              let _ = state.commit_hook(tr)
-              Nil
-            }
+          let _ = case committed {
+            True -> state.commit_hook(tr)
             False -> Nil
           }
+          // Even when the model request fails (`StreamErrored`), the user
+          // message appended in `start_send_turn` stays committed in `tr`
+          // (and Postgres) so retries preserve the prefix. Recomputing usage
+          // on every outcome (`turn_usage = None` on error → calibrated byte
+          // estimate) keeps the pill, `/state`, and `last_context_tokens`
+          // accurate across failed sends too. Broadcast UsageUpdated BEFORE
+          // the terminal event so subscribers see the updated context count
+          // when TurnDone/TurnStopped/TurnFailed lands and any post-turn
+          // events (queued roster lines, MetaUpdated) follow strictly after.
+          let next_usage =
+            update_usage(
+              state.usage,
+              tr,
+              state.base_opts,
+              turn_usage,
+              exact_for_usage,
+            )
+          let _ = state.usage_hook(next_usage.tokens)
+          emit(state, UsageUpdated(next_usage))
+          emit(state, event)
           let state =
             State(
               ..state,
@@ -1463,6 +1691,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
               // mirror must not leak into the next turn's replay).
               turn_view: None,
               metrics: push_metric(state.metrics, sample),
+              usage: next_usage,
               last_commit_s: case committed {
                 True -> timing.wall_now_s()
                 False -> state.last_commit_s
@@ -1656,6 +1885,19 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
           case is_current {
             False -> actor.continue(state)
             True -> {
+              // The user message appended in `start_send_turn` remains
+              // committed in `state.transcript`; refresh the estimated usage
+              // so a worker crash never leaves the pill or `/state` stale.
+              let next_usage =
+                update_usage(
+                  state.usage,
+                  state.transcript,
+                  state.base_opts,
+                  None,
+                  False,
+                )
+              let _ = state.usage_hook(next_usage.tokens)
+              emit(state, UsageUpdated(next_usage))
               emit(state, TurnFailed("turn worker exited unexpectedly", None))
               actor.continue(
                 State(
@@ -1665,6 +1907,7 @@ fn handle(state: State, msg: Msg) -> actor.Next(State, Msg) {
                   // mirrored, and the turn committed nothing — drop the
                   // mirror so the next turn's replay starts clean.
                   turn_view: None,
+                  usage: next_usage,
                   metrics: push_metric(
                     state.metrics,
                     MetricSample(
@@ -2210,7 +2453,7 @@ fn finish_outcome(
   turn: TurnState,
   tr: Transcript,
   outcome: TurnOutcome,
-) -> #(Transcript, EventKind, MetricSample) {
+) -> #(Transcript, EventKind, MetricSample, Option(CompletionUsage), Bool) {
   let now = timing.now_us()
   let started_us = turn_start_us(turn)
   let ttft_ms = case turn_first_us(turn) {
@@ -2233,8 +2476,10 @@ fn finish_outcome(
         stopped_chars: None,
         failure_reason: None,
       ),
+      stats.usage,
+      True,
     )
-    StreamStopped(tr2) -> {
+    StreamStopped(tr2, usage) -> {
       let chars = turn_chars(turn)
       #(
         tr2,
@@ -2244,14 +2489,16 @@ fn finish_outcome(
           ttft_ms: ttft_ms,
           duration_ms: duration_ms,
           token_deltas: deltas,
-          prompt_tokens: None,
-          cached_tokens: None,
+          prompt_tokens: usage_prompt(usage),
+          cached_tokens: usage_cached(usage),
           stopped_chars: Some(chars),
           failure_reason: None,
         ),
+        usage,
+        False,
       )
     }
-    StreamGuard(max, tr2) -> {
+    StreamGuard(max, tr2, usage) -> {
       let reason =
         "iteration guard: reached max "
         <> int.to_string(max)
@@ -2266,11 +2513,13 @@ fn finish_outcome(
           ttft_ms: ttft_ms,
           duration_ms: duration_ms,
           token_deltas: deltas,
-          prompt_tokens: None,
-          cached_tokens: None,
+          prompt_tokens: usage_prompt(usage),
+          cached_tokens: usage_cached(usage),
           stopped_chars: None,
           failure_reason: Some(reason),
         ),
+        usage,
+        True,
       )
     }
     // Nothing committed — `tr` is the actor's untouched transcript, so
@@ -2289,6 +2538,8 @@ fn finish_outcome(
         stopped_chars: None,
         failure_reason: Some(reason),
       ),
+      None,
+      False,
     )
   }
 }

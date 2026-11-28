@@ -56,6 +56,8 @@ fn summary(id: String, provider_id: String) -> store.StoredSummary {
     workspaces: None,
     roster: None,
     message_count: 1,
+    context_window: None,
+    last_context_tokens: None,
   )
 }
 

@@ -85,6 +85,7 @@ fn test_config() -> Config {
     node_idle_days: 7,
     log_level: log.Info,
     max_bot_hops: 4,
+    default_context_window: None,
   )
 }
 
@@ -158,6 +159,7 @@ fn create_bot(
         model: "alpha",
         system_prompt: None,
         tools: None,
+        context_window: None,
       ),
     )
   // The create always opens the gate (P3a); PATCH it closed when a test
@@ -177,6 +179,7 @@ fn create_bot(
             system_prompt: None,
             tools: None,
             allow_inbound: Some(False),
+            context_window: None,
           ),
         )
       patch
@@ -217,6 +220,7 @@ fn create_bot_thread(
         bot_id: bot_id,
         parent_thread_id: None,
         title: "",
+        context_window: None,
       ),
       bundle,
     )
@@ -277,8 +281,8 @@ fn bot_message_runner(
     }
     case loop.run(specs, 8, stream, tr, cancel, delivery, None, recording) {
       loop.LoopDone(stats, tr) -> thread.StreamDone(stats, tr)
-      loop.LoopStopped(tr) -> thread.StreamStopped(tr)
-      loop.LoopGuardHit(max, tr) -> thread.StreamGuard(max, tr)
+      loop.LoopStopped(tr, usage) -> thread.StreamStopped(tr, usage)
+      loop.LoopGuardHit(max, tr, usage) -> thread.StreamGuard(max, tr, usage)
       loop.LoopFailed(reason) -> thread.StreamErrored(reason)
     }
   }
@@ -292,7 +296,7 @@ fn blocking_runner() -> thread.TurnRunner {
       process.new_selector()
       |> process.select_map(cancel, fn(_) { Nil })
     let _ = process.selector_receive(selector, 10_000)
-    thread.StreamStopped(tr)
+    thread.StreamStopped(tr, None)
   }
 }
 
@@ -318,6 +322,7 @@ fn create_parent_thread(
         bot_id: bot_id,
         parent_thread_id: None,
         title: "",
+        context_window: None,
       ),
       thread.Toolset(
         names: [],
@@ -689,6 +694,7 @@ pub fn deliver_hint_only_when_tool_present_test() {
         bot_id: quiet.id,
         parent_thread_id: None,
         title: "",
+        context_window: None,
       ),
       thread.Toolset(
         names: [],
@@ -828,6 +834,7 @@ pub fn deliver_by_thread_id_direct_test() {
         bot_id: target_bot.id,
         parent_thread_id: None,
         title: "",
+        context_window: None,
       ),
       thread.Toolset(
         names: [],

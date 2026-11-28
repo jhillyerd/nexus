@@ -250,3 +250,54 @@ pub fn finish_reason_sets_saw_finish_flag_test() {
   // Zero-event stream defers to finish_stream's buffered status-probe path.
   openai.truncation_error(acc()) |> should.equal(None)
 }
+
+// ---------------------------------------------------------------------------
+// Best-effort /v1/models context-length parsing (context-compaction Phase 1)
+// ---------------------------------------------------------------------------
+
+pub fn decode_model_infos_parses_vllm_openrouter_llamacpp_hints_test() {
+  let body =
+    "{\"object\":\"list\",\"data\":["
+    <> "{\"id\":\"vllm-model\",\"max_model_len\":131072},"
+    <> "{\"id\":\"openrouter-model\",\"context_length\":200000},"
+    <> "{\"id\":\"llamacpp-model\",\"meta\":{\"n_ctx_train\":65536}},"
+    <> "{\"id\":\"plain-model\"},"
+    <> "{\"id\":\"bad-types\",\"max_model_len\":\"not-an-int\",\"context_length\":null,\"meta\":{\"n_ctx_train\":0}},"
+    <> "{\"id\":\"negative\",\"max_model_len\":-100},"
+    <> "{\"id\":\"vllm-model\",\"context_length\":32768}"
+    <> "]}"
+  let assert Ok(infos) = openai.decode_model_infos(body)
+  infos
+  |> should.equal([
+    openai.ModelInfo("vllm-model", Some(131_072)),
+    openai.ModelInfo("openrouter-model", Some(200_000)),
+    openai.ModelInfo("llamacpp-model", Some(65_536)),
+    openai.ModelInfo("plain-model", None),
+    openai.ModelInfo("bad-types", None),
+    openai.ModelInfo("negative", None),
+  ])
+}
+
+pub fn decode_model_infos_merges_duplicate_hint_when_first_lacks_one_test() {
+  let body =
+    "{\"data\":["
+    <> "{\"id\":\"m1\"},"
+    <> "{\"id\":\"m1\",\"max_model_len\":32768}"
+    <> "]}"
+  let assert Ok(infos) = openai.decode_model_infos(body)
+  infos |> should.equal([openai.ModelInfo("m1", Some(32_768))])
+}
+
+pub fn decode_model_infos_prefers_bifrost_alias_over_id_test() {
+  let body =
+    "{\"data\":["
+    <> "{\"id\":\"internal-name\",\"alias\":\"public-alias\",\"max_model_len\":65536},"
+    <> "{\"id\":\"no-alias\"}"
+    <> "]}"
+  let assert Ok(infos) = openai.decode_model_infos(body)
+  infos
+  |> should.equal([
+    openai.ModelInfo("public-alias", Some(65_536)),
+    openai.ModelInfo("no-alias", None),
+  ])
+}

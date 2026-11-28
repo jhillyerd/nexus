@@ -155,16 +155,33 @@ pub fn thread_state_json_test() {
       last_commit_at: 2000,
     )
   let inspect =
-    thread.ThreadInspect(status: status, transcript: t, live_turn: None)
+    thread.ThreadInspect(
+      status: status,
+      transcript: t,
+      live_turn: None,
+      usage: thread.ContextUsage(
+        tokens: 4200,
+        source: thread.Measured,
+        context_window: Some(65_536),
+        last_prompt_tokens: Some(4100),
+        last_cached_tokens: Some(3900),
+        bytes_per_token: 3.75,
+      ),
+    )
   let data =
     json.to_string(web.thread_state_json(
       summary_with_archived("s-2", False),
       inspect,
     ))
 
-  // Shape: summary passthrough + status + committed transcript + idle.
+  // Shape: summary passthrough + status + usage + committed transcript + idle.
   should.be_true(string.contains(data, "\"summary\":{\"id\":\"s-2\""))
   should.be_true(string.contains(data, "\"status\":{\"model\":\"alias-x\""))
+  should.be_true(string.contains(data, "\"context_window\":65536"))
+  should.be_true(string.contains(data, "\"usage\":{\"tokens\":4200"))
+  should.be_true(string.contains(data, "\"source\":\"measured\""))
+  should.be_true(string.contains(data, "\"last_prompt_tokens\":4100"))
+  should.be_true(string.contains(data, "\"last_cached_tokens\":3900"))
   should.be_true(string.contains(data, "\"message_count\":5"))
   should.be_true(string.contains(data, "\"last_commit_at\":2000"))
   should.be_true(string.contains(data, "\"live_turn\":null"))
@@ -953,4 +970,65 @@ fn assert_no_external_urls(html: String) {
   should.be_false(string.contains(html, "url(//"))
   should.be_false(string.contains(html, "url(\"//"))
   should.be_false(string.contains(html, "url('//"))
+}
+
+pub fn bot_context_window_body_decoders_test() {
+  // POST /bots: absent, null, and blank string flatten to None; integer sets.
+  let assert Ok(absent) =
+    web.parse_bot_create_json(
+      "{\"name\":\"a\",\"provider\":\"p\",\"model\":\"m\"}",
+    )
+  absent.context_window |> should.equal(None)
+
+  let assert Ok(null_val) =
+    web.parse_bot_create_json(
+      "{\"name\":\"a\",\"provider\":\"p\",\"model\":\"m\",\"context_window\":null}",
+    )
+  null_val.context_window |> should.equal(None)
+
+  let assert Ok(blank_str) =
+    web.parse_bot_create_json(
+      "{\"name\":\"a\",\"provider\":\"p\",\"model\":\"m\",\"context_window\":\"  \"}",
+    )
+  blank_str.context_window |> should.equal(None)
+
+  let assert Ok(int_val) =
+    web.parse_bot_create_json(
+      "{\"name\":\"a\",\"provider\":\"p\",\"model\":\"m\",\"context_window\":131072}",
+    )
+  int_val.context_window |> should.equal(Some(131_072))
+
+  // Non-blank strings and non-integer types fail decoding (400).
+  web.parse_bot_create_json(
+    "{\"name\":\"a\",\"provider\":\"p\",\"model\":\"m\",\"context_window\":\"128k\"}",
+  )
+  |> should.equal(Error(Nil))
+
+  web.parse_bot_create_json(
+    "{\"name\":\"a\",\"provider\":\"p\",\"model\":\"m\",\"context_window\":true}",
+  )
+  |> should.equal(Error(Nil))
+
+  // PATCH /bots/<id>: three-state — absent keeps (None), null or blank string
+  // clears (Some(None)), integer replaces (Some(Some(n))).
+  let assert Ok(patch_absent) = web.parse_bot_patch_json("{\"name\":\"b\"}")
+  patch_absent.context_window |> should.equal(None)
+
+  let assert Ok(patch_null) =
+    web.parse_bot_patch_json("{\"context_window\":null}")
+  patch_null.context_window |> should.equal(Some(None))
+
+  let assert Ok(patch_blank) =
+    web.parse_bot_patch_json("{\"context_window\":\"  \"}")
+  patch_blank.context_window |> should.equal(Some(None))
+
+  let assert Ok(patch_int) =
+    web.parse_bot_patch_json("{\"context_window\":65536}")
+  patch_int.context_window |> should.equal(Some(Some(65_536)))
+
+  web.parse_bot_patch_json("{\"context_window\":\"128k\"}")
+  |> should.equal(Error(Nil))
+
+  web.parse_bot_patch_json("{\"context_window\":false}")
+  |> should.equal(Error(Nil))
 }

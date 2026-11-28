@@ -74,6 +74,7 @@ fn test_config() -> config.Config {
     log_level: log.Info,
     // Bots P3c: the delivery hop guard; 4 = the shipped default.
     max_bot_hops: 4,
+    default_context_window: None,
   )
 }
 
@@ -138,6 +139,8 @@ fn pinned_thread(id: String, provider_id: String) -> store.StoredSummary {
     workspaces: None,
     roster: None,
     message_count: 1,
+    context_window: None,
+    last_context_tokens: None,
   )
 }
 
@@ -749,4 +752,35 @@ pub fn ciphertext_is_not_plaintext_test() {
   let plain = bit_array.from_string("sk-live-007")
   envelope |> should.not_equal(plain)
   should.be_false(list.any([envelope], fn(bytes) { bytes == plain }))
+}
+
+pub fn list_model_infos_preserves_context_length_hints_test() {
+  let mock = store_mock.start()
+  let seam = store_mock.seam(mock)
+  let expected = [
+    openai.ModelInfo(id: "qwen-32b", context_length: Some(131_072)),
+    openai.ModelInfo(id: "plain", context_length: None),
+  ]
+  let assert Ok(started) =
+    provider_registry.start_with_model_info_fetcher(
+      test_config(),
+      seam,
+      process.new_name("nexus_test_provider_infos"),
+      fn(_endpoint) { Ok(expected) },
+    )
+  let registry = started.data
+  let assert Ok(created) =
+    provider_registry.create(
+      registry,
+      provider.ProviderParams(
+        name: "local",
+        base_url: "http://127.0.0.1:8080/v1",
+        api_key: None,
+      ),
+    )
+
+  provider_registry.list_model_infos(registry, created.id, 1000)
+  |> should.equal(Ok(expected))
+  provider_registry.list_models(registry, created.id, 1000)
+  |> should.equal(Ok(["qwen-32b", "plain"]))
 }

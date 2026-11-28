@@ -29,6 +29,7 @@ import nexus/transcript.{type Transcript}
 pub type Event {
   EvInsertThread(id: String)
   EvCommit(id: String, messages: Int)
+  EvSetLastContextTokens(id: String, tokens: Int)
   EvSetTitle(id: String, title: String)
   EvAutoTitle(id: String, title: String)
   EvAutoMetaUpgrade(id: String, title: String, tags: List(String))
@@ -82,6 +83,8 @@ pub type MockMsg {
   /// replay path — applying the same (or an older) transcript again is a
   /// no-op apart from the recency bump.
   Commit(id: String, transcript: Transcript)
+  /// Write-behind context usage update: fire-and-forget.
+  SetLastContextTokens(id: String, tokens: Int)
   SetTitle(id: String, title: String, reply: Subject(Result(Nil, String)))
   AutoTitle(id: String, title: String, reply: Subject(Result(Bool, String)))
   AutoMetaUpgrade(
@@ -255,6 +258,7 @@ pub fn fixture_bot() -> StoredBot {
     system_prompt: None,
     tools: None,
     allow_inbound: True,
+    context_window: None,
     created_at: 0,
     updated_at: 0,
   )
@@ -310,6 +314,9 @@ pub fn seam(mock: Subject(MockMsg)) -> Store {
       call(mock, 5000, fn(r) { FindChannel(parent_thread_id, bot_id, r) })
     },
     commit: fn(id, transcript) { process.send(mock, Commit(id, transcript)) },
+    set_last_context_tokens: fn(id, tokens) {
+      process.send(mock, SetLastContextTokens(id, tokens))
+    },
     set_title: fn(id, title) {
       call(mock, 5000, fn(r) { SetTitle(id, title, r) })
     },
@@ -573,25 +580,47 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
                   |> fn(taken) { !taken }
                 _, _ -> True
               }
-              case bot_ok, parent_ok, channel_free {
-                False, _, _ -> {
+              let context_ok = case summary.context_window {
+                None -> True
+                Some(n) -> n >= bot.min_context_window
+              }
+              let tokens_ok = case summary.last_context_tokens {
+                None -> True
+                Some(n) -> n >= 0
+              }
+              case bot_ok, parent_ok, channel_free, context_ok, tokens_ok {
+                False, _, _, _, _ -> {
                   let assert Some(bot_id) = summary.meta.bot_id
                   process.send(reply, Error("unknown bot " <> bot_id))
                   actor.continue(state)
                 }
-                _, False, _ -> {
+                _, False, _, _, _ -> {
                   let assert Some(parent) = summary.meta.parent_thread_id
                   process.send(reply, Error("unknown parent thread " <> parent))
                   actor.continue(state)
                 }
-                _, _, False -> {
+                _, _, False, _, _ -> {
                   process.send(
                     reply,
                     Error("duplicate channel for parent/bot (thread_channel)"),
                   )
                   actor.continue(state)
                 }
-                True, True, True -> {
+                _, _, _, False, _ -> {
+                  process.send(
+                    reply,
+                    Error("thread.context_window check violation"),
+                  )
+                  actor.continue(state)
+                }
+                _, _, _, _, False -> {
+                  process.send(
+                    reply,
+                    Error("thread.last_context_tokens check violation"),
+                  )
+                  actor.continue(state)
+                }
+                True, True, True, True, True -> {
                   // Workspace-sandbox plan Phase 1: insert_thread creates the
                   // thread's managed `thread` and `tmp` workspace rows in the
                   // same atomic statement when summary.workspaces is Some.
@@ -778,6 +807,29 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
             }
           }
         }
+      }
+      actor.continue(State(..state, threads: threads, events: events))
+    }
+
+    SetLastContextTokens(id, tokens) -> {
+      // Mirror persist.gleam's defensive clamp so the mock and Postgres agree
+      // even on out-of-contract negative inputs.
+      let tokens = int.max(0, tokens)
+      let events = [EvSetLastContextTokens(id, tokens), ..state.events]
+      let threads = case dict.get(state.threads, id) {
+        Ok(stored) ->
+          dict.insert(
+            state.threads,
+            id,
+            Stored(
+              ..stored,
+              summary: store.StoredSummary(
+                ..stored.summary,
+                last_context_tokens: Some(tokens),
+              ),
+            ),
+          )
+        Error(_) -> state.threads
       }
       actor.continue(State(..state, threads: threads, events: events))
     }
@@ -1385,21 +1437,29 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
         list.any(dict.values(state.bots), fn(existing) {
           string.lowercase(existing.name) == string.lowercase(bot.name)
         }),
-        dict.has_key(state.providers, bot.provider_id)
+        dict.has_key(state.providers, bot.provider_id),
+        case bot.context_window {
+          None -> True
+          Some(n) -> n >= bot.min_context_window
+        }
       {
-        True, _, _ -> {
+        True, _, _, _ -> {
           process.send(reply, Error("bot " <> bot.id <> " exists"))
           actor.continue(state)
         }
-        False, True, _ -> {
+        False, True, _, _ -> {
           process.send(reply, Error("bot name " <> bot.name <> " exists"))
           actor.continue(state)
         }
-        False, False, False -> {
+        False, False, False, _ -> {
           process.send(reply, Error("unknown provider " <> bot.provider_id))
           actor.continue(state)
         }
-        False, False, True -> {
+        False, False, True, False -> {
+          process.send(reply, Error("bot.context_window check violation"))
+          actor.continue(state)
+        }
+        False, False, True, True -> {
           // insert_bot.sql writes created_at and updated_at from the same
           // $9 timestamp.
           let stored = bot.Bot(..bot, updated_at: bot.created_at)
@@ -1432,17 +1492,25 @@ fn handle(state: State, msg: MockMsg) -> actor.Next(State, MockMsg) {
               existing.id != bot.id
               && string.lowercase(existing.name) == string.lowercase(bot.name)
             }),
-            dict.has_key(state.providers, bot.provider_id)
+            dict.has_key(state.providers, bot.provider_id),
+            case bot.context_window {
+              None -> True
+              Some(n) -> n >= bot.min_context_window
+            }
           {
-            True, _ -> {
+            True, _, _ -> {
               process.send(reply, Error("bot name " <> bot.name <> " exists"))
               actor.continue(state)
             }
-            False, False -> {
+            False, False, _ -> {
               process.send(reply, Error("unknown provider " <> bot.provider_id))
               actor.continue(state)
             }
-            False, True -> {
+            False, True, False -> {
+              process.send(reply, Error("bot.context_window check violation"))
+              actor.continue(state)
+            }
+            False, True, True -> {
               // Mirrors update_bot.sql: created_at stays from the stored
               // row, and updated_at is server-side now().
               let updated =

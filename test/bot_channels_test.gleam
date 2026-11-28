@@ -87,6 +87,7 @@ fn test_config() -> Config {
     node_idle_days: 7,
     log_level: log.Info,
     max_bot_hops: 4,
+    default_context_window: None,
   )
 }
 
@@ -185,6 +186,7 @@ fn create_bot(booted: Booted, name: String) -> bot.Bot {
         model: "alpha",
         system_prompt: None,
         tools: None,
+        context_window: None,
       ),
     )
   created
@@ -206,6 +208,7 @@ fn create_parent_thread(booted: Booted, bot_id: String) -> String {
         bot_id: bot_id,
         parent_thread_id: None,
         title: "",
+        context_window: None,
       ),
       thread.Toolset(
         names: [],
@@ -748,6 +751,7 @@ pub fn archive_no_cancel_of_parent_turn_test() {
         bot_id: alpha.id,
         parent_thread_id: None,
         title: "",
+        context_window: None,
       ),
       thread.Toolset(
         names: [],

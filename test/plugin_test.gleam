@@ -74,6 +74,7 @@ fn test_config() -> config.Config {
     env_max_output_bytes: 100_000,
     node_idle_days: 7,
     log_level: log.Info,
+    default_context_window: None,
   )
 }
 

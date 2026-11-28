@@ -313,6 +313,7 @@ fn check_non_utc_timezone_invariance(s: store.Store) -> Result(Nil, String) {
       system_prompt: None,
       tools: None,
       allow_inbound: True,
+      context_window: None,
       created_at: fixed_epoch,
       updated_at: fixed_epoch,
     )
@@ -349,6 +350,8 @@ fn check_non_utc_timezone_invariance(s: store.Store) -> Result(Nil, String) {
       roster: None,
       last_active_at: fixed_epoch,
       message_count: 1,
+      context_window: None,
+      last_context_tokens: None,
     )
   use _ <- result.try(s.insert_thread(summary, "sys"))
   use got_t <- result.try(s.get_thread("t-tz"))
@@ -524,6 +527,8 @@ fn check_persist_restart_multi_call(
           roster: None,
           last_active_at: 1_700_000_000,
           message_count: 1,
+          context_window: None,
+          last_context_tokens: None,
         ),
         "sys",
       ))

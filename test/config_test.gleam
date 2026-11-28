@@ -55,6 +55,7 @@ fn set_all(pairs: List(#(String, String))) -> Nil {
   envoy.unset("NEXUS_WEB_FETCH_DEFAULT_CHARS")
   envoy.unset("NEXUS_WEB_FETCH_MAX_CHARS")
   envoy.unset("NEXUS_WEB_FETCH_CACHE_TTL_MS")
+  envoy.unset("NEXUS_DEFAULT_CONTEXT_WINDOW")
   list.each(pairs, fn(pair) { envoy.set(pair.0, pair.1) })
 }
 
@@ -882,4 +883,59 @@ pub fn hint_matches_the_error_test() {
   ])
   let assert Error(generic) = config.load()
   should.equal(generic.hint, config.GenericHint)
+}
+
+// ---------------------------------------------------------------------------
+// Context monitoring (Phase 1): NEXUS_DEFAULT_CONTEXT_WINDOW
+// ---------------------------------------------------------------------------
+
+pub fn default_context_window_unset_blank_valid_and_rejected_test() {
+  set_all([#("NEXUS_ENCRYPTION_KEY", key_b64)])
+  let assert Ok(unset) = config.load()
+  unset.default_context_window |> should.equal(None)
+
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_DEFAULT_CONTEXT_WINDOW", "   "),
+  ])
+  let assert Ok(blank) = config.load()
+  blank.default_context_window |> should.equal(None)
+
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_DEFAULT_CONTEXT_WINDOW", "65536"),
+  ])
+  let assert Ok(valid) = config.load()
+  valid.default_context_window |> should.equal(Some(65_536))
+
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_DEFAULT_CONTEXT_WINDOW", "4095"),
+  ])
+  let assert Error(low) = config.load()
+  should.be_true(string.contains(low.message, "NEXUS_DEFAULT_CONTEXT_WINDOW"))
+  should.be_true(string.contains(low.message, ">= 4096"))
+
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_DEFAULT_CONTEXT_WINDOW", "2147483648"),
+  ])
+  let assert Error(high) = config.load()
+  should.be_true(string.contains(high.message, "NEXUS_DEFAULT_CONTEXT_WINDOW"))
+  should.be_true(string.contains(high.message, "<= 2147483647"))
+
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_DEFAULT_CONTEXT_WINDOW", "128k"),
+  ])
+  let assert Error(bad) = config.load()
+  should.be_true(string.contains(bad.message, "NEXUS_DEFAULT_CONTEXT_WINDOW"))
+
+  // Existing optional_min_int knobs still fail boot on blank strings.
+  set_all([
+    #("NEXUS_ENCRYPTION_KEY", key_b64),
+    #("NEXUS_ENV_TIMEOUT_MS", ""),
+  ])
+  let assert Error(blank_existing) = config.load()
+  should.be_true(string.contains(blank_existing.message, "NEXUS_ENV_TIMEOUT_MS"))
 }

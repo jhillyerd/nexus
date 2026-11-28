@@ -234,7 +234,7 @@ pub fn select_resets_log_and_streams_test() {
   let model =
     new_model()
     |> step(ui.ThreadsLoaded([summary("s-1", False), summary("s-2", False)]))
-    |> step(ui.Hello("smart"))
+    |> step(ui.Hello("smart", empty_usage()))
     |> step(ui.UserEcho("hi", None, None))
     |> step(ui.Select("s-2"))
   model.selected |> should.equal(Some("s-2"))
@@ -324,7 +324,7 @@ pub fn vanished_selection_ends_thread_test() {
   let model =
     new_model()
     |> step(ui.ThreadsLoaded([summary("s-1", False)]))
-    |> step(ui.Hello("smart"))
+    |> step(ui.Hello("smart", empty_usage()))
     |> step(ui.UserEcho("hi", None, None))
     |> step(ui.Token("par"))
   let model = model |> step(ui.ThreadsLoaded([]))
@@ -348,7 +348,7 @@ pub fn hello_sets_label_and_busy_state_test() {
   let model =
     new_model()
     |> step(ui.ThreadsLoaded([summary("s-1", True)]))
-    |> step(ui.Hello("smart"))
+    |> step(ui.Hello("smart", empty_usage()))
   model.model_label |> should.equal("smart")
   model.streaming |> should.be_true
 }
@@ -506,7 +506,7 @@ pub fn threads_loaded_drops_stale_client_thread_test() {
 pub fn threads_loaded_reconciles_streaming_after_hello_test() {
   let model =
     new_model_with_thread(Some("s1"))
-    |> step(ui.Hello("smart"))
+    |> step(ui.Hello("smart", empty_usage()))
     |> step(ui.ThreadsLoaded([summary("s1", True)]))
   model.streaming |> should.be_true
 }
@@ -516,7 +516,7 @@ pub fn threads_loaded_reconciles_streaming_after_hello_test() {
 pub fn threads_loaded_reconcile_skips_changed_selection_test() {
   let model =
     new_model_with_thread(Some("gone"))
-    |> step(ui.Hello("smart"))
+    |> step(ui.Hello("smart", empty_usage()))
     |> step(ui.ThreadsLoaded([summary("s1", True)]))
   model.selected |> should.equal(Some("s1"))
   model.streaming |> should.be_false
@@ -527,8 +527,8 @@ pub fn threads_loaded_reconcile_skips_changed_selection_test() {
 // ---------------------------------------------------------------------------
 
 pub fn event_translation_test() {
-  ui.from_thread_event(thread.Hello("smart", 3, []))
-  |> should.equal(ui.Hello("smart"))
+  ui.from_thread_event(thread.Hello("smart", 3, [], empty_usage()))
+  |> should.equal(ui.Hello("smart", empty_usage()))
   ui.from_thread_event(thread.UserEcho("hi", Some(1_700_000_000), None))
   |> should.equal(ui.UserEcho("hi", Some(1_700_000_000), None))
   // Bot-authored shape carries through too — a mapping that dropped the
@@ -783,7 +783,7 @@ pub fn guard_failure_keeps_committed_rounds_test() {
 pub fn replay_reconstructs_complete_tool_history_test() {
   let model =
     new_model()
-    |> step(ui.Hello("smart"))
+    |> step(ui.Hello("smart", empty_usage()))
     |> step(ui.UserEcho("search for cats", None, None))
     |> step(ui.AssistantFull("checking", None))
     |> step(ui.ToolCallAssembled(
@@ -944,7 +944,7 @@ pub fn view_popup_defaults_closed_test() {
 pub fn view_popup_rolled_back_call_renders_nothing_test() {
   let model =
     new_model()
-    |> step(ui.Hello("test-model"))
+    |> step(ui.Hello("test-model", empty_usage()))
     |> step(ui.UserEcho("hi", None, None))
     |> step(ui.ToolCallAssembled("call_1", "http_fetch", "{}", None))
     |> step(ui.ToolViewOpened(ui.CallPop("call_1")))
@@ -2332,7 +2332,10 @@ pub fn settings_tab_switch_stands_forms_down_test() {
   assert_settings_transients_down(step(with_bot_add, bots))
 
   let with_bot_edit =
-    step(base, ui.Settings(ui_settings.BotEditToggled("b1", "p1", None)))
+    step(
+      base,
+      ui.Settings(ui_settings.BotEditToggled("b1", "p1", "smart", None)),
+    )
   with_bot_edit.settings.bot_edit |> should.equal(Some("b1"))
   assert_settings_transients_down(step(with_bot_edit, bots))
 
@@ -2523,11 +2526,23 @@ pub fn bot_model_combobox_scopes_and_lists_test() {
   let loaded =
     step(
       model,
-      ui.Settings(ui_settings.BotAliasesLoaded("p1", ["smart", "fast"])),
+      ui.Settings(
+        ui_settings.BotAliasesLoaded("p1", [
+          openai.ModelInfo("smart", None),
+          openai.ModelInfo("fast", None),
+        ]),
+      ),
     )
   loaded.settings.bot_aliases
   |> dict.get("p1")
-  |> should.equal(Ok(ui_settings.AliasOk(["smart", "fast"])))
+  |> should.equal(
+    Ok(
+      ui_settings.AliasOk([
+        openai.ModelInfo("smart", None),
+        openai.ModelInfo("fast", None),
+      ]),
+    ),
+  )
 
   let html = view_string(loaded)
   // The decoration: a select-style chevron class, the browser's own
@@ -2560,10 +2575,14 @@ pub fn bot_alias_cache_invalidated_on_provider_mutation_test() {
     |> step(ui.SettingsToggled)
     |> step(ui.Settings(ui_settings.TabSelected(ui_settings.BotsTab)))
     |> step(ui.Settings(ui_settings.BotAddToggled(Some("p1"))))
-    |> step(ui.Settings(ui_settings.BotAliasesLoaded("p1", ["smart"])))
+    |> step(
+      ui.Settings(
+        ui_settings.BotAliasesLoaded("p1", [openai.ModelInfo("smart", None)]),
+      ),
+    )
   model.settings.bot_aliases
   |> dict.get("p1")
-  |> should.equal(Ok(ui_settings.AliasOk(["smart"])))
+  |> should.equal(Ok(ui_settings.AliasOk([openai.ModelInfo("smart", None)])))
 
   let mutated = step(model, ui.Settings(ui_settings.Mutated))
   mutated.settings.bot_aliases |> dict.size |> should.equal(0)
@@ -2591,7 +2610,11 @@ pub fn bot_model_combobox_provider_switch_rescopes_test() {
     |> step(ui.SettingsToggled)
     |> step(ui.Settings(ui_settings.TabSelected(ui_settings.BotsTab)))
     |> step(ui.Settings(ui_settings.BotAddToggled(Some("p1"))))
-    |> step(ui.Settings(ui_settings.BotAliasesLoaded("p1", ["smart"])))
+    |> step(
+      ui.Settings(
+        ui_settings.BotAliasesLoaded("p1", [openai.ModelInfo("smart", None)]),
+      ),
+    )
 
   let switched =
     step(model, ui.Settings(ui_settings.BotAddProviderPicked("p2")))
@@ -2603,14 +2626,24 @@ pub fn bot_model_combobox_provider_switch_rescopes_test() {
   // A late reply for the superseded provider is dropped (its cache
   // entry already settled) — the Test control's stale-reply rule.
   let late =
-    step(switched, ui.Settings(ui_settings.BotAliasesLoaded("p1", ["late"])))
+    step(
+      switched,
+      ui.Settings(
+        ui_settings.BotAliasesLoaded("p1", [openai.ModelInfo("late", None)]),
+      ),
+    )
   late.settings.bot_aliases
   |> dict.get("p1")
-  |> should.equal(Ok(ui_settings.AliasOk(["smart"])))
+  |> should.equal(Ok(ui_settings.AliasOk([openai.ModelInfo("smart", None)])))
 
   // The new provider's reply lands and is the only thing suggested.
   let settled =
-    step(late, ui.Settings(ui_settings.BotAliasesLoaded("p2", ["fast"])))
+    step(
+      late,
+      ui.Settings(
+        ui_settings.BotAliasesLoaded("p2", [openai.ModelInfo("fast", None)]),
+      ),
+    )
   let html = view_string(settled)
   should.be_true(string.contains(html, "data-value=\"fast\""))
   should_not_contain(html, "data-value=\"smart\"")
@@ -2651,11 +2684,16 @@ pub fn bot_edit_model_combobox_scopes_to_bot_provider_test() {
     |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
     |> step(ui.BotsLoaded([bot_row("b1", "Writer", "", None)]))
     |> step(ui.SettingsToggled)
-    |> step(ui.Settings(ui_settings.BotEditToggled("b1", "p1", None)))
+    |> step(ui.Settings(ui_settings.BotEditToggled("b1", "p1", "smart", None)))
   model.settings.bot_alias_provider |> should.equal(option.Some("p1"))
 
   let html =
-    step(model, ui.Settings(ui_settings.BotAliasesLoaded("p1", ["smart"])))
+    step(
+      model,
+      ui.Settings(
+        ui_settings.BotAliasesLoaded("p1", [openai.ModelInfo("smart", None)]),
+      ),
+    )
     |> view_string
   should.be_true(string.contains(html, "data-value=\"smart\""))
   should.be_true(string.contains(html, "live suggestions: bifrost"))
@@ -2677,8 +2715,8 @@ pub fn bot_model_combobox_hostile_aliases_escape_test() {
     |> step(
       ui.Settings(
         ui_settings.BotAliasesLoaded("p1", [
-          "<img src=x onerror=alert(2)>",
-          "x\" onmouseover=\"alert(1)",
+          openai.ModelInfo("<img src=x onerror=alert(2)>", None),
+          openai.ModelInfo("x\" onmouseover=\"alert(1)", None),
         ]),
       ),
     )
@@ -3185,6 +3223,8 @@ pub fn send_moves_previous_day_row_into_today_immediately_test() {
         roster: None,
         last_active_at: yesterday,
         message_count: 1,
+        context_window: None,
+        last_context_tokens: None,
       ),
       "test system prompt",
     )
@@ -3416,7 +3456,7 @@ fn parked_runner(
     process.new_selector()
     |> process.select_map(cancel, fn(_) { Nil })
   let _ = process.selector_receive(selector, 60_000)
-  thread.StreamStopped(tr)
+  thread.StreamStopped(tr, None)
 }
 
 /// Emits one distinctive token delta then completes. The stream the
@@ -3686,6 +3726,7 @@ fn new_thread(provider_id: String, model: String) -> thread_registry.NewThread {
     bot_id: "b-fixture",
     parent_thread_id: None,
     title: "",
+    context_window: None,
   )
 }
 
@@ -3754,6 +3795,7 @@ fn test_config() -> config.Config {
     log_level: log.Info,
     // Bots P3c: the delivery hop guard; 4 = the shipped default.
     max_bot_hops: 4,
+    default_context_window: None,
   )
 }
 
@@ -3833,6 +3875,7 @@ fn bot_row(
     allow_inbound: True,
     created_at: 0,
     updated_at: 0,
+    context_window: None,
   )
 }
 
@@ -3895,7 +3938,7 @@ pub fn view_settings_bots_section_test() {
     |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
     |> step(ui.BotsLoaded([bot_row("b1", "Writer", "", Some("be terse"))]))
     |> step(ui.SettingsToggled)
-    |> step(ui.Settings(ui_settings.BotEditToggled("b1", "p1", None)))
+    |> step(ui.Settings(ui_settings.BotEditToggled("b1", "p1", "smart", None)))
     |> view_string
   should.be_true(string.contains(editing, ">Edit bot<"))
   should.be_true(string.contains(editing, "value=\"Writer\""))
@@ -3990,7 +4033,12 @@ pub fn view_settings_bots_tools_display_test() {
     )
     |> step(ui.SettingsToggled)
     |> step(
-      ui.Settings(ui_settings.BotEditToggled("b3", "p1", Some(["http_fetch"]))),
+      ui.Settings(ui_settings.BotEditToggled(
+        "b3",
+        "p1",
+        "smart",
+        Some(["http_fetch"]),
+      )),
     )
     |> view_string
   // The picker seeds the stored toolset: http_fetch renders as a
@@ -4009,7 +4057,9 @@ pub fn view_settings_bots_tools_display_test() {
       ui.BotsLoaded([bot_row_with_tools("b2", "quiet", "", None, Some([]))]),
     )
     |> step(ui.SettingsToggled)
-    |> step(ui.Settings(ui_settings.BotEditToggled("b2", "p1", Some([]))))
+    |> step(
+      ui.Settings(ui_settings.BotEditToggled("b2", "p1", "smart", Some([]))),
+    )
     |> view_string
   should.be_true(string.contains(editing_chat_only, ">Custom tools<"))
   should.be_true(string.contains(editing_chat_only, "checked"))
@@ -4045,7 +4095,12 @@ pub fn view_settings_bots_tool_picker_test() {
     )
     |> step(ui.SettingsToggled)
   let open_b1 =
-    ui.Settings(ui_settings.BotEditToggled("b1", "p1", Some(["http_fetch"])))
+    ui.Settings(ui_settings.BotEditToggled(
+      "b1",
+      "p1",
+      "smart",
+      Some(["http_fetch"]),
+    ))
 
   // The settled picker: four catalog boxes, the Custom switch (ON —
   // the edit seeded an explicit set), All/None controls, the seeded
@@ -4095,6 +4150,7 @@ pub fn view_settings_bots_tool_picker_test() {
       ui.Settings(ui_settings.BotEditToggled(
         "b2",
         "p1",
+        "smart",
         Some(["http_fetch", "<script>alert(2)</script>"]),
       )),
     )
@@ -4258,6 +4314,7 @@ pub fn bot_picker_submit_roundtrip_test() {
         "smart",
         "",
         "",
+        "",
       )),
     ),
   )
@@ -4284,6 +4341,7 @@ pub fn bot_picker_submit_roundtrip_test() {
         "smart",
         "",
         "",
+        "",
       )),
     ),
   )
@@ -4301,6 +4359,7 @@ pub fn bot_picker_submit_roundtrip_test() {
         "",
         store_mock.fixture_provider_id,
         "smart",
+        "",
         "",
         "",
       )),
@@ -4337,6 +4396,7 @@ pub fn settings_inbound_toggle_runtime_round_trip_test() {
           allow_inbound: True,
           created_at: 0,
           updated_at: 0,
+          context_window: None,
         ))
       },
       fn(_endpoint) { Error(openai.Transport("offline test")) },
@@ -4655,7 +4715,7 @@ pub fn hello_preserves_streaming_after_send_accepted_test() {
     |> step(ui.SendRequested("hello"))
     |> step(ui.Created(summary("s-new", False)))
     |> step(ui.SendAccepted)
-    |> step(ui.Hello("smart"))
+    |> step(ui.Hello("smart", empty_usage()))
   model.streaming |> should.be_true
 }
 
@@ -5076,6 +5136,7 @@ pub fn create_worker_lands_off_list_alias_and_runtime_stays_live_test() {
           allow_inbound: True,
           created_at: 0,
           updated_at: 0,
+          context_window: None,
         ))
       },
       fn(_endpoint) {
@@ -5137,6 +5198,7 @@ pub fn create_from_bot_worker_lands_provenance_test() {
           allow_inbound: True,
           created_at: 0,
           updated_at: 0,
+          context_window: None,
         ))
       },
       fn(_endpoint) {
@@ -5187,6 +5249,7 @@ pub fn create_worker_crash_releases_guard_test() {
           allow_inbound: True,
           created_at: 0,
           updated_at: 0,
+          context_window: None,
         ))
       },
       fn(_endpoint) {
@@ -6217,6 +6280,7 @@ pub fn settings_exit_syncs_threads_and_bots_from_other_session_test() {
         "smart",
         "",
         "",
+        "",
       )),
     ),
   )
@@ -6284,6 +6348,7 @@ pub fn settings_enter_and_tab_switch_sync_other_session_changes_test() {
         model: "smart",
         system_prompt: None,
         tools: None,
+        context_window: None,
       ),
     )
 
@@ -6365,6 +6430,7 @@ pub fn first_run_settings_exit_syncs_other_session_chat_test() {
         model: "smart",
         system_prompt: None,
         tools: None,
+        context_window: None,
       ),
     )
   let assert Ok(_) =
@@ -6378,6 +6444,7 @@ pub fn first_run_settings_exit_syncs_other_session_chat_test() {
         toolset: None,
         parent_thread_id: None,
         title: "created while away",
+        context_window: None,
       ),
     )
 
@@ -6464,6 +6531,7 @@ pub fn bot_edit_toggle_refreshes_bots_from_other_session_test() {
         system_prompt: None,
         tools: Some(Some(["codemode"])),
         allow_inbound: None,
+        context_window: None,
       ),
     )
 
@@ -6476,6 +6544,7 @@ pub fn bot_edit_toggle_refreshes_bots_from_other_session_test() {
       ui.Settings(ui_settings.BotEditToggled(
         store_mock.fixture_bot_id,
         store_mock.fixture_provider_id,
+        "alias-1",
         None,
       )),
     ),
@@ -6495,6 +6564,7 @@ pub fn bot_edit_toggle_refreshes_bots_from_other_session_test() {
         "",
         store_mock.fixture_provider_id,
         "fast-updated",
+        "",
         "",
         "",
       )),
@@ -6523,12 +6593,13 @@ pub fn bot_edit_sync_respects_local_edits_and_remote_delete_test() {
       allow_inbound: True,
       created_at: 0,
       updated_at: 0,
+      context_window: None,
     )
   // Opening arms sync, then user flips Custom ON and ticks `http_fetch`
   // before `BotsLoaded` arrives -> local choice must win.
   let edited =
     new_model()
-    |> step(ui.Settings(ui_settings.BotEditToggled("b1", "p1", None)))
+    |> step(ui.Settings(ui_settings.BotEditToggled("b1", "p1", "smart", None)))
     |> step(ui.Settings(ui_settings.BotToolsCustomToggled))
     |> step(ui.Settings(ui_settings.BotToolToggled("http_fetch")))
     |> step(ui.BotsLoaded([remote_bot]))
@@ -6539,8 +6610,155 @@ pub fn bot_edit_sync_respects_local_edits_and_remote_delete_test() {
   // the editor cleanly.
   let vanished =
     new_model()
-    |> step(ui.Settings(ui_settings.BotEditToggled("b1", "p1", None)))
+    |> step(ui.Settings(ui_settings.BotEditToggled("b1", "p1", "smart", None)))
     |> step(ui.BotsLoaded([]))
   vanished.settings.bot_edit |> should.equal(None)
   vanished.settings.bot_alias_provider |> should.equal(None)
+}
+
+fn empty_usage() -> thread.ContextUsage {
+  thread.ContextUsage(
+    tokens: 0,
+    source: thread.Estimated,
+    context_window: None,
+    last_prompt_tokens: None,
+    last_cached_tokens: None,
+    bytes_per_token: thread.default_bytes_per_token,
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Context monitoring (Phase 1): usage pill, tooltip, bot context_window form
+// ---------------------------------------------------------------------------
+
+pub fn usage_pill_formatting_and_warn_threshold_test() {
+  ui.format_tokens_compact(0) |> should.equal("0")
+  ui.format_tokens_compact(850) |> should.equal("850")
+  ui.format_tokens_compact(1500) |> should.equal("1.5k")
+  ui.format_tokens_compact(42_180) |> should.equal("42k")
+  ui.format_tokens_compact(128_000) |> should.equal("128k")
+  ui.format_tokens_compact(1_000_000) |> should.equal("1M")
+  ui.format_tokens_compact(1_500_000) |> should.equal("1.5M")
+
+  let measured =
+    thread.ContextUsage(
+      tokens: 42_180,
+      source: thread.Measured,
+      context_window: Some(128_000),
+      last_prompt_tokens: Some(42_180),
+      last_cached_tokens: Some(39_400),
+      bytes_per_token: 4.0,
+    )
+  ui.usage_pill_label(measured) |> should.equal("42k / 128k (32%)")
+  ui.usage_pill_warn(measured) |> should.be_false
+  let tip = ui.usage_pill_tooltip(measured)
+  should_contain(tip, "42,180 / 128,000 tokens")
+  should_contain(tip, "Prompt: 42,180 · Cached: 39,400 (93%)")
+
+  let estimated_no_cap =
+    thread.ContextUsage(
+      tokens: 4200,
+      source: thread.Estimated,
+      context_window: None,
+      last_prompt_tokens: None,
+      last_cached_tokens: None,
+      bytes_per_token: 4.0,
+    )
+  ui.usage_pill_label(estimated_no_cap) |> should.equal("~4.2k tok")
+  ui.usage_pill_warn(estimated_no_cap) |> should.be_false
+  should_contain(ui.usage_pill_tooltip(estimated_no_cap), "~4,200 tokens")
+  should_contain(ui.usage_pill_tooltip(estimated_no_cap), "(estimated)")
+
+  let high =
+    thread.ContextUsage(
+      ..measured,
+      tokens: 102_400,
+      context_window: Some(128_000),
+    )
+  ui.usage_pill_warn(high) |> should.be_true
+}
+
+pub fn view_renders_context_usage_pill_and_resets_on_switch_test() {
+  let usage =
+    thread.ContextUsage(
+      tokens: 105_000,
+      source: thread.Measured,
+      context_window: Some(128_000),
+      last_prompt_tokens: Some(104_000),
+      last_cached_tokens: Some(90_000),
+      bytes_per_token: 3.8,
+    )
+  // Unconfigured zero-token thread hides the pill cleanly.
+  let quiet =
+    new_model()
+    |> step(ui.ThreadsLoaded([summary("s-1", False), summary("s-2", False)]))
+    |> step(ui.Hello("smart", empty_usage()))
+  quiet |> view_string |> should_not_contain("id=\"context-usage\"")
+
+  // UsageUpdated renders the pill with warn class and tooltip.
+  let active = step(quiet, ui.UsageUpdated(usage))
+  let html = view_string(active)
+  should_contain(html, "id=\"context-usage\"")
+  should_contain(html, "class=\"usage-pill warn\"")
+  should_contain(html, "105k / 128k (82%)")
+  should_contain(html, "Prompt: 104,000 · Cached: 90,000 (86%)")
+
+  // Switching threads clears stale usage until the new thread's Hello lands.
+  let switched = step(active, ui.Select("s-2"))
+  switched.usage |> should.equal(None)
+  switched |> view_string |> should_not_contain("id=\"context-usage\"")
+}
+
+pub fn bot_settings_form_shows_provider_context_hint_and_validates_int_test() {
+  let model =
+    new_model()
+    |> step(ui.ProvidersLoaded([prov("p1", "bifrost", True, True)]))
+    |> step(ui.SettingsToggled)
+    |> step(ui.Settings(ui_settings.TabSelected(ui_settings.BotsTab)))
+    |> step(ui.Settings(ui_settings.BotAddToggled(Some("p1"))))
+    |> step(
+      ui.Settings(
+        ui_settings.BotAliasesLoaded("p1", [
+          openai.ModelInfo("qwen-32b", Some(131_072)),
+          openai.ModelInfo("plain", None),
+        ]),
+      ),
+    )
+    |> step(ui.Settings(ui_settings.BotModelChanged("qwen-32b")))
+
+  let html = view_string(model)
+  should_contain(html, "name=\"context_window\"")
+  should_contain(html, "Provider reports 131,072 tokens")
+
+  // Switching tabs and reopening Add Bot preserves the hint for the still-mounted input.
+  let reopened =
+    model
+    |> step(ui.Settings(ui_settings.TabSelected(ui_settings.ProvidersTab)))
+    |> step(ui.Settings(ui_settings.TabSelected(ui_settings.BotsTab)))
+    |> step(ui.Settings(ui_settings.BotAddToggled(Some("p1"))))
+  reopened |> view_string |> should_contain("Provider reports 131,072 tokens")
+
+  // Model with no reported context length hides the helper text.
+  let no_hint =
+    step(model, ui.Settings(ui_settings.BotModelChanged("plain")))
+    |> view_string
+  should_not_contain(no_hint, "Provider reports")
+
+  // Non-integer context_window keeps the add form open and records an error.
+  let invalid =
+    step(
+      model,
+      ui.Settings(ui_settings.BotSubmitted(
+        "MyBot",
+        "",
+        "p1",
+        "qwen-32b",
+        "",
+        "",
+        "128k",
+      )),
+    )
+  invalid.settings.bots_open |> should.be_true
+  invalid.settings.bot_last_error
+  |> should.equal(Some("context window must be a whole number of tokens"))
 }

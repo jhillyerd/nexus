@@ -1503,8 +1503,8 @@ async function main() {
         assert(
           next.envelope ===
             base.envelope.replace(
-              ',"stream":true',
-              `,"stream":true${UTILITY_DELTA}`,
+              ',"stream":true,"stream_options":{"include_usage":true}',
+              `,"stream":true,"stream_options":{"include_usage":true}${UTILITY_DELTA}`,
             ),
           "utility envelope differs by exactly the max_completion_tokens delta",
         );
